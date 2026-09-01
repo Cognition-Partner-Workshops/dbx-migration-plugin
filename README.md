@@ -25,7 +25,7 @@ manifest:
 
 ```json
 {
-  "requiredPlugins": ["Cognition-Partner-Workshops/dbx-migration-factory"]
+  "requiredPlugins": ["Cognition-Partner-Workshops/dbx-migration-plugin"]
 }
 ```
 
@@ -34,7 +34,7 @@ Pin a version instead of tracking the default branch:
 ```json
 {
   "requiredPlugins": [
-    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-factory", "ref": "v0.1.0" }
+    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.1.0" }
   ]
 }
 ```
@@ -42,7 +42,7 @@ Pin a version instead of tracking the default branch:
 **Per user (CLI):**
 
 ```bash
-devin plugins install Cognition-Partner-Workshops/dbx-migration-factory
+devin plugins install Cognition-Partner-Workshops/dbx-migration-plugin
 ```
 
 ## After installing
