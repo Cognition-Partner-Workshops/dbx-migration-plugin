@@ -1,0 +1,20 @@
+{
+  "version": "map-v1",
+  "tables": [
+    {
+      "source_table": "public.orders",
+      "target_table": "orders",
+      "key": {"source": ["order_id"], "target": "order_id"},
+      "root_where": "order_date >= '${from_date}'",
+      "fields": [
+        {"source": "order_id",   "target": "order_id",   "source_type": "BIGINT",       "target_type": "BIGINT"},
+        {"source": "cust_name",  "target": "cust_name",  "source_type": "CHAR(20)",     "target_type": "STRING",
+         "rules": ["rstrip_spaces", "empty_string_is_null"]},
+        {"source": "total_amt",  "target": "total_amt",  "source_type": "NUMERIC(10,2)", "target_type": "DECIMAL(10,2)",
+         "rules": ["decimal_round"]},
+        {"source": "updated_at", "target": "updated_at", "source_type": "TIMESTAMP",    "target_type": "TIMESTAMP",
+         "rules": ["datetime_utc_truncate_ms"]}
+      ]
+    }
+  ]
+}
