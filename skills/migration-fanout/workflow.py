@@ -52,9 +52,11 @@ RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 
 if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
-    raise SystemExit(f"{RESULT_PATH} already exists: this wave already closed. To resume an "
-                     "interrupted run pass its run_id. To redo the wave on purpose, set "
-                     "WAVE_RERUN=1.")
+    prior = json.loads(RESULT_PATH.read_text())
+    if prior.get("closed"):
+        raise SystemExit(f"{RESULT_PATH} says wave {prior.get('wave')} closed clean. To redo it on "
+                         "purpose, set WAVE_RERUN=1.")
+    # halted or failed: fall through and resume (same run_id replays finished children)
 
 
 def validate_manifest(m):
@@ -161,7 +163,7 @@ def verify_prompt(passed, auto_merge):
     merge_line = (
         "If your wave verdict is PASS, merge the PRs you marked PASS and list them in merged_prs."
         if auto_merge else
-        "Do not merge anything; the orchestrator merges after STOP D.")
+        "Do not merge anything; return per-unit verdicts. The orchestrator merges the PASS PRs at wave close.")
     return (
         f"You are the independent verifier for wave {WAVE}. Repo: {REPO}. You did not write "
         f"any of this code.\nRun the playbook {MANIFEST['verify_macro']} exactly as written over "
@@ -209,7 +211,7 @@ async def run_batch(batch, sem, breaker):
         return out
 
 
-def write_brief(results, verify, surprises):
+def write_brief(results, verify, surprises, undeclared):
     """Ten lines a lead reads in one minute. The orchestrator posts this at wave close."""
     n = len(BATCHES)
     passed = sum(1 for r in results if r["status"] == "PASS")
@@ -230,6 +232,10 @@ def write_brief(results, verify, surprises):
     if surprises:
         lines.append(f"Merges held: two children reported the same write target "
                      f"({', '.join(surprises)}). A human decides which PR lands.")
+    if undeclared:
+        lines.append("Merges held: children wrote outside their declared targets: "
+                     + "; ".join(f"{k}: {', '.join(v)}" for k, v in sorted(undeclared.items()))
+                     + ". A human decides which PR lands.")
     lines += [
         "",
         "Verifier findings:" if verify and verify["findings"] else "Verifier findings: none.",
@@ -256,10 +262,19 @@ async def main():
 
     reported = Counter(t for r in results for t in r.get("write_targets", []))
     surprises = [t for t, c in reported.items() if c > 1]
+    undeclared = {}
+    for b, r in zip(BATCHES, results):
+        extra = sorted(set(r.get("write_targets", [])) - set(b["write_targets"]))
+        if extra:
+            undeclared[b["id"]] = extra
     auto_merge = AUTO_MERGE
     if surprises:
         auto_merge = False
         log(f"WARNING: children reported overlapping write targets after the fact: {surprises}. "
+            "Auto-merge is off for this wave; a human decides at wave close.")
+    if undeclared:
+        auto_merge = False
+        log(f"HALT: children wrote outside their declared targets: {undeclared}. "
             "Auto-merge is off for this wave; a human decides at wave close.")
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
@@ -277,14 +292,19 @@ async def main():
     else:
         log("verify: skipped, no batch passed")
 
+    closed = (breaker.tripped_on is None and not surprises and not undeclared
+              and verify is not None and verify["wave_verdict"] == "PASS"
+              and all(r["status"] == "PASS" for r in results))
     RESULT_PATH.write_text(json.dumps({
         "wave": WAVE, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
+        "closed": closed,
         "write_target_overlaps": surprises,
+        "undeclared_write_targets": undeclared,
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
         "verify": verify,
     }, indent=2, sort_keys=True) + "\n")
-    write_brief(results, verify, surprises)
+    write_brief(results, verify, surprises, undeclared)
     log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 

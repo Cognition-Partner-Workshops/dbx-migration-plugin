@@ -34,7 +34,7 @@ redoes finished work.
 |---|---|
 | Manifest check | Refuses to start if the manifest is missing, a batch has no brief or no write targets, or batch ids repeat. |
 | Collision check | Refuses to start if two batches claim the same write target. If children report an overlap after the fact, merges are held and the brief says so. |
-| Closed-wave guard | Refuses to start if `wave-<N>.result.json` already exists, so a wave is never redone by accident. Resume with `run_id`; redo on purpose with `WAVE_RERUN=1`. |
+| Closed-wave guard | Refuses to start only if the wave closed clean (`closed: true` in the result); a halted or failed wave resumes with the same `run_id`. Redo on purpose with `WAVE_RERUN=1`. |
 | Width | At most `width` children at once (default 20). |
 | Circuit breaker | After `breaker_threshold` (default 3) children fail with the same `failure_class`, no new children launch. Running ones finish. |
 | Single ledger writer | Children never edit `.migration/`. The result file is written here, once. |
