@@ -13,7 +13,7 @@ What this script guarantees, so the orchestrator does not have to:
   - Children never edit shared ledger files. This script is the single writer of
     <manifest>.result.json and the ledger rows the orchestrator appends from it.
   - The verifier is a different session from every child. Only PRs the verifier marks
-    PASS are merged, and only if the manifest says auto_merge.
+    PASS are merged, and only if the manifest says auto_merge (true by default; soft stop_mode keeps it true).
   - Re-running with the same run_id (also passed as WAVE_RUN_ID) replays finished children and only
     launches the rest.
 

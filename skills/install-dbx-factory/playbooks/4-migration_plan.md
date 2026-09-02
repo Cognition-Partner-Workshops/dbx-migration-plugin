@@ -6,7 +6,7 @@ The plan is the contract between the human stops and the parallel execution mach
 ```
 <Pipeline>_analysis.md  ->  dependency decisions (decide mode)  ->  scaffolding delta
                         ->  execution schedule (waves x batches x width)  ->  recon gate spec
-                        ->  <Pipeline>_plan.md  ->  STOP C (blocking)
+                        ->  <Pipeline>_plan.md  ->  STOP C (per stop_mode)
 ```
 
 ## What's Needed From User
@@ -30,7 +30,7 @@ The plan is the contract between the human stops and the parallel execution mach
 6. **Pilot and calibration rule**: wave 1 runs deliberately narrow (width <= 5) regardless of confirmed width, to tune the dialect skill and surface systematic conversion errors before they multiply across 50 children. Corrections land in the skill and knowledge notes before wave 2 fans out fully. The same logic applies **per pattern class, not just per engagement**: when a later wave introduces a new unit class (the first aggregation-layer unit, the first report unit, the first CDC unit), the schedule runs one deliberately small calibration unit of that class first, harvests its dictionary/skill feedback, and only then briefs the rest of the class, in parallel. Serializing whole waves because each unit might teach something is the expensive version of this rule; calibrate on one cheap unit, then fan out.
 7. **Governance mapping section**: with the `governance-mapping` skill, turn the governance inventory rows touching this pipeline into the proposed UC mapping (grants -> UC GRANTs and groups, masking/row policies -> UC masks and row filters), with every unmappable row flagged GAP. Policy-design questions (group restructuring, PII regime changes) become D-entries with a human owner, explicitly outside automation scope. The mapping and its gaps are attached at STOP C for the security reviewer's approval; the executable script is generated from approved rows only.
 8. **Write `<Pipeline>_plan.md`** with all of the above plus the risk register (INFERRED types, unresolved-contract blockers now cleared or accepted, lead-time exposures). Update the ledger.
-9. **STOP C (blocking)**: attach the analysis and the plan; present the dependency decision table with fired requests, the schedule with width and wall-clock projection, the gate spec, the governance mapping with its GAP rows, and the scaffolding delta. Get explicit approval before any execution session launches.
+9. **STOP C (per stop_mode)**: attach the analysis and the plan; present the dependency decision table with fired requests, the schedule with width and wall-clock projection, the gate spec, the governance mapping with its GAP rows, and the scaffolding delta. Get explicit approval before any execution session launches.
 
 ## Specifications
 - Deliverable: `<Pipeline>_plan.md`, every dependency DECIDED with fired requests, approved at STOP C.

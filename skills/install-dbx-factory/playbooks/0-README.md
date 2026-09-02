@@ -16,7 +16,7 @@
 | **A** | "This is what 'migrated' will mean, these are the accuracy tolerances, and this is the access we need. Correct?" |
 | **B** | "Here is everything in your estate. Which pipeline do we migrate first?" |
 | **C** | "Here is the plan: order, dependencies, how many parallel sessions, cost. Approved?" |
-| **D** | "A batch is done, here is the evidence it matches the old system. Any concerns?" (notification, not blocking) |
+| **D** | "A batch is done, here is the evidence it matches the old system. Any concerns?" (notification only) |
 | **E** | "The new system has matched the old one in production for weeks. Authorize cutover?" |
 
 **Why it is safe**: Devin never touches the legacy system except to read it. Migration work writes only to an isolated area. The credentials that can repoint production are held by the customer and used exactly once, at stop E, never by the automated sessions. Every claim of correctness is machine-checked data comparison, re-verified by an independent session that did not do the migration.
@@ -34,17 +34,17 @@ PRE-MIGRATION (once per engagement)
   1  !dbx_migration_setup          Phase 1: CORE + per-workload target profiles -> doc +
                                    knowledge note. Phase 2: .migration/ workspace: context,
                                    recon tolerances, access checklist, dependency register,
-                                   ledger                                      STOP A (blocking)
+                                   ledger                                      STOP A (per stop_mode)
 ESTATE LEVEL
   2  !dbx_estate_inventory         asset census, lineage DAG, 100% coverage proof,
                                    shared-object map, first-pass dependency register
-                                                                               STOP B (blocking:
+                                                                               STOP B (per stop_mode:
                                                                                user picks pipeline)
 PIPELINE LEVEL
   3  !dbx_pipeline_analysis        unit inventory, lineage waves, field/type dictionary,
                                    dependency sweep, fan-out batches
   4  !dbx_migration_plan           plan, every dependency DECIDED, access requests fired,
-                                   fan-out width and gates confirmed           STOP C (blocking)
+                                   fan-out width and gates confirmed           STOP C (per stop_mode)
 EXECUTION (parallel fan-out)
   5  !dbx_unit_migration           N children per wave IN PARALLEL, one per unit batch
   6  !dbx_data_reconciliation      independent dual-run diff per unit batch    STOP D (notify)
@@ -125,13 +125,13 @@ The number prefix is reading order, not an execution requirement. `13-dependency
 
 | Stop | When | Default | What the user decides |
 |---|---|---|---|
-| **A** | after pre-migration | blocking | target profiles per workload (and which are N/A), recon tolerances, access checklist status, repo topology |
-| **B** | after estate inventory | blocking | **which pipeline to migrate**, its scope boundary and exclusions |
-| **C** | after plan | blocking | analysis, plan, every dependency decision, fan-out width, wave gates, data target |
+| **A** | after pre-migration | per `stop_mode` (default soft) | target profiles per workload (and which are N/A), recon tolerances, access checklist status, repo topology |
+| **B** | after estate inventory | per `stop_mode` (default soft) | **which pipeline to migrate**, its scope boundary and exclusions |
+| **C** | after plan | per `stop_mode` (default soft) | analysis, plan, every dependency decision, fan-out width, wave gates, data target |
 | **D** | after each wave | notify | review the wave's PRs and recon evidence in batch; optionally pause the fan-out |
 | **E** | before cutover | blocking | sign-off, evidence, independent audit, cutover authorization |
 
-Blocking stops fire even on resumed runs where prior sessions already produced the artifacts. Prior work is acknowledged and re-presented; a previous approval never carries over. At every stop, the full markdown artifacts are attached, not summarized.
+Stops fire even on resumed runs; approvals never carry over. Default `stop_mode` is soft (60-second window, then the recommended default, recorded as `default-accepted`); STOP E always blocks. At every stop, the full markdown artifacts are attached, not summarized.
 
 ## Dependency taxonomy
 
