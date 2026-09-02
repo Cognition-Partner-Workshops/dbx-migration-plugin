@@ -46,7 +46,10 @@ When `root_where` or an embed's `child_where` is set, the corresponding `target_
 required so both sides have the same scope.
 
 The allowlist file is trusted setup state, not a caller-controlled CLI list. Use
-`--snapshot-manifest` for snapshot mode; it records source, extraction time, and row counts.
+`--snapshot-manifest` for snapshot mode; it must live under `.migration/snapshots/` and record
+`source` (equal to `--family`), `extracted_at`, and `row_counts` keyed by root table. The
+harness checks those counts against what Tier 1 observed on the source; any mismatch is a
+provenance warning and the run is not merge-eligible.
 
 ## What it checks, in cost order
 
