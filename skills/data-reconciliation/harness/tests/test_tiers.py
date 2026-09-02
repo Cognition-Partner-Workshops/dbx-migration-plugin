@@ -5,10 +5,11 @@ one mismatch per class, proving each tier catches its class and the engine gates
 import copy
 import json
 from pathlib import Path
+import pytest
 
 from recon.config import (CanonRule, ObjectMapping, EmbedMapping, FieldMapping,
                           MappingSpec, Tolerances, load_canon_rules, load_mapping_spec,
-                          load_tolerances)
+                          load_tolerances, ConfigError, validate_identifier)
 from recon.engine import run_recon
 from tests.fakes import FakeSource, FakeTarget
 
@@ -284,6 +285,116 @@ def test_config_loaders_and_report(tmp_path: Path):
     assert (tmp_path / "out/result.json").exists()
     report = (tmp_path / "out/report.md").read_text()
     assert "snapshot" in report and "scoped to the snapshot watermark" in report
+
+
+def test_mapping_identifier_and_predicate_validation(tmp_path: Path):
+    base = {"version": "m", "objects": [{
+        "object": "c", "root_table": "T",
+        "key": {"source": ["ID"], "target": "id"},
+        "fields": [{"source": "a.b", "target": "a.b"}]}]}
+    path = tmp_path / "map.json"
+    path.write_text(json.dumps(base))
+    assert load_mapping_spec(path).objects[0].fields[0].source == "a.b"
+    base["objects"][0]["fields"][0]["source"] = "a b"
+    path.write_text(json.dumps(base))
+    with pytest.raises(ConfigError):
+        load_mapping_spec(path)
+    base["objects"][0]["fields"][0]["source"] = "A"
+    base["objects"][0]["root_table"] = "T; DROP TABLE x"
+    path.write_text(json.dumps(base))
+    with pytest.raises(ConfigError):
+        load_mapping_spec(path)
+    base["objects"][0]["root_table"] = "T"
+    base["objects"][0]["root_where"] = "ID = 1 -- injected"
+    path.write_text(json.dumps(base))
+    with pytest.raises(ConfigError, match="predicates must be a single expression"):
+        load_mapping_spec(path)
+    assert validate_identifier("schema.table") == "schema.table"
+
+
+def test_cli_rejects_unsafe_param_before_adapter(tmp_path: Path):
+    import pytest
+    from recon import cli
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--unit", "u", "--family", "oracle",
+                  "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
+                  "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
+                  "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+                  "--target-catalog", "c", "--target-schema", "s", "--param", "x=bad'"])
+
+
+def test_scoped_source_and_target_pass_and_missing_scope_fails():
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="orders", root_table="ORDERS", root_where="BATCH = 'a'", target_where="batch=a",
+        key_source=["ORDER_ID"], key_target="order_id",
+        fields=[FieldMapping("ORDER_ID", "order_id", "", "long")])])
+    source = FakeSource({"ORDERS": [{"ORDER_ID": 1, "BATCH": "a"}, {"ORDER_ID": 2, "BATCH": "b"}]})
+    target = FakeTarget({"orders": [{"order_id": 1, "batch": "a"}, {"order_id": 2, "batch": "b"}]})
+    assert run_recon("u", "live", spec, TOL, RULES, source, target)["verdict"] == "PASS"
+    with pytest.raises(ConfigError, match="has root_where but no target_where"):
+        run_recon("u", "live", spec.__class__(version="m", objects=[ObjectMapping(
+            object="orders", root_table="ORDERS", root_where="BATCH = 'a'",
+            key_source=["ORDER_ID"], key_target="order_id",
+            fields=spec.objects[0].fields)]), TOL, RULES, source, target)
+
+
+def test_duplicate_source_key_fails():
+    source, target = make_green()
+    source.tables["ORDERS"].append({"ORDER_ID": 1, "CUST_NAME": "Ada", "TOTAL": 10.5})
+    target.objects["orders"].append({"order_id": 1, "customer": {"name": "Ada"}, "total": 10.5,
+                                     "items": []})
+    result = run(source, target)
+    assert result["verdict"] == "FAIL"
+    assert any(f["check"] == "duplicate_source_key"
+               for t in result["tiers"] for f in t["findings"])
+
+
+def test_rewriting_aggregate_defers_to_tier3():
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="c", root_table="T", key_source=["ID"], key_target="id",
+        fields=[FieldMapping("ID", "id", "", "long"),
+                FieldMapping("NAME", "name", "", "string", ["collation_casefold"])])])
+    source = FakeSource({"T": [{"ID": 1, "NAME": "abc"}]})
+    target = FakeTarget({"c": [{"id": 1, "name": "ABC"}]})
+    result = run_recon("u", "live", spec, TOL,
+                       RULES + [CanonRule("collation_casefold", "*")], source, target)
+    assert result["verdict"] == "PASS"
+    assert "c.name" in result["tiers"][1]["stats"]["deferred_to_tier3"]
+
+
+def test_sampling_is_deterministic_and_pushes_keys():
+    rows = [{"ORDER_ID": i, "CUST_NAME": str(i), "TOTAL": float(i)} for i in range(10)]
+    source1 = FakeSource({"ORDERS": rows, "ORDER_ITEMS": []})
+    target1 = FakeTarget({"orders": [{"order_id": i, "customer": {"name": str(i)}, "total": float(i),
+                                      "items": []} for i in range(10)]})
+    tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=2)
+    r1 = run_recon("u", "live", SPEC, tol, RULES, source1, target1, seed=9)
+    keys1 = source1.last_fetch_keyed["keys"]
+    source2 = FakeSource({"ORDERS": rows, "ORDER_ITEMS": []})
+    target2 = FakeTarget({"orders": [{"order_id": i, "customer": {"name": str(i)}, "total": float(i),
+                                      "items": []} for i in range(10)]})
+    r2 = run_recon("u", "live", SPEC, tol, RULES, source2, target2, seed=9)
+    assert keys1 == source2.last_fetch_keyed["keys"]
+    assert r1["tiers"][2]["stats"] == r2["tiers"][2]["stats"]
+
+
+def test_ops_require_executors():
+    import pytest
+    with pytest.raises(ConfigError, match="no query executors"):
+        run_recon("u", "live", SPEC, TOL, RULES, *make_green(),
+                  ops=[{"name": "x"}])
+
+
+def test_merge_eligibility_by_mode():
+    from recon.report import build_result
+    from recon.tiers import TierResult
+    tier = TierResult(1, "x", True, 1, [])
+    assert build_result("u", "fixture", "m", "t", [tier])["merge_eligible"] is False
+    assert build_result("u", "continuous", "m", "t", [tier])["merge_eligible"] is False
+    assert build_result("u", "live", "m", "t", [tier])["merge_eligible"] is True
+    assert build_result("u", "snapshot", "m", "t", [tier])["merge_eligible"] is True
+    assert build_result("u", "live", "m", "t",
+                        [TierResult(1, "x", False, 1, [])])["merge_eligible"] is False
 
 
 def test_unversioned_inputs_rejected(tmp_path: Path):

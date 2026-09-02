@@ -38,8 +38,10 @@ Exit code 0 is PASS, 1 is FAIL. Secrets are passed by NAME; the harness reads th
 environment. Never inline a connection string or token.
 
 `--param name=value` (repeatable) fills `${name}` placeholders in the mapping spec's
-`root_where`. Use it for date or partition scoping so a new slice is a parameter, not a new
-mapping version. Unresolved placeholders are refused.
+`root_where`/`target_where`. Values are validated before any database adapter is constructed.
+Unresolved placeholders are refused, and mapping identifiers are validated before execution.
+When `root_where` or an embed's `child_where` is set, the corresponding `target_where` is
+required so both sides have the same scope.
 
 ## What it checks, in cost order
 
@@ -48,7 +50,7 @@ mapping version. Unresolved placeholders are refused.
 | 1 | Row counts, source table vs target table (through the mapping, with `root_where`) | Load defect or wrong scope. Nothing else runs. |
 | 2 | Per-column aggregates: null rate, min, max, distinct count, sum on numeric columns | Type or conversion drift. |
 | 3 | Keyed row diff: full below `full_diff_row_threshold`, seeded stratified sample above | Value-level mismatch; findings name the key and column. |
-| 4 | Replay of recorded representative queries on both engines (optional, `--ops`) | Report or extract does not match. |
+| 4 | Replay of recorded representative queries on both engines (optional, `--ops`) | Report or extract does not match. SQL ops execute read-only and only `SELECT`/`WITH` queries are allowed. |
 
 Aggregates run natively on each engine, so nothing bulky crosses the wire. Comparisons happen
 after the canonicalization rules (trailing spaces, decimal rounding, timestamp precision,
@@ -61,6 +63,9 @@ null vs empty string) are applied to BOTH sides.
 - `live`: the real read-only source, inside the one live window the parent granted this unit.
 - `snapshot`: source is a frozen extract; every PASS is scoped to the snapshot watermark.
 - `continuous`: Tier 1+2 plus a sampled Tier 3, appended per cycle during parallel-run.
+
+Only PASS results in `live` or `snapshot` mode have `merge_eligible=true`; fixture and
+continuous evidence never merges.
 
 ## Outputs (in `--out`)
 

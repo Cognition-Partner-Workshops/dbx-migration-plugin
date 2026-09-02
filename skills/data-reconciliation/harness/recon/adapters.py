@@ -16,21 +16,24 @@ import os
 from collections.abc import Iterable
 from typing import Any, Protocol
 
+from .paths import get_path
+
 
 class SourceAdapter(Protocol):
     def row_count(self, table: str, where: str | None = None) -> int: ...
     def field_aggregates(self, table: str, column: str, where: str | None = None) -> dict[str, Any]: ...
     def fetch_keyed(self, table: str, key_cols: list[str], columns: list[str],
                     where: str | None = None, keys: list[tuple] | None = None) -> Iterable[dict[str, Any]]: ...
+    def iter_keys(self, table: str, key_cols: list[str], where: str | None = None) -> Iterable[tuple]: ...
     def key_strata(self, table: str, key_cols: list[str], n_strata: int) -> list[tuple]: ...
 
 
 class TargetAdapter(Protocol):
-    def target_row_count(self, object: str) -> int: ...
-    def nested_count(self, object: str, array_path: str) -> int: ...
-    def field_aggregates(self, object: str, field_path: str) -> dict[str, Any]: ...
+    def target_row_count(self, object: str, where: str | None = None) -> int: ...
+    def nested_count(self, object: str, array_path: str, where: str | None = None) -> int: ...
+    def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]: ...
     def fetch_keyed(self, object: str, key_field: str, fields: list[str],
-                    keys: list[Any] | None = None) -> Iterable[dict[str, Any]]: ...
+                    where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]: ...
 
 
 def _secret(name: str) -> str:
@@ -47,13 +50,38 @@ AGG_SQL = ("SELECT COUNT(*) AS n, COUNT({col}) AS nonnull, MIN({col}) AS mn, "
 class _SqlAdapterBase:
     """Shared SQL implementation; subclasses provide a DB-API connection."""
 
+    paramstyle = "qmark"
+
     def __init__(self, conn):
         self._conn = conn
 
-    def _rows(self, sql: str, params: tuple = ()) -> list[tuple]:
+    def _rows(self, sql: str, params=()) -> list[tuple]:
         cur = self._conn.cursor()
         cur.execute(sql, params)
         return cur.fetchall()
+
+    def _placeholders(self, n: int, offset: int = 0) -> list[str]:
+        if self.paramstyle == "format":
+            return ["%s"] * n
+        if self.paramstyle == "named":
+            return [f":{i}" for i in range(offset + 1, offset + n + 1)]
+        if self.paramstyle == "pyformat":
+            return [f"%(p{i})s" for i in range(offset, offset + n)]
+        return ["?"] * n
+
+    def _params(self, values: list[Any]):
+        if self.paramstyle == "pyformat":
+            return {f"p{i}": value for i, value in enumerate(values)}
+        return tuple(values)
+
+    def run_query(self, sql: str) -> list[dict[str, Any]]:
+        if not sql.lstrip().lower().startswith(("select", "with")):
+            from .config import ConfigError
+            raise ConfigError("recorded SQL ops must be read-only SELECT or WITH queries")
+        cur = self._conn.cursor()
+        cur.execute(sql)
+        names = [d[0] for d in cur.description or []]
+        return [dict(zip(names, row)) for row in cur.fetchall()]
 
     def row_count(self, table: str, where: str | None = None) -> int:
         w = f" WHERE {where}" if where else ""
@@ -76,15 +104,37 @@ class _SqlAdapterBase:
     def fetch_keyed(self, table: str, key_cols: list[str], columns: list[str],
                     where: str | None = None, keys: list[tuple] | None = None) -> Iterable[dict[str, Any]]:
         cols = ", ".join(dict.fromkeys(key_cols + columns))
+        chunks = [keys[i:i + 500] for i in range(0, len(keys), 500)] if keys is not None else [None]
+        for chunk in chunks:
+            clauses, values = [], []
+            if where:
+                clauses.append(f"({where})")
+            if chunk is not None:
+                if len(key_cols) == 1:
+                    clauses.append(f"{key_cols[0]} IN ({', '.join(self._placeholders(len(chunk)))})")
+                    values.extend(k[0] if isinstance(k, tuple) else k for k in chunk)
+                else:
+                    for key in chunk:
+                        parts = []
+                        for col, value in zip(key_cols, key):
+                            parts.append(f"{col} = {self._placeholders(1, len(values))[0]}")
+                            values.append(value)
+                        clauses.append("(" + " AND ".join(parts) + ")")
+                    clauses[-len(chunk):] = ["(" + " OR ".join(clauses[-len(chunk):]) + ")"]
+            w = " WHERE " + " AND ".join(clauses) if clauses else ""
+            cur = self._conn.cursor()
+            cur.execute(f"SELECT {cols} FROM {table}{w} ORDER BY {', '.join(key_cols)}",
+                        self._params(values))
+            names = [d[0] for d in cur.description]
+            for row in cur:
+                yield dict(zip(names, row))
+
+    def iter_keys(self, table: str, key_cols: list[str], where: str | None = None) -> Iterable[tuple]:
         w = f" WHERE {where}" if where else ""
         cur = self._conn.cursor()
-        cur.execute(f"SELECT {cols} FROM {table}{w} ORDER BY {', '.join(key_cols)}")
-        names = [d[0] for d in cur.description]
-        wanted = {tuple(k) for k in keys} if keys is not None else None
+        cur.execute(f"SELECT {', '.join(key_cols)} FROM {table}{w} ORDER BY {', '.join(key_cols)}")
         for row in cur:
-            rec = dict(zip(names, row))
-            if wanted is None or tuple(rec[k] for k in key_cols) in wanted:
-                yield rec
+            yield tuple(row)
 
     def key_strata(self, table: str, key_cols: list[str], n_strata: int) -> list[tuple]:
         key = key_cols[0]
@@ -97,6 +147,7 @@ class _SqlAdapterBase:
 class RedshiftSourceAdapter(_SqlAdapterBase):
     """Secret value: a libpq DSN, e.g. postgresql://user:pw@host:5439/db (read-only user)."""
 
+    paramstyle = "format"
     def __init__(self, dsn_secret: str):
         import psycopg2  # lazy: optional extra
         super().__init__(psycopg2.connect(_secret(dsn_secret)))
@@ -105,6 +156,7 @@ class RedshiftSourceAdapter(_SqlAdapterBase):
 class SnowflakeSourceAdapter(_SqlAdapterBase):
     """Secret value: JSON with account, user, password, warehouse, database, schema, role."""
 
+    paramstyle = "format"
     def __init__(self, dsn_secret: str):
         import snowflake.connector  # lazy: optional extra
         super().__init__(snowflake.connector.connect(**json.loads(_secret(dsn_secret))))
@@ -121,6 +173,7 @@ class TeradataSourceAdapter(_SqlAdapterBase):
 class OracleSourceAdapter(_SqlAdapterBase):
     """Secret value: user/password/dsn."""
 
+    paramstyle = "named"
     def __init__(self, dsn_secret: str):
         import oracledb  # lazy: optional extra
         user, password, dsn = _secret(dsn_secret).split("/", 2)
@@ -172,31 +225,43 @@ class DatabricksTargetAdapter:
     def __init__(self, secret_name: str, catalog: str, schema: str):
         self._conn = _databricks_connect(secret_name)
         self._sql = _SqlAdapterBase(self._conn)
+        self._sql.paramstyle = "pyformat"
         self._prefix = f"`{catalog}`.`{schema}`."
 
     def _q(self, object: str) -> str:
         return self._prefix + f"`{object}`"
 
-    def target_row_count(self, object: str) -> int:
-        return self._sql.row_count(self._q(object))
+    def target_row_count(self, object: str, where: str | None = None) -> int:
+        return self._sql.row_count(self._q(object), where)
 
-    def nested_count(self, object: str, array_path: str) -> int:
-        (n,) = self._sql._rows(f"SELECT COALESCE(SUM(size({array_path})), 0) FROM {self._q(object)}")[0]
+    def nested_count(self, object: str, array_path: str, where: str | None = None) -> int:
+        w = f" WHERE {where}" if where else ""
+        (n,) = self._sql._rows(f"SELECT COALESCE(SUM(size({array_path})), 0) FROM {self._q(object)}{w}")[0]
         return int(n)
 
-    def field_aggregates(self, object: str, field_path: str) -> dict[str, Any]:
-        return self._sql.field_aggregates(self._q(object), field_path)
+    def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
+        return self._sql.field_aggregates(self._q(object), field_path, where)
 
     def fetch_keyed(self, object: str, key_field: str, fields: list[str],
-                    keys: list[Any] | None = None) -> Iterable[dict[str, Any]]:
+                    where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]:
         # Select top-level columns only; STRUCT/ARRAY columns come back as dicts/lists via
         # Row.asDict(recursive=True) so tier logic can walk dotted paths.
         tops = list(dict.fromkeys([key_field.split(".")[0]] + [f.split(".")[0] for f in fields]))
-        cur = self._conn.cursor()
-        cur.execute(f"SELECT {', '.join(tops)} FROM {self._q(object)} ORDER BY {key_field}")
-        wanted = set(keys) if keys is not None else None
-        for row in cur:
-            rec = row.asDict(recursive=True) if hasattr(row, "asDict") else dict(zip(
-                [d[0] for d in cur.description], row))
-            if wanted is None or rec.get(key_field) in wanted:
+        chunks = [keys[i:i + 500] for i in range(0, len(keys), 500)] if keys is not None else [None]
+        for chunk in chunks:
+            clauses = [f"({where})"] if where else []
+            values = []
+            if chunk is not None:
+                clauses.append(f"{key_field} IN ({', '.join(self._sql._placeholders(len(chunk)))})")
+                values.extend(k[0] if isinstance(k, tuple) else k for k in chunk)
+            w = " WHERE " + " AND ".join(clauses) if clauses else ""
+            cur = self._conn.cursor()
+            cur.execute(f"SELECT {', '.join(tops)} FROM {self._q(object)}{w} ORDER BY {key_field}",
+                        self._sql._params(values))
+            for row in cur:
+                rec = row.asDict(recursive=True) if hasattr(row, "asDict") else dict(zip(
+                    [d[0] for d in cur.description], row))
                 yield rec
+
+    def run_query(self, sql: str) -> list[dict[str, Any]]:
+        return self._sql.run_query(sql)

@@ -22,11 +22,12 @@ redoes finished work.
 2. Commit it. Children clone the repo and read `.migration/` from there.
 3. Run:
    `run_workflow(workflow_name="migration-wave-<N>", script_path="<this dir>/workflow.py")`
-   with `WAVE_MANIFEST=.migration/waves/wave-<N>.json` in the environment.
+   with `WAVE_MANIFEST=.migration/waves/wave-<N>.json` and the workflow's `run_id` also
+   passed as `WAVE_RUN_ID` in the environment, on both the first run and any resume.
 4. When it returns, read `.migration/waves/wave-<N>.result.json` (machine) and
    `.migration/waves/wave-<N>.brief.md` (human). Post the brief as the wave-close message.
 5. If it timed out, halted, or the session slept, run it again with the same `run_id` and
-   `WAVE_RESUME=1`. Finished children replay; only the rest launch.
+   `WAVE_RUN_ID=<run_id>` plus `WAVE_RESUME=1`. Finished children replay; only the rest launch.
 
 ## What it enforces
 

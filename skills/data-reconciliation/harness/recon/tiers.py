@@ -13,6 +13,7 @@ from typing import Any
 
 from .canon import MISSING, Canonicalizer
 from .config import MappingSpec, ObjectMapping, Tolerances
+from .paths import get_path
 
 
 @dataclass
@@ -45,13 +46,7 @@ class TierResult:
                 "findings": [f.as_dict() for f in self.findings]}
 
 
-def _get_path(doc: dict, path: str) -> Any:
-    cur: Any = doc
-    for part in path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return MISSING
-        cur = cur[part]
-    return cur
+_get_path = get_path
 
 
 def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
@@ -61,14 +56,14 @@ def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
     for c in spec.objects:
         checks += 1
         src_n = source.row_count(c.root_table, c.root_where)
-        tgt_n = target.target_row_count(c.object)
+        tgt_n = target.target_row_count(c.object, c.target_where)
         if src_n != tgt_n:
             findings.append(Finding(c.object, "root_count",
                                     f"rows({c.root_table})={src_n} vs target rows={tgt_n}"))
         for e in c.embeds:
             checks += 1
             child_n = source.row_count(e.child_table, e.child_where)
-            emb_n = target.nested_count(c.object, e.array_path)
+            emb_n = target.nested_count(c.object, e.array_path, e.target_where)
             if child_n != emb_n:
                 findings.append(Finding(c.object, "embed_cardinality",
                                         f"rows({e.child_table})={child_n} vs sum(len({e.array_path}))={emb_n}"))
@@ -88,6 +83,9 @@ def _agg_close(a: Any, b: Any, rel_tol: float) -> bool:
 # side (pre-canonicalization), so null_rate/distinct/min/max are not comparable for fields
 # carrying these rules; they are deferred to Tier 3's keyed post-canonicalization diff.
 NULL_SEMANTIC_RULES = {"empty_string_is_null", "null_missing_equiv"}
+ORDER_PRESERVING_RULES = {
+    "identity", "decimal_round", "datetime_utc_truncate_ms", "datetime_grid_333",
+}
 
 # SUM is only meaningful for numeric fields. SUM of a string column errors or returns NULL
 # depending on the engine, so comparing sums on non-numeric fields manufactures false
@@ -111,13 +109,22 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         for f in c.fields:
             checks += 1
             s = source.field_aggregates(c.root_table, f.source, c.root_where)
-            t = target.field_aggregates(c.object, f.target)
+            t = (target.field_aggregates(c.object, f.target, c.target_where)
+                 if c.target_where is not None else target.field_aggregates(c.object, f.target))
             numeric = _is_numeric_field(f, s.get("sum"))
             stats_to_check: tuple[str, ...] = ("null_rate", "distinct_count", "min", "max")
             if numeric:
                 stats_to_check += ("sum",)
             if NULL_SEMANTIC_RULES & set(f.rules):
                 stats_to_check = ("sum",) if numeric else ()
+                deferred.append(f"{c.object}.{f.target}")
+            rewriting = set(f.rules) - ORDER_PRESERVING_RULES - NULL_SEMANTIC_RULES
+            if not (NULL_SEMANTIC_RULES & set(f.rules)) and rewriting:
+                stats_to_check = ("null_rate",)
+                deferred.append(f"{c.object}.{f.target}")
+            elif "decimal_round" in f.rules:
+                stats_to_check = tuple(s for s in stats_to_check
+                                      if s not in ("sum", "distinct_count"))
                 deferred.append(f"{c.object}.{f.target}")
             for stat in stats_to_check:
                 sv, tv = s.get(stat), t.get(stat)
@@ -200,25 +207,59 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         n = source.row_count(c.root_table, c.root_where)
         sampled = n > tol.full_diff_row_threshold
         keys: list[Any] | None = None
-        src_rows = {tuple(r[k] for k in c.key_source): r
-                    for r in source.fetch_keyed(c.root_table, c.key_source,
-                                                [f.source for f in c.fields], c.root_where)}
+        duplicate_counts = {}
         if sampled:
-            population = sorted(src_rows)
-            take = min(tol.sample_size, len(population))
-            chosen = set(population[:2] + population[-2:] + rng.sample(population, take))
-            src_rows = {k: src_rows[k] for k in chosen}
-            keys = [k[0] if len(k) == 1 else k for k in chosen]
+            first, last, reservoir = [], [], []
+            seen = 0
+            for raw_key in source.iter_keys(c.root_table, c.key_source, c.root_where):
+                key = tuple(raw_key)
+                duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
+                seen += 1
+                if len(first) < 2:
+                    first.append(key)
+                last = (last + [key])[-2:]
+                if len(reservoir) < tol.sample_size:
+                    reservoir.append(key)
+                else:
+                    slot = rng.randrange(seen)
+                    if slot < tol.sample_size:
+                        reservoir[slot] = key
+            chosen = set(first + last + reservoir)
+            keys = sorted(chosen)
+            fetched = source.fetch_keyed(c.root_table, c.key_source,
+                                         [f.source for f in c.fields],
+                                         where=c.root_where, keys=keys)
+            src_rows = {tuple(r[k] for k in c.key_source): r for r in fetched}
             stats[c.object] = {"mode": "stratified_sample", "population": n,
                                    "sampled": len(src_rows),
                                    "coverage": round(len(src_rows) / n, 6) if n else 1.0}
         else:
+            src_rows = {}
+            for r in source.fetch_keyed(c.root_table, c.key_source,
+                                        [f.source for f in c.fields], where=c.root_where):
+                key = tuple(r[k] for k in c.key_source)
+                duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
+                src_rows[key] = r
             stats[c.object] = {"mode": "full_diff", "population": n}
+        for key, count in duplicate_counts.items():
+            if count > 1:
+                checks += 1
+                findings.append(Finding(c.object, "duplicate_source_key",
+                                        f"key={key} seen {count} times"))
         tgt_docs = {}
         proj = [f.target for f in c.fields] + [e.array_path for e in c.embeds]
-        for d in target.fetch_keyed(c.object, c.key_target, proj, keys):
+        target_counts = {}
+        for d in target.fetch_keyed(c.object, c.key_target, proj,
+                                    where=c.target_where, keys=keys):
             kv = _get_path(d, c.key_target)
-            tgt_docs[(kv,) if not isinstance(kv, tuple) else kv] = d
+            key = (kv,) if not isinstance(kv, tuple) else kv
+            target_counts[key] = target_counts.get(key, 0) + 1
+            tgt_docs[key] = d
+        for key, count in target_counts.items():
+            if count > 1:
+                checks += 1
+                findings.append(Finding(c.object, "duplicate_target_key",
+                                        f"key={key} seen {count} times"))
         for k, row in src_rows.items():
             checks += 1
             doc = tgt_docs.get(k)

@@ -20,9 +20,11 @@ from pathlib import Path
 from . import canon, engine, report  # noqa: F401
 from .adapters import SOURCE_ADAPTERS, DatabricksTargetAdapter
 from .config import CanonRule, load_canon_rules, load_mapping_spec, load_tolerances
+from .config import ConfigError
 from .engine import MODES, run_recon
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks")
+PARAM_RE = __import__("re").compile(r"^[A-Za-z0-9_\-:.T /]*$")
 
 
 def selftest() -> int:
@@ -85,19 +87,31 @@ def main(argv: list[str] | None = None) -> int:
         name, sep, value = item.partition("=")
         if not sep or not name:
             raise SystemExit(f"--param must be NAME=VALUE, got '{item}'")
+        if not PARAM_RE.fullmatch(value):
+            raise SystemExit(f"invalid --param value for {name}")
         params[name] = value
     spec = load_mapping_spec(args.mapping, params)
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
 
+    ops = json.loads(args.ops.read_text()) if args.ops else None
+    if ops:
+        for op in ops:
+            if not all(op.get(k) for k in ("name", "source_sql", "target_sql")):
+                raise ConfigError(f"ops entry missing required keys: {op.get('name', '?')}")
+            for key in ("source_sql", "target_sql"):
+                if not op[key].lstrip().lower().startswith(("select", "with")):
+                    raise ConfigError(f"op {op.get('name', '?')} SQL must be SELECT or WITH")
     source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
     target = DatabricksTargetAdapter(args.target_secret, args.target_catalog, args.target_schema)
-
-    ops = json.loads(args.ops.read_text()) if args.ops else None
+    run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
+    run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
-                       ops=ops, out_dir=args.out, seed=args.seed, params=params)
+                       ops=ops, run_source=run_source, run_target=run_target,
+                       out_dir=args.out, seed=args.seed, params=params)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} "
-          f"mapping={spec.version} tolerances={tol.version} -> {args.out}/result.json")
+          f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
+          f"-> {args.out}/result.json")
     return 0 if result["verdict"] == "PASS" else 1
 
 

@@ -31,6 +31,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         for path in t.stats.get("embeds_ungraded", []):
             warnings.append(f"UNGRADED embedded values: {path} (cardinality checked only; "
                             "declare embed key/fields in the mapping spec to grade values)")
+    verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
+    merge_eligible = verdict == "PASS" and mode in ("live", "snapshot")
     return {
         "unit": unit,
         "mode": mode,
@@ -41,7 +43,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "tiers": [t.as_dict() for t in tiers],
         "warnings": warnings,
-        "verdict": "PASS" if all(t.passed for t in tiers) else "FAIL",
+        "verdict": verdict,
+        "merge_eligible": merge_eligible,
     }
 
 
@@ -51,6 +54,8 @@ def render_report(result: dict) -> str:
         "",
         f"- **Verdict: {result['verdict']}**",
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
+        f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
+        "(fixture/continuous evidence never merges)",
         f"- Mapping version: `{result['mapping_version']}`",
         f"- Tolerance version: `{result['tolerance_version']}`",
         f"- Seed: `{result.get('seed', 0)}`" + (f" | Params: `{result['params']}`"
@@ -96,6 +101,8 @@ def render_summary(result: dict) -> str:
         f"# Recon summary: `{result['unit']}` - **{result['verdict']}**",
         "",
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
+        f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
+        "(fixture/continuous evidence never merges)",
         f"- Mapping `{result['mapping_version']}` / tolerances `{result['tolerance_version']}`"
         f" / seed `{result.get('seed', 0)}`"
         + (f" / params `{result['params']}`" if result.get("params") else ""),

@@ -50,14 +50,16 @@ MANIFEST = json.loads(MANIFEST_TEXT)
 MANIFEST_SHA = hashlib.sha256(MANIFEST_TEXT.encode()).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
+RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
 
 if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
+    resume = os.environ.get("WAVE_RESUME") == "1"
     try:
         prior = json.loads(RESULT_PATH.read_text())
         if not isinstance(prior, dict):
             raise ValueError("result is not a JSON object")
     except ValueError:
-        if os.environ.get("WAVE_RESUME") != "1":
+        if not resume:
             raise SystemExit(f"{RESULT_PATH} is not valid JSON (interrupted write?). Inspect it; to resume "
                              "the same run set WAVE_RESUME=1 with the recorded run_id, or set WAVE_RERUN=1 "
                              "to redo the wave.") from None
@@ -65,10 +67,17 @@ if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
         if prior.get("closed"):
             raise SystemExit(f"{RESULT_PATH} says wave {prior.get('wave')} closed clean. To redo it on "
                              "purpose, set WAVE_RERUN=1.")
-        if os.environ.get("WAVE_RESUME") != "1":
+        if not resume:
             raise SystemExit(f"{RESULT_PATH} records a halted or failed run. To continue it, re-run with the "
                              "recorded run_id AND WAVE_RESUME=1 (finished children replay). To redo the wave "
                              "from scratch, set WAVE_RERUN=1.")
+    if resume:
+        run_id = os.environ.get("WAVE_RUN_ID")
+        if not run_id:
+            raise SystemExit("WAVE_RESUME=1 requires WAVE_RUN_ID; pass the recorded run_id")
+        if RUN_ID_PATH.exists() and RUN_ID_PATH.read_text().strip() != run_id:
+            raise SystemExit(f"WAVE_RUN_ID does not match {RUN_ID_PATH}; pass the recorded run_id to "
+                             "run_workflow and WAVE_RUN_ID, or WAVE_RERUN=1 for a fresh run")
 
 
 def validate_manifest(m):
@@ -123,7 +132,7 @@ CHILD_SCHEMA = {
         "skill_feedback": {"type": "array", "items": {"type": "string"}},
         "one_line_summary": {"type": "string"},
     },
-    "required": ["status", "recon_verdict", "write_targets", "one_line_summary"],
+    "required": ["status", "recon_verdict", "recon_mode", "write_targets", "one_line_summary"],
 }
 
 VERIFY_SCHEMA = {
@@ -164,6 +173,8 @@ def child_prompt(batch):
         "Rules that override anything else:\n"
         "- Do not edit files under .migration/. The workflow writes the ledger from your report.\n"
         "- Do not merge your own PR.\n"
+        "- status=PASS requires a live or snapshot recon PASS (result.json merge_eligible=true). "
+        "Fixture evidence is never PASS.\n"
         "- If the recon harness fails 3 full runs, stop and report status=FAIL with a short "
         "failure_class (for example 'timestamp_precision', 'decimal_rounding', 'missing_rule').\n"
         "- Report every rule you had to derive yourself in skill_feedback.\n"
@@ -181,6 +192,8 @@ def verify_prompt(passed, auto_merge):
         f"any of this code.\nRun the playbook {MANIFEST['verify_macro']} exactly as written over "
         f"these batches:\n{json.dumps(passed, sort_keys=True, indent=1)}\n\n"
         "Re-run the recon harness yourself. Do not trust the PR's pasted evidence. "
+        "Mark a unit PASS only if you re-ran the harness in live or snapshot mode and result.json says "
+        "merge_eligible=true. "
         f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{WAVE}/report.md, "
         f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
         "report_path. Do not edit any other file under .migration/. Each finding is one plain "
@@ -216,6 +229,14 @@ async def run_batch(batch, sem, breaker):
         except WorkflowAgentError as e:
             out = {"status": "FAIL", "recon_verdict": "NOT_RUN", "failure_class": "session_died",
                    "one_line_summary": f"child session died: {e}"}
+        if (out["status"] == "PASS"
+                and (out["recon_verdict"] != "PASS"
+                     or out.get("recon_mode") not in ("live", "snapshot"))):
+            out["status"] = "FAIL"
+            out["failure_class"] = "non_merge_evidence"
+            out["one_line_summary"] = (
+                f"PASS downgraded: recon evidence was {out.get('recon_mode')}/"
+                f"{out.get('recon_verdict')}; " + out["one_line_summary"])
         if out["status"] != "PASS":
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
@@ -321,6 +342,7 @@ async def main():
     result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
     result_tmp.write_text(json.dumps({
         "wave": WAVE, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
+        "run_id": os.environ.get("WAVE_RUN_ID"),
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
         "closed": closed,
         "write_target_overlaps": surprises,

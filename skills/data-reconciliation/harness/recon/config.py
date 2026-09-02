@@ -17,6 +17,21 @@ class ConfigError(Exception):
     pass
 
 
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)*$")
+
+
+def validate_identifier(name: str) -> str:
+    if not isinstance(name, str) or not IDENTIFIER_RE.fullmatch(name):
+        raise ConfigError(f"invalid identifier: {name!r}")
+    return name
+
+
+def _validate_predicate(value: str | None) -> str | None:
+    if value is not None and any(token in value for token in (";", "--", "/*")):
+        raise ConfigError("predicates must be a single expression")
+    return value
+
+
 @dataclass(frozen=True)
 class FieldMapping:
     source: str
@@ -34,6 +49,7 @@ class EmbedMapping:
     child_table: str
     # Optional filter on the child table when only a subset embeds.
     child_where: str | None = None
+    target_where: str | None = None
     # Value grading (Tier 3). Without these, only cardinality is checked (Tier 1) and the
     # embed is reported as UNGRADED in every result: an ungraded embed is never silent.
     parent_key: list[str] = field(default_factory=list)  # child cols joining to the root key
@@ -51,6 +67,7 @@ class ObjectMapping:
     fields: list[FieldMapping]
     embeds: list[EmbedMapping] = field(default_factory=list)
     root_where: str | None = None
+    target_where: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,19 +121,46 @@ def _field_mappings(items: list[dict]) -> list[FieldMapping]:
     ) for f in items]
 
 
+def _validate_mapping_identifiers(c: dict) -> None:
+    validate_identifier(c.get("object") or c.get("target_table") or c.get("source_table"))
+    validate_identifier(c.get("root_table") or c.get("source_table"))
+    key = c.get("key") or {}
+    for name in key.get("source", []):
+        validate_identifier(name)
+    validate_identifier(key.get("target", ""))
+    for f in c.get("fields", []):
+        validate_identifier(f["source"])
+        validate_identifier(f["target"])
+    for e in c.get("embeds", []):
+        validate_identifier(e["array_path"])
+        validate_identifier(e["child_table"])
+        for name in e.get("parent_key", []):
+            validate_identifier(name)
+        ekey = e.get("key") or {}
+        for name in ekey.get("source", []):
+            validate_identifier(name)
+        if ekey.get("target"):
+            validate_identifier(ekey["target"])
+        for f in e.get("fields", []):
+            validate_identifier(f["source"])
+            validate_identifier(f["target"])
+
+
 def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> MappingSpec:
     data = json.loads(path.read_text())
     version = _require_version(data, path)
     params = params or {}
     objects = []
     for c in data.get("objects") or data.get("tables") or []:
+        _validate_mapping_identifiers(c)
         fields_ = _field_mappings(c.get("fields", []))
         embeds = []
         for e in c.get("embeds", []):
             ekey = e.get("key") or {}
             embeds.append(EmbedMapping(
                 array_path=e["array_path"], child_table=e["child_table"],
-                child_where=substitute_params(e.get("child_where"), params, path),
+                child_where=_validate_predicate(substitute_params(e.get("child_where"), params, path)),
+                target_where=_validate_predicate(substitute_params(e.get("target_where"), params, path)),
                 parent_key=list(e.get("parent_key", [])),
                 key_source=list(ekey.get("source", [])), key_target=ekey.get("target", ""),
                 fields=_field_mappings(e.get("fields", [])),
@@ -130,7 +174,8 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             object=c.get("object") or c["target_table"], root_table=c.get("root_table") or c["source_table"],
             key_source=list(key["source"]), key_target=key["target"],
             fields=fields_, embeds=embeds,
-            root_where=substitute_params(c.get("root_where"), params, path),
+            root_where=_validate_predicate(substitute_params(c.get("root_where"), params, path)),
+            target_where=_validate_predicate(substitute_params(c.get("target_where"), params, path)),
         ))
     if not objects:
         raise ConfigError(f"{path}: mapping spec has no objects")
