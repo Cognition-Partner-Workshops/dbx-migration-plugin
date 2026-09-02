@@ -1,4 +1,4 @@
-Playbook: Front door for code and ML scoring estates (SAS, SPSS, R, Hadoop/Hive, on-prem Spark, legacy Python/notebooks, BigQuery ML). Thin intake that pins the languages and workload mix, loads the dialect skill(s), activates the ML-SCORING profile where models are present, and hands off to `!dbx_migrate_pipeline`. No migration method lives here.
+Playbook: Front door for code and ML scoring estates (SAS, SPSS, R, Hadoop/Hive, on-prem Spark, legacy Python/notebooks, BigQuery ML). Thin intake that pins the languages and workload mix, loads the dialect skill(s), activates the ML-SCORING profile where models are present, and then runs `!dbx_migrate_pipeline` in the same session. No migration method lives here.
 
 ## Overview
 The customer says "we have ten years of SAS" or "our scoring jobs run on the Hadoop cluster." This playbook turns that into a configured run of the standard chain, with one family-specific addition: where the estate contains **model training or scoring code**, the parity question changes from "same rows" to "same predictions," and that distinction must be pinned at intake, not discovered at recon time.
@@ -15,11 +15,11 @@ The customer says "we have ten years of SAS" or "our scoring jobs run on the Had
 3. Attach the matching dialect skill(s) (`sas-programs`, `hadoop-hive`, `sparkml-legacy`, ...). Multiple skills are normal in this family.
 4. Partition the estate at intake into **data code** (ETL-like: standard chain, standard recon) and **model code** (training/scoring: ML-SCORING profile, prediction-parity gate, D9 consumers). This partition drives the inventory's workload typing.
 5. Set family defaults: unit = program/script/notebook + its schedule entry; lineage extraction = parser + directory convention + scheduler export (weakest lineage of the three families, so INFERRED edges are expected and priced); dual-run mechanism per the runtime-access answer; prediction-parity tolerances routed into `03_recon_tolerances.md` at setup.
-6. Record intake facts and hand off to `!dbx_migrate_pipeline`.
+6. Record intake facts in `.migration/00_context.md` shape. Then run `!dbx_migrate_pipeline` **in this same session**, right away. Do not open a new session, do not ask the user to run it, do not stop here: the orchestrator reads the intake facts you just wrote and begins ingest and setup as normal. The user's next message from Devin is STOP A.
 
 ## Specifications
 - Deliverable: configured hand-off: languages pinned, ML partition made, dialect skills attached, dual-run mechanism stated, parity posture per scoring job recorded or explicitly scoped out.
-- Validation: the orchestrator can start ingest without re-asking anything this intake covered; no scoring job enters scope without a stated parity tolerance.
+- Validation: `!dbx_migrate_pipeline` was invoked in this session and the orchestrator can start ingest without re-asking anything this intake covered; no scoring job enters scope without a stated parity tolerance.
 
 ## Advice and Pointers
 - The ML partition is the credibility line: Devin migrates the engineering around models (pipelines, scoring jobs, lineage, upgrades) gated on prediction parity; it does not re-model. Scientific judgment (features, labels, model choice, release) stays with the customer's team, and saying so at intake wins trust.

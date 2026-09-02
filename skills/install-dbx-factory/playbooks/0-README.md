@@ -67,6 +67,28 @@ INTERNAL SUBROUTINE (never operator-invoked; called by 2, 3, 4 and 5)
 
 Migrating a whole estate means running the orchestrator once per pipeline, in the order the inventory recommends; independent pipelines may themselves run as parallel orchestrator sessions once the first pipeline has validated the target profiles.
 
+## What stops a bad day
+
+Each row is a way a migration goes wrong and the one thing in the kit that catches it. Nothing here needs a human watching.
+
+| If this happens | What catches it |
+|---|---|
+| A stop is skipped or an old approval is reused | Every stop is a row in the decisions file with a date. The orchestrator re-reads it on resume and re-asks if the inputs changed. |
+| A child gets an incomplete brief | It reports BLOCKED, does nothing, and the brief says which item was missing. It never guesses. |
+| Two children write the same table | The wave refuses to launch. If it only shows up afterwards, merges are held and the brief says so. |
+| The same wave is launched twice | The workflow refuses if the wave's result file already exists. Resume uses the run_id; redo needs an explicit flag. |
+| One mistake repeats across 20 children | Circuit breaker: 3 same-class failures and no new children launch. Fix once, resume, held-back batches run. |
+| A child keeps retrying a red recon | Hard cap of 3 full runs, then it reports FAIL with a one-word failure class. |
+| Children hammer the live source | Fixture first. Each child reads the real source once, inside the cap agreed at the first stop. |
+| A child grades its own homework | A separate session that wrote none of the code re-runs the harness. Only its PASS merges. |
+| Fixture PASS gets mistaken for done | The report says so in the verdict line. Only live or snapshot PASS can merge. |
+| The source moved during the check | Live comparisons are timestamped and re-run on the source side to separate drift from a real defect. |
+| Someone loosens a tolerance to go green | Tolerance changes need a dated approval in the decisions file. Grading-only fixes are the one exception. |
+| A secret ends up in a PR or log | Everything takes secret names; values are read from the environment at run time and never printed. |
+| Work lands outside the migration area | Write targets come from the brief only. The migration catalog or cluster is the only place with write grants. |
+| Cutover runs by accident | It needs a customer-held principal Devin never has, plus a current approval. Children cannot do it. |
+| Too many messages | One message per stop, wave close, or halt. Never per child or per PR. The wave brief is ten lines. |
+
 ## Design principles
 
 1. **Target is constant, source varies.** Every engagement lands on the same target shape (Unity Catalog, Delta, Databricks SQL/PySpark, Jobs or DLT, Asset Bundles). All source-stack specifics live in pluggable skills, never in the playbooks.
@@ -133,8 +155,8 @@ Each entry records the full contract, then a decision (federate / re-point / dua
 ## Parallelization model
 
 - The estate inventory computes lineage depth per unit. Units at the same depth with no shared-object conflicts form a **wave**; a wave is partitioned into **unit batches** (default 1-5 units per child) that run as parallel child sessions.
-- Default fan-out width is 20 concurrent children, configurable at STOP C. Large estates run the fan-out as a dynamic workflow with structured outputs and journal-based resume, not hand-managed sessions.
-- Each child self-grades: its PR carries its own recon evidence, and the orchestrator (or workflow gate) verifies recon PASS before counting the unit done. Humans review exceptions at STOP D, not every PR.
+- Default fan-out width is 20 concurrent children, configurable at STOP C. Waves above the plan's threshold run through the `migration-fanout` workflow (shipped in the plugin) with structured outputs and resume; smaller waves are launched as one batch in-session, gathered once, and gated the same way. Nobody reviews children one at a time.
+- Each child self-grades with the `dbx-recon` CLI; the wave is then re-verified by one independent session and gated on `result.json`. Humans read the ten-line wave brief at STOP D and act only on exceptions.
 - Two runtime backstops guard the fan-out: children register write targets in the ledger before deploying (a collision halts launches: it means the lineage extraction missed an edge), and a circuit breaker pauses remaining launches when N children (default 3) report the same failure class, so a new systematic trap is fixed once, not twenty times.
 - Shared objects (D2) migrate in wave 0, serially, before any fan-out, so parallel children never collide on them.
 - The first small wave (5-10 units) runs before full fan-out to tune the source-dialect skill and knowledge notes; every later session inherits the corrections.

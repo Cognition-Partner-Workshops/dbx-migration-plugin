@@ -1,0 +1,604 @@
+"""Synthetic-estate tests: a small Oracle-shaped estate with an embed mapping, seeded with
+one mismatch per class, proving each tier catches its class and the engine gates on Tier 1.
+"""
+
+import copy
+import decimal
+import json
+from pathlib import Path
+import pytest
+
+from recon.config import (CanonRule, ObjectMapping, EmbedMapping, FieldMapping,
+                          MappingSpec, Tolerances, load_canon_rules, load_mapping_spec,
+                          load_tolerances, ConfigError, validate_identifier)
+from recon.engine import run_recon
+from tests.fakes import FakeSource, FakeTarget
+
+RULES = [CanonRule("rstrip_spaces", "*"), CanonRule("empty_string_is_null", "*"),
+         CanonRule("null_missing_equiv", "*"), CanonRule("identity", "*")]
+
+SPEC = MappingSpec(version="map-v1", objects=[ObjectMapping(
+    object="orders", root_table="ORDERS",
+    key_source=["ORDER_ID"], key_target="order_id",
+    fields=[
+        FieldMapping("ORDER_ID", "order_id", "NUMBER(18,0)", "long"),
+        FieldMapping("CUST_NAME", "customer.name", "CHAR(20)", "string",
+                     rules=["rstrip_spaces", "empty_string_is_null", "null_missing_equiv"]),
+        FieldMapping("TOTAL", "total", "NUMBER(10,2)", "Decimal128"),
+    ],
+    embeds=[EmbedMapping(array_path="items", child_table="ORDER_ITEMS")],
+)])
+
+TOL = Tolerances(version="tol-v1", full_diff_row_threshold=100, sample_size=10)
+
+
+def make_green():
+    source = FakeSource({
+        "ORDERS": [
+            {"ORDER_ID": 1, "CUST_NAME": "Ada   ", "TOTAL": 10.5},
+            {"ORDER_ID": 2, "CUST_NAME": "", "TOTAL": 20.0},
+        ],
+        "ORDER_ITEMS": [{"ORDER_ID": 1, "SKU": "a"}, {"ORDER_ID": 1, "SKU": "b"},
+                        {"ORDER_ID": 2, "SKU": "c"}],
+    })
+    target = FakeTarget({
+        "orders": [
+            {"order_id": 1, "customer": {"name": "Ada"}, "total": 10.5,
+             "items": [{"sku": "a"}, {"sku": "b"}]},
+            {"order_id": 2, "customer": {}, "total": 20.0, "items": [{"sku": "c"}]},
+        ],
+    })
+    return source, target
+
+
+def run(source, target, mode="live"):
+    return run_recon("orders-batch-1", mode, SPEC, TOL, RULES, source, target)
+
+
+def test_green_estate_passes():
+    result = run(*make_green())
+    assert result["verdict"] == "PASS"
+    assert [t["tier"] for t in result["tiers"]] == [1, 2, 3]
+    assert result["mapping_version"] == "map-v1" and result["tolerance_version"] == "tol-v1"
+
+
+def test_tier1_root_count_and_gate():
+    source, target = make_green()
+    target.objects["orders"] = target.objects["orders"][:1]
+    result = run(source, target)
+    assert result["verdict"] == "FAIL"
+    assert len(result["tiers"]) == 1  # nothing else ran: Tier 1 gates
+    assert any(f["check"] == "root_count" for f in result["tiers"][0]["findings"])
+
+
+def test_tier1_embed_cardinality():
+    source, target = make_green()
+    target.objects["orders"][0]["items"].pop()
+    result = run(source, target)
+    checks = {f["check"] for f in result["tiers"][0]["findings"]}
+    assert checks == {"embed_cardinality"}
+
+
+def test_tier2_aggregate_mismatch():
+    source, target = make_green()
+    target.objects["orders"][0]["total"] = 999.0  # sum/min/max drift
+    result = run(source, target)
+    t2 = result["tiers"][1]
+    assert not t2["passed"]
+    assert any(f["check"].startswith("aggregate_") for f in t2["findings"])
+
+
+def test_tier3_field_diff_reports_rule_evidence():
+    source, target = make_green()
+    target.objects["orders"][0]["customer"]["name"] = "Bob"
+    result = run(source, target)
+    t3 = result["tiers"][2]
+    diffs = [f for f in t3["findings"] if f["check"] == "field_diff"]
+    assert diffs and "rstrip_spaces" in diffs[0]["rules_applied"]
+
+
+def test_tier3_missing_doc():
+    source, target = make_green()
+    source.tables["ORDERS"].append({"ORDER_ID": 3, "CUST_NAME": "Eve", "TOTAL": 1.0})
+    source.tables["ORDER_ITEMS"].append({"ORDER_ID": 3, "SKU": "d"})
+    result = run(source, target)
+    assert result["verdict"] == "FAIL"  # tier 1 catches count; force tier 3 view too
+    # add matching counts but wrong key to reach tier 3
+    source, target = make_green()
+    source.tables["ORDERS"][1] = {"ORDER_ID": 99, "CUST_NAME": "", "TOTAL": 20.0}
+    result = run(source, target)
+    t3 = result["tiers"][2]
+    assert {f["check"] for f in t3["findings"]} >= {"missing_doc", "extra_doc"}
+
+
+def test_tier3_sampling_above_threshold():
+    source, target = make_green()
+    tol = Tolerances(version="tol-v1", full_diff_row_threshold=1, sample_size=1)
+    result = run_recon("u", "live", SPEC, tol, RULES, source, target)
+    stats = result["tiers"][2]["stats"]["orders"]
+    assert stats["mode"] == "stratified_sample" and 0 < stats["coverage"] <= 1
+
+
+def test_tier4_parity():
+    source, target = make_green()
+    ops = [{"name": "top_customers", "object": "orders", "rules": ["rstrip_spaces"]}]
+    good = lambda op: [{"name": "Ada   "}]
+    bad = lambda op: [{"name": "Zed"}]
+    result = run_recon("u", "live", SPEC, TOL, RULES, source, target,
+                       ops=ops, run_source=good, run_target=lambda op: [{"name": "Ada"}])
+    assert result["verdict"] == "PASS" and len(result["tiers"]) == 4
+    result = run_recon("u", "live", SPEC, TOL, RULES, source, target,
+                       ops=ops, run_source=good, run_target=bad)
+    assert result["tiers"][3]["findings"][0]["check"] == "parity_mismatch"
+
+
+def test_continuous_mode_samples_tier3_and_skips_tier4():
+    source, target = make_green()
+    ops = [{"name": "x"}]
+    result = run_recon("u", "continuous", SPEC, TOL, RULES, source, target,
+                       ops=ops, run_source=lambda o: [], run_target=lambda o: [])
+    assert [t["tier"] for t in result["tiers"]] == [1, 2, 3]
+    assert result["tiers"][2]["stats"]["orders"]["mode"] == "stratified_sample"
+
+
+def test_determinism():
+    r1 = run(*make_green())
+    r2 = run(*make_green())
+    r1.pop("generated_at"); r2.pop("generated_at")
+    assert r1 == r2
+
+
+GRADED_SPEC = MappingSpec(version="map-v2", objects=[ObjectMapping(
+    object="orders", root_table="ORDERS",
+    key_source=["ORDER_ID"], key_target="order_id",
+    fields=[FieldMapping("ORDER_ID", "order_id", "NUMBER(18,0)", "long")],
+    embeds=[EmbedMapping(
+        array_path="items", child_table="ORDER_ITEMS",
+        parent_key=["ORDER_ID"], key_source=["SKU"], key_target="sku",
+        fields=[FieldMapping("SKU", "sku", "VARCHAR2(10)", "string"),
+                FieldMapping("QTY", "qty", "NUMBER(5,0)", "int")],
+    )],
+)])
+
+
+def make_graded():
+    source = FakeSource({
+        "ORDERS": [{"ORDER_ID": 1}, {"ORDER_ID": 2}],
+        "ORDER_ITEMS": [{"ORDER_ID": 1, "SKU": "a", "QTY": 2},
+                        {"ORDER_ID": 1, "SKU": "b", "QTY": 1},
+                        {"ORDER_ID": 2, "SKU": "c", "QTY": 5}],
+    })
+    target = FakeTarget({"orders": [
+        {"order_id": 1, "items": [{"sku": "a", "qty": 2}, {"sku": "b", "qty": 1}]},
+        {"order_id": 2, "items": [{"sku": "c", "qty": 5}]},
+    ]})
+    return source, target
+
+
+def test_embed_values_graded_green():
+    result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, *make_graded())
+    assert result["verdict"] == "PASS"
+    assert result["warnings"] == []
+    assert result["tiers"][2]["stats"]["embeds_graded"]["orders.items"] == 3
+
+
+def test_embed_value_diff_caught():
+    source, target = make_graded()
+    target.objects["orders"][0]["items"][1]["qty"] = 99
+    result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, source, target)
+    assert result["verdict"] == "FAIL"
+    checks = {f["check"] for f in result["tiers"][2]["findings"]}
+    assert "embed_field_diff" in checks
+
+
+def test_missing_embedded_elem_caught():
+    source, target = make_graded()
+    # same cardinality (Tier 1 green) but wrong element key
+    target.objects["orders"][0]["items"][1]["sku"] = "zzz"
+    result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, source, target)
+    checks = {f["check"] for f in result["tiers"][2]["findings"]}
+    assert "missing_embedded_elem" in checks
+
+
+def test_ungraded_embed_is_loud():
+    result = run(*make_green())  # SPEC's embed declares no key/fields
+    assert result["verdict"] == "PASS"
+    assert result["tiers"][2]["stats"]["embeds_ungraded"] == ["orders.items"]
+    assert any("UNGRADED" in w for w in result["warnings"])
+    from recon.report import render_summary
+    assert "UNGRADED" in render_summary(result)
+
+
+def test_tier2_sum_skipped_for_non_numeric():
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="c", root_table="T", key_source=["ID"], key_target="id",
+        fields=[FieldMapping("ID", "id", "NUMBER", "long"),
+                FieldMapping("NAME", "name", "VARCHAR2(10)", "string")])])
+    source = FakeSource({"T": [{"ID": 1, "NAME": "x"}]})
+    # target sum for a string field comes back 0 (Mongo $sum semantics)
+    class Target(FakeTarget):
+        def field_aggregates(self, object, field_path):
+            out = super().field_aggregates(object, field_path)
+            if out["sum"] is None:
+                out["sum"] = 0
+            return out
+    target = Target({"c": [{"id": 1, "name": "x"}]})
+    result = run_recon("u", "live", spec, TOL, RULES, source, target)
+    assert result["verdict"] == "PASS"  # 0-vs-None sum on a string field is not a finding
+
+
+def test_null_consistent_aggregates_green():
+    # Adapter contract: SUM/MIN/MAX/DISTINCT-COUNT over non-null values only (SQL
+    # semantics). A nullable numeric field with nulls on both sides must not produce
+    # Tier-2 findings, and an all-null field sums to None on both sides.
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="c", root_table="T", key_source=["ID"], key_target="id",
+        fields=[FieldMapping("ID", "id", "NUMBER", "long"),
+                FieldMapping("AMT", "amt", "NUMBER(10,2)", "double"),
+                FieldMapping("VOID", "void", "NUMBER", "double")])])
+    source = FakeSource({"T": [{"ID": 1, "AMT": 10.0, "VOID": None},
+                               {"ID": 2, "AMT": None, "VOID": None}]})
+    target = FakeTarget({"c": [{"id": 1, "amt": 10.0, "void": None},
+                               {"id": 2, "amt": None, "void": None}]})
+    result = run_recon("u", "live", spec, TOL,
+                       RULES + [CanonRule("null_missing_equiv", "c.amt"),
+                                CanonRule("null_missing_equiv", "c.void")],
+                       source, target)
+    assert result["verdict"] == "PASS"
+
+
+def test_seed_and_params_recorded():
+    result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, *make_graded(),
+                       seed=42, params={"batch": "demo"})
+    assert result["seed"] == 42 and result["params"] == {"batch": "demo"}
+
+
+def test_where_clause_params(tmp_path: Path):
+    import pytest
+    from recon.config import ConfigError
+    (tmp_path / "map.json").write_text(json.dumps({
+        "version": "m1", "objects": [{
+            "object": "c", "root_table": "T", "root_where": "BATCH = '${batch}'",
+            "key": {"source": ["ID"], "target": "id"},
+            "fields": [{"source": "ID", "target": "id"}]}]}))
+    spec = load_mapping_spec(tmp_path / "map.json", {"batch": "demo"})
+    assert spec.objects[0].root_where == "BATCH = 'demo'"
+    with pytest.raises(ConfigError):
+        load_mapping_spec(tmp_path / "map.json")
+
+
+def test_config_loaders_and_report(tmp_path: Path):
+    (tmp_path / "map.json").write_text(json.dumps({
+        "version": "m1", "objects": [{
+            "object": "c", "root_table": "T",
+            "key": {"source": ["ID"], "target": "id"},
+            "fields": [{"source": "ID", "target": "id"}]}]}))
+    (tmp_path / "tol.json").write_text(json.dumps({"version": "t1"}))
+    (tmp_path / "rules.json").write_text(json.dumps([{"rule": "identity", "applies_to": "*"}]))
+    spec = load_mapping_spec(tmp_path / "map.json")
+    tol = load_tolerances(tmp_path / "tol.json")
+    rules = load_canon_rules(tmp_path / "rules.json")
+    source = FakeSource({"T": [{"ID": 1}]})
+    target = FakeTarget({"c": [{"id": 1}]})
+    result = run_recon("u", "snapshot", spec, tol, rules, source, target,
+                       out_dir=tmp_path / "out")
+    assert result["verdict"] == "PASS"
+    assert (tmp_path / "out/result.json").exists()
+    report = (tmp_path / "out/report.md").read_text()
+    assert "snapshot" in report and "scoped to the snapshot watermark" in report
+
+
+def test_mapping_identifier_and_predicate_validation(tmp_path: Path):
+    base = {"version": "m", "objects": [{
+        "object": "c", "root_table": "T",
+        "key": {"source": ["ID"], "target": "id"},
+        "fields": [{"source": "a.b", "target": "a.b"}]}]}
+    path = tmp_path / "map.json"
+    path.write_text(json.dumps(base))
+    assert load_mapping_spec(path).objects[0].fields[0].source == "a.b"
+    base["objects"][0]["fields"][0]["source"] = "a b"
+    path.write_text(json.dumps(base))
+    with pytest.raises(ConfigError):
+        load_mapping_spec(path)
+    base["objects"][0]["fields"][0]["source"] = "A"
+    base["objects"][0]["root_table"] = "T; DROP TABLE x"
+    path.write_text(json.dumps(base))
+    with pytest.raises(ConfigError):
+        load_mapping_spec(path)
+    base["objects"][0]["root_table"] = "T"
+    base["objects"][0]["root_where"] = "ID = 1 -- injected"
+    path.write_text(json.dumps(base))
+    with pytest.raises(ConfigError, match="predicates must be a single expression"):
+        load_mapping_spec(path)
+    assert validate_identifier("schema.table") == "schema.table"
+
+
+def test_cli_rejects_unsafe_param_before_adapter(tmp_path: Path):
+    import pytest
+    from recon import cli
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text(json.dumps({"catalogs": ["c"]}))
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--unit", "u", "--family", "oracle",
+                  "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
+                  "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
+                  "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+                  "--target-catalog", "c", "--allowed-targets-file", str(allowlist), "--target-schema", "s",
+                  "--param", "x=bad'"])
+
+
+def test_cli_rejects_target_outside_allowlist_before_adapter(tmp_path: Path, monkeypatch):
+    from recon import cli
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    allowlist = tmp_path / ".migration" / "allowed_targets.json"
+    allowlist.write_text(json.dumps({"catalogs": ["migration"]}))
+    with pytest.raises(SystemExit, match="not in"):
+        cli.main(["run", "--unit", "u", "--family", "oracle",
+                  "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
+                  "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
+                  "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+                  "--target-catalog", "not_migration", "--allowed-targets-file", str(allowlist),
+                  "--target-schema", "s", "--out", str(tmp_path / "out")])
+
+
+def test_cli_requires_trusted_allowlist_file(tmp_path: Path):
+    from recon import cli
+    args = ["run", "--unit", "u", "--family", "oracle",
+            "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
+            "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
+            "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+            "--target-catalog", "migration", "--target-schema", "s", "--out", str(tmp_path / "out")]
+    with pytest.raises(SystemExit, match="allowlist"):
+        cli.main(args)
+    with pytest.raises(SystemExit):
+        cli.main(args + ["--allowed-catalogs", "migration"])
+
+
+def test_scoped_source_and_target_pass_and_missing_scope_fails():
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="orders", root_table="ORDERS", root_where="BATCH = 'a'", target_where="batch=a",
+        key_source=["ORDER_ID"], key_target="order_id",
+        fields=[FieldMapping("ORDER_ID", "order_id", "", "long")])])
+    source = FakeSource({"ORDERS": [{"ORDER_ID": 1, "BATCH": "a"}, {"ORDER_ID": 2, "BATCH": "b"}]})
+    target = FakeTarget({"orders": [{"order_id": 1, "batch": "a"}, {"order_id": 2, "batch": "b"}]})
+    assert run_recon("u", "live", spec, TOL, RULES, source, target)["verdict"] == "PASS"
+    with pytest.raises(ConfigError, match="has root_where but no target_where"):
+        run_recon("u", "live", spec.__class__(version="m", objects=[ObjectMapping(
+            object="orders", root_table="ORDERS", root_where="BATCH = 'a'",
+            key_source=["ORDER_ID"], key_target="order_id",
+            fields=spec.objects[0].fields)]), TOL, RULES, source, target)
+
+
+def test_duplicate_source_key_fails():
+    source, target = make_green()
+    source.tables["ORDERS"].append({"ORDER_ID": 1, "CUST_NAME": "Ada", "TOTAL": 10.5})
+    target.objects["orders"].append({"order_id": 1, "customer": {"name": "Ada"}, "total": 10.5,
+                                     "items": []})
+    result = run(source, target)
+    assert result["verdict"] == "FAIL"
+    assert any(f["check"] == "duplicate_source_key"
+               for t in result["tiers"] for f in t["findings"])
+
+
+def test_rewriting_aggregate_defers_to_tier3():
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="c", root_table="T", key_source=["ID"], key_target="id",
+        fields=[FieldMapping("ID", "id", "", "long"),
+                FieldMapping("NAME", "name", "", "string", ["collation_casefold"])])])
+    source = FakeSource({"T": [{"ID": 1, "NAME": "abc"}]})
+    target = FakeTarget({"c": [{"id": 1, "name": "ABC"}]})
+    result = run_recon("u", "live", spec, TOL,
+                       RULES + [CanonRule("collation_casefold", "*")], source, target)
+    assert result["verdict"] == "PASS"
+    assert "c.name" in result["tiers"][1]["stats"]["deferred_to_tier3"]
+
+
+def test_sampling_is_deterministic_and_pushes_keys():
+    rows = [{"ORDER_ID": i, "CUST_NAME": str(i), "TOTAL": float(i)} for i in range(10)]
+    source1 = FakeSource({"ORDERS": rows, "ORDER_ITEMS": []})
+    target1 = FakeTarget({"orders": [{"order_id": i, "customer": {"name": str(i)}, "total": float(i),
+                                      "items": []} for i in range(10)]})
+    tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=2)
+    r1 = run_recon("u", "live", SPEC, tol, RULES, source1, target1, seed=9)
+    keys1 = source1.last_fetch_keyed["keys"]
+    source2 = FakeSource({"ORDERS": rows, "ORDER_ITEMS": []})
+    target2 = FakeTarget({"orders": [{"order_id": i, "customer": {"name": str(i)}, "total": float(i),
+                                      "items": []} for i in range(10)]})
+    r2 = run_recon("u", "live", SPEC, tol, RULES, source2, target2, seed=9)
+    assert keys1 == source2.last_fetch_keyed["keys"]
+    assert r1["tiers"][2]["stats"] == r2["tiers"][2]["stats"]
+
+
+def test_ops_require_executors():
+    import pytest
+    with pytest.raises(ConfigError, match="no query executors"):
+        run_recon("u", "live", SPEC, TOL, RULES, *make_green(),
+                  ops=[{"name": "x"}])
+
+
+def test_merge_eligibility_by_mode():
+    from recon.report import build_result
+    from recon.tiers import TierResult
+    tier = TierResult(1, "x", True, 1, [])
+    assert build_result("u", "fixture", "m", "t", [tier])["merge_eligible"] is False
+    assert build_result("u", "continuous", "m", "t", [tier])["merge_eligible"] is False
+    assert build_result("u", "live", "m", "t", [tier])["merge_eligible"] is True
+    assert build_result("u", "snapshot", "m", "t", [tier])["merge_eligible"] is False
+    assert build_result("u", "snapshot", "m", "t", [tier],
+                        snapshot={"source": "s", "extracted_at": "2024-01-01T00:00:00Z",
+                                  "row_counts": {"x": 1}})["merge_eligible"] is True
+    assert build_result("u", "live", "m", "t",
+                        [TierResult(1, "x", False, 1, [])])["merge_eligible"] is False
+
+
+def test_unversioned_inputs_rejected(tmp_path: Path):
+    import pytest
+    from recon.config import ConfigError
+    (tmp_path / "map.json").write_text(json.dumps({"objects": []}))
+    with pytest.raises(ConfigError):
+        load_mapping_spec(tmp_path / "map.json")
+
+
+def test_missing_comparison_key_rejected(tmp_path: Path):
+    import pytest
+    from recon.config import ConfigError
+    (tmp_path / "map.json").write_text(json.dumps({
+        "version": "m1", "objects": [{"object": "c", "root_table": "T", "fields": []}]}))
+    with pytest.raises(ConfigError):
+        load_mapping_spec(tmp_path / "map.json")
+
+
+def test_decimal_aggregate_comparison_preserves_precision():
+    from recon.tiers import _agg_close
+    value = decimal.Decimal("12345678901234567890.123456789012345678")
+    changed = decimal.Decimal("12345678901234567890.123456789012345679")
+    assert _agg_close(value, value, 0)
+    assert not _agg_close(value, changed, 0)
+
+
+def test_ungraded_embed_blocks_merge_eligibility():
+    from recon.report import build_result
+    from recon.tiers import TierResult
+    tier = TierResult(3, "keyed_diffs", True, 1, [],
+                      {"embeds_ungraded": ["orders.items"]})
+    result = build_result("u", "live", "m", "t", [tier])
+    assert result["verdict"] == "PASS"
+    assert result["merge_eligible"] is False
+
+
+def test_read_only_sql_validation():
+    from recon.cli import _validate_sql
+    for sql in ("WITH x AS (SELECT 1) UPDATE t SET a=1",
+                "SELECT 1; DELETE FROM t", "SELECT * INTO t2 FROM t"):
+        with pytest.raises(SystemExit):
+            _validate_sql(sql, "unsafe")
+    _validate_sql("/* comment */ WITH x AS (SELECT 1) SELECT * FROM x", "safe")
+
+
+def test_snapshot_manifest_and_merge_eligibility(tmp_path: Path, monkeypatch):
+    from recon.cli import _load_snapshot
+    from recon.report import build_result
+    from recon.tiers import TierResult
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration" / "snapshots").mkdir(parents=True)
+    manifest = tmp_path / ".migration" / "snapshots" / "snapshot.json"
+    manifest.write_text(json.dumps({
+        "source": "export-1", "extracted_at": "2024-01-01T00:00:00Z",
+        "row_counts": {"ORDERS": 2}, "unexpected": "not persisted"}))
+    snapshot = _load_snapshot(manifest, "snapshot")
+    assert set(snapshot) == {"source", "extracted_at", "row_counts"}
+    result = build_result("u", "snapshot", "m", "t",
+                          [TierResult(1, "counts", True, 1, [])],
+                          snapshot=snapshot)
+    assert result["snapshot"] == snapshot and result["merge_eligible"] is True
+    with pytest.raises(SystemExit, match="snapshot-manifest"):
+        _load_snapshot(None, "snapshot")
+
+
+@pytest.mark.parametrize("snapshot, expected_warning", [
+    ({"source": "oracle", "extracted_at": "2024-01-01T00:00:00Z",
+      "row_counts": {"ORDERS": 1}}, "mismatch"),
+    ({"source": "oracle", "extracted_at": "2024-01-01T00:00:00Z",
+      "row_counts": {}}, "missing"),
+    ({"source": "sqlserver", "extracted_at": "2024-01-01T00:00:00Z",
+      "row_counts": {"ORDERS": 2}}, "run family"),
+])
+def test_snapshot_provenance_warnings(snapshot, expected_warning):
+    source, target = make_green()
+    result = run_recon("u", "snapshot", SPEC, TOL, RULES, source, target,
+                       snapshot=snapshot, source_family="oracle")
+    assert result["verdict"] == "PASS"
+    assert result["merge_eligible"] is False
+    assert any(expected_warning in warning for warning in result["warnings"])
+
+
+def test_snapshot_provenance_matching_is_merge_eligible():
+    source, target = make_green()
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="orders", root_table="ORDERS", key_source=["ORDER_ID"],
+        key_target="order_id", fields=SPEC.objects[0].fields)])
+    result = run_recon(
+        "u", "snapshot", spec, TOL, RULES, source, target,
+        snapshot={"source": "oracle", "extracted_at": "2024-01-01T00:00:00Z",
+                  "row_counts": {"ORDERS": 2}},
+        source_family="oracle")
+    assert result["verdict"] == "PASS"
+    assert result["merge_eligible"] is True
+
+
+def test_composite_key_full_and_sampled_diff():
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="orders", root_table="ORDERS", key_source=["A", "B"],
+        key_target=["a", "b"], fields=[
+            FieldMapping("A", "a", "", "long"), FieldMapping("B", "b", "", "long"),
+            FieldMapping("V", "v", "", "long")])])
+    source = FakeSource({"ORDERS": [{"A": 1, "B": 2, "V": 3},
+                                    {"A": 4, "B": 5, "V": 6}]})
+    target = FakeTarget({"orders": [{"a": 1, "b": 2, "v": 3},
+                                    {"a": 9, "b": 9, "v": 6}]})
+    for threshold in (100, 1):
+        result = run_recon("u", "live", spec,
+                           Tolerances(version="t", full_diff_row_threshold=threshold,
+                                      sample_size=1),
+                           RULES, source, target)
+        assert result["verdict"] == "FAIL"
+        assert any(f["check"] == "missing_doc" for f in result["tiers"][2]["findings"])
+
+
+def test_tier4_multiset_matching_canonicalizes_decimal_and_order():
+    from recon.tiers import tier4_parity
+    from recon.canon import Canonicalizer
+    ops = [{"name": "rows", "object": "orders", "rules": []}]
+    result = tier4_parity(
+        ops, Canonicalizer([CanonRule("identity", "*")]),
+        Tolerances(version="t", numeric_abs_tol=0.01),
+        lambda op: [{"a": decimal.Decimal("1.00")}, {"a": 2}],
+        lambda op: [{"a": 2.0}, {"a": decimal.Decimal("1.005")}])
+    assert result.passed
+
+
+def test_tier4_multiset_matching_preserves_duplicates():
+    from recon.tiers import tier4_parity
+    from recon.canon import Canonicalizer
+    result = tier4_parity(
+        [{"name": "rows", "object": "orders", "rules": []}],
+        Canonicalizer([CanonRule("identity", "*")]), TOL,
+        lambda op: [{"a": 1}, {"a": 1}], lambda op: [{"a": 1}])
+    assert not result.passed
+    assert "1 source rows unmatched" in result.findings[0].detail
+
+
+def test_decimal_round_handles_decimal38_precision():
+    from recon.canon import Canonicalizer
+    value = decimal.Decimal("12345678901234567890123456789.1234567891")
+    result, _ = Canonicalizer([
+        CanonRule("decimal_round", "*", {"places": 4})
+    ]).apply(value, ["decimal_round"])
+    assert result == decimal.Decimal("12345678901234567890123456789.1235")
+
+
+def test_continuous_writes_keep_cycle_history(tmp_path: Path):
+    from recon.report import build_result, write_outputs
+    from recon.tiers import TierResult
+    result1 = build_result("u", "continuous", "m", "t",
+                           [TierResult(1, "counts", True, 1, [])])
+    result1["generated_at"] = "2024-01-01T00:00:00+00:00"
+    result2 = dict(result1)
+    result2["generated_at"] = "2024-01-01T00:00:01+00:00"
+    write_outputs(tmp_path, result1)
+    write_outputs(tmp_path, result2)
+    cycles = sorted((tmp_path / "cycles").glob("*.result.json"))
+    assert len(cycles) == 2
+    assert all(json.loads(path.read_text())["mode"] == "continuous" for path in cycles)
+
+
+def test_sampling_unique_keys_retains_bounded_duplicate_state():
+    rows = [{"ORDER_ID": i, "CUST_NAME": str(i), "TOTAL": float(i)} for i in range(200)]
+    source = FakeSource({"ORDERS": rows, "ORDER_ITEMS": []})
+    target = FakeTarget({"orders": [
+        {"order_id": i, "customer": {"name": str(i)}, "total": float(i), "items": []}
+        for i in range(200)]})
+    tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=3)
+    result = run_recon("u", "live", SPEC, tol, RULES, source, target)
+    assert result["tiers"][2]["stats"]["orders"]["duplicate_source_key_count"] == 0

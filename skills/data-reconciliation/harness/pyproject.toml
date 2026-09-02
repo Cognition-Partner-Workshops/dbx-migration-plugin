@@ -1,0 +1,27 @@
+[project]
+name = "dbx-recon-harness"
+version = "0.1.0"
+description = "Reconciliation harness for warehouse/ETL-to-Databricks migrations"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+databricks = ["databricks-sql-connector>=3.0"]
+redshift = ["psycopg2-binary>=2.9"]
+snowflake = ["snowflake-connector-python>=3.0"]
+teradata = ["teradatasql>=20.0"]
+oracle = ["oracledb>=2.0"]
+sqlserver = ["pyodbc>=5.0"]
+all = ["databricks-sql-connector>=3.0", "psycopg2-binary>=2.9", "snowflake-connector-python>=3.0",
+       "teradatasql>=20.0", "oracledb>=2.0", "pyodbc>=5.0"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+dbx-recon = "recon.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["recon*"]

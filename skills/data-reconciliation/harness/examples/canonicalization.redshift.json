@@ -1,0 +1,9 @@
+[
+  {"rule": "decimal_round", "applies_to": "NUMERIC->DECIMAL", "params": {"mode": "half_even", "places": 10}},
+  {"rule": "datetime_utc_truncate_ms", "applies_to": "TIMESTAMP,TIMESTAMPTZ->TIMESTAMP", "params": {}},
+  {"rule": "rstrip_spaces", "applies_to": "CHAR->STRING", "params": {}},
+  {"rule": "empty_string_is_null", "applies_to": "VARCHAR,CHAR->STRING", "params": {"policy": "SET_AT_STOP_A"}},
+  {"rule": "null_missing_equiv", "applies_to": "*", "params": {}},
+  {"rule": "collation_casefold", "applies_to": "STRING", "params": {"enabled_if": "case-insensitive compares found in census"}},
+  {"rule": "identity", "applies_to": "*", "params": {}}
+]

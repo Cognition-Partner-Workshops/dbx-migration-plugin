@@ -1,4 +1,4 @@
-Playbook: Front door for SQL warehouse estates (Redshift, Teradata, BigQuery, Synapse, Oracle EDW). Thin intake that pins the engine, loads the dialect skill, sets warehouse-family defaults, and hands off to `!dbx_migrate_pipeline`. No migration method lives here.
+Playbook: Front door for SQL warehouse estates (Redshift, Teradata, BigQuery, Synapse, Oracle EDW). Thin intake that pins the engine, loads the dialect skill, sets warehouse-family defaults, and then runs `!dbx_migrate_pipeline` in the same session. No migration method lives here.
 
 ## Overview
 The customer says "we're moving off Redshift." This playbook turns that into a configured run of the standard chain: engine and version pinned, catalog metadata access confirmed, dialect skill attached, and the warehouse-family defaults set. Everything after intake is the standard chain, unmodified.
@@ -13,11 +13,11 @@ The customer says "we're moving off Redshift." This playbook turns that into a c
 2. Pin engine and version; probe catalog access with one live metadata query; register D10s for anything blocked.
 3. Attach the matching dialect skill (`redshift-sql`, `teradata-bteq`, `bigquery-sql`, ...). If none exists, generic ANSI translation plus a build-the-skill wave-0 item, stated plainly.
 4. Set family defaults for the chain: unit = view / procedure / scheduled query / load script; lineage extraction = catalog metadata + view dependency graphs + query history; SQL profile is the dominant surface; the physical design translation (dist/sort keys, partitioning to liquid clustering) is a named dictionary concern; federation-first coexistence.
-5. Record intake facts and hand off to `!dbx_migrate_pipeline`.
+5. Record intake facts in `.migration/00_context.md` shape. Then run `!dbx_migrate_pipeline` **in this same session**, right away. Do not open a new session, do not ask the user to run it, do not stop here: the orchestrator reads the intake facts you just wrote and begins ingest and setup as normal. The user's next message from Devin is STOP A.
 
 ## Specifications
 - Deliverable: configured hand-off: engine pinned, access probed, dialect skill attached, family defaults recorded.
-- Validation: the orchestrator can start ingest without re-asking anything this intake covered.
+- Validation: `!dbx_migrate_pipeline` was invoked in this session and the orchestrator can start ingest without re-asking anything this intake covered.
 
 ## Advice and Pointers
 - Warehouse migrations look easier than ETL migrations and hide their difficulty in the same two places every time: engine-specific function semantics (numeric truncation, timestamp behavior) and the untracked consumer population. The dictionary and the D4 sweep are where this family's engagements are won.

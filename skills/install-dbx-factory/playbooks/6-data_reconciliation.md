@@ -23,7 +23,8 @@ Every unit PR already carries its own recon evidence, but the author grading the
 6. Update the ledger and hand the report to the orchestrator for **STOP D** (notify: PRs, recon report, findings, in batch).
 
 ## Specifications
-- Deliverable: the wave recon report, every unit independently re-verified.
+- Gate re-runs use the `dbx-recon` CLI (`data-reconciliation` skill) with the unit's committed mapping and tolerance files, in `live` or `snapshot` mode. Gate on `result.json`, not on the PR text or the CLI stdout.
+- Deliverable: the wave recon report, every unit independently re-verified. Write it under `.migration/recon/wave-<N>/`, on its own branch when launched by the fan-out workflow, and touch nothing else in `.migration/`.
 - Validation: (1) every gate re-run from spec, not trusted from the PR; (2) probes executed and recorded even when all green; (3) any FAIL has evidence and a routed owner; (4) this session converted nothing in the wave.
 
 ## Advice and Pointers
