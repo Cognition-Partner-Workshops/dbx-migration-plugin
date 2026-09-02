@@ -25,8 +25,8 @@ redoes finished work.
    with `WAVE_MANIFEST=.migration/waves/wave-<N>.json` in the environment.
 4. When it returns, read `.migration/waves/wave-<N>.result.json` (machine) and
    `.migration/waves/wave-<N>.brief.md` (human). Post the brief as the wave-close message.
-5. If it timed out or the session slept, run it again with the same `run_id`. Finished
-   children replay; only the rest launch.
+5. If it timed out, halted, or the session slept, run it again with the same `run_id` and
+   `WAVE_RESUME=1`. Finished children replay; only the rest launch.
 
 ## What it enforces
 
@@ -34,7 +34,7 @@ redoes finished work.
 |---|---|
 | Manifest check | Refuses to start if the manifest is missing, a batch has no brief or no write targets, or batch ids repeat. |
 | Collision check | Refuses to start if two batches claim the same write target. If children report an overlap after the fact, merges are held and the brief says so. |
-| Closed-wave guard | Refuses to start only if the wave closed clean (`closed: true` in the result); a halted or failed wave resumes with the same `run_id`. Redo on purpose with `WAVE_RERUN=1`. |
+| Closed-wave guard | Refuses to start only if the wave closed clean (`closed: true` in the result); a halted or failed wave resumes only with the same `run_id` and `WAVE_RESUME=1`. Invalid result JSON also requires `WAVE_RESUME=1` to continue. Redo on purpose with `WAVE_RERUN=1`. |
 | Width | At most `width` children at once (default 20). |
 | Circuit breaker | After `breaker_threshold` (default 3) children fail with the same `failure_class`, no new children launch. Running ones finish. |
 | Single ledger writer | Children never edit `.migration/`. The result file is written here, once. |
@@ -44,7 +44,7 @@ redoes finished work.
 ## After the run
 
 - Breaker tripped: fix the dialect skill or knowledge note once, then re-run with the same
-  `run_id`. Held-back batches launch; finished ones do not repeat.
+  `run_id` and `WAVE_RESUME=1`. Held-back batches launch; finished ones do not repeat.
 - A batch is BLOCKED: its brief was incomplete. Fix the manifest (the prompt changes, so
   only that child re-runs).
 - Verifier FAIL: reopen the named units as fresh children with the finding attached.

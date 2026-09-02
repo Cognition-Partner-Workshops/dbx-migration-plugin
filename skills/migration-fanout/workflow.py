@@ -52,11 +52,21 @@ RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 
 if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
-    prior = json.loads(RESULT_PATH.read_text())
-    if prior.get("closed"):
-        raise SystemExit(f"{RESULT_PATH} says wave {prior.get('wave')} closed clean. To redo it on "
-                         "purpose, set WAVE_RERUN=1.")
-    # halted or failed: fall through and resume (same run_id replays finished children)
+    try:
+        prior = json.loads(RESULT_PATH.read_text())
+    except json.JSONDecodeError:
+        if os.environ.get("WAVE_RESUME") != "1":
+            raise SystemExit(f"{RESULT_PATH} is not valid JSON (interrupted write?). Inspect it; to resume "
+                             "the same run set WAVE_RESUME=1 with the recorded run_id, or set WAVE_RERUN=1 "
+                             "to redo the wave.") from None
+    else:
+        if prior.get("closed"):
+            raise SystemExit(f"{RESULT_PATH} says wave {prior.get('wave')} closed clean. To redo it on "
+                             "purpose, set WAVE_RERUN=1.")
+        if os.environ.get("WAVE_RESUME") != "1":
+            raise SystemExit(f"{RESULT_PATH} records a halted or failed run. To continue it, re-run with the "
+                             "recorded run_id AND WAVE_RESUME=1 (finished children replay). To redo the wave "
+                             "from scratch, set WAVE_RERUN=1.")
 
 
 def validate_manifest(m):
@@ -111,7 +121,7 @@ CHILD_SCHEMA = {
         "skill_feedback": {"type": "array", "items": {"type": "string"}},
         "one_line_summary": {"type": "string"},
     },
-    "required": ["status", "recon_verdict", "one_line_summary"],
+    "required": ["status", "recon_verdict", "write_targets", "one_line_summary"],
 }
 
 VERIFY_SCHEMA = {
@@ -248,7 +258,9 @@ def write_brief(results, verify, surprises, undeclared):
     lines += [f"- {b['id']}: {r['status']}. {r['one_line_summary']}"
               + (f" {r['pr_url']}" if r.get("pr_url") else "")
               for b, r in zip(BATCHES, results)]
-    BRIEF_PATH.write_text("\n".join(lines) + "\n")
+    brief_tmp = BRIEF_PATH.with_suffix(".brief.md.tmp")
+    brief_tmp.write_text("\n".join(lines) + "\n")
+    os.replace(brief_tmp, BRIEF_PATH)
 
 
 async def main():
@@ -267,6 +279,8 @@ async def main():
         extra = sorted(set(r.get("write_targets", [])) - set(b["write_targets"]))
         if extra:
             undeclared[b["id"]] = extra
+    unreported = [b["id"] for b, r in zip(BATCHES, results)
+                  if r["status"] == "PASS" and not r.get("write_targets")]
     auto_merge = AUTO_MERGE
     if surprises:
         auto_merge = False
@@ -275,6 +289,10 @@ async def main():
     if undeclared:
         auto_merge = False
         log(f"HALT: children wrote outside their declared targets: {undeclared}. "
+            "Auto-merge is off for this wave; a human decides at wave close.")
+    if unreported:
+        auto_merge = False
+        log(f"HALT: PASS children did not report write targets: {unreported}. "
             "Auto-merge is off for this wave; a human decides at wave close.")
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
@@ -292,19 +310,22 @@ async def main():
     else:
         log("verify: skipped, no batch passed")
 
-    closed = (breaker.tripped_on is None and not surprises and not undeclared
+    closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported
               and verify is not None and verify["wave_verdict"] == "PASS"
               and all(r["status"] == "PASS" for r in results))
-    RESULT_PATH.write_text(json.dumps({
+    result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
+    result_tmp.write_text(json.dumps({
         "wave": WAVE, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
         "closed": closed,
         "write_target_overlaps": surprises,
         "undeclared_write_targets": undeclared,
+        "unreported_write_targets": unreported,
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
         "verify": verify,
     }, indent=2, sort_keys=True) + "\n")
-    write_brief(results, verify, surprises, undeclared)
+    os.replace(result_tmp, RESULT_PATH)
+    write_brief(results, verify, surprises, undeclared, unreported)
     log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 
