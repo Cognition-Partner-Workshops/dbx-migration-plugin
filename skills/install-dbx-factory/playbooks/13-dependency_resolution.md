@@ -4,7 +4,7 @@ Playbook: Register, decide, and implement every point where a pipeline touches s
 Dependencies, not conversion difficulty, are what make data migrations slow and risky: the upstream feed that keeps writing to the legacy warehouse, the dashboard nobody mentioned, the scheduler that expects a completion signal, the access request that takes four weeks. This playbook is the single method for handling them, in three modes:
 
 - **register**: find crossings mechanically, classify them, specify their contracts, append to `.migration/04_dependency_register.md` as UNDECIDED.
-- **decide**: at plan time, walk every UNDECIDED entry with the user, record the decision and the routing point, and fire the lead-time request.
+- **decide**: at plan time, propose a decision for every UNDECIDED entry, present them all at STOP C (resolved per `stop_mode`), record the decision and the routing point, and fire the lead-time request.
 - **implement**: during a wave, build the decided mechanism (federation view, dual-write, re-pointed connection, ingestion contract) and record the evidence.
 
 ## Taxonomy
@@ -33,7 +33,7 @@ Dependencies, not conversion difficulty, are what make data migrations slow and 
 3. Append to the register as UNDECIDED with cites. Never decide here.
 
 **decide mode**
-4. Walk every UNDECIDED entry with the user at STOP C. Record decision, routing point (the single place traffic flips at cutover), cutover condition, decommission condition, and owner.
+4. Propose one decision per UNDECIDED entry (the safest option the class admits, usually the read-only or coexistence-preserving one) and present the whole table at STOP C. In hard mode walk each entry with the user; in soft mode the proposals are the stop's default and are default-accepted as a batch after the window unless a reply changes them. Record for each entry the decision, routing point (the single place traffic flips at cutover), cutover condition, decommission condition, owner, and provenance (`user:<id>` or `default-accepted`). A class with no safe proposal (anything that would write to the legacy source or change tolerances) has no default and waits for a human regardless of `stop_mode`.
 5. **Fire every lead-time request immediately** (access, firewall, service principal, DBA/platform tickets, consumer-team notifications), and record what was fired, to whom, and the expected lead time. Requests fire at plan approval, not when the wave needs them.
 
 **implement mode**

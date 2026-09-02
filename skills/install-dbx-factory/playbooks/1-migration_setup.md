@@ -68,7 +68,7 @@ Nothing downstream may guess. If this phase has not run, `!dbx_migration_plan` a
 - Do NOT invent, assume, or silently default any profile's runtime, UC layout, dialect policy, orchestration target, or recon tolerance.
 - Do NOT apply a SQL-derived target state to a pipeline or ML workload, or the reverse.
 - Do NOT collapse the profiles into a single undifferentiated description, and do NOT omit a surface silently; mark it N/A with a reason.
-- Do NOT proceed past STOP A with PROPOSED fields unconfirmed.
+- Do NOT proceed past STOP A with PROPOSED fields unresolved: confirmed by the user, or (soft mode) default-accepted as a batch with that provenance recorded. Never resolve a PROPOSED field silently outside the stop.
 - Do NOT hardcode workspace IDs, warehouse IDs, or a single-repo layout; record them as named facts in the document.
 - Do NOT analyze the estate, plan a migration, or write pipeline code here.
 - Do NOT leave the target state only in chat; it must be a committed artifact plus a knowledge note, or fifty parallel sessions will re-derive it fifty ways.
