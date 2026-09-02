@@ -70,6 +70,8 @@ class _SqlAdapterBase:
         return ["?"] * n
 
     def _params(self, values: list[Any]):
+        if self.paramstyle == "named":
+            return {str(i): value for i, value in enumerate(values, 1)}
         if self.paramstyle == "pyformat":
             return {f"p{i}": value for i, value in enumerate(values)}
         return tuple(values)

@@ -73,9 +73,11 @@ def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
 def _agg_close(a: Any, b: Any, rel_tol: float) -> bool:
     if a is None and b is None:
         return True
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        denom = max(abs(a), abs(b), 1e-12)
-        return abs(a - b) <= rel_tol * denom
+    if (isinstance(a, (int, float, decimal.Decimal)) and
+            isinstance(b, (int, float, decimal.Decimal))):
+        da, db = decimal.Decimal(str(a)), decimal.Decimal(str(b))
+        denom = max(abs(da), abs(db), decimal.Decimal("1e-12"))
+        return abs(da - db) <= decimal.Decimal(str(rel_tol)) * denom
     return a == b
 
 
@@ -131,8 +133,6 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                 if stat in ("min", "max", "sum"):
                     sv, _ = canon.apply(sv, f.rules)
                     tv, _ = canon.apply(tv, f.rules)
-                    sv = float(sv) if hasattr(sv, "__float__") and not isinstance(sv, bool) else sv
-                    tv = float(tv) if hasattr(tv, "__float__") and not isinstance(tv, bool) else tv
                 if not _agg_close(sv, tv, tol.aggregate_rel_tol):
                     findings.append(Finding(c.object, f"aggregate_{stat}",
                                             f"field {f.source}->{f.target}", sv, tv, f.rules))
@@ -207,13 +207,26 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         n = source.row_count(c.root_table, c.root_where)
         sampled = n > tol.full_diff_row_threshold
         keys: list[Any] | None = None
-        duplicate_counts = {}
+        duplicate_source_runs = []
+        previous_source_key = None
+        source_run_count = 0
+
+        def record_source_key(key):
+            nonlocal previous_source_key, source_run_count
+            if source_run_count and key == previous_source_key:
+                source_run_count += 1
+                return
+            if source_run_count > 1:
+                duplicate_source_runs.append((previous_source_key, source_run_count))
+            previous_source_key = key
+            source_run_count = 1
+
         if sampled:
             first, last, reservoir = [], [], []
             seen = 0
             for raw_key in source.iter_keys(c.root_table, c.key_source, c.root_where):
                 key = tuple(raw_key)
-                duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
+                record_source_key(key)
                 seen += 1
                 if len(first) < 2:
                     first.append(key)
@@ -238,10 +251,13 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
             for r in source.fetch_keyed(c.root_table, c.key_source,
                                         [f.source for f in c.fields], where=c.root_where):
                 key = tuple(r[k] for k in c.key_source)
-                duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
+                record_source_key(key)
                 src_rows[key] = r
             stats[c.object] = {"mode": "full_diff", "population": n}
-        for key, count in duplicate_counts.items():
+        if source_run_count > 1:
+            duplicate_source_runs.append((previous_source_key, source_run_count))
+        stats[c.object]["duplicate_source_key_count"] = len(duplicate_source_runs)
+        for key, count in duplicate_source_runs:
             if count > 1:
                 checks += 1
                 findings.append(Finding(c.object, "duplicate_source_key",

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from pathlib import Path
 
 from .tiers import TierResult
@@ -25,14 +26,16 @@ def _mode_note(mode: str) -> str:
 
 def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: str,
                  tiers: list[TierResult], seed: int = 0,
-                 params: dict[str, str] | None = None) -> dict:
+                 params: dict[str, str] | None = None,
+                 snapshot: dict | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
             warnings.append(f"UNGRADED embedded values: {path} (cardinality checked only; "
                             "declare embed key/fields in the mapping spec to grade values)")
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
-    merge_eligible = verdict == "PASS" and mode in ("live", "snapshot")
+    merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot")
+                      and not warnings and (mode != "snapshot" or snapshot is not None))
     return {
         "unit": unit,
         "mode": mode,
@@ -40,6 +43,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "tolerance_version": tolerance_version,
         "seed": seed,
         "params": params or {},
+        "snapshot": snapshot,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "tiers": [t.as_dict() for t in tiers],
         "warnings": warnings,
@@ -62,6 +66,8 @@ def render_report(result: dict) -> str:
                                                 if result.get("params") else ""),
         f"- Generated: {result['generated_at']}",
     ]
+    if result.get("snapshot") is not None:
+        lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [
@@ -108,6 +114,8 @@ def render_summary(result: dict) -> str:
         + (f" / params `{result['params']}`" if result.get("params") else ""),
         f"- Generated: {result['generated_at']}",
     ]
+    if result.get("snapshot") is not None:
+        lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [
@@ -132,7 +140,17 @@ def write_outputs(out_dir: Path, result: dict) -> tuple[Path, Path, Path]:
     rj = out_dir / "result.json"
     rm = out_dir / "report.md"
     rs = out_dir / "recon.summary.md"
-    rj.write_text(json.dumps(result, indent=2, default=str) + "\n")
-    rm.write_text(render_report(result))
-    rs.write_text(render_summary(result))
+    def atomic_write(path: Path, content: str) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(content)
+        tmp.replace(path)
+    atomic_write(rj, json.dumps(result, indent=2, default=str) + "\n")
+    atomic_write(rm, render_report(result))
+    atomic_write(rs, render_summary(result))
+    if result.get("mode") == "continuous":
+        cycles = out_dir / "cycles"
+        cycles.mkdir(parents=True, exist_ok=True)
+        stamp = re.sub(r"[^A-Za-z0-9_.-]", "_", result["generated_at"])
+        atomic_write(cycles / f"{stamp}.result.json",
+                     json.dumps(result, indent=2, default=str) + "\n")
     return rj, rm, rs

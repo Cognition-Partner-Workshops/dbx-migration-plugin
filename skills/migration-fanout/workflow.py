@@ -41,7 +41,10 @@ import os
 from collections import Counter
 from pathlib import Path
 
-MANIFEST_PATH = Path(os.environ.get("WAVE_MANIFEST", ".migration/waves/wave-1.json"))
+WAVES_DIR = Path(".migration/waves").resolve()
+MANIFEST_PATH = Path(os.environ.get("WAVE_MANIFEST", ".migration/waves/wave-1.json")).resolve()
+if MANIFEST_PATH.suffix != ".json" or not MANIFEST_PATH.is_relative_to(WAVES_DIR):
+    raise SystemExit(f"WAVE_MANIFEST must be a .json file inside {WAVES_DIR}")
 if not MANIFEST_PATH.exists():
     raise SystemExit(f"no wave manifest at {MANIFEST_PATH}. Set WAVE_MANIFEST to the file the "
                      "plan playbook wrote, then re-run.")
@@ -51,9 +54,10 @@ MANIFEST_SHA = hashlib.sha256(MANIFEST_TEXT.encode()).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
+resume = os.environ.get("WAVE_RESUME") == "1"
+prior = None
 
 if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
-    resume = os.environ.get("WAVE_RESUME") == "1"
     try:
         prior = json.loads(RESULT_PATH.read_text())
         if not isinstance(prior, dict):
@@ -71,13 +75,19 @@ if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
             raise SystemExit(f"{RESULT_PATH} records a halted or failed run. To continue it, re-run with the "
                              "recorded run_id AND WAVE_RESUME=1 (finished children replay). To redo the wave "
                              "from scratch, set WAVE_RERUN=1.")
-    if resume:
-        run_id = os.environ.get("WAVE_RUN_ID")
-        if not run_id:
-            raise SystemExit("WAVE_RESUME=1 requires WAVE_RUN_ID; pass the recorded run_id")
-        if RUN_ID_PATH.exists() and RUN_ID_PATH.read_text().strip() != run_id:
-            raise SystemExit(f"WAVE_RUN_ID does not match {RUN_ID_PATH}; pass the recorded run_id to "
-                             "run_workflow and WAVE_RUN_ID, or WAVE_RERUN=1 for a fresh run")
+if resume:
+    run_id = os.environ.get("WAVE_RUN_ID")
+    if not run_id:
+        raise SystemExit("WAVE_RESUME=1 requires WAVE_RUN_ID; pass the recorded run_id")
+    if not RUN_ID_PATH.exists():
+        raise SystemExit(f"no run record at {RUN_ID_PATH}; cannot verify WAVE_RUN_ID belongs to this wave "
+                         "— use WAVE_RERUN=1 for a fresh run")
+    if RUN_ID_PATH.read_text().strip() != run_id:
+        raise SystemExit(f"WAVE_RUN_ID does not match {RUN_ID_PATH}; pass the recorded run_id to "
+                         "run_workflow and WAVE_RUN_ID, or WAVE_RERUN=1 for a fresh run")
+    if isinstance(prior, dict) and prior.get("run_id") and prior["run_id"] != run_id:
+        raise SystemExit(f"WAVE_RUN_ID does not match prior result at {RESULT_PATH}; pass the recorded "
+                         "run_id to run_workflow and WAVE_RUN_ID, or WAVE_RERUN=1 for a fresh run")
 
 
 def validate_manifest(m):
@@ -87,6 +97,9 @@ def validate_manifest(m):
             raise SystemExit(f"manifest is missing '{key}'")
     if not m["batches"]:
         raise SystemExit("manifest has no batches")
+    for key in ("width", "breaker_threshold", "child_minutes"):
+        if key in m and (isinstance(m[key], bool) or not isinstance(m[key], int) or m[key] <= 0):
+            raise SystemExit(f"manifest key '{key}' must be a positive integer")
     ids = Counter(b.get("id") for b in m["batches"])
     dupes = [i for i, c in ids.items() if c > 1 or not i]
     if dupes:
@@ -99,6 +112,53 @@ def validate_manifest(m):
 
 
 validate_manifest(MANIFEST)
+
+
+def validate_verify(verify, passed, auto_merge) -> list[str]:
+    """Return verifier-output problems without reading files or mutating input."""
+    problems = []
+    if not isinstance(verify, dict):
+        return ["verifier output invalid: expected an object"]
+    expected = {p.get("batch") for p in passed}
+    if None in expected:
+        problems.append("verifier output invalid: passed batch is missing its id")
+        expected.discard(None)
+    verdicts = verify.get("unit_verdicts")
+    if not isinstance(verdicts, dict):
+        problems.append("verifier output invalid: unit_verdicts must be a dict")
+        verdicts = {}
+    missing = sorted(expected - set(verdicts))
+    extra = sorted(set(verdicts) - expected)
+    if missing:
+        problems.append("verifier output invalid: missing verdicts for " + ", ".join(missing))
+    if extra:
+        problems.append("verifier output invalid: unexpected verdicts for " + ", ".join(extra))
+    wave_verdict = verify.get("wave_verdict")
+    if wave_verdict not in ("PASS", "FAIL"):
+        problems.append("verifier output invalid: wave_verdict must be PASS or FAIL")
+    for batch in sorted(expected):
+        verdict = verdicts.get(batch)
+        if verdict not in ("PASS", "FAIL"):
+            problems.append(f"verifier output invalid: verdict for {batch} is {verdict!r}")
+        elif wave_verdict == "PASS" and verdict != "PASS":
+            problems.append(f"verifier output invalid: wave PASS contradicts {batch}={verdict}")
+    if wave_verdict == "FAIL" and expected and all(verdicts.get(b) == "PASS" for b in expected):
+        problems.append("verifier output invalid: wave FAIL contradicts all unit verdicts PASS")
+    merged = verify.get("merged_prs")
+    if merged is not None and not isinstance(merged, list):
+        problems.append("verifier output invalid: merged_prs must be a list")
+        merged = []
+    if auto_merge:
+        if merged is None:
+            problems.append("verifier output invalid: merged_prs must be a list when auto_merge is on")
+            merged = []
+        for batch in passed:
+            url = batch.get("pr_url")
+            if url and url not in merged:
+                problems.append(f"verifier output invalid: merged_prs is missing {url} for {batch['batch']}")
+    if not isinstance(verify.get("findings"), list):
+        problems.append("verifier output invalid: findings must be a list")
+    return problems
 
 WAVE = MANIFEST["wave"]
 REPO = MANIFEST["repo"]
@@ -188,7 +248,8 @@ def verify_prompt(passed, auto_merge):
         "failed units are reopened next launch."
         if auto_merge else
         "Do not merge anything; return per-unit verdicts. The orchestrator surfaces the PASS PRs in the "
-        "wave brief, merges them at wave close (or records the human's decision in .migration/06_decisions.md), "
+        "wave brief, merges them at wave close (or records the human's decision in the kit's decision log "
+        "under .migration/), "
         "and the next wave does not launch until that is done.")
     return (
         f"You are the independent verifier for wave {WAVE}. Repo: {REPO}. You did not write "
@@ -297,6 +358,10 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
 
 
 async def main():
+    if not resume and os.environ.get("WAVE_RUN_ID"):
+        run_id_tmp = RUN_ID_PATH.with_suffix(".run_id.tmp")
+        run_id_tmp.write_text(os.environ["WAVE_RUN_ID"] + "\n")
+        os.replace(run_id_tmp, RUN_ID_PATH)
     await register_workflow(META)
     check_write_targets(BATCHES)
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}")
@@ -343,8 +408,16 @@ async def main():
     else:
         log("verify: skipped, no batch passed")
 
+    verify_problems = validate_verify(verify, passed, auto_merge) if verify is not None else []
+    if verify_problems:
+        if not isinstance(verify, dict):
+            verify = {"wave_verdict": "FAIL", "unit_verdicts": {}, "findings": []}
+        verify["wave_verdict"] = "FAIL"
+        if not isinstance(verify.get("findings"), list):
+            verify["findings"] = []
+        verify["findings"].extend(verify_problems)
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported
-              and verify is not None and verify["wave_verdict"] == "PASS"
+              and not verify_problems and verify is not None and verify["wave_verdict"] == "PASS"
               and all(r["status"] == "PASS" for r in results))
     result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
     result_tmp.write_text(json.dumps({

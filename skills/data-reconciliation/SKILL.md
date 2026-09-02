@@ -30,7 +30,8 @@ dbx-recon run \
   --mode fixture|live|snapshot|continuous \
   --source-dsn-secret <SOURCE_SECRET_NAME> \
   --target-secret DATABRICKS_MIGRATION_SQL --target-catalog <migration catalog> \
-  --allowed-catalogs <migration catalog(s)> --target-schema <schema> \
+  --allowed-targets-file .migration/allowed_targets.json --target-schema <schema> \
+  --snapshot-manifest .migration/snapshots/<unit_id>.json \
   --seed 0 [--param from_date=2024-01-01 ...] \
   --out .migration/recon/<unit_id>/
 ```
@@ -43,6 +44,9 @@ environment. Never inline a connection string or token.
 Unresolved placeholders are refused, and mapping identifiers are validated before execution.
 When `root_where` or an embed's `child_where` is set, the corresponding `target_where` is
 required so both sides have the same scope.
+
+The allowlist file is trusted setup state, not a caller-controlled CLI list. Use
+`--snapshot-manifest` for snapshot mode; it records source, extraction time, and row counts.
 
 ## What it checks, in cost order
 

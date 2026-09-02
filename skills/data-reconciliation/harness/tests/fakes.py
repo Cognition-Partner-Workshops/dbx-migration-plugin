@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import decimal
 from typing import Any, Iterable
 
 from recon.paths import get_path
@@ -19,7 +20,9 @@ def _matches(row: dict, where: str | None) -> bool:
     if not sep:
         return True
     right = right.strip().strip("'\"")
-    return str(row.get(left.strip())) == right
+    key = left.strip()
+    value = row[key] if key in row else get_path(row, key)
+    return str(value) == right
 
 class FakeSource:
     def __init__(self, tables: dict[str, list[dict]]):
@@ -30,9 +33,10 @@ class FakeSource:
         return sum(_matches(r, where) for r in self.tables[table])
 
     def field_aggregates(self, table: str, column: str, where: str | None = None) -> dict[str, Any]:
-        vals = [r.get(column) for r in self.tables[table] if _matches(r, where)]
+        vals = [(r[column] if column in r else get_path(r, column))
+                for r in self.tables[table] if _matches(r, where)]
         nn = [v for v in vals if v is not None]
-        nums = [v for v in nn if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        nums = [v for v in nn if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool)]
         return {"count": len(vals),
                 "null_rate": (len(vals) - len(nn)) / len(vals) if vals else 0.0,
                 "min": min(nn) if nn else None, "max": max(nn) if nn else None,
@@ -42,14 +46,17 @@ class FakeSource:
         self.last_fetch_keyed = {"table": table, "key_cols": key_cols, "columns": columns,
                                  "where": where, "keys": keys}
         wanted = {tuple(k) for k in keys} if keys is not None else None
-        for r in sorted(self.tables[table], key=lambda r: tuple(repr(r[k]) for k in key_cols)):
-            if _matches(r, where) and (wanted is None or tuple(r[k] for k in key_cols) in wanted):
+        for r in sorted(self.tables[table], key=lambda r: tuple(repr(r[k] if k in r else get_path(r, k))
+                                                               for k in key_cols)):
+            row_key = tuple(r[k] if k in r else get_path(r, k) for k in key_cols)
+            if _matches(r, where) and (wanted is None or row_key in wanted):
                 yield r
 
     def iter_keys(self, table, key_cols, where=None):
-        for r in sorted(self.tables[table], key=lambda r: tuple(repr(r[k]) for k in key_cols)):
+        for r in sorted(self.tables[table], key=lambda r: tuple(repr(r[k] if k in r else get_path(r, k))
+                                                               for k in key_cols)):
             if _matches(r, where):
-                yield tuple(r[k] for k in key_cols)
+                yield tuple(r[k] if k in r else get_path(r, k) for k in key_cols)
 
     def key_strata(self, table, key_cols, n_strata):
         return []
@@ -85,7 +92,7 @@ class FakeTarget:
         vals = [get_path(d, field_path) for d in self._rows(object, where)]
         vals = [None if v is MISSING else v for v in vals]
         nn = [v for v in vals if v is not None]
-        nums = [v for v in nn if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        nums = [v for v in nn if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool)]
         return {"count": len(vals),
                 "null_rate": (len(vals) - len(nn)) / len(vals) if vals else 0.0,
                 "min": min(nn) if nn else None, "max": max(nn) if nn else None,

@@ -3,6 +3,7 @@ one mismatch per class, proving each tier catches its class and the engine gates
 """
 
 import copy
+import decimal
 import json
 from pathlib import Path
 import pytest
@@ -315,24 +316,41 @@ def test_mapping_identifier_and_predicate_validation(tmp_path: Path):
 def test_cli_rejects_unsafe_param_before_adapter(tmp_path: Path):
     import pytest
     from recon import cli
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text(json.dumps({"catalogs": ["c"]}))
     with pytest.raises(SystemExit):
         cli.main(["run", "--unit", "u", "--family", "oracle",
                   "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
                   "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
                   "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
-                  "--target-catalog", "c", "--allowed-catalogs", "c", "--target-schema", "s",
+                  "--target-catalog", "c", "--allowed-targets-file", str(allowlist), "--target-schema", "s",
                   "--param", "x=bad'"])
 
 
 def test_cli_rejects_target_outside_allowlist_before_adapter(tmp_path: Path):
     from recon import cli
-    with pytest.raises(SystemExit, match="not in --allowed-catalogs"):
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text(json.dumps({"catalogs": ["migration"]}))
+    with pytest.raises(SystemExit, match="not in"):
         cli.main(["run", "--unit", "u", "--family", "oracle",
                   "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
                   "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
                   "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
-                  "--target-catalog", "not_migration", "--allowed-catalogs", "migration",
+                  "--target-catalog", "not_migration", "--allowed-targets-file", str(allowlist),
                   "--target-schema", "s", "--out", str(tmp_path / "out")])
+
+
+def test_cli_requires_trusted_allowlist_file(tmp_path: Path):
+    from recon import cli
+    args = ["run", "--unit", "u", "--family", "oracle",
+            "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
+            "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
+            "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+            "--target-catalog", "migration", "--target-schema", "s", "--out", str(tmp_path / "out")]
+    with pytest.raises(SystemExit, match="allowlist"):
+        cli.main(args)
+    with pytest.raises(SystemExit):
+        cli.main(args + ["--allowed-catalogs", "migration"])
 
 
 def test_scoped_source_and_target_pass_and_missing_scope_fails():
@@ -404,7 +422,10 @@ def test_merge_eligibility_by_mode():
     assert build_result("u", "fixture", "m", "t", [tier])["merge_eligible"] is False
     assert build_result("u", "continuous", "m", "t", [tier])["merge_eligible"] is False
     assert build_result("u", "live", "m", "t", [tier])["merge_eligible"] is True
-    assert build_result("u", "snapshot", "m", "t", [tier])["merge_eligible"] is True
+    assert build_result("u", "snapshot", "m", "t", [tier])["merge_eligible"] is False
+    assert build_result("u", "snapshot", "m", "t", [tier],
+                        snapshot={"source": "s", "extracted_at": "2024-01-01T00:00:00Z",
+                                  "row_counts": {"x": 1}})["merge_eligible"] is True
     assert build_result("u", "live", "m", "t",
                         [TierResult(1, "x", False, 1, [])])["merge_eligible"] is False
 
@@ -424,3 +445,73 @@ def test_missing_comparison_key_rejected(tmp_path: Path):
         "version": "m1", "objects": [{"object": "c", "root_table": "T", "fields": []}]}))
     with pytest.raises(ConfigError):
         load_mapping_spec(tmp_path / "map.json")
+
+
+def test_decimal_aggregate_comparison_preserves_precision():
+    from recon.tiers import _agg_close
+    value = decimal.Decimal("12345678901234567890.123456789012345678")
+    changed = decimal.Decimal("12345678901234567890.123456789012345679")
+    assert _agg_close(value, value, 0)
+    assert not _agg_close(value, changed, 0)
+
+
+def test_ungraded_embed_blocks_merge_eligibility():
+    from recon.report import build_result
+    from recon.tiers import TierResult
+    tier = TierResult(3, "keyed_diffs", True, 1, [],
+                      {"embeds_ungraded": ["orders.items"]})
+    result = build_result("u", "live", "m", "t", [tier])
+    assert result["verdict"] == "PASS"
+    assert result["merge_eligible"] is False
+
+
+def test_read_only_sql_validation():
+    from recon.cli import _validate_sql
+    for sql in ("WITH x AS (SELECT 1) UPDATE t SET a=1",
+                "SELECT 1; DELETE FROM t", "SELECT * INTO t2 FROM t"):
+        with pytest.raises(SystemExit):
+            _validate_sql(sql, "unsafe")
+    _validate_sql("/* comment */ WITH x AS (SELECT 1) SELECT * FROM x", "safe")
+
+
+def test_snapshot_manifest_and_merge_eligibility(tmp_path: Path):
+    from recon.cli import _load_snapshot
+    from recon.report import build_result
+    from recon.tiers import TierResult
+    manifest = tmp_path / "snapshot.json"
+    manifest.write_text(json.dumps({
+        "source": "export-1", "extracted_at": "2024-01-01T00:00:00Z",
+        "row_counts": {"ORDERS": 2}}))
+    snapshot = _load_snapshot(manifest, "snapshot")
+    result = build_result("u", "snapshot", "m", "t",
+                          [TierResult(1, "counts", True, 1, [])],
+                          snapshot=snapshot)
+    assert result["snapshot"] == snapshot and result["merge_eligible"] is True
+    with pytest.raises(SystemExit, match="snapshot-manifest"):
+        _load_snapshot(None, "snapshot")
+
+
+def test_continuous_writes_keep_cycle_history(tmp_path: Path):
+    from recon.report import build_result, write_outputs
+    from recon.tiers import TierResult
+    result1 = build_result("u", "continuous", "m", "t",
+                           [TierResult(1, "counts", True, 1, [])])
+    result1["generated_at"] = "2024-01-01T00:00:00+00:00"
+    result2 = dict(result1)
+    result2["generated_at"] = "2024-01-01T00:00:01+00:00"
+    write_outputs(tmp_path, result1)
+    write_outputs(tmp_path, result2)
+    cycles = sorted((tmp_path / "cycles").glob("*.result.json"))
+    assert len(cycles) == 2
+    assert all(json.loads(path.read_text())["mode"] == "continuous" for path in cycles)
+
+
+def test_sampling_unique_keys_retains_bounded_duplicate_state():
+    rows = [{"ORDER_ID": i, "CUST_NAME": str(i), "TOTAL": float(i)} for i in range(200)]
+    source = FakeSource({"ORDERS": rows, "ORDER_ITEMS": []})
+    target = FakeTarget({"orders": [
+        {"order_id": i, "customer": {"name": str(i)}, "total": float(i), "items": []}
+        for i in range(200)]})
+    tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=3)
+    result = run_recon("u", "live", SPEC, tol, RULES, source, target)
+    assert result["tiers"][2]["stats"]["orders"]["duplicate_source_key_count"] == 0

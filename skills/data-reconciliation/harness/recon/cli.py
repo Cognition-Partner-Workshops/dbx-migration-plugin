@@ -37,6 +37,50 @@ def _single_identifier(value: str, option: str) -> str:
     return value
 
 
+def _load_allowed_targets(path: Path) -> list[str]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read allowlist file {path}: {exc}") from None
+    values = data.get("catalogs") if isinstance(data, dict) else None
+    if not isinstance(values, list) or not values:
+        raise SystemExit(f"{path} must contain a non-empty 'catalogs' list")
+    return [_single_identifier(value, "allowed-targets-file") for value in values]
+
+
+def _validate_sql(sql: str, name: str) -> None:
+    stripped = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    stripped = re.sub(r"--[^\r\n]*", " ", stripped)
+    if ";" in stripped or re.search(
+            r"\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|call|"
+            r"exec|execute|copy|unload|into)\b", stripped, re.IGNORECASE):
+        raise SystemExit(f"op {name} SQL must be a single read-only SELECT or WITH query")
+    if not stripped.lstrip().lower().startswith(("select", "with")):
+        raise SystemExit(f"op {name} SQL must be SELECT or WITH")
+
+
+def _load_snapshot(path: Path | None, mode: str) -> dict | None:
+    if mode == "snapshot" and path is None:
+        raise SystemExit("--snapshot-manifest is required when --mode snapshot")
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read snapshot manifest {path}: {exc}") from None
+    if not isinstance(data, dict) or not all(key in data for key in ("source", "extracted_at", "row_counts")):
+        raise SystemExit(f"{path} must contain source, extracted_at, and row_counts")
+    try:
+        dt.datetime.fromisoformat(str(data["extracted_at"]).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise SystemExit(f"{path} extracted_at must be ISO-8601") from None
+    if not isinstance(data["row_counts"], dict) or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in data["row_counts"].values()):
+        raise SystemExit(f"{path} row_counts must be a dictionary of integer counts")
+    return data
+
+
 def selftest() -> int:
     """Blueprint post-setup check: exercises every canonicalization rule on sample values
     and verifies the engine and report modules import. No database connections."""
@@ -79,11 +123,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="ENV VAR NAME holding Databricks SQL JSON "
                         "(convention: DATABRICKS_MIGRATION_SQL)")
     r.add_argument("--target-catalog", required=True)
-    r.add_argument("--allowed-catalogs", required=True,
-                   help="the migration catalog(s) recorded in .migration/00_context.md; "
-                        "the run refuses any other --target-catalog")
+    r.add_argument("--allowed-targets-file", type=Path,
+                   default=Path(".migration/allowed_targets.json"))
     r.add_argument("--target-schema", required=True)
     r.add_argument("--ops", type=Path, help="recorded representative queries for Tier 4")
+    r.add_argument("--snapshot-manifest", type=Path)
     r.add_argument("--seed", type=int, default=0,
                    help="sampling seed (recorded in result.json for re-runnability)")
     r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
@@ -95,14 +139,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "selftest":
         return selftest()
 
-    allowed_catalogs = [_single_identifier(value.strip(), "allowed-catalogs")
-                        for value in args.allowed_catalogs.split(",") if value.strip()]
-    if not allowed_catalogs:
-        raise SystemExit("--allowed-catalogs must contain at least one catalog")
+    allowed_catalogs = _load_allowed_targets(args.allowed_targets_file)
     target_catalog = _single_identifier(args.target_catalog, "target-catalog")
     target_schema = _single_identifier(args.target_schema, "target-schema")
     if target_catalog not in allowed_catalogs:
-        raise SystemExit(f"--target-catalog {target_catalog!r} is not in --allowed-catalogs")
+        raise SystemExit(f"--target-catalog {target_catalog!r} is not in {args.allowed_targets_file}")
 
     params = {}
     for item in args.param:
@@ -116,16 +157,18 @@ def main(argv: list[str] | None = None) -> int:
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
 
-    ops = json.loads(args.ops.read_text()) if args.ops else None
+    snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
+    try:
+        ops = json.loads(args.ops.read_text()) if args.ops else None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read ops file {args.ops}: {exc}") from None
     if ops:
         for op in ops:
             if not all(op.get(k) for k in ("name", "source_sql", "target_sql")):
                 raise SystemExit(
                     f"ops entry missing required keys: {op.get('name', '?')}")
             for key in ("source_sql", "target_sql"):
-                if not op[key].lstrip().lower().startswith(("select", "with")):
-                    raise SystemExit(
-                        f"op {op.get('name', '?')} SQL must be SELECT or WITH")
+                _validate_sql(op[key], op.get("name", "?"))
     from .adapters import SOURCE_ADAPTERS, DatabricksTargetAdapter
 
     source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
@@ -134,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
-                       out_dir=args.out, seed=args.seed, params=params)
+                       out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")

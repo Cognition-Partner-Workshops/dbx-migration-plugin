@@ -22,7 +22,8 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
               rules: list[CanonRule], source, target,
               ops: list[dict] | None = None, run_source=None, run_target=None,
               out_dir: Path | None = None, seed: int = 0,
-              params: dict[str, str] | None = None) -> dict:
+              params: dict[str, str] | None = None,
+              snapshot: dict | None = None) -> dict:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     for c in spec.objects:
@@ -48,7 +49,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         if ops and mode != "continuous":
             tiers.append(tier4_parity(ops, canon, tol, run_source, run_target))
     result = build_result(unit, mode, spec.version, tol.version, tiers,
-                          seed=seed, params=params)
+                          seed=seed, params=params, snapshot=snapshot)
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result
