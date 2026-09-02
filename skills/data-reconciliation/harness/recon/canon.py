@@ -29,7 +29,9 @@ def _decimal_round(value: Any, params: dict) -> Any:
             "half_up": decimal.ROUND_HALF_UP}[params.get("mode", "half_even")]
     places = int(params.get("places", 10))
     d = value if isinstance(value, decimal.Decimal) else decimal.Decimal(str(value))
-    return d.quantize(decimal.Decimal(1).scaleb(-places), rounding=mode)
+    with decimal.localcontext() as ctx:
+        ctx.prec = max(28, len(d.as_tuple().digits) + places + 2)
+        return d.quantize(decimal.Decimal(1).scaleb(-places), rounding=mode)
 
 
 def _datetime_utc_truncate_ms(value: Any, params: dict) -> Any:

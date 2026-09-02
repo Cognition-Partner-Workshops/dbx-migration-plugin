@@ -27,12 +27,14 @@ def _mode_note(mode: str) -> str:
 def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: str,
                  tiers: list[TierResult], seed: int = 0,
                  params: dict[str, str] | None = None,
-                 snapshot: dict | None = None) -> dict:
+                 snapshot: dict | None = None,
+                 provenance_warnings: list[str] | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
             warnings.append(f"UNGRADED embedded values: {path} (cardinality checked only; "
                             "declare embed key/fields in the mapping spec to grade values)")
+    warnings.extend(provenance_warnings or [])
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot")
                       and not warnings and (mode != "snapshot" or snapshot is not None))

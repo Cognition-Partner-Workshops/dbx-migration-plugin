@@ -17,13 +17,35 @@ from .tiers import tier1_counts, tier2_aggregates, tier3_diffs, tier4_parity
 # its one live run.
 MODES = ("fixture", "live", "snapshot", "continuous")
 
+def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | None,
+                                  spec: MappingSpec, tier1) -> list[str]:
+    if snapshot is None:
+        return []
+    warnings = []
+    if snapshot.get("source") != source_family:
+        warnings.append(
+            f"SNAPSHOT provenance: manifest source '{snapshot.get('source')}' "
+            f"!= run family '{source_family}'")
+    observed = tier1.stats.get("source_counts", {})
+    manifest_counts = snapshot.get("row_counts", {})
+    for c in spec.objects:
+        name = c.root_table
+        if name not in manifest_counts:
+            warnings.append(f"SNAPSHOT provenance: {name} missing from manifest")
+        elif manifest_counts[name] != observed.get(name):
+            warnings.append(
+                f"SNAPSHOT provenance mismatch: {name} manifest={manifest_counts[name]} "
+                f"observed={observed.get(name)}")
+    return warnings
+
 
 def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
               rules: list[CanonRule], source, target,
               ops: list[dict] | None = None, run_source=None, run_target=None,
               out_dir: Path | None = None, seed: int = 0,
               params: dict[str, str] | None = None,
-              snapshot: dict | None = None) -> dict:
+              snapshot: dict | None = None,
+              source_family: str | None = None) -> dict:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     for c in spec.objects:
@@ -37,6 +59,8 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         raise ConfigError("--ops given but no query executors; tier 4 cannot run")
     canon = Canonicalizer(rules)
     tiers = [tier1_counts(spec, source, target)]
+    provenance_warnings = _snapshot_provenance_warnings(
+        snapshot, source_family, spec, tiers[0])
     if tiers[0].passed:
         # Tier 1 failures are load defects or mapping-spec violations; nothing else runs.
         tiers.append(tier2_aggregates(spec, tol, canon, source, target))
@@ -49,7 +73,8 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         if ops and mode != "continuous":
             tiers.append(tier4_parity(ops, canon, tol, run_source, run_target))
     result = build_result(unit, mode, spec.version, tol.version, tiers,
-                          seed=seed, params=params, snapshot=snapshot)
+                          seed=seed, params=params, snapshot=snapshot,
+                          provenance_warnings=provenance_warnings)
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result

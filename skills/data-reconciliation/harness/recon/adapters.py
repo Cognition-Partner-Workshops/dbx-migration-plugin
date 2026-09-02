@@ -32,7 +32,7 @@ class TargetAdapter(Protocol):
     def target_row_count(self, object: str, where: str | None = None) -> int: ...
     def nested_count(self, object: str, array_path: str, where: str | None = None) -> int: ...
     def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]: ...
-    def fetch_keyed(self, object: str, key_field: str, fields: list[str],
+    def fetch_keyed(self, object: str, key_fields: list[str], fields: list[str],
                     where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]: ...
 
 
@@ -244,21 +244,33 @@ class DatabricksTargetAdapter:
     def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
         return self._sql.field_aggregates(self._q(object), field_path, where)
 
-    def fetch_keyed(self, object: str, key_field: str, fields: list[str],
+    def fetch_keyed(self, object: str, key_fields: list[str], fields: list[str],
                     where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]:
         # Select top-level columns only; STRUCT/ARRAY columns come back as dicts/lists via
         # Row.asDict(recursive=True) so tier logic can walk dotted paths.
-        tops = list(dict.fromkeys([key_field.split(".")[0]] + [f.split(".")[0] for f in fields]))
+        tops = list(dict.fromkeys([k.split(".")[0] for k in key_fields]
+                                  + [f.split(".")[0] for f in fields]))
         chunks = [keys[i:i + 500] for i in range(0, len(keys), 500)] if keys is not None else [None]
         for chunk in chunks:
             clauses = [f"({where})"] if where else []
             values = []
             if chunk is not None:
-                clauses.append(f"{key_field} IN ({', '.join(self._sql._placeholders(len(chunk)))})")
-                values.extend(k[0] if isinstance(k, tuple) else k for k in chunk)
+                if len(key_fields) == 1:
+                    clauses.append(f"{key_fields[0]} IN ({', '.join(self._sql._placeholders(len(chunk)))})")
+                    values.extend(k[0] if isinstance(k, tuple) else k for k in chunk)
+                else:
+                    groups = []
+                    for key in chunk:
+                        parts = []
+                        for col, value in zip(key_fields, key):
+                            parts.append(f"{col} = {self._sql._placeholders(1, len(values))[0]}")
+                            values.append(value)
+                        groups.append("(" + " AND ".join(parts) + ")")
+                    clauses.append("(" + " OR ".join(groups) + ")")
             w = " WHERE " + " AND ".join(clauses) if clauses else ""
             cur = self._conn.cursor()
-            cur.execute(f"SELECT {', '.join(tops)} FROM {self._q(object)}{w} ORDER BY {key_field}",
+            cur.execute(f"SELECT {', '.join(tops)} FROM {self._q(object)}{w} "
+                        f"ORDER BY {', '.join(key_fields)}",
                         self._sql._params(values))
             for row in cur:
                 rec = row.asDict(recursive=True) if hasattr(row, "asDict") else dict(zip(

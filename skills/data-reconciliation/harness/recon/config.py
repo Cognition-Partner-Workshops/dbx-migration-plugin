@@ -18,6 +18,12 @@ class ConfigError(Exception):
 
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)*$")
+READ_ONLY_SQL_KEYWORDS = re.compile(
+    r"\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|call|"
+    r"exec|execute|copy|unload|into)\b", re.IGNORECASE)
+READ_ONLY_PREDICATE_KEYWORDS = re.compile(
+    r"\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|call|"
+    r"exec|execute|copy|unload|into|union)\b", re.IGNORECASE)
 
 
 def validate_identifier(name: str) -> str:
@@ -27,7 +33,9 @@ def validate_identifier(name: str) -> str:
 
 
 def _validate_predicate(value: str | None) -> str | None:
-    if value is not None and any(token in value for token in (";", "--", "/*")):
+    if (value is not None and
+            (any(token in value for token in (";", "--", "/*"))
+             or READ_ONLY_PREDICATE_KEYWORDS.search(value))):
         raise ConfigError("predicates must be a single expression")
     return value
 
@@ -63,11 +71,15 @@ class ObjectMapping:
     object: str
     root_table: str
     key_source: list[str]
-    key_target: str
+    key_target: list[str]
     fields: list[FieldMapping]
     embeds: list[EmbedMapping] = field(default_factory=list)
     root_where: str | None = None
     target_where: str | None = None
+
+    def __post_init__(self):
+        if isinstance(self.key_target, str):
+            object.__setattr__(self, "key_target", [self.key_target])
 
 
 @dataclass(frozen=True)
@@ -127,7 +139,13 @@ def _validate_mapping_identifiers(c: dict) -> None:
     key = c.get("key") or {}
     for name in key.get("source", []):
         validate_identifier(name)
-    validate_identifier(key.get("target", ""))
+    targets = key.get("target", "")
+    if isinstance(targets, str):
+        targets = [targets]
+    if not isinstance(targets, list) or not targets:
+        raise ConfigError("comparison key target must be a string or list of strings")
+    for name in targets:
+        validate_identifier(name)
     for f in c.get("fields", []):
         validate_identifier(f["source"])
         validate_identifier(f["target"])
@@ -170,9 +188,13 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             raise ConfigError(
                 f"{path}: object '{c.get('object')}' has no comparison key; "
                 "every target table must declare a business key in the mapping spec")
+        key_targets = [key["target"]] if isinstance(key["target"], str) else list(key["target"])
+        if len(key["source"]) != len(key_targets):
+            raise ConfigError(
+                f"{path}: object '{c.get('object')}' comparison key source/target lengths differ")
         objects.append(ObjectMapping(
             object=c.get("object") or c["target_table"], root_table=c.get("root_table") or c["source_table"],
-            key_source=list(key["source"]), key_target=key["target"],
+            key_source=list(key["source"]), key_target=key_targets,
             fields=fields_, embeds=embeds,
             root_where=_validate_predicate(substitute_params(c.get("root_where"), params, path)),
             target_where=_validate_predicate(substitute_params(c.get("target_where"), params, path)),

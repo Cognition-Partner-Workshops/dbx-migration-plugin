@@ -53,10 +53,12 @@ def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
     """Counts THROUGH the mapping: root docs vs root rows; embedded array cardinality vs
     child-table rows. A naive docs-vs-rows count is wrong by construction for embeds."""
     findings, checks = [], 0
+    stats: dict[str, Any] = {"source_counts": {}}
     for c in spec.objects:
         checks += 1
         src_n = source.row_count(c.root_table, c.root_where)
         tgt_n = target.target_row_count(c.object, c.target_where)
+        stats["source_counts"][c.root_table] = src_n
         if src_n != tgt_n:
             findings.append(Finding(c.object, "root_count",
                                     f"rows({c.root_table})={src_n} vs target rows={tgt_n}"))
@@ -67,7 +69,7 @@ def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
             if child_n != emb_n:
                 findings.append(Finding(c.object, "embed_cardinality",
                                         f"rows({e.child_table})={child_n} vs sum(len({e.array_path}))={emb_n}"))
-    return TierResult(1, "counts_through_mapping", not findings, checks, findings)
+    return TierResult(1, "counts_through_mapping", not findings, checks, findings, stats)
 
 
 def _agg_close(a: Any, b: Any, rel_tol: float) -> bool:
@@ -267,8 +269,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         target_counts = {}
         for d in target.fetch_keyed(c.object, c.key_target, proj,
                                     where=c.target_where, keys=keys):
-            kv = _get_path(d, c.key_target)
-            key = (kv,) if not isinstance(kv, tuple) else kv
+            key = tuple(_get_path(d, key_field) for key_field in c.key_target)
             target_counts[key] = target_counts.get(key, 0) + 1
             tgt_docs[key] = d
         for key, count in target_counts.items():
@@ -308,12 +309,28 @@ def tier4_parity(ops: list[dict], canon: Canonicalizer, tol: Tolerances,
     for op in ops:
         checks += 1
         rules = list(op.get("rules", []))
-        s = [tuple(sorted((k, canon.apply(v, rules)[0]) for k, v in row.items()))
+        s = [{k: canon.apply(v, rules)[0] for k, v in row.items()}
              for row in run_source(op)]
-        t = [tuple(sorted((k, canon.apply(v, rules)[0]) for k, v in row.items()))
+        t = [{k: canon.apply(v, rules)[0] for k, v in row.items()}
              for row in run_target(op)]
-        if sorted(map(repr, s)) != sorted(map(repr, t)):
+        unmatched_source = 0
+        unmatched_target = [True] * len(t)
+        for source_row in s:
+            match = None
+            for i, target_row in enumerate(t):
+                if not unmatched_target[i] or source_row.keys() != target_row.keys():
+                    continue
+                if all(canon.equal(source_row[k], target_row[k], rules,
+                                   tol.numeric_abs_tol)[0] for k in source_row):
+                    match = i
+                    break
+            if match is None:
+                unmatched_source += 1
+            else:
+                unmatched_target[match] = False
+        unmatched_target_count = sum(unmatched_target)
+        if unmatched_source or unmatched_target_count:
             findings.append(Finding(op.get("object", "?"), "parity_mismatch",
-                                    f"op '{op.get('name', '?')}' result sets differ "
-                                    f"(source {len(s)} rows, target {len(t)} rows)"))
+                                    f"op {op.get('name', '?')}: {unmatched_source} source rows "
+                                    f"unmatched, {unmatched_target_count} target rows unmatched"))
     return TierResult(4, "app_level_parity", not findings, checks, findings)

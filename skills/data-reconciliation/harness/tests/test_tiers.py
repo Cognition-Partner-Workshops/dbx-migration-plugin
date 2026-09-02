@@ -327,9 +327,11 @@ def test_cli_rejects_unsafe_param_before_adapter(tmp_path: Path):
                   "--param", "x=bad'"])
 
 
-def test_cli_rejects_target_outside_allowlist_before_adapter(tmp_path: Path):
+def test_cli_rejects_target_outside_allowlist_before_adapter(tmp_path: Path, monkeypatch):
     from recon import cli
-    allowlist = tmp_path / "allowed.json"
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    allowlist = tmp_path / ".migration" / "allowed_targets.json"
     allowlist.write_text(json.dumps({"catalogs": ["migration"]}))
     with pytest.raises(SystemExit, match="not in"):
         cli.main(["run", "--unit", "u", "--family", "oracle",
@@ -474,21 +476,106 @@ def test_read_only_sql_validation():
     _validate_sql("/* comment */ WITH x AS (SELECT 1) SELECT * FROM x", "safe")
 
 
-def test_snapshot_manifest_and_merge_eligibility(tmp_path: Path):
+def test_snapshot_manifest_and_merge_eligibility(tmp_path: Path, monkeypatch):
     from recon.cli import _load_snapshot
     from recon.report import build_result
     from recon.tiers import TierResult
-    manifest = tmp_path / "snapshot.json"
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration" / "snapshots").mkdir(parents=True)
+    manifest = tmp_path / ".migration" / "snapshots" / "snapshot.json"
     manifest.write_text(json.dumps({
         "source": "export-1", "extracted_at": "2024-01-01T00:00:00Z",
-        "row_counts": {"ORDERS": 2}}))
+        "row_counts": {"ORDERS": 2}, "unexpected": "not persisted"}))
     snapshot = _load_snapshot(manifest, "snapshot")
+    assert set(snapshot) == {"source", "extracted_at", "row_counts"}
     result = build_result("u", "snapshot", "m", "t",
                           [TierResult(1, "counts", True, 1, [])],
                           snapshot=snapshot)
     assert result["snapshot"] == snapshot and result["merge_eligible"] is True
     with pytest.raises(SystemExit, match="snapshot-manifest"):
         _load_snapshot(None, "snapshot")
+
+
+@pytest.mark.parametrize("snapshot, expected_warning", [
+    ({"source": "oracle", "extracted_at": "2024-01-01T00:00:00Z",
+      "row_counts": {"ORDERS": 1}}, "mismatch"),
+    ({"source": "oracle", "extracted_at": "2024-01-01T00:00:00Z",
+      "row_counts": {}}, "missing"),
+    ({"source": "sqlserver", "extracted_at": "2024-01-01T00:00:00Z",
+      "row_counts": {"ORDERS": 2}}, "run family"),
+])
+def test_snapshot_provenance_warnings(snapshot, expected_warning):
+    source, target = make_green()
+    result = run_recon("u", "snapshot", SPEC, TOL, RULES, source, target,
+                       snapshot=snapshot, source_family="oracle")
+    assert result["verdict"] == "PASS"
+    assert result["merge_eligible"] is False
+    assert any(expected_warning in warning for warning in result["warnings"])
+
+
+def test_snapshot_provenance_matching_is_merge_eligible():
+    source, target = make_green()
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="orders", root_table="ORDERS", key_source=["ORDER_ID"],
+        key_target="order_id", fields=SPEC.objects[0].fields)])
+    result = run_recon(
+        "u", "snapshot", spec, TOL, RULES, source, target,
+        snapshot={"source": "oracle", "extracted_at": "2024-01-01T00:00:00Z",
+                  "row_counts": {"ORDERS": 2}},
+        source_family="oracle")
+    assert result["verdict"] == "PASS"
+    assert result["merge_eligible"] is True
+
+
+def test_composite_key_full_and_sampled_diff():
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="orders", root_table="ORDERS", key_source=["A", "B"],
+        key_target=["a", "b"], fields=[
+            FieldMapping("A", "a", "", "long"), FieldMapping("B", "b", "", "long"),
+            FieldMapping("V", "v", "", "long")])])
+    source = FakeSource({"ORDERS": [{"A": 1, "B": 2, "V": 3},
+                                    {"A": 4, "B": 5, "V": 6}]})
+    target = FakeTarget({"orders": [{"a": 1, "b": 2, "v": 3},
+                                    {"a": 9, "b": 9, "v": 6}]})
+    for threshold in (100, 1):
+        result = run_recon("u", "live", spec,
+                           Tolerances(version="t", full_diff_row_threshold=threshold,
+                                      sample_size=1),
+                           RULES, source, target)
+        assert result["verdict"] == "FAIL"
+        assert any(f["check"] == "missing_doc" for f in result["tiers"][2]["findings"])
+
+
+def test_tier4_multiset_matching_canonicalizes_decimal_and_order():
+    from recon.tiers import tier4_parity
+    from recon.canon import Canonicalizer
+    ops = [{"name": "rows", "object": "orders", "rules": []}]
+    result = tier4_parity(
+        ops, Canonicalizer([CanonRule("identity", "*")]),
+        Tolerances(version="t", numeric_abs_tol=0.01),
+        lambda op: [{"a": decimal.Decimal("1.00")}, {"a": 2}],
+        lambda op: [{"a": 2.0}, {"a": decimal.Decimal("1.005")}])
+    assert result.passed
+
+
+def test_tier4_multiset_matching_preserves_duplicates():
+    from recon.tiers import tier4_parity
+    from recon.canon import Canonicalizer
+    result = tier4_parity(
+        [{"name": "rows", "object": "orders", "rules": []}],
+        Canonicalizer([CanonRule("identity", "*")]), TOL,
+        lambda op: [{"a": 1}, {"a": 1}], lambda op: [{"a": 1}])
+    assert not result.passed
+    assert "1 source rows unmatched" in result.findings[0].detail
+
+
+def test_decimal_round_handles_decimal38_precision():
+    from recon.canon import Canonicalizer
+    value = decimal.Decimal("12345678901234567890123456789.1234567891")
+    result, _ = Canonicalizer([
+        CanonRule("decimal_round", "*", {"places": 4})
+    ]).apply(value, ["decimal_round"])
+    assert result == decimal.Decimal("12345678901234567890123456789.1235")
 
 
 def test_continuous_writes_keep_cycle_history(tmp_path: Path):

@@ -14,7 +14,8 @@ What this script guarantees, so the orchestrator does not have to:
     <manifest>.result.json and the ledger rows the orchestrator appends from it.
   - The verifier is a different session from every child. Only PRs the verifier marks
     PASS are merged, and only if the manifest says auto_merge.
-  - Re-running with the same run_id replays finished children and only launches the rest.
+  - Re-running with the same run_id (also passed as WAVE_RUN_ID) replays finished children and only
+    launches the rest.
 
 Manifest shape (written by the plan playbook, read here):
 {
@@ -88,6 +89,11 @@ if resume:
     if isinstance(prior, dict) and prior.get("run_id") and prior["run_id"] != run_id:
         raise SystemExit(f"WAVE_RUN_ID does not match prior result at {RESULT_PATH}; pass the recorded "
                          "run_id to run_workflow and WAVE_RUN_ID, or WAVE_RERUN=1 for a fresh run")
+
+REPLAYED = {
+    b["id"]: b["status"] for b in (prior or {}).get("batches", [])
+    if b.get("status") in ("PASS", "FAIL", "BLOCKED")
+} if resume and isinstance(prior, dict) else {}
 
 
 def validate_manifest(m):
@@ -301,7 +307,13 @@ async def run_batch(batch, sem, breaker):
             out["one_line_summary"] = (
                 f"PASS downgraded: recon evidence was {out.get('recon_mode')}/"
                 f"{out.get('recon_verdict')}; " + out["one_line_summary"])
-        if out["status"] != "PASS":
+        if (out["status"] == "PASS"
+                and (not out.get("pr_url") or not out.get("branch"))):
+            out["status"] = "FAIL"
+            out["failure_class"] = "missing_pr"
+            out["one_line_summary"] = (
+                "PASS downgraded: no PR URL/branch reported; " + out["one_line_summary"])
+        if out["status"] != "PASS" and batch["id"] not in REPLAYED:
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
             f"{out['one_line_summary']}")
@@ -358,9 +370,13 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
 
 
 async def main():
-    if not resume and os.environ.get("WAVE_RUN_ID"):
+    if not resume:
+        run_id = os.environ.get("WAVE_RUN_ID")
+        if not run_id:
+            raise SystemExit("WAVE_RUN_ID is required on the first run so the wave can be resumed "
+                             "(pass the run_workflow run_id)")
         run_id_tmp = RUN_ID_PATH.with_suffix(".run_id.tmp")
-        run_id_tmp.write_text(os.environ["WAVE_RUN_ID"] + "\n")
+        run_id_tmp.write_text(run_id + "\n")
         os.replace(run_id_tmp, RUN_ID_PATH)
     await register_workflow(META)
     check_write_targets(BATCHES)

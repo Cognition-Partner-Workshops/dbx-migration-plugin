@@ -98,9 +98,14 @@ class FakeTarget:
                 "min": min(nn) if nn else None, "max": max(nn) if nn else None,
                 "sum": sum(nums) if nums else None, "distinct_count": len(set(map(repr, nn)))}
 
-    def fetch_keyed(self, object, key_field, fields, where=None, keys=None) -> Iterable[dict]:
-        self.last_fetch_keyed = {"object": object, "key_field": key_field,
+    def fetch_keyed(self, object, key_fields, fields, where=None, keys=None) -> Iterable[dict]:
+        if isinstance(key_fields, str):
+            key_fields = [key_fields]
+        self.last_fetch_keyed = {"object": object, "key_fields": key_fields,
                                  "fields": fields, "where": where, "keys": keys}
-        for d in sorted(self._rows(object, where), key=lambda d: repr(get_path(d, key_field))):
-            if keys is None or get_path(d, key_field) in keys:
+        wanted = ({k if isinstance(k, tuple) else (k,) for k in keys}
+                  if keys is not None else None)
+        for d in sorted(self._rows(object, where),
+                        key=lambda d: repr(tuple(get_path(d, k) for k in key_fields))):
+            if wanted is None or tuple(get_path(d, k) for k in key_fields) in wanted:
                 yield d

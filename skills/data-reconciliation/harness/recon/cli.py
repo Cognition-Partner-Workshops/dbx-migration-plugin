@@ -19,8 +19,9 @@ import uuid as uuid_mod
 from pathlib import Path
 
 from . import canon, engine, report  # noqa: F401
-from .config import (CanonRule, ConfigError, load_canon_rules, load_mapping_spec,
-                     load_tolerances, validate_identifier)
+from .config import (CanonRule, ConfigError, READ_ONLY_SQL_KEYWORDS,
+                     load_canon_rules, load_mapping_spec, load_tolerances,
+                     validate_identifier)
 from .engine import MODES, run_recon
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks")
@@ -38,6 +39,9 @@ def _single_identifier(value: str, option: str) -> str:
 
 
 def _load_allowed_targets(path: Path) -> list[str]:
+    path = path.resolve()
+    if path != Path(".migration/allowed_targets.json").resolve():
+        raise SystemExit("--allowed-targets-file must resolve to .migration/allowed_targets.json")
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -51,9 +55,7 @@ def _load_allowed_targets(path: Path) -> list[str]:
 def _validate_sql(sql: str, name: str) -> None:
     stripped = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     stripped = re.sub(r"--[^\r\n]*", " ", stripped)
-    if ";" in stripped or re.search(
-            r"\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|call|"
-            r"exec|execute|copy|unload|into)\b", stripped, re.IGNORECASE):
+    if ";" in stripped or READ_ONLY_SQL_KEYWORDS.search(stripped):
         raise SystemExit(f"op {name} SQL must be a single read-only SELECT or WITH query")
     if not stripped.lstrip().lower().startswith(("select", "with")):
         raise SystemExit(f"op {name} SQL must be SELECT or WITH")
@@ -64,6 +66,9 @@ def _load_snapshot(path: Path | None, mode: str) -> dict | None:
         raise SystemExit("--snapshot-manifest is required when --mode snapshot")
     if path is None:
         return None
+    path = path.resolve()
+    if path.suffix != ".json" or not path.is_relative_to(Path(".migration/snapshots").resolve()):
+        raise SystemExit("--snapshot-manifest must be a .json file inside .migration/snapshots")
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -78,7 +83,7 @@ def _load_snapshot(path: Path | None, mode: str) -> dict | None:
             isinstance(value, bool) or not isinstance(value, int)
             for value in data["row_counts"].values()):
         raise SystemExit(f"{path} row_counts must be a dictionary of integer counts")
-    return data
+    return {key: data[key] for key in ("source", "extracted_at", "row_counts")}
 
 
 def selftest() -> int:
@@ -177,7 +182,8 @@ def main(argv: list[str] | None = None) -> int:
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
-                       out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot)
+                       out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
+                       source_family=args.family)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")
