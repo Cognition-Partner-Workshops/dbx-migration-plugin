@@ -126,7 +126,7 @@ The number prefix is reading order, not an execution requirement. `13-dependency
 | Stop | When | Default | What the user decides |
 |---|---|---|---|
 | **A** | after pre-migration | per `stop_mode` (default soft) | target profiles per workload (and which are N/A), recon tolerances, access checklist status, repo topology |
-| **B** | after estate inventory | per `stop_mode` (default soft) | **which pipeline to migrate**, its scope boundary and exclusions |
+| **B** | after estate inventory | per `stop_mode` (default soft) | **which pipeline to migrate** (default: the inventory's recommendation), its scope boundary and exclusions |
 | **C** | after plan | per `stop_mode` (default soft) | analysis, plan, every dependency decision, fan-out width, wave gates, data target |
 | **D** | after each wave | notify | review the wave's PRs and recon evidence in batch; optionally pause the fan-out |
 | **E** | before cutover | blocking | sign-off, evidence, independent audit, cutover authorization |
