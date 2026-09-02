@@ -29,7 +29,8 @@ dbx-recon run \
   --canonicalization skills/<source>-sql/canonicalization.json \
   --mode fixture|live|snapshot|continuous \
   --source-dsn-secret <SOURCE_SECRET_NAME> \
-  --target-secret DATABRICKS_MIGRATION_SQL --target-catalog <migration catalog> --target-schema <schema> \
+  --target-secret DATABRICKS_MIGRATION_SQL --target-catalog <migration catalog> \
+  --allowed-catalogs <migration catalog(s)> --target-schema <schema> \
   --seed 0 [--param from_date=2024-01-01 ...] \
   --out .migration/recon/<unit_id>/
 ```

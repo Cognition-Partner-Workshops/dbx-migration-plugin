@@ -13,18 +13,28 @@ import argparse
 import datetime as dt
 import decimal
 import json
+import re
 import sys
 import uuid as uuid_mod
 from pathlib import Path
 
 from . import canon, engine, report  # noqa: F401
-from .adapters import SOURCE_ADAPTERS, DatabricksTargetAdapter
-from .config import CanonRule, load_canon_rules, load_mapping_spec, load_tolerances
-from .config import ConfigError
+from .config import (CanonRule, ConfigError, load_canon_rules, load_mapping_spec,
+                     load_tolerances, validate_identifier)
 from .engine import MODES, run_recon
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks")
-PARAM_RE = __import__("re").compile(r"^[A-Za-z0-9_\-:.T /]*$")
+PARAM_RE = re.compile(r"^[A-Za-z0-9_\-:.T /]*$")
+
+
+def _single_identifier(value: str, option: str) -> str:
+    try:
+        validate_identifier(value)
+    except ConfigError as exc:
+        raise SystemExit(str(exc)) from None
+    if "." in value:
+        raise SystemExit(f"--{option} must be a single identifier segment")
+    return value
 
 
 def selftest() -> int:
@@ -68,7 +78,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--target-secret", required=True,
                    help="ENV VAR NAME holding Databricks SQL JSON "
                         "(convention: DATABRICKS_MIGRATION_SQL)")
-    r.add_argument("--target-catalog", required=True, help="the migration catalog, never prod")
+    r.add_argument("--target-catalog", required=True)
+    r.add_argument("--allowed-catalogs", required=True,
+                   help="the migration catalog(s) recorded in .migration/00_context.md; "
+                        "the run refuses any other --target-catalog")
     r.add_argument("--target-schema", required=True)
     r.add_argument("--ops", type=Path, help="recorded representative queries for Tier 4")
     r.add_argument("--seed", type=int, default=0,
@@ -81,6 +94,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "selftest":
         return selftest()
+
+    allowed_catalogs = [_single_identifier(value.strip(), "allowed-catalogs")
+                        for value in args.allowed_catalogs.split(",") if value.strip()]
+    if not allowed_catalogs:
+        raise SystemExit("--allowed-catalogs must contain at least one catalog")
+    target_catalog = _single_identifier(args.target_catalog, "target-catalog")
+    target_schema = _single_identifier(args.target_schema, "target-schema")
+    if target_catalog not in allowed_catalogs:
+        raise SystemExit(f"--target-catalog {target_catalog!r} is not in --allowed-catalogs")
 
     params = {}
     for item in args.param:
@@ -98,12 +120,16 @@ def main(argv: list[str] | None = None) -> int:
     if ops:
         for op in ops:
             if not all(op.get(k) for k in ("name", "source_sql", "target_sql")):
-                raise ConfigError(f"ops entry missing required keys: {op.get('name', '?')}")
+                raise SystemExit(
+                    f"ops entry missing required keys: {op.get('name', '?')}")
             for key in ("source_sql", "target_sql"):
                 if not op[key].lstrip().lower().startswith(("select", "with")):
-                    raise ConfigError(f"op {op.get('name', '?')} SQL must be SELECT or WITH")
+                    raise SystemExit(
+                        f"op {op.get('name', '?')} SQL must be SELECT or WITH")
+    from .adapters import SOURCE_ADAPTERS, DatabricksTargetAdapter
+
     source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
-    target = DatabricksTargetAdapter(args.target_secret, args.target_catalog, args.target_schema)
+    target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,

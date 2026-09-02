@@ -184,9 +184,12 @@ def child_prompt(batch):
 
 def verify_prompt(passed, auto_merge):
     merge_line = (
-        "If your wave verdict is PASS, merge the PRs you marked PASS and list them in merged_prs."
+        "Merge every PR you mark PASS and list it in merged_prs, even if another unit in the wave failed; "
+        "failed units are reopened next launch."
         if auto_merge else
-        "Do not merge anything; return per-unit verdicts. The orchestrator merges the PASS PRs at wave close.")
+        "Do not merge anything; return per-unit verdicts. The orchestrator surfaces the PASS PRs in the "
+        "wave brief, merges them at wave close (or records the human's decision in .migration/06_decisions.md), "
+        "and the next wave does not launch until that is done.")
     return (
         f"You are the independent verifier for wave {WAVE}. Repo: {REPO}. You did not write "
         f"any of this code.\nRun the playbook {MANIFEST['verify_macro']} exactly as written over "
@@ -244,7 +247,7 @@ async def run_batch(batch, sem, breaker):
         return out
 
 
-def write_brief(results, verify, surprises, undeclared, unreported):
+def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
     """Ten lines a lead reads in one minute. The orchestrator posts this at wave close."""
     n = len(BATCHES)
     passed = sum(1 for r in results if r["status"] == "PASS")
@@ -272,6 +275,10 @@ def write_brief(results, verify, surprises, undeclared, unreported):
     if unreported:
         lines.append(f"Merges held: {', '.join(unreported)} passed but reported no write targets; "
                      "a human confirms what they wrote before any PR lands.")
+    if not auto_merge:
+        urls = [r["pr_url"] for r in results
+                if r["status"] == "PASS" and r.get("pr_url")]
+        lines.append("Awaiting manual merge: " + (", ".join(urls) or "none reported"))
     lines += [
         "",
         "Verifier findings:" if verify and verify["findings"] else "Verifier findings: none.",
@@ -352,7 +359,7 @@ async def main():
         "verify": verify,
     }, indent=2, sort_keys=True) + "\n")
     os.replace(result_tmp, RESULT_PATH)
-    write_brief(results, verify, surprises, undeclared, unreported)
+    write_brief(results, verify, surprises, undeclared, unreported, auto_merge)
     log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 

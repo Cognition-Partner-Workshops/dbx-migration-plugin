@@ -320,7 +320,19 @@ def test_cli_rejects_unsafe_param_before_adapter(tmp_path: Path):
                   "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
                   "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
                   "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
-                  "--target-catalog", "c", "--target-schema", "s", "--param", "x=bad'"])
+                  "--target-catalog", "c", "--allowed-catalogs", "c", "--target-schema", "s",
+                  "--param", "x=bad'"])
+
+
+def test_cli_rejects_target_outside_allowlist_before_adapter(tmp_path: Path):
+    from recon import cli
+    with pytest.raises(SystemExit, match="not in --allowed-catalogs"):
+        cli.main(["run", "--unit", "u", "--family", "oracle",
+                  "--mapping", str(tmp_path / "missing"), "--tolerances", str(tmp_path / "missing"),
+                  "--canonicalization", str(tmp_path / "missing"), "--mode", "fixture",
+                  "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+                  "--target-catalog", "not_migration", "--allowed-catalogs", "migration",
+                  "--target-schema", "s", "--out", str(tmp_path / "out")])
 
 
 def test_scoped_source_and_target_pass_and_missing_scope_fails():
