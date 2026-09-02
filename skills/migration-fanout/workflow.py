@@ -54,7 +54,9 @@ BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
     try:
         prior = json.loads(RESULT_PATH.read_text())
-    except json.JSONDecodeError:
+        if not isinstance(prior, dict):
+            raise ValueError("result is not a JSON object")
+    except ValueError:
         if os.environ.get("WAVE_RESUME") != "1":
             raise SystemExit(f"{RESULT_PATH} is not valid JSON (interrupted write?). Inspect it; to resume "
                              "the same run set WAVE_RESUME=1 with the recorded run_id, or set WAVE_RERUN=1 "
