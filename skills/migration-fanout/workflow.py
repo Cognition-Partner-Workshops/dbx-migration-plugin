@@ -221,7 +221,7 @@ async def run_batch(batch, sem, breaker):
         return out
 
 
-def write_brief(results, verify, surprises, undeclared):
+def write_brief(results, verify, surprises, undeclared, unreported):
     """Ten lines a lead reads in one minute. The orchestrator posts this at wave close."""
     n = len(BATCHES)
     passed = sum(1 for r in results if r["status"] == "PASS")
@@ -246,6 +246,9 @@ def write_brief(results, verify, surprises, undeclared):
         lines.append("Merges held: children wrote outside their declared targets: "
                      + "; ".join(f"{k}: {', '.join(v)}" for k, v in sorted(undeclared.items()))
                      + ". A human decides which PR lands.")
+    if unreported:
+        lines.append(f"Merges held: {', '.join(unreported)} passed but reported no write targets; "
+                     "a human confirms what they wrote before any PR lands.")
     lines += [
         "",
         "Verifier findings:" if verify and verify["findings"] else "Verifier findings: none.",
