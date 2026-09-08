@@ -81,7 +81,7 @@ def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source,
         # keys and the lag behind a count gap instead of just the gap
         tiers.append(tier5_pk_set(spec, tol, ctx, source, target))
         tiers.append(tier6_cdc(spec, tol, ctx, source, target))
-        tiers.append(tier7_schema_parity(spec, source, target))
+        tiers.append(tier7_schema_parity(spec, tol, source, target))
         # the window closes last so every tier above read inside it; a moved side fails the run
         tiers.insert(0, close_window(spec, tol, ctx, source, target))
     return tiers

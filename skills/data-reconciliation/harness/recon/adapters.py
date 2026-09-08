@@ -42,6 +42,10 @@ def _as_key(value: Any) -> tuple:
 # epoch-microsecond datetime's square inside DECIMAL(38,0) on every engine.
 DIGEST_MODULUS = 2_147_483_647
 
+# How often a fallback window marker re-reads (token, count/max, token) before giving up on a
+# quiet bracket and recording the unstable pair instead.
+MARKER_BRACKET_ATTEMPTS = 3
+
 
 def _digest_value(value: Any) -> Any:
     """Normalise an engine's SUM result so equal digests compare equal across drivers
@@ -427,22 +431,30 @@ class _SqlAdapterBase:
         w = f" WHERE {where}" if where else ""
         marks = [f"MAX({watermark})"] if watermark else [f"MAX({k})" for k in key_cols]
         sql = f"SELECT COUNT(*), {', '.join(marks)} FROM {table}{w}"
-        try:
+        if self.isolation in ("snapshot", "repeatable_read"):
+            try:
+                return tuple(self._rows(sql)[0])
+            except Exception:  # noqa: BLE001  driver-specific error type
+                if self.isolation != "snapshot":
+                    raise
+                # SQL Server accepts SET ... SNAPSHOT and only fails on the first table read when
+                # the database has ALLOW_SNAPSHOT_ISOLATION off; drop to plain reads, markers
+                # still decide.
+                self._conn.rollback()
+                if self.snapshot_reset_sql:
+                    self._execute(self.snapshot_reset_sql)
+                self.isolation = "none"
+        # No pinned snapshot: the count/max row and the change token are separate reads, so a
+        # write landing between them would enter the baseline unseen. Bracket the row with two
+        # token reads and accept it only when both agree; a bracket that never settles carries
+        # both tokens, a shape no later marker can equal.
+        for _ in range(MARKER_BRACKET_ATTEMPTS):
+            before = self._change_token(table)
             row = self._rows(sql)[0]
-        except Exception:  # noqa: BLE001  driver-specific error type
-            if self.isolation != "snapshot":
-                raise
-            # SQL Server accepts SET ... SNAPSHOT and only fails on the first table read when the
-            # database has ALLOW_SNAPSHOT_ISOLATION off; drop to plain reads, markers still decide.
-            self._conn.rollback()
-            if self.snapshot_reset_sql:
-                self._execute(self.snapshot_reset_sql)
-            self.isolation = "none"
-            row = self._rows(sql)[0]
-        marker = tuple(row)
-        if self.isolation not in ("snapshot", "repeatable_read"):
-            marker += (self._change_token(table),)
-        return marker
+            after = self._change_token(table)
+            if before == after:
+                return tuple(row) + (after,)
+        return tuple(row) + (before, after)
 
     def _range_predicate(self, key_cols: list[str], lo: tuple | None, hi: tuple | None,
                          offset: int) -> tuple[str, list[Any]]:

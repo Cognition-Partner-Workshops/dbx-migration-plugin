@@ -6,5 +6,6 @@
   "aggregate_rel_tol": 0.0,
   "source_concurrency": 1,
   "cdc_lag_max_s": 60,
-  "pk_set_ranges": 16
+  "pk_set_ranges": 16,
+  "accept_target_only_constraints": true
 }

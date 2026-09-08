@@ -117,6 +117,10 @@ class Tolerances:
     # insert+delete pairs. False (default): such a run is not merge-eligible. True records the
     # STOP A decision to accept marker-only evidence (Sybase ASE, logins without VIEW SERVER STATE).
     accept_marker_only_window: bool = False
+    # Tier 7 fails a target that enforces a NOT NULL, unique, foreign-key or CHECK constraint the
+    # source does not: such a target rejects writes the legacy application makes today. True
+    # records the decision that the tightening is intended and demotes those findings to stats.
+    accept_target_only_constraints: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,6 +264,7 @@ def load_tolerances(path: Path) -> Tolerances:
         pk_set_ranges=int(data.get("pk_set_ranges", 64)),
         pk_set_stream_every_range=_flag(data, "pk_set_stream_every_range", path),
         accept_marker_only_window=_flag(data, "accept_marker_only_window", path),
+        accept_target_only_constraints=_flag(data, "accept_target_only_constraints", path),
     )
 
 

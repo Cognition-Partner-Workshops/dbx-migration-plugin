@@ -10,6 +10,7 @@ from recon.adapters import (
     LakebaseTargetAdapter,
     SchemaFacts,
     TargetIdentityError,
+    _SqlAdapterBase,
 )
 from recon.cli import main
 from recon.config import (
@@ -421,7 +422,8 @@ def test_marker_only_window_is_accepted_only_by_a_recorded_tolerance():
     assert window["stats"]["accepted_marker_only"] == ["source"]
 
 
-@pytest.mark.parametrize("flag", ["accept_marker_only_window", "pk_set_stream_every_range"])
+@pytest.mark.parametrize("flag", ["accept_marker_only_window", "pk_set_stream_every_range",
+                                  "accept_target_only_constraints"])
 @pytest.mark.parametrize("value", ["false", "true", "no", 0, 1, None, [], {}])
 def test_tolerance_switches_must_be_json_booleans(tmp_path, flag, value):
     path = tmp_path / "tol.json"
@@ -438,6 +440,7 @@ def test_tolerance_switches_load_real_booleans_and_default_off(tmp_path):
     path.write_text(json.dumps({"version": "t1"}))
     tol = load_tolerances(path)
     assert tol.accept_marker_only_window is False and tol.pk_set_stream_every_range is False
+    assert tol.accept_target_only_constraints is False
 
 
 def _tokened(source, counter):
@@ -606,6 +609,62 @@ def test_source_filtered_indexes_are_reported_for_a_manual_check_not_graded():
     assert parity["stats"]["loans"]["source"]["partial"] == [["days_past_due"]]
 
 
+def _facts(base: SchemaFacts, **over) -> SchemaFacts:
+    fields = {"primary_key": base.primary_key, "unique": set(base.unique),
+              "foreign_keys": set(base.foreign_keys), "not_null": set(base.not_null),
+              "indexes": set(base.indexes), "check_count": base.check_count,
+              "identity_columns": set(base.identity_columns)}
+    fields.update(over)
+    return SchemaFacts(**fields)
+
+
+def _tightened(**over) -> SchemaFacts:
+    return _facts(TARGET_LOANS_FACTS, **over)
+
+
+@pytest.mark.parametrize("src, tgt, code, needle", [
+    (_facts(LOANS_FACTS, not_null=LOANS_FACTS.not_null - {"current_balance"}), _tightened(),
+     "not_null_extra", "current_balance is NOT NULL but its source column is nullable"),
+    (LOANS_FACTS, _tightened(unique=TARGET_LOANS_FACTS.unique | {("borrower_id", "loan_number")}),
+     "unique_extra", "('borrower_id', 'loan_number') has no source counterpart"),
+    (LOANS_FACTS, _tightened(foreign_keys=TARGET_LOANS_FACTS.foreign_keys
+                             | {(("loan_number",), "loan_servicing.borrowers", ("borrower_id",))}),
+     "foreign_key_extra", "('loan_number',) -> borrowers('borrower_id',) has no source counterpart"),
+    (LOANS_FACTS, _tightened(check_count=3), "check_constraint_count_higher",
+     "source 2 CHECK constraints, target 3"),
+])
+def test_a_target_only_constraint_fails_parity_because_it_rejects_legacy_valid_writes(src, tgt, code, needle):
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target)
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    parity = _tier(result, "schema_parity")
+    assert [f["check"] for f in parity["findings"]] == [code]
+    assert needle in parity["findings"][0]["detail"]
+
+    accepted = _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))
+    assert accepted["verdict"] == "PASS" and accepted["merge_eligible"] is True
+    note = _tier(accepted, "schema_parity")["stats"]["accepted_target_only_constraints"]
+    assert len(note) == 1 and note[0].startswith(f"loans: {code}: ")
+
+
+def test_target_only_constraints_on_unmapped_columns_or_out_of_scope_tables_are_noted_not_graded():
+    loans, borrowers = _rows(6)
+    facts = _tightened(
+        unique=TARGET_LOANS_FACTS.unique | {("servicer_ref",)},
+        foreign_keys=TARGET_LOANS_FACTS.foreign_keys
+        | {(("servicer_id",), "loan_servicing.servicers", ("servicer_id",))},
+        not_null=TARGET_LOANS_FACTS.not_null | {"servicer_ref", "servicer_id"})
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=facts)
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == []
+    stats = _tier(result, "schema_parity")["stats"]
+    assert stats["target_only_columns_unverified"] == [
+        "loans: unique ('servicer_ref',) covers a column outside the mapping"]
+    assert stats["foreign_keys_out_of_scope"] == ["loans: target FK ('servicer_id',) -> servicers"]
+
+
 def test_primary_key_mismatch_is_reported():
     loans, borrowers = _rows(6)
     facts = SchemaFacts(primary_key=("loan_number",), unique={("loan_number",)},
@@ -768,6 +827,72 @@ def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkey
     assert conns[0].executed == ["SELECT current_database()"]
     target = LakebaseTargetAdapter("T", "loan_servicing_prod", "loan_servicing")
     assert target.database == "loan_servicing_prod" and conns[1].closed is False
+
+
+class _LiveTable:
+    """DB-API stand-in for an engine with no snapshot: answers the marker aggregate and a
+    per-table write counter, and lets a test schedule a write between any two statements."""
+
+    def __init__(self):
+        self.count, self.max_wm, self.token = 100, 500, 7
+        self.executed: list[str] = []
+        self.before_statement: dict = {}
+
+    def write_below_max(self):
+        self.token += 1  # an UPDATE that leaves COUNT(*) and MAX(watermark) untouched
+
+    def cursor(self):
+        conn = self
+
+        class Cur:
+            def execute(self, sql, params=()):
+                hook = conn.before_statement.pop(len(conn.executed), None)
+                if hook:
+                    hook()
+                conn.executed.append(sql)
+                self.sql = sql
+
+            def fetchall(self):
+                if self.sql.startswith("TOKEN"):
+                    return [(conn.token,)]
+                return [(conn.count, conn.max_wm)]
+        return Cur()
+
+
+class _NoSnapshotAdapter(_SqlAdapterBase):
+    change_token_sql = "TOKEN {table}"
+
+
+def test_a_write_between_the_marker_row_and_its_token_is_not_baked_into_the_baseline():
+    conn = _LiveTable()
+    conn.before_statement[2] = conn.write_below_max  # after the aggregate, before the token
+    adapter = _NoSnapshotAdapter(conn)
+    assert adapter.open_window() == "none"
+    marker = adapter.window_marker("dbo.loan", ["loan_id"], "modified_date")
+    # first bracket (7, row, 8) disagreed and was discarded; the retry read (8, row, 8)
+    assert marker == (100, 500, 8)
+    assert [s[:5] for s in conn.executed] == ["TOKEN", "SELEC", "TOKEN", "TOKEN", "SELEC", "TOKEN"]
+    assert adapter.window_marker("dbo.loan", ["loan_id"], "modified_date") == marker
+
+
+def test_a_bracket_that_never_settles_yields_a_marker_no_close_can_match():
+    conn = _LiveTable()
+    for i in (2, 5, 8):  # a write inside every one of the three brackets
+        conn.before_statement[i] = conn.write_below_max
+    adapter = _NoSnapshotAdapter(conn)
+    adapter.open_window()
+    opened = adapter.window_marker("dbo.loan", ["loan_id"], "modified_date")
+    assert opened == (100, 500, 9, 10)
+    closed = adapter.window_marker("dbo.loan", ["loan_id"], "modified_date")
+    assert closed == (100, 500, 10) and closed != opened
+
+
+def test_a_pinned_snapshot_marker_reads_no_token():
+    conn = _LiveTable()
+    adapter = _NoSnapshotAdapter(conn)
+    adapter.isolation = "repeatable_read"
+    assert adapter.window_marker("dbo.loan", ["loan_id"], "modified_date") == (100, 500)
+    assert all(not s.startswith("TOKEN") for s in conn.executed)
 
 
 def test_cli_refuses_a_lakebase_dsn_outside_the_allowlisted_database(tmp_path, monkeypatch):

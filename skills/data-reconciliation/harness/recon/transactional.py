@@ -423,12 +423,24 @@ def _covered(leading: tuple, facts: SchemaFacts) -> bool:
     return any(tuple(x.lower() for x in cand[:len(leading)]) == leading for cand in candidates)
 
 
-def tier7_schema_parity(spec: MappingSpec, source, target) -> TierResult:
+def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> TierResult:
+    """Constraints are compared both ways: a source constraint the target lacks lets bad data in,
+    a target constraint the source lacks rejects writes the legacy application makes today.
+    Indexes stay one-directional (an extra target index changes cost, not acceptance)."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
     tables = _table_map(spec)
+
+    def tightened(finding: Finding) -> None:
+        if tol.accept_target_only_constraints:
+            stats.setdefault("accepted_target_only_constraints", []).append(
+                f"{finding.object}: {finding.check}: {finding.detail}")
+        else:
+            findings.append(finding)
+
     for c in spec.objects:
         colmap = _column_map(spec, c)
+        mapped_targets = {v.lower() for v in colmap.values()}
         try:
             s = source.schema_facts(c.root_table)
             t = target.schema_facts(c.object)
@@ -449,10 +461,20 @@ def tier7_schema_parity(spec: MappingSpec, source, target) -> TierResult:
             findings.append(Finding(c.object, "primary_key_mismatch",
                                     f"source {s.primary_key} -> expected {pk}, target {t.primary_key}",
                                     s.primary_key, t.primary_key))
+        expected_unique = {_map_cols(u, colmap) for u in s.unique}
         for u in sorted(s.unique):
             if _map_cols(u, colmap) not in t_lower.unique:
                 findings.append(Finding(c.object, "unique_missing",
                                         f"source unique {u} has no target unique {_map_cols(u, colmap)}"))
+        for u in sorted(t_lower.unique - expected_unique - {t_lower.primary_key}):
+            if set(u) <= mapped_targets:
+                tightened(Finding(c.object, "unique_extra",
+                                  f"target unique {u} has no source counterpart: legacy-valid "
+                                  "duplicates would be rejected"))
+            else:
+                stats.setdefault("target_only_columns_unverified", []).append(
+                    f"{c.object}: unique {u} covers a column outside the mapping")
+        expected_fks: set[tuple] = set()
         for cols, ref, rcols in sorted(s.foreign_keys):
             ref_obj = tables.get(ref.split(".")[-1].lower())
             if ref_obj is None:
@@ -460,14 +482,29 @@ def tier7_schema_parity(spec: MappingSpec, source, target) -> TierResult:
                 continue
             ref_map = next((_column_map(spec, o) for o in spec.objects if o.object.lower() == ref_obj), {})
             want = (_map_cols(cols, colmap), ref_obj, _map_cols(rcols, ref_map))
+            expected_fks.add(want)
             if want not in t_lower.foreign_keys:
                 findings.append(Finding(c.object, "foreign_key_missing",
                                         f"source FK {cols} -> {ref}{rcols} expected on target as {want}"))
+        in_scope = {o.object.lower() for o in spec.objects}
+        for cols, ref, rcols in sorted(t_lower.foreign_keys - expected_fks):
+            if ref not in in_scope:
+                stats.setdefault("foreign_keys_out_of_scope", []).append(
+                    f"{c.object}: target FK {cols} -> {ref}")
+            else:
+                tightened(Finding(c.object, "foreign_key_extra",
+                                  f"target FK {cols} -> {ref}{rcols} has no source counterpart: "
+                                  "legacy-valid orphans would be rejected"))
+        expected_not_null = {colmap[col].lower() for col in s.not_null if col in colmap}
         for col in sorted(s.not_null):
             mapped = colmap.get(col, col).lower()
             if col in colmap and mapped not in t_lower.not_null:
                 findings.append(Finding(c.object, "not_null_missing",
                                         f"source NOT NULL {col} -> target {mapped} is nullable"))
+        for col in sorted((t_lower.not_null & mapped_targets) - expected_not_null - set(t_lower.primary_key)):
+            tightened(Finding(c.object, "not_null_extra",
+                              f"target {col} is NOT NULL but its source column is nullable: "
+                              "legacy-valid NULLs would be rejected"))
         for idx in sorted(s.indexes):
             if not _covered(_map_cols(idx, colmap), t_lower):
                 findings.append(Finding(c.object, "index_missing",
@@ -476,6 +513,11 @@ def tier7_schema_parity(spec: MappingSpec, source, target) -> TierResult:
             findings.append(Finding(c.object, "check_constraint_count_lower",
                                     f"source {s.check_count} CHECK constraints, target {t.check_count}",
                                     s.check_count, t.check_count))
+        elif t.check_count > s.check_count:
+            tightened(Finding(c.object, "check_constraint_count_higher",
+                              f"source {s.check_count} CHECK constraints, target {t.check_count}: "
+                              "the extra checks reject writes the source accepts",
+                              s.check_count, t.check_count))
         for idx in sorted(s.partial):
             stats.setdefault("partial_indexes_unverified", []).append(
                 f"{c.object}: source filtered index {idx} carries a predicate the harness cannot "

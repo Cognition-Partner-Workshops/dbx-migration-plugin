@@ -8,10 +8,10 @@ Postgres database standing in for a Lakebase migration branch (same wire protoco
 
 | File | Purpose |
 |---|---|
-| `target_ddl.sql` | Lakebase-shaped schema: `IDENTITY` for `INT IDENTITY`, `NUMERIC(19,4)` for `MONEY`, `TIMESTAMP(6)` for `DATETIME2`, `TEXT` for `VARCHAR(MAX)`, every PK/unique/FK/NOT NULL/CHECK/index carried over |
+| `target_ddl.sql` | Lakebase-shaped schema: `IDENTITY` for `INT IDENTITY`, `NUMERIC(19,4)` for `MONEY`, `TIMESTAMP(6)` for `DATETIME2`, `TEXT` for `VARCHAR(MAX)`, every PK/NOT NULL/index carried over, plus the unique/FK/CHECK constraints of the loan-servicing model that the `raw.*` landing schema does not declare |
 | `load_target.py` | One-shot SELECT -> `COPY` initial load in FK order; restarts identity sequences above the loaded max. Secrets by name only |
 | `mapping.json` | Five objects with `key`, `watermark`, `identity`, field maps and type canonicalization |
-| `tolerances.json` | OLTP record: zero numeric tolerance, `cdc_lag_max_s: 60`, `pk_set_ranges: 16` |
+| `tolerances.json` | OLTP record: zero numeric tolerance, `cdc_lag_max_s: 60`, `pk_set_ranges: 16`, `accept_target_only_constraints: true` (the recorded decision that the target's added unique/FK/CHECK constraints are intended; see Observed) |
 | `canonicalization.json` | `decimal_round` for MONEY, `datetime_utc_truncate_ms` for legacy DATETIME, `rstrip_spaces` for CHAR, `empty_string_is_null` for VARCHAR(MAX) |
 | `inject_target_defects.sql` | Negative rehearsal A: missing keys, stray row, out-of-order apply, dropped NOT NULL, sequence behind |
 | `inject_target_drift.sql` | Negative rehearsal B: CDC lag beyond tolerance plus one applied-row value drift |
@@ -37,8 +37,9 @@ dbx-recon run --unit loan_servicing_oltp --family sqlserver \
 ## Observed
 
 Clean target: `PASS`, `merge_eligible=true`; tiers 0/1/2/3/5/6/7 = 5/5/68/6730/5/5/10 checks,
-zero findings, zero rows in flight. Cost 97 source statements / 6810 rows fetched, 55 target
-statements / 6730 rows, under one second. Window isolation: target `repeatable_read` (verified
+zero findings, zero rows in flight. Cost 107 source statements / 6810 rows fetched, 56 target
+statements / 6730 rows, under one second (ten of the source statements are the second
+change-token read that brackets each of the five open and five close markers). Window isolation: target `repeatable_read` (verified
 by updating a row from another connection mid-window: marker unchanged inside, visible after
 close); source `none` because the fixture database has `ALLOW_SNAPSHOT_ISOLATION OFF`, so the
 adapter reset to `READ COMMITTED`; its window strength is `change_token` (the
@@ -48,6 +49,16 @@ and modular sum of squares per key column and for the watermark) matched on all 
 every table across engines (`DATEDIFF_BIG` microseconds vs `EXTRACT(EPOCH)` microseconds; T-SQL
 `%` vs Postgres `MOD()`), so no keys streamed on the clean run. `--target-catalog` was the
 connected database name; pointing it at another name is refused before any query runs.
+
+The first run with two-way constraint parity failed the clean target on tier 7 alone: `unique_extra
+('loan_number',)`, `check_constraint_count_higher 0 -> 2` and `foreign_key_extra borrower_id ->
+borrowers` on `loans`, `foreign_key_extra loan_id -> loans` on `payments`/`escrow_accounts`/
+`loan_modifications`, `check_constraint_count_higher 0 -> 1` on `payments`. The `raw.*` source
+schema declares none of them, so a legacy-valid orphan or duplicate loan number would be rejected
+by the target. Keeping them is the intent of this rehearsal, so the decision is recorded as
+`accept_target_only_constraints: true` in `tolerances.json`; the seven findings now sit under
+`stats.accepted_target_only_constraints` and the run is `PASS` again. Without the record the
+verdict is `FAIL`, `merge_eligible=false`.
 
 Rehearsal A (`inject_target_defects.sql`): `FAIL`. Tier 1 count gaps on `payments`/`escrow_accounts`;
 tier 5 `pk_missing_on_target [(10,), (11,)]` and `pk_extra_on_target [(999999,)]`; tier 6
