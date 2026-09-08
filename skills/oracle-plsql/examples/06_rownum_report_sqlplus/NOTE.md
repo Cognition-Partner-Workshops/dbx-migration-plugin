@@ -12,7 +12,7 @@
 |---|---|---|
 | `SET PAGESIZE/LINESIZE/...`, `SPOOL`, `WHENEVER`, `EXIT` | dropped / task semantics; table stated per directive | §6 SQL*Plus row; §7 trap 17 |
 | `&1`, `&2`, `DEFINE page_size` | named parameter markers `:page_no`, `:as_of`, `:page_size` via `sql_task.parameters` | §6 SQL*Plus row |
-| `ROWNUM` sandwich | `ORDER BY ... LIMIT ... OFFSET` in the inner query + `row_number()` for `rn` | §5 #68; §7 trap 7 |
+| `ROWNUM` sandwich | `ORDER BY ... LIMIT ... OFFSET` in the inner query + `:page_size * (:page_no - 1) + row_number()` for `rn` (Oracle numbers the whole ordered set, so `rn` continues across pages) | §5 #68; §7 trap 7 |
 | `LISTAGG(x,';') WITHIN GROUP (ORDER BY ...)` | `listagg(...) WITHIN GROUP (...)` | §5 #72 |
 | `TO_CHAR(d,'DD-MON-YYYY')` | `upper(date_format(d,'dd-MMM-yyyy'))` | §5 #45 |
 | `TO_CHAR(n,'FM999999990.00')` | `cast(cast(n AS DECIMAL(18,2)) AS STRING)` (no `FM` in Databricks `to_char`) | §5 #44 |
@@ -27,7 +27,9 @@
   output. A `LIMIT`/`OFFSET` placed outside the ordered subquery, or an `ORDER BY` on a non-total key, produces a
   different set of rows per page (Oracle: `ROWNUM` after the inner `ORDER BY`). `MMM` without `upper()` gives `Jan`
   vs `JAN`; a bare `cast(annual_premium AS STRING)` gives `1234.5` vs `1234.50`; a missing `rtrim` gives a
-  trailing-blank `postcode`.
+  trailing-blank `postcode`. A bare `row_number()` for `rn` restarts at 1 on every page, so page 2 keys
+  `(2, 1..page_size)` find no Oracle rows `(2, page_size+1..2*page_size)`: every row of every page after the first
+  is a Tier 4 miss, which is why the offset is added back.
 - **Tier 1** on the page: exactly `page_size` rows except the last page. Off-by-one in `OFFSET :page_size *
   (:page_no - 1)` shows as a duplicated/skipped row between consecutive pages.
 - **Tier 3** on the underlying `SELECT` (before formatting), keyed by `policy_no`: catches the `''` rows that Oracle

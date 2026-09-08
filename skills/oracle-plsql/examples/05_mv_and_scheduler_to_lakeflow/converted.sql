@@ -80,8 +80,11 @@ SELECT p.product_cd,
 --             file:
 --               path: ../src/sql/call_renew_expiring.sql   # see examples/07: CALL ... ; IF status <> 'OK' THEN SIGNAL ...
 --               source: WORKSPACE
---           # max_failures 3 + restartable TRUE -> task retries (retry the failed task, not the whole chain)
---           max_retries: 3
+--           # restartable TRUE -> Oracle restarts a failed run with back-off and counts the exhausted restarts as ONE
+--           # failure; the nearest field is a task retry. Retries are per run and the count resets every run
+--           # (#Retry Behavior), so this is NOT max_failures. Keep the retry count at 1 (renew_expiring is idempotent
+--           # through the MERGE in example 07); the exact Oracle restart count is a live-verify item.
+--           max_retries: 1
 --           min_retry_interval_millis: 300000
 --           retry_on_timeout: false
 --         # PRG_NIGHTLY_RENEWAL step 2: DBMS_MVIEW.REFRESH('ODS.MV_POLICY_PREMIUM_SUMMARY', METHOD => 'F')
@@ -92,6 +95,19 @@ SELECT p.product_cd,
 --           pipeline_task:
 --             pipeline_id: ${resources.pipelines.ods_summary_pipeline.id}
 --             full_refresh: false                  # METHOD => 'F' (fast); a 'C' complete refresh maps to full_refresh: true
+--
+-- GAP: max_failures 3 (§7 trap 16). Oracle counts consecutive *failed scheduled runs* and sets the job to
+-- state = 'BROKEN' after 3, so no fourth night runs until a DBA re-enables it. Lakeflow has no job-level failure
+-- counter and never pauses a schedule on its own; max_retries above is orthogonal (attempts inside one run).
+-- Mitigation chosen for this unit (recorded in 06_decisions.md):
+--   1. email_notifications.on_failure above + the ops runbook step "after 3 consecutive failed runs set
+--      schedule.pause_status: PAUSED" [jobs:references/triggers-schedules.md#Pause and Resume]; and
+--   2. an optional guard task, first in the chain, that reads the last 3 runs of this job
+--      (`databricks jobs get-run`, [jobs:SKILL.md#Common Operations]) and, if all failed, pauses the schedule via
+--      `databricks jobs update <job_id> --json '{"new_settings":{"schedule":{"pause_status":"PAUSED"}}}'` and
+--      fails the run, so behaviour matches Oracle (no further work is attempted). Not implemented here: it needs the
+--      job's own id at run time and a principal allowed to update the job, both deployment facts, not conversion facts.
+-- Until one of these is live the target keeps scheduling after Oracle would have stopped (Tier 4 outcome drift).
 --
 -- Not mapped (recorded as GAP in the census, §10): job_class DEFAULT_JOB_CLASS (resource-consumer group),
 -- logging_level LOGGING_FULL (Jobs run history is always on), ATOMIC_REFRESH => TRUE (a pipeline update is atomic per

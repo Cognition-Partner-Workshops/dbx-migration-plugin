@@ -20,7 +20,8 @@ comment block so the file stays a single `.sql`).
 | `ENABLE QUERY REWRITE` | none (no rewrite on Databricks; consumers query the MV directly) | §6 MV row, GAP |
 | `repeat_interval` calendar string + `start_date` TZ | `quartz_cron_expression` + `timezone_id: Europe/London` | §6 scheduler row; §7 trap 16 |
 | program = two PL/SQL steps | two tasks with `depends_on` + `run_if: ALL_SUCCESS` | §6 scheduler row |
-| `max_failures 3`, `restartable TRUE` | task `max_retries: 3` | §7 trap 16 |
+| `restartable TRUE` | task `max_retries: 1` (attempts *within one run*; count resets per run) | §7 trap 16 |
+| `max_failures 3` (job disabled / `BROKEN` after 3 consecutive failed runs) | **GAP**: no Lakeflow field; `on_failure` + runbook "pause after 3", optional guard task that sets `schedule.pause_status: PAUSED` | §7 trap 16; §6 scheduler row; `06_decisions.md` |
 | `max_run_duration 2h`, `JOB_OVER_MAX_DUR` | `timeout_seconds: 7200` + `RUN_DURATION_SECONDS` health rule | §7 trap 16 |
 | `ADD_JOB_EMAIL_NOTIFICATION` | `email_notifications.on_failure` (recipients from deployment vars) | §6 scheduler row |
 | `DBMS_MVIEW.REFRESH(..., METHOD => 'F')` | `pipeline_task` with `full_refresh: false` | §6 MV row |
@@ -40,6 +41,10 @@ comment block so the file stays a single `.sql`).
 - **Tier 1 on the renewal outputs** (`poladm.premium_txn` count of `'RN'` rows per run date): a job whose second
   task runs on `ALL_DONE` instead of `ALL_SUCCESS` refreshes the MV from a failed sweep; the count for that run
   date is zero on Oracle and non-zero on the target.
+- **Tier 4 (job outcome parity)**: after three consecutive failed nights Oracle stops scheduling; a target that maps
+  `max_failures` onto `max_retries` keeps running (and, if the failure is partial, keeps writing `'RN'` rows) every
+  night. The run-history compare shows runs on the target with no Oracle counterpart. This is the recorded GAP
+  until the pause runbook or guard task is live.
 
 ## Canonicalization used
 
@@ -50,4 +55,5 @@ comment block so the file stays a single `.sql`).
 
 Pipeline MV incremental refresh actually engaging (depends on row tracking on `policy`/`premium_txn`); the
 `EXPECT ... ON VIOLATION FAIL UPDATE` clause on an MV; Jobs cron acceptance of `MON-SAT`; DABs field placement of
-`max_retries` under a `sql_task`; e-mail delivery.
+`max_retries` under a `sql_task`; Oracle's exact `restartable` restart count and back-off; `jobs update` of
+`schedule.pause_status` from inside a running task (permissions, job id discovery); e-mail delivery.

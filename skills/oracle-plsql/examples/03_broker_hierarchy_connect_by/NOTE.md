@@ -16,7 +16,7 @@
 | `LTRIM(SYS_CONNECT_BY_PATH(ref,'/'),'/')` | `concat(path, '/', ref)` seeded with the root ref | §5 #81 |
 | `NVL(col, PRIOR col)` | `nvl(col, h.effective_commission_pct)` | §5 #82 |
 | `CONNECT_BY_ISLEAF` | post-walk `EXISTS` on active children | §7 trap 6 |
-| `CONNECT_BY_ISCYCLE` / `NOCYCLE` | `array_contains(path_ids, id)` guard | §7 trap 6 (semantics differ, see below) |
+| `CONNECT_BY_ISCYCLE` / `NOCYCLE` | `WHERE NOT array_contains(path_ids, id)` in the recursive member (do not descend) + post-walk `EXISTS` on the parent row (`is_cycle`) | §7 trap 6 (Oracle flags the row whose child is its ancestor, never re-emits the ancestor) |
 | `ORDER SIBLINGS BY` | `sort_key` column exposed; no order in a view | §7 trap 6, trap 22 |
 | `FROM broker` (PUBLIC synonym) | resolved to `poladm.broker` | §7 trap 18; §9 synonyms |
 
@@ -28,9 +28,9 @@
   the depth being off by one (anchor at 0 instead of 1), the `PRIOR` inheritance being reversed, and the default
   recursion depth truncating deep trees (Oracle has no cap; the census records the max `LEVEL` and the converted
   view must set `MAX RECURSION LEVEL` above it).
-- **Tier 3** keyed on `(region_ref, broker_id)`: catches `path_refs` separator/leading-slash differences and the
-  `is_cycle` semantic mismatch, which is expected and must be excluded from the compare set or agreed in
-  `06_decisions.md`.
+- **Tier 3** keyed on `(region_ref, broker_id)`: catches `path_refs` separator/leading-slash differences and
+  `is_cycle` placed on the wrong row (a conversion that flags the repeated child inside the CTE instead of the
+  parent after the walk yields `is_cycle = 0` everywhere, since the child is the row `NOCYCLE` suppresses).
 - Ordering is not compared (a view has no order); consumers that relied on `ORDER SIBLINGS BY` are Tier 4 and
   must add `ORDER BY sort_key`.
 
@@ -41,5 +41,7 @@ for `parent_broker_id` at the root.
 
 ## Not verified live
 
-`WITH RECURSIVE` inside `CREATE VIEW` on DBSQL 2025.20+; `MAX RECURSION LEVEL` syntax acceptance; Postgres 17 `CYCLE`
-clause on Lakebase.
+`WITH RECURSIVE` inside `CREATE VIEW` on DBSQL 2025.20+; `MAX RECURSION LEVEL` syntax acceptance; correlated
+`EXISTS` over the recursive result in the outer select; Postgres 17 `CYCLE` clause on Lakebase (note Postgres'
+`CYCLE ... SET is_cycle` marks the *repeated* row, so the Lakebase variant must keep the post-walk `EXISTS` to match
+Oracle rather than exposing the Postgres column).

@@ -18,7 +18,8 @@
 -- ROWNUM sandwich (§5 #68, §7 trap 7): Oracle assigns ROWNUM after the inner ORDER BY, so the page is stable only
 -- because the inner query is ordered on a total key (expiry_dt, policy_no). Databricks: ORDER BY ... LIMIT ... OFFSET
 -- [docs:sql-ref-syntax-qry-select-limit], [docs:sql-ref-syntax-qry-select-offset]; the ORDER BY must be on the same
--- total key or pages overlap/skip rows.
+-- total key or pages overlap/skip rows. Oracle's rn is numbered over the whole ordered set before the page filter
+-- (WHERE rn > lo), so row_number() computed after LIMIT/OFFSET must have the offset added back.
 
 CREATE TABLE IF NOT EXISTS ${catalog}.rpt.policy_page (
   page_no        INT,
@@ -36,7 +37,8 @@ CREATE TABLE IF NOT EXISTS ${catalog}.rpt.policy_page (
 
 INSERT INTO ${catalog}.rpt.policy_page
 SELECT :page_no                                                            AS page_no,
-       row_number() OVER (ORDER BY q.expiry_dt, q.policy_no)               AS rn,          -- ROWNUM over the ordered inner query
+       :page_size * (:page_no - 1)
+         + row_number() OVER (ORDER BY q.expiry_dt, q.policy_no)             AS rn,          -- ROWNUM is global: page 2 starts at page_size + 1, so add the OFFSET back
        q.policy_no,
        q.party_name,
        rtrim(q.postcode)                                                    AS postcode,    -- §7 trap 5

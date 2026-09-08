@@ -19,9 +19,21 @@ CREATE TEMPORARY TABLE stg_policy_feed (
 
 -- Oracle MERGE evaluation order: WHEN MATCHED UPDATE (WHERE) then DELETE WHERE on the *updated* row;
 -- Databricks evaluates WHEN clauses top-down and takes the first match [docs:delta-merge-into],
--- so the DELETE branch must come first and carry its own predicate. Duplicate source keys raise ORA-30926 in
--- Oracle and DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE on Databricks: dedupe explicitly with
--- QUALIFY [docs:sql-ref-syntax-qry-select-qualify] and count the dropped rows (Tier 1 evidence).
+-- so the DELETE branch must come first and carry its own predicate.
+--
+-- Duplicate source keys: Oracle raises ORA-30926 and the whole MERGE rolls back; Databricks raises
+-- DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE only when the duplicate keys also match a *target* row, and
+-- inserts both rows when they do not. The failure contract is preserved with an explicit pre-check that fails the
+-- unit on any duplicate normalised key (assert_true raises USER_RAISED_EXCEPTION [docs:functions/assert_true]);
+-- picking one row with QUALIFY would turn Oracle's all-or-nothing failure into a silent, order-dependent mutation
+-- (§7 trap 8). If the business wants the feed deduped instead, that is a 06_decisions.md row with a stated ORDER BY.
+SELECT assert_true(count(*) = 0,
+                   concat('ORA-30926 parity: ', count(*), ' duplicate policy_no key(s) in stg_policy_feed'))
+  FROM (SELECT replace(upper(trim(policy_no)), 'AL/', 'ALB-') AS policy_no
+          FROM stg_policy_feed
+         GROUP BY 1
+        HAVING count(*) > 1);
+
 MERGE INTO ${catalog}.poladm.policy AS tgt
 USING (
   SELECT replace(upper(trim(s.policy_no)), 'AL/', 'ALB-')  AS policy_no,
@@ -35,9 +47,7 @@ USING (
          nullif(trim(s.cover_note_ref), '')                  AS cover_note_ref, -- '' must become NULL explicitly on Databricks (§7 trap 1)
          rtrim(s.feed_action)                                AS feed_action
     FROM stg_policy_feed s
-    LEFT JOIN ${catalog}.poladm.broker b ON b.broker_ref = s.broker_ref
-  QUALIFY row_number() OVER (PARTITION BY replace(upper(trim(s.policy_no)), 'AL/', 'ALB-')
-                             ORDER BY s.expiry_dt DESC, s.feed_action) = 1      -- Oracle would have raised ORA-30926 here
+    LEFT JOIN ${catalog}.poladm.broker b ON b.broker_ref = s.broker_ref       -- broker_ref is UNIQUE (02_tbl_party_broker.sql), so no fan-out
 ) AS src
 ON tgt.policy_no = src.policy_no
 WHEN MATCHED AND src.feed_action = 'D' AND tgt.row_version >= 1 THEN
@@ -65,17 +75,21 @@ WHEN NOT MATCHED AND src.feed_action <> 'D' THEN
 -- policy_id BIGINT GENERATED ALWAYS AS IDENTITY [docs:sql-ref-syntax-ddl-create-table-using] and Tier 3 keys on
 -- policy_no (the business key), never on policy_id (§7 trap 10).
 
--- No COMMIT: each MERGE is its own Delta transaction. If the GTT load + MERGE must be one unit, wrap in
--- BEGIN ATOMIC ... END [dbsql:sql-scripting.md#SQL Scripting Atomic Blocks] (catalogManaged tables required).
+-- No COMMIT: each MERGE is its own Delta transaction. The pre-check and the MERGE are two statements, so a row
+-- inserted into the temp table between them is not covered; run both inside one sql_task, or wrap GTT load +
+-- pre-check + MERGE in BEGIN ATOMIC ... END [dbsql:sql-scripting.md#SQL Scripting Atomic Blocks] (catalogManaged
+-- tables required) when the load and the MERGE must be one unit as in Oracle.
 
 -- ---------------------------------------------------------------------------------------------
 -- Lakebase (OLTP profile) variant, PostgreSQL 17 syntax [pg17:sql-merge]:
 --   CREATE TEMP TABLE stg_policy_feed (...) ON COMMIT PRESERVE ROWS;   -- same clause exists in Postgres
---   MERGE INTO poladm.policy tgt USING (...deduped src...) ON tgt.policy_no = src.policy_no
+--   MERGE INTO poladm.policy tgt USING (...same src, no dedupe...) ON tgt.policy_no = src.policy_no
 --   WHEN MATCHED AND src.feed_action = 'D' THEN DELETE
 --   WHEN MATCHED THEN UPDATE SET ...
 --   WHEN NOT MATCHED AND src.feed_action <> 'D' THEN
 --     INSERT (policy_id, ...) VALUES (nextval('poladm.policy_seq'), ...);   -- sequence survives as-is (§4, [pg17:sql-createsequence])
---   Postgres also raises on duplicate source keys ("MERGE command cannot affect row a second time"), so the
---   QUALIFY dedupe (as DISTINCT ON / ROW_NUMBER) stays. The BEFORE trigger from example 04 fires here, so
---   row_version / updated_* are NOT set in the MERGE on Lakebase.
+--   Postgres raises on duplicate source keys that hit one target row ("MERGE command cannot affect row a second
+--   time" [pg17:sql-merge]) and aborts the transaction, which is the Oracle contract; keep the same pre-check
+--   (RAISE EXCEPTION in a DO block or the calling function) so duplicates that do NOT match a target row also fail
+--   instead of inserting twice. The BEFORE trigger from example 04 fires here, so row_version / updated_* are NOT
+--   set in the MERGE on Lakebase.
