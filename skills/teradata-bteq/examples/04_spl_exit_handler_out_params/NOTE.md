@@ -19,8 +19,9 @@ Source: fixture `dml/stored_procedures/sp_load_daily_transactions.sql` (verbatim
   the date, is the gate: a batch that completed keeps every row it wrote even when the same `TRANSACTION_ID`s are
   still in staging for that `LOAD_DATE` (the `NOT EXISTS` guard already skipped re-inserting them), so a later run
   for an already-loaded date only adds what is missing and never rewrites history. Incomplete means no `COMPLETED`
-  row in `ETL_BATCH_CONTROL`: example 03 writes `FAILED` for a run that reached its error branch and nothing for a
-  run that died, and both are adopted. The OUT counts and example 03's per-batch `LOADED_ROWS`/`ERROR_ROWS` then
+  row in `ETL_BATCH_CONTROL`: example 03 reserves `STARTED` at allocation, closes it as `FAILED` from its error
+  branch or from the next run's orphan step, and a run that died between the two inserts of its task 02 leaves no row
+  at all -- all three are adopted. The OUT counts and example 03's per-batch `LOADED_ROWS`/`ERROR_ROWS` then
   describe the whole attempt chain, and a transaction is never in the fact twice. Source parity note: a re-run on
   Teradata *would* duplicate, so the shadow-run compares against the legacy first-attempt result for that date, not
   against a replayed legacy retry.

@@ -26,7 +26,7 @@ AS BEGIN
     -- INSERTs below are keyed on TRANSACTION_ID (stable identity: fixture PI/COLLECT STATS column, example 07
     -- quarantines duplicates before they reach STG_TRANSACTIONS) so the re-run adds only what is missing, and the
     -- completing batch adopts the rows of *incomplete* earlier batches for the date -- batches with no COMPLETED row
-    -- in ETL_BATCH_CONTROL (marked FAILED by example 03's error branch, or died before writing any row). Rows owned
+    -- in ETL_BATCH_CONTROL (still STARTED, marked FAILED by example 03, or died before writing any row). Rows owned
     -- by a batch that did complete are never re-stamped: a successful load is history, and a later run for the same
     -- date only adds what that load did not. This keeps the OUT counts and example 03's per-batch recon report whole
     -- for the attempt chain without rewriting other batches' ownership.

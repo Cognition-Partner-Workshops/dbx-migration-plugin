@@ -7,17 +7,23 @@
 -- (A temporary table would be session-scoped to this task only: databricks-dbsql
 --  references/materialized-views-pipes.md "Temporary Tables and Temporary Views".)
 --
--- ETL_JOB_RUN is owned by this unit and is the *only* target-side state the conversion adds. ETL_BATCH_CONTROL keeps
--- its legacy contract untouched: like the BTEQ, this job INSERTs exactly one COMPLETED or FAILED row per run at the
--- end (07 / 91) and never updates rows it did not write, so any other process sharing that table is unaffected. A run
--- that dies before 07/91 (job cancel, timeout) leaves an ETL_JOB_RUN row and no ETL_BATCH_CONTROL row -- the same
--- footprint the BTEQ left when its session died with VT_BATCH -- and later tasks never see it because every lookup is
--- WHERE RUN_ID = :run_id, not "the open batch".
+-- Two tables, two roles:
+--   * ETL_JOB_RUN (unit-owned) is VT_BATCH: which BATCH_ID belongs to which job run. Every later task reads it
+--     WHERE RUN_ID = :run_id, never "the open batch".
+--   * ETL_BATCH_CONTROL (shared, legacy contract) gets the reservation *immediately*: a STARTED row for this run's
+--     BATCH_ID is written here, in the same task as the allocation, so every other MAX(BATCH_ID) + 1 allocator sharing
+--     the table sees the id as taken for the whole run. (The BTEQ only inserted at the end, so its id was invisible to
+--     other writers for the entire script -- the target closes that window to the two statements below and fails the
+--     run if it lost the race.) Tasks 07/91 then UPDATE *this run's own row* -- matched on BATCH_ID *and* START_TS =
+--     the run's BATCH_START_TS, the pair this task wrote -- to COMPLETED/FAILED; no row this job did not write is ever
+--     touched. The STARTED value is new to the table's readers (legacy rows were only ever COMPLETED/FAILED): NOTE.md
+--     records it as a consumer-contract delta.
 --
--- Allocation: MAX(BATCH_ID) + 1 as on the source, but over both tables, because a died run's BATCH_ID reached
--- FACT_TRANSACTION.ETL_BATCH_ID without ever reaching ETL_BATCH_CONTROL and must not be reused. The job is serialised
--- (daily_load.job.yml: max_concurrent_runs 1 + queue), so two runs of *this* job cannot allocate concurrently; other
--- writers of ETL_BATCH_CONTROL allocating MAX + 1 at the same instant is the legacy exposure, unchanged.
+-- Orphans: a run that dies before 07/91 (job cancel, timeout) leaves its own STARTED row open. The next run closes
+-- it as FAILED first -- identified as *this job's* by its ETL_JOB_RUN row (a different RUN_ID, same BATCH_ID and
+-- START_TS), never by status alone, so STARTED rows of other processes are left as they are. The job is serialised
+-- (daily_load.job.yml: max_concurrent_runs 1 + queue), so any other RUN_ID with a STARTED row is a run that is no
+-- longer executing.
 CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ETL_JOB_RUN (
   RUN_ID          STRING    NOT NULL,     -- {{job.run_id}}
   BATCH_ID        BIGINT    NOT NULL,
@@ -26,6 +32,26 @@ CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ETL_JOB_RUN (
 )
 COMMENT 'VT_BATCH of bteq_daily_load, one row per job run; read by the tasks of that run only';
 
+INSERT INTO ${catalog}.${schema}.ETL_LOG
+  (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
+SELECT 'BTEQ_DAILY_LOAD', c.BATCH_ID, 'WARN',
+       'Orphaned STARTED batch of run ' || r.RUN_ID || ' (' || CAST(c.BATCH_DATE AS STRING)
+       || ') closed as FAILED before new allocation',
+       current_timestamp()
+FROM ${catalog}.${schema}.ETL_BATCH_CONTROL c
+JOIN ${catalog}.${schema}.ETL_JOB_RUN r ON r.BATCH_ID = c.BATCH_ID AND r.BATCH_START_TS = c.START_TS
+WHERE c.BATCH_STATUS = 'STARTED'
+  AND r.RUN_ID <> :run_id;
+
+UPDATE ${catalog}.${schema}.ETL_BATCH_CONTROL c
+SET BATCH_STATUS = 'FAILED',
+    END_TS = current_timestamp()
+WHERE c.BATCH_STATUS = 'STARTED'
+  AND EXISTS (SELECT 1 FROM ${catalog}.${schema}.ETL_JOB_RUN r
+              WHERE r.BATCH_ID = c.BATCH_ID AND r.BATCH_START_TS = c.START_TS AND r.RUN_ID <> :run_id);
+
+-- Allocation: MAX(BATCH_ID) + 1 as on the source. The reservation row below makes the id visible in
+-- ETL_BATCH_CONTROL; ETL_JOB_RUN is included for the case where a run died between these two statements.
 INSERT INTO ${catalog}.${schema}.ETL_JOB_RUN
   (RUN_ID, BATCH_ID, BATCH_DATE, BATCH_START_TS)
 SELECT :run_id,
@@ -38,3 +64,35 @@ SELECT :run_id,
 WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.ETL_JOB_RUN WHERE RUN_ID = :run_id);
 -- The NOT EXISTS keeps a repaired/re-run task of the *same* job run on its existing BATCH_ID (one row per RUN_ID, so
 -- the scalar lookups in 03-07/91 stay single-valued); a new job run has a new run_id and allocates a new batch.
+
+-- Reservation: the shared table learns the id now, not at the end of the run.
+INSERT INTO ${catalog}.${schema}.ETL_BATCH_CONTROL
+  (BATCH_ID, BATCH_DATE, BATCH_STATUS, START_TS, END_TS)
+SELECT r.BATCH_ID, r.BATCH_DATE, 'STARTED', r.BATCH_START_TS, NULL
+FROM ${catalog}.${schema}.ETL_JOB_RUN r
+WHERE r.RUN_ID = :run_id
+  AND NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.ETL_BATCH_CONTROL c
+                  WHERE c.BATCH_ID = r.BATCH_ID);
+-- Residual exposure: another writer computing MAX + 1 between the two INSERTs above takes the same id. That is the
+-- legacy race narrowed from a whole script to one task; removing it needs an allocator shared by *every* writer of
+-- ETL_BATCH_CONTROL (an identity column or sequence table all of them adopt), which is a contract change for those
+-- writers and is recorded as a decision item in NOTE.md rather than done unilaterally here. What this task does do
+-- is refuse to continue when it lost: the run's reservation must be present as *its own* row (BATCH_ID and START_TS
+-- both from ETL_JOB_RUN); if the id is present with a different START_TS another writer owns it, this task fails, 91
+-- records FAILED for the run without touching the other writer's row (same two-column match), and no fact rows are
+-- loaded under a shared BATCH_ID. A writer that appends the same id *after* this run's reservation is not caught here
+-- (that is its allocation to check); recon's duplicate-BATCH_ID signature in NOTE.md is the net for it. A re-run of
+-- this task inside the same job run (repair) finds its own row and passes. SIGNAL in a compound: databricks-dbsql
+-- references/sql-scripting.md "SIGNAL and RESIGNAL" (same pattern as 03/04); a compound after plain statements in one
+-- sql_task file is Not verified live (NOTE.md).
+BEGIN
+  IF NOT EXISTS (SELECT 1
+                 FROM ${catalog}.${schema}.ETL_BATCH_CONTROL c
+                 JOIN ${catalog}.${schema}.ETL_JOB_RUN r
+                   ON r.BATCH_ID = c.BATCH_ID AND r.BATCH_START_TS = c.START_TS
+                 WHERE r.RUN_ID = :run_id) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'BATCH_ID allocation lost to a concurrent writer of ETL_BATCH_CONTROL; run '
+                         || :run_id || ' stopped before loading';
+  END IF;
+END;

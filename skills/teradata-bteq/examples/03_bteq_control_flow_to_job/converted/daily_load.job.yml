@@ -22,10 +22,11 @@
 #                                                  return code is recorded in ETL_BATCH_CONTROL, not as a process exit code
 #   VT_BATCH volatile table                       -> one ETL_JOB_RUN row keyed by the job run (parameter run_id = {{job.run_id}}),
 #                                                  written by 02_new_batch_id and read by every later task WHERE RUN_ID = :run_id;
-#                                                  no shared temp object across tasks, no "the open batch" lookup, and
-#                                                  ETL_BATCH_CONTROL is only INSERTed (07 / 91) exactly as the BTEQ did.
-#                                                  The job is serialised (max_concurrent_runs 1, queued) so MAX(BATCH_ID)+1
-#                                                  cannot race between two runs of this job
+#                                                  no shared temp object across tasks, no "the open batch" lookup. The id is
+#                                                  reserved at once as a STARTED row in the shared ETL_BATCH_CONTROL (02) and
+#                                                  that same row -- matched on the run's BATCH_ID + START_TS, never on status -- is closed
+#                                                  by 07 / 91. The job is serialised (max_concurrent_runs 1, queued) so
+#                                                  MAX(BATCH_ID)+1 cannot race between two runs of this job
 #   .EXPORT REPORT FILE=...                       -> 06_export_recon_report writes a Delta table the report consumer reads
 #   .LOGON TDPROD/etl_svc_acct,;                  -> job run_as migration service principal (target-routing "Auth")
 resources:

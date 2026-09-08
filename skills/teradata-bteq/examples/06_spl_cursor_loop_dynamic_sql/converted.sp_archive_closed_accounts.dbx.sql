@@ -6,6 +6,20 @@
 -- Row-at-a-time cursor + per-row DELETE is the Teradata shape; the target keeps the loop (first pass) so behaviour is
 -- traceable to the source, and the skill §11 risk heuristic flags it for a set-based rewrite once recon is green.
 
+-- Unit-owned ledger of which call archived which account. The source needed nothing like it because BT/ET rolled a
+-- failed call back to zero; here partial work is kept, so the EXIT handler must know exactly which accounts *this*
+-- call archived to charge the INOUT budget correctly -- and "archived since my start timestamp" is not that when two
+-- calls (two campaigns, two schedules) overlap: it would count the other call's accounts too and under-fill this one.
+-- One row per (call, account), written just before the account's status UPDATE; the handler counts ledger rows of
+-- this call whose account is ARCHIVED, which is exactly the set of accounts whose UPDATE landed in this call.
+CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ARCHIVE_RUN_LEDGER (
+  RUN_ID         STRING    NOT NULL,   -- uuid() minted per call (docs.databricks.com/aws/en/sql/language-manual/functions/uuid)
+  CLOSED_BEFORE  DATE      NOT NULL,   -- p_closed_before: the campaign the call belongs to
+  ACCOUNT_KEY    BIGINT    NOT NULL,   -- DIM_ACCOUNT.ACCOUNT_KEY (fixture ddl/tables/02_dim_account.sql)
+  LEDGER_TS      TIMESTAMP NOT NULL
+)
+COMMENT 'SP_ARCHIVE_CLOSED_ACCOUNTS: accounts each call took through the archive triple; joined to DIM_ACCOUNT to charge the budget';
+
 CREATE OR REPLACE PROCEDURE ${catalog}.${schema}.SP_ARCHIVE_CLOSED_ACCOUNTS(
     IN    p_closed_before   DATE,
     IN    p_archive_schema  STRING,          -- was p_archive_db (Teradata database == UC schema)
@@ -20,7 +34,7 @@ AS BEGIN
     DECLARE v_txn_count  INT;
     DECLARE v_arch_table STRING;
     DECLARE v_year       STRING;
-    DECLARE v_start_ts   TIMESTAMP;
+    DECLARE v_run_id     STRING;
 
     -- CONTINUE HANDLER FOR NOT FOUND + FETCH loop: not needed; FOR ... DO iterates the cursor and ends on exhaustion.
     -- EXIT HANDLER: ROLLBACK has no cited equivalent for a multi-statement compound (no BT/ET); the handler records
@@ -28,27 +42,32 @@ AS BEGIN
     -- skipped by the cursor predicate). Because that partial work is *kept* (the source rolled it back), the INOUT
     -- budget must be reduced by the accounts actually archived, otherwise a retry with the caller's unchanged
     -- p_max_batch archives a full second batch on top of the partial one. The handler does not trust the loop
-    -- counter for that: it recounts from persisted state -- accounts whose status UPDATE committed during this call
-    -- (ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= v_start_ts). An account interrupted anywhere in its triple is
-    -- still CLOSED, so it is neither counted nor charged, and the retry redoes it and charges it exactly once; a
-    -- counter-based deduction could charge an account whose UPDATE never committed and leave the campaign short.
-    -- The same expression is what a caller uses when the session dies without returning OUT values.
-    -- Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
+    -- counter for that: it recounts from persisted state -- this call's ARCHIVE_RUN_LEDGER rows whose account is
+    -- ARCHIVED, i.e. accounts whose status UPDATE committed *in this call* (the ledger row is written just before the
+    -- UPDATE, so ledger-and-ARCHIVED <=> UPDATE landed; ledger-and-CLOSED = interrupted before it). An account
+    -- interrupted anywhere in its triple is still CLOSED, so it is neither counted nor charged, and the retry redoes
+    -- it and charges it exactly once; a counter-based deduction could charge an account whose UPDATE never committed
+    -- and leave the campaign short, and a start-timestamp predicate would count accounts a concurrent call archived.
+    -- A caller whose session died without OUT values recovers the campaign's consumption from the same join on
+    -- CLOSED_BEFORE with COUNT(DISTINCT ACCOUNT_KEY) (an account interrupted in one call and finished by the retry has
+    -- a ledger row under each RUN_ID). Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         SET p_return_code = -1;
-        SET p_accounts_done = (SELECT COUNT(*) FROM ${catalog}.${schema}.DIM_ACCOUNT
-                               WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= v_start_ts);
+        SET p_accounts_done = (SELECT COUNT(*)
+                               FROM ${catalog}.${schema}.ARCHIVE_RUN_LEDGER l
+                               JOIN ${catalog}.${schema}.DIM_ACCOUNT a ON a.ACCOUNT_KEY = l.ACCOUNT_KEY
+                               WHERE l.RUN_ID = v_run_id AND a.ACCOUNT_STATUS = 'ARCHIVED');
         SET p_max_batch = p_max_batch - p_accounts_done;                    -- budget consumed by the kept partial work
         INSERT INTO ${catalog}.${schema}.ETL_LOG (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
         VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR',
-                'SQLEXCEPTION during archive after ' || CAST(p_accounts_done AS STRING)
+                'SQLEXCEPTION during archive run ' || v_run_id || ' after ' || CAST(p_accounts_done AS STRING)
                 || ' accounts (partial batch kept; re-run with the returned budget is idempotent)', current_timestamp());
     END;
 
     SET p_return_code = 0;
     SET p_accounts_done = 0;
-    SET v_start_ts = current_timestamp();                                    -- lower bound for "archived by this call"
+    SET v_run_id = uuid();                                                   -- this call's identity in the ledger
 
     IF p_max_batch IS NULL OR p_max_batch <= 0 THEN
         SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT = 'p_max_batch must be positive';
@@ -108,10 +127,16 @@ AS BEGIN
                 DELETE FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;
         END CASE;
 
-        -- The status UPDATE is the account's commit point: once it lands the account leaves the cursor predicate of
-        -- any retry and its ETL_UPDATE_TS >= v_start_ts marks it as this call's work. The counter follows the
-        -- persisted state (incremented after the UPDATE) and is only the loop's cap check; the handler above
-        -- recomputes it from the table, so a failure on either statement cannot leave counter and table disagreeing.
+        -- Ledger row first, then the status UPDATE: the UPDATE is the account's commit point (once it lands the
+        -- account leaves the cursor predicate of any retry), and the ledger row names the call that did it. A retry
+        -- of an account whose ledger row landed but whose UPDATE did not writes a second ledger row under its own
+        -- RUN_ID; the first call's row then pairs with a status the first call never set, and the handler's join on
+        -- RUN_ID + ARCHIVED counts it for the retry only. The counter follows the persisted state (incremented after
+        -- the UPDATE) and is only the loop's cap check; the handler recomputes it, so a failure on any of the three
+        -- statements cannot leave counter and table disagreeing.
+        INSERT INTO ${catalog}.${schema}.ARCHIVE_RUN_LEDGER (RUN_ID, CLOSED_BEFORE, ACCOUNT_KEY, LEDGER_TS)
+        VALUES (v_run_id, p_closed_before, acct.ACCOUNT_KEY, current_timestamp());
+
         UPDATE ${catalog}.${schema}.DIM_ACCOUNT
         SET ACCOUNT_STATUS = 'ARCHIVED', ETL_UPDATE_TS = current_timestamp()
         WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;

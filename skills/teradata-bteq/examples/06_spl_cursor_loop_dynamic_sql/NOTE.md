@@ -27,15 +27,23 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   Because partial work is kept rather than rolled back, the EXIT handler also writes back the consumed budget
   (`p_max_batch = p_max_batch - p_accounts_done`): the source's ROLLBACK left the budget untouched *and* the accounts
   untouched; here the accounts stay archived, so the budget must follow. Retry contract: call again with the returned
-  `p_max_batch`. The handler charges what is *persisted*, not what the loop counted: it recomputes `p_accounts_done`
-  as `COUNT(*) FROM DIM_ACCOUNT WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= v_start_ts` (the call's start
-  timestamp) before deducting. The status `UPDATE` is an account's commit point -- it is what removes the account from
-  a retry's cursor -- so an account interrupted anywhere in its triple (still `CLOSED`) is neither counted nor charged
-  and the retry redoes it and charges it once; an account whose `UPDATE` landed is charged exactly once whichever
-  statement failed next. The campaign therefore ends exactly at the cap: a counter-based deduction (an earlier
-  revision incremented before the `UPDATE` and deducted the counter) charged accounts whose `UPDATE` never committed
-  and left the retry underfilling the batch. If the session itself dies (no handler, no OUT values), the caller
-  applies the same expression with the campaign's start instead of reusing the last returned value.
+  `p_max_batch`. The handler charges what is *persisted and this call's*, not what the loop counted: each call mints
+  `v_run_id = uuid()` and writes one `ARCHIVE_RUN_LEDGER (RUN_ID, CLOSED_BEFORE, ACCOUNT_KEY, LEDGER_TS)` row per
+  account immediately before that account's status `UPDATE`; the handler recomputes `p_accounts_done` as
+  `COUNT(*) FROM ARCHIVE_RUN_LEDGER l JOIN DIM_ACCOUNT a ON a.ACCOUNT_KEY = l.ACCOUNT_KEY WHERE l.RUN_ID = v_run_id AND
+  a.ACCOUNT_STATUS = 'ARCHIVED'` before deducting. The status `UPDATE` is an account's commit point -- it is what
+  removes the account from a retry's cursor -- so ledger-row-and-`ARCHIVED` is exactly "this call's `UPDATE` landed":
+  an account interrupted anywhere in its triple (still `CLOSED`) is neither counted nor charged and the retry redoes
+  it (under its own `RUN_ID`) and charges it once; an account whose `UPDATE` landed is charged exactly once whichever
+  statement failed next. The campaign therefore ends exactly at the cap. Two earlier revisions got this wrong in
+  opposite ways: deducting the loop counter charged accounts whose `UPDATE` never committed (retry underfills), and
+  counting `ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= v_start_ts` charged accounts a *concurrent* call archived
+  in the same window (two campaigns or two schedules overlapping; retry underfills by the other call's work) -- the
+  per-call `RUN_ID` is what makes the count exact under concurrency. If the session itself dies (no handler, no OUT
+  values), the caller recovers the campaign's consumption as `COUNT(DISTINCT l.ACCOUNT_KEY)` over the same join with
+  `l.CLOSED_BEFORE = <campaign date>` (an account interrupted in one call and finished by the retry has a ledger row
+  under each `RUN_ID`). The ledger is the second unit-owned table this example adds (the archive table is the first);
+  `CREATE TABLE IF NOT EXISTS` ships in the converted file ahead of the procedure, as example 05 does.
 - `SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT` -> same syntax.
 - `INOUT` parameter -> `INOUT` (same).
 - `EXTRACT(YEAR FROM d) (FORMAT '9999')`, `TRIM(n (FORMAT '-(18)9'))` -> `CAST(year(d) AS STRING)` / parameter marker.
@@ -65,6 +73,12 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   the retry (`p_max_batch - 1` vs `p_max_batch`). The mirror bug (counter after the `UPDATE`, handler trusting it,
   failure between the two) ends one *past* the cap. Both are the same Tier 1 signature with opposite sign, so the
   shadow-run needs the injected failure placed once on the `UPDATE` statement and once on the `SET` after it.
+- Handler counting by time window instead of by call (`ARCHIVED AND ETL_UPDATE_TS >= v_start_ts`, no ledger): with
+  a second call archiving m accounts in the same window, the failed call charges `k + m`, and its retry archives m
+  fewer -> **Tier 1** on `DIM_ACCOUNT WHERE ACCOUNT_STATUS = 'ARCHIVED'` for the campaign (`p_max_batch - m` vs
+  `p_max_batch`). The shadow-run therefore needs one run with two overlapping calls (different `p_closed_before`),
+  one of them with the injected failure. Ledger row missing or written *after* the `UPDATE` (failure between the two
+  leaves an `ARCHIVED` account with no ledger row): one *past* the cap, same signature as the mirror bug above.
 
 ## Citations
 - `FOR ... AS query DO`, `WHILE`, `LEAVE`, `CASE` statement: `databricks-dbsql` `references/sql-scripting.md`
@@ -74,6 +88,8 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
 - `SIGNAL SQLSTATE ... SET MESSAGE_TEXT`: same file, "SIGNAL and RESIGNAL".
 - `EXECUTE IMMEDIATE ... INTO ... USING`: same file, "EXECUTE IMMEDIATE (Dynamic SQL)".
 - `INOUT` parameter mode: same file, "Stored Procedures / CREATE PROCEDURE".
+- `uuid()` returns a 36-character UUID string, non-deterministic: docs.databricks.com/aws/en/sql/language-manual/
+  functions/uuid.
 - Transactions: same file, "Multi-Statement Transactions" (status and SQL scripting atomic blocks); routed through
   `target-routing`, not restated here.
 
@@ -83,6 +99,9 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
 - Reading SQLSTATE inside a handler; row-count register after DML.
 - That `INOUT`/`OUT` values assigned inside an EXIT handler are returned to the caller (the budget write-back relies on
   it); if not, the remaining budget must be persisted to a control row from the handler instead.
-- That `current_timestamp()` assigned to `v_start_ts` and the one stamped by each `UPDATE` come from the same clock
-  such that `ETL_UPDATE_TS >= v_start_ts` holds for every account this call archived (a per-call marker column or a
-  ledger table replaces the timestamp predicate if it does not).
+- That a procedure-local `DECLARE`d variable assigned from `uuid()` (docs.databricks.com/aws/en/sql/language-manual/
+  functions/uuid, "non-deterministic") is evaluated once per call and stable across the loop and the handler (the
+  ledger keys on it); if it were re-evaluated per reference, `v_run_id` would have to be passed in by the caller as an
+  `IN` parameter instead.
+- That the second-pass INFO summary (`ARCHIVED AND CAST(ETL_UPDATE_TS AS DATE) = current_date()`, kept as on the
+  source) is acceptable when two calls run on the same day; it is a log line, not a budget input.
