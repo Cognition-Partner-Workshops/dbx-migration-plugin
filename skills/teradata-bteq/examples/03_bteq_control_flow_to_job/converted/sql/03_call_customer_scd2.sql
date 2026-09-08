@@ -6,8 +6,8 @@ BEGIN
   DECLARE changed_rows INT;
   DECLARE return_code INT;
 
-  SET v_batch_id = (SELECT BATCH_ID FROM ${catalog}.${schema}.ETL_BATCH_CONTROL
-                    WHERE BATCH_STATUS = 'STARTED');
+  SET v_batch_id = (SELECT BATCH_ID FROM ${catalog}.${schema}.ETL_JOB_RUN
+                    WHERE RUN_ID = :run_id);           -- (SEL BATCH_ID FROM VT_BATCH): this run's row only
 
   CALL ${catalog}.${schema}.SP_CUSTOMER_SCD2(v_batch_id, new_rows, changed_rows, return_code);
 

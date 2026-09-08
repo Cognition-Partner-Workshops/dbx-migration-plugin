@@ -6,8 +6,8 @@ BEGIN
   DECLARE rows_rejected INT;
   DECLARE return_code INT;
 
-  SET v_batch_id = (SELECT BATCH_ID FROM ${catalog}.${schema}.ETL_BATCH_CONTROL
-                    WHERE BATCH_STATUS = 'STARTED');
+  SET v_batch_id = (SELECT BATCH_ID FROM ${catalog}.${schema}.ETL_JOB_RUN
+                    WHERE RUN_ID = :run_id);           -- (SEL BATCH_ID FROM VT_BATCH): this run's row only
 
   CALL ${catalog}.${schema}.SP_LOAD_DAILY_TRANSACTIONS(
     current_date(), v_batch_id, rows_inserted, rows_rejected, return_code);

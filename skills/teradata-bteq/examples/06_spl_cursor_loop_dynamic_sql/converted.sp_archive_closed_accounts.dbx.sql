@@ -20,18 +20,25 @@ AS BEGIN
     DECLARE v_txn_count  INT;
     DECLARE v_arch_table STRING;
     DECLARE v_year       STRING;
+    DECLARE v_start_ts   TIMESTAMP;
 
     -- CONTINUE HANDLER FOR NOT FOUND + FETCH loop: not needed; FOR ... DO iterates the cursor and ends on exhaustion.
     -- EXIT HANDLER: ROLLBACK has no cited equivalent for a multi-statement compound (no BT/ET); the handler records
     -- the failure and leaves partial work to be repaired by the idempotent re-run (accounts already ARCHIVED are
     -- skipped by the cursor predicate). Because that partial work is *kept* (the source rolled it back), the INOUT
-    -- budget must be reduced by the accounts already completed, otherwise a retry with the caller's unchanged
-    -- p_max_batch archives a full second batch on top of the partial one. p_accounts_done is incremented only after
-    -- an account's status UPDATE, so an account interrupted mid-triple is not counted here and is redone (and then
-    -- counted) by the retry. Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
+    -- budget must be reduced by the accounts actually archived, otherwise a retry with the caller's unchanged
+    -- p_max_batch archives a full second batch on top of the partial one. The handler does not trust the loop
+    -- counter for that: it recounts from persisted state -- accounts whose status UPDATE committed during this call
+    -- (ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= v_start_ts). An account interrupted anywhere in its triple is
+    -- still CLOSED, so it is neither counted nor charged, and the retry redoes it and charges it exactly once; a
+    -- counter-based deduction could charge an account whose UPDATE never committed and leave the campaign short.
+    -- The same expression is what a caller uses when the session dies without returning OUT values.
+    -- Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         SET p_return_code = -1;
+        SET p_accounts_done = (SELECT COUNT(*) FROM ${catalog}.${schema}.DIM_ACCOUNT
+                               WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= v_start_ts);
         SET p_max_batch = p_max_batch - p_accounts_done;                    -- budget consumed by the kept partial work
         INSERT INTO ${catalog}.${schema}.ETL_LOG (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
         VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR',
@@ -41,6 +48,7 @@ AS BEGIN
 
     SET p_return_code = 0;
     SET p_accounts_done = 0;
+    SET v_start_ts = current_timestamp();                                    -- lower bound for "archived by this call"
 
     IF p_max_batch IS NULL OR p_max_batch <= 0 THEN
         SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT = 'p_max_batch must be positive';
@@ -100,15 +108,15 @@ AS BEGIN
                 DELETE FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;
         END CASE;
 
-        -- Charge the budget *before* the account leaves the cursor predicate. The budget is an upper bound: if the
-        -- UPDATE below fails, the account is still CLOSED, the retry redoes it (idempotently) and it is counted twice
-        -- (one short of the cap). The other order lets a retry skip an ARCHIVED-but-uncounted account and archive one
-        -- past the cap.
-        SET p_accounts_done = p_accounts_done + 1;
-
+        -- The status UPDATE is the account's commit point: once it lands the account leaves the cursor predicate of
+        -- any retry and its ETL_UPDATE_TS >= v_start_ts marks it as this call's work. The counter follows the
+        -- persisted state (incremented after the UPDATE) and is only the loop's cap check; the handler above
+        -- recomputes it from the table, so a failure on either statement cannot leave counter and table disagreeing.
         UPDATE ${catalog}.${schema}.DIM_ACCOUNT
         SET ACCOUNT_STATUS = 'ARCHIVED', ETL_UPDATE_TS = current_timestamp()
         WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;
+
+        SET p_accounts_done = p_accounts_done + 1;
     END FOR archive_loop;
 
     -- Second pass: FOR cursor loop maps 1:1

@@ -19,26 +19,39 @@ resource) plus one SQL file per task under `converted/sql/`.
   main chain and one `errorhandler_mark_failed` task with `run_if: AT_LEAST_ONE_FAILED` over every step.
 - `.LABEL` / `.GOTO` -> task keys and `depends_on` edges; `.QUIT 0/4/8` -> job run state + `BATCH_STATUS`; the
   numeric exit code is not reproduced (scheduler contract changes: record in the unit's runbook).
-- `CREATE VOLATILE TABLE VT_BATCH ... ON COMMIT PRESERVE ROWS` -> persisted `STARTED` row in `ETL_BATCH_CONTROL`;
-  tasks have no shared session (skill §6 "Volatile/global temp tables"). Later tasks read "the one open batch"
-  (`WHERE BATCH_STATUS = 'STARTED'`, no date predicate, so a run crossing midnight still finds it). Two things keep
-  that lookup single-valued: the job is serialised (`max_concurrent_runs: 1` + `queue.enabled`), so `MAX(BATCH_ID) + 1`
-  cannot race; and `02_new_batch_id` first closes any orphaned `STARTED` row (a cancelled/timed-out run never reaches
-  the `AT_LEAST_ONE_FAILED` branch) as `FAILED`, logging a WARN row per orphan in `ETL_LOG`. The BTEQ never met the
-  orphan case because `VT_BATCH` died with the session; on the target it is an explicit step, not an accident.
+- `CREATE VOLATILE TABLE VT_BATCH ... ON COMMIT PRESERVE ROWS` -> one row in a unit-owned `ETL_JOB_RUN` table keyed
+  by the job run; tasks have no shared session (skill §6 "Volatile/global temp tables"). The session identity the
+  volatile table had becomes the job-level parameter `run_id` (default `{{job.run_id}}`), pushed to every task and read
+  in each SQL file as `:run_id`; `02_new_batch_id` writes `(RUN_ID, BATCH_ID, BATCH_DATE, BATCH_START_TS)` for it and
+  tasks 03-07/91 read `WHERE RUN_ID = :run_id` -- never "the open batch", so nothing this job does depends on what
+  other runs or other processes have in flight. `ETL_BATCH_CONTROL` keeps its legacy contract exactly: the job only
+  `INSERT`s the final `COMPLETED` (07) or `FAILED` (91) row from its own `ETL_JOB_RUN` row, as the BTEQ did from
+  `VT_BATCH`, and never updates or closes rows it did not write (an earlier revision failed every `STARTED` row in
+  the table, which would have hit any other job sharing it). A run that dies before 07/91 leaves an `ETL_JOB_RUN` row
+  and no control row -- the BTEQ's footprint when its session died -- and is invisible to later runs. Allocation stays
+  `MAX(BATCH_ID) + 1`, taken over both tables so a died run's id (already stamped on `FACT_TRANSACTION.ETL_BATCH_ID`)
+  is never reused; `max_concurrent_runs: 1` + `queue.enabled` serialise this job's allocations. A repaired task of the
+  same job run keeps its `BATCH_ID` (`NOT EXISTS` on `RUN_ID`); a new run allocates a new one.
 - `CALL proc(..., out1, out2, rc)` -> `CALL` inside a compound with `DECLARE`d OUT variables; `IF rc <> 0 THEN SIGNAL`.
 - `EXEC macro(...)` -> `CALL` of the procedure the macro became (example 05).
 - `.EXPORT REPORT FILE=... / .EXPORT RESET` -> report rows written to a Delta table; file export (if still
   needed) is a downstream consumer task.
 - `TRIM(x (FORMAT 'YYYY-MM-DD'))`, `TRIM(ERRORCODE (FORMAT '-9(5)'))` -> explicit `CAST(... AS STRING)`.
-- `MAX(BATCH_ID) + 1` -> `COALESCE(MAX(BATCH_ID), 0) + 1` (NULL on an empty control table on both engines; made explicit).
+- `MAX(BATCH_ID) + 1` -> `GREATEST(COALESCE(MAX ctrl, 0), COALESCE(MAX run, 0)) + 1` (NULL on an empty control table
+  on both engines; made explicit, and widened to the run table as above).
 
 ## Recon tier that catches a wrong conversion
 - Missing error branch (a step fails but `ETL_BATCH_CONTROL` never gets `FAILED`): **Tier 1** row count on
-  `ETL_BATCH_CONTROL` per `BATCH_DATE` grouped by `BATCH_STATUS` (`STARTED` rows left behind).
-- Two open batches after a same-day retry (orphan not closed, or two concurrent runs): **Tier 1** `count(*) WHERE
-  BATCH_STATUS = 'STARTED'` > 1 on the control table, and scalar-subquery failures in tasks 03-06 (`SET v_batch_id =
-  (SELECT ...)` returns more than one row); `ETL_LOG` WARN rows with `Orphaned STARTED batch` are the audit trail.
+  `ETL_BATCH_CONTROL` per `BATCH_DATE` grouped by `BATCH_STATUS` (a `FAILED` row short); `ETL_JOB_RUN` rows with no
+  control row are the died-run audit trail.
+- Batch state keyed on status instead of on the run ("the open batch" lookup): a second process with its own open row
+  in `ETL_BATCH_CONTROL` gets closed as `FAILED` by this job, or tasks 03-06 fail on a multi-row scalar subquery --
+  **Tier 1** on `ETL_BATCH_CONTROL` grouped by `BATCH_STATUS` for the *other* process's rows (its `FAILED` count up,
+  `COMPLETED` down against legacy), plus this job's `FACT_TRANSACTION.ETL_BATCH_ID` missing for the day.
+- `run_id` not passed / `:run_id` unresolved: every task after 02 fails on a NULL batch id -> **Tier 1** on
+  `FACT_TRANSACTION` for the batch, and `ETL_JOB_RUN` gets a row whose `RUN_ID` is the literal placeholder.
+- Batch id reused after a died run (allocation taken over `ETL_BATCH_CONTROL` only): two runs share an `ETL_BATCH_ID`
+  on `FACT_TRANSACTION` -> **Tier 1** row count per `ETL_BATCH_ID` and **Tier 2** `sum(amount)` per batch both high.
 - Note on the fixture: `STG_TRANSACTIONS`, `ETL_BATCH_CONTROL`, `ETL_LOG`, `RPT_*` have no DDL under `ddl/`; they are
   reached only through this script and the procedures, so lineage marks them INFERRED (skill §2) and the census must
   pull their DDL from `DBC.TablesV`/`SHOW TABLE` on a live engine (PR "Not verified live").
@@ -50,7 +63,7 @@ resource) plus one SQL file per task under `converted/sql/`.
   on `ETL_LOG` `WARN` rows. This case must be in the shadow-run calendar, not just the busy days.
 - Emulating `VT_BATCH` with a temporary table (scoped to one task) -> later tasks fail to find the batch: **Tier 1**
   on `FACT_TRANSACTION` for the batch (`ETL_BATCH_ID` never populated).
-- Writing a second `COMPLETED` row instead of updating the `STARTED` one: **Tier 1** row-count excess on
+- Writing a `COMPLETED` row twice (task 07 repaired without its `NOT EXISTS`): **Tier 1** row-count excess on
   `ETL_BATCH_CONTROL` (2 vs 1 per batch).
 - Report table (`RPT_DAILY_RECONCILIATION`) is a D4 derived consumer output: **Tier 2** on `STAGED_ROWS`,
   `LOADED_ROWS`, `ERROR_ROWS` against the legacy report file parsed once during shadow-run.
@@ -66,6 +79,10 @@ resource) plus one SQL file per task under `converted/sql/`.
   "SIGNAL and RESIGNAL", "CALL (Invoke a Procedure)".
 - Temporary tables are session-scoped: `databricks-dbsql` `references/materialized-views-pipes.md`
   "Temporary Tables and Temporary Views".
+- Job-level `parameters` pushed to every task: `databricks-jobs` `SKILL.md` "Job Parameters"; `{{job.run_id}}` ("the
+  unique identifier assigned to the job run"): docs.databricks.com/aws/en/jobs/dynamic-value-references; SQL tasks
+  read parameters with the named-parameter syntax `:name`: docs.databricks.com/aws/en/jobs/parameter-use ("Use named
+  parameters in SQL" and the SQL row of "Details by task type").
 
 ## Not verified live
 - BTEQ `ACTIVITYCOUNT` after a *failed* request is 0 (which is what makes `.GOTO NOSTAGING` reachable on an error);
@@ -73,7 +90,9 @@ resource) plus one SQL file per task under `converted/sql/`.
 - That a `sql_task` running a `.sql` file accepts a multi-statement `BEGIN ... END` compound (the official skill shows
   the file form but not a scripting body inside it). If it does not, each file becomes a `CALL` of a small procedure.
 - Actual job-run behaviour of `AT_LEAST_ONE_FAILED` fan-in when an upstream task was skipped rather than failed, and
-  whether it runs at all on job cancel / `timeout_seconds` expiry (the orphan-closing step in `02_new_batch_id`
-  assumes it may not).
-- Passing a run-scoped batch token between `sql_task` files (job parameters into a SQL file are not shown in the
-  official skill read); the persisted single `STARTED` row is the substitute.
+  whether it runs at all on job cancel / `timeout_seconds` expiry (the design assumes it may not: a died run leaves an
+  `ETL_JOB_RUN` row without a control row and nothing depends on closing it).
+- That `:run_id` resolves inside a `BEGIN ... END` compound in a `sql_task` file (the docs show it in a plain
+  `SELECT`), and that a *repaired* run resolves `{{job.run_id}}` to the original run's id (the `NOT EXISTS` in 02 and
+  07/91 makes either answer safe: same id -> same batch resumed; new id -> new batch, old one stays without a control
+  row).

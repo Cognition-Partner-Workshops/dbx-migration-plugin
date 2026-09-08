@@ -14,10 +14,16 @@ Source: fixture `dml/stored_procedures/sp_load_daily_transactions.sql` (verbatim
   has no cited multi-statement transaction), so the committed rows survive under the failed batch id and example 03
   re-runs the date under a new batch. Both `INSERT ... SELECT`s carry `NOT EXISTS` on `TRANSACTION_ID` (the stable
   identity: fixture `COLLECT STATISTICS COLUMN (TRANSACTION_ID)`, example 07 quarantines duplicate ids upstream), and
-  the completing batch *adopts* the earlier batch's rows for the date (`UPDATE ... SET ETL_BATCH_ID / BATCH_ID`). The
-  OUT counts and example 03's per-batch `LOADED_ROWS`/`ERROR_ROWS` then describe the whole date, and a transaction is
-  never in the fact twice. Source parity note: a re-run on Teradata *would* duplicate, so the shadow-run compares
-  against the legacy first-attempt result for that date, not against a replayed legacy retry.
+  the completing batch *adopts* the rows of the date's **incomplete** earlier batches (`UPDATE ... SET ETL_BATCH_ID /
+  BATCH_ID ... WHERE NOT EXISTS (control row with BATCH_STATUS = 'COMPLETED' for the row's batch)`). Ownership, not
+  the date, is the gate: a batch that completed keeps every row it wrote even when the same `TRANSACTION_ID`s are
+  still in staging for that `LOAD_DATE` (the `NOT EXISTS` guard already skipped re-inserting them), so a later run
+  for an already-loaded date only adds what is missing and never rewrites history. Incomplete means no `COMPLETED`
+  row in `ETL_BATCH_CONTROL`: example 03 writes `FAILED` for a run that reached its error branch and nothing for a
+  run that died, and both are adopted. The OUT counts and example 03's per-batch `LOADED_ROWS`/`ERROR_ROWS` then
+  describe the whole attempt chain, and a transaction is never in the fact twice. Source parity note: a re-run on
+  Teradata *would* duplicate, so the shadow-run compares against the legacy first-attempt result for that date, not
+  against a replayed legacy retry.
 - `INSERT ... SEL stg.*, literal, param` -> explicit column list (positional `*` insert is a silent-mismatch trap).
   The fixture has no DDL for `STG_TRANSACTIONS` / `STG_TRANSACTION_ERRORS`; the list in the converted file is inferred
   from the columns the procedure reads and must be confirmed against `SHOW TABLE` on the live engine.
@@ -47,6 +53,12 @@ Source: fixture `dml/stored_procedures/sp_load_daily_transactions.sql` (verbatim
   batch adoption `UPDATE`, the guards hold but example 03's report shows `LOADED_ROWS + ERROR_ROWS < STAGED_ROWS` for the
   completing batch (**Tier 1** on the report). The shadow-run must include one injected failure after the fact insert
   (e.g. on the completion log write) followed by the re-run.
+- Adoption keyed on the date instead of on ownership (an earlier revision re-stamped every fact/error row whose
+  `TRANSACTION_ID` was in staging for the date): a second run for a date that already `COMPLETED` moves that batch's
+  rows to the new id -> **Tier 1** on `FACT_TRANSACTION` per `ETL_BATCH_ID` (the completed batch drops to 0, the new
+  one is over) and **Tier 1** on example 03's `RPT_DAILY_RECONCILIATION` (`LOADED_ROWS` for the old batch no longer
+  matches its legacy report line). The shadow-run calendar therefore needs one deliberate second run of an
+  already-completed date with staging left in place.
 
 ## Citations
 - `CREATE PROCEDURE` syntax, parameter modes, required/optional characteristics, "DEFAULT is not supported for OUT

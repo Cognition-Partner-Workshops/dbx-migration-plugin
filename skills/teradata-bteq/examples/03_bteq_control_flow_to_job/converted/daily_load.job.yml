@@ -4,7 +4,10 @@
 # sql_task file form: databricks-jobs references/task-types.md "SQL Task / Run SQL File";
 # retries/timeouts: databricks-jobs references/notifications-monitoring.md "Retry Configuration", "Timeout Configuration";
 # max_concurrent_runs / queue: databricks-jobs references/notifications-monitoring.md "Run Queue Settings";
-# ${var.*}: databricks-dabs references/bundle-structure.md (variables / substitution table).
+# ${var.*}: databricks-dabs references/bundle-structure.md (variables / substitution table);
+# job-level parameters pushed to every task: databricks-jobs SKILL.md "Job Parameters"; {{job.run_id}} dynamic value:
+# docs.databricks.com/aws/en/jobs/dynamic-value-references; :run_id named parameter in a SQL task:
+# docs.databricks.com/aws/en/jobs/parameter-use ("SQL: use named parameters").
 # The SQL files carry ${catalog}.${schema} placeholders substituted at build time from .migration/allowed_targets.json
 # (factory convention); the batch date is current_date(), as the BTEQ used CURRENT_DATE.
 #
@@ -17,10 +20,12 @@
 #                                                  errorhandler_mark_failed runs with run_if AT_LEAST_ONE_FAILED
 #   .QUIT 0 / .QUIT 4 / .QUIT 8                   -> job run state (success / failed) + BATCH_STATUS row; the numeric
 #                                                  return code is recorded in ETL_BATCH_CONTROL, not as a process exit code
-#   VT_BATCH volatile table                       -> persisted STARTED row in ETL_BATCH_CONTROL (02_new_batch_id), re-read by
-#                                                  later tasks as the single open batch; no shared temp object across tasks.
+#   VT_BATCH volatile table                       -> one ETL_JOB_RUN row keyed by the job run (parameter run_id = {{job.run_id}}),
+#                                                  written by 02_new_batch_id and read by every later task WHERE RUN_ID = :run_id;
+#                                                  no shared temp object across tasks, no "the open batch" lookup, and
+#                                                  ETL_BATCH_CONTROL is only INSERTed (07 / 91) exactly as the BTEQ did.
 #                                                  The job is serialised (max_concurrent_runs 1, queued) so MAX(BATCH_ID)+1
-#                                                  cannot race, and 02_new_batch_id closes orphaned STARTED rows first
+#                                                  cannot race between two runs of this job
 #   .EXPORT REPORT FILE=...                       -> 06_export_recon_report writes a Delta table the report consumer reads
 #   .LOGON TDPROD/etl_svc_acct,;                  -> job run_as migration service principal (target-routing "Auth")
 resources:
@@ -28,9 +33,12 @@ resources:
     banking_dw_daily_load:
       name: banking_dw_daily_load
       timeout_seconds: 7200
-      max_concurrent_runs: 1                          # one open batch at a time: BTEQ ran as a single scheduler process
+      max_concurrent_runs: 1                          # one allocation at a time: BTEQ ran as a single scheduler process
       queue:
         enabled: true                                 # a second trigger waits instead of being skipped
+      parameters:
+        - name: run_id
+          default: "{{job.run_id}}"                   # VT_BATCH's session identity; every sql_task reads it as :run_id
       tasks:
         - task_key: staging_check                       # Step 1 + .IF ACTIVITYCOUNT = 0
           sql_task:

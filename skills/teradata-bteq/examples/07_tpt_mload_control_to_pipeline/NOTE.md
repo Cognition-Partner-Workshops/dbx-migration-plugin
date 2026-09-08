@@ -13,13 +13,16 @@ Source: two skill-authored minimal control files (the estate has none): `source.
   `LogTable` -> pipeline event log (no artifact); `MaxSessions/MinSessions` -> no equivalent (dropped).
 - `ErrorTable1` / `ErrorTable2` -> one classification streaming table (`stg_transactions_classified`, every bronze row
   gets one `ERROR_REASON` or NULL) split into a quarantine table and `STG_TRANSACTIONS` by that column. ErrorTable1 =
-  `PARSE` / `NULL_KEY` / `CAST_*` (all four typed columns are `try_cast`-checked: amount, transaction, posting, value
-  dates); ErrorTable2 (UPI on `TRANSACTION_ID`) = `DUP_KEY` via `ROW_NUMBER() OVER (PARTITION BY key ORDER BY
+  `PARSE` / `NULL_KEY` / `CAST_*` (the four typed columns are `try_cast`-checked: amount, transaction, posting, value
+  dates; `TRANSACTION_TIME`, which stays a string, is checked against the TPT's `(TIME(0), FORMAT 'HH:MI:SS')` with
+  `try_to_timestamp(x, 'HH:mm:ss') IS NULL` -> `CAST_TIME`, so a malformed time is quarantined here rather than
+  failing example 04's `CAST(date || ' ' || time AS TIMESTAMP)` downstream); ErrorTable2 (UPI on `TRANSACTION_ID`) = `DUP_KEY` via `ROW_NUMBER() OVER (PARTITION BY key ORDER BY
   _ingested_at, _source_file) > 1`, first row kept. `ErrorLimit` -> `FAIL UPDATE` on the non-negotiable invariant
   (null key) + job-level count check on the quarantine table (skill §7 "ErrorLimit").
 - `APPLY ('INSERT ... VALUES (:f (DATE, FORMAT ''YYYY-MM-DD''), :a (DECIMAL(15,2)) ...)')` -> `try_cast`s in the
   silver `SELECT` (a strict `CAST` would abort the whole update on one malformed line, the opposite of the FastLoad
-  ET-table contract); `CURRENT_DATE` -> `current_date()`; `TIME(0)` -> `STRING`.
+  ET-table contract); `CURRENT_DATE` -> `current_date()`; `TIME(0)` -> `STRING` (value kept verbatim once it passes
+  the `HH:mm:ss` check; the check is a filter, not a reformat, so `07:05:00` is stored as the source wrote it).
 - `@Variable` job variables / `$tdpid/$user/$password` -> pipeline configuration + service principal; no secret inline.
 - MLOAD `.LOGTABLE`, `.BEGIN IMPORT MLOAD ... WORKTABLES/ERRORTABLES/ERRLIMIT/CHECKPOINT/SESSIONS` -> pipeline
   bookkeeping (no artifacts); `.LAYOUT` `.FIELD`/`.FILLER` -> `schemaHints` + a typed temporary view excluding the
@@ -37,6 +40,12 @@ Source: two skill-authored minimal control files (the estate has none): `source.
 ## Recon tier that catches a wrong conversion
 - Header row loaded as data (`header => false` on the TPT feed): **Tier 1** row-count excess of exactly one per file
   and a `CAST_DATE` quarantine row per file.
+- `TRANSACTION_TIME` not validated (an earlier revision passed any non-null string through): a line the legacy
+  FastLoad sent to ErrorTable1 on the `TIME(0)` conversion lands in `STG_TRANSACTIONS` -> **Tier 1** on the
+  quarantine table (one `CAST_TIME` row short per bad line against the legacy ET1 count) and, if not caught there,
+  example 04's fact load fails on the row instead of rejecting it, which the shadow-run sees as a `FAILED` batch
+  (**Tier 1** on `ETL_BATCH_CONTROL`). Shadow-run input must include one line with a malformed time (`25:00:00`,
+  `7:5:0`, `07-05-00`).
 - Delimiter/quote mismatch shifting columns: **Tier 3** keyed diff on `STG_TRANSACTIONS` by `TRANSACTION_ID`
   (`MERCHANT_NAME` containing `|` is the usual culprit); **Tier 1** on the quarantine table catches the gross case.
 - Rejects silently dropped instead of quarantined (no `_rescued_data`): **Tier 1** `legacy ET rows + loaded rows =

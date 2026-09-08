@@ -39,13 +39,18 @@ AS SELECT *,
 -- and ErrorTable2 (UPI violation) are the non-NULL reasons; the two tables below are complementary filters over this
 -- one table, so quarantine + STG_TRANSACTIONS = bronze row-for-row (Tier 1 conservation).
 --   * All casts are try_cast here, so a malformed amount/date is a classified row, never a failed update.
+--   * TRANSACTION_TIME stays a STRING on the target (no TIME type), so the TPT's (TIME(0), FORMAT 'HH:MI:SS') cast has
+--     no try_cast to mirror; the contract is checked instead with try_to_timestamp(x, 'HH:mm:ss'), which "returns NULL
+--     if the input cannot be parsed using the format" (docs.databricks.com/aws/en/sql/language-manual/functions/
+--     try_to_timestamp). A value the source would have rejected into ErrorTable1 is 'CAST_TIME' here and never reaches
+--     STG_TRANSACTIONS, where example 04 concatenates it into a TIMESTAMP cast that would otherwise fail per row.
 --   * FastLoad UPI on TRANSACTION_ID: first row per key is kept, later rows are ErrorTable2 -> 'DUP_KEY'
 --     (streaming-patterns.md "Deduplication / By key (keep first)": ROW_NUMBER over the stream). Rows already
 --     rejected for parsing/casting do not occupy the key, as in FastLoad (ET1 rows never reach the UV check).
 --     Ordering inside a single file is not observable (only _metadata.file_path is documented), so the kept row is
 --     the first by (_ingested_at, _source_file); FastLoad kept the first in file order -- NOTE.md "Not verified live".
 CREATE OR REFRESH STREAMING TABLE stg_transactions_classified
-COMMENT 'Bronze rows with the TPT reject reason (NULL = loadable): PARSE, NULL_KEY, CAST_*, DUP_KEY'
+COMMENT 'Bronze rows with the TPT reject reason (NULL = loadable): PARSE, NULL_KEY, CAST_AMOUNT, CAST_DATE, CAST_TIME, CAST_POSTING_DATE, CAST_VALUE_DATE, DUP_KEY'
 AS SELECT *,
           CASE
             WHEN _reject_reason IS NOT NULL THEN _reject_reason
@@ -62,6 +67,8 @@ AS SELECT *,
                 WHEN TRANSACTION_ID IS NULL                                               THEN 'NULL_KEY'
                 WHEN try_cast(TRANSACTION_AMOUNT AS DECIMAL(15,2)) IS NULL                THEN 'CAST_AMOUNT'   -- NOT NULL on target
                 WHEN try_cast(TRANSACTION_DATE   AS DATE)          IS NULL                THEN 'CAST_DATE'     -- NOT NULL on target
+                WHEN TRANSACTION_TIME IS NOT NULL
+                 AND try_to_timestamp(TRANSACTION_TIME, 'HH:mm:ss') IS NULL                THEN 'CAST_TIME'     -- (TIME(0), FORMAT 'HH:MI:SS')
                 WHEN POSTING_DATE IS NOT NULL AND try_cast(POSTING_DATE AS DATE) IS NULL  THEN 'CAST_POSTING_DATE'
                 WHEN VALUE_DATE   IS NOT NULL AND try_cast(VALUE_DATE   AS DATE) IS NULL  THEN 'CAST_VALUE_DATE'
               END AS _reject_reason
@@ -85,13 +92,15 @@ CREATE OR REFRESH STREAMING TABLE STG_TRANSACTIONS (
     CONSTRAINT key_present        EXPECT (TRANSACTION_ID IS NOT NULL)                  ON VIOLATION FAIL UPDATE,
     CONSTRAINT amount_parses      EXPECT (TRANSACTION_AMOUNT IS NOT NULL),             -- warn (metric only)
     CONSTRAINT date_parses        EXPECT (TRANSACTION_DATE IS NOT NULL),               -- warn (metric only)
+    CONSTRAINT time_parses        EXPECT (TRANSACTION_TIME IS NULL
+                                          OR try_to_timestamp(TRANSACTION_TIME, 'HH:mm:ss') IS NOT NULL),  -- warn (metric only)
     CONSTRAINT currency_is_iso    EXPECT (length(CURRENCY_CODE) = 3)                   -- warn (metric only)
 )
 COMMENT 'BANKING_DW.STG_TRANSACTIONS: typed per the TPT APPLY clause'
 AS SELECT
       TRANSACTION_ID,
       try_cast(TRANSACTION_DATE AS DATE)                               AS TRANSACTION_DATE,     -- (DATE, FORMAT 'YYYY-MM-DD')
-      TRANSACTION_TIME,                                                                        -- TIME(0) -> STRING 'HH:MM:SS'
+      TRANSACTION_TIME,                                                                        -- TIME(0) -> STRING 'HH:MM:SS', validated by the classifier
       ACCOUNT_ID,
       TRANSACTION_TYPE,
       TRANSACTION_SUBTYPE,

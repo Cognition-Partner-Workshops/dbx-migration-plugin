@@ -25,8 +25,11 @@ AS BEGIN
     -- the failed batch id, and example 03 marks that batch FAILED and re-runs the date under a new one. The two
     -- INSERTs below are keyed on TRANSACTION_ID (stable identity: fixture PI/COLLECT STATS column, example 07
     -- quarantines duplicates before they reach STG_TRANSACTIONS) so the re-run adds only what is missing, and the
-    -- completing batch adopts the earlier batch's rows for the date, which keeps the OUT counts and example 03's
-    -- per-batch recon report whole.
+    -- completing batch adopts the rows of *incomplete* earlier batches for the date -- batches with no COMPLETED row
+    -- in ETL_BATCH_CONTROL (marked FAILED by example 03's error branch, or died before writing any row). Rows owned
+    -- by a batch that did complete are never re-stamped: a successful load is history, and a later run for the same
+    -- date only adds what that load did not. This keeps the OUT counts and example 03's per-batch recon report whole
+    -- for the attempt chain without rewriting other batches' ownership.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         SET p_return_code = -1;
@@ -69,10 +72,15 @@ AS BEGIN
                         AND e.LOAD_DATE = stg.LOAD_DATE
                         AND e.ERROR_REASON = 'INVALID_ACCOUNT');
 
-    -- Re-run of the date: rejections written by the failed batch now belong to this one.
-    UPDATE ${catalog}.${schema}.STG_TRANSACTION_ERRORS
+    -- Re-run of the date: rejections written by an incomplete (FAILED or died) batch now belong to this one; rows of
+    -- a batch that COMPLETED keep their owner.
+    UPDATE ${catalog}.${schema}.STG_TRANSACTION_ERRORS e
     SET BATCH_ID = p_batch_id
-    WHERE LOAD_DATE = p_batch_date AND ERROR_REASON = 'INVALID_ACCOUNT' AND BATCH_ID <> p_batch_id;
+    WHERE e.LOAD_DATE = p_batch_date
+      AND e.ERROR_REASON = 'INVALID_ACCOUNT'
+      AND e.BATCH_ID <> p_batch_id
+      AND NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.ETL_BATCH_CONTROL c
+                      WHERE c.BATCH_ID = e.BATCH_ID AND c.BATCH_STATUS = 'COMPLETED');
 
     -- ACTIVITY_COUNT: no cited row-count register in the official scripting reference; count the rows this batch owns.
     SET v_error_count = (SELECT COUNT(*) FROM ${catalog}.${schema}.STG_TRANSACTION_ERRORS
@@ -137,14 +145,18 @@ AS BEGIN
       AND NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.FACT_TRANSACTION f
                       WHERE f.TRANSACTION_ID = stg.TRANSACTION_ID);
 
-    -- Re-run of the date: fact rows the failed batch committed are adopted by the completing batch, so
-    -- ETL_BATCH_ID means "the batch that completed this date" and the per-batch counts below (and example 03's
-    -- LOADED_ROWS) cover the whole date, not just this attempt's remainder.
+    -- Re-run of the date: fact rows an incomplete batch committed are adopted by the completing batch, so
+    -- ETL_BATCH_ID means "the batch that completed this load" and the per-batch counts below (and example 03's
+    -- LOADED_ROWS) cover the whole attempt chain, not just this attempt's remainder. Ownership is the gate, not the
+    -- date: a row whose batch has a COMPLETED control row belongs to that batch for good, even if its TRANSACTION_ID
+    -- is still in staging for the date (the NOT EXISTS above already skipped re-inserting it).
     UPDATE ${catalog}.${schema}.FACT_TRANSACTION f
     SET ETL_BATCH_ID = p_batch_id
     WHERE f.ETL_BATCH_ID <> p_batch_id
       AND EXISTS (SELECT 1 FROM ${catalog}.${schema}.STG_TRANSACTIONS stg
-                  WHERE stg.TRANSACTION_ID = f.TRANSACTION_ID AND stg.LOAD_DATE = p_batch_date);
+                  WHERE stg.TRANSACTION_ID = f.TRANSACTION_ID AND stg.LOAD_DATE = p_batch_date)
+      AND NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.ETL_BATCH_CONTROL c
+                      WHERE c.BATCH_ID = f.ETL_BATCH_ID AND c.BATCH_STATUS = 'COMPLETED');
 
     SET p_rows_inserted = (SELECT COUNT(*) FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE ETL_BATCH_ID = p_batch_id);
     SET p_rows_rejected = v_error_count;
