@@ -22,11 +22,16 @@ from .paths import get_path
 
 @dataclass(frozen=True)
 class Stratum:
-    """One key range of a table: keys in [lo, hi] (on the first key column), n rows."""
+    """One key range of a table: n rows whose full composite key is in [lo, hi] (tuples ordered
+    lexicographically over every key column, so strata sharing a first-column value stay disjoint)."""
     bucket: int
-    lo: Any
-    hi: Any
+    lo: tuple
+    hi: tuple
     n: int
+
+
+def _as_key(value: Any) -> tuple:
+    return value if isinstance(value, tuple) else (value,)
 
 
 class SourceAdapter(Protocol):
@@ -212,28 +217,59 @@ class _SqlAdapterBase:
 
     def key_strata(self, table: str, key_cols: list[str], n_strata: int,
                    where: str | None = None) -> list[Stratum]:
-        """n equal-count key ranges, computed server-side in one statement (one sort, n rows back)."""
+        """n equal-count key ranges, computed server-side in one statement. Bounds are full composite
+        keys: MIN/MAX for a single key column, the first and last row per bucket otherwise."""
         order = ", ".join(key_cols)
-        k = key_cols[0]
         w = f" WHERE {where}" if where else ""
         bucket = self.bucket_sql.format(n=int(n_strata), order=order)
+        inner = f"(SELECT {order}, {bucket} AS b FROM {table}{w}) s"
+        if len(key_cols) == 1:
+            k = key_cols[0]
+            rows = self._rows(f"SELECT b, MIN({k}), MAX({k}), COUNT(*) FROM {inner} GROUP BY b ORDER BY b")
+            self.rows_fetched += len(rows)
+            return [Stratum(int(b), (lo,), (hi,), int(n)) for b, lo, hi, n in rows]
+        desc = ", ".join(f"{k} DESC" for k in key_cols)
         rows = self._rows(
-            f"SELECT b, MIN({k}), MAX({k}), COUNT(*) FROM "
-            f"(SELECT {order}, {bucket} AS b FROM {table}{w}) s GROUP BY b ORDER BY b")
+            f"SELECT b, ra, rd, cnt, {order} FROM (SELECT {order}, b, "
+            f"ROW_NUMBER() OVER (PARTITION BY b ORDER BY {order}) AS ra, "
+            f"ROW_NUMBER() OVER (PARTITION BY b ORDER BY {desc}) AS rd, "
+            f"COUNT(*) OVER (PARTITION BY b) AS cnt FROM {inner}) x "
+            f"WHERE ra = 1 OR rd = 1 ORDER BY b, ra")
         self.rows_fetched += len(rows)
-        return [Stratum(int(b), lo, hi, int(n)) for b, lo, hi, n in rows]
+        by_bucket: dict[int, dict[str, Any]] = {}
+        for b, ra, rd, cnt, *key in rows:
+            entry = by_bucket.setdefault(int(b), {"n": int(cnt)})
+            if int(ra) == 1:
+                entry["lo"] = tuple(key)
+            if int(rd) == 1:
+                entry["hi"] = tuple(key)
+        return [Stratum(b, e["lo"], e["hi"], e["n"]) for b, e in sorted(by_bucket.items())]
+
+    def _key_bound(self, key_cols: list[str], bound: tuple, op: str, offset: int) -> tuple[str, list[Any]]:
+        """Lexicographic `(k1, k2, ...) op (v1, v2, ...)` for op in {>=, <=}, spelled without row-value
+        constructors so every dialect accepts it and the first-column range stays prunable."""
+        strict = op[0]
+        terms, values = [], []
+        for i in range(len(bound)):
+            eq = [f"{k} = {{}}" for k in key_cols[:i]]
+            last_op = op if i == len(bound) - 1 else strict
+            terms.append("(" + " AND ".join(eq + [f"{key_cols[i]} {last_op} {{}}"]) + ")")
+            values += list(bound[:i + 1])
+        ph = iter(self._placeholders(len(values), offset))
+        sql = " OR ".join(terms).format(*[next(ph) for _ in values])
+        return f"({sql})", values
 
     def sample_keys(self, table: str, key_cols: list[str], lo: Any, hi: Any,
                     row_numbers: list[int], where: str | None = None) -> list[tuple]:
-        """Keys at the given 1-based positions within the key range [lo, hi]: ROW_NUMBER over the
-        range, filtered by position, so only the chosen keys cross the wire."""
+        """Keys at the given 1-based positions within the composite key range [lo, hi]: ROW_NUMBER
+        over the range, filtered by position, so only the chosen keys cross the wire."""
         if not row_numbers:
             return []
         order = ", ".join(key_cols)
-        k = key_cols[0]
-        ph = self._placeholders(2)
-        clauses = [f"{k} >= {ph[0]}", f"{k} <= {ph[1]}"]
-        values: list[Any] = [lo, hi]
+        lo_sql, values = self._key_bound(key_cols, _as_key(lo), ">=", 0)
+        hi_sql, hi_vals = self._key_bound(key_cols, _as_key(hi), "<=", len(values))
+        values += hi_vals
+        clauses = [lo_sql, hi_sql]
         if where:
             clauses.append(f"({where})")
         rn_ph = self._placeholders(len(row_numbers), len(values))

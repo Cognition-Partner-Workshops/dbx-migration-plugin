@@ -58,9 +58,53 @@ def test_ready_offline_with_probe_blocked(tmp_path):
 
 def test_unknown_probe_is_unverified_and_carries_command(tmp_path):
     ws = make_workspace(tmp_path)
-    c = by_id(doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, True))
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, True)
+    c = by_id(report)
     assert c["hook_platform_loaded"]["status"] == "unverified"
     assert c["hook_platform_loaded"]["data"]["probe_command"] == doctor.HOOK_PROBE_COMMAND
+    assert not report["ready"] and report["blocking"] == ["hook_platform_loaded=unverified"]
+
+
+def test_human_identity_is_not_ready(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "warn", "pat (env)"),
+        doctor.Check("databricks_identity", "warn", "authenticated as someone@example.com (user)"),
+        doctor.Check("databricks_warehouse", "warn", "none"),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, no_databricks=False)
+    assert report["summary"].get("fail", 0) == 0
+    assert not report["ready"] and report["blocking"] == ["databricks_identity=warn"]
+
+
+def test_service_principal_with_advisory_warns_is_ready(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "ok", "oauth-m2m (env)"),
+        doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
+        doctor.Check("databricks_warehouse", "warn", "none"),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, no_databricks=False)
+    assert report["ready"] and report["blocking"] == []
+
+
+def test_driver_probe_requires_full_module(monkeypatch):
+    import importlib.util
+    real = importlib.util.find_spec
+
+    def fake(name):
+        if name == "databricks.sql":
+            raise ModuleNotFoundError("No module named 'databricks.sql'")
+        if name == "databricks":
+            return real("json")
+        return real(name)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake)
+    c = doctor.check_drivers()
+    assert c.data["drivers"]["databricks"] is False and c.status == "warn"
+    assert "databricks-sql-connector missing" in c.detail
 
 
 def test_not_blocked_probe_fails(tmp_path):

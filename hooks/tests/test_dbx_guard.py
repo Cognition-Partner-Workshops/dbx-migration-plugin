@@ -53,7 +53,6 @@ def block(cmd: str, cfg=CFG):
     "databricks schemas delete mig_cat.wave1_u12",
     "databricks grants update schema mig_cat.wave1_u12 --json '{\"changes\": []}'",
     "databricks jobs list",
-    "bteq < scripts/extract_orders.bteq",
     "bteq <<'EOF'\n.LOGON tdprod.corp.example/svc_ro;\nSELECT COUNT(*) FROM sales.orders;\n.QUIT\nEOF",
     "docker exec -i sybase-fixture isql -Usa -Q 'SELECT TOP 5 * FROM dbo.loans'",
     "psql -h localhost -d fixture -c \"CREATE TABLE loans (id int)\"",
@@ -98,10 +97,61 @@ def test_allowed(cmd):
     ("databricks bundle run -t prod nightly_orders", "prod"),
     ("databricks bundle destroy --target prod", "prod"),
     ("cd repo && databricks bundle validate && databricks bundle deploy -t prod", "prod"),
+    ("databricks bundle deploy \\\n  --target prod \\\n  --var env=live", "prod"),
+    ("databricks bundle run \\\n\t-t production nightly_orders", "production"),
+    ("databricks experimental aitools tools query \"USE CATALOG mig_cat; CREATE TABLE a (id INT); USE CATALOG prod_cat; CREATE TABLE orders_v2 (id INT)\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"USE CATALOG mig_cat; USE CATALOG prod_cat; INSERT INTO orders SELECT 1\"", "prod_cat"),
 ])
 def test_blocked_databricks(cmd, needle):
     v = block(cmd)
     assert needle in v.reason
+
+
+def test_use_catalog_switch_back_to_allowed_is_fine():
+    approve("databricks experimental aitools tools query \"USE CATALOG prod_cat; SELECT 1; USE CATALOG mig_cat; CREATE TABLE t (id INT)\"")
+
+
+# ---------------------------------------------------------------- script files fed to clients
+
+def test_legacy_script_file_readonly_is_approved(tmp_path: Path):
+    (tmp_path / "extract.bteq").write_text(".LOGON tdprod/svc_ro;\nSELECT COUNT(*) FROM sales.orders;\n.QUIT\n")
+    assert g.evaluate("bteq < extract.bteq", CFG, root=tmp_path).decision == "approve"
+    assert g.evaluate(f"bteq < {tmp_path / 'extract.bteq'}", CFG, root=tmp_path).decision == "approve"
+
+
+@pytest.mark.parametrize("invocation", [
+    "bteq < {f}",
+    "sqlplus -S svc_ro@LEGACY_TD_DSN @{f}",
+    "snowsql -f {f}",
+    "tbuild -f {f}",
+    "bteq -i {f}",
+])
+def test_legacy_script_file_with_write_is_blocked(tmp_path: Path, invocation: str):
+    f = tmp_path / "fix.sql"
+    f.write_text("SELECT 1;\nUPDATE sales.orders SET status = 'X' WHERE 1 = 1;\n")
+    v = g.evaluate(invocation.format(f=f), CFG, root=tmp_path)
+    assert v.decision == "block"
+    assert "read-only" in v.reason
+
+
+def test_legacy_script_file_unreadable_is_blocked(tmp_path: Path):
+    v = g.evaluate("bteq < /nonexistent/extract.bteq", CFG, root=tmp_path)
+    assert v.decision == "block"
+    assert "cannot read" in v.reason
+    v = g.evaluate("psql -h tdprod.corp.example -f missing.sql", CFG, root=tmp_path)
+    assert v.decision == "block"
+
+
+def test_databricks_script_file_is_inspected(tmp_path: Path):
+    (tmp_path / "load.sql").write_text("USE CATALOG prod_cat;\nCREATE TABLE orders_v2 (id INT);\n")
+    v = g.evaluate("spark-sql -f load.sql", CFG, root=tmp_path)
+    assert v.decision == "block" and "prod_cat" in v.reason
+    (tmp_path / "ok.sql").write_text("CREATE TABLE mig_cat.wave1.orders (id INT);\n")
+    assert g.evaluate("spark-sql -f ok.sql", CFG, root=tmp_path).decision == "approve"
+
+
+def test_non_client_commands_do_not_read_files(tmp_path: Path):
+    approve("rm -f /nonexistent/thing && docker run -i img < /nonexistent/in.txt")
 
 
 # ---------------------------------------------------------------- denied shapes: legacy writes

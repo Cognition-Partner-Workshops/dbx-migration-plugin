@@ -2,14 +2,16 @@
 the verify-depth knob, and cost accounting in the result."""
 
 import json
+import random
 import sqlite3
 
 import pytest
 
 from recon.adapters import _SqlAdapterBase
-from recon.config import ConfigError, Tolerances
+from recon.config import ConfigError, ObjectMapping, Tolerances
 from recon.cost import estimate_cost
 from recon.engine import run_recon
+from recon.tiers import _stratified_keys
 from tests.fakes import FakeSource, FakeTarget
 from tests.test_tiers import RULES, SPEC
 
@@ -85,7 +87,7 @@ def test_key_strata_covers_range_and_is_contiguous():
     strata = ad.key_strata("t", ["id"], 4)
     assert len(conn.statements) == 1
     assert len(strata) == 4
-    assert strata[0].lo == 1 and strata[-1].hi == 100
+    assert strata[0].lo == (1,) and strata[-1].hi == (100,)
     assert sum(s.n for s in strata) == 100
     for a, b in zip(strata, strata[1:]):
         assert a.hi < b.lo
@@ -100,6 +102,41 @@ def test_sample_keys_returns_requested_row_numbers_in_range():
     assert len(conn.statements) == 1
     assert keys == [(41,), (45,), (60,)]
     assert ad.sample_keys("t", ["id"], lo=41, hi=60, row_numbers=[1], where="grp = 1") == [(43,)]
+
+
+# every row shares the first key column; only the second differs
+COMPOSITE_ROWS = [(1, i, float(i), f"n{i}") for i in range(1, 101)]
+
+
+def test_key_strata_composite_bounds_are_disjoint_when_first_key_is_shared():
+    ad, conn = sqlite_adapter(COMPOSITE_ROWS)
+    conn.statements.clear()
+    strata = ad.key_strata("t", ["id", "grp"], 4)
+    assert len(conn.statements) == 1 and len(strata) == 4
+    assert strata[0].lo == (1, 1) and strata[-1].hi == (1, 100)
+    assert [s.n for s in strata] == [25, 25, 25, 25]
+    for a, b in zip(strata, strata[1:]):
+        assert a.hi < b.lo
+    sampled: set[tuple] = set()
+    for s in strata:
+        keys = ad.sample_keys("t", ["id", "grp"], s.lo, s.hi, [1, s.n])
+        assert keys == [s.lo, s.hi], (s, keys)
+        sampled.update(keys)
+    assert len(sampled) == 8
+    with_where = ad.key_strata("t", ["id", "grp"], 2, where="grp > 50")
+    assert [s.n for s in with_where] == [25, 25] and with_where[0].lo == (1, 51)
+
+
+def test_stratified_keys_cover_every_stratum_of_a_shared_first_key():
+    rows = [{"ID": 1, "SEQ": i, "TOTAL": float(i)} for i in range(1, 201)]
+    source = FakeSource({"T": rows})
+    mapping = ObjectMapping("t", "T", ["ID", "SEQ"], ["id", "seq"], [])
+    keys, n_strata = _stratified_keys(mapping, source, 200, 16, random.Random(1))
+    assert n_strata == 16
+    assert (1, 1) in keys and (1, 200) in keys
+    per_stratum = {(k[1] - 1) * n_strata // 200 for k in keys}
+    assert per_stratum == set(range(n_strata))  # no stratum left unsampled, no early-row repeats
+    assert len(keys) == len(set(keys)) and 16 <= len(keys) <= 16 + 2 * n_strata
 
 
 def test_duplicate_key_count():

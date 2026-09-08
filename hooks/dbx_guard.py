@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CONFIG_REL = Path(".migration") / "allowed_targets.json"
+_MAX_SCRIPT_BYTES = 4 * 1024 * 1024
 DEFAULT_FORBIDDEN_BUNDLE_TARGETS = ("prod", "production")
 
 _SEG = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$-]*)"
@@ -69,6 +70,7 @@ _ON_SCHEMA = re.compile(rf"\bON\s+(?:SCHEMA|DATABASE)\s+({_SEG})\.({_SEG})(?![\w
 _BUNDLE_DEPLOY = re.compile(r"\bdatabricks\s+bundle\s+(?:deploy|run|destroy)\b(.*)", re.IGNORECASE)
 _BUNDLE_TARGET = re.compile(r"(?:^|\s)(?:-t|--target)(?:=|\s+)(\S+)")
 _TARGET_CATALOG_FLAG = re.compile(r"--target-catalog(?:=|\s+)(\S+)")
+_SCRIPT_INPUT = re.compile(r"(?<![<>])<\s*(?!<)([^\s<>|;&]+)|(?:^|\s)@([^\s;&|]+)|(?:^|\s)(?:-f|-i|--file|--input)(?:=|\s+)([^\s;&|]+)")
 _CLI_SECURABLE = re.compile(
     r"\bdatabricks\s+(grants\s+(?:update|delete)|schemas\s+(?:create|delete|update)|tables\s+delete|volumes\s+(?:create|delete)|catalogs\s+(?:create|delete|update))\s+(.*)",
     re.IGNORECASE,
@@ -147,13 +149,45 @@ def _strip_comments(text: str) -> str:
     return re.sub(r"(?m)--[^\n]*$", " ", text)
 
 
-def _write_segments(text: str) -> list[str]:
-    """Each write statement from its leading keyword to the next ';' or end of text."""
+def _join_continuations(cmd: str) -> str:
+    return re.sub(r"\\\r?\n", " ", cmd)
+
+
+def _write_segments(text: str) -> list[tuple[int, str]]:
+    """Each write statement, as (offset, text) from its leading keyword to the next ';' or end."""
     out = []
     for m in _WRITE_STMT.finditer(text):
         end = text.find(";", m.end())
-        out.append(text[m.start(): end if end != -1 else len(text)])
+        out.append((m.start(), text[m.start(): end if end != -1 else len(text)]))
     return out
+
+
+def _script_inputs(cmd: str) -> list[str]:
+    """Files a client is told to execute: `< f`, `@f`, `-f f`, `--file f`, `-i f`, `--input f`."""
+    files = []
+    for m in _SCRIPT_INPUT.finditer(cmd):
+        f = next(g for g in m.groups() if g).strip("'\"")
+        if f and not f.startswith("-") and f != "<":
+            files.append(f)
+    return files
+
+
+def _inline_scripts(cmd: str, root: Path, cfg: GuardConfig) -> tuple[str, list[str]]:
+    """Command text plus the contents of every referenced script; unreadable scripts are returned."""
+    unreadable: list[str] = []
+    if not (_DATABRICKS_CONTEXT.search(cmd) or _LEGACY_ONLY_CLIENTS.search(cmd) or _mentions_legacy(cmd, cfg)):
+        return cmd, unreadable
+    parts = [cmd]
+    for f in _script_inputs(cmd):
+        p = Path(os.path.expandvars(os.path.expanduser(f)))
+        if not p.is_absolute():
+            p = root / p
+        try:
+            with p.open(errors="replace") as fh:
+                parts.append("\n;\n" + fh.read(_MAX_SCRIPT_BYTES))
+        except OSError:
+            unreadable.append(f)
+    return "\n".join(parts), unreadable
 
 
 def _catalogs_in_segment(seg: str) -> set[str]:
@@ -176,12 +210,11 @@ def _check_databricks_writes(cmd: str, cfg: GuardConfig) -> list[str]:
     text = _strip_comments(cmd)
     in_dbx = bool(_DATABRICKS_CONTEXT.search(cmd))
 
-    use_cat = None
-    m = _USE_CATALOG.search(text)
-    if m:
-        use_cat = _norm(m.group(1))
+    use_cats = [(m.start(), _norm(m.group(1))) for m in _USE_CATALOG.finditer(text)]
 
-    for seg in _write_segments(text):
+    for offset, seg in _write_segments(text):
+        # the catalog in force is the last USE CATALOG *before* this statement, not the first in the command
+        use_cat = next((c for pos, c in reversed(use_cats) if pos < offset), None)
         cats = _catalogs_in_segment(seg)
         head = seg.strip().split("\n", 1)[0][:80]
         if cats:
@@ -228,22 +261,28 @@ def _mentions_legacy(cmd: str, cfg: GuardConfig) -> list[str]:
     return hits
 
 
-def _check_legacy_writes(cmd: str, cfg: GuardConfig) -> list[str]:
+def _check_legacy_writes(cmd: str, cfg: GuardConfig, unreadable: list[str]) -> list[str]:
+    hits = _mentions_legacy(cmd, cfg)
+    legacy_client = bool(_LEGACY_ONLY_CLIENTS.search(cmd))
+    if (hits or legacy_client) and unreadable:
+        return [f"legacy client fed script(s) {unreadable} that the guard cannot read; inline the SQL or use a "
+                "path under the project so it can be inspected (legacy is read-only in every phase)"]
     text = _strip_comments(cmd)
     segs = _write_segments(text)
     if not segs:
         return []
-    heads = [s.strip().split("\n", 1)[0][:80] for s in segs]
-    hits = _mentions_legacy(cmd, cfg)
+    heads = [s.strip().split("\n", 1)[0][:80] for _, s in segs]
     if hits:
         return [f"non-read statement against legacy source {hits}: `{heads[0]}` (legacy is read-only in every phase)"]
-    if _LEGACY_ONLY_CLIENTS.search(cmd):
+    if legacy_client:
         return [f"non-read statement through a legacy-only client: `{heads[0]}` (legacy is read-only in every phase)"]
     return []
 
 
-def evaluate(command: str, cfg: GuardConfig) -> Verdict:
-    violations = _check_databricks_writes(command, cfg) + _check_legacy_writes(command, cfg)
+def evaluate(command: str, cfg: GuardConfig, root: Path | None = None) -> Verdict:
+    command = _join_continuations(command)
+    full, unreadable = _inline_scripts(command, root or _project_root(), cfg)
+    violations = _check_databricks_writes(full, cfg) + _check_legacy_writes(full, cfg, unreadable)
     if not violations:
         return Verdict("approve")
     reason = (

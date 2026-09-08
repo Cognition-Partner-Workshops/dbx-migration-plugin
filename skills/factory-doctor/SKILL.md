@@ -17,7 +17,10 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
 ```
 
 Writes `.migration/09_capabilities.json` and prints one line per check. Exit 0 = `ready`.
-`--no-databricks` skips CLI/identity checks for offline use (never in an engagement session).
+`ready` needs no `fail` anywhere *and* the three security controls (`hook_guard_functional`,
+`hook_platform_loaded`, `databricks_identity`) at `ok`: an `unverified` probe or a human identity
+leaves `ready: false` with the offending ids in `blocking`. Other `warn`/`unverified` rows are
+advisory. `--no-databricks` skips CLI/identity checks for offline use (never in an engagement session).
 
 ## The hook probe (the one manual step)
 
@@ -48,14 +51,14 @@ doctor therefore reports `hook_platform_loaded: unverified` until you prove it:
 | `recon_drivers` | `warn` if `databricks-sql-connector` is missing (live/snapshot recon impossible) | harness `pyproject.toml` extras |
 | `databricks_cli` | CLI not on PATH | `databricks-core` |
 | `databricks_auth_kind` | `warn` unless OAuth M2M env (`DATABRICKS_HOST/CLIENT_ID/CLIENT_SECRET`) | `target-routing` auth rules |
-| `databricks_identity` | `current-user me` fails, or differs from `--expect-identity`; `warn` if a human user | `07_access_checklist.md` |
+| `databricks_identity` | `current-user me` fails, or differs from `--expect-identity`; `warn` if a human user (still blocks `ready`) | `07_access_checklist.md` |
 | `databricks_warehouse` | `warn` if `aitools get-default-warehouse` resolves nothing | `databricks-core` |
 
 ## Where it runs in the factory
 
 - **Setup (`1-migration_setup` step 7)**: orchestrator runs it after writing `allowed_targets.json`,
-  completes the hook probe, commits `09_capabilities.json`. `ready: false` with a `fail` on identity,
-  harness, or hooks is a D10 and blocks STOP A.
+  completes the hook probe, commits `09_capabilities.json`. `ready: false` (a `fail` anywhere, or
+  identity/hooks not `ok`) is a D10 and blocks STOP A.
 - **Plan (`4-migration_plan`)**: re-run before every wave manifest is committed; the manifest's briefs
   quote the `summary` line and the migration principal's `userName` so children can compare.
 - **Unit (`5-unit_migration` step 1)**: each child runs

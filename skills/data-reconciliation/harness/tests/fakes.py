@@ -110,8 +110,8 @@ class FakeSource:
         for b in range(n_strata):
             end = start + size + (1 if b < rem else 0)
             chunk = rows[start:end]
-            out.append(Stratum(b + 1, self._key(chunk[0], key_cols)[0],
-                               self._key(chunk[-1], key_cols)[0], len(chunk)))
+            out.append(Stratum(b + 1, self._key(chunk[0], key_cols),
+                               self._key(chunk[-1], key_cols), len(chunk)))
             start = end
         self.rows_fetched += len(out)
         return out
@@ -119,8 +119,10 @@ class FakeSource:
     def sample_keys(self, table, key_cols, lo, hi, row_numbers, where=None) -> list[tuple]:
         self.calls["sample_keys"] += 1
         self.statements += 1
+        lo = lo if isinstance(lo, tuple) else (lo,)
+        hi = hi if isinstance(hi, tuple) else (hi,)
         in_range = [r for r in self._sorted(table, key_cols, where, natural=True)
-                    if lo <= self._key(r, key_cols)[0] <= hi]
+                    if lo <= self._key(r, key_cols) <= hi]
         wanted = set(row_numbers)
         keys = [self._key(r, key_cols) for i, r in enumerate(in_range, 1) if i in wanted]
         self.rows_fetched += len(keys)

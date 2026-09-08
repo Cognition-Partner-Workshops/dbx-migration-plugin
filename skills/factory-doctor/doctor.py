@@ -11,8 +11,10 @@ Usage:
                       [--hook-probe-result blocked|not-blocked|unknown] [--expect-identity NAME]
                       [--no-databricks] [--out PATH]
 
-Exit code 0 when no check is `fail`; 1 otherwise. `unverified` and `warn` do not fail the run but
-are surfaced in the JSON and the summary so the playbook can decide.
+Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and the security
+controls (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`,
+or `skipped` by an explicit flag; an `unverified` hook probe or a human identity is not ready.
+Other `warn`/`unverified` checks are advisory and listed in the JSON for the playbook to decide.
 """
 from __future__ import annotations
 
@@ -42,6 +44,7 @@ OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines"
                    "databricks-dabs", "databricks-unity-catalog", "databricks-lakeflow-connect",
                    "databricks-lakebase")
 M2M_VARS = ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET")
+SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
 DRIVERS = {"databricks": "databricks.sql", "redshift": "psycopg2", "snowflake": "snowflake.connector",
            "teradata": "teradatasql", "oracle": "oracledb", "sqlserver": "pyodbc", "postgres": "psycopg2"}
 
@@ -229,8 +232,15 @@ def check_harness(plugin_root: Path) -> Check:
     return Check("recon_harness", "fail", f"selftest rc={rc}: {_redact(err or out)}")
 
 
+def _module_present(dotted: str) -> bool:
+    try:
+        return importlib.util.find_spec(dotted) is not None
+    except (ModuleNotFoundError, ValueError):
+        return False
+
+
 def check_drivers() -> Check:
-    present = {k: importlib.util.find_spec(v.split(".")[0]) is not None for k, v in DRIVERS.items()}
+    present = {k: _module_present(v) for k, v in DRIVERS.items()}
     have = sorted(k for k, v in present.items() if v)
     status = "ok" if present["databricks"] else "warn"
     return Check("recon_drivers", status,
@@ -307,6 +317,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     counts: dict[str, int] = {}
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
+    blocking = [f"{c.id}={c.status}" for c in checks
+                if c.status == "fail" or (c.id in SECURITY_CONTROLS and c.status not in ("ok", "skipped"))]
     return {
         "schema": "dbx-migration-factory/capabilities/1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -314,7 +326,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         "workspace": str(ws),
         "plugin_root": str(plugin_root),
         "summary": counts,
-        "ready": counts.get("fail", 0) == 0,
+        "ready": not blocking,
+        "blocking": blocking,
         "checks": [asdict(c) for c in checks],
     }
 
@@ -340,7 +353,9 @@ def main(argv: list[str] | None = None) -> int:
         out.write_text(text + "\n")
     for c in report["checks"]:
         print(f"{c['status']:<10} {c['id']:<28} {c['detail']}")
-    print(f"\nready={report['ready']} {report['summary']}" + (f"  -> {out}" if str(out) != "-" else ""))
+    print(f"\nready={report['ready']} {report['summary']}"
+          + (f" blocking={report['blocking']}" if report["blocking"] else "")
+          + (f"  -> {out}" if str(out) != "-" else ""))
     return 0 if report["ready"] else 1
 
 
