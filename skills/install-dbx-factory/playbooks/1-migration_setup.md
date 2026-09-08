@@ -18,7 +18,7 @@ This is a **knowledge ingestion** step, not an analysis step. Its job is to make
 | **ORCHESTRATION** | schedules and triggers | Lakeflow Jobs vs external scheduler retained, dependency and completion signalling, calendar/SLA mapping, alerting and on-call routing, backfill procedure |
 | **CONSUMER** | BI dashboards, extracts, APIs | re-point vs rebuild policy per consumer type, connection/auth conventions, SLA for consumer cutover, extract format contracts |
 | **ML-SCORING** | model training / scoring jobs | target framework (PySpark ML, MLflow), prediction-parity tolerance policy (seeds, float tolerance, shuffle nondeterminism), feature pipeline conventions, model registry and lineage requirements |
-| **DATA / DEPENDENCY** | all workloads | coexistence mechanism (Lakehouse Federation as default read bridge), dual-write policy, data target per legacy store type, PII/masking rules, sample-data fallback policy, decommission criteria |
+| **DATA / DEPENDENCY** | all workloads | coexistence mechanism (Lakehouse Federation as default read bridge; Lakeflow Connect connector per engine for continuously written tables, with its source-side prerequisites listed as D10), dual-write policy, data target per legacy store type, PII/masking rules, sample-data fallback policy, decommission criteria |
 
 Each profile can be sourced independently from a **reference implementation** (an already-migrated pipeline, the strongest evidence), an **architecture/standards document**, or a **skill** that encodes the conventions mechanically. It is normal for a customer to have a reference for pipelines, a document for UC layout, and nothing for ML scoring.
 

@@ -13,7 +13,7 @@ Dependencies, not conversion difficulty, are what make data migrations slow and 
 |---|---|---|
 | D1 | intra-pipeline lineage edge | ordering constraint only; handled by wave order, no decision |
 | D2 | shared object used by 2+ pipelines | migrate once in wave 0; owner pipeline per the shared-object map |
-| D3 | upstream feed from a non-migrating system | federate for reads; ingestion contract (Auto Loader, CDC) at cutover |
+| D3 | upstream feed from a non-migrating system | federate for reads (default); managed ingestion via Lakeflow Connect (SQL Server CT/CDC gateway, Postgres/MySQL CDC, query-based Oracle/Teradata/SQL Server/PG/MySQL, foreign-catalog Snowflake/Redshift/Synapse/BigQuery) or Auto Loader for files; the connector choice, its source-side prerequisites, and cutover cadence are the contract |
 | D4 | downstream consumer of legacy output | re-point at cutover; dual-publish during coexistence; rebuild |
 | D5 | scheduler / orchestration dependency | replace with Lakeflow Jobs; keep external scheduler triggering Databricks; hybrid with completion signal |
 | D6 | shared table with non-migrated writers | dual-write window; legacy remains writer + federated read; documented deferral |
@@ -45,6 +45,7 @@ Dependencies, not conversion difficulty, are what make data migrations slow and 
 
 ## Advice and Pointers
 - **D4 consumers are the ones nobody mentions.** Query history and BI-tool metadata find them; asking the room does not. Sweep mechanically first, then confirm.
+- D3 via Lakeflow Connect has legacy-side prerequisites the migration principal must never perform: enabling change tracking / CDC on the source (`ALTER DATABASE ... SET CHANGE_TRACKING`, `sp_cdc_enable_table`, Postgres logical decoding), a dedicated minimum-privilege connector user, and the gateway's network path. Each is its own D10 entry owned by the customer DBA/platform team and fired at plan approval; until it closes, the D3 decision stays at federated read or a query-based connector (higher source load; count it against the legacy-query cap). Route the build to `target-routing` → `databricks-lakeflow-connect`; the factory's rule is that the connector lands in the migration catalog with a PAUSED schedule until STOP E.
 - D6 shared tables are the coexistence trap: a table with legacy writers cannot simply move. Default to legacy-remains-writer + federated read, and make dual-write an explicit, tested exception.
 - Lead times dominate the schedule. A four-week access request fired at STOP A instead of wave 3 is often the entire difference in engagement duration; check fired-request status at every stop.
 - D10 gates parallelism directly: fan-out width is bounded by what the service principal and warehouse are approved to run concurrently. Confirm concurrency limits as part of the D10 contract.
