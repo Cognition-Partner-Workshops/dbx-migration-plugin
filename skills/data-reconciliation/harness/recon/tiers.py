@@ -55,9 +55,10 @@ class TierResult:
 _get_path = get_path
 
 
-def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
+def tier1_counts(spec: MappingSpec, source, target, ctx=None) -> TierResult:
     """Counts THROUGH the mapping: root docs vs root rows; embedded array cardinality vs
-    child-table rows. A naive docs-vs-rows count is wrong by construction for embeds."""
+    child-table rows. A naive docs-vs-rows count is wrong by construction for embeds.
+    In transactional mode `ctx` bounds how many source rows may not have reached the target yet."""
     findings, checks = [], 0
     stats: dict[str, Any] = {"source_counts": {}}
     for c in spec.objects:
@@ -65,9 +66,14 @@ def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
         src_n = source.row_count(c.root_table, c.root_where)
         tgt_n = target.target_row_count(c.object, c.target_where)
         stats["source_counts"][c.root_table] = src_n
-        if src_n != tgt_n:
+        in_flight = ctx.in_flight(c) if ctx is not None else 0
+        if src_n != tgt_n and 0 <= src_n - tgt_n <= in_flight:
+            stats.setdefault("count_gap_within_in_flight", {})[c.object] = {
+                "gap": src_n - tgt_n, "in_flight": in_flight}
+        elif src_n != tgt_n:
             findings.append(Finding(c.object, "root_count",
-                                    f"rows({c.root_table})={src_n} vs target rows={tgt_n}"))
+                                    f"rows({c.root_table})={src_n} vs target rows={tgt_n}"
+                                    + (f" ({in_flight} in flight)" if in_flight else "")))
         for e in c.embeds:
             checks += 1
             child_n = source.row_count(e.child_table, e.child_where)
@@ -143,10 +149,15 @@ def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict
 
 
 def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
-                     source, target) -> TierResult:
+                     source, target, ctx=None) -> TierResult:
     findings, checks = [], 0
     deferred: list[str] = []
+    skipped_in_flight: list[str] = []
     for c in spec.objects:
+        if ctx is not None and ctx.in_flight(c):
+            # aggregates over a moving table cannot be exact; tiers 3 and 5 grade it per key
+            skipped_in_flight.append(c.object)
+            continue
         s_all, t_all = _object_aggregates(c, source, target)
         for f in c.fields:
             checks += 1
@@ -174,7 +185,9 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                 if not _agg_close(sv, tv, tol.aggregate_rel_tol):
                     findings.append(Finding(c.object, f"aggregate_{stat}",
                                             f"field {f.source}->{f.target}", sv, tv, f.rules))
-    stats = {"deferred_to_tier3": deferred} if deferred else {}
+    stats: dict[str, Any] = {"deferred_to_tier3": deferred} if deferred else {}
+    if skipped_in_flight:
+        stats["skipped_in_flight"] = skipped_in_flight
     return TierResult(2, "per_field_aggregates", not findings, checks, findings, stats)
 
 
@@ -251,15 +264,19 @@ def _stratified_keys(c: ObjectMapping, source: StratifiedKeys, n: int, sample_si
 
 
 def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
-                source, target, seed: int = 0, depth: str = "threshold") -> TierResult:
+                source, target, seed: int = 0, depth: str = "threshold", ctx=None) -> TierResult:
     """Full keyed diff below the tolerance row threshold; keyed stratified sampling above.
     `depth` overrides the threshold: "full" always diffs every key, "sampled" always samples.
     Embedded arrays with declared element keys/fields are value-graded; the rest are
-    reported UNGRADED."""
+    reported UNGRADED. In transactional mode `ctx` classifies source rows changed after the
+    target's applied watermark as in flight (not graded) and a target row newer than its
+    source row as an ordering violation."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
     rng = random.Random(seed)
     for c in spec.objects:
+        wm = bool(ctx is not None and c.watermark_source and c.watermark_target)
+        src_cols = [f.source for f in c.fields] + ([c.watermark_source] if wm else [])
         n = source.row_count(c.root_table, c.root_where)
         if depth == "full":
             sampled = False
@@ -284,8 +301,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
 
         if sampled and isinstance(source, StratifiedKeys):
             keys, n_strata = _stratified_keys(c, source, n, tol.sample_size, rng)
-            fetched = source.fetch_keyed(c.root_table, c.key_source,
-                                         [f.source for f in c.fields],
+            fetched = source.fetch_keyed(c.root_table, c.key_source, src_cols,
                                          where=c.root_where, keys=keys)
             src_rows = {tuple(r[k] for k in c.key_source): r for r in fetched}
             dup_keys = source.duplicate_key_count(c.root_table, c.key_source, c.root_where)
@@ -311,8 +327,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                         reservoir[slot] = key
             chosen = set(first + last + reservoir)
             keys = sorted(chosen)
-            fetched = source.fetch_keyed(c.root_table, c.key_source,
-                                         [f.source for f in c.fields],
+            fetched = source.fetch_keyed(c.root_table, c.key_source, src_cols,
                                          where=c.root_where, keys=keys)
             src_rows = {tuple(r[k] for k in c.key_source): r for r in fetched}
             stats[c.object] = {"mode": "stratified_sample", "sampling": "reservoir",
@@ -320,8 +335,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                "coverage": round(len(src_rows) / n, 6) if n else 1.0}
         else:
             src_rows = {}
-            for r in source.fetch_keyed(c.root_table, c.key_source,
-                                        [f.source for f in c.fields], where=c.root_where):
+            for r in source.fetch_keyed(c.root_table, c.key_source, src_cols, where=c.root_where):
                 key = tuple(r[k] for k in c.key_source)
                 record_source_key(key)
                 src_rows[key] = r
@@ -336,8 +350,10 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                         f"key={key} seen {count} times" if key is not None
                                         else "a source key occurs more than once (server-side count)"))
         tgt_docs = {}
-        proj = [f.target for f in c.fields] + [e.array_path for e in c.embeds]
+        proj = ([f.target for f in c.fields] + [e.array_path for e in c.embeds]
+                + ([c.watermark_target] if wm else []))
         target_counts = {}
+        in_flight_rows = 0
         for d in target.fetch_keyed(c.object, c.key_target, proj,
                                     where=c.target_where, keys=keys):
             key = tuple(_get_path(d, key_field) for key_field in c.key_target)
@@ -351,9 +367,18 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         for k, row in src_rows.items():
             checks += 1
             doc = tgt_docs.get(k)
+            if wm and ctx.row_in_flight(c, row):
+                in_flight_rows += 1
+                continue
             if doc is None:
                 findings.append(Finding(c.object, "missing_doc", f"key={k}"))
                 continue
+            if wm:
+                s_wm, t_wm = row.get(c.watermark_source), _get_path(doc, c.watermark_target)
+                if s_wm is not None and t_wm is not None and t_wm > s_wm:
+                    findings.append(Finding(c.object, "row_ahead_of_source",
+                                            f"key={k} target {c.watermark_target} newer than source "
+                                            f"{c.watermark_source}", s_wm, t_wm))
             for f in c.fields:
                 sv = row.get(f.source, MISSING)
                 tv = _get_path(doc, f.target)
@@ -366,6 +391,8 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
             if k not in src_rows and not sampled:
                 checks += 1
                 findings.append(Finding(c.object, "extra_doc", f"key={k}"))
+        if wm:
+            stats[c.object]["in_flight_rows"] = in_flight_rows
         checks += _grade_embeds(c, canon, tol, source, src_rows, tgt_docs, sampled,
                                 findings, stats)
     return TierResult(3, "keyed_diffs", not findings, checks, findings, stats)

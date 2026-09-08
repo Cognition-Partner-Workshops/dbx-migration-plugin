@@ -1,0 +1,657 @@
+{
+  "version": "loan-servicing-lakebase-v1",
+  "objects": [
+    {
+      "object": "borrowers",
+      "root_table": "raw.borrowers",
+      "key": {
+        "source": [
+          "borrower_id"
+        ],
+        "target": "borrower_id"
+      },
+      "watermark": {
+        "source": "modified_date",
+        "target": "modified_date"
+      },
+      "identity": {
+        "source": "borrower_id",
+        "target": "borrower_id"
+      },
+      "fields": [
+        {
+          "source": "ssn_hash",
+          "target": "ssn_hash",
+          "source_type": "VARCHAR(64)",
+          "target_type": "string"
+        },
+        {
+          "source": "first_name",
+          "target": "first_name",
+          "source_type": "VARCHAR(50)",
+          "target_type": "string"
+        },
+        {
+          "source": "last_name",
+          "target": "last_name",
+          "source_type": "VARCHAR(50)",
+          "target_type": "string"
+        },
+        {
+          "source": "date_of_birth",
+          "target": "date_of_birth",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "credit_score",
+          "target": "credit_score",
+          "source_type": "SMALLINT",
+          "target_type": "smallint"
+        },
+        {
+          "source": "borrower_type",
+          "target": "borrower_type",
+          "source_type": "CHAR(1)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "state_code",
+          "target": "state_code",
+          "source_type": "CHAR(2)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "phone_number",
+          "target": "phone_number",
+          "source_type": "VARCHAR(15)",
+          "target_type": "string"
+        },
+        {
+          "source": "email",
+          "target": "email",
+          "source_type": "VARCHAR(100)",
+          "target_type": "string"
+        },
+        {
+          "source": "employer_name",
+          "target": "employer_name",
+          "source_type": "VARCHAR(100)",
+          "target_type": "string"
+        },
+        {
+          "source": "annual_income",
+          "target": "annual_income",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "created_date",
+          "target": "created_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "object": "loans",
+      "root_table": "raw.loans",
+      "key": {
+        "source": [
+          "loan_id"
+        ],
+        "target": "loan_id"
+      },
+      "watermark": {
+        "source": "modified_date",
+        "target": "modified_date"
+      },
+      "identity": {
+        "source": "loan_id",
+        "target": "loan_id"
+      },
+      "fields": [
+        {
+          "source": "borrower_id",
+          "target": "borrower_id",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "loan_number",
+          "target": "loan_number",
+          "source_type": "VARCHAR(20)",
+          "target_type": "string"
+        },
+        {
+          "source": "loan_type",
+          "target": "loan_type",
+          "source_type": "CHAR(4)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "loan_purpose",
+          "target": "loan_purpose",
+          "source_type": "CHAR(1)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "original_balance",
+          "target": "original_balance",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "current_balance",
+          "target": "current_balance",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "interest_rate",
+          "target": "interest_rate",
+          "source_type": "DECIMAL(6,4)",
+          "target_type": "decimal(6,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "term_months",
+          "target": "term_months",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "origination_date",
+          "target": "origination_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "first_payment_date",
+          "target": "first_payment_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "maturity_date",
+          "target": "maturity_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "loan_status",
+          "target": "loan_status",
+          "source_type": "CHAR(2)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "days_past_due",
+          "target": "days_past_due",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "past_due_amount",
+          "target": "past_due_amount",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "escrow_balance",
+          "target": "escrow_balance",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "late_fee_balance",
+          "target": "late_fee_balance",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "late_fee_assessed",
+          "target": "late_fee_assessed",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "last_fee_date",
+          "target": "last_fee_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "servicer_id",
+          "target": "servicer_id",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "investor_code",
+          "target": "investor_code",
+          "source_type": "VARCHAR(10)",
+          "target_type": "string"
+        },
+        {
+          "source": "property_state",
+          "target": "property_state",
+          "source_type": "CHAR(2)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "property_value",
+          "target": "property_value",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "ltv",
+          "target": "ltv",
+          "source_type": "DECIMAL(6,4)",
+          "target_type": "decimal(6,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "note_text",
+          "target": "note_text",
+          "source_type": "VARCHAR(MAX)",
+          "target_type": "string",
+          "rules": [
+            "empty_string_is_null"
+          ]
+        },
+        {
+          "source": "created_date",
+          "target": "created_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "object": "payments",
+      "root_table": "raw.payments",
+      "key": {
+        "source": [
+          "payment_id"
+        ],
+        "target": "payment_id"
+      },
+      "watermark": {
+        "source": "created_date",
+        "target": "created_date"
+      },
+      "identity": {
+        "source": "payment_id",
+        "target": "payment_id"
+      },
+      "fields": [
+        {
+          "source": "loan_id",
+          "target": "loan_id",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "payment_date",
+          "target": "payment_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "effective_date",
+          "target": "effective_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "principal_amt",
+          "target": "principal_amt",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "interest_amt",
+          "target": "interest_amt",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "escrow_amt",
+          "target": "escrow_amt",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "late_fee_amt",
+          "target": "late_fee_amt",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "total_amt",
+          "target": "total_amt",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "payment_type",
+          "target": "payment_type",
+          "source_type": "CHAR(3)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "payment_method",
+          "target": "payment_method",
+          "source_type": "CHAR(3)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "batch_id",
+          "target": "batch_id",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "reversal_flag",
+          "target": "reversal_flag",
+          "source_type": "CHAR(1)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        }
+      ]
+    },
+    {
+      "object": "escrow_accounts",
+      "root_table": "raw.escrow_accounts",
+      "key": {
+        "source": [
+          "escrow_id"
+        ],
+        "target": "escrow_id"
+      },
+      "watermark": {
+        "source": "modified_date",
+        "target": "modified_date"
+      },
+      "identity": {
+        "source": "escrow_id",
+        "target": "escrow_id"
+      },
+      "fields": [
+        {
+          "source": "loan_id",
+          "target": "loan_id",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "escrow_type",
+          "target": "escrow_type",
+          "source_type": "CHAR(3)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "monthly_amount",
+          "target": "monthly_amount",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "current_balance",
+          "target": "current_balance",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "target_balance",
+          "target": "target_balance",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "last_disbursement",
+          "target": "last_disbursement",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "next_due_date",
+          "target": "next_due_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "shortage_flag",
+          "target": "shortage_flag",
+          "source_type": "CHAR(1)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "created_date",
+          "target": "created_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "object": "loan_modifications",
+      "root_table": "raw.loan_modifications",
+      "key": {
+        "source": [
+          "modification_id"
+        ],
+        "target": "modification_id"
+      },
+      "watermark": {
+        "source": "created_date",
+        "target": "created_date"
+      },
+      "identity": {
+        "source": "modification_id",
+        "target": "modification_id"
+      },
+      "fields": [
+        {
+          "source": "loan_id",
+          "target": "loan_id",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "modification_type",
+          "target": "modification_type",
+          "source_type": "CHAR(3)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        },
+        {
+          "source": "effective_date",
+          "target": "effective_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "expiration_date",
+          "target": "expiration_date",
+          "source_type": "DATETIME",
+          "target_type": "timestamp",
+          "rules": [
+            "datetime_utc_truncate_ms"
+          ]
+        },
+        {
+          "source": "original_rate",
+          "target": "original_rate",
+          "source_type": "DECIMAL(6,4)",
+          "target_type": "decimal(6,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "modified_rate",
+          "target": "modified_rate",
+          "source_type": "DECIMAL(6,4)",
+          "target_type": "decimal(6,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "original_term",
+          "target": "original_term",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "modified_term",
+          "target": "modified_term",
+          "source_type": "INT",
+          "target_type": "int"
+        },
+        {
+          "source": "deferred_amount",
+          "target": "deferred_amount",
+          "source_type": "MONEY",
+          "target_type": "decimal(19,4)",
+          "rules": [
+            "decimal_round"
+          ]
+        },
+        {
+          "source": "status",
+          "target": "status",
+          "source_type": "CHAR(1)",
+          "target_type": "string",
+          "rules": [
+            "rstrip_spaces"
+          ]
+        }
+      ]
+    }
+  ]
+}

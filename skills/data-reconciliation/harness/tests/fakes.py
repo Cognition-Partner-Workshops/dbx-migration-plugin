@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import decimal
 from collections import Counter
 from typing import Any, Iterable
 
-from recon.adapters import Stratum
+from recon.adapters import SchemaFacts, Stratum
 from recon.paths import get_path
 from recon.canon import MISSING
 
@@ -18,6 +19,22 @@ def _matches(row: dict, where: str | None) -> bool:
     if where.lstrip().startswith("{"):
         parsed = json.loads(where)
         return all(row.get(k) == v for k, v in parsed.items())
+    if " > " in where or " >= " in where:
+        # the in-flight predicate the transactional window issues:
+        # [(scope) AND ]col > literal  |  [(scope) AND ]col >= datetime_literal
+        scope, _, newer = where.rpartition(" AND ") if " AND " in where else (None, None, where)
+        op = " >= " if " >= " in newer else " > "
+        col, _, lit = newer.partition(op)
+        value = row.get(col.strip())
+        if value is None:
+            return False
+        lit = lit.strip().strip("'")
+        if isinstance(value, datetime.datetime):
+            bound = datetime.datetime.fromisoformat(lit)
+        else:
+            bound = type(value)(lit)
+        newer_ok = value >= bound if op == " >= " else value > bound
+        return newer_ok and _matches(row, scope.strip("() ") if scope else None)
     left, sep, right = where.partition("=")
     if not sep:
         return True
@@ -26,16 +43,110 @@ def _matches(row: dict, where: str | None) -> bool:
     value = row[key] if key in row else get_path(row, key)
     return str(value) == right
 
-class FakeSource:
-    """Implements SourceAdapter plus the optional BatchAggregates / StratifiedKeys /
-    StatementCounting protocols; `calls` records which entry points the tiers used."""
 
-    def __init__(self, tables: dict[str, list[dict]]):
+class _TransactionalMixin:
+    """TransactionalSide for the in-memory fakes; `schema` maps table -> SchemaFacts and
+    `sequences` maps (table, column) -> next value, both optional."""
+    tables: dict
+    calls: Counter
+    statements: int
+    rows_fetched: int
+
+    def _init_transactional(self, schema=None, sequences=None):
+        self.schema = schema or {}
+        self.sequences = sequences or {}
+        self.isolation = "none"
+        self.window_open = False
+        # called between open and close by tests that simulate a side moving mid-run
+        self.on_open = None
+
+    def _tx_rows(self, table, where):
+        return [r for r in self._all_rows(table) if _matches(r, where)]
+
+    def _tx_key(self, r, key_cols):
+        return tuple(get_path(r, k) if k not in r else r[k] for k in key_cols)
+
+    def open_window(self) -> str:
+        self.calls["open_window"] += 1
+        self.window_open = True
+        self.isolation = "fake_snapshot"
+        if self.on_open:
+            self.on_open()
+        return self.isolation
+
+    def close_window(self) -> None:
+        self.calls["close_window"] += 1
+        self.window_open = False
+
+    def window_marker(self, table, key_cols, watermark, where=None) -> tuple:
+        self.calls["window_marker"] += 1
+        self.statements += 1
+        rows = self._tx_rows(table, where)
+        if watermark:
+            vals = [r.get(watermark) for r in rows if r.get(watermark) is not None]
+            return (len(rows), max(vals) if vals else None)
+        keys = [self._tx_key(r, key_cols) for r in rows]
+        return (len(rows),) + tuple(max(k[i] for k in keys) if keys else None for i in range(len(key_cols)))
+
+    def range_counts(self, table, key_cols, ranges, where=None) -> list[int]:
+        self.calls["range_counts"] += 1
+        self.statements += 1
+        keys = [self._tx_key(r, key_cols) for r in self._tx_rows(table, where)]
+        out = []
+        for lo, hi in ranges:
+            lo = lo if lo is None or isinstance(lo, tuple) else (lo,)
+            hi = hi if hi is None or isinstance(hi, tuple) else (hi,)
+            out.append(sum(1 for k in keys if (lo is None or k >= lo) and (hi is None or k <= hi)))
+        return out
+
+    def keys_in_range(self, table, key_cols, lo, hi, where=None, extra_cols=None) -> list[tuple]:
+        self.calls["keys_in_range"] += 1
+        self.statements += 1
+        lo = lo if lo is None or isinstance(lo, tuple) else (lo,)
+        hi = hi if hi is None or isinstance(hi, tuple) else (hi,)
+        out = []
+        for r in self._tx_rows(table, where):
+            k = self._tx_key(r, key_cols)
+            if (lo is None or k >= lo) and (hi is None or k <= hi):
+                out.append(k + tuple(r.get(c) for c in (extra_cols or [])))
+        self.rows_fetched += len(out)
+        return sorted(out, key=lambda k: k[:len(key_cols)])
+
+    def max_watermark(self, table, watermark, where=None):
+        self.calls["max_watermark"] += 1
+        self.statements += 1
+        vals = [r.get(watermark) for r in self._tx_rows(table, where) if r.get(watermark) is not None]
+        return max(vals) if vals else None
+
+    def schema_facts(self, table) -> SchemaFacts:
+        self.calls["schema_facts"] += 1
+        self.statements += 4
+        if table not in self.schema:
+            raise NotImplementedError(f"fake has no schema facts for {table}")
+        return self.schema[table]
+
+    def identity_next(self, table, column) -> int | None:
+        self.calls["identity_next"] += 1
+        self.statements += 1
+        if (table, column) not in self.sequences:
+            raise NotImplementedError(f"fake has no identity state for {table}.{column}")
+        return self.sequences[(table, column)]
+
+class FakeSource(_TransactionalMixin):
+    """Implements SourceAdapter plus the optional BatchAggregates / StratifiedKeys /
+    StatementCounting / TransactionalSide protocols; `calls` records which entry points the
+    tiers used."""
+
+    def __init__(self, tables: dict[str, list[dict]], schema=None, sequences=None):
         self.tables = tables
         self.last_fetch_keyed = None
         self.calls: Counter[str] = Counter()
         self.statements = 0
         self.rows_fetched = 0
+        self._init_transactional(schema, sequences)
+
+    def _all_rows(self, table):
+        return self.tables[table]
 
     def _key(self, r: dict, key_cols: list[str]) -> tuple:
         return tuple(r[k] if k in r else get_path(r, k) for k in key_cols)
@@ -144,14 +255,19 @@ def _get_path(doc: dict, path: str):
     return cur
 
 
-class FakeTarget:
-    def __init__(self, objects: dict[str, list[dict]], scopes: dict[str, callable] | None = None):
+class FakeTarget(_TransactionalMixin):
+    def __init__(self, objects: dict[str, list[dict]], scopes: dict[str, callable] | None = None,
+                 schema=None, sequences=None):
         self.objects = objects
         self.scopes = scopes or {}
         self.last_fetch_keyed = None
         self.calls: Counter[str] = Counter()
         self.statements = 0
         self.rows_fetched = 0
+        self._init_transactional(schema, sequences)
+
+    def _all_rows(self, table):
+        return self.objects[table]
 
     def _rows(self, object, where):
         scope = self.scopes.get(where) if where else None

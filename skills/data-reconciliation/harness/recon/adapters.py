@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from .paths import get_path
@@ -32,6 +32,19 @@ class Stratum:
 
 def _as_key(value: Any) -> tuple:
     return value if isinstance(value, tuple) else (value,)
+
+
+@dataclass
+class SchemaFacts:
+    """Constraint, index and identity shape of one table, in the engine's own column names.
+    Column tuples are ordered; unique/index sets hold leading-column tuples."""
+    primary_key: tuple[str, ...] = ()
+    unique: set[tuple[str, ...]] = field(default_factory=set)
+    foreign_keys: set[tuple[tuple[str, ...], str, tuple[str, ...]]] = field(default_factory=set)
+    not_null: set[str] = field(default_factory=set)
+    indexes: set[tuple[str, ...]] = field(default_factory=set)
+    check_count: int = 0
+    identity_columns: set[str] = field(default_factory=set)
 
 
 class SourceAdapter(Protocol):
@@ -70,6 +83,24 @@ class StratifiedKeys(Protocol):
 
 
 @runtime_checkable
+class TransactionalSide(Protocol):
+    """What --mode transactional needs from a live side. Both sides implement it; the tiers
+    compare the two. `window_marker` is read at open and close to prove the window held."""
+    def open_window(self) -> str: ...
+    def close_window(self) -> None: ...
+    def window_marker(self, table: str, key_cols: list[str], watermark: str | None,
+                      where: str | None = None) -> tuple: ...
+    def range_counts(self, table: str, key_cols: list[str],
+                     ranges: list[tuple[tuple | None, tuple | None]],
+                     where: str | None = None) -> list[int]: ...
+    def keys_in_range(self, table: str, key_cols: list[str], lo: tuple | None, hi: tuple | None,
+                      where: str | None = None, extra_cols: list[str] | None = None) -> list[tuple]: ...
+    def max_watermark(self, table: str, watermark: str, where: str | None = None) -> Any: ...
+    def schema_facts(self, table: str) -> SchemaFacts: ...
+    def identity_next(self, table: str, column: str) -> int | None: ...
+
+
+@runtime_checkable
 class StatementCounting(Protocol):
     """Adapters that count what they cost: statements issued and rows pulled across the wire."""
     statements: int
@@ -98,11 +129,18 @@ class _SqlAdapterBase:
 
     paramstyle = "qmark"
     bucket_sql = NTILE_SQL
+    # Statement that pins a repeatable snapshot for the rest of the transaction; None when the
+    # engine has none we can rely on (the window markers then carry the proof alone).
+    snapshot_sql: str | None = None
+    # Statement that undoes snapshot_sql when the engine rejects it at the first table read
+    # (the level is session-scoped on SQL Server, so a rollback alone leaves it in force).
+    snapshot_reset_sql: str | None = None
 
     def __init__(self, conn):
         self._conn = conn
         self.statements = 0
         self.rows_fetched = 0
+        self.isolation = "none"
 
     def _execute(self, sql: str, params=()):
         cur = self._conn.cursor()
@@ -287,6 +325,97 @@ class _SqlAdapterBase:
                           f"GROUP BY {order} HAVING COUNT(*) > 1) d")[0]
         return int(n)
 
+    # ---- transactional mode -----------------------------------------------------------
+
+    def open_window(self) -> str:
+        """Best effort: pin a snapshot for the run. Engines that refuse (SQL Server without
+        ALLOW_SNAPSHOT_ISOLATION, Sybase) fall back to plain reads; the markers still decide."""
+        if hasattr(self._conn, "rollback"):
+            try:
+                self._conn.rollback()
+            except Exception:  # noqa: BLE001  nothing to roll back on some drivers
+                pass
+        if self.snapshot_sql:
+            try:
+                self._execute(self.snapshot_sql)
+                self.isolation = "snapshot"
+            except Exception:  # noqa: BLE001  driver-specific error type
+                if hasattr(self._conn, "rollback"):
+                    self._conn.rollback()
+                self.isolation = "none"
+        return self.isolation
+
+    def close_window(self) -> None:
+        if hasattr(self._conn, "rollback"):
+            self._conn.rollback()
+
+    def window_marker(self, table: str, key_cols: list[str], watermark: str | None,
+                      where: str | None = None) -> tuple:
+        w = f" WHERE {where}" if where else ""
+        marks = [f"MAX({watermark})"] if watermark else [f"MAX({k})" for k in key_cols]
+        sql = f"SELECT COUNT(*), {', '.join(marks)} FROM {table}{w}"
+        try:
+            row = self._rows(sql)[0]
+        except Exception:  # noqa: BLE001  driver-specific error type
+            if self.isolation != "snapshot":
+                raise
+            # SQL Server accepts SET ... SNAPSHOT and only fails on the first table read when the
+            # database has ALLOW_SNAPSHOT_ISOLATION off; drop to plain reads, markers still decide.
+            self._conn.rollback()
+            if self.snapshot_reset_sql:
+                self._execute(self.snapshot_reset_sql)
+            self.isolation = "none"
+            row = self._rows(sql)[0]
+        return tuple(row)
+
+    def _range_predicate(self, key_cols: list[str], lo: tuple | None, hi: tuple | None,
+                         offset: int) -> tuple[str, list[Any]]:
+        parts, values = [], []
+        if lo is not None:
+            sql, vals = self._key_bound(key_cols, _as_key(lo), ">=", offset + len(values))
+            parts.append(sql)
+            values += vals
+        if hi is not None:
+            sql, vals = self._key_bound(key_cols, _as_key(hi), "<=", offset + len(values))
+            parts.append(sql)
+            values += vals
+        return (" AND ".join(parts) if parts else "1 = 1"), values
+
+    def range_counts(self, table: str, key_cols: list[str],
+                     ranges: list[tuple[tuple | None, tuple | None]],
+                     where: str | None = None) -> list[int]:
+        """Row count per key range, one statement for every range (SUM over CASE)."""
+        if not ranges:
+            return []
+        exprs, values = [], []
+        for lo, hi in ranges:
+            pred, vals = self._range_predicate(key_cols, lo, hi, len(values))
+            values += vals
+            exprs.append(f"SUM(CASE WHEN {pred} THEN 1 ELSE 0 END)")
+        w = f" WHERE {where}" if where else ""
+        row = self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}", self._params(values))[0]
+        return [int(v or 0) for v in row]
+
+    def keys_in_range(self, table: str, key_cols: list[str], lo: tuple | None, hi: tuple | None,
+                      where: str | None = None, extra_cols: list[str] | None = None) -> list[tuple]:
+        pred, values = self._range_predicate(key_cols, lo, hi, 0)
+        clauses = [pred] + ([f"({where})"] if where else [])
+        cols = ", ".join(list(key_cols) + list(extra_cols or []))
+        rows = self._rows(f"SELECT {cols} FROM {table} WHERE {' AND '.join(clauses)} "
+                          f"ORDER BY {', '.join(key_cols)}", self._params(values))
+        self.rows_fetched += len(rows)
+        return [tuple(r) for r in rows]
+
+    def max_watermark(self, table: str, watermark: str, where: str | None = None) -> Any:
+        w = f" WHERE {where}" if where else ""
+        return self._rows(f"SELECT MAX({watermark}) FROM {table}{w}")[0][0]
+
+    def schema_facts(self, table: str) -> SchemaFacts:
+        raise NotImplementedError(f"{type(self).__name__} cannot read constraint metadata")
+
+    def identity_next(self, table: str, column: str) -> int | None:
+        raise NotImplementedError(f"{type(self).__name__} cannot read identity state")
+
 
 # ---- Source warehouses ------------------------------------------------------------------
 
@@ -328,12 +457,94 @@ class OracleSourceAdapter(_SqlAdapterBase):
         super().__init__(oracledb.connect(user=user, password=password, dsn=dsn))
 
 
+def _split_table(table: str, default_schema: str | None) -> tuple[str | None, str]:
+    parts = table.replace("[", "").replace("]", "").replace('"', "").split(".")
+    return (parts[-2] if len(parts) > 1 else default_schema), parts[-1]
+
+
 class SqlServerSourceAdapter(_SqlAdapterBase):
-    """Secret value: an ODBC connection string."""
+    """Secret value: an ODBC connection string. Also the Sybase ASE stand-in for the OLTP track
+    (same T-SQL catalog shape through sys.* views on SQL Server; ASE itself has no snapshot
+    isolation, which the fallback covers)."""
+
+    snapshot_sql = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT"
+    snapshot_reset_sql = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
 
     def __init__(self, dsn_secret: str):
         import pyodbc  # lazy: optional extra
         super().__init__(pyodbc.connect(_secret(dsn_secret)))
+
+    def schema_facts(self, table: str) -> SchemaFacts:
+        schema, name = _split_table(table, "dbo")
+        facts = SchemaFacts()
+        rows = self._rows(
+            "SELECT i.is_primary_key, i.is_unique, i.name, ic.key_ordinal, c.name "
+            "FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+            "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+            "WHERE s.name = ? AND o.name = ? AND i.index_id > 0 AND ic.is_included_column = 0 "
+            "ORDER BY i.index_id, ic.key_ordinal", (schema, name))
+        by_index: dict[str, list] = {}
+        for is_pk, is_unique, iname, _ord, col in rows:
+            by_index.setdefault(iname, [bool(is_pk), bool(is_unique), []])[2].append(col)
+        for is_pk, is_unique, cols in by_index.values():
+            if is_pk:
+                facts.primary_key = tuple(cols)
+            elif is_unique:
+                facts.unique.add(tuple(cols))
+            else:
+                facts.indexes.add(tuple(cols))
+        rows = self._rows(
+            "SELECT fk.name, pc.name, rs.name + '.' + ro.name, rc.name "
+            "FROM sys.foreign_keys fk "
+            "JOIN sys.objects o ON o.object_id = fk.parent_object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "JOIN sys.objects ro ON ro.object_id = fk.referenced_object_id "
+            "JOIN sys.schemas rs ON rs.schema_id = ro.schema_id "
+            "JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id "
+            "JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id "
+            "JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id "
+            "WHERE s.name = ? AND o.name = ? ORDER BY fk.name, fkc.constraint_column_id", (schema, name))
+        by_fk: dict[str, list] = {}
+        for fk_name, col, ref_table, ref_col in rows:
+            entry = by_fk.setdefault(fk_name, [[], ref_table, []])
+            entry[0].append(col)
+            entry[2].append(ref_col)
+        for cols, ref_table, ref_cols in by_fk.values():
+            facts.foreign_keys.add((tuple(cols), ref_table, tuple(ref_cols)))
+        rows = self._rows(
+            "SELECT c.name, c.is_nullable, c.is_identity FROM sys.columns c "
+            "JOIN sys.objects o ON o.object_id = c.object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = ? AND o.name = ?",
+            (schema, name))
+        for col, nullable, is_identity in rows:
+            if not nullable:
+                facts.not_null.add(col)
+            if is_identity:
+                facts.identity_columns.add(col)
+        (n,) = self._rows(
+            "SELECT COUNT(*) FROM sys.check_constraints cc "
+            "JOIN sys.objects o ON o.object_id = cc.parent_object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = ? AND o.name = ?",
+            (schema, name))[0]
+        facts.check_count = int(n)
+        return facts
+
+    def identity_next(self, table: str, column: str) -> int | None:
+        schema, name = _split_table(table, "dbo")
+        rows = self._rows(
+            "SELECT CAST(ic.last_value AS BIGINT), CAST(ic.increment_value AS BIGINT), "
+            "       CAST(ic.seed_value AS BIGINT) "
+            "FROM sys.identity_columns ic JOIN sys.objects o ON o.object_id = ic.object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "WHERE s.name = ? AND o.name = ? AND ic.name = ?", (schema, name, column))
+        if not rows:
+            return None
+        last, inc, seed = rows[0]
+        if last is None:  # identity never used: the next value is the seed
+            return int(seed) if seed is not None else None
+        return int(last) + int(inc or 1)
 
 
 class DatabricksSourceAdapter(_SqlAdapterBase):
@@ -437,3 +648,168 @@ class DatabricksTargetAdapter:
 
     def run_query(self, sql: str) -> list[dict[str, Any]]:
         return self._sql.run_query(sql)
+
+
+# ---- Lakebase (Postgres) target -----------------------------------------------------------
+
+class _PostgresBase(_SqlAdapterBase):
+    """Postgres wire protocol via psycopg 3: Lakebase branches and any stand-in Postgres."""
+
+    paramstyle = "format"
+
+    def open_window(self) -> str:
+        """Every statement until close_window reads one REPEATABLE READ snapshot."""
+        self._conn.rollback()
+        try:
+            import psycopg  # lazy: optional extra
+            self._conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            self._conn.read_only = True
+            self.isolation = "repeatable_read"
+        except Exception:  # noqa: BLE001  a non-psycopg connection object (tests, other drivers)
+            self.isolation = "none"
+        return self.isolation
+
+    def schema_facts(self, table: str) -> SchemaFacts:
+        schema, name = _split_table(table, "public")
+        facts = SchemaFacts()
+        rows = self._rows(
+            "SELECT con.contype, con.conname, a.attname, "
+            "       CASE WHEN con.contype = 'f' THEN rn.nspname || '.' || rc.relname END, "
+            "       ra.attname, k.ord "
+            "FROM pg_constraint con "
+            "JOIN pg_class c ON c.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+            "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum "
+            "LEFT JOIN pg_class rc ON rc.oid = con.confrelid "
+            "LEFT JOIN pg_namespace rn ON rn.oid = rc.relnamespace "
+            "LEFT JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) "
+            "       ON fk.ord = k.ord "
+            "LEFT JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = fk.attnum "
+            "WHERE n.nspname = %s AND c.relname = %s AND con.contype IN ('p', 'u', 'f', 'c') "
+            "ORDER BY con.conname, k.ord", (schema, name))
+        by_con: dict[str, list] = {}
+        for ctype, cname, col, ref_table, ref_col, _ord in rows:
+            entry = by_con.setdefault(cname, [ctype, [], ref_table, []])
+            entry[1].append(col)
+            if ref_col is not None:
+                entry[3].append(ref_col)
+        for ctype, cols, ref_table, ref_cols in by_con.values():
+            if ctype == "p":
+                facts.primary_key = tuple(cols)
+            elif ctype == "u":
+                facts.unique.add(tuple(cols))
+            elif ctype == "f":
+                facts.foreign_keys.add((tuple(cols), ref_table, tuple(ref_cols)))
+            elif ctype == "c":
+                facts.check_count += 1
+        rows = self._rows(
+            "SELECT ix.indisunique, ix.indisprimary, a.attname, k.ord "
+            "FROM pg_index ix JOIN pg_class c ON c.oid = ix.indrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON k.ord <= ix.indnkeyatts "
+            "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum "
+            "WHERE n.nspname = %s AND c.relname = %s AND NOT ix.indisprimary "
+            "ORDER BY ix.indexrelid, k.ord", (schema, name))
+        # indexes are grouped by their order of appearance (indexrelid), so a change in the
+        # ordinal back to 1 starts a new index
+        current: list[str] = []
+        current_unique = False
+        for is_unique, _is_pk, col, ord_ in rows:
+            if int(ord_) == 1 and current:
+                (facts.unique if current_unique else facts.indexes).add(tuple(current))
+                current = []
+            current.append(col)
+            current_unique = bool(is_unique)
+        if current:
+            (facts.unique if current_unique else facts.indexes).add(tuple(current))
+        rows = self._rows(
+            "SELECT a.attname, a.attnotnull, a.attidentity <> '' OR "
+            "       pg_get_serial_sequence(%s, a.attname) IS NOT NULL "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped",
+            (f'"{schema}"."{name}"', schema, name))
+        for col, notnull, has_seq in rows:
+            if notnull:
+                facts.not_null.add(col)
+            if has_seq:
+                facts.identity_columns.add(col)
+        return facts
+
+    def identity_next(self, table: str, column: str) -> int | None:
+        schema, name = _split_table(table, "public")
+        (seq,) = self._rows("SELECT pg_get_serial_sequence(%s, %s)",
+                            (f'"{schema}"."{name}"', column))[0]
+        if seq is None:
+            return None
+        (last, is_called, inc) = self._rows(
+            f"SELECT s.last_value, s.is_called, p.seqincrement FROM {seq} s, "
+            "pg_sequence p WHERE p.seqrelid = %s::regclass", (seq,))[0]
+        return int(last) + int(inc) if is_called else int(last)
+
+
+class PostgresSourceAdapter(_PostgresBase):
+    """Secret value: a libpq DSN for a read-only role (on-prem Postgres/MySQL-compatible OLTP
+    sources on the operational track; also the stand-in source in rehearsals)."""
+
+    def __init__(self, dsn_secret: str):
+        import psycopg  # lazy: optional extra
+        super().__init__(psycopg.connect(_secret(dsn_secret)))
+
+
+SOURCE_ADAPTERS["postgres"] = PostgresSourceAdapter
+
+
+class LakebaseTargetAdapter(_PostgresBase):
+    """Target side for the operational track: one schema inside a Lakebase branch database.
+    Secret value: the branch endpoint's libpq DSN (OAuth token as the password, minted by
+    `databricks postgres` for the migration principal; never the production branch). Object
+    names in the mapping spec are bare table names, qualified here with the schema."""
+
+    def __init__(self, secret_name: str, schema: str):
+        import psycopg  # lazy: optional extra
+        super().__init__(psycopg.connect(_secret(secret_name)))
+        self._schema = schema
+
+    def _q(self, object: str) -> str:
+        return f'"{self._schema}"."{object}"'
+
+    def target_row_count(self, object: str, where: str | None = None) -> int:
+        return self.row_count(self._q(object), where)
+
+    def nested_count(self, object: str, array_path: str, where: str | None = None) -> int:
+        from .config import ConfigError
+        raise ConfigError(f"{object}.{array_path}: embedded arrays have no Lakebase shape; "
+                          "map the child table as its own object")
+
+    def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
+        return super().field_aggregates(self._q(object), field_path, where)
+
+    def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
+                         where: str | None = None) -> dict[str, dict[str, Any]]:
+        return super().table_aggregates(self._q(object), columns, numeric, where)
+
+    def fetch_keyed(self, object: str, key_fields: list[str], fields: list[str],
+                    where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]:
+        return super().fetch_keyed(self._q(object), key_fields, fields, where, keys)
+
+    def window_marker(self, object: str, key_cols: list[str], watermark: str | None,
+                      where: str | None = None) -> tuple:
+        return super().window_marker(self._q(object), key_cols, watermark, where)
+
+    def range_counts(self, object: str, key_cols: list[str], ranges, where: str | None = None) -> list[int]:
+        return super().range_counts(self._q(object), key_cols, ranges, where)
+
+    def keys_in_range(self, object: str, key_cols: list[str], lo, hi, where: str | None = None,
+                      extra_cols: list[str] | None = None) -> list[tuple]:
+        return super().keys_in_range(self._q(object), key_cols, lo, hi, where, extra_cols)
+
+    def max_watermark(self, object: str, watermark: str, where: str | None = None) -> Any:
+        return super().max_watermark(self._q(object), watermark, where)
+
+    def schema_facts(self, object: str) -> SchemaFacts:
+        return super().schema_facts(self._q(object))
+
+    def identity_next(self, object: str, column: str) -> int | None:
+        return super().identity_next(self._q(object), column)

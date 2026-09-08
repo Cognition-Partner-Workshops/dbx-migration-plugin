@@ -76,6 +76,14 @@ class ObjectMapping:
     embeds: list[EmbedMapping] = field(default_factory=list)
     root_where: str | None = None
     target_where: str | None = None
+    # Transactional mode (operational track). watermark: the change column on each side; rows
+    # whose source watermark is newer than the target's applied high-watermark are in flight,
+    # not defects. identity: the source identity/sequence column and its target column, whose
+    # owned sequence must be ahead of every migrated key.
+    watermark_source: str | None = None
+    watermark_target: str | None = None
+    identity_source: str | None = None
+    identity_target: str | None = None
 
     def __post_init__(self):
         if isinstance(self.key_target, str):
@@ -96,6 +104,10 @@ class Tolerances:
     numeric_abs_tol: float = 0.0
     aggregate_rel_tol: float = 0.0
     source_concurrency: int = 1
+    # Transactional mode: tolerated CDC lag between max(source watermark) and max(target
+    # watermark), and the number of key ranges the PK-set diff counts before streaming keys.
+    cdc_lag_max_s: float = 0.0
+    pk_set_ranges: int = 64
 
 
 @dataclass(frozen=True)
@@ -149,6 +161,14 @@ def _validate_mapping_identifiers(c: dict) -> None:
     for f in c.get("fields", []):
         validate_identifier(f["source"])
         validate_identifier(f["target"])
+    for block in ("watermark", "identity"):
+        pair = c.get(block)
+        if pair is None:
+            continue
+        if not isinstance(pair, dict) or not pair.get("source") or not pair.get("target"):
+            raise ConfigError(f"{block} must be an object with source and target column names")
+        validate_identifier(pair["source"])
+        validate_identifier(pair["target"])
     for e in c.get("embeds", []):
         validate_identifier(e["array_path"])
         validate_identifier(e["child_table"])
@@ -198,6 +218,10 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             fields=fields_, embeds=embeds,
             root_where=_validate_predicate(substitute_params(c.get("root_where"), params, path)),
             target_where=_validate_predicate(substitute_params(c.get("target_where"), params, path)),
+            watermark_source=(c.get("watermark") or {}).get("source"),
+            watermark_target=(c.get("watermark") or {}).get("target"),
+            identity_source=(c.get("identity") or {}).get("source"),
+            identity_target=(c.get("identity") or {}).get("target"),
         ))
     if not objects:
         raise ConfigError(f"{path}: mapping spec has no objects")
@@ -214,6 +238,8 @@ def load_tolerances(path: Path) -> Tolerances:
         numeric_abs_tol=float(data.get("numeric_abs_tol", 0.0)),
         aggregate_rel_tol=float(data.get("aggregate_rel_tol", 0.0)),
         source_concurrency=int(data.get("source_concurrency", 1)),
+        cdc_lag_max_s=float(data.get("cdc_lag_max_s", 0.0)),
+        pk_set_ranges=int(data.get("pk_set_ranges", 64)),
     )
 
 

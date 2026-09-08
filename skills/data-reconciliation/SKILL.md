@@ -27,8 +27,9 @@ dbx-recon run \
   --mapping .migration/units/<unit_id>/mapping_spec.json \
   --tolerances .migration/03_recon_tolerances.json \
   --canonicalization skills/<source>-sql/canonicalization.json \
-  --mode fixture|live|snapshot|continuous \
+  --mode fixture|live|snapshot|continuous|transactional \
   --source-dsn-secret <SOURCE_SECRET_NAME> \
+  --target-kind databricks|lakebase \
   --target-secret DATABRICKS_MIGRATION_SQL --target-catalog <migration catalog> \
   --allowed-targets-file .migration/allowed_targets.json --target-schema <schema> \
   --snapshot-manifest .migration/snapshots/<unit_id>.json \
@@ -76,6 +77,25 @@ provenance warning and the run is not merge-eligible.
 | 3 | Keyed row diff: full below `full_diff_row_threshold`, else server-side stratified sample (equal-count key ranges, seeded positions inside each, every range's first and last key, plus a duplicate-key probe), overridable with `--depth` | Value-level mismatch; findings name the key and column. |
 | 4 | Replay of recorded representative queries on both engines (optional, `--ops`) | Report or extract does not match. SQL ops execute read-only and only `SELECT`/`WITH` queries are allowed. |
 
+`--mode transactional` (operational track, Lakebase target only; refused for `--target-kind
+databricks`) wraps tiers 1-3 in a consistency window and adds the tiers an OLTP target needs:
+
+| Tier | Check | What a FAIL means |
+|---|---|---|
+| 0 | Consistency window: both sides pinned (SQL Server `SNAPSHOT` / Postgres `REPEATABLE READ`; falls back to marker reads and records `isolation: none` when the engine refuses), open and close markers (count, max watermark) compared | A side moved during the run; nothing graded in between is evidence. |
+| 1-3 | As above, but rows newer than the target's applied CDC watermark are *in flight*: a count gap within the in-flight count, and in-flight keys, are not defects | Same as the analytical tiers, on applied rows only. |
+| 5 | PK set diff: equal-count key ranges compared by count on each side, keys streamed only for ranges that differ | `pk_missing_on_target` older than the watermark = lost change; `pk_extra_on_target` = unapplied delete or stray write. |
+| 6 | CDC lag (source max watermark - target max watermark vs `cdc_lag_max_s`) and ordering (`target_ahead_of_source` = replay or out-of-order apply) | Pipeline behind or applying out of order; cutover cannot be scheduled. |
+| 7 | Schema parity through the mapping: PK, unique, FK, NOT NULL, CHECK count, index coverage (a longer target index covers a shorter source one), and identity/sequence headroom (`sequence_behind_source`: the target's next value would collide with rows already loaded) | Constraint or index dropped in conversion, or new inserts after cutover would fail. |
+
+Tiers 5-7 run even when tier 1 fails, so a FAIL names the keys, lag, and schema gaps rather
+than just a count. The mapping needs `watermark` (source/target column) and, for identity
+tables, `identity`; the tolerance record needs `cdc_lag_max_s` and optionally `pk_set_ranges`.
+A table without a watermark is graded strictly (no in-flight allowance). Embedded arrays are
+refused on a Lakebase target: map operational children as separate objects.
+`harness/examples/lakebase_rehearsal/` is the rehearsed SQL Server -> Postgres run (mapping,
+tolerances, DDL, loader, and two defect scripts with the findings each one must produce).
+
 Aggregates and stratification run natively on each engine, so only chosen keys and their rows
 cross the wire; an adapter without stratification support falls back to a streamed key
 reservoir and says so in `stats.sampling`. Comparisons happen
@@ -89,9 +109,12 @@ null vs empty string) are applied to BOTH sides.
 - `live`: the real read-only source, inside the one live window the parent granted this unit.
 - `snapshot`: source is a frozen extract; every PASS is scoped to the snapshot watermark.
 - `continuous`: Tier 1+2 plus a sampled Tier 3, appended per cycle during parallel-run.
+- `transactional`: both sides live under a consistency window, Lakebase target only. A PASS is
+  scoped to the window that held and the target's applied CDC watermark; the summary names the
+  isolation each side actually ran under.
 
-Only PASS results in `live` or `snapshot` mode have `merge_eligible=true`; fixture and
-continuous evidence never merges.
+Only PASS results in `live`, `snapshot`, or `transactional` mode have `merge_eligible=true`;
+fixture and continuous evidence never merges.
 
 ## Outputs (in `--out`)
 
@@ -116,8 +139,9 @@ continuous evidence never merges.
 
 ## Example inputs
 
-`harness/examples/` has a mapping spec, a tolerance record, and Redshift canonicalization
-rules. Copy and edit; do not start from a blank file.
+`harness/examples/` has a mapping spec, a tolerance record, Redshift canonicalization rules,
+and the `lakebase_rehearsal/` operational set (mapping with watermark/identity, OLTP
+tolerances, target DDL, loader, defect scripts). Copy and edit; do not start from a blank file.
 
 ## Known traps (append per engagement)
 - AVG on integers truncates on some legacy engines and returns decimal on Databricks. Use
