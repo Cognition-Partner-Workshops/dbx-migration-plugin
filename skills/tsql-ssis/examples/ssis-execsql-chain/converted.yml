@@ -120,6 +120,9 @@ resources:
         - task_key: log_failure
           depends_on:
             - task_key: count_eligible
+            # no `outcome`: fan-in on completion of the If/else itself, so a failed evaluation
+            # (e.g. a non-numeric task value) logs like any other task failure
+            - task_key: check_eligible
             - task_key: nightly_accrual
             - task_key: apply_late_fees
             - task_key: eod_reconciliation

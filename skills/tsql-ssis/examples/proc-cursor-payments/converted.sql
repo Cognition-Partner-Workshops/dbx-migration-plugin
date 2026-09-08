@@ -25,22 +25,30 @@ AS BEGIN
     DECLARE eligible_rows  INT    DEFAULT 0;
     DECLARE total_applied  DECIMAL(19,4) DEFAULT 0;
     DECLARE payment_failed CONDITION FOR SQLSTATE '45001';   -- source RAISERROR 50001
+    DECLARE balances_applied BOOLEAN DEFAULT false;          -- set after the loans MERGE commits
 
     -- error_handler (source: @@error + GOTO, with a per-loan BEGIN TRAN ... COMMIT / ROLLBACK).
+    -- Commit unit: the source commits loan by loan, so a failure at loan k leaves loans 1..k-1 applied
+    -- (and a rerun would pay them twice, since eligibility is not batch-aware). The set-based conversion
+    -- makes the BATCH the commit unit: on failure nothing is applied, which is the source's own state
+    -- when loan 1 fails and the only state a rerun can safely start from. Recorded as a per-unit
+    -- decision (SKILL §6 transactions row), not silently assumed.
     -- The compound statement is NOT ATOMIC by default (sql-scripting.md "Key rules"), so a failure after
-    -- the payments INSERT would otherwise leave payments with no balance update, which the source's
-    -- per-loan transaction never allows. The handler therefore undoes whichever of this batch's writes
-    -- landed, in reverse order; every statement is a no-op when its write did not happen:
-    --   * audit rows are keyed to this batch through payments.batch_id,
-    --   * payments are keyed by batch_id,
-    --   * loans are restored to the pre-batch snapshot held in eligible_loans (a MERGE that did not run
-    --     leaves every balance equal to the snapshot, so the restore touches nothing).
+    -- the payments INSERT would otherwise leave payments with no balance update, a state the source can
+    -- never produce. The handler therefore undoes ONLY this invocation's writes, in reverse order, each
+    -- guarded by an ownership predicate so concurrent writers are never overwritten:
+    --   * audit rows: owned through payments.batch_id (= this invocation's audit_id),
+    --   * payments: owned by batch_id,
+    --   * loans: the MERGE is one atomic statement, so balances_applied tells whether it ran; if so the
+    --     reversal ADDS BACK w.principal_due per loan (a delta, not an absolute restore from the
+    --     eligible_loans snapshot, which would erase any balance change a concurrent writer made in
+    --     between). modified_date is left as written; NOTE.md excludes it from the failure-replay Tier 3.
     -- Alternative when payments, audit_trail and loans are all created with
     -- TBLPROPERTIES ('delta.feature.catalogManaged' = 'supported'): wrap the four writes below in
     -- BEGIN ATOMIC ... END (sql-scripting.md "SQL Scripting Atomic Blocks", Preview) and drop the
     -- compensation. Not verified live: BEGIN ATOMIC nested inside a procedure body.
-    -- Edge: if the snapshot CREATE itself fails, nothing has been written and the handler's MERGE raises
-    -- its own error (table not found) instead of 45001; no data is at risk in that path.
+    -- Edge: if a temp-table CREATE itself fails, nothing permanent has been written; p_batch_id is
+    -- NULL, so both DELETEs match no rows and the guarded MERGE is skipped.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         DELETE FROM ${catalog}.${schema}.audit_trail
@@ -48,11 +56,13 @@ AS BEGIN
           AND table_name  = 'payments'
           AND record_id IN (SELECT payment_id FROM ${catalog}.${schema}.payments WHERE batch_id = p_batch_id);
         DELETE FROM ${catalog}.${schema}.payments WHERE batch_id = p_batch_id;
-        MERGE INTO ${catalog}.${schema}.loans t
-        USING eligible_loans el
-        ON t.loan_id = el.loan_id
-        WHEN MATCHED AND t.current_balance <> el.current_balance THEN UPDATE SET
-            t.current_balance = el.current_balance;
+        IF balances_applied THEN
+            MERGE INTO ${catalog}.${schema}.loans t
+            USING waterfall w
+            ON t.loan_id = w.loan_id
+            WHEN MATCHED THEN UPDATE SET
+                t.current_balance = t.current_balance + w.principal_due;
+        END IF;
         DROP TABLE IF EXISTS waterfall;
         DROP TABLE IF EXISTS eligible_loans;
         SET p_rc = 1;
@@ -63,8 +73,6 @@ AS BEGIN
     SET p_rc = 0;
 
     -- Step 1: eligible loans snapshot (SELECT INTO #eligible_loans -> session-scoped temp table).
-    -- Taken BEFORE the first permanent write so the handler's restore always has its snapshot;
-    -- the source takes it after the batch record, which is observably equivalent.
     CREATE TEMP TABLE eligible_loans AS
     SELECT l.loan_id,
            l.current_balance,
@@ -142,6 +150,7 @@ AS BEGIN
     WHEN MATCHED THEN UPDATE SET
         t.current_balance = t.current_balance - w.principal_due,
         t.modified_date   = current_timestamp();
+    SET balances_applied = true;
 
     -- Step 4: batch record update (CONVERT(VARCHAR(20), money) -> cast to STRING).
     UPDATE ${catalog}.${schema}.audit_trail

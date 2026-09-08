@@ -17,6 +17,7 @@ AS BEGIN
 
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
+        DROP TABLE IF EXISTS fee_targets;   -- session-scoped: a retry in the same session must be able to recreate it
         SET p_rc = 1;
         RESIGNAL;
     END;

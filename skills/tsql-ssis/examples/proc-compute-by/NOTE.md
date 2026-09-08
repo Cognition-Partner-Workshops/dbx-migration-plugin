@@ -15,6 +15,7 @@ Reads: `vw_active_loan_portfolio` (-> `loans`, `borrowers`, `loan_modifications`
 ## Recon tier that catches a wrong conversion
 - **Tier 1 (row count)**: source detail rows + one subtotal row per distinct `loan_type`; a conversion with a plain `GROUP BY` (no grouping set) is short by exactly `count(distinct loan_type)` rows, and one with `ROLLUP` is long by one grand-total row plus the `(loan_type, property_state)` level.
 - **Tier 2**: `sum(total_balance) WHERE grouping_level = 1` must equal `sum(total_balance) WHERE grouping_level = 0`; `sum(n_loans)` likewise.
+- **Tier 3 (subtotal rows)**: on `grouping_level = 1` rows only `n_loans` and `total_balance` carry values (the source `COMPUTE` clause has exactly those two aggregates); `total_past_due` must be `NULL` there. A conversion that aggregates it on the subtotal row emits a column the source never did.
 - **Tier 4 (replay)**: the ordered stream is compared row-by-row against a captured ASE `isql` output; `ORDER BY loan_type, grouping_level, property_state` reproduces the "subtotal after its group" position.
 - Requires the `view-outer-join` unit to be PASS first; a `*=` regression shows up here as a Tier 1 undercount too.
 

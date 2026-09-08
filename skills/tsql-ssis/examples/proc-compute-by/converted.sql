@@ -15,7 +15,8 @@ SELECT
     delinq_bucket,
     COUNT(*)              AS n_loans,
     SUM(current_balance)  AS total_balance,
-    SUM(past_due_amount)  AS total_past_due,
+    -- the source COMPUTE row carries COUNT(*) and SUM(current_balance) only: NULL on the subtotal
+    CASE WHEN grouping(property_state) = 1 THEN NULL ELSE SUM(past_due_amount) END AS total_past_due,
     -- 0 = detail row; 1 = COMPUTE BY loan_type subtotal (property_state / delinq_bucket are NULL)
     CASE WHEN grouping(property_state) = 1 THEN 1 ELSE 0 END AS grouping_level
 FROM ${catalog}.${schema}.vw_active_loan_portfolio
@@ -25,6 +26,6 @@ GROUP BY GROUPING SETS (
 )
 ORDER BY loan_type, grouping_level, property_state, delinq_bucket;
 
--- Note on the second COMPUTE column: the source subtotalled COUNT(*) and SUM(current_balance) only.
--- total_past_due is also aggregated on the subtotal row here; consumers that must see NULL there
--- can wrap it: CASE WHEN grouping_level = 1 THEN NULL ELSE total_past_due END.
+-- Output contract: the subtotal row exposes exactly the two COMPUTE aggregates; total_past_due is NULL
+-- there (not a third aggregate the source never emitted). Tier 3 on grouping_level = 1 rows compares
+-- n_loans and total_balance against the parsed COMPUTE rows and expects total_past_due IS NULL.
