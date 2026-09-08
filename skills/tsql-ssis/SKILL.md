@@ -1,0 +1,451 @@
+---
+name: tsql-ssis
+description: Source-dialect skill for SQL Server T-SQL estates (with Sybase ASE deltas) and SSIS packages. Load it when enumerating a SQL Server / Azure SQL / Sybase ASE estate, extracting lineage from T-SQL procedures, views, triggers, SQL Agent jobs, isql runners or .dtsx packages, converting T-SQL/SSIS to Databricks SQL, Lakeflow Jobs and Lakeflow Spark Declarative Pipelines, or reconciling a T-SQL-sourced unit (analytical track and the Lakebase OLTP front door).
+---
+
+# T-SQL + SSIS Dialect (v1)
+
+Source-side half of the factory for the `mssql` and `ssis` Lakebridge flags. Everything Databricks-side is a pointer through `skills/target-routing/SKILL.md` to the official plugin; this file never restates it. Sybase ASE 16 is a **sub-profile** of this skill (§ "Sybase ASE delta list"), not a separate dialect: Lakebridge has no ASE flag, so ASE runs under `--source-dialect mssql` and the delta list is applied by hand before and after the transpile.
+
+Fixture estate used to validate this skill: `Cognition-Partner-Workshops/ts-tsql-sybase-legacy-db` (Sybase ASE 16 loan-servicing: 7 tables, 3 views/conceptual reporting objects, 12 procedures, 2 triggers, 3 scalar functions, 2 `isql` shell runners, 1 `interfaces` file). It contains no SSIS packages; the SSIS half of the fixture is the three `.dtsx`-shaped descriptions under `examples/ssis-*`.
+
+**Citation keys used below.** Every Databricks-side statement carries one of these; nothing target-side is asserted from memory.
+
+| Key | Source |
+|---|---|
+| `[dbsql:scripting]` | `databricks-dbsql` `references/sql-scripting.md` (compound statements, control flow, condition handlers, `EXECUTE IMMEDIATE`, `CREATE PROCEDURE`, transactions) |
+| `[dbsql:collation]` | `databricks-dbsql` `references/geospatial-collations.md` Part 2 (collations: `UTF8_BINARY`, `UTF8_LCASE`, `UNICODE_CI`, `_RTRIM`, column/table/schema levels) |
+| `[dbsql:temp]` | `databricks-dbsql` `references/materialized-views-pipes.md` §2 (session-scoped temporary tables and views) |
+| `[dbsql:skill]` | `databricks-dbsql` `SKILL.md` (warehouse/statement execution, `MERGE`, `IDENTIFIER()` routing) |
+| `[jobs]` | `databricks-jobs` `SKILL.md` "Multi-Task Workflows" (`depends_on`, `run_if`, job parameters) |
+| `[jobs:tasks]` | `databricks-jobs` `references/task-types.md` (`sql_task`, `notebook_task`, `pipeline_task`, `run_job_task`, `for_each_task`, task values) |
+| `[jobs:triggers]` | `databricks-jobs` `references/triggers-schedules.md` (Quartz cron, `timezone_id`, file-arrival and table-update triggers) |
+| `[jobs:monitor]` | `databricks-jobs` `references/notifications-monitoring.md` (failure notifications, `timeout_seconds`, `max_retries`, `max_concurrent_runs`) |
+| `[jobs:runif]` `[jobs:ifelse]` `[jobs:taskvalues]` | `https://docs.databricks.com/aws/en/jobs/conditional-tasks` (Run if: All succeeded / At least one succeeded / None failed / All done / At least one failed / All failed; Excluded cascades), `/aws/en/jobs/if-else` (If/else condition task over `{{job.parameters.x}}` / `{{tasks.t.values.v}}`; `==`/`!=` compare as strings, `<`/`>` numerically), `/aws/en/jobs/task-values` (`dbutils.jobs.taskValues.set` is Python-notebook only) |
+| `[jobs:params]` | `https://docs.databricks.com/aws/en/jobs/parameter-use` (SQL tasks read key-value parameters with `:name` named-parameter syntax; job parameters are pushed down to SQL tasks), `/aws/en/jobs/task-parameters`, `/aws/en/jobs/dynamic-value-references` (`{{job.run_id}}`, `{{job.start_time.iso_date}}`, `{{job.parameters.<name>}}`) |
+| `[sdp]` | `databricks-pipelines` `SKILL.md` (dataset-type decision, streaming tables vs materialized views vs temporary views, Auto CDC, sinks) |
+| `[sdp:st]` `[sdp:mv]` `[sdp:tv]` `[sdp:expect]` | `databricks-pipelines` `references/streaming-table-sql.md`, `materialized-view-sql.md`, `temporary-view-sql.md`, `expectations-sql.md` |
+| `[lakebase:types]` | `databricks-lakebase` `references/synced-tables.md` "Type mapping" (Unity Catalog -> Lakebase Postgres) and `SKILL.md` (Postgres 16/17 front door) |
+| `[uc]` | `databricks-unity-catalog` `SKILL.md` + `references/1-access-control.md`, `4-fine-grained-access.md`, `5-system-tables.md` |
+| `[fn:NAME]` | `https://docs.databricks.com/aws/en/sql/language-manual/functions/NAME` (opened while writing this skill) |
+| `[docs:types]` `[docs:merge]` `[docs:identity]` `[docs:identifier]` `[docs:limit]` `[docs:groupby]` `[docs:datetime]` | `sql-ref-datatypes`, `delta-merge-into`, `delta/generated-columns`, `sql-ref-names-identifier-clause`, `sql-ref-syntax-qry-select-limit`, `sql-ref-syntax-qry-select-groupby`, `sql-ref-datetime-pattern` under `https://docs.databricks.com/aws/en/sql/language-manual/` (and `/aws/en/delta/`) |
+
+## 1. Enumeration
+
+Two sources of truth, always both: the **repository** (DDL, procedure scripts, `.dtsx`, shell runners, `interfaces`/connection files) and, when the access checklist allows, the **live catalog**. Repo-only enumeration is what the fixture round-trip exercises; catalog-only enumeration misses SSIS and shell scheduling. The census key for every SQL object is `server.database.schema.object` (Sybase: `server.database.owner.object`, owner is almost always `dbo`); for SSIS it is `project.package.task_path`; for shell runners it is `repo_path:script`.
+
+### 1a. Repository / file patterns
+
+| Object class | File pattern (fixture confirmed) | Parse anchor | Census key |
+|---|---|---|---|
+| Table | `schema/tables/<owner>.<table>.sql`, `*.sql` containing `CREATE TABLE` | `CREATE TABLE [db.]owner.name (`, `go` batch separator (lower-case in ASE scripts) | `db.owner.table` |
+| Index | `schema/indexes/*.sql`, inline after the table | `CREATE [UNIQUE] [NON]CLUSTERED INDEX` | attached to the table, inventory `size` signal |
+| View | `schema/views/*.sql` | `CREATE VIEW` | `db.owner.view` |
+| Procedure | `stored_procs/<Area>/sp_*.sql` | `CREATE PROC[EDURE] [owner.]name` + parameter list up to `AS` | `db.owner.proc` |
+| Trigger | `triggers/trg_*.sql` | `CREATE TRIGGER name ON table FOR INSERT\|UPDATE\|DELETE` (ASE) / `AFTER\|INSTEAD OF` (SQL Server) | `db.owner.trigger` -> parent table |
+| Scalar / TVF | `functions/fn_*.sql` | `CREATE FUNCTION ... RETURNS <type>` | `db.owner.fn` |
+| Batch runner | `batch/*.sh`, `*.bat`, `*.ps1` | `isql -S <server> -U <user> -D <db>` / `sqlcmd -S -d -i -v`, `-i <file>`, here-doc `<<EOF ... EOF` | `repo_path:script` |
+| Connection config | `config/interfaces` (ASE), `*.udl`, `*.dtsConfig`, `*.config` | `<SERVERNAME>\n\tmaster tcp ether host port` / connection strings | server alias -> host:port |
+| SSIS package | `**/*.dtsx` (XML) | `DTS:Executable DTS:ExecutableType="..."`, `DTS:ObjectName`, `DTS:ConnectionManager`, `DTS:Variable`, `DTS:PrecedenceConstraint` | `project.package.task_path` |
+| SSIS project / params | `*.dtproj`, `Project.params`, `*.dtsConfig`, `*.ispac` (zip of the above) | `<SSIS:Parameter>`, `<Configuration ConfiguredType=...>` | project |
+| SQL Agent job export | `*.sql` containing `sp_add_job` / `sp_add_jobstep` / `sp_add_schedule` | `@command=N'...'`, `@database_name`, `@freq_type`, `@active_start_time` | `server.job.step` |
+
+One object per `go`-delimited batch; the fixture puts one object per file plus its indexes. Conceptual naming lies: `schema/views/vw_delinquency_snapshot.sql` is a `CREATE PROCEDURE` (it needs `COMPUTE BY`, which cannot live in a view); classify by the DDL verb, never by the path or prefix.
+
+### 1b. Live catalog queries (read-only, one class per statement, paginate on the ORDER BY key)
+
+Minimum privilege is named per row so `07_access_checklist.md` can be filled directly. All are `SELECT`s against catalog views; none touch user data.
+
+| Class | SQL Server (2016+) | Sybase ASE 16 | Privilege |
+|---|---|---|---|
+| Databases | `SELECT name, database_id, collation_name FROM sys.databases ORDER BY name` | `SELECT name, dbid FROM master..sysdatabases ORDER BY name` | `VIEW ANY DATABASE` (SQL Server); login with `master` access (ASE) |
+| Tables + row/size | `SELECT s.name, t.name, p.rows FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id JOIN sys.partitions p ON p.object_id=t.object_id AND p.index_id IN (0,1) ORDER BY s.name, t.name OFFSET @o ROWS FETCH NEXT 1000 ROWS ONLY` (size: `sys.dm_db_partition_stats`) | `SELECT o.name, u.name AS owner, row_count(db_id(), o.id) AS rows, data_pages(db_id(), o.id, 0) AS pages FROM sysobjects o JOIN sysusers u ON u.uid=o.uid WHERE o.type='U' ORDER BY o.name` | `VIEW DEFINITION` on the database (SQL Server); `select` on system tables, granted by default (ASE) |
+| Columns/types | `sys.columns` + `sys.types` (`max_length`, `precision`, `scale`, `collation_name`, `is_identity`, `is_computed`) | `syscolumns` + `systypes` (`length`, `prec`, `scale`, `status & 0x80` = identity) | as above |
+| Views / procs / functions / triggers | `sys.objects` (`type IN ('V','P','FN','IF','TF','TR')`) + `sys.sql_modules.definition` | `sysobjects` (`type IN ('V','P','TR','SF')`) + `syscomments.text` ordered by `colid` (definitions are split into 255-byte rows: concatenate) | `VIEW DEFINITION` (SQL Server); `select` on `syscomments` (ASE; hidden text if `sp_hidetext` was run: record as UNVERIFIABLE) |
+| Dependencies | `sys.sql_expression_dependencies` (`referenced_server_name` set = linked server) | `sysdepends` (ASE keeps it only when the referenced object existed at compile time) | `VIEW DEFINITION` |
+| Synonyms | `sys.synonyms` (`base_object_name`) | n/a (ASE has no synonyms) | `VIEW DEFINITION` |
+| Linked servers | `sys.servers` (`is_linked=1`), `sys.linked_logins` | `sysservers` (remote servers for `proxy tables` / CIS) | `VIEW ANY DEFINITION` / `sa_role` read |
+| SQL Agent jobs | `msdb.dbo.sysjobs`, `sysjobsteps` (`command`, `database_name`, `subsystem` = `TSQL`/`SSIS`/`CmdExec`/`PowerShell`), `sysjobschedules` + `sysschedules`, `sysjobhistory` (last 90 days for hidden-consumer sweep) | Job Scheduler (`sybmgmtdb..js_*`) if installed; otherwise cron on the runner host | `SQLAgentReaderRole` in `msdb` |
+| SSIS catalog | `SSISDB.catalog.projects`, `catalog.packages`, `catalog.executions`, `catalog.execution_parameter_values`, `catalog.environment_variables` | n/a | `ssis_admin` or `ssis_logreader` in `SSISDB` |
+| Query-history hidden consumers | `sys.dm_exec_query_stats` + `sys.dm_exec_sql_text` (plan cache only, not history), Query Store `sys.query_store_query_text` if enabled | `monSysStatement` / `monProcessSQLText` (MDA tables, `mon_role`) | `VIEW SERVER STATE` / `mon_role` |
+
+### 1c. Size and complexity signals per object
+
+- **Tables**: row count, page/partition count, identity column present, `text/image/varchar(max)` columns, trigger count, FK fan-in/fan-out, collation != database default, computed columns, `rowversion`.
+- **Procedures/functions/triggers**: line count, statement count, parameter count (`OUTPUT` count separately), cursor count, `WHILE` depth, `EXEC(@sql)`/`sp_executesql` count, `#temp`/`SELECT INTO` count, cross-database (`db..obj`) and 4-part references, `RAISERROR`/`THROW`/`GOTO` count, `@@identity`/`SCOPE_IDENTITY` use, `SET ROWCOUNT`, ASE-only tokens (§ delta list), calls to `xp_*`/`sp_OA*`/CLR.
+- **SSIS**: task count, data-flow component count, Lookup count and cache mode, Script Task/Component count (each is a hand-convert unit), Execute SQL Task SQL length, event-handler count, variable-expression count, connection managers (per external system), package configurations.
+- **Runners**: number of `isql`/`sqlcmd` invocations, shell variables substituted into SQL, loop constructs, exit-code handling (`$?`), `-o` output files consumed downstream.
+
+## 2. Lineage extraction
+
+### 2a. Reads and writes per object class
+
+| Class | Reads (FACT when cited) | Writes (FACT when cited) | Notes |
+|---|---|---|---|
+| View | `FROM`/`JOIN` list, comma-join list, subqueries, scalar-function calls (`dbo.fn_*`) | none | Function calls are edges to the function, whose own reads propagate. |
+| Procedure | `FROM`, `JOIN`, `EXISTS(...)`, `SELECT ... INTO`, scalar-function calls, `EXEC other_proc` (propagate) | `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `SELECT INTO`, `TRUNCATE`, `EXEC` targets, `OUTPUT INTO` | Every `EXEC` to another procedure is an edge; resolve transitively, cycle-safe. |
+| Trigger | `inserted`/`deleted` pseudo-tables (= parent table), plus explicit reads | explicit writes (audit tables), `ROLLBACK TRIGGER`/`ROLLBACK TRANSACTION` = control edge back to the writer | The trigger's writes are attributed to **every** writer of the parent table (fan-out risk, §11). |
+| Function | `FROM` list | none allowed in T-SQL/ASE scalar functions | |
+| SQL Agent step | the step's `command` parsed as T-SQL, or the `.dtsx` path for `SSIS` subsystem | same | Scheduler edge: `schedule -> job -> step -> object`. |
+| `isql`/`sqlcmd` runner | `-i file` and here-doc bodies parsed as T-SQL; `EXEC proc` lines | same | Shell variable substitution (`${VAR}`, `$1`) inside the SQL is INFERRED with the variable name recorded. |
+| SSIS Execute SQL Task | `SqlStatementSource` parsed as T-SQL | same | Parameter mapping (`?` / `@p`) recorded; if `SqlStatementSource` is an expression, INFERRED. |
+| SSIS Data Flow | OLE DB / ADO.NET / Flat File Source (`SqlCommand`, `OpenRowset`, `ConnectionString`), Lookup reference query, Merge Join inputs | OLE DB / ADO.NET Destination `OpenRowset` / `SqlCommand`, Flat File Destination path | Each component is a node; paths (`<path startId endId>`) are edges. |
+| SSIS Script Task/Component | cannot be parsed | cannot be parsed | Always INFERRED; the connection managers it references are recorded as candidate edges. |
+
+### 2b. Resolving indirection
+
+- **Cross-database and 4-part names**: `db..table` / `db.owner.table` / `server.db.owner.table`. Resolve the server via `sys.servers` (SQL Server) or `sysservers`/`interfaces` (ASE); the fixture's `config/interfaces` names `LOAN_PROD`, `LOAN_DEV`, `LOAN_QA` -> host:port; a 4-part name to a server not in the catalog is UNVERIFIABLE and must be listed in the inventory.
+- **Synonyms** (SQL Server only): replace with `sys.synonyms.base_object_name` before recording the edge; record the synonym as an alias, not as an object.
+- **Dynamic SQL**: `EXEC(@sql)`, `EXECUTE sp_executesql @stmt`, `EXECUTE (@s)`: the edge is INFERRED with risk `dynamic_sql`; when the string is fully built from literals in the same batch, concatenate and parse it (FACT with `derived_from_literal` note); when a parameter or table variable contributes, record the parameter name. Fixture: no dynamic SQL anywhere (`rg -i 'exec\s*\(|sp_executesql'` over the estate is empty); the reporting procedures filter through parameters (`@report_month`, `@state_code`) in static SQL, so every fixture edge is FACT (§12).
+- **Temp objects**: `#t` and `##t` are session-local nodes named `<proc>#t`; `SELECT ... INTO #t` is a write, later `FROM #t` a read; they never leave the unit. Table variables `@t` are the same. `tempdb..t` (ASE and SQL Server) is a real shared table: enumerate it.
+- **Parameter files**: SSIS `Project.params`, `*.dtsConfig`, SSISDB environments, `sqlcmd -v name=value` and `isql` shell variables. A connection string or table name that comes from a parameter is INFERRED with the parameter name; if the parameter has a literal default in the repo, record the default as the resolved value and the source `parameter_default`.
+- **Triggers**: a write to table T by object X creates edges `X -> T` (FACT) and `X -> (every trigger on T) -> (trigger writes)` (FACT, `via_trigger`). Fixture: any writer of `dbo.payments` also writes `dbo.audit_trail` through `trg_audit_payment`; `sp_apply_late_fees` comments that `@@identity` can be hijacked by exactly this fan-out.
+- **`isql` runners**: `batch/run_nightly_batch.sh` and `run_monthly_reports.sh` in the fixture: parse `isql -U ${SYBASE_USER} -P ${SYBASE_PWD} -S ${SYBASE_SERVER} -D ${SYBASE_DB} <<EOF ... EOF` here-docs as T-SQL (FACT for the `EXEC dbo.sp_*` calls), record `${SYBASE_SERVER}` (an `interfaces` alias: `LOAN_PROD`/`LOAN_DEV`/`LOAN_QA`), `${SYBASE_DB}`, `${REPORT_MONTH}` substitutions as INFERRED parameters, expand shell loops (`for STATE in CA TX ...` -> one `EXEC` edge per literal, FACT `derived_from_literal`), and record the shell exit-code checks (`if ! isql ...; then exit 1`) as the precedence constraints of the runner. `${SYBASE_PWD}` is a secret name, never a value.
+
+### 2c. Scheduler edges (this dialect owns two schedulers)
+
+- **SQL Agent**: `sysschedules.freq_type` (4 daily, 8 weekly, 16 monthly, 32 monthly-relative, 64 at start-up, 128 idle) + `freq_interval`, `freq_subday_type`, `active_start_time` (HHMMSS int) -> recorded as an edge `schedule(name, cron-equivalent, server timezone) -> job -> step`. Job-step `on_success_action`/`on_fail_action` (1 quit success, 2 quit fail, 3 next step, 4 go to step N) are the precedence constraints. Converted schedules use Quartz cron + `timezone_id` `[jobs:triggers]` and task `depends_on`/`run_if` `[jobs]`; the conversion writes both the original `freq_*` tuple and the cron string into the mapping so the two can be diffed.
+- **cron / shell**: crontab lines (or the comment block `Schedule: Daily via cron` in the fixture procedures) -> the same edge shape with `source=cron`. The runner's exit-code branches map to `run_if: ALL_SUCCESS` / `ALL_DONE` `[jobs]`.
+- **SSIS**: package-internal precedence constraints (`Success`/`Failure`/`Completion`, `Expression`, `LogicalAnd`) are edges inside the unit; the package itself is scheduled by an Agent job with `subsystem='SSIS'`.
+
+## 3. Unit definition
+
+- **Procedure unit** = the procedure + every procedure it `EXEC`s (transitive) + every table it writes (including trigger-implied writes) + the temp objects it owns. Reads are the unit's dependencies, not members. Fixture units: `sp_process_monthly_payments` (writes `payments`, `loans`, `audit_trail` via trigger and directly), `sp_apply_late_fees` (writes `loans`, `audit_trail`), `sp_nightly_accrual`, `sp_end_of_day_reconciliation`, `sp_calculate_escrow`, `sp_loan_modification`, the three CRUD procs, the three reporting procs (read-only units: writes = none, output = result set).
+- **View unit** = the view + the scalar functions it calls. A view is `shared` when two or more procedure/report units read it (`vw_active_loan_portfolio` is read by `sp_delinquency_snapshot` and the reporting procedures: shared).
+- **Trigger** is never its own unit; it belongs to every unit that writes its parent table and is converted once, into the converted writer(s).
+- **SSIS package unit** = the package + all its tasks + its connection managers + the project parameters it reads; a child package called through Execute Package Task joins the parent's unit unless it is also called from another parent (then `shared`).
+- **Runner unit** = the shell script + the procedures it calls, when the script adds logic (loops, exit-code branching, file output). `run_nightly_batch.sh` is a unit (it sequences `sp_nightly_accrual` -> `sp_apply_late_fees` -> `sp_end_of_day_reconciliation` with exit-code checks); a script that only calls one procedure is folded into that procedure's unit.
+- **`shared`**: a table written by two units, a view/function read by two units, a trigger whose parent table has two writers, a temp table in `tempdb..` used by two procedures. Shared objects migrate first (wave 0) and freeze their converted schema.
+
+## 4. Type map
+
+`Delta type` is the analytical track `[docs:types]`; `Lakebase PG` is the OLTP front door (`!dbx_migrate_oltp`), taken from the Unity Catalog -> Lakebase synced-table map `[lakebase:types]` for every type that exists in that map (Lakebase is Postgres 16/17 per `databricks-lakebase` `SKILL.md`, so the types listed are plain Postgres types). `loss`: none / precision / semantics. `canon` names the harness rule that neutralizes the loss; `-` means no rule needed, `GAP` means the harness lacks one (filed in the PR body).
+
+| Source type (SQL Server / ASE) | Delta type | Lakebase PG | loss | canon / note |
+|---|---|---|---|---|
+| `BIT` | `BOOLEAN` | `BOOLEAN` | semantics | T-SQL `BIT` accepts 0/1/NULL and string 'TRUE'/'FALSE'; cast `1`->`true`. Tier 2 null-rate. `-` |
+| `TINYINT` (0..255, unsigned) | `SMALLINT` (Delta `TINYINT` is signed -128..127 `[docs:types]`) | `SMALLINT` | none | never map to Delta `TINYINT`; `-` |
+| `SMALLINT` | `SMALLINT` | `SMALLINT` | none | `-` |
+| `INT` | `INT` | `INTEGER` | none | `-` |
+| `BIGINT` | `BIGINT` | `BIGINT` | none | `-` |
+| `INT IDENTITY` / `BIGINT IDENTITY` | `BIGINT GENERATED ALWAYS AS IDENTITY` `[docs:identity]` | `BIGINT` (identity/sequence per Postgres) | semantics | values are not reproducible: gaps differ, identity disables concurrent writes `[docs:identity]`. Recon keys must be business keys or the source value must be **loaded**, not regenerated. `identity` |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `DECIMAL(p,s)` (p<=38) | `NUMERIC(p,s)` | none (precision if p>38: not in this dialect) | `decimal_round` at scale s for derived columns only |
+| `MONEY` | `DECIMAL(19,4)` | `NUMERIC(19,4)` | precision | source arithmetic on `MONEY` rounds intermediate results to 4 places and `MONEY/MONEY` truncates; converted `DECIMAL` arithmetic widens. `decimal_round` places=4 half_even on money-derived columns; Tier 2 sums to the cent. |
+| `SMALLMONEY` | `DECIMAL(10,4)` | `NUMERIC(10,4)` | precision | as `MONEY` |
+| `FLOAT(53)` / `FLOAT` | `DOUBLE` | `DOUBLE PRECISION` | none | Tier 2 sums need a relative tolerance in the tolerance record, not canon. |
+| `REAL` / `FLOAT(24)` | `FLOAT` | `REAL` | none | as above |
+| `CHAR(n)` | `STRING` (`CHAR(n)` exists but is not padded on read in Delta; use `STRING`) | `CHAR(n)` (PG pads) or `TEXT` | semantics | blank-padding: source `=` ignores trailing spaces, Delta `UTF8_BINARY` does not. `rstrip_spaces`, or declare `STRING COLLATE UTF8_BINARY_RTRIM` `[dbsql:collation]` |
+| `VARCHAR(n)` | `STRING` | `VARCHAR(n)` / `TEXT` | semantics | trailing spaces are significant in source `LEN` but not in `=`; database collation is usually case-insensitive. `rstrip_spaces` + `collation_casefold` when the census says CI (§7) |
+| `NCHAR(n)` / `NVARCHAR(n)` | `STRING` | `TEXT` | none | UCS-2/UTF-16 -> UTF-8; `DATALENGTH` doubles vanish (§5). `collation_casefold` if CI |
+| `VARCHAR(MAX)` / `NVARCHAR(MAX)` / ASE `TEXT` / `UNITEXT` | `STRING` | `TEXT` | none | ASE `TEXT` columns cannot be compared/grouped in source; recon uses `length()`/hash at Tier 2 only |
+| `BINARY(n)` / `VARBINARY(n)` / `VARBINARY(MAX)` / ASE `IMAGE` | `BINARY` | `BYTEA` | none | Tier 2 `octet_length` and `sha2` `[fn:sha2]` |
+| `ROWVERSION` / `TIMESTAMP` (binary(8)) | `BINARY` (do not reproduce; drop or keep as load-time value) | `BYTEA` | semantics | value is engine-assigned; exclude from recon columns |
+| `DATE` (SQL Server 2008+) | `DATE` | `DATE` | none | `-` |
+| `TIME(p)` | `TIME` (`[docs:types]` lists `TIME`) or `STRING` if the warehouse lacks it | `TIME` | precision | p up to 7 (100 ns) vs microseconds. `datetime_utc_truncate_ms` if recon compares as timestamps |
+| `SMALLDATETIME` | `TIMESTAMP_NTZ` | `TIMESTAMP WITHOUT TIME ZONE` | none | minute precision; `-` |
+| `DATETIME` (both engines; ASE 1/300 s) | `TIMESTAMP_NTZ` (wall-clock, no zone `[docs:types]`) | `TIMESTAMP WITHOUT TIME ZONE` | precision | stored on a 3.33 ms grid (`.000/.003/.007`); any converted value computed to true ms differs. `datetime_grid_333` (§8) |
+| `DATETIME2(p)` | `TIMESTAMP_NTZ` | `TIMESTAMP WITHOUT TIME ZONE` | precision | p=7 (100 ns) vs microseconds. `datetime_utc_truncate_ms` |
+| `DATETIMEOFFSET(p)` | `TIMESTAMP` (session-zone, normalized to UTC `[docs:types]`) | `TIMESTAMP WITH TIME ZONE` | semantics | the original offset is lost; keep a separate `offset_minutes` column if consumers read it. `datetime_utc_truncate_ms` |
+| ASE `BIGDATETIME` / `BIGTIME` | `TIMESTAMP_NTZ` / `TIME` | as above | none | microsecond both sides |
+| `UNIQUEIDENTIFIER` | `STRING` (36-char canonical, `uuid()` `[fn:uuid]` produces the same shape) | `UUID` | semantics | source displays upper-case, Postgres/Delta lower-case; byte order differs when cast to binary. `uuid_normalize` |
+| `XML` | `STRING` (`VARIANT` only if parsed) | `XML` / `TEXT` | semantics | whitespace and attribute order are not canonical; Tier 2 `length` + hash of a normalized form. `GAP: xml_canonicalize` |
+| `SQL_VARIANT` | `STRING` + `typeof`-style tag column | `TEXT` + tag | semantics | no equivalent; split per base type at conversion. `GAP: variant_split` |
+| `HIERARCHYID` / `GEOGRAPHY` / `GEOMETRY` | `STRING` (path) / `GEOGRAPHY(srid)` / `GEOMETRY(srid)` `[docs:types]` | `TEXT` / PostGIS if enabled | semantics | hand-convert; recon Tier 2 on `ST_AsText`-style canonical text |
+| `TABLE` type / TVP | `ARRAY<STRUCT<...>>` parameter or a temp table `[dbsql:temp]` | n/a | semantics | procedure signature change (§6) |
+| `CURSOR` type variable | none | none | semantics | rewrite (§6) |
+| ASE `UNSIGNED INT/BIGINT` | `BIGINT` / `DECIMAL(20,0)` | `BIGINT` / `NUMERIC(20,0)` | none | `-` |
+
+## 5. Function and operator map
+
+`semantics`: same / edge / none (no equivalent, hand-convert). Databricks behavior per the cited function page; source behavior is the dialect's own. Where SQL Server and ASE differ the row says so.
+
+| # | Source | Databricks SQL | semantics | Edge case / note |
+|---|---|---|---|---|
+| 1 | `ISNULL(a, b)` | `coalesce(a, b)` `[fn:coalesce]` | edge | T-SQL result type is the type of `a` (b is truncated/cast to it); Databricks uses the least common type. `ISNULL(char(2)_col, 'UNKNOWN')` returns `'UN'` in source. Databricks `isnull(x)` is a boolean test `[fn:isnull]`, never a replacement. |
+| 2 | `COALESCE(a, b, ...)` | `coalesce(a, b, ...)` `[fn:coalesce]` | same | both short-circuit; T-SQL type precedence vs least common type only matters for mixed numeric/string |
+| 3 | `NULLIF(a, b)` | `nullif(a, b)` `[fn:nullif]` | same | |
+| 4 | `IIF(c, a, b)` | `iff(c, a, b)` `[fn:iff]` or `if()` | same | |
+| 5 | `CHOOSE(i, a, b, ...)` | `elt(i, a, b, ...)` `[fn:elt]` | edge | T-SQL returns NULL when `i` is out of range; `elt` raises `INVALID_ARRAY_INDEX` under ANSI |
+| 6 | `CASE` (simple/searched) | `CASE` | same | `CASE` on strings follows collation on both sides |
+| 7 | `a + b` (strings) | `a \|\| b` `[fn:pipepipesign]` / `concat(a, b)` `[fn:concat]` | edge | SQL Server: NULL operand yields NULL (default `CONCAT_NULL_YIELDS_NULL ON`); ASE treats NULL as `''` in concatenation (verify live; fixture `trg_audit_payment` relies on it). Databricks `\|\|` and `concat` return NULL. Wrap ASE operands in `coalesce(x, '')`. Numeric `+` never concatenates in Databricks: cast explicitly. |
+| 8 | `CONCAT(a, b, ...)` | `concat(coalesce(a,''), coalesce(b,''), ...)` `[fn:concat]` | edge | T-SQL `CONCAT` treats NULL as empty string; Databricks `concat` returns NULL |
+| 9 | `CONCAT_WS(sep, ...)` | `concat_ws(sep, ...)` | same | both skip NULLs |
+| 10 | `LEN(s)` | `length(rtrim(s))` `[fn:len]` | edge | T-SQL `LEN` excludes trailing spaces; Databricks `len`/`length` include them `[fn:len]` |
+| 11 | `DATALENGTH(s)` | `octet_length(s)` | edge | source counts bytes in the source encoding (`NVARCHAR` = 2/char, `CHAR(n)` padded); target counts UTF-8 bytes. Never compare values; compare `length()` |
+| 12 | `CHARINDEX(sub, s [, start])` | `charindex(sub, s [, start])` `[fn:charindex]` / `locate` `[fn:locate]` | edge | both 1-based, 0 when absent; source is collation-sensitive (CI database matches case-insensitively), Databricks follows the column collation (`UTF8_LCASE` example in `[fn:locate]`) |
+| 13 | `PATINDEX('%pat%', s)` | `regexp_instr(s, regex)` `[fn:regexp_instr]` | none | T-SQL wildcard pattern (`%`, `_`, `[a-z]`, `[^x]`) must be rewritten as a regex; anchors differ |
+| 14 | `SUBSTRING(s, start, len)` | `substring(s, start, len)` `[fn:substring]` | edge | both 1-based; T-SQL with `start <= 0` shortens `len`; Databricks negative `pos` counts from the end `[fn:substring]`. `len` is mandatory in T-SQL, optional in Databricks. |
+| 15 | `LEFT(s, n)` / `RIGHT(s, n)` | `left(s, n)` / `right(s, n)` `[fn:left]` | same | `n < 1` -> `''` on both |
+| 16 | `LTRIM(s)` / `RTRIM(s)` | `ltrim(s)` / `rtrim(s)` `[fn:rtrim]` | same | space only on both (SQL Server 2022 optional char list = Databricks `rtrim(trimStr, s)`) |
+| 17 | `TRIM(s)` / `TRIM(chars FROM s)` | `trim(s)` / `trim(chars FROM s)` | same | |
+| 18 | `UPPER(s)` / `LOWER(s)` | `upper(s)` / `lower(s)` | edge | source is collation/locale-aware for non-ASCII; Databricks is Unicode; Tier 3 on non-ASCII keys |
+| 19 | `REPLACE(s, a, b)` | `replace(s, a, b)` `[fn:replace]` | edge | source matches under the column collation (CI matches `'abc'` to `'ABC'`); Databricks matches under `UTF8_BINARY` unless the column/expression is `COLLATE UTF8_LCASE` (`[fn:replace]` shows both) |
+| 20 | `TRANSLATE(s, from, to)` | `translate(s, from, to)` `[fn:translate]` | edge | T-SQL errors when `from`/`to` lengths differ; Databricks deletes unmatched characters |
+| 21 | `STUFF(s, start, len, new)` | `overlay(s PLACING new FROM start FOR len)` `[fn:overlay]` | same | both 1-based; `STUFF` with `start` out of range returns NULL, `overlay` does not |
+| 22 | `REPLICATE(s, n)` | `repeat(s, n)` | same | |
+| 23 | `SPACE(n)` | `space(n)` `[fn:space]` | same | |
+| 24 | `REVERSE(s)` | `reverse(s)` | same | |
+| 25 | `ASCII(c)` / `CHAR(n)` | `ascii(c)` / `char(n)` `[fn:char]` | edge | Databricks `char` is modulo 256 for n>255 `[fn:char]`; T-SQL `CHAR(n>255)` is NULL |
+| 26 | `UNICODE(c)` / `NCHAR(n)` | `ascii(c)` / `chr(n)` | same | code points on both |
+| 27 | `STRING_AGG(x, sep) [WITHIN GROUP (ORDER BY k)]` | `string_agg(x, sep) WITHIN GROUP (ORDER BY k)` `[fn:string_agg]` (alias `listagg`) | same | both ignore NULLs; without `WITHIN GROUP` order is undefined on both: always add it before Tier 3 |
+| 28 | `STRING_SPLIT(s, sep)` (TVF) | `explode(split(s, sep_regex))` `[fn:split]` | edge | `split` takes a regex; escape `.`/`\|`; T-SQL keeps empty tokens, `split` keeps them too but `limit` semantics differ |
+| 29 | `FORMAT(v, 'fmt')` | `format_number(v, fmt)` `[fn:format_number]` / `date_format(d, fmt)` `[fn:date_format]` / `to_char` `[fn:to_char]` | none | .NET format strings have no equivalent; rewrite each format literal; culture argument has no equivalent |
+| 30 | `QUOTENAME(s)` | `concat('\`', replace(s, '\`', '\`\`'), '\`')` | none | identifier quoting differs (`[ ]` vs backtick); use `IDENTIFIER()` `[docs:identifier]` in dynamic SQL instead |
+| 31 | `LIKE 'a%'` | `LIKE 'a%'` | edge | T-SQL bracket classes `[a-f]`, `[^x]` are not SQL `LIKE`; rewrite as `rlike` `[fn:regexp_like]`. Case sensitivity follows collation on both sides. Trailing-space padding on `CHAR` matters (§7) |
+| 32 | `s1 = s2` under CI collation | `s1 = s2` with `COLLATE UTF8_LCASE` column/expression `[dbsql:collation]` | edge | T-SQL default `SQL_Latin1_General_CP1_CI_AS` is case-insensitive **and** ignores trailing spaces; Databricks default `UTF8_BINARY` is neither. Decide once per table (§7) |
+| 33 | `COLLATE <name>` (expression) | `COLLATE UTF8_LCASE` / `UNICODE_CI` / `UNICODE_CI_AI` `[dbsql:collation]` | edge | `_AS` -> accent-sensitive (`UTF8_LCASE`, `UNICODE_CI`), `_AI` -> `UNICODE_CI_AI`; mixing explicit collations in one comparison is an error on Databricks `[dbsql:collation]` |
+| 34 | `GETDATE()` | `current_timestamp()` `[fn:current_timestamp]` (Databricks also accepts `getdate()` `[fn:getdate]`) | edge | source returns server-local wall clock on a 3.33 ms grid; Databricks returns session-zone `TIMESTAMP`. Store into `TIMESTAMP_NTZ` with an explicit `from_utc_timestamp(..., '<server tz>')` `[fn:from_utc_timestamp]` if the estate assumed local time |
+| 35 | `GETUTCDATE()` / `SYSUTCDATETIME()` | `current_timestamp()` with session zone UTC (`current_timezone()` `[fn:current_timezone]` to assert) | edge | precision as row 34 |
+| 36 | `SYSDATETIME()` | `current_timestamp()` | edge | 100 ns vs microsecond; `datetime_utc_truncate_ms` |
+| 37 | `DATEADD(part, n, d)` | `dateadd(PART, n, d)` `[fn:dateadd]` / `date_add(d, n)` `[fn:date_add]` / `add_months` `[fn:add_months]` | edge | month-end clamps on both (`Mar 31 - 1 month = Feb 28` `[fn:dateadd]`); T-SQL `week` adds 7 days, Databricks `WEEK` too; T-SQL `DATEADD` on `DATE` returns `DATETIME`-like, Databricks `dateadd` returns `TIMESTAMP` `[fn:dateadd]`: cast back to `DATE` |
+| 38 | `DATEDIFF(day, a, b)` | `datediff(b, a)` `[fn:datediff]` (dates) | edge | argument order reversed; T-SQL counts **midnight boundaries** for `day`, Databricks `datediff(end, start)` on `DATE` counts days: equal only when both are dates. For timestamps use `date_diff`/`timestampdiff` (row 39) |
+| 39 | `DATEDIFF(part, a, b)` (non-day) | `timestampdiff(PART, a, b)` `[fn:timestampdiff]` | edge | T-SQL counts **boundary crossings** (`DATEDIFF(month, Jan 31, Feb 1) = 1`); Databricks counts **whole elapsed units** (`= 0`) `[fn:timestampdiff]`. Rewrite as `(year(b)*12+month(b)) - (year(a)*12+month(a))` for month, `year(b)-year(a)` for year, `datediff(date(b), date(a))` for day, `floor(unix_timestamp(b)/3600) - floor(unix_timestamp(a)/3600)` for hour to preserve T-SQL semantics. Tier 2 drift on any bucket column |
+| 40 | `DATEPART(part, d)` | `date_part('PART', d)` `[fn:date_part]` / `extract(PART FROM d)` `[fn:extract]` | edge | T-SQL `week` is `DATEFIRST`-dependent and not ISO; Databricks `WEEK` is ISO 8601 `[fn:extract]`; `weekday` -> `dayofweek` `[fn:dayofweek]` (1=Sunday on both when `DATEFIRST=7`) |
+| 41 | `DATENAME(weekday, d)` / `DATENAME(month, d)` | `dayname(d)` `[fn:dayname]` (3-letter) / `date_format(d, 'EEEE')` / `date_format(d, 'MMMM')` `[fn:date_format]` | edge | T-SQL returns the full localized name; `dayname` returns `Mon`..`Sun` `[fn:dayname]` |
+| 42 | `EOMONTH(d [, n])` | `last_day(add_months(d, n))` `[fn:last_day]` `[fn:add_months]` | same | |
+| 43 | `DATEFROMPARTS(y, m, d)` / `DATETIMEFROMPARTS(...)` | `make_date(y, m, d)` / `make_timestamp(...)` | same | |
+| 44 | `YEAR(d)` / `MONTH(d)` / `DAY(d)` | `year(d)` / `month(d)` / `day(d)` | same | |
+| 45 | `CONVERT(VARCHAR, d, style)` | `date_format(d, pattern)` `[fn:date_format]` `[docs:datetime]` | edge | style -> pattern table: 101 `MM/dd/yyyy`, 103 `dd/MM/yyyy`, 104 `dd.MM.yyyy`, 105 `dd-MM-yyyy`, 106 `dd MMM yyyy`, 107 `MMM dd, yyyy`, 108 `HH:mm:ss`, 110 `MM-dd-yyyy`, 111 `yyyy/MM/dd`, 112 `yyyyMMdd`, 120 `yyyy-MM-dd HH:mm:ss`, 121 `yyyy-MM-dd HH:mm:ss.SSS`, 126 `yyyy-MM-dd'T'HH:mm:ss.SSS`, 100/109 (ASE default) `MMM dd yyyy hh:mma`. Two-digit-year styles (1..14) are a semantics trap. ASE `CONVERT(char(8), d, 112)` is the most common; the fixture comments call out style codes as a known trap. |
+| 46 | `CONVERT(DATETIME, s, style)` | `to_timestamp(s, pattern)` `[fn:to_timestamp]` / `to_date` `[fn:to_date]` | edge | T-SQL parses per `DATEFORMAT`/language when style is omitted; always pass the pattern |
+| 47 | `CAST(x AS type)` | `cast(x AS type)` `[fn:cast]` | edge | T-SQL `CAST('1.5' AS INT)` errors, `CAST(1.5 AS INT)` truncates; Databricks ANSI cast raises on overflow/malformed; string->numeric of `'1.5'` to `INT` differs. `CAST(x AS VARCHAR)` without length truncates to 30 chars in T-SQL |
+| 48 | `TRY_CONVERT(type, x)` / `TRY_CAST(x AS type)` | `try_cast(x AS type)` `[fn:try_cast]` | same | NULL on failure on both |
+| 49 | `CONVERT(VARCHAR, money_col, 1)` | `format_number(v, '#,##0.00')` `[fn:format_number]` | edge | style 1 adds thousands separators |
+| 50 | `ROUND(x, n)` | `round(x, n)` `[fn:round]` | edge | both HALF_UP for `DECIMAL`; T-SQL `ROUND` on `FLOAT` is binary-float rounding, Databricks too; `ROUND(x, n, 1)` (truncate) -> `floor(x*10^n)/10^n`; `MONEY` rounding to 4 places is implicit in source arithmetic (§4) |
+| 51 | `CEILING(x)` / `FLOOR(x)` | `ceiling(x)` / `floor(x)` | same | |
+| 52 | `a / b` (integers) | `a div b` `[fn:div]` | edge | T-SQL integer division truncates toward zero; Databricks `/` returns `DOUBLE` `[fn:slashsign]`. `-7 / 2` = `-3` in T-SQL, `-3.5` in Databricks; `div` truncates toward zero `[fn:div]` (`-5.9 div 1 = -5`). Fixture `fn_calculate_amortization` divides `MONEY` by `INT` (decimal division, safe) |
+| 53 | `a % b` / `a MOD b` | `a % b` `[fn:percentsign]` / `mod(a, b)` `[fn:mod]` | edge | sign of result follows the dividend on both; Databricks raises `REMAINDER_BY_ZERO`, T-SQL raises too |
+| 54 | `x / 0` | `try_divide(x, 0)` `[fn:try_divide]` | edge | T-SQL raises (unless `SET ARITHABORT OFF, ANSI_WARNINGS OFF` -> NULL); Databricks raises `DIVIDE_BY_ZERO` under ANSI `[fn:slashsign]`, `try_divide` returns NULL |
+| 55 | `POWER(x, y)` | `power(x, y)` | edge | T-SQL `POWER(int, int)` returns `INT` and overflows; Databricks returns `DOUBLE`. Fixture `fn_calculate_amortization` uses `POWER(1 + rate, term)` on `DECIMAL`: same |
+| 56 | `ABS` / `SIGN` / `SQRT` / `EXP` / `LOG` / `LOG10` / `PI` | same names | same | T-SQL `LOG(x, base)` = Databricks `log(base, x)` (argument order reversed) |
+| 57 | `RAND([seed])` / `NEWID()` | `rand([seed])` `[fn:rand]` / `uuid()` `[fn:uuid]` | none | non-deterministic on both; exclude from recon |
+| 58 | `CHECKSUM(...)` / `BINARY_CHECKSUM` / `HASHBYTES('SHA2_256', x)` | `hash(...)` `[fn:hash]` / `sha2(x, 256)` `[fn:sha2]` / `md5` | edge | `CHECKSUM` and `hash` are different algorithms: never compare stored checksums; `HASHBYTES` on `NVARCHAR` hashes UTF-16 bytes, Databricks hashes UTF-8: recompute both sides from canonical text |
+| 59 | `COUNT(*)` / `COUNT(col)` / `COUNT_BIG` | `count(*)` / `count(col)` | same | `count(col)` ignores NULLs on both |
+| 60 | `SUM(int_col)` | `sum(int_col)` | edge | T-SQL `SUM(INT)` returns `INT` and overflows at 2^31; Databricks widens to `BIGINT`. Divergence only shows as a source error, not a value difference |
+| 61 | `AVG(int_col)` | `avg(int_col)` | edge | T-SQL `AVG(INT)` returns `INT` (truncated); Databricks returns `DOUBLE`. Classic Tier 2 mean drift: wrap as `floor(avg(...))` or cast the input to `DECIMAL` on both sides |
+| 62 | `SUM(money_col)` / `AVG(money_col)` | `sum(decimal_col)` / `avg(decimal_col)` | edge | `AVG(MONEY)` is `MONEY` (4 places); Databricks `avg(DECIMAL(19,4))` has more scale: `decimal_round` places=4 |
+| 63 | `MIN` / `MAX` on strings | `min` / `max` | edge | collation order (§7) |
+| 64 | `STDEV` / `STDEVP` / `VAR` / `VARP` | `stddev_samp` / `stddev_pop` / `var_samp` / `var_pop` `[fn:stddev]` | same | `STDEV` = sample on both |
+| 65 | `PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY x) OVER (PARTITION BY ...)` | `percentile_cont(p) WITHIN GROUP (ORDER BY x)` `[fn:percentile_cont]` (aggregate or window) | same | T-SQL requires the `OVER` window form; Databricks accepts aggregate or window |
+| 66 | `ROW_NUMBER() / RANK() / DENSE_RANK() / NTILE(n) OVER (...)` | same names | same | ties and `ORDER BY` NULL placement: T-SQL sorts NULLs first ascending, Databricks too |
+| 67 | `LAG` / `LEAD` / `FIRST_VALUE` / `LAST_VALUE` | same names | edge | default frame for `LAST_VALUE` is `RANGE ... CURRENT ROW` on both (returns the current row); T-SQL 2022 `IGNORE NULLS` = Databricks `IGNORE NULLS` |
+| 68 | `TOP (n) [PERCENT] [WITH TIES]` | `LIMIT n` `[docs:limit]` (`PERCENT` -> window `percent_rank`; `WITH TIES` -> `rank() = 1` filter) | edge | `TOP` without `ORDER BY` is arbitrary on both; `LIMIT` must be a foldable literal `[docs:limit]`, so `TOP (@n)` becomes `EXECUTE IMMEDIATE` `[dbsql:scripting]` or a `row_number()` filter |
+| 69 | `OFFSET n ROWS FETCH NEXT m ROWS ONLY` | `LIMIT m OFFSET n` `[docs:limit]` | same | |
+| 70 | `SELECT ... INTO #t` | `CREATE TEMP TABLE t AS SELECT ...` `[dbsql:temp]` | edge | temp tables are session-scoped, `CREATE OR REPLACE TEMP TABLE` is not supported, `DELETE FROM` a temp table is not supported `[dbsql:temp]`: use a temp view or filter on read |
+| 71 | `INSERT ... SELECT ... FROM x *= y` / `LEFT JOIN` | `LEFT JOIN` | edge | ASE `*=`: WHERE predicates on the inner table are applied **as join conditions** (NULL-extended rows survive); ANSI applies them after the join. Move them into `ON` (§7, `examples/view-outer-join`) |
+| 72 | `MERGE ... WHEN NOT MATCHED BY SOURCE` | `MERGE INTO ... WHEN NOT MATCHED BY SOURCE` `[docs:merge]` | same | T-SQL `OUTPUT` clause has no equivalent; capture row counts with a separate query |
+| 73 | `UPDATE t SET ... FROM t JOIN s` / `DELETE t FROM t JOIN s` | `MERGE INTO t USING s ... WHEN MATCHED THEN UPDATE/DELETE` `[docs:merge]` | edge | T-SQL update-from with a 1:N join picks an arbitrary source row; `MERGE` raises on multiple matches: dedupe the source first (Tier 3 shows which rows were arbitrary) |
+| 74 | `SCOPE_IDENTITY()` / `@@IDENTITY` / `IDENT_CURRENT` | none; `GENERATED ALWAYS AS IDENTITY` values are read back by business key `[docs:identity]` | none | ASE has only `@@identity` (trigger-hijackable; fixture `sp_apply_late_fees` documents it). Return the new key with `SELECT ... WHERE business_key = ...` or generate the key in the procedure |
+| 75 | `@@ROWCOUNT` (ASE `@@rowcount`) | none in DBSQL; SQL scripting has no row-count variable `[dbsql:scripting]` | none | replace with `SET v = (SELECT count(*) ...)` before/after (`[dbsql:scripting]` "Variable Assignment"), or restructure the loop (§6). `SET ROWCOUNT n` batching (ASE) disappears: a Delta DML is one atomic statement `[dbsql:scripting]` |
+| 76 | `@@ERROR` (ASE `@@error`) / `ERROR_NUMBER()` / `ERROR_MESSAGE()` | `DECLARE EXIT HANDLER FOR SQLEXCEPTION` / `FOR SQLSTATE 'xxxxx'` `[dbsql:scripting]` | none | error numbers do not carry over; map each `RAISERROR` number to a `SIGNAL SQLSTATE '45xxx'` + `MESSAGE_TEXT` `[dbsql:scripting]` |
+| 77 | `@@SQLSTATUS` (ASE) / `@@FETCH_STATUS` | none; `FOR row AS SELECT ... DO ... END FOR` `[dbsql:scripting]` | none | ASE 0=ok, 1=error, 2=no more rows; SQL Server 0/-1/-2. The `FOR` loop has no status variable (it simply ends); `NOT FOUND` handlers catch `02xxx` states `[dbsql:scripting]` "Handler Declaration" |
+| 78 | `@@TRANCOUNT` / `XACT_STATE()` | none; DBSQL scripting is `NOT ATOMIC` by default, `BEGIN ATOMIC` is Preview and needs `catalogManaged` tables `[dbsql:scripting]` | none | see §6 transactions |
+| 79 | `@@SERVERNAME` / `@@VERSION` / `DB_NAME()` / `HOST_NAME()` | `current_catalog()` / `current_schema()` / `version()` / `current_user()` `[fn:current_user]` | edge | server names in the estate become catalog names in the mapping |
+| 80 | `SUSER_SNAME()` / `USER_NAME()` / `IS_MEMBER('role')` / `IS_ROLEMEMBER` | `current_user()` `[fn:current_user]` / `is_account_group_member('g')` `[fn:is_account_group_member]` (also `is_member`) | edge | used in dynamic views for RLS (§9); group names change |
+| 81 | `OBJECT_ID('x')` / `OBJECT_NAME` / `IF OBJECT_ID('#t') IS NOT NULL DROP TABLE #t` | `DROP TABLE IF EXISTS` / `information_schema.tables` | edge | |
+| 82 | `EXEC sp_executesql @sql, N'@p int', @p = 1` / `EXEC(@sql)` | `EXECUTE IMMEDIATE sql USING p [INTO v]` `[dbsql:scripting]`, object names via `IDENTIFIER(:name)` `[docs:identifier]` | edge | `sp_executesql` `OUTPUT` parameters -> `INTO`; string-built object names must go through `IDENTIFIER()` |
+| 83 | `xp_cmdshell` / `sp_OACreate` / `sp_send_dbmail` / CLR UDF | none | none | hand-convert to a Lakeflow Jobs task (`notebook_task`/`python_wheel_task` `[jobs:tasks]`) or job notifications `[jobs:monitor]`; flag `external_call` (§11) |
+| 84 | `$45.00` money literal (ASE / T-SQL) | `45.00` (`DECIMAL(19,4)` literal via `CAST(45.00 AS DECIMAL(19,4))`) | edge | leading `$` is not a literal in Databricks; fixture `sp_apply_late_fees` uses `$0.00`, `$45.00` |
+| 85 | `0x1F` binary literal | `X'1F'` | same | |
+| 86 | `N'text'` | `'text'` | same | all Databricks strings are Unicode |
+| 87 | `'a' + CONVERT(VARCHAR, 5)` (implicit numeric->string) | `'a' \|\| cast(5 AS STRING)` | edge | T-SQL raises `Conversion failed` for `'a' + 5`; ASE converts implicitly; Databricks `\|\|` requires strings `[fn:pipepipesign]` |
+| 88 | `SET @v = (SELECT ...)` / `SELECT @v = col FROM ...` / `SELECT @a = x, @b = y FROM ...` | `SET v = (SELECT ...)` / `SET (a, b) = (SELECT x, y FROM ...)` `[dbsql:scripting]` "Variable Assignment (SET)" | edge | T-SQL `SELECT @v = col` over N rows leaves the **last** row's value silently; a scalar subquery over more than one row raises: add `LIMIT 1` with an `ORDER BY` or rethink |
+| 89 | `WAITFOR DELAY` | none | none | scheduler concern -> Lakeflow Jobs `depends_on`/retries `[jobs:monitor]` |
+| 90 | `COMPUTE BY` (ASE) | `GROUP BY ... WITH ROLLUP` / `GROUPING SETS` `[docs:groupby]` | none | source emits a second, interleaved result set; converted output is one relation with `grouping()` / `grouping_id()` marker rows `[docs:groupby]` `[fn:grouping]`. Consumers change (§7, `examples/proc-compute-by`) |
+| 91 | `HOLDLOCK` / `NOHOLDLOCK` / `WITH (NOLOCK)` / `AT ISOLATION` | none | none | remove; Delta readers are snapshot-isolated (`[dbsql:scripting]` "Isolation Levels"); record the hint so recon knows dirty reads were possible in source |
+| 92 | `SET ANSI_NULLS OFF` (`= NULL` true) / `SET ANSI_PADDING OFF` | none | none | procedure-level behavior; rewrite `col = @p` as `col IS NOT DISTINCT FROM p` (`<=>`) when `ANSI_NULLS OFF` is in force |
+
+## 6. Procedural-construct map
+
+Order of preference, per the template: DBSQL SQL scripting / `CREATE PROCEDURE` first, Lakeflow Jobs task control flow second, PySpark last. Row citations are the sections the mapping relies on.
+
+| Construct (T-SQL / ASE) | First choice | Second choice | Last | Citation / note |
+|---|---|---|---|---|
+| `CREATE PROCEDURE p @a INT, @b MONEY OUTPUT AS BEGIN ... END` | `CREATE OR REPLACE PROCEDURE p(IN a INT, OUT b DECIMAL(19,4)) LANGUAGE SQL SQL SECURITY INVOKER AS BEGIN ... END;` called with `CALL p(1, out_var)` | one `sql_task` per procedure body when scripting features are missing | notebook | `[dbsql:scripting]` "Stored Procedures" (`IN`/`OUT`/`INOUT`, `LANGUAGE SQL`, `SQL SECURITY INVOKER`, Public Preview DBR 17.0+ per the reference). ASE `OUTPUT`/`OUT` -> `OUT`; defaults (`@a INT = 0`) -> `DEFAULT`; `RETURN n` -> an extra `OUT rc INT` |
+| `DECLARE @v INT; SELECT @v = 0` / `SET @v = expr` | `DECLARE v INT DEFAULT 0; SET v = expr;` | | | `[dbsql:scripting]` "Variable Declaration" / "Variable Assignment". Names lose `@`; use `SET VAR` when a session variable shares the name |
+| `IF ... ELSE IF ... ELSE` / `IF EXISTS (SELECT ...)` | `IF cond THEN ... ELSEIF ... ELSE ... END IF;` / `IF EXISTS (SELECT ...) THEN` | | | `[dbsql:scripting]` "Control Flow" |
+| `WHILE cond BEGIN ... BREAK / CONTINUE END` | `lbl: WHILE cond DO ... LEAVE lbl; / ITERATE lbl; END WHILE lbl;` | `for_each_task` when the loop body is a whole procedure over a parameter list | | `[dbsql:scripting]` "Loops" (`WHILE`, `REPEAT`, `LOOP`, `LEAVE`, `ITERATE`); `[jobs:tasks]` `for_each_task` (`inputs`, `concurrency`, `{{input}}`) |
+| `WHILE 1=1 ... SET ROWCOUNT 1000 ... IF @@rowcount = 0 BREAK` (ASE batching) | one set-based `UPDATE`/`MERGE` | | | every Delta DML statement is atomic `[dbsql:scripting]` "Multi-Statement Transactions" table; batching for lock escalation has no purpose. `examples/proc-set-rowcount` |
+| `DECLARE c CURSOR FOR SELECT ...; OPEN c; FETCH c INTO @a, @b; WHILE @@sqlstatus = 0 / @@FETCH_STATUS = 0 ... CLOSE c; DEALLOCATE CURSOR c` | set-based rewrite (`MERGE`, window functions) | `FOR rec AS SELECT a, b FROM ... DO ... END FOR;` | PySpark `foreach` | `[dbsql:scripting]` "FOR Loop" (`FOR row AS query DO`). `FOR UPDATE OF` cursors (positioned `UPDATE ... WHERE CURRENT OF`) have no equivalent: rewrite as keyed `MERGE`. `examples/proc-cursor-payments` |
+| `GOTO label` / `label:` (ASE error handling) | labeled compound statement + `LEAVE label` | | | `[dbsql:scripting]` "Loops" (`LEAVE`) — labels exist only on loops and compound statements; forward `GOTO` into cleanup code becomes an `EXIT HANDLER` |
+| `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH` / `IF @@error != 0 GOTO err` | `BEGIN ... DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ... RESIGNAL; END; ... END` | task-level `run_if: AT_LEAST_ONE_FAILED` cleanup task | | `[dbsql:scripting]` "Exception Handling" (`DECLARE ... CONDITION FOR SQLSTATE`, `EXIT` handler only, `SQLEXCEPTION`, `NOT FOUND`; `RESIGNAL` inside handlers keeps the diagnostic stack). No `CONTINUE` handler: a `CATCH` that swallows and carries on becomes a nested `BEGIN ... END` with its own `EXIT` handler; `[jobs]` `run_if` |
+| `RAISERROR 50001 'msg %1!', @arg` (ASE) / `RAISERROR('msg', 16, 1)` / `THROW 50001, 'msg', 1` | `SIGNAL SQLSTATE '45001' SET MESSAGE_TEXT = 'msg'` (custom condition per source error number) / `RESIGNAL` in a handler | | | `[dbsql:scripting]` "SIGNAL" / "RESIGNAL". Keep a table `source_error_number -> SQLSTATE` in the mapping; severity <= 10 (informational `RAISERROR ... WITH NOWAIT`) becomes a log row, not a signal |
+| `BEGIN TRAN ... COMMIT / ROLLBACK`, `SAVE TRAN`, `@@TRANCOUNT` nesting | single-statement atomicity (`MERGE`/`INSERT ... SELECT`) so the transaction is not needed | `BEGIN ATOMIC ... END` (Preview; tables need `delta.feature.catalogManaged`) | Python connector `autocommit=False` | `[dbsql:scripting]` "Multi-Statement Transactions", "SQL Scripting Atomic Blocks", "Python Connector Transaction API". Cross-table atomicity is Preview: record it in the tolerance record as an ordering assumption for recon |
+| `ROLLBACK TRIGGER` / `ROLLBACK TRANSACTION` inside a trigger (`trg_validate_loan_amount`) | validation moved into the writing procedure as `IF ... THEN SIGNAL` before the DML | pipeline `CONSTRAINT ... EXPECT (...) ON VIOLATION FAIL UPDATE` when the write is a pipeline | | `[dbsql:scripting]` "SIGNAL"; `[sdp:expect]` (`FAIL UPDATE` rolls the update back). `examples/trigger-validate` |
+| `CREATE TRIGGER ... FOR INSERT` / `AFTER INSERT` audit trigger (`trg_audit_payment`) | audit `INSERT ... SELECT` appended to every converted writer of the parent table (fan-out list from §2) | Delta Change Data Feed (`delta.enableChangeDataFeed`, named in `databricks-lakebase` `SKILL.md` Troubleshooting) consumed by a streaming table `[sdp:st]` | | no trigger object exists on Databricks; `UPDATE(col)` tests -> compare old/new columns in the `MERGE`; `inserted`/`deleted` -> the source rows of the DML |
+| `INSTEAD OF` trigger | rewrite the view's writers as procedures | | | |
+| `SELECT ... INTO #t` / `CREATE TABLE #t` / `DECLARE @t TABLE` | `CREATE TEMP TABLE t AS SELECT ...` / `CREATE TEMPORARY TABLE t (...)` | `CREATE TEMPORARY VIEW` for read-only intermediates | | `[dbsql:temp]` (session-scoped, 7-day max, no `CREATE OR REPLACE`, no `DELETE FROM`); in pipelines `[sdp:tv]` |
+| `EXEC(@sql)` / `sp_executesql` with `OUTPUT` | `EXECUTE IMMEDIATE stmt INTO v USING p` | | | `[dbsql:scripting]` "Dynamic SQL"; object names via `IDENTIFIER()` `[docs:identifier]` |
+| `RETURN 0 / RETURN -1` | `OUT rc INT` parameter set before every exit; callers `CALL p(..., rc)` then `IF rc <> 0 THEN SIGNAL` | job task failure = non-zero | | `[dbsql:scripting]` "Stored Procedures" (no scalar return value) |
+| `EXEC other_proc @p` (nested call) | `CALL other_proc(p)` | `run_job_task` | | `[dbsql:scripting]` "CALL"; `[jobs:tasks]` `run_job_task` |
+| `PRINT 'x'` / `RAISERROR ... WITH NOWAIT` (progress) | drop, or `INSERT` into a run-log table | task notifications | | `[jobs:monitor]` |
+| Scalar UDF `CREATE FUNCTION fn(...) RETURNS MONEY` | `CREATE FUNCTION fn(...) RETURNS DECIMAL(19,4) RETURN <expr>` (SQL UDF) | inline the expression | | `[dbsql:skill]` routes UDF DDL to the official skill; the three fixture functions are single-expression `CASE`/arithmetic bodies and inline cleanly. T-SQL scalar UDFs are row-by-row; the Databricks SQL UDF is an expression: same results, no perf trap |
+| Multi-statement TVF / `RETURNS TABLE` | view or SQL table function | | | `[dbsql:skill]` |
+| SQL Agent job (steps + `on_success_action`) | Lakeflow job: one task per step, `depends_on` = step order, `run_if` = `on_fail_action` (`ALL_SUCCESS` for "quit with failure", `ALL_DONE` for "go to next step") | | | `[jobs]` "Multi-Task Workflows"; `[jobs:triggers]` `schedule.quartz_cron_expression` + `timezone_id` for `sysschedules`; `[jobs:monitor]` `email_notifications.on_failure`, `timeout_seconds`, `max_retries`, `max_concurrent_runs: 1` for jobs whose Agent equivalent could not overlap |
+| `isql` shell runner (`batch/run_nightly_batch.sh`) | Lakeflow job with one `sql_task` (`sql_task.file` or `query`) per `isql` block, `depends_on` following the script order, exit-code `if` -> `run_if` | `notebook_task` when the shell does file work | | `[jobs:tasks]` "SQL Task" (`file.path`, `warehouse_id`, `parameters`); job parameters (`{{job.parameters.report_date}}`) replace `${REPORT_DATE}` `[jobs]` "Job Parameters". `examples/runner-nightly-batch` |
+| SSIS control flow: Execute SQL Task | `sql_task` (`query`/`file`) whose body is converted under §5/§6 | | | `[jobs:tasks]` "SQL Task". `ResultSet=SingleRow` into a variable: fold the read into the consuming task's SQL script (`SET v = (SELECT ...)`, `IF v > 0 THEN ... END IF` `[dbsql:scripting]`) or, when a graph branch is needed, a `notebook_task` that sets a task value `[jobs:taskvalues]` feeding an If/else task `[jobs:ifelse]` |
+| SSIS precedence constraint `Success`/`Failure`/`Completion`, `LogicalAnd`/`LogicalOr`, expression | `depends_on` + `run_if` `ALL_SUCCESS` / `AT_LEAST_ONE_FAILED` / `ALL_DONE`; `LogicalOr` -> `AT_LEAST_ONE_SUCCESS` / `AT_LEAST_ONE_FAILED`; expression constraints -> If/else condition task on a job parameter or task value, or an `IF` guard inside the downstream `sql_task` | | | `[jobs]` `run_if` values; `[jobs:runif]` semantics (unmet -> Upstream failed / Excluded; Excluded cascades down linear chains); `[jobs:ifelse]`. `examples/ssis-execsql-chain` |
+| SSIS Sequence Container / For Loop / Foreach Loop | flatten; `for_each_task` over the enumerator list (`inputs` literal or `{{tasks.x.values.list}}`) | | | `[jobs:tasks]` `for_each_task` (`concurrency`, nested task `{{input}}`) |
+| SSIS Execute Package Task | `run_job_task` (child = its own job) | | | `[jobs:tasks]` "Run Job Task" |
+| SSIS Data Flow: OLE DB Source -> transforms -> OLE DB Destination | Lakeflow Spark Declarative Pipeline: source `CREATE TEMPORARY VIEW` `[sdp:tv]`, transforms as views, destination `CREATE OR REFRESH MATERIALIZED VIEW` (full reload / `TRUNCATE`+load packages) or `STREAMING TABLE` + `APPEND FLOW` (append-only, incremental sources) `[sdp:st]` `[sdp:mv]`; scheduled through `pipeline_task` `[jobs:tasks]` | `sql_task` with `INSERT OVERWRITE` | PySpark | `[sdp]` decision table (batch full-scan -> MV; append/incremental -> ST; multiple sources -> `APPEND FLOW`, never `UNION`). `examples/ssis-dataflow-lookup` |
+| SSIS Lookup (Full Cache / No Cache, `NoMatch` redirect) | `LEFT JOIN` to the reference view + `CASE WHEN ref.key IS NULL` routing; "fail on no match" -> `CONSTRAINT ... EXPECT (ref.key IS NOT NULL) ON VIOLATION FAIL UPDATE`; "ignore" -> keep NULLs; "redirect" -> second dataset with `WHERE ref.key IS NULL` | | | `[sdp:expect]`; `[sdp:st]` stream-static join for streaming sources. Trap: Full-cache Lookup is case-sensitive/exact even on a CI database; No-cache Lookup uses the database collation (§7) |
+| SSIS Derived Column (SSIS expression language) | column expressions in the view (`? :` -> `CASE`/`iff`, `ISNULL(x) ? a : b` -> `coalesce`, `(DT_STR, n, cp)x` -> `cast(x AS STRING)`, `REPLACENULL` -> `coalesce`, `DATEADD` / `DATEDIFF` per §5 rows 37-39, `+` string concat, `GETDATE()`) | | | `[sdp:tv]`. SSIS `DATEDIFF` follows T-SQL boundary semantics |
+| SSIS Conditional Split / Multicast / Union All / Sort / Aggregate / Merge Join | `WHERE` per output dataset / multiple downstream datasets / `UNION ALL` (batch) or `APPEND FLOW` (streaming) / `ORDER BY` in the consumer only / `GROUP BY` / `JOIN` | | | `[sdp]`; SSIS Sort `RemoveDuplicates` -> `DISTINCT`; Aggregate `COUNT DISTINCT` same |
+| SSIS Slowly Changing Dimension / historical loads | `CREATE FLOW ... AS AUTO CDC INTO ... STORED AS SCD TYPE 1|2` | `MERGE INTO` | | `[sdp]` Auto CDC; `[docs:merge]` |
+| SSIS error output (`RedirectRow` to an error table) | `CONSTRAINT ... EXPECT ... ON VIOLATION DROP ROW` on the main dataset plus a quarantine dataset with the negated predicate | | | `[sdp:expect]` |
+| SSIS Script Task / Script Component (C#/VB) | **hand-convert** — no automatic rule. Read the script, classify: pure expression -> SQL; row-by-row API call -> `notebook_task`; file/FTP -> `notebook_task` with Volumes `[uc]` | | notebook | `[jobs:tasks]` "Notebook Task". `examples/ssis-script-component` |
+| SSIS Event Handlers (`OnError`, `OnPostExecute`) | `email_notifications.on_failure` / `webhook_notifications`, plus an `ALL_DONE`/`AT_LEAST_ONE_FAILED` cleanup task | | | `[jobs:monitor]` "Notifications"; `[jobs]` `run_if` |
+| SSIS Variables / Project Parameters / `.dtsConfig` / SSISDB environments | job parameters `{{job.parameters.name}}` (project params), task values (runtime variables), Databricks secrets for passwords (referenced by name only) | | | `[jobs]` "Job Parameters"; `[jobs:tasks]` "Task Values"; `databricks-core` for secret scopes via `target-routing` |
+| SSIS Connection Managers (OLE DB to SQL Server, Flat File, FTP, SMTP) | catalog/schema names (SQL Server), `read_files`/Auto Loader on a Volume path (Flat File `[sdp:st]`), `notebook_task` (FTP/SMTP) | Lakehouse Federation for a source that stays (`skills/lakehouse-federation`) | | |
+| SSIS Checkpoints / `FailPackageOnFailure` / `MaximumErrorCount` | task retries and `run_if`; checkpoint restart -> `repair run` semantics of Lakeflow Jobs (routed to `databricks-jobs`) | | | `[jobs:monitor]` "Retry Configuration" |
+
+## 7. Known traps with recon signature
+
+| Trap | Legacy engine | Databricks | Recon signature | Fix in converted code | Decision forced before run 1 |
+|---|---|---|---|---|---|
+| **ASE `*=` with WHERE predicates on the inner side** (`vw_active_loan_portfolio`: `l.loan_id *= m.loan_id AND (m.status='A' OR m.status IS NULL)`) | predicate on the outer-joined table is evaluated inside the join; every loan survives | naive `LEFT JOIN ... WHERE (m.status='A' OR m.status IS NULL)` is correct only by accident of the `IS NULL` arm; dropping the `IS NULL` or leaving a comma join gives an inner join | **Tier 1** row count < source (loans without modifications/payments vanish); Tier 2 null-rate on `modification_id` = 0 | `LEFT JOIN m ON l.loan_id = m.loan_id AND m.status = 'A'` | none; static rewrite. Lakebridge cannot see intent: rule `mangles` |
+| **`COMPUTE BY` subtotals** | second interleaved result set | one relation with `WITH ROLLUP` `[docs:groupby]` | Tier 1 row count differs by the number of subtotal rows if the consumer counted both result sets; Tier 4 replay of the report | `GROUP BY GROUPING SETS ((loan_type, property_state, delinq_bucket), (loan_type))` + `grouping()` marker for the exact subtotal levels `[docs:groupby]` `[fn:grouping]` | consumer contract: who reads the subtotals |
+| **`DATETIME` 1/300 s grid** | values stored as `.000/.003/.007`; `GETDATE()` snaps | `current_timestamp()` has microseconds; loaded values keep the grid, computed ones do not | **Tier 3** keyed diff on every `*_date` column derived by `GETDATE()`/`DATEADD(ms, ...)`; Tier 2 `max()` drift of <= 3 ms | keep loaded values; compare on a 10 ms grid | `datetime_grid_333` on `DATETIME->TIMESTAMP_NTZ` columns (§8) |
+| **CI collation equality and grouping** (default `SQL_Latin1_General_CP1_CI_AS`; ASE default is `binary` — check `sp_helpsort`) | `'ABC' = 'abc'`; `GROUP BY` merges cases; `DISTINCT` counts once | `UTF8_BINARY`: distinct, unequal | **Tier 2 distinct-count drift on string keys**, Tier 1 row count on joins by string key | declare columns `STRING COLLATE UTF8_LCASE` (accent-sensitive, like `_CI_AS`) `[dbsql:collation]`, or `UNICODE_CI_AI` for `_CI_AI`; never sprinkle `lower()` in joins | `collation_casefold` enabled only when the census reports a CI collation (`sys.databases.collation_name` / `sp_helpsort`); ASE binary sort order -> disabled |
+| **Trailing-space padding** (`CHAR(n)`, and `VARCHAR` equality under ANSI_PADDING) | `'AC ' = 'AC'` true; `LEN` ignores trailing spaces; `CHAR(4)` `'FHA'` is stored `'FHA '` | strings differ; `length('FHA ') = 4` | Tier 2 distinct-count on `loan_type`/`loan_status`, Tier 1 join fan-out to 0 on `CHAR` keys | `rtrim()` on load of every `CHAR(n)` column, or `COLLATE UTF8_BINARY_RTRIM` `[dbsql:collation]` | `rstrip_spaces` on `CHAR->STRING` |
+| **`ISNULL` type coercion** | `ISNULL(char(2), 'UNKNOWN')` = `'UN'` | `coalesce` = `'UNKNOWN'` | Tier 2 `max(length())` drift, Tier 3 value diff | reproduce the truncation explicitly if consumers depend on it, else document the intentional fix | tolerance record: value-fix accepted or not |
+| **`@@ROWCOUNT`-driven logic and `SET ROWCOUNT` batching** | loop ends when a batch touches 0 rows; `SET ROWCOUNT` left on leaks into later statements | one atomic statement `[dbsql:scripting]` | Tier 1 on the target table after the run (batch loop bugs over/under-apply), Tier 2 `sum(late_fee_balance)` | single `UPDATE`; fee totals computed from the same predicate | none |
+| **Integer division and `AVG(INT)`** | truncates | `DOUBLE` `[fn:slashsign]` | **Tier 2 sum/mean drift** on ratio columns | `div` / `floor(avg())` / cast inputs to `DECIMAL` on both sides | tolerance record chooses "reproduce truncation" vs "fix" |
+| **`MONEY` arithmetic** | 4-place rounding per operation, `MONEY * MONEY` stays `MONEY` | `DECIMAL(19,4) * DECIMAL(19,4)` = `DECIMAL(38,8)` | Tier 2 sums differ in the 5th+ decimal; Tier 3 on `interest_amt` | `round(..., 4)` `[fn:round]` at each step that the source rounded | `decimal_round` places=4 half_even on money-derived columns (source `MONEY` rounding is half away from zero; half_even is the harness's available mode — mismatch only on exact `.00005` ties, listed under Not verified live) |
+| **`DATEDIFF` boundary semantics** | counts boundaries | counts elapsed units `[fn:timestampdiff]` | Tier 2 histogram drift on `days_past_due`-style buckets; `fn_get_delinquency_bucket` inputs | rewrite per §5 row 39 | none |
+| **`CONVERT` style codes** | style-driven formatting; ASE default style 100 differs from SQL Server 0 (`Mon dd yyyy hh:miAM`) | `date_format` pattern `[fn:date_format]` | Tier 3 on formatted string columns (`fn_format_loan_type`, audit `action_detail`) | pattern table §5 row 45 | none |
+| **`@@identity` hijacked by triggers** (`sp_apply_late_fees` comment) | returns the audit table's identity, not `loans` | no `@@identity` | Tier 3 on any FK populated from `@@identity` (wrong parent ids) | return keys by business key | keys loaded, not regenerated (`identity` rule) |
+| **String concatenation with NULL** | ASE: NULL -> `''`; SQL Server: NULL | NULL `[fn:concat]` | Tier 2 null-rate on `action_detail`-style columns rises | `coalesce(x, '')` per operand for ASE sources; keep NULL for SQL Server sources | `null_missing_equiv` is **not** the fix (it would hide it); leave disabled for these columns |
+| **`SELECT @v = col` over many rows** | last row wins silently | `SET v = (SELECT col ...)` raises on >1 row `[dbsql:scripting]` | converted procedure fails, or (if `LIMIT 1` added without `ORDER BY`) Tier 3 diff on the derived value | deterministic `ORDER BY ... LIMIT 1` | none |
+| **Lookup cache mode vs collation** (SSIS) | Full Cache compares exactly (case-sensitive) even when the database is CI; Partial/No Cache uses the database collation | `JOIN` follows the column collation | Tier 1 row count of "matched" vs "no match" outputs | join on `COLLATE UTF8_BINARY` for full-cache lookups, `UTF8_LCASE` for no-cache | collation per join, recorded in the mapping |
+| **`UNIQUEIDENTIFIER` case/byte order** | upper-case display; `CAST(uid AS BINARY(16))` is mixed-endian | `uuid()` lower-case `[fn:uuid]`; string compare is byte-wise | Tier 3 key mismatch 100% | lower-case on load | `uuid_normalize` |
+| **Timezone of `DATETIME` values** | server-local wall clock, zone unknown to the data | `TIMESTAMP` normalizes to UTC via the session zone `[docs:types]`; `TIMESTAMP_NTZ` does not | Tier 2 `min()/max()` shifted by the zone offset | land as `TIMESTAMP_NTZ`; convert once with `to_utc_timestamp(x, '<server tz>')` if the target state wants UTC | tolerance record names the server zone |
+
+## 8. Canonicalization rules
+
+`canonicalization.json` (list shape, loaded by `recon.config.load_canon_rules`; every rule name exists in `recon/canon.py`):
+
+| Rule | `applies_to` | params | Why this dialect needs it |
+|---|---|---|---|
+| `datetime_grid_333` | `DATETIME->TIMESTAMP_NTZ` | `{}` | ASE and SQL Server `DATETIME` are stored on a 1/300 s grid (`.000/.003/.007`); the harness rule truncates to ms and rounds both sides to the coarsest shared 10 ms grid, so loaded (gridded) and recomputed (true ms) values compare equal while a real second-level error still shows. Not applied to `DATETIME2`/`BIGDATETIME` (use `datetime_utc_truncate_ms`). |
+| `datetime_utc_truncate_ms` | `DATETIME2,DATETIMEOFFSET,SMALLDATETIME,BIGDATETIME->TIMESTAMP_NTZ,TIMESTAMP` | `{}` | 100 ns source precision vs microsecond target; `DATETIMEOFFSET` normalizes to UTC on the target side. |
+| `collation_casefold` | `STRING` | `{"enabled_if": "census reports a *_CI_* database/column collation (sys.databases.collation_name, sys.columns.collation_name) or SSIS no-cache Lookup on a CI database; disabled for ASE binary sort order (sp_helpsort)"}` | CI equality/grouping in the source; folding both sides before comparing reproduces the source's notion of "same key". Off for ASE estates with binary sort order and for columns declared `COLLATE ... _CS_`. |
+| `rstrip_spaces` | `CHAR->STRING` | `{}` | `CHAR(n)` is blank-padded on the source and trailing spaces are ignored by `=`/`LEN`; converted `STRING` values loaded without `rtrim()` or declared `UTF8_BINARY_RTRIM` differ only by padding. Also legitimately applied to `VARCHAR->STRING` when the census shows `ANSI_PADDING OFF` tables (then extend `applies_to`). |
+| `decimal_round` | `MONEY,SMALLMONEY->DECIMAL` | `{"mode": "half_even", "places": 4}` | `MONEY` arithmetic rounds to 4 places at every step; converted `DECIMAL` arithmetic carries 8+ places on derived columns. Rounding to 4 before compare isolates real logic errors from scale noise. (Source rounds half away from zero; the harness offers `half_even`; the difference is a tie at exactly 5 in the 5th place, documented as Not verified live.) |
+| `decimal_round` | `DECIMAL,NUMERIC->DECIMAL` | `{"mode": "half_even", "places": 10}` | derived `DECIMAL` columns (`interest_rate * balance`) differ in trailing scale after Databricks' `DECIMAL(38,s)` promotion; 10 places keeps every fixture scale (max `DECIMAL(6,4)`) exact. Stored (non-derived) decimals compare exactly anyway. |
+| `uuid_normalize` | `UNIQUEIDENTIFIER->STRING` | `{}` | upper-case source display vs lower-case canonical target. |
+| `null_missing_equiv` | `*` | `{}` | `OUTER JOIN`-produced NULLs vs missing rows in the target's `LEFT JOIN`; also covers `SELECT INTO`-created nullable columns. **Not** the fix for the ASE `NULL + 'x'` concatenation difference (§7): that must be fixed in code. |
+| `identity` | `*` | `{}` | pass-through for every column not listed above (integers, `BIT`, `DATE`, loaded identity keys). |
+
+`empty_string_is_null` is intentionally absent: neither SQL Server nor ASE treats `''` as NULL (unlike Oracle), and enabling it would hide the ASE concatenation trap.
+
+**Harness gaps** (filed in the PR body, not implemented here): `xml_canonicalize` (XML columns: whitespace/attribute-order normalization before hashing), `variant_split` (`SQL_VARIANT` per-base-type comparison), `decimal_round` mode `half_away_from_zero` (exact `MONEY` tie semantics).
+
+## 9. Governance discovery
+
+Read-only catalog queries; privilege named per row. Output feeds `skills/governance-mapping` and D8; the Databricks side (`GRANT`/`REVOKE`, row filters, column masks, `system.access.audit`) is `[uc]` via `target-routing`, not restated here.
+
+| Surface | SQL Server | Sybase ASE | Privilege |
+|---|---|---|---|
+| Object grants | `sys.database_permissions` JOIN `sys.database_principals` (`state_desc`, `permission_name`, `class_desc`, `major_id`); server level `sys.server_permissions` | `sysprotects` JOIN `sysusers`/`sysobjects` (`protecttype` 1 grant / 2 revoke, `action` 193 select / 195 insert / 196 delete / 197 update / 224 execute), or `sp_helprotect` per object | `VIEW DEFINITION` + `VIEW ANY DEFINITION`; ASE `select` on `sysprotects` |
+| Roles and memberships | `sys.database_role_members` JOIN `sys.database_principals` twice; `sys.server_role_members`; fixed roles `db_owner`, `db_datareader`, `db_datawriter` expand implicitly | `sysroles`, `syssrvroles`, `sp_displayroles`, `sysloginroles`; groups via `sysusers` (`gid`) | as above |
+| Ownership-implied rights | `sys.objects.principal_id` / `sys.schemas.principal_id` (owner has all rights; ownership chaining across views/procs bypasses grants) | `sysobjects.uid` (owner = full rights; `dbo` aliasing via `sysalternates`) | as above |
+| Row-level security | `sys.security_policies`, `sys.security_predicates` (predicate functions), plus views filtering on `SUSER_SNAME()`/`IS_MEMBER()` (grep `sys.sql_modules`) | none native; look for views with `suser_name()`/`user_name()` predicates | `VIEW DEFINITION` |
+| Column masking / encryption | `sys.masked_columns` (Dynamic Data Masking), `sys.column_encryption_keys` (Always Encrypted), `sys.symmetric_keys`, `sys.certificates` | encrypted columns: `syscolumns.encrtype`, `sysencryptkeys` | `VIEW DEFINITION`; key metadata may need `CONTROL` -> record as UNVERIFIABLE if denied |
+| PUBLIC grants | `sys.database_permissions WHERE grantee_principal_id = DATABASE_PRINCIPAL_ID('public')`; `guest` user enabled (`sys.database_principals`) | `sysprotects WHERE uid = 0` (`public`); `guest` in `sysusers` | as above |
+| Audit settings | `sys.server_audits`, `sys.server_audit_specifications`, `sys.database_audit_specifications`; SQL Trace / Extended Events sessions (`sys.server_event_sessions`) | `sp_displayaudit`, `sybsecurity..sysauditoptions` (if auditing installed) | `VIEW ANY DEFINITION` / `sso_role` read |
+| Logins and auth mode | `sys.server_principals` (`type_desc`: SQL_LOGIN, WINDOWS_LOGIN, WINDOWS_GROUP), `sys.sql_logins.is_disabled` | `syslogins` (`status`), `syssrvroles`; external auth via LDAP (`sp_configure 'enable ldap user auth'`) | `VIEW ANY DEFINITION` |
+| Linked-server / remote logins (rights that cross servers) | `sys.linked_logins`, `sys.remote_logins` | `sysremotelogins`, `sysservers` | `VIEW ANY DEFINITION` |
+| SSIS-side secrets | `SSISDB.catalog.environment_variables WHERE sensitive = 1` (values are never read), `ProtectionLevel` attribute in each `.dtsx`, connection strings in `.dtsConfig` | n/a | `ssis_admin`; values stay in the source: record the **name** and the target secret scope only |
+
+Fixture note: the estate ships no grants scripts; ownership is uniformly `dbo`, so D8 for the fixture is "owner-implied, PUBLIC unknown, live verification required".
+
+## 10. Lakebridge coverage delta
+
+Flags: `--source-dialect mssql` for SQL Server, Azure SQL, RDS SQL Server **and Sybase ASE** (no ASE flag exists; the § delta list is applied by hand before and after transpile); `--source-dialect ssis` for `.dtsx` (experimental). Rows below are mirrored into `skills/lakebridge/SKILL.md` (SEEDED); every `converts` row is still proven only by the harness verdict.
+
+| Construct | Lakebridge (`mssql`/`ssis`) | Post-transpile action |
+|---|---|---|
+| ANSI joins, CTEs, window functions, `TOP` -> `LIMIT`, `ISNULL`/`COALESCE`, `GETDATE()`, `DATEADD`/`DATEDIFF` names | converts | check `DATEDIFF` boundary semantics (§5 row 39) and `ISNULL` typing (row 1) by hand: name-level conversion is not semantics-level |
+| `CREATE PROCEDURE` with `DECLARE`/`SET`/`IF`/`WHILE`, `sp_executesql` | converts (into SQL scripting shapes) | verify `OUT` parameters and `RETURN` codes (§6); `SELECT @v = col` multi-row semantics |
+| `*=` / `=*` (ASE) | mangles (parses as `*` `=` or rejects) | pre-rewrite to ANSI `LEFT`/`RIGHT JOIN` with inner-side predicates moved to `ON` (§7) |
+| `COMPUTE BY` (ASE) | rejects | hand-convert to `WITH ROLLUP`/`GROUPING SETS` |
+| `SET ROWCOUNT n` + `@@rowcount` batching loops | mangles (loop kept, `SET ROWCOUNT` dropped or kept as a no-op) | collapse to one set-based DML |
+| `@@sqlstatus`, `DEALLOCATE CURSOR`, `@@error` + `GOTO`, `RAISERROR 50001 'msg'` (ASE positional form) | rejects / mangles | hand-convert per §6 |
+| `@@identity`, `SCOPE_IDENTITY()`, `IDENT_CURRENT` | mangles (emitted as unresolved function) | business-key read-back (§5 row 74) |
+| `HOLDLOCK`/`NOHOLDLOCK`/`WITH (NOLOCK)`/`AT ISOLATION` | converts (hints dropped) | record the dropped hint in the mapping |
+| `text`/`image` -> `STRING`/`BINARY`, `MONEY` -> `DECIMAL(19,4)` | converts | apply `decimal_round` places=4 on money-derived columns |
+| `CONVERT(..., style)` | mangles for styles other than 101/103/112/120 (emits `cast`, loses the pattern) | replace with `date_format`/`to_timestamp` per the style table |
+| `$45.00` money literals | rejects | rewrite as decimal literals |
+| `FOR INSERT`/`FOR UPDATE`/`AFTER` triggers, `ROLLBACK TRIGGER` | rejects (no target object) | fold into the converted writers (§6) |
+| `STRING_AGG ... WITHIN GROUP`, `PERCENTILE_CONT ... OVER` | converts | add deterministic `ORDER BY` |
+| `PATINDEX`, `FORMAT`, `QUOTENAME`, `CHOOSE` | mangles / rejects | hand rows 13, 29, 30, 5 |
+| `MERGE ... OUTPUT`, `UPDATE ... FROM` with joins | mangles (`OUTPUT` dropped; `UPDATE FROM` emitted as non-executable) | `MERGE INTO` rewrite, dedupe source (§5 row 73) |
+| SQL Agent job scripts (`sp_add_job`/`sp_add_jobstep`) | rejects | Lakeflow job YAML by hand (§6) |
+| `.dtsx` Data Flow with OLE DB Source/Destination, Derived Column, Conditional Split, Union All, Sort, Aggregate | converts (experimental, SparkSQL/PySpark shape) | re-target to SDP datasets (`[sdp]`), re-check Lookup collation and Derived Column null semantics |
+| `.dtsx` Lookup (`NoMatch` redirect / fail), error outputs, event handlers, Script Task/Component, Execute Package, For/Foreach Loop, `.dtsConfig`/parameters | rejects or mangles | hand rows in §6; Script components are always hand-convert |
+| `.dtsx` Execute SQL Task | converts the container, body inherits the `mssql` rows above | precedence constraints -> `run_if` by hand |
+
+## 11. Risk heuristics
+
+Inputs the census computes per object; thresholds are suggestions for the inventory's complexity rank (`low`/`medium`/`high`/`hand-convert`).
+
+| Signal | How measured | Suggested weight |
+|---|---|---|
+| Lines / statements | non-comment lines; statement count per `go` batch | > 300 lines or > 60 statements: +1 |
+| Procedural depth | max nesting of `BEGIN..END`/`WHILE`/`IF` | depth >= 3: +1; any cursor: +1 |
+| Cursor loops | `DECLARE ... CURSOR` count; `FOR UPDATE OF` / `WHERE CURRENT OF` present | each cursor +1; positioned update: +2 (set-based rewrite mandatory) |
+| Dynamic SQL | `EXEC(`, `sp_executesql`, `EXECUTE (` count; parameters contributing to the string | each +1; object name from a parameter: +2 and INFERRED lineage |
+| Vendor-function density | count of §5 rows tagged `edge`/`none` used per 100 lines | > 5 per 100 lines: +1; any `none` row: +1 each |
+| ASE-only tokens | `*=`, `=*`, `COMPUTE`, `@@sqlstatus`, `SET ROWCOUNT`, `RAISERROR <num>` positional, `DEALLOCATE CURSOR`, `HOLDLOCK`, `GOTO`, `$` literals, `AT ISOLATION`, `ROLLBACK TRIGGER` | each distinct token +1; `*=`/`COMPUTE` +2 (semantic rewrite) |
+| External calls | `xp_*`, `sp_OA*`, CLR, `OPENQUERY`/`OPENROWSET`, 4-part names, `sp_send_dbmail`, `BULK INSERT`, `bcp` in runners | each: `hand-convert` floor `medium`; `xp_cmdshell`: `high` |
+| Trigger fan-out | number of triggers on tables the object writes x writers of those tables | > 1 trigger or > 3 writers: +1; validating trigger with `ROLLBACK`: +1 |
+| Transactions | explicit `BEGIN TRAN` spanning > 1 table; `SAVE TRAN`; `@@TRANCOUNT` checks | +1; cross-table atomicity required: +2 (Preview `BEGIN ATOMIC` or ordering assumption) |
+| Temp-object churn | `#temp` / `SELECT INTO` count; `tempdb..` shared tables | > 3 temps: +1; `tempdb..` shared: `shared` flag |
+| Output contract | `OUTPUT` params, `RETURN` codes checked by callers, result sets consumed by SSIS/runners | multiple result sets (e.g. `COMPUTE BY`): +2 |
+| Collation dependence | string joins/`GROUP BY` on `CHAR`/`VARCHAR` keys under a CI collation | each keyed string join: +1 unless the target collation is decided |
+| Identity dependence | `@@identity`/`SCOPE_IDENTITY` used to populate FKs | +2 |
+| SSIS package | Script Task/Component count (each `hand-convert`), Lookup count with `NoMatch` redirect (+1 each), event handlers (+1), variables with expressions (+1 per 5), connection managers to non-SQL systems (+1 each), `.dtsConfig` overrides (+1) | any Script component: `hand-convert` |
+| Runner | `isql`/`sqlcmd` blocks (+1 per block beyond 1), shell loops (+1), variable substitution into SQL (+1), output files consumed downstream (+1) | |
+
+Fixture ranks under these inputs: `sp_process_monthly_payments` high (cursor + `@@sqlstatus` + `GOTO` + `RAISERROR` + `@@identity` + transactions), `sp_apply_late_fees` medium (`SET ROWCOUNT` loop, `$` literals, `@@identity`), `vw_active_loan_portfolio` medium (`*=` x2, function calls), `sp_delinquency_snapshot` medium (`COMPUTE BY`, output contract), the CRUD procedures low, the three functions low, the two runners low-medium (variable substitution, exit-code branching).
+
+## 12. Worked examples
+
+Each directory holds `source.*`, `converted.*`, and `NOTE.md` (constructs exercised, recon tier that proves the conversion, INFERRED edges). All Databricks-side syntax in the converted files follows the citations in §5/§6.
+
+| Example | Source | Constructs | Recon tier that catches a wrong conversion |
+|---|---|---|---|
+| `examples/view-outer-join/` | fixture `schema/views/vw_active_loan_portfolio.sql` | ASE `*=` x2 with inner-side predicate, comma joins, correlated subquery, scalar UDF calls, `CHAR(n)` keys | **Tier 1** row count (dropped loans without modifications/payments); Tier 2 null-rate on `modification_id`, `last_payment_date` |
+| `examples/proc-cursor-payments/` | fixture `stored_procs/Servicing/sp_process_monthly_payments.sql` | `OUTPUT` param, `SELECT INTO #temp`, cursor + `@@sqlstatus` + `DEALLOCATE CURSOR`, `@@error`/`GOTO`, `RAISERROR`, `BEGIN TRAN`/`ROLLBACK`, `@@identity`, `MONEY` arithmetic, audit trigger fan-out | **Tier 2** sums of `principal_amt`/`interest_amt` (money rounding, allocation order) and row count of `payments` per batch; Tier 3 keyed diff on `loans.current_balance` |
+| `examples/proc-set-rowcount/` | fixture `stored_procs/Servicing/sp_apply_late_fees.sql` | `SET ROWCOUNT` batching loop, `@@rowcount`, `$` money literals, `CASE` on `CHAR(4)`, `@@identity` audit row, VA-exemption invariant | **Tier 2** `sum(late_fee_balance)` and `count(*) WHERE loan_type='VA' AND late_fee_balance>0` (= 0 invariant); Tier 1 on `audit_trail` |
+| `examples/proc-compute-by/` | fixture `schema/views/vw_delinquency_snapshot.sql` (a procedure) | `COMPUTE BY` subtotals, `GROUP BY` over a view that calls UDFs, result-set contract | **Tier 4** replay of the report (`WITH ROLLUP` levels) after **Tier 1** detail-row count |
+| `examples/trigger-validate/` | fixture `triggers/trg_validate_loan_amount.sql` + `trg_audit_payment.sql` | `FOR UPDATE` with `UPDATE(col)`, `ROLLBACK TRANSACTION` + `RAISERROR`, `FOR INSERT` audit with `@@rowcount`, string concat with `CONVERT` style | **Tier 1** on `audit_trail` (one row per statement, not per row); Tier 3 on rejected updates never landing in `loans` |
+| `examples/runner-nightly-batch/` | fixture `batch/run_nightly_batch.sh` | `isql` here-docs, `${VAR}` substitution, exit-code precedence, three-procedure sequence, `interfaces` alias | **Tier 1** per written table after a full run; task-graph parity check (`depends_on` == script order) |
+| `examples/ssis-dataflow-lookup/` | built fixture `LoadPaymentFact.dtsx` (`source.dtsx` description) -> `converted.sql` (SDP) | OLE DB Source with parameterised `SqlCommand`, Lookup (Full Cache, `NoMatch` redirect), Derived Column (`?:`, nested `?:`, `YEAR()*100+MONTH()`, `(DT_WSTR)TRIM`), OLE DB Destination fast-load (`KeepNulls=false`), no-match error destination, `OnError` handler | **Tier 1** `fact + err` = source rows, matched vs no-match split; Tier 2 null-rate/`sum(total_amt)`/distinct `amt_bucket`; Tier 3 on `amt_bucket` boundaries and trimmed `loan_type` |
+| `examples/ssis-execsql-chain/` | built fixture `NightlyServicing.dtsx` (`source.dtsx` description) -> `converted.yml` (Lakeflow Jobs) | five Execute SQL Tasks, `Success`/`Failure` constraints, `LogicalAnd="False"` (OR) fan-in, `ExpressionAndConstraint` on a variable, `ResultSet=SingleRow` into a variable, `FailPackageOnFailure`, `OnError` event handler, project parameter in a connection string | task-graph parity (`depends_on`/`run_if` vs constraints) then **Tier 1** on written tables; Tier 2 on the count captured in the variable |
+| `examples/ssis-script-component/` | built fixture `InvestorFileExport.dtsx` (`source.dtsx` description with abridged C#) -> `converted.md` (hand-conversion plan) | Script Component (C#) as transformation: culture-dependent formatting, custom check digit, per-row HTTP call with cache, silent row skip; fixed-width Flat File Destination (cp1252), FTP Task, sensitive project parameter | **hand-convert**; Tier 3 keyed diff of the export table vs source query (check digit, formats), Tier 2 `sha2` of the canonical file and dropped-row count |
+
+INFERRED edges the fixture round-trip produces (accepted, per the template): none from SQL (the fixture has no `EXEC(@sql)`/`sp_executesql`; every procedure, view, trigger, and function edge is FACT from the text); `${SYBASE_SERVER}`/`${SYBASE_DB}`/`${REPORT_MONTH}` in both runners (the `for STATE in CA TX FL NY IL PA OH` loop expands to FACT edges); the three SSIS descriptions' connection strings (project parameters); the Script Component's external rate-service read (`external_call`). UNVERIFIABLE edges caused by this skill: none.
+
+## Sybase ASE delta list (applied under the `mssql` flag)
+
+Pre-transpile rewrites (do before Lakebridge), then post-transpile checks:
+
+1. `a *= b` -> `a LEFT JOIN b ON ...` with **every WHERE predicate on b moved into ON**; `a =* b` -> `RIGHT JOIN`. Never leave a comma join.
+2. `COMPUTE [BY]` -> `WITH ROLLUP`/`GROUPING SETS` and a consumer contract change (single relation).
+3. `SET ROWCOUNT n` -> remove; the loop collapses to one DML. Audit that `SET ROWCOUNT 0` was present (if missing, the source silently truncated later statements: record it).
+4. `@@sqlstatus` (0/1/2) -> cursor loop rewrite (`FOR ... DO` or set-based); `DEALLOCATE CURSOR c` -> nothing.
+5. `RAISERROR 50001 'text %1!' , @arg` (positional, no parentheses, numbers >= 17000 user range) -> `SIGNAL SQLSTATE` with a condition per number; `%1!` -> `format_string`. Severity is implicit (16) in ASE.
+6. `@@error` checked after each statement + `GOTO err_exit` -> `EXIT HANDLER`.
+7. `@@identity` -> business-key read-back (`SCOPE_IDENTITY()` does not exist in ASE either).
+8. `datetime` 1/300 s grid -> `datetime_grid_333`; `bigdatetime` -> `datetime_utc_truncate_ms`.
+9. `HOLDLOCK` / `NOHOLDLOCK` / `AT ISOLATION READ UNCOMMITTED` -> remove, record.
+10. `text` / `image` / `unitext` -> `STRING` / `BINARY`; `readtext`/`writetext` -> plain column access.
+11. `CONVERT(char(n), d, style)` -> `date_format` (ASE default style is 100; two-digit-year styles 1-14 are semantics traps).
+12. `CREATE TRIGGER ... FOR INSERT|UPDATE|DELETE` (per statement, `inserted`/`deleted`, `ROLLBACK TRIGGER`) -> fold into the writers; ASE allows one trigger per action per table, so the fan-out list is short.
+13. `$12.34` money literals -> decimal literals.
+14. NULL in string concatenation behaves as `''` -> `coalesce(x, '')` per operand (verify live).
+15. `select @v = col from t` with multiple rows (last row wins) -> `ORDER BY ... LIMIT 1` or set-based.
+16. `sp_helpsort` binary sort order -> `collation_casefold` **disabled**; the SQL Server default CI assumption does not hold for ASE.
+17. `syscomments` 255-byte text rows -> concatenate before parsing; `sp_hidetext` objects are UNVERIFIABLE.
+18. `isql` runners and `interfaces` aliases replace SQL Agent: scheduler edges come from cron and the shell's exit-code branching.

@@ -1,0 +1,110 @@
+# Converted under skills/tsql-ssis/SKILL.md §6 "SSIS control flow" rows.
+# Lakeflow Jobs resource (Databricks Asset Bundle shape) per databricks-jobs SKILL.md "Multi-Task
+# Workflows" (depends_on / run_if / job parameters), references/task-types.md ("SQL Task": sql_task.file
+# with source: WORKSPACE + warehouse_id), references/notifications-monitoring.md (on_failure), and
+# https://docs.databricks.com/aws/en/jobs/conditional-tasks (Run if semantics: AT_LEAST_ONE_FAILED tasks
+# are Excluded when unmet; Excluded cascades along linear chains), /aws/en/jobs/parameter-use (SQL tasks
+# read key-value parameters as :name; job parameters are pushed down to SQL tasks) and
+# /aws/en/jobs/dynamic-value-references ({{job.run_id}}).
+#
+# Mapping from source.dtsx:
+#   SQL Count eligible + expression constraint  ->  folded into accrual's SQL as an IF guard (see note).
+#   Success constraints (LogicalAnd)            ->  depends_on + run_if: ALL_SUCCESS (default).
+#   Failure constraints, LogicalAnd="False"     ->  one task with three depends_on + run_if: AT_LEAST_ONE_FAILED.
+#   FailPackageOnFailure="True"                 ->  default: any failed task fails the run.
+#   OnError event handler (audit_trail row)     ->  same AT_LEAST_ONE_FAILED task + on_failure notification.
+#   $Project::ServerName connection manager     ->  catalog/schema job parameters (no server name survives).
+#   $Package::ServicerId (7) / User::ProcessingDate ((DT_DBDATE)GETDATE()) -> job parameters; ProcessingDate
+#     is evaluated inside SQL as current_date() so the job does not need a runtime-expression variable.
+resources:
+  jobs:
+    nightly_servicing:
+      name: nightly_servicing        # NightlyServicing.dtsx
+      description: "Converted from NightlyServicing.dtsx (SQL Server / SQL Agent edition of batch/run_nightly_batch.sh)"
+      max_concurrent_runs: 1         # SSIS packages are not re-entrant; SQL Agent skips overlapping schedules
+      timeout_seconds: 7200
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: servicer_id
+          default: "7"               # $Package::ServicerId default value
+      email_notifications:
+        on_failure:
+          - ${var.ops_email}
+      tasks:
+        # SQL Count eligible -> SQL Nightly accrual, constraint Success AND @[User::EligibleCount] > 0.
+        # The SingleRow result binding has no direct SQL-task equivalent (task values are set from Python
+        # notebooks: docs /jobs/task-values), so the guard is evaluated in the consuming task's SQL script:
+        #   USE CATALOG IDENTIFIER(:catalog);
+        #   USE SCHEMA  IDENTIFIER(:schema);
+        #   BEGIN
+        #     DECLARE eligible_count INT;
+        #     SET eligible_count = (SELECT count(*) FROM loans
+        #                           WHERE loan_status = 'AC' AND servicer_id = :servicer_id);
+        #     IF eligible_count > 0 THEN
+        #       CALL sp_nightly_accrual(current_date());
+        #     END IF;
+        #   END
+        # (databricks-dbsql references/sql-scripting.md: compound statement, SET, IF ... END IF, CALL;
+        #  IDENTIFIER clause is allowed for USE CATALOG/SCHEMA and table names, not for CALL targets:
+        #  docs sql-ref-names-identifier-clause.)
+        # Job parameters (catalog, schema, servicer_id) are pushed down automatically and read as :name.
+        # Alternative when the branch must be visible in the graph: notebook_task setting task value
+        # eligible_count + If/else condition task `{{tasks.count_eligible.values.eligible_count}} > 0`
+        # (docs /jobs/if-else), with accrual depending on the `true` outcome.
+        - task_key: nightly_accrual
+          sql_task:
+            file:
+              path: ../sql/nightly_accrual_guarded.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+
+        # Accrual -> Fees : Success, LogicalAnd
+        - task_key: apply_late_fees
+          depends_on:
+            - task_key: nightly_accrual
+          run_if: ALL_SUCCESS
+          sql_task:
+            file:
+              path: ../sql/sp_apply_late_fees_call.sql     # CALL ...sp_apply_late_fees(current_date())
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+
+        # Fees -> EOD : Success, LogicalAnd
+        - task_key: eod_reconciliation
+          depends_on:
+            - task_key: apply_late_fees
+          run_if: ALL_SUCCESS
+          sql_task:
+            file:
+              path: ../sql/sp_end_of_day_reconciliation_call.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+
+        # Three Failure constraints with LogicalAnd="False" (OR) into SQL Log failure, plus the package
+        # OnError handler: one task, AT_LEAST_ONE_FAILED. Excluded (not failed) when the run is clean.
+        # System::SourceName / System::ErrorDescription have no SQL-task equivalent; the run page and the
+        # on_failure email carry them, the audit row records the job + run id instead.
+        - task_key: log_failure
+          depends_on:
+            - task_key: nightly_accrual
+            - task_key: apply_late_fees
+            - task_key: eod_reconciliation
+          run_if: AT_LEAST_ONE_FAILED
+          sql_task:
+            file:
+              path: ../sql/log_batch_failure.sql
+              # INSERT INTO IDENTIFIER(:catalog||'.'||:schema||'.audit_trail')
+              #   (action_type, action_date, table_name, record_count, new_value)
+              # VALUES ('BATCH_FAILED', current_timestamp(), 'loans', NULL, 'nightly_servicing:' || :run_id);
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              run_id: "{{job.run_id}}"      # task-level key-value parameter, read as :run_id
+
+# Not represented (SKILL §6 "SSIS Checkpoints"): the package had no CheckpointFileName, so no repair-run
+# note. ProtectionLevel=EncryptSensitiveWithUserKey is a §9 governance finding: the package can only be
+# opened by its author's Windows profile, so the .dtsx on disk is authoritative for structure but any
+# sensitive property values it carried are unreadable (recorded, never recovered).

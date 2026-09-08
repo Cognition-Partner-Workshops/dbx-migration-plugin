@@ -1,0 +1,11 @@
+[
+  {"rule": "datetime_grid_333", "applies_to": "DATETIME->TIMESTAMP_NTZ", "params": {}},
+  {"rule": "datetime_utc_truncate_ms", "applies_to": "DATETIME2,DATETIMEOFFSET,SMALLDATETIME,BIGDATETIME->TIMESTAMP_NTZ,TIMESTAMP", "params": {}},
+  {"rule": "collation_casefold", "applies_to": "STRING", "params": {"enabled_if": "census reports a *_CI_* database/column collation (sys.databases.collation_name, sys.columns.collation_name) or an SSIS no-cache Lookup on a CI database; disabled for Sybase ASE binary sort order (sp_helpsort)"}},
+  {"rule": "rstrip_spaces", "applies_to": "CHAR->STRING", "params": {}},
+  {"rule": "decimal_round", "applies_to": "MONEY,SMALLMONEY->DECIMAL", "params": {"mode": "half_even", "places": 4}},
+  {"rule": "decimal_round", "applies_to": "DECIMAL,NUMERIC->DECIMAL", "params": {"mode": "half_even", "places": 10}},
+  {"rule": "uuid_normalize", "applies_to": "UNIQUEIDENTIFIER->STRING", "params": {}},
+  {"rule": "null_missing_equiv", "applies_to": "*", "params": {}},
+  {"rule": "identity", "applies_to": "*", "params": {}}
+]

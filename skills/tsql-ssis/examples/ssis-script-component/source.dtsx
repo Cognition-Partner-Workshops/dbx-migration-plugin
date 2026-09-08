@@ -1,0 +1,182 @@
+<?xml version="1.0"?>
+<!--
+  Representative .dtsx-shaped fixture (hand-written) for the tsql-ssis skill.
+
+  Package: InvestorFileExport.dtsx
+  Shape:   Data Flow Task
+             OLE DB Source (dbo.loans JOIN dbo.investors, active loans for one investor)
+               -> Script Component (transformation, C#): row-by-row .NET logic that
+                     * formats amounts with the investor's culture (CultureInfo),
+                     * computes a check digit with a custom algorithm,
+                     * calls an external rate service (HttpClient) per row and caches the result
+               -> Flat File Destination (fixed-width, Windows-1252, CRLF)
+           then FTP Task uploads the file using a sensitive project parameter.
+
+  HAND-CONVERT: the Script Component is not parsed by this skill or by Lakebridge (SKILL §2b row
+  "SSIS Script Task/Component", §6 row "SSIS Script Task / Script Component"). The C# body is
+  reproduced (abridged) so the conversion plan in converted.md can classify each statement.
+-->
+<DTS:Executable xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+  DTS:ExecutableType="Microsoft.Package"
+  DTS:ObjectName="InvestorFileExport"
+  DTS:ProtectionLevel="EncryptSensitiveWithPassword">
+
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager DTS:ObjectName="OLTP_LoanServicing" DTS:CreationName="OLEDB">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager DTS:ConnectionString="Data Source=LOANSQL01;Initial Catalog=loan_servicing;Provider=SQLNCLI11;Integrated Security=SSPI;" />
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+    <DTS:ConnectionManager DTS:ObjectName="FF_InvestorExport" DTS:CreationName="FLATFILE">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager DTS:ConnectionString="\\fileshare\investor_out\INV_@[$Package::InvestorCode]_@[User::FileDate].txt"
+          DTS:Format="FixedWidth" DTS:CodePage="1252" DTS:RowDelimiter="_x000D__x000A_" DTS:ColumnNamesInFirstDataRow="False">
+          <DTS:FlatFileColumns>
+            <DTS:FlatFileColumn DTS:ObjectName="loan_number"      DTS:ColumnWidth="20" DTS:DataType="129" />
+            <DTS:FlatFileColumn DTS:ObjectName="borrower_name"    DTS:ColumnWidth="60" DTS:DataType="129" />
+            <DTS:FlatFileColumn DTS:ObjectName="upb_formatted"    DTS:ColumnWidth="18" DTS:DataType="129" />
+            <DTS:FlatFileColumn DTS:ObjectName="rate_formatted"   DTS:ColumnWidth="8"  DTS:DataType="129" />
+            <DTS:FlatFileColumn DTS:ObjectName="index_rate"       DTS:ColumnWidth="8"  DTS:DataType="129" />
+            <DTS:FlatFileColumn DTS:ObjectName="check_digit"      DTS:ColumnWidth="1"  DTS:DataType="129" />
+          </DTS:FlatFileColumns>
+        </DTS:ConnectionManager>
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+    <DTS:ConnectionManager DTS:ObjectName="FTP_Investor" DTS:CreationName="FTP">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager DTS:ConnectionString="sftp.investor.example:22" DTS:ServerUserName="@[$Project::FtpUser]" />
+        <!-- ServerPassword bound to $Project::FtpPassword (Sensitive="True"); value never stored in this file -->
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+
+  <DTS:PackageParameters>
+    <DTS:PackageParameter DTS:ObjectName="InvestorCode" DTS:DataType="8" DTS:Required="True" />
+  </DTS:PackageParameters>
+  <!-- Project.params: FtpUser (String), FtpPassword (String, Sensitive=True), RateServiceUrl (String) -->
+
+  <DTS:Variables>
+    <DTS:Variable DTS:Namespace="User" DTS:ObjectName="FileDate" DTS:DataType="8"
+      DTS:EvaluateAsExpression="True"
+      DTS:Expression="(DT_WSTR,4)YEAR(GETDATE()) + RIGHT(&quot;0&quot; + (DT_WSTR,2)MONTH(GETDATE()),2) + RIGHT(&quot;0&quot; + (DT_WSTR,2)DAY(GETDATE()),2)" />
+  </DTS:Variables>
+
+  <DTS:Executables>
+    <DTS:Executable DTS:refId="Package\DFT Export investor file" DTS:ObjectName="DFT Export investor file"
+      DTS:ExecutableType="Microsoft.Pipeline">
+      <DTS:ObjectData>
+        <pipeline version="1">
+          <components>
+
+            <component refId="Package\DFT Export investor file\SRC loans" componentClassID="Microsoft.OLEDBSource" name="SRC loans">
+              <properties>
+                <property name="AccessMode">2</property>
+                <property name="SqlCommand">SELECT l.loan_number, l.borrower_name, l.current_upb, l.interest_rate, l.rate_index_code,
+       i.investor_code, i.culture_name
+FROM dbo.loans l
+JOIN dbo.investors i ON i.investor_id = l.investor_id
+WHERE l.loan_status = 'AC' AND i.investor_code = ?</property>
+                <property name="ParameterMapping">"Parameter0:Input",{$Package::InvestorCode};</property>
+              </properties>
+              <connections><connection connectionManagerRefId="Package.ConnectionManagers[OLTP_LoanServicing]" /></connections>
+            </component>
+
+            <!-- ===================== HAND-CONVERT ===================== -->
+            <component refId="Package\DFT Export investor file\SCR Format and enrich"
+                       componentClassID="Microsoft.ManagedComponentHost" name="SCR Format and enrich"
+                       description="HAND-CONVERT: C# Script Component, transformation, synchronous output">
+              <properties>
+                <property name="UserComponentTypeName">Microsoft.SqlServer.Dts.Pipeline.ScriptComponentHost</property>
+                <property name="ReadOnlyVariables">$Project::RateServiceUrl</property>
+                <property name="ScriptLanguage">Microsoft Visual C# 2019</property>
+                <property name="SourceCode" description="abridged"><![CDATA[
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Net.Http;
+
+public class ScriptMain : UserComponent
+{
+    private static readonly HttpClient http = new HttpClient();
+    private readonly Dictionary<string, decimal> rateCache = new Dictionary<string, decimal>();
+
+    public override void Input0_ProcessInputRow(Input0Buffer Row)
+    {
+        // (A) culture-specific number formatting: pure expression, but culture-dependent
+        var ci = CultureInfo.GetCultureInfo(Row.culture_name);          // e.g. "de-DE" -> 1.234.567,89
+        Row.upb_formatted  = Row.current_upb.ToString("N2", ci);
+        Row.rate_formatted = (Row.interest_rate / 100m).ToString("P3", ci);
+
+        // (B) custom check digit over loan_number: pure expression (Luhn variant, weights 3-1)
+        int sum = 0; bool odd = true;
+        for (int i = Row.loan_number.Length - 1; i >= 0; i--)
+        {
+            if (!char.IsDigit(Row.loan_number[i])) continue;
+            int d = Row.loan_number[i] - '0';
+            sum += odd ? d * 3 : d;
+            odd = !odd;
+        }
+        Row.check_digit = ((10 - (sum % 10)) % 10).ToString();
+
+        // (C) per-row external API call with in-memory cache: external side effect
+        if (!rateCache.TryGetValue(Row.rate_index_code, out var idx))
+        {
+            var url = Variables.RateServiceUrl + "/index/" + Row.rate_index_code;
+            var body = http.GetStringAsync(url).GetAwaiter().GetResult();
+            idx = decimal.Parse(body, CultureInfo.InvariantCulture);
+            rateCache[Row.rate_index_code] = idx;
+        }
+        Row.index_rate = idx.ToString("F4", CultureInfo.InvariantCulture);
+
+        // (D) row-level rejection: rows with UPB <= 0 are silently dropped (no error output configured)
+        if (Row.current_upb <= 0) Row.DirectRowToOutput0_Skip();   // pseudo: DirectRow to an unused output
+    }
+}
+]]></property>
+              </properties>
+              <outputs>
+                <output name="Output 0" synchronousInputId="Package\DFT Export investor file\SCR Format and enrich.Inputs[Input 0]">
+                  <outputColumns>
+                    <outputColumn name="upb_formatted"  dataType="wstr" length="18" />
+                    <outputColumn name="rate_formatted" dataType="wstr" length="8" />
+                    <outputColumn name="index_rate"     dataType="wstr" length="8" />
+                    <outputColumn name="check_digit"    dataType="wstr" length="1" />
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+            <!-- ======================================================== -->
+
+            <component refId="Package\DFT Export investor file\DST investor file" componentClassID="Microsoft.FlatFileDestination" name="DST investor file">
+              <properties>
+                <property name="Overwrite">true</property>
+                <property name="Header"></property>
+              </properties>
+              <connections><connection connectionManagerRefId="Package.ConnectionManagers[FF_InvestorExport]" /></connections>
+            </component>
+          </components>
+
+          <paths>
+            <path startId="Package\DFT Export investor file\SRC loans.Outputs[OLE DB Source Output]"
+                  endId="Package\DFT Export investor file\SCR Format and enrich.Inputs[Input 0]" />
+            <path startId="Package\DFT Export investor file\SCR Format and enrich.Outputs[Output 0]"
+                  endId="Package\DFT Export investor file\DST investor file.Inputs[Flat File Destination Input]" />
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <DTS:Executable DTS:refId="Package\FTP Upload investor file" DTS:ObjectName="FTP Upload investor file"
+      DTS:ExecutableType="Microsoft.FtpTask">
+      <DTS:ObjectData>
+        <FtpData Connection="Package.ConnectionManagers[FTP_Investor]" Operation="Send"
+                 LocalPath="Package.ConnectionManagers[FF_InvestorExport]" RemotePath="/inbound" OverwriteDestination="True" />
+      </DTS:ObjectData>
+    </DTS:Executable>
+  </DTS:Executables>
+
+  <DTS:PrecedenceConstraints>
+    <DTS:PrecedenceConstraint DTS:From="Package\DFT Export investor file" DTS:To="Package\FTP Upload investor file"
+      DTS:Value="0" DTS:EvalOp="1" DTS:LogicalAnd="True" />
+  </DTS:PrecedenceConstraints>
+</DTS:Executable>
