@@ -76,79 +76,89 @@ def sq_plcymstr_daily():
     )
 
 
-@dp.temporary_view()
-def exp_policy_dates():
+# The three Expression transformations are row-preserving (one output row per input row, no grain change). They are
+# therefore evaluated as column derivations on the SAME source row below, never as separate views re-joined on
+# PLCY_POLICY_NO: the file has no declared unique key, and a repeated policy number would multiply rows through such a
+# join where the legacy pipeline kept exactly one output row per input row (SKILL.md section 5 rows 69-70; ex05 NOTE).
+
+
+def exp_policy_dates(df):
     # EXP_POLICY_DATES: Julian YYDDD, Y2K window 00-49 => 20xx (pivot 49 is the mapping's rule; the actuarial SAS
     # macro uses 50: keep 49 here, record the disagreement as an estate finding, not a conversion choice).
     # TO_INTEGER(SUBSTR(...)) rounds in Informatica; on a 2-digit numeric text the result equals CAST, and a
     # non-numeric value would be 0 in Informatica (SKILL.md section 5 row 14) -> made explicit with coalesce.
-    src = spark.read.table("sq_plcymstr_daily")
     yy = F.coalesce(F.expr("try_cast(substr(PLCY_INCEPT_DT_JUL, 1, 2) AS INT)"), F.lit(0))
     ddd = F.coalesce(F.expr("try_cast(substr(PLCY_INCEPT_DT_JUL, 3, 3) AS INT)"), F.lit(0))
     v_year = F.when(yy <= 49, 2000 + yy).otherwise(1900 + yy)
     # ADD_TO_DATE(TO_DATE(TO_CHAR(v_YEAR)||'0101','YYYYMMDD'),'DD', ddd - 1)  (rows 9, 21)
     out_inception_dt = F.date_add(F.to_date(F.concat(v_year.cast("string"), F.lit("0101")), "yyyyMMdd"), ddd - 1)
-    return src.select("PLCY_POLICY_NO", out_inception_dt.alias("out_INCEPTION_DT"))
+    return df.withColumn("out_INCEPTION_DT", out_inception_dt)
 
 
-@dp.temporary_view()
-def exp_postcode_dq():
+def exp_postcode_dq(df):
     # EXP_POSTCODE_DQ (DQR-014 variant A): insert a space before the final 3 chars when absent and len >= 5,
     # UPPER, then REG_MATCH -> RLIKE (row 42). LENGTH/INSTR/LTRIM/RTRIM are identical (rows 31, 35, 36).
-    src = spark.read.table("sq_plcymstr_daily").withColumn("pc", F.trim(F.col("PLCY_POSTCODE")))
     # LTRIM(RTRIM(x)) trims spaces only, same as trim(); SUBSTR with a computed start/len keeps 1-based semantics.
+    pc = F.trim(F.col("PLCY_POSTCODE"))
     v_pc_std = F.when(
-        (F.locate(" ", F.col("pc")) == 0) & (F.length("pc") >= 5),
-        F.concat(F.expr("substr(pc, 1, length(pc) - 3)"), F.lit(" "), F.expr("substr(pc, length(pc) - 2, 3)")),
-    ).otherwise(F.upper(F.col("pc")))
+        (F.locate(" ", pc) == 0) & (F.length(pc) >= 5),
+        F.concat(pc.substr(F.lit(1), F.length(pc) - 3), F.lit(" "), pc.substr(F.length(pc) - 2, F.lit(3))),
+    ).otherwise(F.upper(pc))
     out_postcode_std = F.upper(v_pc_std)
     out_postcode_dq_status = F.when(
         out_postcode_std.rlike(r"^[A-Z]{1,2}[0-9][A-Z0-9]? [0-9][A-Z]{2}$"), "VALID"
     ).otherwise("INVALID")
-    return src.select("PLCY_POLICY_NO", out_postcode_std.alias("out_POSTCODE_STD"),
-                      out_postcode_dq_status.alias("out_POSTCODE_DQ_STATUS"))
+    return (df.withColumn("out_POSTCODE_STD", out_postcode_std)
+              .withColumn("out_POSTCODE_DQ_STATUS", out_postcode_dq_status))
+
+
+def exp_policy_flags(df):
+    # EXP_POLICY_FLAGS
+    return df.withColumn("out_ACTIVE_POLICY_FLAG", F.when(F.col("PLCY_STATUS").isin("IF", "RN"), "Y").otherwise("N"))
 
 
 @dp.temporary_view()
 def lkp_xref_client_party():
     # LKP_XREF_CLIENT_PARTY: connected, static cache, 'Lookup policy on multiple match = Use First Value'.
     # Cache build order is not in the export: ORDER BY below is INFERRED and must be recorded in the unit brief
-    # (SKILL.md section 5 row 74; trap 9).
+    # (SKILL.md section 5 row 74; trap 9). row_number() = 1 guarantees one lookup row per CLIENT_NO, so the join
+    # below cannot multiply source rows.
     xref = spark.read.table(XREF_TABLE)
     w = Window.partitionBy("CLIENT_NO").orderBy(F.col("PARTY_ID"))  # INFERRED order
     return xref.withColumn("rn", F.row_number().over(w)).filter("rn = 1").select("CLIENT_NO", "PARTY_ID")
 
 
-@dp.materialized_view(name="stg_policy_master", comment="m_POLICY_MASTER_DAILY converted; grain = POLICY_NO")
+@dp.materialized_view(name="stg_policy_master", comment="m_POLICY_MASTER_DAILY converted; one row per PLCYMSTR line")
 @dp.expect_or_drop("policy_no_present", "POLICY_NO IS NOT NULL")          # NOTNULL flat-file field -> row error legacy
 @dp.expect("postcode_valid", "POSTCODE_DQ_STATUS = 'VALID'")              # DQ status was a column, not a reject: warn only
 def stg_policy_master():
     src = spark.read.table("sq_plcymstr_daily")
-    dates = spark.read.table("exp_policy_dates")
-    pc = spark.read.table("exp_postcode_dq")
     xref = spark.read.table("lkp_xref_client_party")
 
-    active_flag = F.when(F.col("PLCY_STATUS").isin("IF", "RN"), "Y").otherwise("N")   # EXP_POLICY_FLAGS
+    # SQ -> EXP_POLICY_DATES / EXP_POSTCODE_DQ / EXP_POLICY_FLAGS all fan out from the same SQ row and fan back into
+    # one target row: one transformation chain over `src`, input cardinality preserved. The legacy target's key
+    # handling (Teradata STG_POLICY_MASTER, load type not exported) decides whether duplicate policy numbers survive;
+    # that is the target's behaviour, recorded in NOTE.md, not something the Expressions may change.
+    derived = exp_policy_flags(exp_postcode_dq(exp_policy_dates(src)))
+
     # PICTURETEXT 9(09)V99 implied decimals: legacy carried the field as string(11); target ANNUAL_PREMIUM_GBP is
     # decimal(12,2). The export has no CONNECTOR for this column (see NOTE.md), so the scaling below is INFERRED.
     annual_premium_gbp = (F.expr("try_cast(PLCY_ANNL_PREM AS DECIMAL(11,0))") / 100).cast("decimal(12,2)")
 
     return (
-        src.join(dates, "PLCY_POLICY_NO", "left")
-           .join(pc, "PLCY_POLICY_NO", "left")
-           .join(xref, src.PLCY_CLIENT_NO.cast("decimal(10,0)") == xref.CLIENT_NO, "left")  # decimal(10,0) lookup port
-           .select(
-               F.col("PLCY_POLICY_NO").alias("POLICY_NO"),
-               F.col("PARTY_ID"),                                     # NULL when unmatched (~12%/day per DESCRIPTION)
-               F.col("PLCY_CLIENT_NO").alias("CLIENT_NO"),
-               F.col("PLCY_PRODUCT_CD").alias("PRODUCT_CD"),
-               F.col("out_INCEPTION_DT").alias("INCEPTION_DT"),
-               annual_premium_gbp.alias("ANNUAL_PREMIUM_GBP"),
-               F.col("PLCY_STATUS").alias("POLICY_STATUS"),
-               F.col("out_POSTCODE_STD").alias("POSTCODE_STD"),
-               F.col("out_POSTCODE_DQ_STATUS").alias("POSTCODE_DQ_STATUS"),
-               active_flag.alias("ACTIVE_POLICY_FLAG"),
-               F.col("RUNDATE"),                                      # the day this row was loaded from ($$RUNDATE)
-               F.current_timestamp().alias("LOAD_TS"),                # audit column: excluded from Tier 3
-           )
+        derived.join(xref, derived.PLCY_CLIENT_NO.cast("decimal(10,0)") == xref.CLIENT_NO, "left")  # decimal(10,0) lookup port
+               .select(
+                   F.col("PLCY_POLICY_NO").alias("POLICY_NO"),
+                   F.col("PARTY_ID"),                                     # NULL when unmatched (~12%/day per DESCRIPTION)
+                   F.col("PLCY_CLIENT_NO").alias("CLIENT_NO"),
+                   F.col("PLCY_PRODUCT_CD").alias("PRODUCT_CD"),
+                   F.col("out_INCEPTION_DT").alias("INCEPTION_DT"),
+                   annual_premium_gbp.alias("ANNUAL_PREMIUM_GBP"),
+                   F.col("PLCY_STATUS").alias("POLICY_STATUS"),
+                   F.col("out_POSTCODE_STD").alias("POSTCODE_STD"),
+                   F.col("out_POSTCODE_DQ_STATUS").alias("POSTCODE_DQ_STATUS"),
+                   F.col("out_ACTIVE_POLICY_FLAG").alias("ACTIVE_POLICY_FLAG"),
+                   F.col("RUNDATE"),                                      # the day this row was loaded from ($$RUNDATE)
+                   F.current_timestamp().alias("LOAD_TS"),                # audit column: excluded from Tier 3
+               )
     )
