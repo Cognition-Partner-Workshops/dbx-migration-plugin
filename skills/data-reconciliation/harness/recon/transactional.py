@@ -10,11 +10,14 @@ never still, so this mode adds what a set-based diff cannot say:
                                with neither a pinned snapshot nor an engine change token makes
                                the run ineligible for merge unless the tolerances accept that
   tier 5  pk_set_diff          key-range fingerprints on both sides (one statement each: count,
-                               exact key sums, watermark sum), then the keys and watermarks of
-                               every range whose fingerprint differs; a swapped key or a moved
-                               watermark is caught even when the counts agree. Missing keys
-                               whose source watermark is newer than the target's applied
-                               watermark are in flight, not defects
+                               exact key sums and modular sums of squares, the same for the
+                               watermark), then the keys and watermarks of every range whose
+                               fingerprint differs; a swapped key or a moved watermark is caught
+                               even when the counts agree. Missing keys whose source watermark
+                               is newer than the target's applied watermark are in flight, not
+                               defects. The allowance never covers a target-only key: a deleted
+                               source row leaves no watermark to date the delete by, so deletes
+                               must be drained before the run and every extra key is a finding
   tier 6  cdc_lag_ordering     max(source watermark) - max(target watermark) against the
                                tolerance, plus the per-key ordering that tier 5 streamed: a
                                target row ahead of its source row is a replay/ordering
@@ -202,14 +205,18 @@ def close_window(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
 
 
 def _ranges(source: StratifiedKeys, c: ObjectMapping, n: int, tol: Tolerances) -> list[tuple]:
-    """Source key strata plus two open-ended edge ranges, so target keys below the first or
-    above the last source key are counted too. Edges overlap their neighbouring stratum by one
-    key on both sides alike; the set diff dedupes any key seen twice."""
+    """Contiguous key ranges built from the source strata: each range runs from the previous
+    stratum's last key to this stratum's last key, plus two open-ended edges below the first
+    and above the last source key. Strata alone would leave the gaps between them uncovered,
+    and a target key living in a gap (a source row deleted since, or a stray insert) must be
+    counted. Neighbouring ranges share their boundary key on both sides alike; the set diff
+    dedupes any key seen twice."""
     n_strata = max(1, min(tol.pk_set_ranges, n))
     strata = source.key_strata(c.root_table, c.key_source, n_strata, c.root_where)
     if not strata:
         return []
-    return [(None, strata[0].lo)] + [(s.lo, s.hi) for s in strata] + [(strata[-1].hi, None)]
+    inner = [(strata[i - 1].hi if i else s.lo, s.hi) for i, s in enumerate(strata)]
+    return [(None, strata[0].lo)] + inner + [(strata[-1].hi, None)]
 
 
 def _kind(value: Any) -> str:
@@ -233,12 +240,14 @@ def _fingerprint_complete(fps: list[tuple], nk: int, watermark: bool) -> bool:
 def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                  source, target) -> TierResult:
     """Full primary-key set comparison at range granularity. Both sides fingerprint every range
-    in one statement (count, exact sum per key column, sum of the watermark as epoch
-    microseconds); only ranges whose fingerprints differ stream their keys and watermarks, which
-    is where missing/extra keys and per-row ordering are graded. Keys or watermarks with no
-    portable digest (strings, uuids) stream every range instead, so the comparison stays
-    complete at the cost of the extra fetch. Cost: strata + one fingerprint statement per side
-    per table, plus one fetch per side per streamed range."""
+    in one statement (count, then exact sum and modular sum of squares per key column and for
+    the watermark as epoch microseconds); only ranges whose fingerprints differ stream their
+    keys and watermarks, which is where missing/extra keys and per-row ordering are graded. Two
+    moments make any one- or two-row difference inside a range visible; a three-or-more-row
+    substitution engineered to preserve both is the residual blind spot, and
+    `pk_set_stream_every_range` removes it by streaming everything. Keys or watermarks with no
+    portable digest (strings, uuids) stream every range as well. Cost: strata + one fingerprint
+    statement per side per table, plus one fetch per side per streamed range."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
     for c in spec.objects:
@@ -262,15 +271,23 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         key_kinds = [_kind(v) for v in first] if len(first) == nk else ["other"] * nk
         s_open_wm = ctx.open_markers[c.object][0][1] if has_wm else None
         wm_kind = _kind(s_open_wm) if has_wm and s_open_wm is not None else None
-        s_fps = source.range_fingerprints(c.root_table, c.key_source, key_kinds, c.watermark_source,
-                                          wm_kind, ranges, c.root_where)
-        t_fps = target.range_fingerprints(c.object, c.key_target, key_kinds, c.watermark_target,
-                                          wm_kind, ranges, c.target_where)
-        complete = _fingerprint_complete(s_fps, nk, has_wm) and _fingerprint_complete(t_fps, nk, has_wm)
-        if complete:
-            streamed_ranges = [i for i, (a, b) in enumerate(zip(s_fps, t_fps)) if a != b]
-        else:
+        complete = False
+        if tol.pk_set_stream_every_range:
+            fingerprint = "not used: every range streamed (pk_set_stream_every_range)"
             streamed_ranges = list(range(len(ranges)))
+        else:
+            s_fps = source.range_fingerprints(c.root_table, c.key_source, key_kinds,
+                                              c.watermark_source, wm_kind, ranges, c.root_where)
+            t_fps = target.range_fingerprints(c.object, c.key_target, key_kinds, c.watermark_target,
+                                              wm_kind, ranges, c.target_where)
+            complete = (_fingerprint_complete(s_fps, nk, has_wm)
+                        and _fingerprint_complete(t_fps, nk, has_wm))
+            if complete:
+                fingerprint = "count+key_sum+key_sumsq" + ("+watermark_sum+watermark_sumsq" if has_wm else "")
+                streamed_ranges = [i for i, (a, b) in enumerate(zip(s_fps, t_fps)) if a != b]
+            else:
+                fingerprint = "unavailable: every range streamed"
+                streamed_ranges = list(range(len(ranges)))
         s_wm_cols = [c.watermark_source] if has_wm else []
         t_wm_cols = [c.watermark_target] if has_wm else []
         hwm = ctx.hwm(c)
@@ -314,9 +331,7 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         diff.missing, diff.extra, diff.in_flight_missing = missing_l, extra_l, len(in_flight_missing)
         diff.in_flight_updates = len(in_flight_updates)
         diff.ahead, diff.behind = sorted(ahead, key=repr), sorted(behind, key=repr)
-        stats[c.object] = {"ranges": len(ranges), "population": n,
-                           "fingerprint": "count+key_sum" + ("+watermark_sum" if has_wm else "")
-                           if complete else "unavailable: every range streamed",
+        stats[c.object] = {"ranges": len(ranges), "population": n, "fingerprint": fingerprint,
                            "mismatched_ranges": len(streamed_ranges), "keys_streamed": streamed,
                            "missing_on_target": len(missing_l), "extra_on_target": len(extra_l),
                            "in_flight_missing": len(in_flight_missing),
@@ -330,8 +345,9 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                                     f"{missing_l[:MAX_KEYS_IN_FINDING]}"))
         if extra_l:
             findings.append(Finding(c.object, "pk_extra_on_target",
-                                    f"{len(extra_l)} target keys absent on source (unapplied deletes "
-                                    f"or stray writes); first {min(len(extra_l), MAX_KEYS_IN_FINDING)}: "
+                                    f"{len(extra_l)} target keys absent on source (undrained deletes "
+                                    f"or stray writes; no tombstone evidence to tell them apart); "
+                                    f"first {min(len(extra_l), MAX_KEYS_IN_FINDING)}: "
                                     f"{extra_l[:MAX_KEYS_IN_FINDING]}"))
     return TierResult(5, "pk_set_diff", not findings, checks, findings, stats)
 
@@ -460,6 +476,10 @@ def tier7_schema_parity(spec: MappingSpec, source, target) -> TierResult:
             findings.append(Finding(c.object, "check_constraint_count_lower",
                                     f"source {s.check_count} CHECK constraints, target {t.check_count}",
                                     s.check_count, t.check_count))
+        for idx in sorted(s.partial):
+            stats.setdefault("partial_indexes_unverified", []).append(
+                f"{c.object}: source filtered index {idx} carries a predicate the harness cannot "
+                f"translate; confirm its target counterpart by hand")
         seq_note = None
         if c.identity_source and c.identity_target:
             checks += 1
@@ -492,4 +512,5 @@ def _facts_dict(f: SchemaFacts) -> dict:
     return {"primary_key": list(f.primary_key), "unique": sorted(map(list, f.unique)),
             "foreign_keys": sorted([list(c), r, list(rc)] for c, r, rc in f.foreign_keys),
             "not_null": sorted(f.not_null), "indexes": sorted(map(list, f.indexes)),
-            "check_count": f.check_count, "identity_columns": sorted(f.identity_columns)}
+            "check_count": f.check_count, "identity_columns": sorted(f.identity_columns),
+            "partial": sorted(map(list, f.partial))}

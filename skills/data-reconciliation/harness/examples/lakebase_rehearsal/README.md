@@ -43,9 +43,11 @@ by updating a row from another connection mid-window: marker unchanged inside, v
 close); source `none` because the fixture database has `ALLOW_SNAPSHOT_ISOLATION OFF`, so the
 adapter reset to `READ COMMITTED`; its window strength is `change_token` (the
 `sys.dm_db_index_usage_stats.user_updates` counter is readable with the fixture login and sits
-in the marker as the third element, `880 -> 880` on `loans`). Tier 5 fingerprints matched on
-all 18 ranges of every table across engines (`DATEDIFF_BIG` microseconds vs `EXTRACT(EPOCH)`
-microseconds), so no keys streamed on the clean run.
+in the marker as the third element, `880 -> 880` on `loans`). Tier 5 fingerprints (count, sum
+and modular sum of squares per key column and for the watermark) matched on all 18 ranges of
+every table across engines (`DATEDIFF_BIG` microseconds vs `EXTRACT(EPOCH)` microseconds; T-SQL
+`%` vs Postgres `MOD()`), so no keys streamed on the clean run. `--target-catalog` was the
+connected database name; pointing it at another name is refused before any query runs.
 
 Rehearsal A (`inject_target_defects.sql`): `FAIL`. Tier 1 count gaps on `payments`/`escrow_accounts`;
 tier 5 `pk_missing_on_target [(10,), (11,)]` and `pk_extra_on_target [(999999,)]`; tier 6
@@ -62,6 +64,10 @@ the tier 6 lag check pass (every count and max watermark unchanged). Tier 5 `pk_
 [(500,)]` and `pk_extra_on_target [(2989,)]` on `payments` from 2 mismatched ranges (376 keys
 streamed of 2988); tier 6 `row_ahead_of_source [(7,)]` on `loans` from 1 mismatched range while
 `lag_s = 0.0`.
+
+Every `pk_extra_on_target` above is graded as a defect: the harness has no tombstone or
+CDC-position evidence, so an undrained source delete and a stray target write look the same
+and the run must start after deletes are drained.
 
 ## Not proven here
 

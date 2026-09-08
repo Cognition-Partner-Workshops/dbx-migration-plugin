@@ -231,11 +231,21 @@ def main(argv: list[str] | None = None) -> int:
                     f"ops entry missing required keys: {op.get('name', '?')}")
             for key in ("source_sql", "target_sql"):
                 _validate_sql(op[key], op.get("name", "?"))
-    from .adapters import SOURCE_ADAPTERS, DatabricksTargetAdapter, LakebaseTargetAdapter
+    from .adapters import (
+        SOURCE_ADAPTERS,
+        DatabricksTargetAdapter,
+        LakebaseTargetAdapter,
+        TargetIdentityError,
+    )
 
     source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
     if args.target_kind == "lakebase":
-        target = LakebaseTargetAdapter(args.target_secret, target_schema)
+        # --target-catalog names the Lakebase database; the adapter refuses a DSN that lands
+        # anywhere else, so the allowlist binds the connection and not just the label
+        try:
+            target = LakebaseTargetAdapter(args.target_secret, target_catalog, target_schema)
+        except TargetIdentityError as exc:
+            raise SystemExit(str(exc)) from None
     else:
         target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None

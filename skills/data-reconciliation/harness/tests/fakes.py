@@ -6,11 +6,11 @@ import datetime
 import datetime as dt
 import json
 import decimal
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from collections import Counter
 from typing import Any, Iterable
 
-from recon.adapters import SchemaFacts, Stratum
+from recon.adapters import DIGEST_MODULUS, SchemaFacts, Stratum
 from recon.paths import get_path
 from recon.canon import MISSING
 
@@ -128,6 +128,16 @@ class _TransactionalMixin:
             return Decimal((value - dt.date(1970, 1, 1)).days * 86_400_000_000)
         return None
 
+    @classmethod
+    def _moments(cls, values) -> tuple[Decimal, int]:
+        digests = [cls._digest(v) or Decimal(0) for v in values]
+        squares = 0
+        for d in digests:
+            whole = int(d.to_integral_value(rounding=ROUND_HALF_UP))
+            residue = abs(whole) % DIGEST_MODULUS  # sign vanishes in the square anyway
+            squares += residue * residue
+        return sum(digests, Decimal(0)), squares
+
     def range_fingerprints(self, table, key_cols, key_kinds, watermark, wm_kind, ranges,
                            where=None) -> list[tuple]:
         self.calls["range_fingerprints"] += 1
@@ -142,12 +152,11 @@ class _TransactionalMixin:
             lo = lo if lo is None or isinstance(lo, tuple) else (lo,)
             hi = hi if hi is None or isinstance(hi, tuple) else (hi,)
             hit = [(k, wm) for k, wm in keyed if (lo is None or k >= lo) and (hi is None or k <= hi)]
-            key_sum = None
+            keys = None
             if digestible_keys:
-                key_sum = tuple(sum((self._digest(k[i]) or 0 for k, _ in hit), Decimal(0))
-                                for i in range(len(key_cols)))
-            wm_sum = sum((self._digest(wm) or 0 for _, wm in hit), Decimal(0)) if digest_wm else None
-            out.append((len(hit), key_sum, wm_sum))
+                keys = tuple(self._moments(k[i] for k, _ in hit) for i in range(len(key_cols)))
+            wm = self._moments(wm for _, wm in hit) if digest_wm else None
+            out.append((len(hit), keys, wm))
         return out
 
     def keys_in_range(self, table, key_cols, lo, hi, where=None, extra_cols=None) -> list[tuple]:

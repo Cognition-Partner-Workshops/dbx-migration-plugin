@@ -5,10 +5,23 @@ import json
 
 import pytest
 
-from recon.adapters import SchemaFacts
+from recon.adapters import (
+    SOURCE_ADAPTERS,
+    LakebaseTargetAdapter,
+    SchemaFacts,
+    TargetIdentityError,
+)
 from recon.cli import main
-from recon.config import (CanonRule, ConfigError, FieldMapping, MappingSpec, ObjectMapping,
-                          Tolerances, load_mapping_spec)
+from recon.config import (
+    CanonRule,
+    ConfigError,
+    FieldMapping,
+    MappingSpec,
+    ObjectMapping,
+    Tolerances,
+    load_mapping_spec,
+    load_tolerances,
+)
 from recon.cost import estimate_cost
 from recon.engine import MODES, PLANNED_MODES, run_recon
 from recon.report import render_summary
@@ -151,7 +164,7 @@ def test_pk_set_diff_reports_missing_and_extra_keys_only_for_mismatched_ranges()
     # only the mismatched ranges streamed keys, never the whole table
     assert stats["keys_streamed"] < 2 * len(loans)
     assert source.calls["range_fingerprints"] == 2 and target.calls["range_fingerprints"] == 2
-    assert stats["fingerprint"] == "count+key_sum+watermark_sum"
+    assert stats["fingerprint"] == "count+key_sum+key_sumsq+watermark_sum+watermark_sumsq"
 
 
 def test_a_key_swapped_for_another_in_the_same_range_is_caught_when_counts_agree():
@@ -170,6 +183,84 @@ def test_a_key_swapped_for_another_in_the_same_range_is_caught_when_counts_agree
     stats = pk["stats"]["loans"]
     assert stats["mismatched_ranges"] == 1 and stats["keys_streamed"] < len(loans)
     assert _tier(result, "counts_through_mapping")["passed"] is True  # counts alone saw nothing
+
+
+def test_two_keys_traded_for_two_with_the_same_sum_are_caught():
+    # source keys 14 and 18 are replaced on the target by 15 and 17 inside the same stratum
+    # (12..20): same count, same key sum, same watermarks; only the second moment (sum of
+    # squares) tells them apart
+    _, borrowers = _rows()
+    loans = [_loan(2 * i, changed=i, borrower_id=1 + i % 3) for i in range(1, 41)]  # even keys
+    tgt = [dict(r) for r in loans if r["loan_id"] not in (14, 18)]
+    tgt.append(_loan(15, changed=7, borrower_id=1))
+    tgt.append(_loan(17, changed=9, borrower_id=1))
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, sample_size=2), depth="sampled")
+    assert result["verdict"] == "FAIL"
+    pk = _tier(result, "pk_set_diff")
+    assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
+    assert "(14,)" in pk["findings"][0]["detail"] and "(18,)" in pk["findings"][0]["detail"]
+    assert "(15,)" in pk["findings"][1]["detail"] and "(17,)" in pk["findings"][1]["detail"]
+    stats = pk["stats"]["loans"]
+    assert 0 < stats["mismatched_ranges"] < stats["ranges"]
+    assert _tier(result, "counts_through_mapping")["passed"] is True
+
+
+def test_two_watermarks_moved_in_opposite_directions_are_caught():
+    # loan 6 applied a second late, loan 8 a second early: the watermark total of the range is
+    # unchanged, its sum of squares is not, so both rows are streamed and graded
+    loans, borrowers = _rows(40)
+    tgt = [dict(r) for r in loans]
+    tgt[5]["modified_date"] = _ts(7)
+    tgt[7]["modified_date"] = _ts(7)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, sample_size=2), depth="sampled")
+    assert result["verdict"] == "FAIL"
+    cdc = _tier(result, "cdc_lag_ordering")
+    codes = {f["check"]: f["detail"] for f in cdc["findings"]}
+    assert "(6,)" in codes["row_ahead_of_source"] and "(8,)" in codes["row_behind_applied_watermark"]
+
+
+def test_an_undrained_source_delete_fails_counts_and_pk_set_even_with_generous_lag():
+    # loan 3 was deleted on the source after the target applied it; the target has also applied
+    # newer rows, so nothing about the extra row says "pending delete" rather than "stray write"
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    del loans[2]
+    source, target = _sides(loans, tgt, borrowers, src_seq=13, tgt_seq=13)
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=3600))
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    assert _codes(result, "counts_through_mapping") == ["root_count"]
+    pk = _tier(result, "pk_set_diff")
+    assert [f["check"] for f in pk["findings"]] == ["pk_extra_on_target"]
+    assert "(3,)" in pk["findings"][0]["detail"] and "undrained deletes" in pk["findings"][0]["detail"]
+    assert pk["stats"]["loans"]["in_flight_missing"] == 0
+
+
+def test_a_stray_target_key_between_two_source_strata_is_counted():
+    # source keys are the even numbers; strata of 5 keys end at 10, 20, ...; a target-only key
+    # 11 lies in the gap between the stratum ending at 10 and the one starting at 12
+    _, borrowers = _rows()
+    loans = [_loan(2 * i, changed=i, borrower_id=1 + i % 3) for i in range(1, 41)]
+    tgt = [dict(r) for r in loans] + [_loan(11, changed=5, borrower_id=1)]
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, cdc_lag_max_s=3600))
+    pk = _tier(result, "pk_set_diff")
+    assert [f["check"] for f in pk["findings"]] == ["pk_extra_on_target"]
+    assert "(11,)" in pk["findings"][0]["detail"]
+    assert pk["stats"]["loans"]["mismatched_ranges"] == 1
+
+
+def test_pk_set_stream_every_range_skips_fingerprints_and_streams_everything():
+    loans, borrowers = _rows(40)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, pk_set_stream_every_range=True))
+    assert result["verdict"] == "PASS", result
+    stats = _tier(result, "pk_set_diff")["stats"]["loans"]
+    assert stats["fingerprint"] == "not used: every range streamed (pk_set_stream_every_range)"
+    assert stats["mismatched_ranges"] == stats["ranges"]
+    assert stats["keys_streamed"] >= 2 * len(loans)
+    assert source.calls["range_fingerprints"] == 0 and target.calls["range_fingerprints"] == 0
 
 
 def test_in_flight_rows_are_not_defects_when_lag_is_tolerated():
@@ -330,6 +421,25 @@ def test_marker_only_window_is_accepted_only_by_a_recorded_tolerance():
     assert window["stats"]["accepted_marker_only"] == ["source"]
 
 
+@pytest.mark.parametrize("flag", ["accept_marker_only_window", "pk_set_stream_every_range"])
+@pytest.mark.parametrize("value", ["false", "true", "no", 0, 1, None, [], {}])
+def test_tolerance_switches_must_be_json_booleans(tmp_path, flag, value):
+    path = tmp_path / "tol.json"
+    path.write_text(json.dumps({"version": "t1", flag: value}))
+    with pytest.raises(ConfigError, match=f"{flag} must be a JSON boolean"):
+        load_tolerances(path)
+
+
+def test_tolerance_switches_load_real_booleans_and_default_off(tmp_path):
+    path = tmp_path / "tol.json"
+    path.write_text(json.dumps({"version": "t1", "accept_marker_only_window": True}))
+    tol = load_tolerances(path)
+    assert tol.accept_marker_only_window is True and tol.pk_set_stream_every_range is False
+    path.write_text(json.dumps({"version": "t1"}))
+    tol = load_tolerances(path)
+    assert tol.accept_marker_only_window is False and tol.pk_set_stream_every_range is False
+
+
 def _tokened(source, counter):
     """A marker-fallback source whose engine exposes a per-table write counter."""
     source.pin = "none"
@@ -479,6 +589,23 @@ def test_index_covered_by_a_longer_target_index_is_parity():
     assert facts["target"]["indexes"] == [["borrower_id"], ["loan_status", "days_past_due", "loan_id"]]
 
 
+def test_source_filtered_indexes_are_reported_for_a_manual_check_not_graded():
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    source.schema["dbo.loans"] = SchemaFacts(
+        primary_key=LOANS_FACTS.primary_key, unique=set(LOANS_FACTS.unique),
+        foreign_keys=set(LOANS_FACTS.foreign_keys), not_null=set(LOANS_FACTS.not_null),
+        indexes=set(LOANS_FACTS.indexes), check_count=2, identity_columns={"loan_id"},
+        partial={("days_past_due",)})
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == []
+    parity = _tier(result, "schema_parity")
+    assert parity["stats"]["partial_indexes_unverified"] == [
+        ("loans: source filtered index ('days_past_due',) carries a predicate the harness cannot "
+         "translate; confirm its target counterpart by hand")]
+    assert parity["stats"]["loans"]["source"]["partial"] == [["days_past_due"]]
+
+
 def test_primary_key_mismatch_is_reported():
     loans, borrowers = _rows(6)
     facts = SchemaFacts(primary_key=("loan_number",), unique={("loan_number",)},
@@ -603,6 +730,61 @@ def test_cli_refuses_transactional_mode_against_a_delta_target(tmp_path, monkeyp
               "--target-catalog", "mig", "--target-schema", "s", "--out", "o"])
     msg = str(exc.value)
     assert "transactional" in msg and "lakebase" in msg and "not implemented" in msg
+
+
+class _Conn:
+    """Minimal DB-API stand-in whose only answer is the connected database name."""
+
+    def __init__(self, database):
+        self.database, self.closed, self.executed = database, False, []
+
+    def cursor(self):
+        conn = self
+
+        class Cur:
+            def execute(self, sql, params=()):
+                conn.executed.append(sql)
+
+            def fetchall(self):
+                return [(conn.database,)]
+        return Cur()
+
+    def close(self):
+        self.closed = True
+
+
+def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkeypatch):
+    psycopg = pytest.importorskip("psycopg")
+    monkeypatch.setenv("T", "dsn-under-test")
+    conns = []
+
+    def connect(dsn):
+        conns.append(_Conn("loan_servicing_prod"))
+        return conns[-1]
+    monkeypatch.setattr(psycopg, "connect", connect)
+    with pytest.raises(TargetIdentityError, match="'loan_servicing_prod'.*'lakebase_rehearsal'"):
+        LakebaseTargetAdapter("T", "lakebase_rehearsal", "loan_servicing")
+    assert conns[0].closed is True
+    assert conns[0].executed == ["SELECT current_database()"]
+    target = LakebaseTargetAdapter("T", "loan_servicing_prod", "loan_servicing")
+    assert target.database == "loan_servicing_prod" and conns[1].closed is False
+
+
+def test_cli_refuses_a_lakebase_dsn_outside_the_allowlisted_database(tmp_path, monkeypatch):
+    _write_inputs(tmp_path, monkeypatch)
+    psycopg = pytest.importorskip("psycopg")
+    monkeypatch.setenv("S", "src")
+    monkeypatch.setenv("T", "dsn-under-test")
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: _Conn("somewhere_else"))
+    monkeypatch.setitem(SOURCE_ADAPTERS, "sqlserver", lambda secret: FakeSource({}))
+    with pytest.raises(SystemExit) as exc:
+        main(["run", "--unit", "u", "--family", "sqlserver", "--mapping", "m.json",
+              "--tolerances", "t.json", "--canonicalization", "c.json",
+              "--mode", "transactional", "--source-dsn-secret", "S", "--target-secret", "T",
+              "--target-kind", "lakebase", "--target-catalog", "mig", "--target-schema", "s",
+              "--out", "o"])
+    assert "'somewhere_else'" in str(exc.value) and "'mig'" in str(exc.value)
+    assert "dsn-under-test" not in str(exc.value)
 
 
 def test_cli_estimate_accepts_mode(tmp_path, monkeypatch, capsys):

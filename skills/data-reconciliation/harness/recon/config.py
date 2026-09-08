@@ -108,6 +108,10 @@ class Tolerances:
     # watermark), and the number of key ranges the PK-set diff counts before streaming keys.
     cdc_lag_max_s: float = 0.0
     pk_set_ranges: int = 64
+    # Tier 5 streams every key range instead of trusting equal range fingerprints (count, sum,
+    # sum of squares): the complete comparison for units where a three-or-more-key substitution
+    # that preserves both moments must be ruled out, at the cost of pulling every key.
+    pk_set_stream_every_range: bool = False
     # A side with no pinned snapshot and no engine change token proves stillness only by
     # (count, max watermark) markers, which miss updates below the max and balanced
     # insert+delete pairs. False (default): such a run is not merge-eligible. True records the
@@ -233,6 +237,15 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
     return MappingSpec(version=version, objects=objects)
 
 
+def _flag(data: dict, key: str, path: Path) -> bool:
+    """A tolerance switch is a JSON boolean and nothing else: "false", 0 or null would
+    otherwise be coerced and silently widen what the run accepts."""
+    value = data.get(key, False)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{path}: {key} must be a JSON boolean (true/false), got {value!r}")
+    return value
+
+
 def load_tolerances(path: Path) -> Tolerances:
     data = json.loads(path.read_text())
     version = _require_version(data, path)
@@ -245,7 +258,8 @@ def load_tolerances(path: Path) -> Tolerances:
         source_concurrency=int(data.get("source_concurrency", 1)),
         cdc_lag_max_s=float(data.get("cdc_lag_max_s", 0.0)),
         pk_set_ranges=int(data.get("pk_set_ranges", 64)),
-        accept_marker_only_window=bool(data.get("accept_marker_only_window", False)),
+        pk_set_stream_every_range=_flag(data, "pk_set_stream_every_range", path),
+        accept_marker_only_window=_flag(data, "accept_marker_only_window", path),
     )
 
 

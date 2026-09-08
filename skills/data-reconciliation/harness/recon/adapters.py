@@ -35,6 +35,14 @@ def _as_key(value: Any) -> tuple:
     return value if isinstance(value, tuple) else (value,)
 
 
+# Range fingerprints carry two moments per digested column: the exact sum and the sum of
+# squared residues modulo this Mersenne prime (2^31 - 1). Two multisets that agree on count,
+# sum and sum of squares must differ in at least three elements, so any one- or two-key
+# substitution inside a range is provably visible; the modulus keeps a bigint key's or an
+# epoch-microsecond datetime's square inside DECIMAL(38,0) on every engine.
+DIGEST_MODULUS = 2_147_483_647
+
+
 def _digest_value(value: Any) -> Any:
     """Normalise an engine's SUM result so equal digests compare equal across drivers
     (Decimal('5.000000') vs int 5 vs float 5.0)."""
@@ -52,7 +60,10 @@ def _digest_value(value: Any) -> Any:
 @dataclass
 class SchemaFacts:
     """Constraint, index and identity shape of one table, in the engine's own column names.
-    Column tuples are ordered; unique/index sets hold leading-column tuples."""
+    Column tuples are ordered; unique/index sets hold leading-column tuples. Only indexes the
+    engine enforces over the whole table belong in `unique`/`indexes`: disabled, invalid or
+    still-building ones are left out, and filtered/partial ones (a row predicate) go to
+    `partial`, which is reported but not graded because the predicate is dialect-bound."""
     primary_key: tuple[str, ...] = ()
     unique: set[tuple[str, ...]] = field(default_factory=set)
     foreign_keys: set[tuple[tuple[str, ...], str, tuple[str, ...]]] = field(default_factory=set)
@@ -60,6 +71,7 @@ class SchemaFacts:
     indexes: set[tuple[str, ...]] = field(default_factory=set)
     check_count: int = 0
     identity_columns: set[str] = field(default_factory=set)
+    partial: set[tuple[str, ...]] = field(default_factory=set)
 
 
 class SourceAdapter(Protocol):
@@ -170,6 +182,13 @@ class _SqlAdapterBase:
     # Portable digests for range fingerprints: exact decimal sums compare equal across engines.
     number_digest_sql = "CAST({col} AS DECIMAL(38,6))"
     datetime_digest_sql: str | None = None  # whole microseconds since the epoch
+    # Remainder of {x} divided by {m}, sign of the dividend (the square below removes it). The
+    # function form is the default because a literal `%` is a placeholder to pyformat drivers
+    # (psycopg, databricks-sql); engines without MOD() override with their operator.
+    mod_sql = "MOD({x}, {m})"
+    # Second moment of a digest {d}: the residue is rounded to a whole number first so engines
+    # that shorten the scale of a decimal product still agree with those that keep it.
+    square_digest_sql = "CAST({r} * {r} AS DECIMAL(38,0))"
 
     def __init__(self, conn):
         self._conn = conn
@@ -438,21 +457,28 @@ class _SqlAdapterBase:
             values += vals
         return (" AND ".join(parts) if parts else "1 = 1"), values
 
-    def _digest_sql(self, col: str, kind: str) -> str | None:
+    def _digest_sql(self, col: str, kind: str) -> tuple[str, str] | None:
+        """(sum term, sum-of-squares term) for one column, or None when the kind has no portable
+        digest (strings, uuids)."""
         if kind == "number":
-            return self.number_digest_sql.format(col=col)
-        if kind == "datetime" and self.datetime_digest_sql:
-            return self.datetime_digest_sql.format(col=col)
-        return None
+            digest = self.number_digest_sql.format(col=col)
+        elif kind == "datetime" and self.datetime_digest_sql:
+            digest = self.datetime_digest_sql.format(col=col)
+        else:
+            return None
+        residue = self.mod_sql.format(x=f"CAST({digest} AS DECIMAL(38,0))", m=DIGEST_MODULUS)
+        return digest, self.square_digest_sql.format(r=residue)
 
     def range_fingerprints(self, table: str, key_cols: list[str], key_kinds: list[str],
                            watermark: str | None, wm_kind: str | None,
                            ranges: list[tuple[tuple | None, tuple | None]],
                            where: str | None = None) -> list[tuple[int, tuple | None, Any]]:
-        """Per key range: (row count, per-key-column sums, watermark sum) in one statement (SUM
-        over CASE). Sums are exact decimals so a key swapped for another or one row's watermark
-        moved inside a range changes the fingerprint even when the count does not. A digest is
-        None when the column kind has no portable sum (strings, uuids)."""
+        """Per key range: (row count, per-key-column (sum, sum of squares), watermark (sum, sum
+        of squares)) in one statement (SUM over CASE). Sums are exact decimals and the squares
+        are taken modulo DIGEST_MODULUS, so a key swapped for another, two keys traded for two
+        others with the same total, or a row's watermark moved inside a range all change the
+        fingerprint even when the count does not. A digest is None when the column kind has no
+        portable sum (strings, uuids)."""
         if not ranges:
             return []
         key_digests = [self._digest_sql(k, kind) for k, kind in zip(key_cols, key_kinds)]
@@ -461,7 +487,11 @@ class _SqlAdapterBase:
         exprs, values = [], []
         for lo, hi in ranges:
             # each CASE binds its own copy of the bounds: positional drivers cannot reuse them
-            terms = ["1"] + (key_digests if key_digestible else []) + ([wm_digest] if wm_digest else [])
+            terms = ["1"]
+            if key_digestible:
+                terms += [t for pair in key_digests for t in pair]
+            if wm_digest:
+                terms += list(wm_digest)
             for term in terms:
                 pred, vals = self._range_predicate(key_cols, lo, hi, len(values))
                 values += vals
@@ -469,12 +499,13 @@ class _SqlAdapterBase:
         w = f" WHERE {where}" if where else ""
         row = list(self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}", self._params(values))[0])
         out: list[tuple[int, tuple | None, Any]] = []
+
+        def moments() -> tuple:
+            return _digest_value(row.pop(0)), _digest_value(row.pop(0))
         for _ in ranges:
             n = int(row.pop(0) or 0)
-            keys = None
-            if key_digestible:
-                keys = tuple(_digest_value(row.pop(0)) for _ in key_cols)
-            wm = _digest_value(row.pop(0)) if wm_digest else None
+            keys = tuple(moments() for _ in key_cols) if key_digestible else None
+            wm = moments() if wm_digest else None
             out.append((n, keys, wm))
         return out
 
@@ -523,6 +554,7 @@ class TeradataSourceAdapter(_SqlAdapterBase):
     """Secret value: JSON accepted by teradatasql.connect (host, user, password, ...)."""
 
     bucket_sql = TERADATA_QUANTILE_SQL
+    mod_sql = "({x} MOD {m})"
 
     def __init__(self, dsn_secret: str):
         import teradatasql  # lazy: optional extra
@@ -533,6 +565,7 @@ class OracleSourceAdapter(_SqlAdapterBase):
     """Secret value: user/password/dsn."""
 
     paramstyle = "named"
+
     def __init__(self, dsn_secret: str):
         import oracledb  # lazy: optional extra
         user, password, dsn = _secret(dsn_secret).split("/", 2)
@@ -551,6 +584,7 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
 
     snapshot_sql = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT"
     snapshot_reset_sql = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    mod_sql = "({x} % {m})"  # T-SQL has no MOD(); pyodbc binds with `?`, so `%` is literal
     # Every INSERT/UPDATE/DELETE statement against the table bumps user_updates, committed or
     # not, so a window whose token held saw no write at all. Needs VIEW SERVER STATE (2019) /
     # VIEW DATABASE PERFORMANCE STATE (2022+) on the read-only login; without it the token is
@@ -567,19 +601,22 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
         schema, name = _split_table(table, "dbo")
         facts = SchemaFacts()
         rows = self._rows(
-            "SELECT i.is_primary_key, i.is_unique, i.name, ic.key_ordinal, c.name "
+            "SELECT i.is_primary_key, i.is_unique, i.has_filter, i.name, ic.key_ordinal, c.name "
             "FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id "
             "JOIN sys.schemas s ON s.schema_id = o.schema_id "
             "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
             "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
             "WHERE s.name = ? AND o.name = ? AND i.index_id > 0 AND ic.is_included_column = 0 "
+            "AND i.is_disabled = 0 AND i.is_hypothetical = 0 "
             "ORDER BY i.index_id, ic.key_ordinal", (schema, name))
         by_index: dict[str, list] = {}
-        for is_pk, is_unique, iname, _ord, col in rows:
-            by_index.setdefault(iname, [bool(is_pk), bool(is_unique), []])[2].append(col)
-        for is_pk, is_unique, cols in by_index.values():
+        for is_pk, is_unique, has_filter, iname, _ord, col in rows:
+            by_index.setdefault(iname, [bool(is_pk), bool(is_unique), bool(has_filter), []])[3].append(col)
+        for is_pk, is_unique, has_filter, cols in by_index.values():
             if is_pk:
                 facts.primary_key = tuple(cols)
+            elif has_filter:
+                facts.partial.add(tuple(cols))
             elif is_unique:
                 facts.unique.add(tuple(cols))
             else:
@@ -795,25 +832,30 @@ class _PostgresBase(_SqlAdapterBase):
             elif ctype == "c":
                 facts.check_count += 1
         rows = self._rows(
-            "SELECT ix.indisunique, ix.indisprimary, a.attname, k.ord "
+            "SELECT ix.indisunique, ix.indpred IS NOT NULL, a.attname, k.ord "
             "FROM pg_index ix JOIN pg_class c ON c.oid = ix.indrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON k.ord <= ix.indnkeyatts "
             "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum "
             "WHERE n.nspname = %s AND c.relname = %s AND NOT ix.indisprimary "
+            "AND ix.indisvalid AND ix.indisready AND ix.indislive "
             "ORDER BY ix.indexrelid, k.ord", (schema, name))
         # indexes are grouped by their order of appearance (indexrelid), so a change in the
         # ordinal back to 1 starts a new index
         current: list[str] = []
-        current_unique = False
-        for is_unique, _is_pk, col, ord_ in rows:
+        current_unique = current_partial = False
+
+        def flush() -> None:
+            bucket = facts.partial if current_partial else facts.unique if current_unique else facts.indexes
+            bucket.add(tuple(current))
+        for is_unique, is_partial, col, ord_ in rows:
             if int(ord_) == 1 and current:
-                (facts.unique if current_unique else facts.indexes).add(tuple(current))
+                flush()
                 current = []
             current.append(col)
-            current_unique = bool(is_unique)
+            current_unique, current_partial = bool(is_unique), bool(is_partial)
         if current:
-            (facts.unique if current_unique else facts.indexes).add(tuple(current))
+            flush()
         rows = self._rows(
             "SELECT a.attname, a.attnotnull, a.attidentity <> '' OR "
             "       pg_get_serial_sequence(%s, a.attname) IS NOT NULL "
@@ -852,16 +894,32 @@ class PostgresSourceAdapter(_PostgresBase):
 SOURCE_ADAPTERS["postgres"] = PostgresSourceAdapter
 
 
+class TargetIdentityError(RuntimeError):
+    """The database a target connection landed in is not the one the allowlist names."""
+
+
 class LakebaseTargetAdapter(_PostgresBase):
     """Target side for the operational track: one schema inside a Lakebase branch database.
     Secret value: the branch endpoint's libpq DSN (OAuth token as the password, minted by
-    `databricks postgres` for the migration principal; never the production branch). Object
+    `databricks postgres` for the migration principal; never the production branch). The DSN
+    decides which database the session lands in, so the connection is bound to `database`, the
+    allowlisted identity, before any statement runs; a DSN pointing elsewhere is refused. Object
     names in the mapping spec are bare table names, qualified here with the schema."""
 
-    def __init__(self, secret_name: str, schema: str):
+    def __init__(self, secret_name: str, database: str, schema: str):
         import psycopg  # lazy: optional extra
         super().__init__(psycopg.connect(_secret(secret_name)))
         self._schema = schema
+        self.database = self._bind_database(database)
+
+    def _bind_database(self, expected: str) -> str:
+        (actual,) = self._rows("SELECT current_database()")[0]
+        if actual != expected:
+            self._conn.close()
+            raise TargetIdentityError(
+                f"target DSN connects to database {actual!r}, but the allowlisted target is "
+                f"{expected!r}; point --target-catalog at the connected database or fix the DSN")
+        return actual
 
     def _q(self, object: str) -> str:
         return f'"{self._schema}"."{object}"'
