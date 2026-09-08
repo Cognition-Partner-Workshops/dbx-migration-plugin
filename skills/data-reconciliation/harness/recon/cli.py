@@ -23,7 +23,7 @@ from .config import (CanonRule, ConfigError, READ_ONLY_SQL_KEYWORDS,
                      load_canon_rules, load_mapping_spec, load_tolerances,
                      validate_identifier)
 from .cost import estimate_cost
-from .engine import DEPTHS, MODES, run_recon
+from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks")
 PARAM_RE = re.compile(r"^[A-Za-z0-9_\-:.T /]*$")
@@ -144,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                    help=".migration/03_tolerances.json, versioned")
     r.add_argument("--canonicalization", required=True, type=Path,
                    help="the source-dialect skill's recon_canonicalization rules, as JSON")
-    r.add_argument("--mode", required=True, choices=MODES)
+    r.add_argument("--mode", required=True, choices=MODES + PLANNED_MODES)
     r.add_argument("--source-dsn-secret", required=True,
                    help="ENV VAR NAME holding the source connection (read-only principal)")
     r.add_argument("--target-secret", required=True,
@@ -169,6 +169,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "selftest":
         return selftest()
+
+    if args.cmd == "run" and args.mode in PLANNED_MODES:
+        raise SystemExit(
+            f"--mode {args.mode} is not implemented in this harness version: operational-track "
+            "units reconcile with --mode snapshot or live at a stated consistency point "
+            "(quiesced window, backup restore, or CDC watermark). See 14-front_door_oltp.")
 
     params = _parse_params(args.param)
     if args.cmd == "estimate":

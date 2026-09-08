@@ -268,3 +268,15 @@ def test_cli_estimate_subcommand(tmp_path, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["depth"] == "sampled" and out["source_rows_fetched"] < 5000
+
+
+def test_cli_refuses_transactional_mode_by_name(tmp_path, capsys):
+    from recon.cli import main
+    with pytest.raises(SystemExit) as exc:
+        main(["run", "--unit", "u", "--family", "sqlserver", "--mapping", str(tmp_path / "m.json"),
+              "--tolerances", str(tmp_path / "t.json"), "--canonicalization", str(tmp_path / "c.json"),
+              "--mode", "transactional", "--source-dsn-secret", "S", "--target-secret", "T",
+              "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out")])
+    msg = str(exc.value)
+    assert "transactional" in msg and "not implemented" in msg
+    assert "snapshot" in msg

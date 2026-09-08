@@ -18,6 +18,9 @@ from .tiers import tier1_counts, tier2_aggregates, tier3_diffs, tier4_parity
 # development and fix rounds. A fixture PASS is never a merge verdict; it only earns the unit
 # its one live run.
 MODES = ("fixture", "live", "snapshot", "continuous")
+# Accepted by the CLI so the refusal names the mode, never run: the Lakebase/OLTP track's
+# consistency-window, PK-set, CDC-lag and constraint-parity tiers are not implemented yet.
+PLANNED_MODES = ("transactional",)
 
 # Tier 3 depth. threshold: the tolerance file's full_diff_row_threshold decides per table.
 # sampled: always stratified sample (the verifier default). full: always keyed full diff

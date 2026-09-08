@@ -1,12 +1,14 @@
 # DBX Migration Factory
 
-**What this is**: a repeatable system for moving a legacy data estate (a SQL warehouse like Redshift or Teradata, an ETL tool like Informatica, or a SAS/Hadoop code estate) onto Databricks, run by Devin sessions working in parallel, with a human approving at exactly five checkpoints.
+**What this is**: a repeatable system for moving a legacy data estate (a SQL warehouse like Redshift or Teradata, an ETL tool like Informatica, a SAS/Hadoop code estate, or an operational database like Sybase or SQL Server OLTP) onto Databricks, run by Devin sessions working in parallel, with a human approving at exactly five checkpoints.
+
+**Two target tracks**: analytical workloads (warehouse tables, ETL, reports, ML) land in Delta tables under Unity Catalog and run on Databricks SQL and Lakeflow; operational workloads (the tables and procedures an application transacts against) land in Lakebase, Databricks' managed Postgres. One estate can span both, in which case the front door records which tables belong to which track and the two tracks share one plan, one dependency register, and one set of stops.
 
 **Why it works, in one paragraph**: the target (Databricks) is always the same, so all the target knowledge is built once and reused. The source varies, so source specifics live in small plug-in profiles. Nothing merges on trust: every converted piece must produce provably identical results to the legacy system (an automated data comparison called the recon gate) before it counts as done. And because most pieces of a data estate are independent of each other, Devin migrates them 20 at a time instead of one at a time.
 
 **What the operator actually does**:
 1. Install one plugin into the Devin org and run one setup session ("set up the DBX migration factory").
-2. Start a migration by typing one command: `!dbx_migrate_etl`, `!dbx_migrate_warehouse`, or `!dbx_migrate_code`.
+2. Start a migration by typing one command: `!dbx_migrate_etl`, `!dbx_migrate_warehouse`, `!dbx_migrate_code`, or `!dbx_migrate_oltp`.
 3. Answer five approval stops when pinged (Slack/Teams optional). Everything else is automatic.
 
 **The five stops** (the only decisions a human makes):
@@ -60,6 +62,8 @@ FRONT DOORS (thin entry points, pre-select skills and vocabulary)
  10  !dbx_migrate_etl              Informatica / Talend / Ab Initio / DataStage estates
  11  !dbx_migrate_warehouse        Redshift / Teradata / BigQuery / Synapse estates
  12  !dbx_migrate_code             SAS / Hadoop / on-prem Spark / ML scoring estates
+ 14  !dbx_migrate_oltp             Sybase / SQL Server / Oracle / DB2 operational databases
+                                   -> Lakebase (operational track) + Delta (analytical track)
 
 INTERNAL SUBROUTINE (never operator-invoked; called by 2, 3, 4 and 5)
  13  !dbx_dependency_resolution    register / decide / implement modes
@@ -117,6 +121,7 @@ Each row is a way a migration goes wrong and the one thing in the kit that catch
 | `11-front_door_warehouse.md` | [DBX v1] Front Door: SQL Warehouse Estate | `!dbx_migrate_warehouse` |
 | `12-front_door_code.md` | [DBX v1] Front Door: Code & ML Scoring Estate | `!dbx_migrate_code` |
 | `13-dependency_resolution.md` | [DBX v1] Dependency Resolution (Register / Decide / Implement) | `!dbx_dependency_resolution` |
+| `14-front_door_oltp.md` | [DBX v1] Front Door: Operational Database Estate (Lakebase) | `!dbx_migrate_oltp` |
 | `00_intake_template.md` | (not a playbook: the pre-kickoff intake form the customer fills; consumed by the front doors) | n/a |
 
 The number prefix is reading order, not an execution requirement. `13-dependency_resolution.md` is an internal subroutine invoked from playbooks 2, 3, 4 and 5, never run in sequence and never presented on the operator surface.
@@ -173,19 +178,21 @@ The kit ships as two packages with different lifecycles:
 - accelerator tool wrappers, chiefly the `lakebridge` skill (see the catalog): install, dialect coverage, output interpretation;
 - the `install-dbx-factory` bootstrap skill, which imports the playbooks and proposes the environment blueprint.
 
-**The playbook library** carries the process: the 13 playbooks above, imported with their titles and macros, tuned per customer. Playbooks hold everything with customer values in it; the plugin holds nothing customer-specific.
+**The playbook library** carries the process: the 14 playbooks above, imported with their titles and macros, tuned per customer. Playbooks hold everything with customer values in it; the plugin holds nothing customer-specific.
 
 Deployment order at engagement start:
 1. Install the plugin into the customer's Devin org.
-2. Run one setup session ("set up the DBX migration factory"): it imports the 13 playbooks and proposes the environment blueprint; the admin approves the suggestion.
+2. Run one setup session ("set up the DBX migration factory"): it imports the 14 playbooks and proposes the environment blueprint; the admin approves the suggestion.
 3. Attach the source-dialect skill(s) matching the customer's legacy stack (installed with this plugin, or repo-level `.agents/skills/`).
 4. Provision the three access principals from the access model in `1-migration_setup.md` (assessment read-only, migration sandbox, customer-held cutover) and load their secrets by name.
 5. Adjust shop-specific conventions only where the customer genuinely differs: artifact paths in `1-migration_setup.md` (default `docs/migration/...`), catalog/schema naming in the target profiles.
 6. Run `!dbx_migration_setup` first. Nothing downstream is allowed to guess the target stack, and later playbooks stop and ask if it has not run.
-7. Start a migration with a front door (`!dbx_migrate_etl`, `!dbx_migrate_warehouse`, `!dbx_migrate_code`) or directly with `!dbx_migrate_pipeline`.
+7. Start a migration with a front door (`!dbx_migrate_etl`, `!dbx_migrate_warehouse`, `!dbx_migrate_code`, `!dbx_migrate_oltp`) or directly with `!dbx_migrate_pipeline`.
 
 The `.migration/` workspace created in step 1 of the chain is the engagement's durable memory: dependency register, progress ledger, recon tolerance record, and decision log live there and are appended by later playbooks, never rewritten.
 
 ## What is deliberately not here
+
+No transactional reconciliation mode yet: operational-track units reconcile with the set-based harness at a stated consistency point (`--mode snapshot`/`live` against a quiesced window or CDC watermark); a `--mode transactional` (consistency-window snapshots, PK-set diff, CDC lag and ordering, constraint/index/sequence parity) is the next harness increment, and until it lands the OLTP front door refuses to promise it.
 
 No bespoke parity scoreboard app and no assumption of production data access. Correctness rests on the reconciliation harness (dual-run diffs against the live legacy system via federation or exported snapshots), captured evidence in every PR, a CI regression gate, an event-driven parallel-run window, and a skeptical independent audit run by a session that did not perform the migration. Where production access is denied (a common pattern), phase 0 falls back to metadata-only assessment plus masked or representative sample data, recorded as a D10 dependency with an explicit recon-scope caveat.

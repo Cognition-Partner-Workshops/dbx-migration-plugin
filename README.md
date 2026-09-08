@@ -61,6 +61,12 @@ Run the `install-dbx-factory` skill once per org in a dedicated setup session: i
 14 playbooks into the org playbook library and proposes the migration environment blueprint —
 the two things a plugin cannot carry itself.
 
+Then start an engagement with one front door: `!dbx_migrate_etl`, `!dbx_migrate_warehouse`,
+`!dbx_migrate_code`, or `!dbx_migrate_oltp` (operational databases; splits the estate into a
+Lakebase operational track and a Delta analytical track). Operational-track units reconcile with
+`dbx-recon --mode snapshot|live` at a stated consistency point; `--mode transactional` is accepted
+by the CLI only so that it can refuse by name until that harness increment lands.
+
 The official `databricks` plugin is installed automatically as a dependency (tracking its default
 branch). To pin it, add `"ref"` or `"sha"` to the `requiredPlugins` entry in
 `.devin-plugin/plugin.json`. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list

@@ -1,6 +1,6 @@
 ---
 name: install-dbx-factory
-description: Bootstrap the DBX Migration Factory in this org. Imports the 13 DBX v1 playbooks into the org playbook library and proposes the migration environment blueprint. Run once per org, in a dedicated setup session, when the user asks to set up or install the migration factory.
+description: Bootstrap the DBX Migration Factory in this org. Imports the 14 DBX v1 playbooks into the org playbook library and proposes the migration environment blueprint. Run once per org, in a dedicated setup session, when the user asks to set up or install the migration factory.
 triggers: ["user"]
 ---
 
@@ -10,7 +10,7 @@ You are bootstrapping the Databricks migration kit into this org. The plugin (sk
 
 ## Step 1: Import the playbooks
 
-The 13 playbook bodies are in this skill's `playbooks/` directory (find the skill's install path on disk first). Titles and macros are defined in `playbooks/0-README.md` in the Files table. `0-README.md` itself is documentation, not a playbook; import files 1 through 13. `00_intake_template.md` is also not a playbook: it is the pre-kickoff form the customer fills; commit it to the engagement docs repo (or hand it to the operator) so the front doors can consume it. File 13 (`dependency_resolution`) is an internal subroutine invoked by other playbooks; import it, but never present its macro as part of the operator surface.
+The 14 playbook bodies are in this skill's `playbooks/` directory (find the skill's install path on disk first). Titles and macros are defined in `playbooks/0-README.md` in the Files table. `0-README.md` itself is documentation, not a playbook; import files 1 through 14 (14 is the Lakebase/OLTP front door, added after 13 so existing macro numbering did not move). `00_intake_template.md` is also not a playbook: it is the pre-kickoff form the customer fills; commit it to the engagement docs repo (or hand it to the operator) so the front doors can consume it. File 13 (`dependency_resolution`) is an internal subroutine invoked by other playbooks; import it, but never present its macro as part of the operator surface.
 
 For each playbook, in numeric order:
 1. Read the file body verbatim. Do not edit, summarize, or re-wrap it.
@@ -31,8 +31,8 @@ Use your environment-config tools to submit this as a blueprint suggestion for t
 
 ## Step 3: Verify and report
 
-1. List org playbooks and confirm all 13 macros resolve.
-2. Report to the user: playbooks imported (with macros), blueprint suggestion status, and the one-line operator guide: start an engagement with `!dbx_migrate_etl`, `!dbx_migrate_warehouse`, or `!dbx_migrate_code`, then answer the five approval stops.
+1. List org playbooks and confirm all 14 macros resolve.
+2. Report to the user: playbooks imported (with macros), blueprint suggestion status, and the one-line operator guide: start an engagement with `!dbx_migrate_etl`, `!dbx_migrate_warehouse`, `!dbx_migrate_code`, or `!dbx_migrate_oltp`, then answer the five approval stops.
 
 ## Forbidden
 - Do not modify the playbook bodies during import.
