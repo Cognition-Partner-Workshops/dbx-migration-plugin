@@ -100,11 +100,15 @@ AS BEGIN
                 DELETE FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;
         END CASE;
 
+        -- Charge the budget *before* the account leaves the cursor predicate. The budget is an upper bound: if the
+        -- UPDATE below fails, the account is still CLOSED, the retry redoes it (idempotently) and it is counted twice
+        -- (one short of the cap). The other order lets a retry skip an ARCHIVED-but-uncounted account and archive one
+        -- past the cap.
+        SET p_accounts_done = p_accounts_done + 1;
+
         UPDATE ${catalog}.${schema}.DIM_ACCOUNT
         SET ACCOUNT_STATUS = 'ARCHIVED', ETL_UPDATE_TS = current_timestamp()
         WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;
-
-        SET p_accounts_done = p_accounts_done + 1;
     END FOR archive_loop;
 
     -- Second pass: FOR cursor loop maps 1:1

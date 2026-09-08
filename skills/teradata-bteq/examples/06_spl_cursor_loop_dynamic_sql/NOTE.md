@@ -27,7 +27,12 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   Because partial work is kept rather than rolled back, the EXIT handler also writes back the consumed budget
   (`p_max_batch = p_max_batch - p_accounts_done`): the source's ROLLBACK left the budget untouched *and* the accounts
   untouched; here the accounts stay archived, so the budget must follow. Retry contract: call again with the returned
-  `p_max_batch`; an account interrupted mid-triple was not counted, is redone idempotently, then counted.
+  `p_max_batch`. The counter is incremented *before* the status `UPDATE`, so the budget is charged before the account
+  drops out of the cursor predicate: a failure anywhere in the triple leaves the account `CLOSED`, the retry redoes it
+  idempotently and charges it again (the campaign ends at most one account *short* of the cap, never past it). If the
+  session itself dies (no handler, no OUT values), the caller recomputes the budget from persisted state --
+  `COUNT(*) FROM DIM_ACCOUNT WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= <campaign start>` -- rather than
+  reusing the last returned value.
 - `SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT` -> same syntax.
 - `INOUT` parameter -> `INOUT` (same).
 - `EXTRACT(YEAR FROM d) (FORMAT '9999')`, `TRIM(n (FORMAT '-(18)9'))` -> `CAST(year(d) AS STRING)` / parameter marker.
@@ -51,6 +56,9 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   archives up to `k` accounts more than the source did for the same sequence of calls -> **Tier 1** on
   `DIM_ACCOUNT WHERE ACCOUNT_STATUS = 'ARCHIVED'` after the retry (`p_max_batch + k` vs `p_max_batch`). The shadow-run
   must include one injected failure after at least one completed account, followed by the retry.
+- Counter incremented *after* the status `UPDATE` (failure between the two): the account is `ARCHIVED` but uncharged,
+  the retry skips it and archives one more -> same **Tier 1** signature, off by exactly one; the injected failure in
+  the shadow-run should therefore be placed on the `UPDATE` statement of the k-th account.
 
 ## Citations
 - `FOR ... AS query DO`, `WHILE`, `LEAVE`, `CASE` statement: `databricks-dbsql` `references/sql-scripting.md`

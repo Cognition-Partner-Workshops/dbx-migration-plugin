@@ -20,6 +20,13 @@ AS BEGIN
     -- SQLCODE has no cited equivalent; the handler records a fixed non-zero code (legacy consumers only test <> 0,
     -- see bteq_daily_load.btq) and the message. Skill §7 trap "SQLCODE/SQLSTATE". Not verified live: reading the
     -- caught SQLSTATE inside the handler body.
+    -- No ROLLBACK: the source has no BT/ET either (each statement commits), and a compound here has no cited
+    -- multi-statement transaction (skill §7 "BT/ET"). Rows written before a failure therefore stay committed under
+    -- the failed batch id, and example 03 marks that batch FAILED and re-runs the date under a new one. The two
+    -- INSERTs below are keyed on TRANSACTION_ID (stable identity: fixture PI/COLLECT STATS column, example 07
+    -- quarantines duplicates before they reach STG_TRANSACTIONS) so the re-run adds only what is missing, and the
+    -- completing batch adopts the earlier batch's rows for the date, which keeps the OUT counts and example 03's
+    -- per-batch recon report whole.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         SET p_return_code = -1;
@@ -56,9 +63,18 @@ AS BEGIN
            'INVALID_ACCOUNT' AS ERROR_REASON, p_batch_id AS BATCH_ID
     FROM ${catalog}.${schema}.STG_TRANSACTIONS stg
     WHERE stg.LOAD_DATE = p_batch_date
-      AND stg.ACCOUNT_ID NOT IN (SELECT ACCOUNT_ID FROM ${catalog}.${schema}.DIM_ACCOUNT WHERE CURRENT_FLAG = 'Y');
+      AND stg.ACCOUNT_ID NOT IN (SELECT ACCOUNT_ID FROM ${catalog}.${schema}.DIM_ACCOUNT WHERE CURRENT_FLAG = 'Y')
+      AND NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.STG_TRANSACTION_ERRORS e
+                      WHERE e.TRANSACTION_ID = stg.TRANSACTION_ID
+                        AND e.LOAD_DATE = stg.LOAD_DATE
+                        AND e.ERROR_REASON = 'INVALID_ACCOUNT');
 
-    -- ACTIVITY_COUNT: no cited row-count register in the official scripting reference; count the rows this batch wrote.
+    -- Re-run of the date: rejections written by the failed batch now belong to this one.
+    UPDATE ${catalog}.${schema}.STG_TRANSACTION_ERRORS
+    SET BATCH_ID = p_batch_id
+    WHERE LOAD_DATE = p_batch_date AND ERROR_REASON = 'INVALID_ACCOUNT' AND BATCH_ID <> p_batch_id;
+
+    -- ACTIVITY_COUNT: no cited row-count register in the official scripting reference; count the rows this batch owns.
     SET v_error_count = (SELECT COUNT(*) FROM ${catalog}.${schema}.STG_TRANSACTION_ERRORS
                          WHERE BATCH_ID = p_batch_id AND ERROR_REASON = 'INVALID_ACCOUNT');
 
@@ -117,7 +133,18 @@ AS BEGIN
        AND fx.TO_CURRENCY = 'NOK'
        AND stg.TRANSACTION_DATE = fx.RATE_DATE
     WHERE stg.LOAD_DATE = p_batch_date
-      AND stg.ACCOUNT_ID IN (SELECT ACCOUNT_ID FROM ${catalog}.${schema}.DIM_ACCOUNT WHERE CURRENT_FLAG = 'Y');
+      AND stg.ACCOUNT_ID IN (SELECT ACCOUNT_ID FROM ${catalog}.${schema}.DIM_ACCOUNT WHERE CURRENT_FLAG = 'Y')
+      AND NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.FACT_TRANSACTION f
+                      WHERE f.TRANSACTION_ID = stg.TRANSACTION_ID);
+
+    -- Re-run of the date: fact rows the failed batch committed are adopted by the completing batch, so
+    -- ETL_BATCH_ID means "the batch that completed this date" and the per-batch counts below (and example 03's
+    -- LOADED_ROWS) cover the whole date, not just this attempt's remainder.
+    UPDATE ${catalog}.${schema}.FACT_TRANSACTION f
+    SET ETL_BATCH_ID = p_batch_id
+    WHERE f.ETL_BATCH_ID <> p_batch_id
+      AND EXISTS (SELECT 1 FROM ${catalog}.${schema}.STG_TRANSACTIONS stg
+                  WHERE stg.TRANSACTION_ID = f.TRANSACTION_ID AND stg.LOAD_DATE = p_batch_date);
 
     SET p_rows_inserted = (SELECT COUNT(*) FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE ETL_BATCH_ID = p_batch_id);
     SET p_rows_rejected = v_error_count;

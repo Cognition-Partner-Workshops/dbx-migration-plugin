@@ -10,6 +10,14 @@ Source: fixture `dml/stored_procedures/sp_load_daily_transactions.sql` (verbatim
 - `DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ... END` -> same shape; `SET p_return_code = SQLCODE` ->
   fixed non-zero code (no cited SQLCODE/SQLSTATE read in the handler; skill §7).
 - `SET v = ACTIVITY_COUNT` (x2) -> counted `SELECT COUNT(*)` keyed on `p_batch_id` (no cited row-count register).
+- Failure after the `FACT_TRANSACTION` insert. Neither engine rolls back (the source has no BT/ET; the target compound
+  has no cited multi-statement transaction), so the committed rows survive under the failed batch id and example 03
+  re-runs the date under a new batch. Both `INSERT ... SELECT`s carry `NOT EXISTS` on `TRANSACTION_ID` (the stable
+  identity: fixture `COLLECT STATISTICS COLUMN (TRANSACTION_ID)`, example 07 quarantines duplicate ids upstream), and
+  the completing batch *adopts* the earlier batch's rows for the date (`UPDATE ... SET ETL_BATCH_ID / BATCH_ID`). The
+  OUT counts and example 03's per-batch `LOADED_ROWS`/`ERROR_ROWS` then describe the whole date, and a transaction is
+  never in the fact twice. Source parity note: a re-run on Teradata *would* duplicate, so the shadow-run compares
+  against the legacy first-attempt result for that date, not against a replayed legacy retry.
 - `INSERT ... SEL stg.*, literal, param` -> explicit column list (positional `*` insert is a silent-mismatch trap).
   The fixture has no DDL for `STG_TRANSACTIONS` / `STG_TRANSACTION_ERRORS`; the list in the converted file is inferred
   from the columns the procedure reads and must be confirmed against `SHOW TABLE` on the live engine.
@@ -33,6 +41,12 @@ Source: fixture `dml/stored_procedures/sp_load_daily_transactions.sql` (verbatim
   places from the tolerance record.
 - Handler that swallows the exception without setting `p_return_code <> 0`: **Tier 1** on `ETL_BATCH_CONTROL`
   (`FAILED` rows missing) via example 03's error branch.
+- Re-run without the `NOT EXISTS` guards (failure after the fact insert, then a new batch for the same date):
+  **Tier 1** `count(*) > count(distinct TRANSACTION_ID)` on `FACT_TRANSACTION` for that `TRANSACTION_DATE`, **Tier 2**
+  doubled `sum(BASE_CURRENCY_AMOUNT)`, and the fixture's `10_regulatory.sql` signature for the date. Without the
+  batch adoption `UPDATE`, the guards hold but example 03's report shows `LOADED_ROWS + ERROR_ROWS < STAGED_ROWS` for the
+  completing batch (**Tier 1** on the report). The shadow-run must include one injected failure after the fact insert
+  (e.g. on the completion log write) followed by the re-run.
 
 ## Citations
 - `CREATE PROCEDURE` syntax, parameter modes, required/optional characteristics, "DEFAULT is not supported for OUT
