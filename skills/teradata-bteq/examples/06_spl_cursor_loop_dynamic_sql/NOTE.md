@@ -11,10 +11,16 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
 - `FOR typ AS type_cur CURSOR FOR ... DO ... END FOR` -> `FOR typ AS ... DO ... END FOR` (1:1).
 - `CASE v WHEN ... THEN ... ELSE ... END CASE` -> same syntax.
 - `CALL DBC.SysExecSQL(v_sql)` -> `EXECUTE IMMEDIATE`; string-spliced key -> `USING ?` parameter marker; row count via
-  `EXECUTE IMMEDIATE ... INTO`.
+  `EXECUTE IMMEDIATE ... INTO`. The schema name cannot go through a marker (identifiers are not bind values), so
+  `p_archive_schema` is validated against a strict identifier regex (`RLIKE '^[A-Za-z_][A-Za-z0-9_]{0,127}$'`) and
+  the procedure `SIGNAL`s before any dynamic statement runs; the write-scope hook is the second gate. The source
+  `TRIM(p_archive_db)` splice carried the same injection surface -- conversion is where it gets closed.
 - `CREATE MULTISET TABLE x AS y WITH NO DATA` -> `CREATE TABLE IF NOT EXISTS x AS SELECT * FROM y WHERE 1 = 0`.
 - `BT; ... ET;` + `ROLLBACK` in the handler -> no drop-in multi-statement transaction for a compound (skill §6 row
-  "Transactions", §7 trap "BT/ET"); loop body made idempotent instead.
+  "Transactions", §7 trap "BT/ET"); loop body made idempotent instead: the archive `INSERT` carries
+  `NOT EXISTS (... a.TRANSACTION_ID = ft.TRANSACTION_ID)` so a retry after a failure between INSERT and DELETE copies
+  nothing twice; DELETE and the status UPDATE are repeatable by construction. Conservation invariant: every
+  `TRANSACTION_ID` is in the fact, in the archive, or transiently in both -- never twice in the archive.
 - `SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT` -> same syntax.
 - `INOUT` parameter -> `INOUT` (same).
 - `EXTRACT(YEAR FROM d) (FORMAT '9999')`, `TRIM(n (FORMAT '-(18)9'))` -> `CAST(year(d) AS STRING)` / parameter marker.
@@ -27,7 +33,10 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   `FACT_TRANSACTION` rows removed; **Tier 2** `sum(BASE_CURRENCY_AMOUNT)` conservation across the two tables.
 - Loss of BT/ET atomicity when a mid-loop failure occurs (archived but not deleted, or deleted but not archived):
   **Tier 2** conservation check `sum(amount) fact + sum(amount) archive = legacy total`; a row appearing in both
-  tables is a **Tier 3** keyed diff on `TRANSACTION_ID`.
+  tables is a **Tier 3** keyed diff on `TRANSACTION_ID`. An archive copy without the `NOT EXISTS` guard shows up as
+  **Tier 1** `count(*) > count(distinct TRANSACTION_ID)` on the archive table after any retried run.
+- Unvalidated `p_archive_schema` (writes redirected outside the declared scope): not a recon signature at all -- the
+  write-scope hook blocks it at run time, and the regex `SIGNAL` in the procedure is the in-band gate.
 - LOAN branch mis-mapped (archived anyway): **Tier 1** on `FACT_TRANSACTION` rows for loan accounts.
 - `INOUT` remaining budget not written back: caught only by the caller's next batch size — **Tier 1** over the whole
   archive campaign (total accounts archived vs legacy).

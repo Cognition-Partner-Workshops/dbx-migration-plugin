@@ -40,7 +40,14 @@ AS BEGIN
         SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT = 'p_max_batch must be positive';
     END IF;
 
-    -- Dynamic DDL via EXECUTE IMMEDIATE. The archive schema must be inside the unit's declared write scope
+    -- p_archive_schema is spliced into dynamic SQL as an identifier (a `?` marker cannot carry an identifier), so it is
+    -- checked against a strict identifier shape first; anything else (quotes, dots, spaces, statement separators) is
+    -- rejected before any EXECUTE IMMEDIATE runs. The source had the same exposure through TRIM(p_archive_db).
+    IF p_archive_schema IS NULL OR NOT (p_archive_schema RLIKE '^[A-Za-z_][A-Za-z0-9_]{0,127}$') THEN
+        SIGNAL SQLSTATE '75002' SET MESSAGE_TEXT = 'p_archive_schema is not a plain identifier';
+    END IF;
+
+    -- Dynamic DDL via EXECUTE IMMEDIATE. The archive schema must also be inside the unit's declared write scope
     -- (.migration/allowed_targets.json); the factory's write-scope hook rejects anything else.
     SET v_year = CAST(year(p_closed_before) AS STRING);                     -- EXTRACT(YEAR ...) (FORMAT '9999')
     SET v_arch_table = '${catalog}.' || p_archive_schema || '.FACT_TRANSACTION_ARCH_' || v_year;
@@ -48,7 +55,11 @@ AS BEGIN
                    || ' AS SELECT * FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE 1 = 0';   -- ... WITH NO DATA
 
     -- BT; ... ET;  -> no multi-statement transaction around the loop (see header). Each DML statement is its own
-    -- atomic Delta commit; the (archive, delete, mark) triple per account is made idempotent instead.
+    -- atomic Delta commit; the (archive, delete, mark) triple per account is made idempotent instead: the archive
+    -- INSERT skips TRANSACTION_IDs already present in the archive table, so a re-run after a failure between the
+    -- INSERT and the DELETE copies nothing twice, and the DELETE/UPDATE that follow are naturally repeatable.
+    -- Every intermediate state therefore satisfies: each TRANSACTION_ID is in FACT_TRANSACTION, in the archive, or
+    -- (transiently) in both -- never lost, and never twice in the archive.
 
     archive_loop: FOR acct AS
         SELECT ACCOUNT_KEY, ACCOUNT_TYPE
@@ -66,9 +77,12 @@ AS BEGIN
             WHEN 'LOAN' THEN
                 SET v_txn_count = 0;
             ELSE
-                -- Parameter marker instead of string-splicing the key (EXECUTE IMMEDIATE ... USING)
+                -- Parameter marker instead of string-splicing the key (EXECUTE IMMEDIATE ... USING);
+                -- NOT EXISTS on TRANSACTION_ID makes the copy idempotent (retry-safe).
                 EXECUTE IMMEDIATE 'INSERT INTO ' || v_arch_table
-                               || ' SELECT * FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE ACCOUNT_KEY = ?'
+                               || ' SELECT ft.* FROM ${catalog}.${schema}.FACT_TRANSACTION ft WHERE ft.ACCOUNT_KEY = ?'
+                               || ' AND NOT EXISTS (SELECT 1 FROM ' || v_arch_table
+                               || ' a WHERE a.TRANSACTION_ID = ft.TRANSACTION_ID)'
                     USING acct.ACCOUNT_KEY;
                 -- ACTIVITY_COUNT -> count what was archived for this key (no cited row-count register)
                 EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM ' || v_arch_table || ' WHERE ACCOUNT_KEY = ?'

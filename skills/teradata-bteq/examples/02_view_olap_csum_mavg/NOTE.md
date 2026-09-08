@@ -7,6 +7,11 @@ Source: fixture `ddl/views/03_vw_branch_performance.sql` (verbatim). Target: Dat
 - `LOCKING ROW FOR ACCESS` -> dropped (Teradata lock modifier, no Delta counterpart; skill §5).
 - `CSUM(x, k)` -> `SUM(x) OVER (ORDER BY k ROWS UNBOUNDED PRECEDING)`; `MAVG(x, n, k)` ->
   `AVG(x) OVER (ORDER BY k ROWS BETWEEN n-1 PRECEDING AND CURRENT ROW)` (skill §5 rows CSUM/MAVG/MSUM/MDIFF).
+  The source writes both without a partition, and a literal reading would give a running total across all branches.
+  The fixture's golden contract (`verify/expected/parity_checksums.csv`: `sum_cumulative_fees 208824.74`,
+  `sum_moving_avg_volume 6789480.28`, `verify/checks/20_branch_performance.sql`) is only reproduced with
+  `PARTITION BY BRANCH_ID` (an unpartitioned frame gives 2011770.49 / 6839911.08 on the seed data, checked with
+  DuckDB), so the conversion keeps the per-branch reset and records the divergence from the literal text here.
 - Nested aggregate inside a window (`SUM(SUM(...)) OVER`) -> lifted into a CTE so the window sits over grouped rows.
 - `NULLIFZERO` -> `nullif(x, 0)`; `ADD_MONTHS(CURRENT_DATE, -24)` -> `add_months(current_date(), -24)` (same month-end
   clamp on both engines for negative offsets, see skill §5).

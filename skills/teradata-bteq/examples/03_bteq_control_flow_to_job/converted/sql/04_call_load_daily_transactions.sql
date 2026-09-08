@@ -7,7 +7,7 @@ BEGIN
   DECLARE return_code INT;
 
   SET v_batch_id = (SELECT BATCH_ID FROM ${catalog}.${schema}.ETL_BATCH_CONTROL
-                    WHERE BATCH_DATE = current_date() AND BATCH_STATUS = 'STARTED');
+                    WHERE BATCH_STATUS = 'STARTED');
 
   CALL ${catalog}.${schema}.SP_LOAD_DAILY_TRANSACTIONS(
     current_date(), v_batch_id, rows_inserted, rows_rejected, return_code);

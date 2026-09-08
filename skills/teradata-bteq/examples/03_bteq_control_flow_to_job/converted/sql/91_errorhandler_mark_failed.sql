@@ -5,4 +5,4 @@
 UPDATE ${catalog}.${schema}.ETL_BATCH_CONTROL
 SET BATCH_STATUS = 'FAILED',
     END_TS = current_timestamp()
-WHERE BATCH_DATE = current_date() AND BATCH_STATUS = 'STARTED';
+WHERE BATCH_STATUS = 'STARTED';

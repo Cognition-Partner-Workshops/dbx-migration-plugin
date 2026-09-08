@@ -15,7 +15,12 @@ resource) plus one SQL file per task under `converted/sql/`.
 - `.LABEL` / `.GOTO` -> task keys and `depends_on` edges; `.QUIT 0/4/8` -> job run state + `BATCH_STATUS`; the
   numeric exit code is not reproduced (scheduler contract changes: record in the unit's runbook).
 - `CREATE VOLATILE TABLE VT_BATCH ... ON COMMIT PRESERVE ROWS` -> persisted `STARTED` row in `ETL_BATCH_CONTROL`;
-  tasks have no shared session (skill §6 "Volatile/global temp tables").
+  tasks have no shared session (skill §6 "Volatile/global temp tables"). Later tasks read "the one open batch"
+  (`WHERE BATCH_STATUS = 'STARTED'`, no date predicate, so a run crossing midnight still finds it). Two things keep
+  that lookup single-valued: the job is serialised (`max_concurrent_runs: 1` + `queue.enabled`), so `MAX(BATCH_ID) + 1`
+  cannot race; and `02_new_batch_id` first closes any orphaned `STARTED` row (a cancelled/timed-out run never reaches
+  the `AT_LEAST_ONE_FAILED` branch) as `FAILED`, logging a WARN row per orphan in `ETL_LOG`. The BTEQ never met the
+  orphan case because `VT_BATCH` died with the session; on the target it is an explicit step, not an accident.
 - `CALL proc(..., out1, out2, rc)` -> `CALL` inside a compound with `DECLARE`d OUT variables; `IF rc <> 0 THEN SIGNAL`.
 - `EXEC macro(...)` -> `CALL` of the procedure the macro became (example 05).
 - `.EXPORT REPORT FILE=... / .EXPORT RESET` -> report rows written to a Delta table; file export (if still
@@ -26,6 +31,9 @@ resource) plus one SQL file per task under `converted/sql/`.
 ## Recon tier that catches a wrong conversion
 - Missing error branch (a step fails but `ETL_BATCH_CONTROL` never gets `FAILED`): **Tier 1** row count on
   `ETL_BATCH_CONTROL` per `BATCH_DATE` grouped by `BATCH_STATUS` (`STARTED` rows left behind).
+- Two open batches after a same-day retry (orphan not closed, or two concurrent runs): **Tier 1** `count(*) WHERE
+  BATCH_STATUS = 'STARTED'` > 1 on the control table, and scalar-subquery failures in tasks 03-06 (`SET v_batch_id =
+  (SELECT ...)` returns more than one row); `ETL_LOG` WARN rows with `Orphaned STARTED batch` are the audit trail.
 - Note on the fixture: `STG_TRANSACTIONS`, `ETL_BATCH_CONTROL`, `ETL_LOG`, `RPT_*` have no DDL under `ddl/`; they are
   reached only through this script and the procedures, so lineage marks them INFERRED (skill §2) and the census must
   pull their DDL from `DBC.TablesV`/`SHOW TABLE` on a live engine (PR "Not verified live").
@@ -42,7 +50,7 @@ resource) plus one SQL file per task under `converted/sql/`.
 - `depends_on`, `run_if` values: `databricks-jobs` `SKILL.md` "Core Concepts / Multi-Task Workflows".
 - `sql_task.file`: `databricks-jobs` `references/task-types.md` "SQL Task / Run SQL File".
 - `timeout_seconds`, `max_retries`: `databricks-jobs` `references/notifications-monitoring.md` "Timeout
-  Configuration", "Retry Configuration".
+  Configuration", "Retry Configuration"; `max_concurrent_runs`, `queue.enabled`: same file, "Run Queue Settings".
 - `${var.*}` substitution: `databricks-dabs` `references/bundle-structure.md` (variables table).
 - `BEGIN ... END`, `DECLARE`, `SET var = (SELECT ...)`, `IF`, `SIGNAL SQLSTATE`, `CALL` with OUT variables:
   `databricks-dbsql` `references/sql-scripting.md` "Compound Statements", "Variable Assignment", "Control Flow",
@@ -53,4 +61,8 @@ resource) plus one SQL file per task under `converted/sql/`.
 ## Not verified live
 - That a `sql_task` running a `.sql` file accepts a multi-statement `BEGIN ... END` compound (the official skill shows
   the file form but not a scripting body inside it). If it does not, each file becomes a `CALL` of a small procedure.
-- Actual job-run behaviour of `AT_LEAST_ONE_FAILED` fan-in when an upstream task was skipped rather than failed.
+- Actual job-run behaviour of `AT_LEAST_ONE_FAILED` fan-in when an upstream task was skipped rather than failed, and
+  whether it runs at all on job cancel / `timeout_seconds` expiry (the orphan-closing step in `02_new_batch_id`
+  assumes it may not).
+- Passing a run-scoped batch token between `sql_task` files (job parameters into a SQL file are not shown in the
+  official skill read); the persisted single `STARTED` row is the substitute.

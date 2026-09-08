@@ -7,7 +7,7 @@ BEGIN
   DECLARE return_code INT;
 
   SET v_batch_id = (SELECT BATCH_ID FROM ${catalog}.${schema}.ETL_BATCH_CONTROL
-                    WHERE BATCH_DATE = current_date() AND BATCH_STATUS = 'STARTED');
+                    WHERE BATCH_STATUS = 'STARTED');
 
   CALL ${catalog}.${schema}.SP_CUSTOMER_SCD2(v_batch_id, new_rows, changed_rows, return_code);
 

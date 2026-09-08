@@ -3,5 +3,5 @@
 UPDATE ${catalog}.${schema}.ETL_BATCH_CONTROL
 SET BATCH_STATUS = 'COMPLETED',
     END_TS = current_timestamp()
-WHERE BATCH_DATE = current_date() AND BATCH_STATUS = 'STARTED';
+WHERE BATCH_STATUS = 'STARTED';
 -- DROP TABLE VT_BATCH: nothing to drop, the volatile table did not exist on the target.
