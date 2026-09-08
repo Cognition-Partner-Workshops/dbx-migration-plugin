@@ -6,8 +6,8 @@
 -- row is a plain INSERT.
 
 CREATE OR REPLACE PROCEDURE ${catalog}.${schema}.sp_apply_late_fees(
-    IN  cutoff_date TIMESTAMP_NTZ,
-    OUT rc          INT
+    IN  p_cutoff_date TIMESTAMP_NTZ,
+    OUT p_rc          INT
 )
 LANGUAGE SQL
 SQL SECURITY INVOKER
@@ -17,11 +17,11 @@ AS BEGIN
 
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
-        SET rc = 1;
+        SET p_rc = 1;
         RESIGNAL;
     END;
 
-    SET rc = 0;
+    SET p_rc = 0;
 
     -- Fee schedule shared by the UPDATE and the total: one definition, no drift between them.
     -- The source computed @total_fees from a second query keyed on late_fee_assessed = MAX(...);
@@ -38,7 +38,7 @@ AS BEGIN
     FROM ${catalog}.${schema}.loans
     WHERE loan_status = 'DL'
       AND days_past_due >= 15
-      AND (last_fee_date IS NULL OR last_fee_date < cutoff_date)
+      AND (last_fee_date IS NULL OR last_fee_date < p_cutoff_date)
       AND rtrim(loan_type) != 'VA';       -- defense in depth, as in the source
 
     SET (total_rows, total_fees) = (SELECT count(*), coalesce(sum(fee_amt), 0) FROM fee_targets);
@@ -50,12 +50,12 @@ AS BEGIN
     WHEN MATCHED THEN UPDATE SET
         t.late_fee_balance  = t.late_fee_balance + f.fee_amt,
         t.late_fee_assessed = t.late_fee_assessed + 1,
-        t.last_fee_date     = cutoff_date,
+        t.last_fee_date     = p_cutoff_date,
         t.modified_date     = current_timestamp();
 
     INSERT INTO ${catalog}.${schema}.audit_trail
         (action_type, action_date, table_name, record_count, new_value, user_name)
-    VALUES ('LATE_FEE', cutoff_date, 'loans', total_rows, cast(total_fees AS STRING), current_user());
+    VALUES ('LATE_FEE', p_cutoff_date, 'loans', total_rows, cast(total_fees AS STRING), current_user());
 
     DROP TABLE IF EXISTS fee_targets;
 END;

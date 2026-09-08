@@ -5,14 +5,21 @@
 # https://docs.databricks.com/aws/en/jobs/conditional-tasks (Run if semantics: AT_LEAST_ONE_FAILED tasks
 # are Excluded when unmet; Excluded cascades along linear chains), /aws/en/jobs/parameter-use (SQL tasks
 # read key-value parameters as :name; job parameters are pushed down to SQL tasks) and
-# /aws/en/jobs/dynamic-value-references ({{job.run_id}}).
+# /aws/en/jobs/dynamic-value-references ({{job.run_id}}), /aws/en/jobs/if-else and /aws/en/jobs/task-values
+# (If/else condition task on {{tasks.<task>.values.<key>}}; task values are set from Python notebooks with
+# dbutils.jobs.taskValues.set), and the condition_task / depends_on.outcome YAML shape from
+# /aws/en/dev-tools/bundles/resources (job example: condition_task op/left/right, depends_on outcome: 'true').
 #
 # Mapping from source.dtsx:
-#   SQL Count eligible + expression constraint  ->  folded into accrual's SQL as an IF guard (see note).
+#   SQL Count eligible (SingleRow -> EligibleCount)  ->  notebook task count_eligible setting task value eligible_count.
+#   Expression constraint @[User::EligibleCount] > 0 ->  If/else task check_eligible (GREATER_THAN); accrual depends on
+#                                                      outcome 'true'. When false, accrual is Excluded and the exclusion
+#                                                      cascades to fees and EOD, exactly like the unmet SSIS constraint.
 #   Success constraints (LogicalAnd)            ->  depends_on + run_if: ALL_SUCCESS (default).
-#   Failure constraints, LogicalAnd="False"     ->  one task with three depends_on + run_if: AT_LEAST_ONE_FAILED.
+#   Failure constraints, LogicalAnd="False"     ->  one task with several depends_on + run_if: AT_LEAST_ONE_FAILED.
 #   FailPackageOnFailure="True"                 ->  default: any failed task fails the run.
-#   OnError event handler (audit_trail row)     ->  same AT_LEAST_ONE_FAILED task + on_failure notification.
+#   OnError event handler (audit_trail row)     ->  same AT_LEAST_ONE_FAILED task (also depending on count_eligible,
+#                                                  since OnError is package-wide) + on_failure notification.
 #   $Project::ServerName connection manager     ->  catalog/schema job parameters (no server name survives).
 #   $Package::ServicerId (7) / User::ProcessingDate ((DT_DBDATE)GETDATE()) -> job parameters; ProcessingDate
 #     is evaluated inside SQL as current_date() so the job does not need a runtime-expression variable.
@@ -34,30 +41,51 @@ resources:
         on_failure:
           - ${var.ops_email}
       tasks:
-        # SQL Count eligible -> SQL Nightly accrual, constraint Success AND @[User::EligibleCount] > 0.
-        # The SingleRow result binding has no direct SQL-task equivalent (task values are set from Python
-        # notebooks: docs /jobs/task-values), so the guard is evaluated in the consuming task's SQL script:
-        #   USE CATALOG IDENTIFIER(:catalog);
-        #   USE SCHEMA  IDENTIFIER(:schema);
-        #   BEGIN
-        #     DECLARE eligible_count INT;
-        #     SET eligible_count = (SELECT count(*) FROM loans
-        #                           WHERE loan_status = 'AC' AND servicer_id = :servicer_id);
-        #     IF eligible_count > 0 THEN
-        #       CALL sp_nightly_accrual(current_date());
-        #     END IF;
-        #   END
-        # (databricks-dbsql references/sql-scripting.md: compound statement, SET, IF ... END IF, CALL;
-        #  IDENTIFIER clause is allowed for USE CATALOG/SCHEMA and table names, not for CALL targets:
-        #  docs sql-ref-names-identifier-clause.)
+        # SQL Count eligible with ResultSet=SingleRow bound to @[User::EligibleCount].
+        # A SQL task cannot publish a task value (task values are set only from Python notebooks:
+        # docs /jobs/task-values), so the count runs in a small notebook:
+        #   n = spark.sql(f"SELECT count(*) FROM {catalog}.{schema}.loans "
+        #                 "WHERE loan_status = 'AC' AND servicer_id = :sid", args={"sid": int(servicer_id)}).first()[0]
+        #   dbutils.jobs.taskValues.set(key="eligible_count", value=n)
+        # (catalog/schema/servicer_id arrive as base_parameters; job parameters are pushed down: /jobs/parameter-use).
+        - task_key: count_eligible
+          notebook_task:
+            notebook_path: ../src/count_eligible_loans.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              schema: "{{job.parameters.schema}}"
+              servicer_id: "{{job.parameters.servicer_id}}"
+
+        # Precedence constraint Count eligible -> Nightly accrual: Success AND @[User::EligibleCount] > 0
+        # (EvalOp=3 ExpressionAndConstraint). The expression becomes a graph-visible If/else task: accrual
+        # depends on the 'true' outcome, so on a zero count accrual never runs and the fees -> EOD Success
+        # chain behind it never fires either (dependents run "based on the results of the condition",
+        # docs /jobs/if-else; skipped tasks cascade: docs /jobs/conditional-tasks "If all of a task's
+        # dependencies are excluded, the task itself is also excluded"). Folding the guard into accrual's
+        # SQL (IF eligible_count > 0 THEN CALL ...) is NOT equivalent: that task would succeed having done
+        # nothing and the downstream Success edges would still fire. Live check: confirm the skipped tasks'
+        # result_state (EXCLUDED per the Jobs API run schema) on the first zero-count run.
+        - task_key: check_eligible
+          depends_on:
+            - task_key: count_eligible
+          condition_task:
+            op: GREATER_THAN                # numeric comparison (docs /jobs/if-else)
+            left: "{{tasks.count_eligible.values.eligible_count}}"
+            right: "0"
+
+        # SQL Nightly accrual: runs only on the 'true' outcome (depends_on.outcome, docs bundles/resources).
+        #   USE CATALOG IDENTIFIER(:catalog); USE SCHEMA IDENTIFIER(:schema);
+        #   CALL sp_nightly_accrual(current_date());
+        # (databricks-dbsql references/sql-scripting.md "CALL"; IDENTIFIER clause is allowed for USE
+        #  CATALOG/SCHEMA and table names, not for CALL targets: docs sql-ref-names-identifier-clause.)
         # Job parameters (catalog, schema, servicer_id) are pushed down automatically and read as :name.
-        # Alternative when the branch must be visible in the graph: notebook_task setting task value
-        # eligible_count + If/else condition task `{{tasks.count_eligible.values.eligible_count}} > 0`
-        # (docs /jobs/if-else), with accrual depending on the `true` outcome.
         - task_key: nightly_accrual
+          depends_on:
+            - task_key: check_eligible
+              outcome: "true"
           sql_task:
             file:
-              path: ../sql/nightly_accrual_guarded.sql
+              path: ../sql/sp_nightly_accrual_call.sql
               source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
 
@@ -84,11 +112,14 @@ resources:
             warehouse_id: ${var.warehouse_id}
 
         # Three Failure constraints with LogicalAnd="False" (OR) into SQL Log failure, plus the package
-        # OnError handler: one task, AT_LEAST_ONE_FAILED. Excluded (not failed) when the run is clean.
+        # OnError handler (which also covers Count eligible): one task, AT_LEAST_ONE_FAILED. Excluded (not
+        # failed) when the run is clean, and skipped on a zero-count run too (no dependency failed; skipped
+        # upstreams count as success for run_if: docs /jobs/conditional-tasks).
         # System::SourceName / System::ErrorDescription have no SQL-task equivalent; the run page and the
         # on_failure email carry them, the audit row records the job + run id instead.
         - task_key: log_failure
           depends_on:
+            - task_key: count_eligible
             - task_key: nightly_accrual
             - task_key: apply_late_fees
             - task_key: eod_reconciliation

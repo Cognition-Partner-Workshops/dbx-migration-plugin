@@ -72,11 +72,13 @@ FROM ${catalog}.${schema}.loans l
 JOIN ${catalog}.${schema}.borrowers b
   ON l.borrower_id = b.borrower_id
 -- Sybase:  AND l.loan_id *= m.loan_id AND (m.status = 'A' OR m.status IS NULL)
--- The inner-side predicate moves INTO the ON clause; a WHERE would turn the
--- outer join back into an inner join for loans whose only modifications are inactive.
+-- The inner-side predicate moves INTO the ON clause, verbatim: a WHERE would turn the
+-- outer join back into an inner join for loans whose only modifications are inactive,
+-- and dropping the IS NULL arm changes the match set whenever status can be NULL
+-- (the fixture declares it NOT NULL, but the conversion rule must not depend on that).
 LEFT JOIN ${catalog}.${schema}.loan_modifications m
   ON l.loan_id = m.loan_id
- AND m.status = 'A'
+ AND (m.status = 'A' OR m.status IS NULL)
 -- Sybase:  AND l.loan_id *= p.loan_id
 LEFT JOIN last_payment p
   ON l.loan_id = p.loan_id

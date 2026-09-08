@@ -9,7 +9,7 @@ Source: fixture `stored_procs/Servicing/sp_apply_late_fees.sql` (Sybase ASE 16).
 - `SELECT @v = expr` variable assignment -> `SET` / `SELECT ... INTO` (§5 row 88).
 - Business invariant carried over: VA loans never receive a fee (both in the fee schedule and in the predicate).
 - `@@identity` warning in the source comments: nothing to convert (no read-back), documented as the §7 trap.
-- `RETURN 0` -> `OUT rc`.
+- `RETURN 0` -> `OUT p_rc`; parameters carry the `p_` prefix (SKILL §7 "parameter shadowing").
 
 ## Lineage (FACT)
 Reads: `loans`. Writes: `loans`, `audit_trail`. Scheduler edge: cron daily (fixture comment `Schedule: Daily via cron`; called from `batch/run_nightly_batch.sh` step 2).

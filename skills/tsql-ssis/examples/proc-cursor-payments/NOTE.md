@@ -3,13 +3,13 @@
 Source: fixture `stored_procs/Servicing/sp_process_monthly_payments.sql` (Sybase ASE 16). Converted: `converted.sql` (DBSQL `CREATE PROCEDURE` + SQL scripting; the same body runs as a `sql_task` if procedures are not enabled on the warehouse).
 
 ## Constructs exercised
-- `OUTPUT` parameter (`@batch_id`) and `RETURN 0/1` -> `OUT batch_id`, `OUT rc` (SKILL §6 "CREATE PROCEDURE", "RETURN").
+- `OUTPUT` parameter (`@batch_id`) and `RETURN 0/1` -> `OUT p_batch_id`, `OUT p_rc` (SKILL §6 "CREATE PROCEDURE", "RETURN"). Every parameter carries a `p_` prefix: an unqualified name resolves as a column before a parameter/variable on Databricks (`[dbsql:names]`), so `l.servicer_id = servicer_id` or `p.batch_id = batch_id` would compare a column with itself and select every row (SKILL §7 "parameter shadowing").
 - `@@identity` after the audit insert -> `uuid()` run key + `SELECT audit_id INTO` read-back (SKILL §5 row 74, §7 "@@identity hijacked by triggers").
 - `SELECT ... INTO #eligible_loans` -> `CREATE TEMP TABLE` (SKILL §5 row 70).
 - `DECLARE CURSOR` / `FETCH` / `WHILE @@sqlstatus = 0` / `CLOSE` / `DEALLOCATE CURSOR` -> one set-based `INSERT ... SELECT` + `MERGE` (SKILL §6 "cursor" row; delta list item 4).
 - `@@error` + `GOTO error_handler` + cleanup -> `DECLARE EXIT HANDLER FOR SQLEXCEPTION` (SKILL §6 "error handling"; delta item 6).
 - `RAISERROR 50001 'msg %1!', @batch_id` -> `DECLARE ... CONDITION FOR SQLSTATE '45001'` + `SIGNAL ... SET MESSAGE_TEXT` (delta item 5).
-- Per-loan `BEGIN TRANSACTION ... COMMIT` -> single-statement atomicity per DML; cross-table (payments then loans) atomicity is not claimed (SKILL §6 "transactions": Preview `BEGIN ATOMIC` requires `catalogManaged` tables).
+- Per-loan `BEGIN TRANSACTION ... COMMIT / ROLLBACK` -> compensating `EXIT HANDLER` (SKILL §6 "transactions"). The compound statement is `NOT ATOMIC` (`[dbsql:scripting]` "Key rules"), so the handler deletes this batch's `PAYMENT_INS` audit rows and `payments`, and restores `loans.current_balance` from the pre-batch snapshot in `eligible_loans`; each step is a no-op for a write that never happened. Invariant preserved: no loan ever ends with a payment row but no balance update (the source's per-loan transaction guarantees exactly that). The `BEGIN ATOMIC ... END` route (Preview; every table `catalogManaged`) is noted in the file as the replacement once the tables are created with that property.
 - `MONEY` arithmetic (`@current_bal * (@interest_rate / 12.0 / 100.0)`) -> `round(..., 4)` at each source rounding point (SKILL §7 "MONEY arithmetic").
 - `ISNULL(e.total_escrow, $0.00)` -> `coalesce(..., CAST(0 AS DECIMAL(19,4)))` (§5 rows 1, 84).
 - `@@rowcount` -> `SELECT count(*) INTO` (§5 row 75).
@@ -22,8 +22,8 @@ Reads: `loans`, `escrow_accounts`; calls `fn_calculate_amortization`. Writes: `a
 ## Recon tier that catches a wrong conversion
 - **Tier 2 (aggregates)** on `payments WHERE batch_id = <batch>`: `sum(principal_amt)`, `sum(interest_amt)`, `sum(escrow_amt)`, `count(*)` vs the source batch. Missing `round(..., 4)` shows as cent-level drift in `sum(interest_amt)` once `decimal_round` places=4 has removed scale noise; a wrong final-payment clamp shows in `sum(principal_amt)`.
 - **Tier 1** on `audit_trail` rows per batch: 1 (`BATCH_START`) + N (`PAYMENT_INS`) — a conversion that forgets the trigger fold produces exactly 1.
-- **Tier 3** keyed on `loans.loan_id`: `current_balance` after the run (the `MERGE` must subtract exactly once per loan; a cursor-faithful loop that double-applied would show here).
-- Ordering assumption to record in the tolerance record: `payments` are inserted before `loans` is updated; a failure between them leaves payments without balance updates (source rolled back per loan). Not verifiable on the fixture.
+- **Tier 3** keyed on `loans.loan_id`: `current_balance` after the run (the `MERGE` must subtract exactly once per loan; a cursor-faithful loop that double-applied would show here). A shadowed `p_servicer_id` (all servicers processed) shows first as a Tier 1 count delta on `payments WHERE batch_id = <batch>`.
+- **Failure-injection replay** (Tier 4, on the migration catalog only): force the `MERGE` to fail (e.g. a NOT NULL violation via a seeded bad row) and assert Tier 1 on `payments`/`audit_trail` deltas = 0 and Tier 3 on `loans.current_balance` = pre-run snapshot. Without the compensating handler this replay leaves N payments and N audit rows with unchanged balances. Not verifiable on the fixture; the compensation assumes the nightly window has no concurrent `loans.current_balance` writers (same assumption the source runner makes).
 
 ## INFERRED edges
 None. `#eligible_loans` and `waterfall` are unit-local temp objects.
