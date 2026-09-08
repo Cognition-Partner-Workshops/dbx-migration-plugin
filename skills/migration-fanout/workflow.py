@@ -27,6 +27,11 @@ Manifest shape (written by the plan playbook, read here):
   "breaker_threshold": 3,
   "auto_merge": true,
   "child_minutes": 45,                        # soft time limit per child
+  "capabilities": {                           # optional; copied from .migration/09_capabilities.json
+    "identity": "<migration SP userName>",   # (factory-doctor). Children run the doctor with
+    "catalogs": ["mig"],                       # --expect-identity and report BLOCKED on mismatch.
+    "guard_mode": "block", "stop_mode": "hard", "ready": true
+  },
   "batches": [
     {"id": "w2-b01", "units": ["orders_load", "orders_dim"],
      "write_targets": ["mig.orders", "mig.orders_dim"],
@@ -115,6 +120,16 @@ def validate_manifest(m):
             if not b.get(key):
                 raise SystemExit(f"batch {b['id']} is missing '{key}' (a child with no brief or "
                                  "no declared write targets cannot be launched safely)")
+    if "capabilities" in m:
+        caps = m["capabilities"]
+        if not isinstance(caps, dict) or not isinstance(caps.get("identity"), str) or not caps["identity"]:
+            raise SystemExit("manifest 'capabilities' must be an object with a non-empty 'identity' "
+                             "(the migration principal's userName from 09_capabilities.json)")
+        if not isinstance(caps.get("catalogs"), list) or not caps["catalogs"]:
+            raise SystemExit("manifest 'capabilities.catalogs' must be the non-empty allowlist")
+        if caps.get("ready") is False:
+            raise SystemExit("manifest 'capabilities.ready' is false: the factory-doctor preflight failed; "
+                             "fix the D10 and re-run the doctor before launching a wave")
 
 
 validate_manifest(MANIFEST)
@@ -236,7 +251,8 @@ def child_prompt(batch):
         f"Units: {json.dumps(batch['units'], sort_keys=True)}\n"
         f"Write targets you own (never write anywhere else): "
         f"{json.dumps(batch.get('write_targets', []), sort_keys=True)}\n\n"
-        "Rules that override anything else:\n"
+        + capability_block()
+        + "Rules that override anything else:\n"
         "- Do not edit files under .migration/. The workflow writes the ledger from your report.\n"
         "- Do not merge your own PR.\n"
         "- status=PASS requires a live or snapshot recon PASS (result.json merge_eligible=true). "
@@ -245,6 +261,21 @@ def child_prompt(batch):
         "failure_class (for example 'timestamp_precision', 'decimal_rounding', 'missing_rule').\n"
         "- Report every rule you had to derive yourself in skill_feedback.\n"
         "- one_line_summary is for a human skimming 20 of these: what landed, or why not."
+    )
+
+
+def capability_block():
+    caps = MANIFEST.get("capabilities")
+    if not caps:
+        return ""
+    return (
+        "CAPABILITY CONTRACT (from the orchestrator's factory-doctor run): "
+        f"{json.dumps(caps, sort_keys=True)}\n"
+        f"Before converting anything run the factory-doctor skill with --role child "
+        f"--expect-identity {caps['identity']} and complete its hook probe. Any 'fail' row "
+        "(identity mismatch, harness missing, hooks not applied, allowlist differs from the contract) "
+        "means status=BLOCKED with the check id in one_line_summary. Never continue as a different "
+        "identity, never run `databricks auth login`, never edit .migration/allowed_targets.json.\n\n"
     )
 
 

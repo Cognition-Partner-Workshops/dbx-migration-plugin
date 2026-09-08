@@ -69,6 +69,48 @@ def test_validate_manifest_rejects_invalid_positive_integer(value):
         validate_manifest(manifest)
 
 
+def _manifest(**extra):
+    m = {"wave": 1, "repo": "repo", "child_macro": "child", "verify_macro": "verify",
+         "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
+    m.update(extra)
+    return m
+
+
+@pytest.mark.parametrize("caps", [
+    "sp@x",                                   # not a dict
+    {"catalogs": ["mig"]},                    # no identity
+    {"identity": "", "catalogs": ["mig"]},    # empty identity
+    {"identity": "sp-1", "catalogs": []},     # no catalogs
+    {"identity": "sp-1", "catalogs": ["mig"], "ready": False},
+])
+def test_validate_manifest_rejects_bad_capability_contract(caps):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="capabilities"):
+        validate_manifest(_manifest(capabilities=caps))
+
+
+def test_validate_manifest_accepts_capability_contract_and_absence():
+    validate_manifest = _functions()["validate_manifest"]
+    validate_manifest(_manifest())
+    validate_manifest(_manifest(capabilities={"identity": "sp-1", "catalogs": ["mig"], "ready": True,
+                                              "guard_mode": "block", "stop_mode": "hard"}))
+
+
+def test_child_prompt_embeds_capability_contract():
+    tree = ast.parse(WORKFLOW.read_text())
+    selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"child_prompt", "capability_block"}]
+    ns = {"json": __import__("json"), "WAVE": 1, "REPO": "repo",
+          "MANIFEST": _manifest(capabilities={"identity": "sp-1", "catalogs": ["mig"], "ready": True,
+                                             "guard_mode": "block", "stop_mode": "hard"})}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
+    text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+    assert "--expect-identity sp-1" in text
+    assert '"catalogs": ["mig"]' in text
+    assert "BLOCKED" in text
+    ns["MANIFEST"] = _manifest()
+    assert "expect-identity" not in ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+
+
 def test_replayed_failures_do_not_refill_breaker():
     namespace = _batch_runtime()
     namespace["REPLAYED"] = {f"b{i}": "FAIL" for i in range(3)}

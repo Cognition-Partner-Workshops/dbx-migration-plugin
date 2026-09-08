@@ -90,6 +90,8 @@ THIS PLAYBOOK  ->  .migration/00_context.md          engagement facts, topology,
                    .migration/05_progress.md         ledger: pipeline x wave x unit status
                    .migration/06_decisions.md        decision log with dates, owners, and provenance (`user:<id>` or `default-accepted`)
                    .migration/07_access_checklist.md D10 items, status, fired requests
+                   .migration/allowed_targets.json   write-scope contract read by dbx-recon and the PreToolUse guard
+                   .migration/09_capabilities.json   factory-doctor output: identity, harness, hooks, stop_mode
 ```
 
 ### What's Needed From User
