@@ -89,11 +89,12 @@ contain (Albion's `ods_policy_360`, whose DDL is not in the repo) is still a FAC
 |---|---|---|---|
 | View / MV | every `FROM`/`JOIN` table, view, MV, synonym-resolved object; `@dblink` targets are edges to an external estate node | MV writes its container table; MV log rows are edges `MASTER -> MLOG$_MASTER` | `@dblink` where `dba_db_links` is not readable (`risk=external-db-link`); `TABLE(fn(...))` (`risk=pipelined-function`) |
 | Package / procedure / function | `SELECT ... INTO`, `CURSOR c IS SELECT`, `OPEN c FOR SELECT` (static), `FOR r IN (SELECT ...)`, `%TYPE`/`%ROWTYPE` anchors, called subprograms (edge to `OWNER.PKG.MEMBER`) | `INSERT INTO`, `UPDATE`, `DELETE FROM`, `MERGE INTO`, `FORALL ... INSERT/UPDATE/DELETE`, `EXECUTE IMMEDIATE '<literal DDL/DML>'` with a constant string, `seq.NEXTVAL` (edge `PKG -> SEQ` typed `consumes-sequence`) | `EXECUTE IMMEDIATE` with concatenated identifiers (`risk=dynamic-sql`, record the literal prefix e.g. `INSERT INTO poladm.<var>`), `OPEN c FOR l_sql`, `DBMS_SQL.*`, `TABLE(CAST(... AS type))`, `%ROWTYPE` of a synonym to a dblink, `DBMS_*` calls that read/write outside SQL (`UTL_FILE`, `UTL_HTTP`, `DBMS_AQ`, `DBMS_PIPE`, `DBMS_LOB.LOADFROMFILE`: `risk=external-io`), `AUTHID CURRENT_USER` units (`risk=invoker-rights`, the referenced schema depends on the caller) |
-| Trigger | the base table (`:OLD`), any `SELECT` in the body, called subprograms | the base table (`:NEW` is an in-flight write), every DML in the body, `seq.NEXTVAL`; the trigger's *transitive* side-effect closure (its own writes/`NEXTVAL`, plus those of every routine it calls, recursively, cycle-safe, plus the triggers on the tables that closure writes) is added to every unit that writes the base table (trigger fan-out, `detail="trigger fan-out via TRG -> callee"`) | body dynamic SQL as above; `WHEN` clause referencing `SYS_CONTEXT` (`risk=session-context`) |
+| Trigger | the base table (`:OLD`), any `SELECT` in the body, called subprograms | the base table (`:NEW` is an in-flight write), every DML in the body, `seq.NEXTVAL`; the trigger's *transitive* side-effect closure (its own writes/`NEXTVAL`, plus those of every routine it calls, recursively, cycle-safe, plus the triggers on the tables that closure writes) is added to every unit whose write of the base table fires one of the trigger's declared events (`BEFORE INSERT OR UPDATE OF col` fires for `INSERT`, `UPDATE`, `MERGE`; not for `DELETE` or `TRUNCATE`; a `MERGE` with `DELETE WHERE` also fires `DELETE` triggers); every `writes` edge carries its events (`ops=INSERT|UPDATE`) and the fan-out edge records `detail="trigger fan-out via TRG -> callee"` | body dynamic SQL as above; `WHEN` clause referencing `SYS_CONTEXT` (`risk=session-context`) |
+| Table / index | `CREATE TABLE ... AS SELECT` (also `GLOBAL TEMPORARY ... AS (SELECT ...)`, `AS WITH ...`): every source of the subquery is a `reads` edge of the new table; `CREATE [UNIQUE|BITMAP] INDEX ix ON t (...)` is a `defines-on` edge `IX -> T` (function-based columns, `TABLESPACE`/`LOCAL` clauses do not matter) | a plain `CREATE TABLE` owns its text (`REFERENCES ... ON DELETE CASCADE` is not DML) and draws no edge | an index whose target is not a plain `ON name (` (quoted identifier, `ON CLUSTER c`) -> `UNVERIFIABLE risk=unparsed-index-target` rather than a silent omission |
 | Sequence | none | none; edges point *at* it | none. Record `last_number` for Lakebase `setval` parity |
 | Scheduler job / program / chain | `job_action`/`program_action` parsed like an anonymous block: every named subprogram is a `schedules` edge; chain steps -> programs | none directly | `job_type='EXECUTABLE'` or `EXTERNAL_SCRIPT` (`risk=os-script`), `job_action` referencing `&`/bind-like placeholders, `event_condition` jobs (`risk=aq-event`) |
 | SQL*Plus script | tables in embedded SQL; `@file`/`@@file`/`START` edges to other scripts (resolve relative to the script dir then `SQLPATH`) | embedded DML/DDL; `SPOOL` target (edge `SCRIPT -> FILE`) | `&var`/`&&var` inside identifiers (`risk=substitution-in-identifier`); `HOST`/`!` lines (`risk=os-shell`); `@file` not found in repo (`risk=missing-include`) |
-| Synonym | resolves to its target; edges are re-pointed to the target and the synonym is kept as an alias row | n/a | synonym with `db_link` (`risk=external-db-link`); synonym to a missing object (`risk=dangling-synonym`, keep the edge to the synonym) |
+| Synonym | resolves to its target *even when the synonym itself is in the census* (a private synonym shares the schema namespace with tables, so an enumerated `ODS.POLICY` synonym row never satisfies a lookup of `ods.policy`; the reader's edge goes to `POLADM.POLICY`); the synonym row stays and draws one `alias-of` edge to its target (FACT, INFERRED over a link, `not-in-census` target node when missing) | n/a | synonym with `db_link` (`risk=external-db-link`); synonym to a missing object (`risk=dangling-synonym`, the edge goes to the `not-in-census` target node) |
 | Database link | node of class `EXTERNAL_DB` with `host` | n/a | always INFERRED beyond the link itself: the remote estate is enumerated separately or listed as out of scope |
 | Dynamic SQL | literal statements are parsed as if static | same | anything with `||` or a bind inside an identifier position |
 | Temporary objects | GTT rows are census tables with `temporary='Y'`; edges are FACT | same | private temporary tables (`ORA$PTT_`) created in code (`risk=session-temp`); `DBMS_SQL` result sets |
@@ -114,20 +115,24 @@ commas only (`start_date => TO_TIMESTAMP_TZ('...', '...')` is one value). `CREAT
 `GLOBAL|PRIVATE TEMPORARY TABLE`, `[NON]EDITIONABLE`, `[NO] FORCE VIEW` and `PUBLIC` modifiers do not change the census
 class. SQL*Plus directives may be indented. A file that mixes DDL with top-level `INSERT`/`MERGE`/`UPDATE`/`DELETE`/
 `TRUNCATE` (outside every PL/SQL unit) gets one extra `DML SCRIPT` row named after the file that owns those writes;
-`ON DELETE CASCADE` and `GRANT ... DELETE ON` are not DML.
+`ON DELETE CASCADE` and `GRANT ... DELETE ON` are not DML. `DELETE FROM t` is a write only: the `FROM` after `DELETE`
+is never a read, while `FROM`/`IN (SELECT ... FROM u)` subqueries inside the same `DELETE` remain reads of `u`.
 
 Round-trip on the fixture (`python3 examples/round_trip.py`, static text only, writes `examples/round_trip_report.md`):
 15 files, 48 census rows (6 tables, 5 indexes, 2 sequences, 3 views, 1 MV + 2 MV logs, package + 4 members,
 procedure, function, trigger, scheduler job + program, 2 synonyms, db link, 8 grants, 2 roles, 2 role memberships,
-VPD + redaction policy, 1 SQL*Plus script, 1 DML script), 47 edges = 44 FACT, 3 INFERRED, 0 UNVERIFIABLE. The
+VPD + redaction policy, 1 SQL*Plus script, 1 DML script), 54 edges = 51 FACT, 3 INFERRED, 0 UNVERIFIABLE. The
 INFERRED three are exactly the constructs built to be dynamic: `PKG_POLICY_RENEWAL` `EXECUTE IMMEDIATE l_sql`
 (literal prefix `INSERT INTO poladm.` recorded), `V_CLAIMS_REMOTE` over `claims.claim@claims_link`, and
 `FN_BROKER_PREDICATE`'s VPD predicate string naming `ods.v_broker_hierarchy`. `RPT_POLICY_PAGE`'s `&as_of` sits in a
 literal position (`TO_DATE('&as_of', ...)`), so its three reads stay FACT. Five of the FACT edges are transitive
 trigger fan-out: `MRG_POLICY_FROM_STG` and `PKG_POLICY_RENEWAL` write `POLICY`, `TRG_POLICY_BIU` calls
-`PRC_LOG_EVENT`, so both inherit `writes POLICY_AUDIT_LOG` and `consumes-sequence AUDIT_SEQ`.
-`python3 examples/round_trip.py --selftest` runs 14 negative cases (one unsupported construct each, must produce the
-named `UNVERIFIABLE` risk), 13 positive cases (look-alike supported syntax `FOR UPDATE OF`, `EXTRACT(... FROM)`,
+`PRC_LOG_EVENT`, so both inherit `writes POLICY_AUDIT_LOG` and `consumes-sequence AUDIT_SEQ` (`MRG_POLICY_FROM_STG`
+writes with `DELETE|INSERT|UPDATE`, `PKG_POLICY_RENEWAL` with `UPDATE`; both overlap the trigger's `INSERT|UPDATE`).
+Five FACT edges are index `defines-on` (`POLICY_PARTY_IX -> POLICY`, ...) and two are synonym `alias-of`
+(`PUBLIC.BROKER -> POLADM.BROKER`, `ODS.POLICY -> POLADM.POLICY`).
+`python3 examples/round_trip.py --selftest` runs 15 negative cases (one unsupported construct each, must produce the
+named `UNVERIFIABLE` risk, including a quoted index target), 18 positive cases (look-alike supported syntax `FOR UPDATE OF`, `EXTRACT(... FROM)`,
 `WHEN MATCHED THEN UPDATE ... DELETE WHERE`, `coll.DELETE`, `DELETE t` without `FROM`, must produce none; multiple and
 recursive CTEs keep their base-table edges and create no alias nodes; a CTE name reused as a real table in the next
 statement is an edge; a qualified `claims.broker` bypasses the `PUBLIC` synonym while unqualified `broker` uses it;
@@ -137,7 +142,14 @@ a `SQLPLUS_SCRIPT` with its reads while `UPDATE ... SET` / `EXECUTE IMMEDIATE` i
 `q'!...!'` `program_action` with several statements and a `);` inside yields every `calls`/`writes` edge; `CREATE TABLE`
 + `INSERT`/`MERGE`/`UPDATE` in one file yields the `DML SCRIPT` writes without attributing them to a procedure in the
 same file, while a DDL-only file with `ON DELETE CASCADE` and `GRANT ... DELETE` yields no script row; `'a;b'`,
-`q'[x;y]'`, `"c;d"` and `'it''s;'` inside a view or MV projection keep the base-table reads), and the fixture
+`q'[x;y]'`, `"c;d"` and `'it''s;'` inside a view or MV projection keep the base-table reads; ordinary, `UNIQUE` and
+`BITMAP` indexes (also declared before their table, function-based, with `TABLESPACE`/`LOCAL`) draw `defines-on` edges;
+CTAS, GTT-as-select and `AS WITH` tables read every source without a CTE node; `DELETE FROM t`, `DELETE t WHERE EXISTS
+(SELECT ... FROM p)` and `... IN (SELECT ... FROM q)` write `t` and read only `p`/`q`; `INSERT`-, `UPDATE OF`- and
+`DELETE`-only triggers fan out only to procedures performing that operation, a `MERGE` without `DELETE WHERE` fires the
+first two, a dynamic `TRUNCATE` fires none; an enumerated private or `PUBLIC` synonym resolves readers to its target
+while keeping its alias row and `alias-of` edge, including targets missing from the census and targets over a db link),
+and the fixture
 invariants (zero `UNVERIFIABLE`, the transitive fan-out edges present, the scheduler `start_date` captured as the full
 `TO_TIMESTAMP_TZ(...)` expression, no CTE alias node, no Albion-only nodes without the Albion input). Albion
 `pkg_policy_inquiry.sql`: 3 census

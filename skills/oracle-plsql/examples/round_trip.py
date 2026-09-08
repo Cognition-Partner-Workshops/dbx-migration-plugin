@@ -73,6 +73,7 @@ class Edge:
     evidence: str                   # FACT | INFERRED | UNVERIFIABLE
     risk: str = ""
     detail: str = ""
+    ops: str = ""                   # writes only: DML events fired on dst (INSERT|UPDATE|DELETE), "" when unknown
 
 
 QQUOTE_CLOSER = {"[": "]", "(": ")", "{": "}", "<": ">"}
@@ -253,12 +254,14 @@ class Estate:
             self.add(key, "EXTERNAL_TABLE", "-", ).status = "external"
             return key, "INFERRED", "external-db-link"
         key = norm(raw, default_owner)
-        if key in self.nodes:
-            return key, "FACT", ""
         _owner, bare = key.split(".", 1)
         # Oracle resolution order for an UNQUALIFIED name: own-schema object, private synonym, public synonym.
-        # A qualified OWNER.NAME never falls through to a same-named public synonym.
-        syn = self.synonyms.get(key) or (self.public_synonyms.get(bare) if "." not in raw else None)
+        # A qualified OWNER.NAME never falls through to a same-named public synonym. A private synonym shares the
+        # schema namespace with tables, so its census row is an alias row, never the edge target.
+        syn = self.synonyms.get(key) or (
+            self.public_synonyms.get(bare) if "." not in raw and key not in self.nodes else None)
+        if key in self.nodes and not syn:
+            return key, "FACT", ""
         if syn:
             if "@" in syn:
                 self.add(syn, "EXTERNAL_TABLE", "-").status = "external"
@@ -271,9 +274,9 @@ class Estate:
         self.add(key, "TABLE", "-").status = "not-in-census"
         return key, "FACT", ""
 
-    def edge(self, src: str, raw_dst: str, kind: str, default_owner: str, detail: str = "") -> None:
+    def edge(self, src: str, raw_dst: str, kind: str, default_owner: str, detail: str = "", ops: str = "") -> None:
         dst, evidence, risk = self.resolve(raw_dst, default_owner)
-        self.edges.append(Edge(src, dst, kind, evidence, risk, detail))
+        self.edges.append(Edge(src, dst, kind, evidence, risk, detail, ops))
 
 
 # --------------------------------------------------------------------------- census (section 1)
@@ -298,6 +301,8 @@ REDACT_RE = re.compile(r"DBMS_REDACT\.ADD_POLICY\s*\(", re.I)
 LOOSE_DML_RE = re.compile(
     rf"\b(?:INSERT\s+INTO|MERGE\s+INTO|TRUNCATE\s+TABLE)\s+{QNAME}|\bUPDATE\s+{QNAME}\s+SET\b|\bDELETE\s+(?:FROM\s+)?{QNAME}\s*(?:WHERE\b|;)",
     re.I)
+CTAS_RE = re.compile(r"\bAS\s*\(?\s*(?:SELECT|WITH)\b", re.I)
+INDEX_ON_RE = re.compile(rf"\s+ON\s+({QNAME})\s*\(", re.I)
 GRANT_RE = re.compile(rf"GRANT\s+([A-Z ,()_]+?)\s+ON\s+({QNAME})\s+TO\s+({IDENT})", re.I)
 ROLE_GRANT_RE = re.compile(rf"GRANT\s+({IDENT})\s+TO\s+({IDENT})\s*;", re.I)
 
@@ -323,7 +328,9 @@ def uncovered(text: str, covered: list[tuple[int, int]]) -> str:
     return "".join(out)
 
 
-def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list, proc_units: list, grants: list) -> None:
+def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list, proc_units: list, deferred: list) -> None:
+    """`deferred` collects (src, raw_dst, kind, owner) edges whose target may be enumerated by a later file (grants,
+    index base tables, synonym targets); `run` resolves them after the whole census."""
     raw = path.read_text()
     text = normalize_qquotes(strip_comments(raw))
     # same offsets as `text`, string literals blanked: object headers are never matched inside a literal
@@ -341,12 +348,14 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
         est.public_synonyms[m.group(1).upper()] = norm(m.group(2).split("@")[0], default_owner) + (
             "@" + m.group(2).split("@")[1].upper() if "@" in m.group(2) else "")
         est.add(f"PUBLIC.{m.group(1).upper()}", "PUBLIC SYNONYM", fname)
+        deferred.append((f"PUBLIC.{m.group(1).upper()}", m.group(2), "alias-of", default_owner))
     for m in PRIV_SYN_RE.finditer(blanked):
         if re.search(r"PUBLIC\s+SYNONYM\s+" + re.escape(m.group(1)), blanked, re.I):
             continue
         est.synonyms[norm(m.group(1), default_owner)] = norm(m.group(2).split("@")[0], default_owner) + (
             "@" + m.group(2).split("@")[1].upper() if "@" in m.group(2) else "")
         est.add(norm(m.group(1), default_owner), "SYNONYM", fname)
+        deferred.append((norm(m.group(1), default_owner), m.group(2), "alias-of", default_owner))
     for m in CREATE_RE.finditer(blanked):
         cls = re.sub(r"\s+", " ", m.group(1).upper())
         name = m.group(2)
@@ -373,6 +382,15 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
                                                  re.match(r"NUMBER$|DATE|CHAR|TIMESTAMP|RAW|CLOB|BINARY|INTERVAL", c[1], re.I)})
             node.signals["constraints"] = len(re.findall(r"CONSTRAINT\s+\w+", body, re.I))
             node.signals["temporary"] = bool(re.search(r"TEMPORARY\s+TABLE\s+" + re.escape(name), blanked, re.I))
+            if CTAS_RE.search(blanked[m.end():stmt_end]):
+                node.signals["ctas"] = True                 # CREATE TABLE ... AS SELECT: the subquery's reads are lineage
+                proc_units.append((key, cls, text[m.start():stmt_end]))
+        if cls == "INDEX":
+            im = INDEX_ON_RE.match(blanked, m.end())
+            if im:
+                deferred.append((key, im.group(1), "defines-on", default_owner))
+            else:
+                unverifiable(est, key, default_owner, "defines-on", "unparsed-index-target", text[m.start():stmt_end])
         if cls in PROCEDURAL_CREATE:
             # a PL/SQL unit ends at its SQL*Plus '/' (or at the next object header when a file has no '/')
             end = next((e for s, e in spans if s <= m.start() < e), len(text))
@@ -418,7 +436,7 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
         priv, obj, grantee = m.groups()
         key = f"GRANT.{grantee.upper()}.{norm(obj, default_owner)}.{re.sub(r'[^A-Z]', '', priv.upper().split('(')[0])}"
         est.add(key, "GRANT", fname, public=grantee.upper() == "PUBLIC", column_level="(" in priv)
-        grants.append((key, obj, default_owner))
+        deferred.append((key, obj, "defines-on", default_owner))
     for m in ROLE_GRANT_RE.finditer(blanked):
         est.add(f"ROLEGRANT.{m.group(2).upper()}.{m.group(1).upper()}", "ROLE MEMBERSHIP", fname)
     # top-level DML outside every procedural unit / DDL statement (loose MERGE files, anonymous blocks, seed rows
@@ -454,6 +472,29 @@ STRING_LIT_RE = re.compile(r"'(?:[^']|'')*'")
 LINEAGE_KW_RE = re.compile(
     r"\b(INSERT\s+INTO|MERGE\s+INTO|TRUNCATE\s+TABLE|DELETE\s+FROM|DELETE|UPDATE|FROM|JOIN)\s*(\S{0,40})", re.I)
 NEXT_IDENT_RE = re.compile(rf"^{QNAME}(?:@{IDENT})?\b")
+
+
+TRIGGER_EVENTS_RE = re.compile(r"\b(INSERT|UPDATE|DELETE)\b", re.I)
+
+
+def trigger_events(header: str) -> str:
+    """'INSERT|UPDATE' for `BEFORE INSERT OR UPDATE OF col ON t`; '' when the timing clause is not recognised."""
+    tm = re.search(r"\b(?:BEFORE|AFTER|INSTEAD\s+OF)\b(.*?)\bON\b", header, re.I | re.S)
+    if not tm:
+        return ""
+    return "|".join(sorted({e.upper() for e in TRIGGER_EVENTS_RE.findall(tm.group(1))}))
+
+
+def dml_ops(verb: str, statement: str) -> str:
+    """DML events a statement fires on its target: MERGE is INSERT|UPDATE (+DELETE with `DELETE WHERE`); TRUNCATE is
+    DDL and fires no row trigger, so it carries the pseudo-event TRUNCATE."""
+    verb = re.sub(r"\s+", " ", verb.strip())
+    if verb.startswith("MERGE"):
+        ops = {"INSERT", "UPDATE"}
+        if re.search(r"\bDELETE\s+WHERE\b", statement, re.I):
+            ops.add("DELETE")
+        return "|".join(sorted(ops))
+    return verb.split(" ")[0]
 
 
 def preceding_word(text: str, pos: int) -> str:
@@ -554,8 +595,10 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
     if cls == "TRIGGER":
         tm = TRIGGER_ON_RE.search(static)
         if tm:
-            est.edge(key, tm.group(1), "defines-on", owner)
-            est.edge(key, tm.group(1), "writes", owner, ":NEW in-flight row")
+            events = trigger_events(static[:tm.end()])
+            est.nodes[key].signals["events"] = events
+            est.edge(key, tm.group(1), "defines-on", owner, ops=events)
+            est.edge(key, tm.group(1), "writes", owner, ":NEW in-flight row", ops=events)
     for stmt in static.split(";"):                      # CTE names are statement-local: scope them per statement
         ctes = {m.group(1).upper() for m in CTE_RE.finditer(stmt)}
         for m in READ_RE.finditer(stmt):
@@ -564,13 +607,16 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
                 continue
             if "." not in name and name.upper() in ctes:
                 continue                                 # a WITH-clause alias, not a physical object (its body is scanned)
+            if preceding_word(stmt, m.start()) == "DELETE":
+                continue                                 # DELETE FROM t: a write (WRITE_RE), not a query source
             est.edge(key, name, "reads", owner)
     for m in WRITE_RE.finditer(static):
         if m.group(1).split(".")[-1].upper() in KEYWORDS | {"OF", "FROM"}:
             continue  # `UPDATE ON t`, `UPDATE OF col`, `UPDATE SET` inside MERGE are not writes
         if preceding_word(static, m.start()) in ("FOR", "THEN", "OR", "BEFORE", "AFTER") or m.group(1).upper().endswith(".DELETE"):
             continue  # FOR UPDATE t?, trigger event lists, collection.DELETE
-        est.edge(key, m.group(1), "writes", owner)
+        verb = m.group(0)[:m.start(1) - m.start()].upper()
+        est.edge(key, m.group(1), "writes", owner, ops=dml_ops(verb, static[m.start():statement_end(static, m.end())]))
     for m in SEQ_RE.finditer(static):
         est.edge(key, m.group(1), "consumes-sequence", owner)
     for m in MVIEW_REFRESH_RE.finditer(text):
@@ -612,15 +658,15 @@ def run(fixture_dir: Path, albion: Path | None) -> dict:
     est = Estate()
     sqlplus_units: list = []
     proc_units: list = []
-    grants: list = []
+    deferred: list = []
     files = sorted(fixture_dir.glob("*.sql"))
     for p in files:
-        census_file(est, p, "POLADM", sqlplus_units, proc_units, grants)
+        census_file(est, p, "POLADM", sqlplus_units, proc_units, deferred)
     albion_units: list = []
     if albion and albion.exists():
-        census_file(est, albion, "ODS", [], albion_units, grants)
-    for key, obj, owner in grants:  # resolved after the whole census so cross-file grants land on enumerated nodes
-        est.edge(key, obj, "defines-on", owner)
+        census_file(est, albion, "ODS", [], albion_units, deferred)
+    for key, obj, kind, owner in deferred:  # resolved after the whole census so cross-file targets land on enumerated nodes
+        est.edge(key, obj, kind, owner)
     # lineage
     for key, cls, text in proc_units + albion_units:
         lineage_unit(est, key, cls, text, key.split(".")[0])
@@ -631,16 +677,23 @@ def run(fixture_dir: Path, albion: Path | None) -> dict:
         est.add("TERADATA.STG_POLICY_360", "EXTERNAL_TABLE", "docs").status = "external"
         est.edges.append(Edge("TERADATA.STG_POLICY_360", "ODS.ODS_POLICY_360", "replication", "INFERRED", "freshness",
                               "GoldenGate nightly copy, up to 26h stale (architecture_overview.md)"))
+    dedupe_edges(est)
     trigger_fan_out(est)
-    # dedupe
-    seen, uniq = set(), []
+    dedupe_edges(est)
+    return {"nodes": est.nodes, "edges": est.edges, "files": [p.name for p in files], "albion": bool(albion_units)}
+
+
+def dedupe_edges(est: Estate) -> None:
+    """One edge per (src, dst, kind, evidence, risk); the DML events of merged write edges are unioned."""
+    keep: dict[tuple, Edge] = {}
     for e in est.edges:
         k = (e.src, e.dst, e.kind, e.evidence, e.risk)
-        if k not in seen:
-            seen.add(k)
-            uniq.append(e)
-    est.edges = uniq
-    return {"nodes": est.nodes, "edges": est.edges, "files": [p.name for p in files], "albion": bool(albion_units)}
+        if k in keep:
+            if e.ops and keep[k].ops != e.ops:
+                keep[k].ops = "|".join(sorted(set(keep[k].ops.split("|")) | set(e.ops.split("|")))) if keep[k].ops else e.ops
+        else:
+            keep[k] = e
+    est.edges = list(keep.values())
 
 
 def side_effect_closure(est: Estate, root: str) -> list[Edge]:
@@ -674,13 +727,16 @@ def trigger_fan_out(est: Estate) -> None:
         existing = {(e.src, e.dst, e.kind) for e in est.edges}
         for t in triggers:
             closure = [c for c in side_effect_closure(est, t.src) if c.dst != t.dst]
-            writers = {w.src for w in est.edges if w.kind == "writes" and w.dst == t.dst and w.src != t.src}
+            events = set(t.ops.split("|")) if t.ops else set()
+            # only writers whose DML events the trigger declares fire it; a write of unknown shape is assumed to fire
+            writers = {w.src for w in est.edges if w.kind == "writes" and w.dst == t.dst and w.src != t.src
+                       and (not events or not w.ops or events & set(w.ops.split("|")))}
             for w in writers:
                 for c in closure:
                     if w in (c.src, c.dst) or (w, c.dst, c.kind) in existing:
                         continue
                     via = f"trigger fan-out via {t.src}" + (f" -> {c.src}" if c.src != t.src else "")
-                    est.edges.append(Edge(w, c.dst, c.kind, "FACT", "", via))
+                    est.edges.append(Edge(w, c.dst, c.kind, "FACT", "", via, c.ops))
                     existing.add((w, c.dst, c.kind))
                     added += 1
         if not added:
@@ -713,7 +769,7 @@ def report(res: dict) -> tuple[str, int]:
     out += ["", "## Census (fixture + Albion)", "", "| key | class | file | signals |", "|---|---|---|---|"]
     out += [f"| {k} | {n.cls} | {n.file} | {json.dumps(n.signals, sort_keys=True) if n.signals else ''} |" for k, n in sorted(nodes.items())]
     out += ["", "## FACT edges", "", "| src | dst | kind | detail |", "|---|---|---|---|"]
-    out += [f"| {e.src} | {e.dst} | {e.kind} | {e.detail} |" for e in edges if e.evidence == "FACT"]
+    out += [f"| {e.src} | {e.dst} | {e.kind} | {e.detail}{' [' + e.ops + ']' if e.ops else ''} |" for e in edges if e.evidence == "FACT"]
     unverifiable = ev["UNVERIFIABLE"] + aev["UNVERIFIABLE"]
     return "\n".join(out) + "\n", unverifiable
 
@@ -743,6 +799,7 @@ NEGATIVE_CASES: dict[str, tuple[str, str]] = {
                  "external-side-effect-package"),
     "unresolved_pkg_call": ("CREATE OR REPLACE PROCEDURE poladm.p_up IS BEGIN some_unknown_pkg.do_it(1); END;", "unresolved-qualified-call"),
     "mview_refresh_var": ("CREATE OR REPLACE PROCEDURE poladm.p_mv (l IN VARCHAR2) IS BEGIN DBMS_MVIEW.REFRESH(l); END;", "mview-refresh-non-literal"),
+    "index_quoted_target": ("CREATE INDEX poladm.ix_q ON \"POLADM\".\"Policy\" (id);", "unparsed-index-target"),
 }
 POSITIVE_TEXT = """
 CREATE TABLE poladm.t_ok (id NUMBER, d DATE);
@@ -817,7 +874,81 @@ POSITIVE_CASES: dict[str, Case] = {
         "CREATE UNIQUE INDEX poladm.ux_t_u ON poladm.t_u (id);\n"
         "CREATE BITMAP INDEX poladm.bx_t_u ON poladm.t_u (flag);\n"
         "CREATE INDEX poladm.ix_t_u ON poladm.t_u (flag, id);",
+        want={("POLADM.UX_T_U", "POLADM.T_U", "defines-on"), ("POLADM.BX_T_U", "POLADM.T_U", "defines-on"),
+              ("POLADM.IX_T_U", "POLADM.T_U", "defines-on")},
         want_nodes={("POLADM.UX_T_U", "INDEX"), ("POLADM.BX_T_U", "INDEX"), ("POLADM.IX_T_U", "INDEX"), ("POLADM.T_U", "TABLE")},
+    ),
+    "index_base_table_in_later_file_and_function_based": Case(
+        "CREATE UNIQUE INDEX poladm.ux_later ON poladm.t_later (UPPER(code), TRUNC(d));\n"
+        "CREATE INDEX poladm.ix_later ON poladm.t_later (id)\n  TABLESPACE idx_ts LOCAL;\n"
+        "CREATE TABLE poladm.t_later (id NUMBER, code VARCHAR2(10), d DATE);",
+        want={("POLADM.UX_LATER", "POLADM.T_LATER", "defines-on"), ("POLADM.IX_LATER", "POLADM.T_LATER", "defines-on")},
+        want_nodes={("POLADM.T_LATER", "TABLE")},
+    ),
+    "ctas_reads_every_source": Case(
+        "CREATE TABLE poladm.policy_bak AS SELECT p.*, b.name FROM poladm.policy p JOIN poladm.broker b ON b.id = p.broker_id;\n"
+        "CREATE GLOBAL TEMPORARY TABLE poladm.gtt_cp ON COMMIT PRESERVE ROWS AS (SELECT id FROM poladm.party WHERE 1 = 0);\n"
+        "CREATE TABLE poladm.t_with AS WITH x AS (SELECT id FROM poladm.premium_txn) SELECT * FROM x;\n"
+        "CREATE TABLE poladm.t_plain (id NUMBER, d DATE DEFAULT SYSDATE);",
+        want={("POLADM.POLICY_BAK", "POLADM.POLICY", "reads"), ("POLADM.POLICY_BAK", "POLADM.BROKER", "reads"),
+              ("POLADM.GTT_CP", "POLADM.PARTY", "reads"), ("POLADM.T_WITH", "POLADM.PREMIUM_TXN", "reads")},
+        forbid={"POLADM.CTAS_READS_EVERY_SOURCE", "POLADM.X"},
+        forbid_edges={("POLADM.T_WITH", "POLADM.X", "reads")},
+        want_nodes={("POLADM.POLICY_BAK", "TABLE"), ("POLADM.GTT_CP", "TABLE"), ("POLADM.T_WITH", "TABLE"), ("POLADM.T_PLAIN", "TABLE")},
+    ),
+    "delete_from_is_a_write_not_a_read": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.p_del IS BEGIN\n"
+        "  DELETE FROM poladm.stg_a WHERE loaded = 'Y';\n"
+        "  DELETE poladm.stg_b WHERE EXISTS (SELECT 1 FROM poladm.policy p WHERE p.id = stg_b.id);\n"
+        "  DELETE FROM poladm.stg_c c WHERE c.party_id IN (SELECT id FROM poladm.party WHERE status = 'X');\n"
+        "END;",
+        want={("POLADM.P_DEL", "POLADM.STG_A", "writes"), ("POLADM.P_DEL", "POLADM.STG_B", "writes"),
+              ("POLADM.P_DEL", "POLADM.STG_C", "writes"), ("POLADM.P_DEL", "POLADM.POLICY", "reads"),
+              ("POLADM.P_DEL", "POLADM.PARTY", "reads")},
+        forbid_edges={("POLADM.P_DEL", "POLADM.STG_A", "reads"), ("POLADM.P_DEL", "POLADM.STG_B", "reads"),
+                      ("POLADM.P_DEL", "POLADM.STG_C", "reads")},
+    ),
+    "trigger_fan_out_matches_dml_events": Case(
+        "CREATE TABLE poladm.t_ev (id NUMBER, v NUMBER);\n"
+        "CREATE OR REPLACE PROCEDURE poladm.log_i IS BEGIN INSERT INTO poladm.log_ins VALUES (1); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.log_u IS BEGIN INSERT INTO poladm.log_upd VALUES (1); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.log_d IS BEGIN INSERT INTO poladm.log_del VALUES (1); END;\n/\n"
+        "CREATE OR REPLACE TRIGGER poladm.trg_i BEFORE INSERT ON poladm.t_ev FOR EACH ROW BEGIN poladm.log_i(); END;\n/\n"
+        "CREATE OR REPLACE TRIGGER poladm.trg_u AFTER UPDATE OF v ON poladm.t_ev FOR EACH ROW BEGIN poladm.log_u(); END;\n/\n"
+        "CREATE OR REPLACE TRIGGER poladm.trg_d AFTER DELETE ON poladm.t_ev FOR EACH ROW BEGIN poladm.log_d(); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_ins IS BEGIN INSERT INTO poladm.t_ev VALUES (1, 1); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_upd IS BEGIN UPDATE poladm.t_ev SET v = 2; END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_del IS BEGIN DELETE FROM poladm.t_ev WHERE id = 1; END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_mrg IS BEGIN MERGE INTO poladm.t_ev t USING poladm.src s ON (t.id = s.id)\n"
+        "  WHEN MATCHED THEN UPDATE SET t.v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_trunc IS BEGIN EXECUTE IMMEDIATE 'TRUNCATE TABLE poladm.t_ev'; END;",
+        want={("POLADM.P_INS", "POLADM.LOG_INS", "writes"), ("POLADM.P_UPD", "POLADM.LOG_UPD", "writes"),
+              ("POLADM.P_DEL", "POLADM.LOG_DEL", "writes"), ("POLADM.P_MRG", "POLADM.LOG_INS", "writes"),
+              ("POLADM.P_MRG", "POLADM.LOG_UPD", "writes")},
+        forbid_edges={("POLADM.P_INS", "POLADM.LOG_UPD", "writes"), ("POLADM.P_INS", "POLADM.LOG_DEL", "writes"),
+                      ("POLADM.P_UPD", "POLADM.LOG_INS", "writes"), ("POLADM.P_UPD", "POLADM.LOG_DEL", "writes"),
+                      ("POLADM.P_DEL", "POLADM.LOG_INS", "writes"), ("POLADM.P_DEL", "POLADM.LOG_UPD", "writes"),
+                      ("POLADM.P_MRG", "POLADM.LOG_DEL", "writes"), ("POLADM.P_TRUNC", "POLADM.LOG_INS", "writes"),
+                      ("POLADM.P_TRUNC", "POLADM.LOG_UPD", "writes"), ("POLADM.P_TRUNC", "POLADM.LOG_DEL", "writes")},
+    ),
+    "enumerated_synonym_resolves_to_target": Case(
+        "CREATE TABLE poladm.policy (id NUMBER);\n"
+        "CREATE TABLE poladm.broker (id NUMBER);\n"
+        "CREATE OR REPLACE SYNONYM poladm.pol_syn FOR poladm.policy;\n"
+        "CREATE OR REPLACE PUBLIC SYNONYM brk FOR poladm.broker;\n"
+        "CREATE OR REPLACE SYNONYM poladm.missing_syn FOR poladm.not_enumerated;\n"
+        "CREATE OR REPLACE SYNONYM poladm.remote_syn FOR claims.claim@claims_link;\n"
+        "CREATE OR REPLACE VIEW poladm.v_syn AS SELECT p.id FROM pol_syn p JOIN brk b ON b.id = p.id;\n"
+        "CREATE OR REPLACE VIEW poladm.v_miss AS SELECT 1 FROM poladm.missing_syn;\n"
+        "CREATE OR REPLACE VIEW poladm.v_rem AS SELECT 1 FROM remote_syn;",
+        want={("POLADM.V_SYN", "POLADM.POLICY", "reads"), ("POLADM.V_SYN", "POLADM.BROKER", "reads"),
+              ("POLADM.V_MISS", "POLADM.NOT_ENUMERATED", "reads"), ("POLADM.V_REM", "CLAIMS.CLAIM@CLAIMS_LINK", "reads"),
+              ("POLADM.POL_SYN", "POLADM.POLICY", "alias-of"), ("PUBLIC.BRK", "POLADM.BROKER", "alias-of"),
+              ("POLADM.MISSING_SYN", "POLADM.NOT_ENUMERATED", "alias-of"), ("POLADM.REMOTE_SYN", "CLAIMS.CLAIM@CLAIMS_LINK", "alias-of")},
+        forbid_edges={("POLADM.V_SYN", "POLADM.POL_SYN", "reads"), ("POLADM.V_SYN", "PUBLIC.BRK", "reads"),
+                      ("POLADM.V_MISS", "POLADM.MISSING_SYN", "reads"), ("POLADM.V_REM", "POLADM.REMOTE_SYN", "reads")},
+        want_nodes={("POLADM.POL_SYN", "SYNONYM"), ("PUBLIC.BRK", "PUBLIC SYNONYM"), ("POLADM.MISSING_SYN", "SYNONYM"),
+                    ("POLADM.REMOTE_SYN", "SYNONYM")},
     ),
     "indented_sqlplus_script": Case(
         "    SET PAGESIZE 0 FEEDBACK OFF\n"
