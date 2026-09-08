@@ -15,7 +15,7 @@ Fixture: `informatica/XML/wf_POLICY_MASTER_DAILY.xml` (copied verbatim as `sourc
 | `INSTR`, `LENGTH`, `LTRIM(RTRIM())`, `SUBSTR` with computed bounds, `UPPER`, `\|\|`, `REG_MATCH` | `EXP_POSTCODE_DQ` | rows 31, 35, 36, 37, 39, 42 |
 | `IIF(a = x OR a = y, 'Y', 'N')` | `EXP_POLICY_FLAGS` | row 1 |
 | Connected static Lookup, `Lookup policy on multiple match = Use First Value`, `decimal(10,0)` lookup port against a `string` source field | `LKP_XREF_CLIENT_PARTY` (`REUSABLE=YES`, shared object) | row 74, trap 9, section 3 |
-| Event Wait file watcher with `$$RUNDATE` in the path | `ew_WAIT_PLCYMSTR` | section 6 (Event Wait -> `trigger.file_arrival`) |
+| Event Wait file watcher with `$$RUNDATE` in the path; per-run `$$RUNDATE` rewritten by the wrapper -> date read from the arrived file name (`plcymstr_raw` Auto Loader table + newest-`RUNDATE` view), NOT from a deployment-time bundle variable; `informatica.RUNDATE` kept only as an explicit-rerun override | `ew_WAIT_PLCYMSTR`, `source.par` | section 6 (Event Wait -> `trigger.file_arrival`), section 2 (parameter precedence: per-run values never become deploy-time constants) |
 | Conditional link `$s.Status = FAILED` -> Email task; `Fail parent if this task fails` | `WORKFLOWLINK`, `email_FAIL_POLICY_LOAD` | section 6 (link conditions, Email, Control) |
 | Parameter file: `$$RUNDATE`, `$DBConnection_TGT/_LKP`, `$InputFile_*`, `$BadFileName`, `$$COMMIT_INTERVAL` | `source.par` | section 2 (parameter precedence), section 6 (`$$` parameters, commit interval) |
 | Dual schedule ownership (Control-M `ALB-DWH-0032` and cron `15 3 * * *`), wrapper `pmcmd ... -wait` + `$?` + BTEQ kick-off | not copied (see paths above) | section 2 "Scheduler edges", trap 24 |
@@ -48,6 +48,11 @@ Fixture: `informatica/XML/wf_POLICY_MASTER_DAILY.xml` (copied verbatim as `sourc
   assessment; the conversion keeps 49.
 - `wf_PARTY_MDM_SYNC` must finish before this workflow (its description says so) but no dependency exists in
   Informatica or Control-M; the job graph above does not invent one - the decision goes to D5.
+- The target load type of `STG_POLICY_MASTER` (truncate/insert vs append) is not in the export. The converted
+  `stg_policy_master` is recomputed from the newest `RUNDATE` ingested (replace-with-today), which is INFERRED; the
+  `plcymstr_raw` table keeps every day's lines, so an explicit-day rerun sets `informatica.RUNDATE` and needs no
+  file restore. The legacy landing directory was swept by NDM, so "newest file" and "the file that fired the
+  watcher" were the same thing; if two files land between two runs the newer one wins and the older is a Tier 1 gap.
 
 ## Not verified live
 

@@ -12,6 +12,7 @@ from pyspark.sql import Window, functions as F
 
 LANDING = spark.conf.get("informatica.bdx_landing_path")      # was /interface/inbound/bordereaux (bdx_transfer $LANDING)
 SII_LOB_MAP = spark.conf.get("informatica.sii_lob_map_table")  # REF_DB.SII_LOB_MAP
+EXPECTED_BROKERS = spark.conf.get("informatica.expected_brokers_table")  # same table the gate task reads
 
 # Broker files are Latin1/MS1252 (the pound sign is byte 0xA3 = CHR(163) in Latin1; in UTF-8 it is 0xC2 0xA3).
 # Reading with the wrong encoding turns '£' into 'Â£' and REPLACECHR(CHR(163)) removes only the second byte
@@ -28,7 +29,33 @@ def bdx_claims_raw():
                  .option("encoding", BROKER_ENCODING)
                  .option("pathGlobFilter", "CLAIMS_BDX_BRK*_*.csv")
                  .load(LANDING)
-                 .withColumn("BROKER_ID", F.regexp_extract(F.col("_metadata.file_path"), r"CLAIMS_BDX_(BRK\d{4})_", 1)))
+                 .withColumn("BROKER_ID", F.regexp_extract(F.col("_metadata.file_path"), r"CLAIMS_BDX_(BRK\d{4})_", 1))
+                 .withColumn("FILE_MONTH", F.regexp_extract(F.col("_metadata.file_path"), r"CLAIMS_BDX_BRK\d{4}_(\d{6})", 1)))
+
+
+@dp.temporary_view()
+def bdx_claims_expected():
+    # Legacy had one hand-built SOURCE definition per broker: a file from an unknown broker had no mapping to load it.
+    # The converted equivalent is the expected-broker table (effective-from/to month) that the gate task also reads;
+    # a landed row whose BROKER_ID is not effective for its FILE_MONTH is flagged here and split below, so the
+    # published view can never contain an undeclared broker even when the pipeline is started without the gate.
+    raw = spark.read.table("bdx_claims_raw")
+    allowed = (spark.read.table(EXPECTED_BROKERS)
+                    .select(F.col("BROKER_ID").alias("exp_BROKER_ID"), "effective_from_month",
+                            F.coalesce(F.col("effective_to_month"), F.lit("999912")).alias("effective_to_month"))
+                    .dropDuplicates(["exp_BROKER_ID", "effective_from_month", "effective_to_month"]))
+    match = ((raw.BROKER_ID == allowed.exp_BROKER_ID)
+             & (raw.FILE_MONTH >= allowed.effective_from_month)
+             & (raw.FILE_MONTH <= allowed.effective_to_month))
+    # left_semi / left_anti keep the raw row count intact (no multiplication if a broker has overlapping rows)
+    return (raw.join(allowed, match, "left_semi").withColumn("broker_expected", F.lit(True))
+               .unionByName(raw.join(allowed, match, "left_anti").withColumn("broker_expected", F.lit(False))))
+
+
+@dp.materialized_view(name="ri_claims_bdx_unexpected_broker",
+                      comment="Rows from broker files not in the expected-broker set for their month; census evidence, never published")
+def ri_claims_bdx_unexpected_broker():
+    return spark.read.table("bdx_claims_expected").filter(~F.col("broker_expected")).drop("broker_expected")
 
 
 def exp_rekey_policy(df):
@@ -75,7 +102,7 @@ def ri_claims_bdx_std():
     # computed in separate views and re-joined. (BROKER_ID, CLAIM_REF) is the declared grain of the OUTPUT, but a
     # broker file may legitimately repeat a CLAIM_REF; a self-join on that pair would turn n copies into n*n rows,
     # whereas the legacy pipeline emitted exactly n. Tier 1 counts per BROKER_ID catch the duplication as a finding.
-    raw = spark.read.table("bdx_claims_raw")
+    raw = spark.read.table("bdx_claims_expected").filter(F.col("broker_expected")).drop("broker_expected")
     rows = exp_amt_clean(exp_rekey_policy(raw))
     lob = spark.read.table("lkp_sii_lob")                        # one row per PRODUCT_CD (see above)
     return (rows.join(lob, "PRODUCT_CD", "left")                 # connected Lookup: unmatched -> NULL SII_LOB, row kept

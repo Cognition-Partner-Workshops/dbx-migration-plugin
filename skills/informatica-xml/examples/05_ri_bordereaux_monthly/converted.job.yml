@@ -16,8 +16,11 @@
 #      "all brokers arrived for the target month" is decided by the gate task below (expected broker set vs files
 #      landed), and the publishing pipeline is reachable ONLY through the condition task's `true` outcome. Every
 #      trigger during days 1-5 therefore ends as a successful no-op until the set is complete; a late file (BRK0007)
-#      fires the trigger again, the gate passes, and the pipeline runs. Reruns are idempotent: the gate is read-only,
-#      Auto Loader ingests each file once, and the materialized view is recomputed from the full ingested set.
+#      fires the trigger again, the gate passes, and the pipeline runs. A file from a broker NOT in the expected set
+#      fails the gate run with the IDs (undeclared source = census finding, not a load), and the pipeline itself
+#      routes such rows to ri_claims_bdx_unexpected_broker, so they cannot reach ri_claims_bdx_std either way.
+#      Reruns are idempotent: the gate is read-only, Auto Loader ingests each file once, and the materialized view is
+#      recomputed from the full ingested set.
 resources:
   jobs:
     wf_reinsurance_bordereaux_monthly:
@@ -34,7 +37,8 @@ resources:
       tasks:
         - task_key: gate_all_brokers_arrived
           # Replaces the per-broker file watchers + WD3 + manual-restart runbook. Sets task values
-          # all_brokers_arrived / missing_brokers / target_month; never writes.
+          # all_brokers_arrived / missing_brokers / unexpected_brokers / target_month; never writes; fails the run
+          # when an unexpected broker file is present.
           notebook_task:
             notebook_path: ./broker_completeness_gate.py
             base_parameters:
@@ -79,4 +83,5 @@ resources:
       configuration:
         informatica.bdx_landing_path: ${var.bdx_landing_path}
         informatica.sii_lob_map_table: ${var.sii_lob_map_table}   # REF_DB.SII_LOB_MAP (read-only legacy reference)
+        informatica.expected_brokers_table: ${var.expected_brokers_table}   # same table the gate task reads
         informatica.bdx_encoding: "ISO-8859-1"                     # repository CODEPAGE=Latin1; per-broker override via census

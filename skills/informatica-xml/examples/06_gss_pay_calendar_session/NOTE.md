@@ -26,6 +26,7 @@ for SKILL.md sections 1-2 (session/partition overrides) and 6 (procedural constr
 | Pre-session / post-session success / post-session failure **variable assignment** components | `SESSIONCOMPONENT` x3 | section 6 (`$$` workflow variables, `SETVARIABLE`) |
 | Predefined workflow variables `$s.Status`, `.TgtSuccessRows`, `.ErrorCode`, ... | `WORKFLOWVARIABLE` x13 | section 6 (link conditions -> `run_if`; counters -> OUT params / task values) |
 | Link conditions `$s_X.Status = Succeeded` chaining four sessions to an Email task | `WORKFLOWLINK` x5 | section 6 (`depends_on` + `run_if: ALL_SUCCESS`) |
+| Terminal `Email_Pay_Calendar` task (`$$WF_SUBJECT` / `$$WF_MESSAGE`) -> job-level `email_notifications.on_success`, kept separate from `on_failure`; computed body is a D5 decision | `TASK TYPE="Email"` | section 6 (Email task) |
 | `SCHEDULEINFO SCHEDULETYPE="ONDEMAND"` | `SCHEDULER` | section 2 (scheduler edges: external caller to be found) |
 | `SESSTRANSFORMATIONINST` partition points (`PASS THROUGH`) and `Is Partitionable=NO` | session | section 2 (partition overrides), row 91 note on partition-dependent values |
 | `PARTITION`-free session on a single-row update: commit-interval semantics vacuous | whole unit | trap 25 (when it does matter) |

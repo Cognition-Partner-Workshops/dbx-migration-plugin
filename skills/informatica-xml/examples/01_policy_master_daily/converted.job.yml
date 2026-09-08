@@ -16,8 +16,10 @@ resources:
       max_concurrent_runs: 1                      # workflow default: no concurrent runs
       # Parameter-file section [..s_m_POLICY_MASTER_DAILY] (source.par) becomes bundle variables declared in
       # databricks.yml `variables:` and referenced as ${var.<name>} (databricks-dabs references/bundle-structure.md):
-      #   $$RUNDATE -> var.rundate (per-run), $InputFile_PLCYMSTR -> var.landing_path,
-      #   REF_DB.XREF_CLIENT_PARTY via $DBConnection_LKP -> var.xref_client_party_table.
+      #   $InputFile_PLCYMSTR -> var.landing_path, REF_DB.XREF_CLIENT_PARTY via $DBConnection_LKP -> var.xref_client_party_table.
+      #   $$RUNDATE is NOT a bundle variable: bundle variables and pipeline configuration are fixed at deploy time,
+      #   while the wrapper rewrote $$RUNDATE before every run. The pipeline reads the date from the arrived file's
+      #   name (PLCYMSTR_D<yymmdd>.dat) instead - see converted.py `plcymstr_raw` / `sq_plcymstr_daily`.
       # $$COMMIT_INTERVAL=10000 and $BadFileName carry no semantics on Delta (SKILL.md section 6): dropped;
       # rejects land in the expectation metrics / quarantine table instead.
       trigger:
@@ -51,6 +53,9 @@ resources:
         - file:
             path: ./converted.py
       configuration:
-        informatica.RUNDATE: ${var.rundate}
+        # Empty = process the newest PLCYMSTR_D<yymmdd>.dat ingested (every daily arrival, no redeploy). Set to a
+        # yymmdd value ONLY for an explicit rerun of an older day (replaces editing $$RUNDATE in the .par file),
+        # then clear it again; the raw table keeps every day's lines so the rerun is a filter, not a file restore.
+        informatica.RUNDATE: ""
         informatica.landing_path: ${var.landing_path}
         informatica.xref_client_party_table: ${var.xref_client_party_table}

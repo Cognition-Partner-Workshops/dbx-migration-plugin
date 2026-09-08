@@ -10,21 +10,53 @@
 #                     -> LKP_XREF_CLIENT_PARTY (connected, static cache, Use First Value) -> STG_POLICY_MASTER.PARTY_ID
 # Port names are kept as column aliases so Tier 3 field mapping is 1:1 (SKILL.md section 5 row 70).
 
+import re
+
 from pyspark import pipelines as dp
-from pyspark.sql import functions as F
+from pyspark.sql import Window, functions as F
 
 # Parameter-file values (source.par) become pipeline configuration, not literals:
-#   $$RUNDATE, $InputFile_PLCYMSTR -> landing path under a UC volume; $DBConnection_LKP -> catalog.schema of the crosswalk
-RUNDATE = spark.conf.get("informatica.RUNDATE")                       # was $$RUNDATE=260115
+#   $InputFile_PLCYMSTR -> landing path under a UC volume; $DBConnection_LKP -> catalog.schema of the crosswalk.
+#   $$RUNDATE was rewritten into the parameter file before every run by the wrapper (per-run value, 260115 is one
+#   sample). Pipeline configuration is a deployment-time value, so it is NOT the daily source of the date: the date
+#   is read from the arrived file's own name (PLCYMSTR_D<yymmdd>.dat, the Event Wait mask). The configuration key
+#   is only an OPTIONAL override for an explicit rerun of an older day; empty (the deployed default) = newest file.
+RUNDATE_OVERRIDE = spark.conf.get("informatica.RUNDATE", "").strip()
+if RUNDATE_OVERRIDE and not re.fullmatch(r"\d{6}", RUNDATE_OVERRIDE):
+    raise ValueError("informatica.RUNDATE must be yymmdd or empty")
 LANDING = spark.conf.get("informatica.landing_path")                  # was /interface/inbound/plcymstr/
 XREF_TABLE = spark.conf.get("informatica.xref_client_party_table")    # was REF_DB.XREF_CLIENT_PARTY via $DBConnection_LKP
 
 
+@dp.table(name="plcymstr_raw", comment="PLCYMSTR_D<yymmdd>.dat lines as landed; one row per line, RUNDATE from the file name")
+def plcymstr_raw():
+    # Auto Loader ingests each landed file exactly once (databricks-pipelines references/auto-loader-python.md:
+    # `spark.readStream.format("cloudFiles")`, `cloudFiles.format` text, generic `pathGlobFilter`; SKILL.md
+    # "input_file_name() -> _metadata.file_path"). The legacy landing directory was swept by NDM; here every day's
+    # file stays queryable, which is what makes an explicit-date rerun a filter instead of a file restore.
+    return (spark.readStream.format("cloudFiles")
+                 .option("cloudFiles.format", "text")
+                 .option("encoding", "windows-1252")                   # SOURCE codepage MS1252 (trap 18)
+                 .option("pathGlobFilter", "PLCYMSTR_D*.dat")
+                 .load(LANDING)
+                 .withColumnRenamed("value", "line")
+                 .withColumn("RUNDATE", F.regexp_extract(F.col("_metadata.file_path"), r"PLCYMSTR_D(\d{6})\.dat$", 1)))
+
+
 @dp.temporary_view()
 def sq_plcymstr_daily():
+    # One run = one day's file, exactly as `pmcmd startworkflow` with the rewritten $$RUNDATE did. Without an
+    # override the run processes the newest RUNDATE ingested (the file whose arrival fired the trigger); the target
+    # load type is not in the export, so "replace with the newest day" is INFERRED and recorded in the unit brief.
+    ingested = spark.read.table("plcymstr_raw")
+    if RUNDATE_OVERRIDE:
+        selected = ingested.filter(F.col("RUNDATE") == RUNDATE_OVERRIDE)
+    else:
+        newest = F.max("RUNDATE").over(Window.partitionBy())
+        selected = ingested.withColumn("newest", newest).filter(F.col("RUNDATE") == F.col("newest")).drop("newest")
     # Fixed-width flat file: SOURCEFIELD OFFSET/LENGTH pairs from source.xml (LRECL 80, STRIPTRAILINGBLANKS=YES,
     # NULL_CHARACTER='*'). Read each line as one string and slice; SQL substr is 1-based, OFFSET is 0-based.
-    raw = spark.read.text(f"{LANDING}/PLCYMSTR_D{RUNDATE}.dat").withColumnRenamed("value", "line")
+    raw = selected
 
     def field(offset, length):
         col = F.substring("line", offset + 1, length)
@@ -32,6 +64,7 @@ def sq_plcymstr_daily():
         return F.when(F.trim(col) == "*", None).otherwise(col)  # NULL_CHARACTER='*'
 
     return raw.select(
+        F.col("RUNDATE"),
         field(0, 18).alias("PLCY_POLICY_NO"),
         field(18, 10).alias("PLCY_CLIENT_NO"),
         field(28, 4).alias("PLCY_PRODUCT_CD"),
@@ -81,7 +114,6 @@ def lkp_xref_client_party():
     # LKP_XREF_CLIENT_PARTY: connected, static cache, 'Lookup policy on multiple match = Use First Value'.
     # Cache build order is not in the export: ORDER BY below is INFERRED and must be recorded in the unit brief
     # (SKILL.md section 5 row 74; trap 9).
-    from pyspark.sql.window import Window
     xref = spark.read.table(XREF_TABLE)
     w = Window.partitionBy("CLIENT_NO").orderBy(F.col("PARTY_ID"))  # INFERRED order
     return xref.withColumn("rn", F.row_number().over(w)).filter("rn = 1").select("CLIENT_NO", "PARTY_ID")
@@ -116,6 +148,7 @@ def stg_policy_master():
                F.col("out_POSTCODE_STD").alias("POSTCODE_STD"),
                F.col("out_POSTCODE_DQ_STATUS").alias("POSTCODE_DQ_STATUS"),
                active_flag.alias("ACTIVE_POLICY_FLAG"),
+               F.col("RUNDATE"),                                      # the day this row was loaded from ($$RUNDATE)
                F.current_timestamp().alias("LOAD_TS"),                # audit column: excluded from Tier 3
            )
     )

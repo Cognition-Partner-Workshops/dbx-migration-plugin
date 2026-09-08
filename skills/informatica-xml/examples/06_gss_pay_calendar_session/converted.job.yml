@@ -25,8 +25,16 @@ resources:
       max_concurrent_runs: 1
       # ONDEMAND: no `schedule:` block by design.
       email_notifications:
+        # Email_Pay_Calendar (last task of the legacy DAG, link `$s_Pay_Calendar_Build_Message.Status = Succeeded`):
+        # fires only when the whole chain succeeded = job-level on_success (databricks-jobs
+        # references/notifications-monitoring.md "Email Notifications" `on_success`). Subject/body are run metadata,
+        # not the computed $$WF_SUBJECT / $$WF_MESSAGE text (see the note under s_Pay_Calendar_Build_Message).
+        on_success:
+          - ${var.wf_pay_calendar_email_list}      # $$WF_PAY_CALENDAR_EMAIL_LIST = Email_Pay_Calendar recipients
+        # on_failure_mail session component (Failure Email on every session): a separate recipient list in the
+        # legacy, kept separate here; the fixture uses the same variable for both.
         on_failure:
-          - ${var.wf_pay_calendar_email_list}      # $$WF_PAY_CALENDAR_EMAIL_LIST (Email_Pay_Calendar + on_failure_mail recipient)
+          - ${var.wf_pay_calendar_email_list}
       tasks:
         # Definition and execution are separate tasks: converted.sql only (re)defines the procedure; a run made of that
         # file alone would succeed without touching PAY_PERIOD. The CALL (converted.call.sql) is the session.
@@ -77,6 +85,10 @@ resources:
               path: ./s_pay_calendar_build_message.sql   # not included; sets $$WF_SUBJECT / $$WF_MESSAGE
               source: WORKSPACE
           max_retries: 0
-        # Email_Pay_Calendar (Email task with $$WF_SUBJECT / $$WF_MESSAGE bodies): Lakeflow email notifications carry
-        # run metadata, not a computed body. Like-for-like is job-level `email_notifications.on_success`; if the
-        # computed message text is a hard requirement, a notebook/python task sending mail is a D5 decision.
+        # Email_Pay_Calendar (Email task with $$WF_SUBJECT / $$WF_MESSAGE bodies) is converted as the job-level
+        # `email_notifications.on_success` above: same recipients, same "only after Build_Message succeeded" semantics,
+        # but the mail carries run metadata, not the computed body. If the computed "Current Pay Period" text is a
+        # hard requirement (D5, ask the GSS payroll team), add a final task here that reads the TgtSuccessRows /
+        # WF_SUBJECT / WF_MESSAGE task values from s_Pay_Calendar_Build_Message and sends the mail (notebook or
+        # python task with the SMTP secret referenced by NAME); it must depend on s_Pay_Calendar_Build_Message with
+        # run_if ALL_SUCCESS so failure mail and success mail stay separate.

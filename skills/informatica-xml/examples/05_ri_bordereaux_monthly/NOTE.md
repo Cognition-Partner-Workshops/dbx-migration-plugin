@@ -43,6 +43,12 @@ comment; `docs/` SAS `08_solvency_ii_qrt_prep.sas` (the drifted SII LoB copy).
 - `bdx_transfer` credentials are per-broker SFTP accounts; only the secret **names** may appear in any artifact.
 - Ceded-claims computation and the Lloyd's-format output are described but not exported: separate census units.
 - Accounting negatives `(1,234.56)` parse to 0 in both engines - a latent legacy defect, reproduced.
+- A landed file from a broker that is not in the effective expected-broker set is an **undeclared source** (legacy:
+  no `SOURCE` definition, nothing loaded it). The gate task fails the run with the broker IDs (task value
+  `unexpected_brokers`) and the pipeline routes any such rows to `ri_claims_bdx_unexpected_broker` instead of
+  `ri_claims_bdx_std`; onboarding is a row in the expected-broker table (D5), never an automatic load.
+- Job parameters (`expected_brokers_table`, `target_month`) are validated as a plain three-part identifier /
+  `yyyyMM` and used only through the DataFrame API; no caller-controlled text reaches `spark.sql`.
 
 ## Not verified live
 
