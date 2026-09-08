@@ -27,6 +27,13 @@ Manifest shape (written by the plan playbook, read here):
   "breaker_threshold": 3,
   "auto_merge": true,
   "child_minutes": 45,                        # soft time limit per child
+  "verify_depth": "sampled",                  # optional; verifier Tier 3 depth for the wave:
+                                              # sampled (default) | full. Per-batch "verify_depth"
+                                              # overrides it (plan sets full on D4/finance-critical).
+  "cost_estimate": {                          # optional; STOP C figures from `dbx-recon estimate`
+    "source_statements": 240, "target_statements": 96,   # summed over the wave; actuals from
+    "source_rows_fetched": 180000, "warehouse_hours": 1.5  # result.json["cost"] land in the brief
+  },
   "capabilities": {                           # optional; copied from .migration/09_capabilities.json
     "identity": "<migration SP userName>",   # (factory-doctor). Children run the doctor with
     "catalogs": ["mig"],                       # --expect-identity and report BLOCKED on mismatch.
@@ -35,6 +42,7 @@ Manifest shape (written by the plan playbook, read here):
   "batches": [
     {"id": "w2-b01", "units": ["orders_load", "orders_dim"],
      "write_targets": ["mig.orders", "mig.orders_dim"],
+     "verify_depth": "full",                  # optional per-batch override
      "brief": "...complete hand-off text for this batch..."}
   ]
 }
@@ -101,6 +109,13 @@ REPLAYED = {
 } if resume and isinstance(prior, dict) else {}
 
 
+# Verifier Tier 3 depth. sampled: Tier 1+2 plus a differently-seeded stratified Tier 3 (catches
+# a child that fabricated or misread results at a fraction of the cost). full: keyed full diff,
+# for units the plan flags cutover-critical (D4 external feed, finance). Never "threshold":
+# the verifier's depth is a plan decision, not a tolerance-file side effect.
+VERIFY_DEPTHS = ("sampled", "full")
+
+
 def validate_manifest(m):
     """Fail here, in one line, instead of 20 children failing on a missing field."""
     for key in ("wave", "repo", "child_macro", "verify_macro", "batches"):
@@ -120,6 +135,14 @@ def validate_manifest(m):
             if not b.get(key):
                 raise SystemExit(f"batch {b['id']} is missing '{key}' (a child with no brief or "
                                  "no declared write targets cannot be launched safely)")
+    if "verify_depth" in m and m["verify_depth"] not in VERIFY_DEPTHS:
+        raise SystemExit(f"manifest 'verify_depth' must be one of {VERIFY_DEPTHS}")
+    for b in m["batches"]:
+        if "verify_depth" in b and b["verify_depth"] not in VERIFY_DEPTHS:
+            raise SystemExit(f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
+    if "cost_estimate" in m and not isinstance(m["cost_estimate"], dict):
+        raise SystemExit("manifest 'cost_estimate' must be an object (output of `dbx-recon estimate`, "
+                         "summed over the wave)")
     if "capabilities" in m:
         caps = m["capabilities"]
         if not isinstance(caps, dict) or not isinstance(caps.get("identity"), str) or not caps["identity"]:
@@ -188,6 +211,11 @@ WIDTH = int(MANIFEST.get("width", 20))
 BREAKER = int(MANIFEST.get("breaker_threshold", 3))
 AUTO_MERGE = bool(MANIFEST.get("auto_merge", True))
 CHILD_MINUTES = int(MANIFEST.get("child_minutes", 45))
+VERIFY_DEPTH = MANIFEST.get("verify_depth", "sampled")
+
+
+def batch_verify_depth(batch) -> str:
+    return batch.get("verify_depth", VERIFY_DEPTH)
 
 META = {
     "name": f"migration-wave-{WAVE}",
@@ -211,6 +239,8 @@ CHILD_SCHEMA = {
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
         "skill_feedback": {"type": "array", "items": {"type": "string"}},
+        "recon_cost": {"type": "object",
+                       "description": "result.json['cost'] of the final live/snapshot run"},
         "one_line_summary": {"type": "string"},
     },
     "required": ["status", "recon_verdict", "recon_mode", "write_targets", "one_line_summary"],
@@ -224,6 +254,8 @@ VERIFY_SCHEMA = {
         "merged_prs": {"type": "array", "items": {"type": "string"}},
         "findings": {"type": "array", "items": {"type": "string"}},
         "report_path": {"type": "string"},
+        "recon_cost": {"type": "object",
+                       "description": "summed result.json['cost'] over the verifier's re-runs"},
     },
     "required": ["wave_verdict", "unit_verdicts", "findings"],
 }
@@ -260,6 +292,8 @@ def child_prompt(batch):
         "- If the recon harness fails 3 full runs, stop and report status=FAIL with a short "
         "failure_class (for example 'timestamp_precision', 'decimal_rounding', 'missing_rule').\n"
         "- Report every rule you had to derive yourself in skill_feedback.\n"
+        "- Copy result.json['cost'] of your final live/snapshot run into recon_cost; the wave brief "
+        "compares it with the STOP C estimate.\n"
         "- one_line_summary is for a human skimming 20 of these: what landed, or why not."
     )
 
@@ -280,6 +314,7 @@ def capability_block():
 
 
 def verify_prompt(passed, auto_merge):
+    depths = {b["id"]: batch_verify_depth(b) for b in passed}
     merge_line = (
         "Merge every PR you mark PASS and list it in merged_prs, even if another unit in the wave failed; "
         "failed units are reopened next launch."
@@ -295,6 +330,10 @@ def verify_prompt(passed, auto_merge):
         "Re-run the recon harness yourself. Do not trust the PR's pasted evidence. "
         "Mark a unit PASS only if you re-ran the harness in live or snapshot mode and result.json says "
         "merge_eligible=true. "
+        f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
+        "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
+        "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. "
+        "Sum result.json['cost'] over your runs into recon_cost.\n"
         f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{WAVE}/report.md, "
         f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
         "report_path. Do not edit any other file under .migration/. Each finding is one plain "
@@ -351,6 +390,42 @@ async def run_batch(batch, sem, breaker):
         return out
 
 
+COST_KEYS = ("source_statements", "target_statements", "source_rows_fetched", "target_rows_fetched")
+
+
+def sum_cost(costs) -> dict:
+    """Sum result.json['cost'] dicts; a side whose adapter did not count stays None."""
+    total: dict = {k: 0 for k in COST_KEYS} | {"elapsed_s": 0.0}
+    for c in costs:
+        if not isinstance(c, dict):
+            continue
+        for k in COST_KEYS:
+            v = c.get(k)
+            if v is None:
+                total[k] = None
+            elif total[k] is not None and isinstance(v, (int, float)) and not isinstance(v, bool):
+                total[k] += v
+        if isinstance(c.get("elapsed_s"), (int, float)):
+            total["elapsed_s"] += c["elapsed_s"]
+    return total
+
+
+def cost_line(results, verify) -> str:
+    """Estimate (STOP C) against actuals (children + verifier), so the next wave's estimate
+    can be corrected instead of guessed again."""
+    est = MANIFEST.get("cost_estimate")
+    actual = sum_cost([r.get("recon_cost") for r in results]
+                      + ([verify.get("recon_cost")] if isinstance(verify, dict) else []))
+    if est is None and all(actual[k] in (None, 0) for k in COST_KEYS):
+        return "Cost: no estimate in the manifest and no recon_cost reported."
+    def fmt(d):
+        return ", ".join(f"{k}={d.get(k)}" for k in COST_KEYS if d.get(k) is not None) or "n/a"
+    return (f"Cost: estimated {fmt(est or {})}; actual {fmt(actual)}, "
+            f"harness time {round(actual['elapsed_s'])}s. Verifier depth {VERIFY_DEPTH}"
+            + (", overrides: " + ", ".join(f"{b['id']}={b['verify_depth']}" for b in BATCHES if "verify_depth" in b)
+               if any("verify_depth" in b for b in BATCHES) else "") + ".")
+
+
 def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
     """Ten lines a lead reads in one minute. The orchestrator posts this at wave close."""
     n = len(BATCHES)
@@ -383,6 +458,7 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
         urls = [r["pr_url"] for r in results
                 if r["status"] == "PASS" and r.get("pr_url")]
         lines.append("Awaiting manual merge: " + (", ".join(urls) or "none reported"))
+    lines.append(cost_line(results, verify))
     lines += [
         "",
         "Verifier findings:" if verify and verify["findings"] else "Verifier findings: none.",

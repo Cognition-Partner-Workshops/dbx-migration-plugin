@@ -5,8 +5,10 @@ Deterministic and idempotent: same inputs produce the same verdict; safe to re-r
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+from .adapters import StatementCounting
 from .canon import Canonicalizer
 from .config import CanonRule, ConfigError, MappingSpec, Tolerances
 from .report import build_result, write_outputs
@@ -16,6 +18,23 @@ from .tiers import tier1_counts, tier2_aggregates, tier3_diffs, tier4_parity
 # development and fix rounds. A fixture PASS is never a merge verdict; it only earns the unit
 # its one live run.
 MODES = ("fixture", "live", "snapshot", "continuous")
+
+# Tier 3 depth. threshold: the tolerance file's full_diff_row_threshold decides per table.
+# sampled: always stratified sample (the verifier default). full: always keyed full diff
+# (cutover-critical units, set by the plan in the wave manifest's verify_depth).
+DEPTHS = ("threshold", "sampled", "full")
+
+
+def _cost(source, target, started: float) -> dict:
+    def side(adapter):
+        if isinstance(adapter, StatementCounting):
+            return adapter.statements, adapter.rows_fetched
+        return None, None
+    s_stmts, s_rows = side(source)
+    t_stmts, t_rows = side(target)
+    return {"source_statements": s_stmts, "source_rows_fetched": s_rows,
+            "target_statements": t_stmts, "target_rows_fetched": t_rows,
+            "elapsed_s": round(time.monotonic() - started, 3)}
 
 def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | None,
                                   spec: MappingSpec, tier1) -> list[str]:
@@ -45,9 +64,13 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
               out_dir: Path | None = None, seed: int = 0,
               params: dict[str, str] | None = None,
               snapshot: dict | None = None,
-              source_family: str | None = None) -> dict:
+              source_family: str | None = None,
+              depth: str = "threshold") -> dict:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
+    if depth not in DEPTHS:
+        raise ConfigError(f"depth must be one of {DEPTHS}, got {depth!r}")
+    started = time.monotonic()
     for c in spec.objects:
         if (c.root_where is None) != (c.target_where is None):
             raise ConfigError(f"object {c.object} has root_where but no target_where; scope both sides or neither")
@@ -64,17 +87,15 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
     if tiers[0].passed:
         # Tier 1 failures are load defects or mapping-spec violations; nothing else runs.
         tiers.append(tier2_aggregates(spec, tol, canon, source, target))
-        if mode == "continuous":
-            # Per-cycle: Tier 1+2 plus sampled Tier 3, appended to the evidence log.
-            sampled_tol = Tolerances(**{**tol.__dict__, "full_diff_row_threshold": 0})
-            tiers.append(tier3_diffs(spec, sampled_tol, canon, source, target, seed))
-        else:
-            tiers.append(tier3_diffs(spec, tol, canon, source, target, seed))
+        # continuous: per-cycle Tier 1+2 plus sampled Tier 3, appended to the evidence log.
+        tier3_depth = "sampled" if mode == "continuous" else depth
+        tiers.append(tier3_diffs(spec, tol, canon, source, target, seed, depth=tier3_depth))
         if ops and mode != "continuous":
             tiers.append(tier4_parity(ops, canon, tol, run_source, run_target))
     result = build_result(unit, mode, spec.version, tol.version, tiers,
                           seed=seed, params=params, snapshot=snapshot,
-                          provenance_warnings=provenance_warnings)
+                          provenance_warnings=provenance_warnings, depth=depth,
+                          cost=_cost(source, target, started))
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result

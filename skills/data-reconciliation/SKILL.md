@@ -32,12 +32,28 @@ dbx-recon run \
   --target-secret DATABRICKS_MIGRATION_SQL --target-catalog <migration catalog> \
   --allowed-targets-file .migration/allowed_targets.json --target-schema <schema> \
   --snapshot-manifest .migration/snapshots/<unit_id>.json \
-  --seed 0 [--param from_date=2024-01-01 ...] \
+  --seed 0 --depth threshold|sampled|full [--param from_date=2024-01-01 ...] \
   --out .migration/recon/<unit_id>/
 ```
 
-Exit code 0 is PASS, 1 is FAIL. Secrets are passed by NAME; the harness reads them from the
-environment. Never inline a connection string or token.
+Exit code 0 is PASS, 1 is FAIL. `--depth` sets Tier 3: `threshold` (default; the tolerance
+file's `full_diff_row_threshold` decides per table), `sampled` (always the stratified sample; the
+independent verifier's default, with a different `--seed` from the child's), `full` (always the
+keyed full diff; what the wave manifest's `verify_depth: full` pins for cutover-critical units).
+The depth is recorded in `result.json` and the summary.
+
+```bash
+dbx-recon estimate --mapping <mapping_spec.json> --tolerances .migration/03_recon_tolerances.json \
+  --depth sampled --row-counts <{root_table: rows}.json> [--ops-count N]
+```
+
+opens no connection and prints statements per side per tier, rows that will cross the wire, and
+which Tier 3 mode each table lands in; the plan playbook sums it per wave for the STOP C cost
+line. After a run, `result.json["cost"]` holds the actuals (statements, rows fetched per side,
+elapsed seconds) so the next estimate is corrected from measurement.
+
+Secrets are passed by NAME; the harness reads them from the environment. Never inline a
+connection string or token.
 
 `--param name=value` (repeatable) fills `${name}` placeholders in the mapping spec's
 `root_where`/`target_where`. Values are validated before any database adapter is constructed.
@@ -56,11 +72,13 @@ provenance warning and the run is not merge-eligible.
 | Tier | Check | What a FAIL means |
 |---|---|---|
 | 1 | Row counts, source table vs target table (through the mapping, with `root_where`) | Load defect or wrong scope. Nothing else runs. |
-| 2 | Per-column aggregates: null rate, min, max, distinct count, sum on numeric columns | Type or conversion drift. |
-| 3 | Keyed row diff: full below `full_diff_row_threshold`, seeded stratified sample above | Value-level mismatch; findings name the key and column. |
+| 2 | Per-column aggregates (null rate, min, max, distinct count, sum on numeric columns), one statement per table per side | Type or conversion drift. |
+| 3 | Keyed row diff: full below `full_diff_row_threshold`, else server-side stratified sample (equal-count key ranges, seeded positions inside each, every range's first and last key, plus a duplicate-key probe), overridable with `--depth` | Value-level mismatch; findings name the key and column. |
 | 4 | Replay of recorded representative queries on both engines (optional, `--ops`) | Report or extract does not match. SQL ops execute read-only and only `SELECT`/`WITH` queries are allowed. |
 
-Aggregates run natively on each engine, so nothing bulky crosses the wire. Comparisons happen
+Aggregates and stratification run natively on each engine, so only chosen keys and their rows
+cross the wire; an adapter without stratification support falls back to a streamed key
+reservoir and says so in `stats.sampling`. Comparisons happen
 after the canonicalization rules (trailing spaces, decimal rounding, timestamp precision,
 null vs empty string) are applied to BOTH sides.
 

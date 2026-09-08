@@ -14,9 +14,19 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable
-from typing import Any, Protocol
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
 
 from .paths import get_path
+
+
+@dataclass(frozen=True)
+class Stratum:
+    """One key range of a table: keys in [lo, hi] (on the first key column), n rows."""
+    bucket: int
+    lo: Any
+    hi: Any
+    n: int
 
 
 class SourceAdapter(Protocol):
@@ -25,7 +35,6 @@ class SourceAdapter(Protocol):
     def fetch_keyed(self, table: str, key_cols: list[str], columns: list[str],
                     where: str | None = None, keys: list[tuple] | None = None) -> Iterable[dict[str, Any]]: ...
     def iter_keys(self, table: str, key_cols: list[str], where: str | None = None) -> Iterable[tuple]: ...
-    def key_strata(self, table: str, key_cols: list[str], n_strata: int) -> list[tuple]: ...
 
 
 class TargetAdapter(Protocol):
@@ -34,6 +43,32 @@ class TargetAdapter(Protocol):
     def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]: ...
     def fetch_keyed(self, object: str, key_fields: list[str], fields: list[str],
                     where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]: ...
+
+
+@runtime_checkable
+class BatchAggregates(Protocol):
+    """One statement per table for Tier 2 (the cost rule: one multi-metric statement, not one per
+    metric). `numeric` names the columns that also get a SUM."""
+    def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
+                         where: str | None = None) -> dict[str, dict[str, Any]]: ...
+
+
+@runtime_checkable
+class StratifiedKeys(Protocol):
+    """Server-side key stratification for Tier 3 sampling: the source computes n key ranges and
+    returns chosen keys per range, so the harness never streams the whole key column."""
+    def key_strata(self, table: str, key_cols: list[str], n_strata: int,
+                   where: str | None = None) -> list[Stratum]: ...
+    def sample_keys(self, table: str, key_cols: list[str], lo: Any, hi: Any,
+                    row_numbers: list[int], where: str | None = None) -> list[tuple]: ...
+    def duplicate_key_count(self, table: str, key_cols: list[str], where: str | None = None) -> int: ...
+
+
+@runtime_checkable
+class StatementCounting(Protocol):
+    """Adapters that count what they cost: statements issued and rows pulled across the wire."""
+    statements: int
+    rows_fetched: int
 
 
 def _secret(name: str) -> str:
@@ -47,18 +82,31 @@ AGG_SQL = ("SELECT COUNT(*) AS n, COUNT({col}) AS nonnull, MIN({col}) AS mn, "
            "MAX({col}) AS mx, COUNT(DISTINCT {col}) AS dc FROM {table}{where}")
 
 
+# Bucket expression assigning each row to one of {n} equal-count strata ordered by key.
+# ANSI NTILE everywhere except Teradata, which only has QUANTILE (0-based).
+NTILE_SQL = "NTILE({n}) OVER (ORDER BY {order})"
+TERADATA_QUANTILE_SQL = "QUANTILE({n}, {order}) + 1"
+
+
 class _SqlAdapterBase:
     """Shared SQL implementation; subclasses provide a DB-API connection."""
 
     paramstyle = "qmark"
+    bucket_sql = NTILE_SQL
 
     def __init__(self, conn):
         self._conn = conn
+        self.statements = 0
+        self.rows_fetched = 0
 
-    def _rows(self, sql: str, params=()) -> list[tuple]:
+    def _execute(self, sql: str, params=()):
         cur = self._conn.cursor()
         cur.execute(sql, params)
-        return cur.fetchall()
+        self.statements += 1
+        return cur
+
+    def _rows(self, sql: str, params=()) -> list[tuple]:
+        return self._execute(sql, params).fetchall()
 
     def _placeholders(self, n: int, offset: int = 0) -> list[str]:
         if self.paramstyle == "format":
@@ -80,10 +128,11 @@ class _SqlAdapterBase:
         if not sql.lstrip().lower().startswith(("select", "with")):
             from .config import ConfigError
             raise ConfigError("recorded SQL ops must be read-only SELECT or WITH queries")
-        cur = self._conn.cursor()
-        cur.execute(sql)
+        cur = self._execute(sql)
         names = [d[0] for d in cur.description or []]
-        return [dict(zip(names, row)) for row in cur.fetchall()]
+        rows = cur.fetchall()
+        self.rows_fetched += len(rows)
+        return [dict(zip(names, row)) for row in rows]
 
     def row_count(self, table: str, where: str | None = None) -> int:
         w = f" WHERE {where}" if where else ""
@@ -101,6 +150,29 @@ class _SqlAdapterBase:
             out["sum"] = None
             if hasattr(self._conn, "rollback"):
                 self._conn.rollback()  # libpq leaves the transaction aborted otherwise
+        return out
+
+    def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
+                         where: str | None = None) -> dict[str, dict[str, Any]]:
+        w = f" WHERE {where}" if where else ""
+        exprs = ["COUNT(*)"]
+        for col in columns:
+            exprs += [f"COUNT({col})", f"MIN({col})", f"MAX({col})", f"COUNT(DISTINCT {col})"]
+            if col in numeric:
+                exprs.append(f"SUM({col})")
+        row = list(self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}")[0])
+        n = int(row.pop(0))
+        out: dict[str, dict[str, Any]] = {}
+        for col in columns:
+            nonnull, mn, mx, dc = row[:4]
+            del row[:4]
+            agg = {"count": n, "null_rate": (n - int(nonnull)) / n if n else 0.0,
+                   "min": mn, "max": mx, "distinct_count": int(dc)}
+            if col in numeric:
+                agg["sum"] = row.pop(0)
+            else:
+                agg["sum"] = None
+            out[col] = agg
         return out
 
     def fetch_keyed(self, table: str, key_cols: list[str], columns: list[str],
@@ -124,24 +196,60 @@ class _SqlAdapterBase:
                         clauses.append("(" + " AND ".join(parts) + ")")
                     clauses[-len(chunk):] = ["(" + " OR ".join(clauses[-len(chunk):]) + ")"]
             w = " WHERE " + " AND ".join(clauses) if clauses else ""
-            cur = self._conn.cursor()
-            cur.execute(f"SELECT {cols} FROM {table}{w} ORDER BY {', '.join(key_cols)}",
-                        self._params(values))
+            cur = self._execute(f"SELECT {cols} FROM {table}{w} ORDER BY {', '.join(key_cols)}",
+                                self._params(values))
             names = [d[0] for d in cur.description]
             for row in cur:
+                self.rows_fetched += 1
                 yield dict(zip(names, row))
 
     def iter_keys(self, table: str, key_cols: list[str], where: str | None = None) -> Iterable[tuple]:
         w = f" WHERE {where}" if where else ""
-        cur = self._conn.cursor()
-        cur.execute(f"SELECT {', '.join(key_cols)} FROM {table}{w} ORDER BY {', '.join(key_cols)}")
+        cur = self._execute(f"SELECT {', '.join(key_cols)} FROM {table}{w} ORDER BY {', '.join(key_cols)}")
         for row in cur:
+            self.rows_fetched += 1
             yield tuple(row)
 
-    def key_strata(self, table: str, key_cols: list[str], n_strata: int) -> list[tuple]:
-        key = key_cols[0]
-        rows = self._rows(f"SELECT MIN({key}), MAX({key}) FROM {table}")
-        return [rows[0]] if rows else []
+    def key_strata(self, table: str, key_cols: list[str], n_strata: int,
+                   where: str | None = None) -> list[Stratum]:
+        """n equal-count key ranges, computed server-side in one statement (one sort, n rows back)."""
+        order = ", ".join(key_cols)
+        k = key_cols[0]
+        w = f" WHERE {where}" if where else ""
+        bucket = self.bucket_sql.format(n=int(n_strata), order=order)
+        rows = self._rows(
+            f"SELECT b, MIN({k}), MAX({k}), COUNT(*) FROM "
+            f"(SELECT {order}, {bucket} AS b FROM {table}{w}) s GROUP BY b ORDER BY b")
+        self.rows_fetched += len(rows)
+        return [Stratum(int(b), lo, hi, int(n)) for b, lo, hi, n in rows]
+
+    def sample_keys(self, table: str, key_cols: list[str], lo: Any, hi: Any,
+                    row_numbers: list[int], where: str | None = None) -> list[tuple]:
+        """Keys at the given 1-based positions within the key range [lo, hi]: ROW_NUMBER over the
+        range, filtered by position, so only the chosen keys cross the wire."""
+        if not row_numbers:
+            return []
+        order = ", ".join(key_cols)
+        k = key_cols[0]
+        ph = self._placeholders(2)
+        clauses = [f"{k} >= {ph[0]}", f"{k} <= {ph[1]}"]
+        values: list[Any] = [lo, hi]
+        if where:
+            clauses.append(f"({where})")
+        rn_ph = self._placeholders(len(row_numbers), len(values))
+        values += [int(r) for r in row_numbers]
+        sql = (f"SELECT {order} FROM (SELECT {order}, ROW_NUMBER() OVER (ORDER BY {order}) AS rn "
+               f"FROM {table} WHERE {' AND '.join(clauses)}) s WHERE rn IN ({', '.join(rn_ph)}) ORDER BY {order}")
+        rows = self._rows(sql, self._params(values))
+        self.rows_fetched += len(rows)
+        return [tuple(r) for r in rows]
+
+    def duplicate_key_count(self, table: str, key_cols: list[str], where: str | None = None) -> int:
+        order = ", ".join(key_cols)
+        w = f" WHERE {where}" if where else ""
+        (n,) = self._rows(f"SELECT COUNT(*) FROM (SELECT {order} FROM {table}{w} "
+                          f"GROUP BY {order} HAVING COUNT(*) > 1) d")[0]
+        return int(n)
 
 
 # ---- Source warehouses ------------------------------------------------------------------
@@ -166,6 +274,8 @@ class SnowflakeSourceAdapter(_SqlAdapterBase):
 
 class TeradataSourceAdapter(_SqlAdapterBase):
     """Secret value: JSON accepted by teradatasql.connect (host, user, password, ...)."""
+
+    bucket_sql = TERADATA_QUANTILE_SQL
 
     def __init__(self, dsn_secret: str):
         import teradatasql  # lazy: optional extra
@@ -230,8 +340,20 @@ class DatabricksTargetAdapter:
         self._sql.paramstyle = "pyformat"
         self._prefix = f"`{catalog}`.`{schema}`."
 
+    @property
+    def statements(self) -> int:
+        return self._sql.statements
+
+    @property
+    def rows_fetched(self) -> int:
+        return self._sql.rows_fetched
+
     def _q(self, object: str) -> str:
         return self._prefix + f"`{object}`"
+
+    def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
+                         where: str | None = None) -> dict[str, dict[str, Any]]:
+        return self._sql.table_aggregates(self._q(object), columns, numeric, where)
 
     def target_row_count(self, object: str, where: str | None = None) -> int:
         return self._sql.row_count(self._q(object), where)
@@ -268,11 +390,11 @@ class DatabricksTargetAdapter:
                         groups.append("(" + " AND ".join(parts) + ")")
                     clauses.append("(" + " OR ".join(groups) + ")")
             w = " WHERE " + " AND ".join(clauses) if clauses else ""
-            cur = self._conn.cursor()
-            cur.execute(f"SELECT {', '.join(tops)} FROM {self._q(object)}{w} "
-                        f"ORDER BY {', '.join(key_fields)}",
-                        self._sql._params(values))
+            cur = self._sql._execute(f"SELECT {', '.join(tops)} FROM {self._q(object)}{w} "
+                                     f"ORDER BY {', '.join(key_fields)}",
+                                     self._sql._params(values))
             for row in cur:
+                self._sql.rows_fetched += 1
                 rec = row.asDict(recursive=True) if hasattr(row, "asDict") else dict(zip(
                     [d[0] for d in cur.description], row))
                 yield rec

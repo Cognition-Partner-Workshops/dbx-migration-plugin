@@ -7,13 +7,19 @@ All comparisons happen post-canonicalization through the mapping spec, never raw
 from __future__ import annotations
 
 import decimal
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Any
 
+from .adapters import BatchAggregates, StratifiedKeys
 from .canon import MISSING, Canonicalizer
 from .config import MappingSpec, ObjectMapping, Tolerances
 from .paths import get_path
+
+# Tier 3 sampling: at most this many strata per table; each stratum contributes
+# ceil(sample_size / strata) keys plus the range edges (first/last keys are always graded).
+MAX_STRATA = 32
 
 
 @dataclass
@@ -105,16 +111,46 @@ def _is_numeric_field(f, source_sum: Any) -> bool:
     return isinstance(source_sum, (int, float, decimal.Decimal)) and not isinstance(source_sum, bool)
 
 
+def _declared_numeric(f) -> bool | None:
+    if f.target_type:
+        return f.target_type.lower().split("(")[0] in NUMERIC_TARGET_TYPES
+    return None
+
+
+def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict], dict[str, dict]]:
+    """All field aggregates for one object: one statement per side when the adapter batches,
+    one per field otherwise. SUM is requested only for fields declared numeric; undeclared
+    fields get the per-column probe (SUM may error on strings)."""
+    cols = [f.source for f in c.fields]
+    numeric_src = [f.source for f in c.fields if _declared_numeric(f)]
+    undeclared = [f for f in c.fields if _declared_numeric(f) is None]
+    if isinstance(source, BatchAggregates):
+        s_all = source.table_aggregates(c.root_table, cols, numeric_src, c.root_where)
+        for f in undeclared:
+            s_all[f.source] = source.field_aggregates(c.root_table, f.source, c.root_where)
+    else:
+        s_all = {f.source: source.field_aggregates(c.root_table, f.source, c.root_where) for f in c.fields}
+    tcols = [f.target for f in c.fields]
+    numeric_tgt = [f.target for f in c.fields
+                   if _is_numeric_field(f, s_all[f.source].get("sum"))]
+    if isinstance(target, BatchAggregates):
+        t_all = target.table_aggregates(c.object, tcols, numeric_tgt, c.target_where)
+    else:
+        t_all = {f.target: (target.field_aggregates(c.object, f.target, c.target_where)
+                            if c.target_where is not None else target.field_aggregates(c.object, f.target))
+                 for f in c.fields}
+    return s_all, t_all
+
+
 def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                      source, target) -> TierResult:
     findings, checks = [], 0
     deferred: list[str] = []
     for c in spec.objects:
+        s_all, t_all = _object_aggregates(c, source, target)
         for f in c.fields:
             checks += 1
-            s = source.field_aggregates(c.root_table, f.source, c.root_where)
-            t = (target.field_aggregates(c.object, f.target, c.target_where)
-                 if c.target_where is not None else target.field_aggregates(c.object, f.target))
+            s, t = s_all[f.source], t_all[f.target]
             numeric = _is_numeric_field(f, s.get("sum"))
             stats_to_check: tuple[str, ...] = ("null_rate", "distinct_count", "min", "max")
             if numeric:
@@ -197,9 +233,27 @@ def _grade_embeds(c: ObjectMapping, canon: Canonicalizer, tol: Tolerances,
     return checks
 
 
+def _stratified_keys(c: ObjectMapping, source: StratifiedKeys, n: int, sample_size: int,
+                     rng: random.Random) -> tuple[list[tuple], int]:
+    """Pick ~sample_size keys server-side: n_strata equal-count key ranges, a seeded set of
+    positions inside each, plus every range's first and last key. Only chosen keys cross the
+    wire (one strata statement + one per stratum)."""
+    n_strata = max(1, min(MAX_STRATA, sample_size, n))
+    strata = source.key_strata(c.root_table, c.key_source, n_strata, c.root_where)
+    per = max(1, math.ceil(sample_size / max(1, len(strata))))
+    chosen: set[tuple] = set()
+    for s in strata:
+        if s.n <= 0:
+            continue
+        positions = sorted({1, s.n} | set(rng.sample(range(1, s.n + 1), min(per, s.n))))
+        chosen.update(source.sample_keys(c.root_table, c.key_source, s.lo, s.hi, positions, c.root_where))
+    return sorted(chosen), len(strata)
+
+
 def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
-                source, target, seed: int = 0) -> TierResult:
+                source, target, seed: int = 0, depth: str = "threshold") -> TierResult:
     """Full keyed diff below the tolerance row threshold; keyed stratified sampling above.
+    `depth` overrides the threshold: "full" always diffs every key, "sampled" always samples.
     Embedded arrays with declared element keys/fields are value-graded; the rest are
     reported UNGRADED."""
     findings, checks = [], 0
@@ -207,7 +261,12 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
     rng = random.Random(seed)
     for c in spec.objects:
         n = source.row_count(c.root_table, c.root_where)
-        sampled = n > tol.full_diff_row_threshold
+        if depth == "full":
+            sampled = False
+        elif depth == "sampled":
+            sampled = True
+        else:
+            sampled = n > tol.full_diff_row_threshold
         keys: list[Any] | None = None
         duplicate_source_runs = []
         previous_source_key = None
@@ -223,7 +282,18 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
             previous_source_key = key
             source_run_count = 1
 
-        if sampled:
+        if sampled and isinstance(source, StratifiedKeys):
+            keys, n_strata = _stratified_keys(c, source, n, tol.sample_size, rng)
+            fetched = source.fetch_keyed(c.root_table, c.key_source,
+                                         [f.source for f in c.fields],
+                                         where=c.root_where, keys=keys)
+            src_rows = {tuple(r[k] for k in c.key_source): r for r in fetched}
+            dup_keys = source.duplicate_key_count(c.root_table, c.key_source, c.root_where)
+            duplicate_source_runs.extend([(None, 2)] * dup_keys)
+            stats[c.object] = {"mode": "stratified_sample", "sampling": "stratified",
+                               "strata": n_strata, "population": n, "sampled": len(src_rows),
+                               "coverage": round(len(src_rows) / n, 6) if n else 1.0}
+        elif sampled:
             first, last, reservoir = [], [], []
             seen = 0
             for raw_key in source.iter_keys(c.root_table, c.key_source, c.root_where):
@@ -245,9 +315,9 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                          [f.source for f in c.fields],
                                          where=c.root_where, keys=keys)
             src_rows = {tuple(r[k] for k in c.key_source): r for r in fetched}
-            stats[c.object] = {"mode": "stratified_sample", "population": n,
-                                   "sampled": len(src_rows),
-                                   "coverage": round(len(src_rows) / n, 6) if n else 1.0}
+            stats[c.object] = {"mode": "stratified_sample", "sampling": "reservoir",
+                               "population": n, "sampled": len(src_rows),
+                               "coverage": round(len(src_rows) / n, 6) if n else 1.0}
         else:
             src_rows = {}
             for r in source.fetch_keyed(c.root_table, c.key_source,
@@ -263,7 +333,8 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
             if count > 1:
                 checks += 1
                 findings.append(Finding(c.object, "duplicate_source_key",
-                                        f"key={key} seen {count} times"))
+                                        f"key={key} seen {count} times" if key is not None
+                                        else "a source key occurs more than once (server-side count)"))
         tgt_docs = {}
         proj = [f.target for f in c.fields] + [e.array_path for e in c.embeds]
         target_counts = {}

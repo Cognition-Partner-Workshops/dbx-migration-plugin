@@ -22,7 +22,8 @@ from . import canon, engine, report  # noqa: F401
 from .config import (CanonRule, ConfigError, READ_ONLY_SQL_KEYWORDS,
                      load_canon_rules, load_mapping_spec, load_tolerances,
                      validate_identifier)
-from .engine import MODES, run_recon
+from .cost import estimate_cost
+from .engine import DEPTHS, MODES, run_recon
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks")
 PARAM_RE = re.compile(r"^[A-Za-z0-9_\-:.T /]*$")
@@ -86,6 +87,18 @@ def _load_snapshot(path: Path | None, mode: str) -> dict | None:
     return {key: data[key] for key in ("source", "extracted_at", "row_counts")}
 
 
+def _parse_params(items: list[str]) -> dict[str, str]:
+    params = {}
+    for item in items:
+        name, sep, value = item.partition("=")
+        if not sep or not name:
+            raise SystemExit(f"--param must be NAME=VALUE, got '{item}'")
+        if not PARAM_RE.fullmatch(value):
+            raise SystemExit(f"invalid --param value for {name}")
+        params[name] = value
+    return params
+
+
 def selftest() -> int:
     """Blueprint post-setup check: exercises every canonicalization rule on sample values
     and verifies the engine and report modules import. No database connections."""
@@ -112,6 +125,16 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="dbx-recon")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="verify the harness install (no connections needed)")
+    e = sub.add_parser("estimate", help="statements/rows a run would cost (no connections); "
+                                        "summed per wave for the STOP C cost line")
+    e.add_argument("--mapping", required=True, type=Path)
+    e.add_argument("--tolerances", required=True, type=Path)
+    e.add_argument("--depth", choices=DEPTHS, default="threshold")
+    e.add_argument("--row-counts", type=Path,
+                   help="JSON {root_table: rows} from the analysis inventory; without it row "
+                        "transfer is reported as unknown")
+    e.add_argument("--ops-count", type=int, default=0, help="number of Tier 4 recorded ops")
+    e.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
     r = sub.add_parser("run", help="run the recon gate for one unit")
     r.add_argument("--unit", required=True)
     r.add_argument("--family", required=True, choices=SOURCE_FAMILIES)
@@ -135,6 +158,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--snapshot-manifest", type=Path)
     r.add_argument("--seed", type=int, default=0,
                    help="sampling seed (recorded in result.json for re-runnability)")
+    r.add_argument("--depth", choices=DEPTHS, default="threshold",
+                   help="Tier 3 depth: threshold (tolerance file decides), sampled (verifier "
+                        "default), full (cutover-critical units per the wave manifest's verify_depth)")
     r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="resolve a ${name} placeholder in the mapping spec's where clauses "
                         "(e.g. partition/date scoping); repeatable; recorded in result.json")
@@ -144,20 +170,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "selftest":
         return selftest()
 
+    params = _parse_params(args.param)
+    if args.cmd == "estimate":
+        spec = load_mapping_spec(args.mapping, params)
+        tol = load_tolerances(args.tolerances)
+        row_counts = None
+        if args.row_counts is not None:
+            try:
+                row_counts = json.loads(args.row_counts.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SystemExit(f"cannot read row counts {args.row_counts}: {exc}") from None
+            if not isinstance(row_counts, dict) or any(
+                    isinstance(v, bool) or not isinstance(v, int) for v in row_counts.values()):
+                raise SystemExit(f"{args.row_counts} must be a JSON object of integer row counts")
+        print(json.dumps(estimate_cost(spec, tol, args.depth, row_counts, args.ops_count), indent=2))
+        return 0
+
     allowed_catalogs = _load_allowed_targets(args.allowed_targets_file)
     target_catalog = _single_identifier(args.target_catalog, "target-catalog")
     target_schema = _single_identifier(args.target_schema, "target-schema")
     if target_catalog not in allowed_catalogs:
         raise SystemExit(f"--target-catalog {target_catalog!r} is not in {args.allowed_targets_file}")
 
-    params = {}
-    for item in args.param:
-        name, sep, value = item.partition("=")
-        if not sep or not name:
-            raise SystemExit(f"--param must be NAME=VALUE, got '{item}'")
-        if not PARAM_RE.fullmatch(value):
-            raise SystemExit(f"invalid --param value for {name}")
-        params[name] = value
     spec = load_mapping_spec(args.mapping, params)
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
@@ -183,8 +217,8 @@ def main(argv: list[str] | None = None) -> int:
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
-                       source_family=args.family)
-    print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} "
+                       source_family=args.family, depth=args.depth)
+    print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={args.depth} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")
     return 0 if result["verdict"] == "PASS" else 1

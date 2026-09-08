@@ -28,7 +28,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  tiers: list[TierResult], seed: int = 0,
                  params: dict[str, str] | None = None,
                  snapshot: dict | None = None,
-                 provenance_warnings: list[str] | None = None) -> dict:
+                 provenance_warnings: list[str] | None = None,
+                 depth: str = "threshold", cost: dict | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -44,8 +45,10 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "mapping_version": mapping_version,
         "tolerance_version": tolerance_version,
         "seed": seed,
+        "depth": depth,
         "params": params or {},
         "snapshot": snapshot,
+        "cost": cost or {},
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "tiers": [t.as_dict() for t in tiers],
         "warnings": warnings,
@@ -66,10 +69,13 @@ def render_report(result: dict) -> str:
         f"- Tolerance version: `{result['tolerance_version']}`",
         f"- Seed: `{result.get('seed', 0)}`" + (f" | Params: `{result['params']}`"
                                                 if result.get("params") else ""),
+        f"- Tier 3 depth: `{result.get('depth', 'threshold')}`",
         f"- Generated: {result['generated_at']}",
     ]
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
+    if result.get("cost"):
+        lines.append(f"- Cost: `{json.dumps(result['cost'], default=str)}`")
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [
@@ -112,10 +118,15 @@ def render_summary(result: dict) -> str:
         f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
         "(fixture/continuous evidence never merges)",
         f"- Mapping `{result['mapping_version']}` / tolerances `{result['tolerance_version']}`"
-        f" / seed `{result.get('seed', 0)}`"
+        f" / seed `{result.get('seed', 0)}` / depth `{result.get('depth', 'threshold')}`"
         + (f" / params `{result['params']}`" if result.get("params") else ""),
         f"- Generated: {result['generated_at']}",
     ]
+    cost = result.get("cost") or {}
+    if cost.get("source_statements") is not None:
+        lines.append(f"- Cost: source {cost['source_statements']} statements / "
+                     f"{cost['source_rows_fetched']} rows fetched; target {cost['target_statements']} "
+                     f"statements / {cost['target_rows_fetched']} rows; {cost['elapsed_s']}s")
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
     for w in result.get("warnings", []):
