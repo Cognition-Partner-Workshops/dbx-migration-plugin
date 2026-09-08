@@ -16,7 +16,8 @@ comment; `docs/` SAS `08_solvency_ii_qrt_prep.sas` (the drifted SII LoB copy).
 | Reusable cached Lookup on reference data that has **drifted** from another engine's copy | `LKP_SII_LOB` (`REUSABLE=YES`, `REF_DB.SII_LOB_MAP`) | row 74, trap 10, section 3 |
 | Many hand-maintained broker-specific `SOURCE` definitions (14) -> one Auto Loader source + per-broker schema decision | described, not exported | section 1 (object-size signals), section 11 |
 | SFTP pre-step wrapper called by cron, with per-broker credentials and a `mailx` completion mail | `source.bdx_transfer.ksh` | section 2 "Scheduler edges" (wrapper scripts), section 9 (secrets by name), section 6 (Command task -> ingestion decision) |
-| Per-broker file watcher + WD3 + habitual late broker -> `trigger.file_arrival` + in-pipeline completeness check | `WORKFLOW DESCRIPTION` | section 6 (Event Wait, file arrival) |
+| Per-broker file watcher + WD3 + habitual late broker -> `trigger.file_arrival` wakes the job; a read-only gate task (`broker_completeness_gate.py`: expected-broker table vs files landed for the target month) + `condition_task` is the only path to the publishing `pipeline_task`, so a partial month is never published and a late file simply re-triggers | `WORKFLOW DESCRIPTION` | section 6 (Event Wait, file arrival; Link condition on counts -> task value) |
+| Row-preserving Expression transformations converted as `withColumn` on the same raw row (never as separate views re-joined on a repeatable key) and a Lookup forced to one row per key | `EXP_REKEY_POLICY`, `EXP_AMT_CLEAN`, `LKP_SII_LOB` | row 74, section 6 "Row error handling", trap 10 |
 | Ownership ambiguity of a cron entry | crontab comment | trap 24 |
 
 ## Recon tier that catches a wrong conversion
@@ -32,7 +33,8 @@ comment; `docs/` SAS `08_solvency_ii_qrt_prep.sas` (the drifted SII LoB copy).
   every `PET` product row - the recon sees it; the drift is a finding to be decided, not fixed in conversion.
 - **Tier 1 count per `BROKER_ID`**: a run that fires before BRK0007's late file has landed is a count shortfall on
   one broker only; the legacy behaviour (manual restart) has no Databricks equivalent by default, so the completeness
-  condition is explicit.
+  gate is an explicit task in the job, and a duplicated `CLAIM_REF` inside one broker file must show as exactly the
+  legacy count (n), not n*n from a self-join of derived views.
 
 ## Findings recorded, not converted
 

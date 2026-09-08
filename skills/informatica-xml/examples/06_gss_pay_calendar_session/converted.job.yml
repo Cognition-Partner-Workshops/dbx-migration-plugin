@@ -1,4 +1,5 @@
-# wf_Pay_Calendar -> Lakeflow Job (shapes: databricks-jobs references/task-types.md "Run SQL File",
+# wf_Pay_Calendar -> Lakeflow Job (shapes: databricks-jobs references/task-types.md "Run SQL File"; databricks-dbsql
+# references/sql-scripting.md "CALL (Invoke a Procedure)" for converted.call.sql;
 # references/dependencies-control-flow.md `depends_on` + `run_if`, references/notifications-monitoring.md
 # "Email Notifications"; databricks-dabs bundle-structure.md for ${var.*}).
 #
@@ -27,11 +28,23 @@ resources:
         on_failure:
           - ${var.wf_pay_calendar_email_list}      # $$WF_PAY_CALENDAR_EMAIL_LIST (Email_Pay_Calendar + on_failure_mail recipient)
       tasks:
-        - task_key: s_Pay_Calendar_Reset_Pay_Calendar
+        # Definition and execution are separate tasks: converted.sql only (re)defines the procedure; a run made of that
+        # file alone would succeed without touching PAY_PERIOD. The CALL (converted.call.sql) is the session.
+        - task_key: deploy_s_Pay_Calendar_Reset_Pay_Calendar
           sql_task:
             warehouse_id: ${var.warehouse_id}
             file:
-              path: ./converted.sql                 # CALL of the procedure defined there
+              path: ./converted.sql                 # CREATE OR REPLACE PROCEDURE only (idempotent)
+              source: WORKSPACE
+          max_retries: 0
+        - task_key: s_Pay_Calendar_Reset_Pay_Calendar
+          depends_on:
+            - task_key: deploy_s_Pay_Calendar_Reset_Pay_Calendar
+          run_if: ALL_SUCCESS
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./converted.call.sql            # DECLARE + CALL + SELECT tgt_success_rows
               source: WORKSPACE
           max_retries: 0
         - task_key: s_Pay_Calendar_Set_Pay_Calendar       # elided in the source excerpt; shape only

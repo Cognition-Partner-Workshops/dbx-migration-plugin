@@ -87,6 +87,5 @@ BEGIN
   SET p_rows_loaded = (SELECT COUNT(*) FROM exp_claim_derived WHERE NOT loss_dt_row_error);
 END;
 
--- Invoked by the sql_task in converted.job.yml:
--- CALL <migration_catalog>.claims.m_claims_fnol_intraday('<cat>.raw.guidewire_cc_events', '<cat>.raw.legacy_clm_extract',
---                                                         '<cat>.claims.claim', '<cat>.claims.claim_quarantine', ?);
+-- This file only DEFINES the procedure (idempotent CREATE OR REPLACE). The run-time CALL lives in converted.call.sql
+-- and is executed by a separate task in converted.job.yml.

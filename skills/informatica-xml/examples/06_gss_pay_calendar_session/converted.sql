@@ -1,7 +1,8 @@
 -- Converted unit: Pay_Calendar / m_Pay_Calendar_Reset_Pay_Calendar + s_Pay_Calendar_Reset_Pay_Calendar
 -- (fixture: source.xml, an excerpt of legacy_shared_services/XML/wf_GSS_PAY_CALENDAR.xml)
 -- Target form: DBSQL stored procedure (databricks-dbsql SKILL.md "Stored Procedure with Error Handling":
--- CREATE OR REPLACE PROCEDURE, LANGUAGE SQL, EXIT HANDLER, MERGE) called by a sql_task in converted.job.yml.
+-- CREATE OR REPLACE PROCEDURE, LANGUAGE SQL, EXIT HANDLER, MERGE) deployed by one sql_task and CALLed by the next
+-- (converted.call.sql) in converted.job.yml.
 -- Routing: SQL-only source->filter->constant->update chain => DBSQL first (SKILL.md section 6).
 --
 -- Legacy pipeline (CONNECTOR rows):
@@ -61,4 +62,5 @@ BEGIN
   SET p_tgt_success_rows = v_src_rows;
 END;
 
--- Invoked by the sql_task:  CALL <migration_catalog>.pay_calendar.s_pay_calendar_reset_pay_calendar('<cat>.gss.pay_period', ?);
+-- This file only DEFINES the procedure (idempotent CREATE OR REPLACE). The run-time CALL lives in converted.call.sql
+-- and is executed by the s_Pay_Calendar_Reset_Pay_Calendar task in converted.job.yml.

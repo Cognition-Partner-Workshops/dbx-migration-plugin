@@ -14,10 +14,24 @@ resources:
         timezone_id: "Europe/London"
         pause_status: PAUSED                    # unpause only after the parallel-run recon signs off (D5)
       tasks:
-        - task_key: s_m_CLAIMS_FNOL_INTRADAY
+        # Procedure definition and procedure execution are separate tasks: converted.sql only (re)defines the
+        # procedure, so a run whose only task was that file would report success without loading a single claim.
+        # The deploy task is idempotent (CREATE OR REPLACE) and may be moved to bundle deployment; the CALL task is
+        # the unit that must run on every schedule tick.
+        - task_key: deploy_m_CLAIMS_FNOL_INTRADAY
           sql_task:
             warehouse_id: ${var.warehouse_id}
             file:
-              path: ./converted.sql             # CREATE OR REPLACE PROCEDURE + the CALL shown at its foot
+              path: ./converted.sql             # CREATE OR REPLACE PROCEDURE only
+              source: WORKSPACE
+          max_retries: 0
+        - task_key: s_m_CLAIMS_FNOL_INTRADAY
+          depends_on:
+            - task_key: deploy_m_CLAIMS_FNOL_INTRADAY
+          run_if: ALL_SUCCESS
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./converted.call.sql        # DECLARE + CALL with the resolved table names + SELECT rows_loaded
               source: WORKSPACE
           max_retries: 0                        # no session Recovery Strategy in the export -> no retry

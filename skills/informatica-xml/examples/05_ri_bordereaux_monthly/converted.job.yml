@@ -1,5 +1,7 @@
 # wf_REINSURANCE_BORDEREAUX_MONTHLY -> Lakeflow Job (shapes: databricks-jobs references/triggers-schedules.md
-# "File Arrival Triggers", references/task-types.md "Pipeline Task"; databricks-dabs bundle-structure.md for ${var.*}).
+# "File Arrival Triggers", references/task-types.md "Pipeline Task", "Notebook Task" and "Generate Dynamic Inputs"
+# (task values); `condition_task` + `depends_on[].outcome` per
+# https://docs.databricks.com/aws/en/dev-tools/bundles/resources; databricks-dabs bundle-structure.md for ${var.*}).
 #
 # Legacy edges (SKILL.md section 2 "Scheduler edges"):
 #   cron `0 6 1-5 * *`  -> scripts/bdx_transfer (SFTP mget per broker, then mailx)        [owner unclear per crontab comment]
@@ -10,8 +12,12 @@
 #   1. SFTP pull is an INGESTION concern, not a mapping: options are Lakeflow Connect / a customer-run transfer landing
 #      into a UC volume / a Python task wrapping the same SFTP with per-broker secrets by NAME. This file assumes the
 #      files land in a volume and does not implement the transfer.
-#   2. One file-arrival trigger on the landing volume replaces the per-broker watchers; "all brokers arrived" is a
-#      condition the pipeline evaluates (count distinct BROKER_ID in the month) rather than a scheduler wait.
+#   2. One file-arrival trigger on the landing volume replaces the per-broker watchers. The trigger only wakes the job;
+#      "all brokers arrived for the target month" is decided by the gate task below (expected broker set vs files
+#      landed), and the publishing pipeline is reachable ONLY through the condition task's `true` outcome. Every
+#      trigger during days 1-5 therefore ends as a successful no-op until the set is complete; a late file (BRK0007)
+#      fires the trigger again, the gate passes, and the pipeline runs. Reruns are idempotent: the gate is read-only,
+#      Auto Loader ingests each file once, and the materialized view is recomputed from the full ingested set.
 resources:
   jobs:
     wf_reinsurance_bordereaux_monthly:
@@ -22,14 +28,37 @@ resources:
           url: ${var.bdx_landing_path}                 # /Volumes/<migration_catalog>/landing/bordereaux/
           min_time_between_triggers_seconds: 3600     # brokers drop several files over days 1-5
           wait_after_last_change_seconds: 300
+      parameters:
+        - name: target_month                          # 'yyyyMM'; empty = previous calendar month (see gate notebook)
+          default: ""
       tasks:
+        - task_key: gate_all_brokers_arrived
+          # Replaces the per-broker file watchers + WD3 + manual-restart runbook. Sets task values
+          # all_brokers_arrived / missing_brokers / target_month; never writes.
+          notebook_task:
+            notebook_path: ./broker_completeness_gate.py
+            base_parameters:
+              bdx_landing_path: ${var.bdx_landing_path}
+              expected_brokers_table: ${var.expected_brokers_table}   # <migration_catalog>.ri.expected_brokers
+              target_month: "{{job.parameters.target_month}}"
+        - task_key: is_month_complete
+          depends_on:
+            - task_key: gate_all_brokers_arrived
+          condition_task:
+            op: EQUAL_TO
+            left: "{{tasks.gate_all_brokers_arrived.values.all_brokers_arrived}}"
+            right: "true"
         - task_key: s_m_RI_BORDEREAUX_MONTHLY
+          depends_on:
+            - task_key: is_month_complete
+              outcome: "true"                          # the pipeline cannot run while any expected broker is missing
           pipeline_task:
             pipeline_id: ${resources.pipelines.m_ri_bordereaux_monthly.id}
         - task_key: notify_files_landed
           # replaces `ls $LANDING | mailx -s "BDX files landed ..."`: job-level email_notifications on_success
           # (databricks-jobs references/notifications-monitoring.md "Email Notifications") is the like-for-like; a
-          # task is kept only if the listing body itself is required by the RI team.
+          # task is kept only if the listing body itself is required by the RI team. Runs after a publish (the
+          # incomplete-month branch produces no mail, exactly as the legacy watcher waited silently).
           depends_on:
             - task_key: s_m_RI_BORDEREAUX_MONTHLY
           run_if: ALL_DONE
