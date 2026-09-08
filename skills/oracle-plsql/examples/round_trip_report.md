@@ -40,7 +40,7 @@ Albion edges: 3 = FACT 2, INFERRED 1, UNVERIFIABLE 0
 | ODS.MV_POLICY_PREMIUM_SUMMARY | MATERIALIZED VIEW | 12_mv_policy_premium_summary.sql | {"refresh": "FAST DEMAND"} |
 | ODS.ODS_CLAIMS | TABLE | - |  |
 | ODS.ODS_POLICY_360 | TABLE | - |  |
-| ODS.PKG_POLICY_INQUIRY | PACKAGE BODY | pkg_policy_inquiry.sql | {"lines": 43} |
+| ODS.PKG_POLICY_INQUIRY | PACKAGE BODY | pkg_policy_inquiry.sql | {"lines": 42} |
 | ODS.PKG_POLICY_INQUIRY.GET_PARTY_CLAIMS | PACKAGE FUNCTION | pkg_policy_inquiry.sql |  |
 | ODS.PKG_POLICY_INQUIRY.GET_POLICY_SUMMARY | PACKAGE FUNCTION | pkg_policy_inquiry.sql |  |
 | ODS.POLICY | SYNONYM | 15_syn_dblink_grants.sql |  |
@@ -53,11 +53,11 @@ Albion edges: 3 = FACT 2, INFERRED 1, UNVERIFIABLE 0
 | POLADM.BROKER | TABLE | 02_tbl_party_broker.sql | {"constraints": 4, "temporary": false, "type_traps": ["CHAR(1)", "NUMBER"]} |
 | POLADM.BROKER_PARENT_IX | INDEX | 02_tbl_party_broker.sql |  |
 | POLADM.CLAIMS_LINK | DATABASE LINK | 15_syn_dblink_grants.sql |  |
-| POLADM.FN_BROKER_PREDICATE | FUNCTION | 15_syn_dblink_grants.sql | {"lines": 35} |
+| POLADM.FN_BROKER_PREDICATE | FUNCTION | 15_syn_dblink_grants.sql | {"lines": 9} |
 | POLADM.JOB_NIGHTLY_RENEWAL | SCHEDULER JOB | 13_job_nightly_renewal.sql | {"repeat_interval": "FREQ=DAILY; BYHOUR=2; BYMINUTE=40; BYSECOND=0; BYDAY=MON,TUE,WED,THU,FRI,SAT", "start_date": "TO_TIMESTAMP_TZ('2019-04-01 02:40:00 Europe/London', 'YYYY-MM-DD HH24:MI:SS TZR')"} |
 | POLADM.PARTY | TABLE | 02_tbl_party_broker.sql | {"constraints": 3, "temporary": false, "type_traps": ["CHAR(1)", "CHAR(8)", "DATE"]} |
 | POLADM.PARTY_DOB_REDACT | REDACTION POLICY | 15_syn_dblink_grants.sql | {"column": "DATE_OF_BIRTH"} |
-| POLADM.PKG_POLICY_RENEWAL | PACKAGE | 08_pkg_policy_renewal.sql | {"lines": 125} |
+| POLADM.PKG_POLICY_RENEWAL | PACKAGE | 08_pkg_policy_renewal.sql | {"lines": 124} |
 | POLADM.PKG_POLICY_RENEWAL.ARCHIVE_TO | PACKAGE PROCEDURE | 08_pkg_policy_renewal.sql |  |
 | POLADM.PKG_POLICY_RENEWAL.BROKER_UPLIFT | PACKAGE FUNCTION | 08_pkg_policy_renewal.sql |  |
 | POLADM.PKG_POLICY_RENEWAL.EXPIRING_CURSOR | PACKAGE FUNCTION | 08_pkg_policy_renewal.sql |  |
@@ -69,12 +69,12 @@ Albion edges: 3 = FACT 2, INFERRED 1, UNVERIFIABLE 0
 | POLADM.POLICY_EXPIRY_IX | INDEX | 03_tbl_policy.sql |  |
 | POLADM.POLICY_PARTY_IX | INDEX | 03_tbl_policy.sql |  |
 | POLADM.POLICY_SEQ | SEQUENCE | 01_seq_policy.sql |  |
-| POLADM.PRC_LOG_EVENT | PROCEDURE | 06_prc_log_event.sql | {"lines": 22} |
+| POLADM.PRC_LOG_EVENT | PROCEDURE | 06_prc_log_event.sql | {"lines": 21} |
 | POLADM.PREMIUM_TXN | TABLE | 04_tbl_premium_txn.sql | {"constraints": 4, "temporary": false, "type_traps": ["BINARY_DOUBLE", "CHAR(3)", "DATE", "INTERVAL DAY(3) TO SECOND(0) NULL", "RAW(16)", "TIMESTAMP(6) WITH LOCAL TIME ZONE NULL", "TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL"]} |
 | POLADM.PREMIUM_TXN_POLICY_IX | INDEX | 04_tbl_premium_txn.sql |  |
 | POLADM.PRG_NIGHTLY_RENEWAL | SCHEDULER PROGRAM | 13_job_nightly_renewal.sql | {"repeat_interval": "", "start_date": ""} |
 | POLADM.STG_POLICY_FEED | TABLE | 09_mrg_policy_from_stg.sql | {"constraints": 0, "temporary": true, "type_traps": ["CHAR(1)", "DATE", "NUMBER"]} |
-| POLADM.TRG_POLICY_BIU | TRIGGER | 07_trg_policy_biu.sql | {"lines": 47} |
+| POLADM.TRG_POLICY_BIU | TRIGGER | 07_trg_policy_biu.sql | {"lines": 46} |
 | PUBLIC.BROKER | PUBLIC SYNONYM | 15_syn_dblink_grants.sql |  |
 | ROLE.ODS_READER | ROLE | 15_syn_dblink_grants.sql |  |
 | ROLE.POLADM_APP | ROLE | 15_syn_dblink_grants.sql |  |

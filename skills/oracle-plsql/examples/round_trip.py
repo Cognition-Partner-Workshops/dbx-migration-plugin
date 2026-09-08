@@ -29,10 +29,10 @@ HERE = Path(__file__).resolve().parent
 FIXTURE = HERE / "fixture"
 ALBION_DEFAULT = HERE.parents[3] / "albion-insurance-data-estate" / "api_legacy" / "plsql" / "pkg_policy_inquiry.sql"
 
+# a SQL*Plus directive may be indented; `SET col = ...` (UPDATE) and `EXECUTE IMMEDIATE` (PL/SQL) are not directives
 SQLPLUS_DIRECTIVE = re.compile(
-    r"^(SET\s+(PAGESIZE|LINESIZE|DEFINE|FEEDBACK|VERIFY|HEADING|ECHO|SERVEROUTPUT|TERMOUT|TRIMSPOOL|TIMING|AUTOCOMMIT|SQLBLANKLINES)"
-    r"|SPOOL|WHENEVER|DEFINE|COLUMN|EXEC(UTE)?\s|@@?|PROMPT|ACCEPT|TTITLE|BREAK|COMPUTE)\b", re.I)
-QQUOTE_RE = re.compile(r"q'([\[({<])(.*?)[\])}>]'", re.I | re.S)
+    r"^\s*(SET\s+(PAGESIZE|LINESIZE|DEFINE|FEEDBACK|VERIFY|HEADING|ECHO|SERVEROUTPUT|TERMOUT|TRIMSPOOL|TIMING|AUTOCOMMIT|SQLBLANKLINES)"
+    r"\b(?!\s*=)|SPOOL|WHENEVER|DEFINE|COLUMN|EXEC(UTE)?\s+(?!IMMEDIATE\b)|@@?|PROMPT|ACCEPT|TTITLE|BREAK|COMPUTE)\b", re.I)
 IDENT = r"[A-Za-z_][A-Za-z0-9_$#]*"
 QNAME = rf"(?:{IDENT}\.)?{IDENT}"
 KEYWORDS = {
@@ -78,9 +78,35 @@ class Edge:
 QQUOTE_CLOSER = {"[": "]", "(": ")", "{": "}", "<": ">"}
 
 
+def literal_end(text: str, i: int) -> int:
+    """If text[i] opens a literal, return the index just past it, else return i. Literals: '...' with '' escape,
+    q'X...X' with ANY single-character delimiter (paired brackets close with their partner), "quoted identifier"."""
+    n = len(text)
+    ch = text[i]
+    if ch in "qQ" and i + 2 < n and text[i + 1] == "'" and not text[i + 2].isspace() \
+            and (i == 0 or not re.match(r"[\w$#]", text[i - 1])):
+        closer = QQUOTE_CLOSER.get(text[i + 2], text[i + 2]) + "'"
+        j = text.find(closer, i + 3)
+        return n if j < 0 else j + 2
+    if ch == "'":
+        j = i + 1
+        while j < n:
+            if text[j] == "'":
+                if j + 1 < n and text[j + 1] == "'":
+                    j += 2
+                    continue
+                return j + 1
+            j += 1
+        return n
+    if ch == '"':
+        j = text.find('"', i + 1)
+        return n if j < 0 else j + 1
+    return i
+
+
 def strip_comments(text: str) -> str:
-    """Lexical comment removal. '...' ('' escape), q'[...]' (any delimiter) and "quoted identifiers" are opaque,
-    so `--` or `/*` inside a literal never swallows the SQL that follows it; comments become spaces, newlines are kept."""
+    """Lexical comment removal. Literals (see literal_end) are opaque, so `--` or `/*` inside one never swallows
+    the SQL that follows it; comments become spaces, newlines are kept."""
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
@@ -95,29 +121,8 @@ def strip_comments(text: str) -> str:
             out.append(re.sub(r"[^\n]", " ", text[i:j]))
             i = j
             continue
-        if ch in "qQ" and i + 2 < n and text[i + 1] == "'" and (i == 0 or not re.match(r"[\w$#]", text[i - 1])):
-            closer = QQUOTE_CLOSER.get(text[i + 2], text[i + 2]) + "'"
-            j = text.find(closer, i + 3)
-            j = n if j < 0 else j + 2
-            out.append(text[i:j])
-            i = j
-            continue
-        if ch == "'":
-            j = i + 1
-            while j < n:
-                if text[j] == "'":
-                    if j + 1 < n and text[j + 1] == "'":
-                        j += 2
-                        continue
-                    break
-                j += 1
-            j = min(j + 1, n)
-            out.append(text[i:j])
-            i = j
-            continue
-        if ch == '"':
-            j = text.find('"', i + 1)
-            j = n if j < 0 else j + 1
+        j = literal_end(text, i)
+        if j > i:
             out.append(text[i:j])
             i = j
             continue
@@ -126,28 +131,79 @@ def strip_comments(text: str) -> str:
     return "".join(out)
 
 
+def normalize_qquotes(text: str) -> str:
+    """Rewrite every q'X...X' literal as an ordinary '...' literal ('' escapes) so all later rules see one string
+    syntax; ordinary strings and quoted identifiers are copied, never rescanned."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        j = literal_end(text, i)
+        if j == i:
+            out.append(text[i])
+            i += 1
+            continue
+        lit = text[i:j]
+        if lit[0] in "qQ":
+            body = lit[3:-2] if len(lit) >= 5 and lit.endswith("'") else lit[3:]
+            out.append("'" + body.replace("'", "''") + "'")
+        else:
+            out.append(lit)
+        i = j
+    return "".join(out)
+
+
+def unquote(value: str) -> str:
+    """Value of a '...' literal argument ('' -> '); non-literal expressions are returned as written."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def call_args(text: str, open_paren: int) -> str:
+    """Argument text of the call whose '(' is at `open_paren`, up to its balanced ')' (literals opaque), so a ');'
+    inside an action string or a nested TO_TIMESTAMP_TZ(...) never ends the call early."""
+    depth, i, n = 0, open_paren, len(text)
+    while i < n:
+        j = literal_end(text, i)
+        if j > i:
+            i = j
+            continue
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren + 1:i]
+        i += 1
+    return text[open_paren + 1:]
+
+
+def statement_end(text: str, start: int) -> int:
+    """Index just past the first ';' at or after `start` that is outside a literal (comments already stripped)."""
+    i, n = start, len(text)
+    while i < n:
+        j = literal_end(text, i)
+        if j > i:
+            i = j
+            continue
+        if text[i] == ";":
+            return i + 1
+        i += 1
+    return n
+
+
 def named_args(text: str) -> list[tuple[str, str]]:
     """`name => value` pairs of a PL/SQL call, splitting on top-level commas only: a value may be a full expression
-    such as TO_TIMESTAMP_TZ('...', '...') (balanced parentheses, '...' and q'[...]' literals are opaque)."""
+    such as TO_TIMESTAMP_TZ('...', '...') (balanced parentheses, literals opaque)."""
     parts: list[str] = []
     depth, start, i, n = 0, 0, 0, len(text)
     while i < n:
+        j = literal_end(text, i)
+        if j > i:
+            i = j
+            continue
         ch = text[i]
-        if ch in "qQ" and i + 2 < n and text[i + 1] == "'" and (i == 0 or not re.match(r"[\w$#]", text[i - 1])):
-            j = text.find(QQUOTE_CLOSER.get(text[i + 2], text[i + 2]) + "'", i + 3)
-            i = n if j < 0 else j + 2
-            continue
-        if ch == "'":
-            j = i + 1
-            while j < n:
-                if text[j] == "'":
-                    if j + 1 < n and text[j + 1] == "'":
-                        j += 2
-                        continue
-                    break
-                j += 1
-            i = min(j + 1, n)
-            continue
         if ch == "(":
             depth += 1
         elif ch == ")":
@@ -163,18 +219,6 @@ def named_args(text: str) -> list[tuple[str, str]]:
         if m:
             out.append((m.group(1), m.group(2)))
     return out
-
-
-def lift_qquotes(text: str) -> tuple[str, dict[str, str]]:
-    """Replace q'[...]' literals with plain placeholders so argument parsing is not derailed by ');' inside them."""
-    lifted: dict[str, str] = {}
-
-    def _sub(m: re.Match) -> str:
-        tok = f"'@@Q{len(lifted)}@@'"
-        lifted[tok.strip("'")] = m.group(2)
-        return tok
-
-    return QQUOTE_RE.sub(_sub, text), lifted
 
 
 def norm(name: str, default_owner: str) -> str:
@@ -235,29 +279,57 @@ class Estate:
 # --------------------------------------------------------------------------- census (section 1)
 
 CREATE_RE = re.compile(
-    rf"CREATE\s+(?:OR\s+REPLACE\s+)?(?:GLOBAL\s+TEMPORARY\s+|PUBLIC\s+|EDITIONABLE\s+)?"
+    rf"CREATE\s+(?:OR\s+REPLACE\s+)?"
+    rf"(?:(?:GLOBAL|PRIVATE)\s+TEMPORARY\s+|PUBLIC\s+|(?:NON)?EDITIONABLE\s+|UNIQUE\s+|BITMAP\s+|(?:NO\s+)?FORCE\s+|SHARED\s+)*"
     rf"(MATERIALIZED\s+VIEW\s+LOG\s+ON|MATERIALIZED\s+VIEW|PACKAGE\s+BODY|DATABASE\s+LINK|SEQUENCE|TABLE|INDEX|VIEW|"
     rf"PROCEDURE|FUNCTION|PACKAGE|TRIGGER|SYNONYM|ROLE)\s+({QNAME})",
     re.I,
 )
+PROCEDURAL_CREATE = {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TRIGGER"}
 PUBLIC_SYN_RE = re.compile(rf"CREATE\s+(?:OR\s+REPLACE\s+)?PUBLIC\s+SYNONYM\s+({IDENT})\s+FOR\s+({QNAME}(?:@{IDENT})?)", re.I)
 PRIV_SYN_RE = re.compile(rf"CREATE\s+(?:OR\s+REPLACE\s+)?SYNONYM\s+({QNAME})\s+FOR\s+({QNAME}(?:@{IDENT})?)", re.I)
 MEMBER_RE = re.compile(rf"^\s*(PROCEDURE|FUNCTION)\s+({IDENT})", re.I | re.M)
-SCHED_RE = re.compile(r"DBMS_SCHEDULER\.CREATE_(JOB|PROGRAM)\s*\((.*?)\);", re.I | re.S)
-RLS_RE = re.compile(r"DBMS_RLS\.ADD_POLICY\s*\((.*?)\);", re.I | re.S)
-REDACT_RE = re.compile(r"DBMS_REDACT\.ADD_POLICY\s*\((.*?)\);", re.I | re.S)
+# call heads only: the argument list runs to the balanced ')' (call_args), never to the first ');' in the text
+SCHED_RE = re.compile(r"DBMS_SCHEDULER\.CREATE_(JOB|PROGRAM)\s*\(", re.I)
+RLS_RE = re.compile(r"DBMS_RLS\.ADD_POLICY\s*\(", re.I)
+REDACT_RE = re.compile(r"DBMS_REDACT\.ADD_POLICY\s*\(", re.I)
+# top-level DML that makes the non-procedural remainder of a file a DML SCRIPT unit (GRANT ... DELETE ON and
+# ON DELETE CASCADE do not qualify)
+LOOSE_DML_RE = re.compile(
+    rf"\b(?:INSERT\s+INTO|MERGE\s+INTO|TRUNCATE\s+TABLE)\s+{QNAME}|\bUPDATE\s+{QNAME}\s+SET\b|\bDELETE\s+(?:FROM\s+)?{QNAME}\s*(?:WHERE\b|;)",
+    re.I)
 GRANT_RE = re.compile(rf"GRANT\s+([A-Z ,()_]+?)\s+ON\s+({QNAME})\s+TO\s+({IDENT})", re.I)
 ROLE_GRANT_RE = re.compile(rf"GRANT\s+({IDENT})\s+TO\s+({IDENT})\s*;", re.I)
 
 
-def split_units(sql: str) -> list[str]:
-    """Split on SQL*Plus '/' terminators, keeping PL/SQL blocks whole."""
-    return [u for u in re.split(r"^\s*/\s*$", sql, flags=re.M) if u.strip()]
+def unit_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) offsets of the SQL*Plus '/'-terminated units of a file; a PL/SQL unit ends at its '/'."""
+    spans, start = [], 0
+    for m in re.finditer(r"^\s*/\s*$", text, re.M):
+        spans.append((start, m.start()))
+        start = m.end()
+    spans.append((start, len(text)))
+    return spans
+
+
+def uncovered(text: str, covered: list[tuple[int, int]]) -> str:
+    """The file text outside `covered` spans (procedural units and CREATE statements that own their own lineage)."""
+    out, pos = [], 0
+    for s, e in sorted(covered):
+        if s > pos:
+            out.append(text[pos:s])
+        pos = max(pos, e)
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list, proc_units: list, grants: list) -> None:
     raw = path.read_text()
-    text, qlits = lift_qquotes(strip_comments(raw))
+    text = normalize_qquotes(strip_comments(raw))
+    # same offsets as `text`, string literals blanked: object headers are never matched inside a literal
+    blanked = STRING_LIT_RE.sub(lambda m: "'" + " " * (len(m.group(0)) - 2) + "'", text)
+    spans = unit_spans(text)
+    covered: list[tuple[int, int]] = []       # spans whose lineage belongs to a named unit, not to the file's loose DML
     fname = path.name
     is_sqlplus = any(SQLPLUS_DIRECTIVE.match(ln) for ln in raw.splitlines())
     if is_sqlplus:
@@ -265,19 +337,22 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
         est.add(key, "SQLPLUS_SCRIPT", fname,
                 lines=len(raw.splitlines()), substitution_vars=len(set(re.findall(r"&&?(\w+)", raw))))
         sqlplus_units.append((key, text))
-    for m in PUBLIC_SYN_RE.finditer(text):
+    for m in PUBLIC_SYN_RE.finditer(blanked):
         est.public_synonyms[m.group(1).upper()] = norm(m.group(2).split("@")[0], default_owner) + (
             "@" + m.group(2).split("@")[1].upper() if "@" in m.group(2) else "")
         est.add(f"PUBLIC.{m.group(1).upper()}", "PUBLIC SYNONYM", fname)
-    for m in PRIV_SYN_RE.finditer(text):
-        if re.search(r"PUBLIC\s+SYNONYM\s+" + re.escape(m.group(1)), text, re.I):
+    for m in PRIV_SYN_RE.finditer(blanked):
+        if re.search(r"PUBLIC\s+SYNONYM\s+" + re.escape(m.group(1)), blanked, re.I):
             continue
         est.synonyms[norm(m.group(1), default_owner)] = norm(m.group(2).split("@")[0], default_owner) + (
             "@" + m.group(2).split("@")[1].upper() if "@" in m.group(2) else "")
         est.add(norm(m.group(1), default_owner), "SYNONYM", fname)
-    for m in CREATE_RE.finditer(text):
+    for m in CREATE_RE.finditer(blanked):
         cls = re.sub(r"\s+", " ", m.group(1).upper())
         name = m.group(2)
+        stmt_end = statement_end(text, m.end())
+        if cls not in PROCEDURAL_CREATE:
+            covered.append((m.start(), stmt_end))     # DDL owns its text (ON DELETE CASCADE, CTAS, ... are not script DML)
         if cls in ("SYNONYM",):
             continue
         if cls == "MATERIALIZED VIEW LOG ON":
@@ -291,72 +366,68 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
         key = norm(name, default_owner)
         node = est.add(key, cls, fname)
         if cls == "TABLE":
-            body = text[m.end():]
-            body = body[: body.find(";")]
+            body = text[m.end():stmt_end]
             cols = re.findall(r"^\s*(\w+)\s+(NUMBER(?!\s*\()|NUMBER\s*\([^)]*\)|DATE|CHAR\s*\(\d+\)|TIMESTAMP[^,]*|RAW\s*\(\d+\)|CLOB|BINARY_DOUBLE|INTERVAL[^,]*)",
                               body, re.I | re.M)
             node.signals["type_traps"] = sorted({re.sub(r"\s+", " ", c[1].upper()) for c in cols if
                                                  re.match(r"NUMBER$|DATE|CHAR|TIMESTAMP|RAW|CLOB|BINARY|INTERVAL", c[1], re.I)})
             node.signals["constraints"] = len(re.findall(r"CONSTRAINT\s+\w+", body, re.I))
-            node.signals["temporary"] = bool(re.search(r"GLOBAL\s+TEMPORARY\s+TABLE\s+" + re.escape(name), text, re.I))
-        if cls in ("PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TRIGGER"):
-            unit_text = text[m.start():]
-            nxt = CREATE_RE.search(text, m.end())
-            unit_text = unit_text[: (nxt.start() - m.start()) if nxt else None]
+            node.signals["temporary"] = bool(re.search(r"TEMPORARY\s+TABLE\s+" + re.escape(name), blanked, re.I))
+        if cls in PROCEDURAL_CREATE:
+            # a PL/SQL unit ends at its SQL*Plus '/' (or at the next object header when a file has no '/')
+            end = next((e for s, e in spans if s <= m.start() < e), len(text))
+            nxt = CREATE_RE.search(blanked, m.end())
+            if nxt and nxt.start() < end:
+                end = nxt.start()
+            unit_text = text[m.start():end]
+            covered.append((m.start(), end))
             node.signals["lines"] = unit_text.count("\n")
             proc_units.append((key, cls, unit_text))
-            if cls == "PACKAGE":
-                for mm in MEMBER_RE.finditer(unit_text):
-                    est.add(f"{key}.{mm.group(2).upper()}", f"PACKAGE {mm.group(1).upper()}", fname)
-            if cls == "PACKAGE BODY":
+            if cls in ("PACKAGE", "PACKAGE BODY"):
                 for mm in MEMBER_RE.finditer(unit_text):
                     est.add(f"{key}.{mm.group(2).upper()}", f"PACKAGE {mm.group(1).upper()}", fname)
         if cls in ("VIEW", "MATERIALIZED VIEW"):
-            unit_text = text[m.start():]
-            unit_text = unit_text[: unit_text.find(";") + 1]
+            unit_text = text[m.start():stmt_end]         # lexical end: a ';' inside a projected literal is text
             proc_units.append((key, cls, unit_text))
             if cls == "MATERIALIZED VIEW":
                 node.signals["refresh"] = " ".join(re.findall(r"REFRESH\s+(\w+)\s+ON\s+(\w+)", unit_text, re.I)[0]) if re.search(
                     r"REFRESH\s+\w+\s+ON", unit_text, re.I) else "?"
     for m in SCHED_RE.finditer(text):
-        args = {k.lower(): v.strip().strip("'") for k, v in named_args(m.group(2))}
+        args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
         name = args.get("job_name") or args.get("program_name")
         cls = "SCHEDULER " + m.group(1).upper()
         key = norm(name, default_owner)
         est.add(key, cls, fname, repeat_interval=args.get("repeat_interval", ""), start_date=args.get("start_date", ""))
         action = args.get("program_action") or args.get("job_action") or ""
-        action = qlits.get(action, action)
         if args.get("program_name") and m.group(1).upper() == "JOB":
             est.edges.append(Edge(key, norm(args["program_name"], default_owner), "schedules", "FACT"))
         if action:
-            proc_units.append((key, cls, action.replace("''", "'")))
+            proc_units.append((key, cls, action))
     for m in RLS_RE.finditer(text):
-        args = {k.lower(): v.strip().strip("'") for k, v in named_args(m.group(1))}
+        args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
         key = f"{args['object_schema']}.{args['policy_name']}".upper()
         est.add(key, "VPD POLICY", fname)
         est.edges.append(Edge(key, f"{args['object_schema']}.{args['object_name']}".upper(), "defines-on", "FACT"))
         est.edges.append(Edge(key, f"{args['function_schema']}.{args['policy_function']}".upper(), "calls", "FACT"))
     for m in REDACT_RE.finditer(text):
-        args = {k.lower(): v.strip().strip("'") for k, v in named_args(m.group(1))}
+        args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
         key = f"{args['object_schema']}.{args['policy_name']}".upper()
         est.add(key, "REDACTION POLICY", fname, column=args.get("column_name"))
         est.edges.append(Edge(key, f"{args['object_schema']}.{args['object_name']}".upper(), "defines-on", "FACT"))
-    for m in GRANT_RE.finditer(text):
+    for m in GRANT_RE.finditer(blanked):
         priv, obj, grantee = m.groups()
         key = f"GRANT.{grantee.upper()}.{norm(obj, default_owner)}.{re.sub(r'[^A-Z]', '', priv.upper().split('(')[0])}"
         est.add(key, "GRANT", fname, public=grantee.upper() == "PUBLIC", column_level="(" in priv)
         grants.append((key, obj, default_owner))
-    for m in ROLE_GRANT_RE.finditer(text):
+    for m in ROLE_GRANT_RE.finditer(blanked):
         est.add(f"ROLEGRANT.{m.group(2).upper()}.{m.group(1).upper()}", "ROLE MEMBERSHIP", fname)
-    # loose MERGE / DML files (no CREATE header) become a unit named after the file
-    if not is_sqlplus and not CREATE_RE.search(text) and re.search(r"\bMERGE\s+INTO\b|\bINSERT\s+INTO\b", text, re.I):
+    # top-level DML outside every procedural unit / DDL statement (loose MERGE files, anonymous blocks, seed rows
+    # after a CREATE TABLE) is one DML SCRIPT unit named after the file; a SQL*Plus script already scans its whole text
+    loose = uncovered(text, covered)
+    if not is_sqlplus and LOOSE_DML_RE.search(STRING_LIT_RE.sub("''", loose)):
         key = f"{default_owner}.{path.stem.upper()}"
         est.add(key, "DML SCRIPT", fname)
-        proc_units.append((key, "DML SCRIPT", text))
-    elif re.search(r"\bMERGE\s+INTO\b", text, re.I) and not re.search(r"CREATE\s+(OR\s+REPLACE\s+)?(PACKAGE|PROCEDURE|FUNCTION|TRIGGER)", text, re.I):
-        key = f"{default_owner}.{path.stem.upper()}"
-        est.add(key, "DML SCRIPT", fname)
-        proc_units.append((key, "DML SCRIPT", text))
+        proc_units.append((key, "DML SCRIPT", loose))
 
 
 # --------------------------------------------------------------------------- lineage (section 2)
@@ -690,40 +761,48 @@ BEGIN
 END;
 /
 """
-# name: (Oracle text, edges that MUST exist as (src, dst, kind), node keys that must NOT exist)
-POSITIVE_CASES: dict[str, tuple[str, set[tuple[str, str, str]], set[str]]] = {
-    "cte_multiple": (
+@dataclass
+class Case:
+    """Supported syntax: edges that MUST exist as (src, dst, kind), node keys that must NOT exist, (key, class)
+    pairs that MUST be in the census, and (src, dst, kind) edges that must NOT be drawn (wrong attribution)."""
+    sql: str
+    want: set = field(default_factory=set)
+    forbid: set = field(default_factory=set)
+    want_nodes: set = field(default_factory=set)
+    forbid_edges: set = field(default_factory=set)
+
+
+POSITIVE_CASES: dict[str, Case] = {
+    "cte_multiple": Case(
         "CREATE OR REPLACE VIEW poladm.v_cte AS\n"
         "WITH recent AS (SELECT * FROM poladm.policy WHERE d > SYSDATE - 7),\n"
         "     agg (n) AS (SELECT count(*) FROM recent r JOIN poladm.broker b ON b.id = r.broker_id)\n"
         "SELECT * FROM agg JOIN recent ON 1 = 1;",
-        {("POLADM.V_CTE", "POLADM.POLICY", "reads"), ("POLADM.V_CTE", "POLADM.BROKER", "reads")},
-        {"POLADM.RECENT", "POLADM.AGG"},
+        want={("POLADM.V_CTE", "POLADM.POLICY", "reads"), ("POLADM.V_CTE", "POLADM.BROKER", "reads")},
+        forbid={"POLADM.RECENT", "POLADM.AGG"},
     ),
-    "cte_recursive": (
+    "cte_recursive": Case(
         "CREATE OR REPLACE VIEW poladm.v_tree AS\n"
         "WITH tree (id, lvl) AS (SELECT id, 1 FROM poladm.broker WHERE parent_id IS NULL\n"
         "  UNION ALL SELECT b.id, t.lvl + 1 FROM tree t JOIN poladm.broker b ON b.parent_id = t.id)\n"
         "SELECT * FROM tree;",
-        {("POLADM.V_TREE", "POLADM.BROKER", "reads")},
-        {"POLADM.TREE"},
+        want={("POLADM.V_TREE", "POLADM.BROKER", "reads")},
+        forbid={"POLADM.TREE"},
     ),
-    "cte_scope_is_per_statement": (
+    "cte_scope_is_per_statement": Case(
         "CREATE OR REPLACE PROCEDURE poladm.p_cte IS l_n NUMBER; BEGIN\n"
         "  WITH recent AS (SELECT id FROM poladm.policy) SELECT count(*) INTO l_n FROM recent;\n"
         "  SELECT count(*) INTO l_n FROM recent;   -- a real table in the next statement, no WITH in scope\n"
         "END;",
-        {("POLADM.P_CTE", "POLADM.POLICY", "reads"), ("POLADM.P_CTE", "POLADM.RECENT", "reads")},
-        set(),
+        want={("POLADM.P_CTE", "POLADM.POLICY", "reads"), ("POLADM.P_CTE", "POLADM.RECENT", "reads")},
     ),
-    "qualified_name_ignores_public_synonym": (
+    "qualified_name_ignores_public_synonym": Case(
         "CREATE OR REPLACE PUBLIC SYNONYM broker FOR poladm.broker;\n"
         "CREATE OR REPLACE VIEW ods.v_a AS SELECT 1 FROM claims.broker;\n"
         "CREATE OR REPLACE VIEW ods.v_b AS SELECT 1 FROM broker;",
-        {("ODS.V_A", "CLAIMS.BROKER", "reads"), ("ODS.V_B", "POLADM.BROKER", "reads")},
-        set(),
+        want={("ODS.V_A", "CLAIMS.BROKER", "reads"), ("ODS.V_B", "POLADM.BROKER", "reads")},
     ),
-    "comment_markers_inside_literals": (
+    "comment_markers_inside_literals": Case(
         "CREATE OR REPLACE PROCEDURE poladm.p_lit IS l_s VARCHAR2(200); l_n NUMBER; BEGIN\n"
         "  SELECT '-- not a comment' INTO l_s FROM poladm.t_a;\n"
         "  SELECT 'it''s /* not a comment' INTO l_s FROM poladm.t_b;\n"
@@ -731,8 +810,78 @@ POSITIVE_CASES: dict[str, tuple[str, set[tuple[str, str, str]], set[str]]] = {
         "  EXECUTE IMMEDIATE 'DELETE FROM poladm.t_d WHERE note = ''--'' /* ';\n"
         "  SELECT 1 AS \"x -- /* y\" INTO l_n FROM poladm.t_e; /* real comment -- */ SELECT 1 INTO l_n FROM poladm.t_f; -- real\n"
         "END;",
-        {("POLADM.P_LIT", f"POLADM.T_{c}", "reads") for c in "ABCEF"} | {("POLADM.P_LIT", "POLADM.T_D", "writes")},
-        set(),
+        want={("POLADM.P_LIT", f"POLADM.T_{c}", "reads") for c in "ABCEF"} | {("POLADM.P_LIT", "POLADM.T_D", "writes")},
+    ),
+    "unique_and_bitmap_index_in_census": Case(
+        "CREATE TABLE poladm.t_u (id NUMBER, flag CHAR(1));\n"
+        "CREATE UNIQUE INDEX poladm.ux_t_u ON poladm.t_u (id);\n"
+        "CREATE BITMAP INDEX poladm.bx_t_u ON poladm.t_u (flag);\n"
+        "CREATE INDEX poladm.ix_t_u ON poladm.t_u (flag, id);",
+        want_nodes={("POLADM.UX_T_U", "INDEX"), ("POLADM.BX_T_U", "INDEX"), ("POLADM.IX_T_U", "INDEX"), ("POLADM.T_U", "TABLE")},
+    ),
+    "indented_sqlplus_script": Case(
+        "    SET PAGESIZE 0 FEEDBACK OFF\n"
+        "    SPOOL page.lst\n"
+        "    SELECT policy_no FROM poladm.policy WHERE ROWNUM <= 10;\n"
+        "    SPOOL OFF",
+        want={("POLADM.INDENTED_SQLPLUS_SCRIPT", "POLADM.POLICY", "reads")},
+        want_nodes={("POLADM.INDENTED_SQLPLUS_SCRIPT", "SQLPLUS_SCRIPT")},
+    ),
+    "plsql_set_and_execute_immediate_are_not_directives": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.p_np IS BEGIN\n"
+        "  UPDATE poladm.t_y\n"
+        "     SET feedback = 1;\n"
+        "  EXECUTE IMMEDIATE 'TRUNCATE TABLE poladm.t_x';\n"
+        "END;",
+        want={("POLADM.P_NP", "POLADM.T_Y", "writes"), ("POLADM.P_NP", "POLADM.T_X", "writes")},
+        forbid={"POLADM.PLSQL_SET_AND_EXECUTE_IMMEDIATE_ARE_NOT_DIRECTIVES"},
+    ),
+    "scheduler_action_any_qquote_delimiter": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.prc_a (p IN NUMBER) IS BEGIN NULL; END;\n"
+        "/\n"
+        "BEGIN\n"
+        "  DBMS_SCHEDULER.CREATE_PROGRAM(program_name => 'POLADM.PRG_Q', program_type => 'PLSQL_BLOCK',\n"
+        "    program_action => q'!DECLARE l NUMBER; BEGIN poladm.prc_a(1); INSERT INTO poladm.t_q VALUES (1);\n"
+        "      DELETE FROM poladm.t_r WHERE note = 'x'; END;!', enabled => TRUE);\n"
+        "  DBMS_SCHEDULER.CREATE_JOB(job_name => 'POLADM.JOB_Q', program_name => 'POLADM.PRG_Q',\n"
+        "    start_date => TO_TIMESTAMP_TZ('2019-04-01 02:40:00 Europe/London', 'YYYY-MM-DD HH24:MI:SS TZR'), enabled => FALSE);\n"
+        "  DBMS_SCHEDULER.CREATE_JOB(job_name => 'POLADM.JOB_INLINE', job_type => 'PLSQL_BLOCK',\n"
+        "    job_action => 'BEGIN poladm.prc_a(2); INSERT INTO poladm.t_s VALUES (''y''); END;', enabled => FALSE);\n"
+        "END;",
+        want={("POLADM.PRG_Q", "POLADM.PRC_A", "calls"), ("POLADM.PRG_Q", "POLADM.T_Q", "writes"),
+              ("POLADM.PRG_Q", "POLADM.T_R", "writes"), ("POLADM.JOB_Q", "POLADM.PRG_Q", "schedules"),
+              ("POLADM.JOB_INLINE", "POLADM.PRC_A", "calls"), ("POLADM.JOB_INLINE", "POLADM.T_S", "writes")},
+        want_nodes={("POLADM.PRG_Q", "SCHEDULER PROGRAM"), ("POLADM.JOB_Q", "SCHEDULER JOB"), ("POLADM.JOB_INLINE", "SCHEDULER JOB")},
+    ),
+    "mixed_ddl_and_top_level_dml": Case(
+        "CREATE TABLE poladm.t_m (id NUMBER, ref_id NUMBER REFERENCES poladm.t_m (id) ON DELETE CASCADE);\n"
+        "CREATE OR REPLACE VIEW poladm.v_m AS SELECT id FROM poladm.t_m;\n"
+        "INSERT INTO poladm.t_m (id) SELECT id FROM poladm.t_src;\n"
+        "MERGE INTO poladm.t_m t USING poladm.t_src s ON (t.id = s.id) WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id);\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_m IS BEGIN DELETE FROM poladm.t_p; END;\n"
+        "/\n"
+        "UPDATE poladm.t_m SET id = 0 WHERE id IS NULL;\n"
+        "GRANT SELECT, DELETE ON poladm.t_m TO ods_reader;",
+        want={("POLADM.MIXED_DDL_AND_TOP_LEVEL_DML", "POLADM.T_M", "writes"),
+              ("POLADM.MIXED_DDL_AND_TOP_LEVEL_DML", "POLADM.T_SRC", "reads"),
+              ("POLADM.V_M", "POLADM.T_M", "reads"), ("POLADM.P_M", "POLADM.T_P", "writes")},
+        forbid={"POLADM.CASCADE"},
+        want_nodes={("POLADM.MIXED_DDL_AND_TOP_LEVEL_DML", "DML SCRIPT")},
+        forbid_edges={("POLADM.P_M", "POLADM.T_M", "writes"), ("POLADM.MIXED_DDL_AND_TOP_LEVEL_DML", "POLADM.T_P", "writes"),
+                      ("POLADM.MIXED_DDL_AND_TOP_LEVEL_DML", "POLADM.T_M", "reads")},
+    ),
+    "ddl_only_file_is_not_a_dml_script": Case(
+        "CREATE TABLE poladm.t_d (id NUMBER, p_id NUMBER REFERENCES poladm.t_d (id) ON DELETE CASCADE);\n"
+        "GRANT INSERT, UPDATE, DELETE ON poladm.t_d TO poladm_app;",
+        forbid={"POLADM.DDL_ONLY_FILE_IS_NOT_A_DML_SCRIPT", "POLADM.CASCADE"},
+    ),
+    "semicolon_inside_view_literal": Case(
+        "CREATE OR REPLACE VIEW poladm.v_semi AS\n"
+        "SELECT 'a;b' AS tag, q'[x;y]' AS tag2, \"c;d\", 'it''s;' AS tag3\n"
+        "  FROM poladm.t_v v JOIN poladm.t_w w ON w.id = v.id;\n"
+        "CREATE MATERIALIZED VIEW ods.mv_semi REFRESH FAST ON DEMAND AS SELECT 'p;q' AS x FROM poladm.t_z;",
+        want={("POLADM.V_SEMI", "POLADM.T_V", "reads"), ("POLADM.V_SEMI", "POLADM.T_W", "reads"), ("ODS.MV_SEMI", "POLADM.T_Z", "reads")},
+        want_nodes={("ODS.MV_SEMI", "MATERIALIZED VIEW")},
     ),
 }
 
@@ -760,16 +909,22 @@ def selftest() -> int:
         kinds = {(e.kind, e.dst) for e in res["edges"] if e.src == "POLADM.P_OK"}
         if ("writes", "POLADM.T_OK") not in kinds or ("reads", "POLADM.T_OK") not in kinds:
             failures.append(f"positive: expected reads+writes of POLADM.T_OK, got {sorted(kinds)}")
-        for name, (sql, want, forbid) in POSITIVE_CASES.items():
+        for name, case in POSITIVE_CASES.items():
             d = Path(td) / name
             d.mkdir()
-            (d / f"{name}.sql").write_text(sql + "\n/\n")
+            (d / f"{name}.sql").write_text(case.sql + "\n/\n")
             res = run(d, None)
             have = {(e.src, e.dst, e.kind) for e in res["edges"]}
-            for w in sorted(want - have):
+            for w in sorted(case.want - have):
                 failures.append(f"{name}: missing edge {w}; got {sorted(have)}")
-            for k in sorted(forbid & set(res["nodes"])):
+            for w in sorted(case.forbid_edges & have):
+                failures.append(f"{name}: wrongly attributed edge {w}")
+            for k in sorted(case.forbid & set(res["nodes"])):
                 failures.append(f"{name}: phantom node {k} ({res['nodes'][k].cls}, {res['nodes'][k].status})")
+            for k, cls in sorted(case.want_nodes):
+                n = res["nodes"].get(k)
+                if n is None or n.cls != cls or n.status != "enumerated":
+                    failures.append(f"{name}: census row {k} ({cls}) missing, got {(n.cls, n.status) if n else None}")
             bad = [e for e in res["edges"] if e.evidence == "UNVERIFIABLE"]
             if bad:
                 failures.append(f"{name}: supported syntax flagged: " + "; ".join(f"{e.risk} [{e.detail}]" for e in bad))

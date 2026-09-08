@@ -105,9 +105,16 @@ same-named PUBLIC synonym (`claims.broker` is `CLAIMS.BROKER`, `not-in-census` i
 exists). Names declared by a statement's `WITH` clause (including recursive ones) are statement-local aliases, not
 objects: their bodies are scanned for base-table reads, the alias itself is never a node, and the scope ends at the
 statement. Record the resolution used on the edge. Quoted identifiers keep case; unquoted are upper-cased before lookup.
-Comment stripping is lexical: `--` and `/* */` inside `'...'` (with `''`), `q'[...]'` or `"quoted"` identifiers are
-text, so a literal such as `'-- not a comment'` never hides the `FROM` that follows it; DBMS_* named arguments are split
-on top-level commas only (`start_date => TO_TIMESTAMP_TZ('...', '...')` is one value).
+Comment stripping is lexical: `--` and `/* */` inside `'...'` (with `''`), `q'X...X'` (any single-character delimiter,
+`[({<` closing with their partner) or `"quoted"` identifiers are text, so a literal such as `'-- not a comment'` never
+hides the `FROM` that follows it. The same lexer bounds statements: a `CREATE [MATERIALIZED] VIEW` ends at the first
+`;` outside a literal (`SELECT 'a;b' ... FROM t` keeps its `FROM`), a `DBMS_SCHEDULER`/`DBMS_RLS`/`DBMS_REDACT` call
+ends at its balanced `)` (a `);` inside a `program_action` block does not), and named arguments are split on top-level
+commas only (`start_date => TO_TIMESTAMP_TZ('...', '...')` is one value). `CREATE UNIQUE|BITMAP INDEX`,
+`GLOBAL|PRIVATE TEMPORARY TABLE`, `[NON]EDITIONABLE`, `[NO] FORCE VIEW` and `PUBLIC` modifiers do not change the census
+class. SQL*Plus directives may be indented. A file that mixes DDL with top-level `INSERT`/`MERGE`/`UPDATE`/`DELETE`/
+`TRUNCATE` (outside every PL/SQL unit) gets one extra `DML SCRIPT` row named after the file that owns those writes;
+`ON DELETE CASCADE` and `GRANT ... DELETE ON` are not DML.
 
 Round-trip on the fixture (`python3 examples/round_trip.py`, static text only, writes `examples/round_trip_report.md`):
 15 files, 48 census rows (6 tables, 5 indexes, 2 sequences, 3 views, 1 MV + 2 MV logs, package + 4 members,
@@ -120,14 +127,20 @@ literal position (`TO_DATE('&as_of', ...)`), so its three reads stay FACT. Five 
 trigger fan-out: `MRG_POLICY_FROM_STG` and `PKG_POLICY_RENEWAL` write `POLICY`, `TRG_POLICY_BIU` calls
 `PRC_LOG_EVENT`, so both inherit `writes POLICY_AUDIT_LOG` and `consumes-sequence AUDIT_SEQ`.
 `python3 examples/round_trip.py --selftest` runs 14 negative cases (one unsupported construct each, must produce the
-named `UNVERIFIABLE` risk), 6 positive cases (look-alike supported syntax `FOR UPDATE OF`, `EXTRACT(... FROM)`,
+named `UNVERIFIABLE` risk), 13 positive cases (look-alike supported syntax `FOR UPDATE OF`, `EXTRACT(... FROM)`,
 `WHEN MATCHED THEN UPDATE ... DELETE WHERE`, `coll.DELETE`, `DELETE t` without `FROM`, must produce none; multiple and
 recursive CTEs keep their base-table edges and create no alias nodes; a CTE name reused as a real table in the next
 statement is an edge; a qualified `claims.broker` bypasses the `PUBLIC` synonym while unqualified `broker` uses it;
 `--`/`/*` inside `'...'`, `''`, `q'{...}'`, a quoted identifier and a dynamic-SQL literal leave every following
-`FROM`/`DELETE FROM` edge intact), and the fixture invariants (zero `UNVERIFIABLE`, the transitive fan-out edges
-present, the scheduler `start_date` captured as the full `TO_TIMESTAMP_TZ(...)` expression, no CTE alias node, no
-Albion-only nodes without the Albion input). Albion `pkg_policy_inquiry.sql`: 3 census
+`FROM`/`DELETE FROM` edge intact; `CREATE UNIQUE|BITMAP INDEX` rows are `INDEX`; an indented directive-only script is
+a `SQLPLUS_SCRIPT` with its reads while `UPDATE ... SET` / `EXECUTE IMMEDIATE` inside PL/SQL are not directives; a
+`q'!...!'` `program_action` with several statements and a `);` inside yields every `calls`/`writes` edge; `CREATE TABLE`
++ `INSERT`/`MERGE`/`UPDATE` in one file yields the `DML SCRIPT` writes without attributing them to a procedure in the
+same file, while a DDL-only file with `ON DELETE CASCADE` and `GRANT ... DELETE` yields no script row; `'a;b'`,
+`q'[x;y]'`, `"c;d"` and `'it''s;'` inside a view or MV projection keep the base-table reads), and the fixture
+invariants (zero `UNVERIFIABLE`, the transitive fan-out edges present, the scheduler `start_date` captured as the full
+`TO_TIMESTAMP_TZ(...)` expression, no CTE alias node, no Albion-only nodes without the Albion input). Albion
+`pkg_policy_inquiry.sql`: 3 census
 rows (body + 2 members), 2 FACT reads (`ods_policy_360`, `ods_claims`; both `OPEN ... FOR` static, both nodes
 `not-in-census` because their DDL is not in the repo), 1 INFERRED `replication` edge
 `TERADATA.STG_POLICY_360 -> ODS_POLICY_360` (`risk=freshness`, from the package header and
