@@ -1,0 +1,53 @@
+# wf_REINSURANCE_BORDEREAUX_MONTHLY -> Lakeflow Job (shapes: databricks-jobs references/triggers-schedules.md
+# "File Arrival Triggers", references/task-types.md "Pipeline Task"; databricks-dabs bundle-structure.md for ${var.*}).
+#
+# Legacy edges (SKILL.md section 2 "Scheduler edges"):
+#   cron `0 6 1-5 * *`  -> scripts/bdx_transfer (SFTP mget per broker, then mailx)        [owner unclear per crontab comment]
+#   Informatica         -> "file watcher per broker" (described, no Event Wait task exported), Control-M WD3
+#   BRK0007 is habitually 2 days late; a manual restart runbook exists.
+#
+# Conversion decisions (D5), each recorded, none defaulted by the converter:
+#   1. SFTP pull is an INGESTION concern, not a mapping: options are Lakeflow Connect / a customer-run transfer landing
+#      into a UC volume / a Python task wrapping the same SFTP with per-broker secrets by NAME. This file assumes the
+#      files land in a volume and does not implement the transfer.
+#   2. One file-arrival trigger on the landing volume replaces the per-broker watchers; "all brokers arrived" is a
+#      condition the pipeline evaluates (count distinct BROKER_ID in the month) rather than a scheduler wait.
+resources:
+  jobs:
+    wf_reinsurance_bordereaux_monthly:
+      name: "wf_REINSURANCE_BORDEREAUX_MONTHLY"
+      max_concurrent_runs: 1
+      trigger:
+        file_arrival:
+          url: ${var.bdx_landing_path}                 # /Volumes/<migration_catalog>/landing/bordereaux/
+          min_time_between_triggers_seconds: 3600     # brokers drop several files over days 1-5
+          wait_after_last_change_seconds: 300
+      tasks:
+        - task_key: s_m_RI_BORDEREAUX_MONTHLY
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.m_ri_bordereaux_monthly.id}
+        - task_key: notify_files_landed
+          # replaces `ls $LANDING | mailx -s "BDX files landed ..."`: job-level email_notifications on_success
+          # (databricks-jobs references/notifications-monitoring.md "Email Notifications") is the like-for-like; a
+          # task is kept only if the listing body itself is required by the RI team.
+          depends_on:
+            - task_key: s_m_RI_BORDEREAUX_MONTHLY
+          run_if: ALL_DONE
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./files_landed_report.sql          # not included; SELECT BROKER_ID, count(*) ... this month
+              source: WORKSPACE
+
+  pipelines:
+    m_ri_bordereaux_monthly:
+      name: "m_RI_BORDEREAUX_MONTHLY"
+      catalog: "<migration_catalog>"
+      schema: "ri"
+      libraries:
+        - file:
+            path: ./converted.py
+      configuration:
+        informatica.bdx_landing_path: ${var.bdx_landing_path}
+        informatica.sii_lob_map_table: ${var.sii_lob_map_table}   # REF_DB.SII_LOB_MAP (read-only legacy reference)
+        informatica.bdx_encoding: "ISO-8859-1"                     # repository CODEPAGE=Latin1; per-broker override via census

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE POWERMART SYSTEM "powrmart.dtd">
+<POWERMART CREATION_DATE="08/21/2021 10:02:44" REPOSITORY_VERSION="187.96">
+<REPOSITORY NAME="ALB_PROD_REPO" VERSION="187" CODEPAGE="Latin1" DATABASETYPE="Teradata">
+<FOLDER NAME="MDM_PARTY" GROUP="" OWNER="mdm_etl" SHARED="SHARED" UUID="0f81b2ce-6a5d-4e30-92a4-770ac1de9b14" PERMISSIONS="rwx---r--" DESCRIPTION="">
+    <MAPPLET DESCRIPTION ="Reusable party standardisation: name case, phone normalisation, postcode repair+validate (DQR-014 variant A - see also BTEQ variant in 04_stg_policy_360 and SAS variant in check_uk_postcode.sas; three engines, three answers). Consumed by wf_PARTY_MDM_SYNC and wf_POLICY_MASTER_DAILY. The GSS payroll estate has its OWN address standardiser (see legacy_shared_services) - a fourth variant, US-format, applied to UK addresses since a 2018 copy-paste." ISVALID ="YES" NAME ="mplt_DQ_PARTY_STANDARDISE" OBJECTVERSION ="1" VERSIONNUMBER ="8">
+        <TRANSFORMATION DESCRIPTION ="Proper-case names, strip double spaces." NAME ="EXP_NAME_STD" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="3">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_NAME" EXPRESSIONTYPE ="GENERAL" NAME ="in_NAME" PORTTYPE ="INPUT" PRECISION ="50" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="INITCAP(REPLACESTR(0, LTRIM(RTRIM(in_NAME)), '  ', ' '))" EXPRESSIONTYPE ="GENERAL" NAME ="out_NAME_STD" PORTTYPE ="OUTPUT" PRECISION ="50" SCALE ="0"/>
+        </TRANSFORMATION>
+        <TRANSFORMATION DESCRIPTION ="UK mobile normalisation to 07xxxxxxxxx; +44 prefix folded." NAME ="EXP_PHONE_STD" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="2">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_PHONE" EXPRESSIONTYPE ="GENERAL" NAME ="in_PHONE" PORTTYPE ="INPUT" PRECISION ="20" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="IIF(SUBSTR(REPLACECHR(0,in_PHONE,' ',''),1,3)='+44','0'||SUBSTR(REPLACECHR(0,in_PHONE,' ',''),4),REPLACECHR(0,in_PHONE,' ',''))" EXPRESSIONTYPE ="GENERAL" NAME ="out_PHONE_STD" PORTTYPE ="OUTPUT" PRECISION ="20" SCALE ="0"/>
+        </TRANSFORMATION>
+    </MAPPLET>
+</FOLDER>
+</REPOSITORY>
+</POWERMART>

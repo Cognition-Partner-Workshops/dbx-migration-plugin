@@ -1,0 +1,33 @@
+# wf_BILLING_PREMIUM_RECON -> Lakeflow Job (shapes: databricks-jobs references/triggers-schedules.md "Cron Schedules",
+# references/task-types.md "Run SQL File"; databricks-dabs references/bundle-structure.md for ${var.*}).
+#
+# Legacy: Start -> s_m_BILLING_PREMIUM_RECON; Control-M ALB-FIN-0012, TIMEFROM=2200, MONTHDAYS="WD1" (first WORKING day
+# of the month, Control-M calendar). Quartz cron has no business-day calendar: the faithful conversion is a daily
+# 22:00 trigger plus a first-working-day guard in a leading condition task (SKILL.md section 6 "Control-M / cron
+# edges"). The guard is a SQL check against a working-day calendar table the customer already owns (GSS PAY_CALENDAR
+# in example 06 is one candidate) - which table is a D5 decision.
+resources:
+  jobs:
+    wf_billing_premium_recon:
+      name: "wf_BILLING_PREMIUM_RECON"
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 0 22 * * ?"     # every day 22:00; WD1 enforced by the guard task
+        timezone_id: "Europe/London"
+        pause_status: PAUSED
+      tasks:
+        - task_key: is_first_working_day
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./guard_first_working_day.sql   # SELECT ... raises via SIGNAL when today is not WD1 (not included)
+              source: WORKSPACE
+        - task_key: s_m_BILLING_PREMIUM_RECON
+          depends_on:
+            - task_key: is_first_working_day
+          run_if: ALL_SUCCESS
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./converted.sql                 # REFRESH of the two materialized views defined there
+              source: WORKSPACE

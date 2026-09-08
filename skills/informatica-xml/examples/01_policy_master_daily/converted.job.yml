@@ -1,0 +1,56 @@
+# wf_POLICY_MASTER_DAILY -> Lakeflow Job (Databricks Asset Bundle resource shape).
+# Shapes cited from databricks-jobs: SKILL.md "Multi-Task Workflows" (depends_on / run_if),
+# references/triggers-schedules.md "File Arrival Triggers", references/notifications-monitoring.md
+# "Email Notifications" and "Retries", references/task-types.md "Pipeline Task" / "Run SQL File".
+#
+# Legacy task graph (source.xml WORKFLOWLINK rows):
+#   Start -> ew_WAIT_PLCYMSTR (Event Wait, File Watch Name /interface/inbound/plcymstr/PLCYMSTR_D$$RUNDATE.dat)
+#         -> s_m_POLICY_MASTER_DAILY (Fail parent if this task fails = YES)
+#         -> email_FAIL_POLICY_LOAD   only when $s_m_POLICY_MASTER_DAILY.Status = FAILED
+# Scheduler is ONDEMAND; the start is owned by Control-M ALB-DWH-0032 AND a cron line (15 3 * * *) via the
+# run_wf_policy_master wrapper (SKILL.md section 2 "Scheduler edges", trap 24): one owner must be chosen (D5).
+resources:
+  jobs:
+    wf_policy_master_daily:
+      name: "wf_POLICY_MASTER_DAILY"
+      max_concurrent_runs: 1                      # workflow default: no concurrent runs
+      # Parameter-file section [..s_m_POLICY_MASTER_DAILY] (source.par) becomes bundle variables declared in
+      # databricks.yml `variables:` and referenced as ${var.<name>} (databricks-dabs references/bundle-structure.md):
+      #   $$RUNDATE -> var.rundate (per-run), $InputFile_PLCYMSTR -> var.landing_path,
+      #   REF_DB.XREF_CLIENT_PARTY via $DBConnection_LKP -> var.xref_client_party_table.
+      # $$COMMIT_INTERVAL=10000 and $BadFileName carry no semantics on Delta (SKILL.md section 6): dropped;
+      # rejects land in the expectation metrics / quarantine table instead.
+      trigger:
+        file_arrival:                             # replaces the Event Wait file watcher
+          url: ${var.landing_path}
+          wait_after_last_change_seconds: 60      # NDM writes the file in place; wait for quiescence
+      email_notifications:
+        on_failure:
+          - "<dwh-oncall distribution list>"      # email_FAIL_POLICY_LOAD; the mailbox itself is governance evidence
+      tasks:
+        - task_key: s_m_POLICY_MASTER_DAILY
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.m_policy_master_daily.id}
+          max_retries: 0                          # session Recovery Strategy not exported for this session: no retry
+        - task_key: post_load_bteq_handoff
+          # The wrapper script also started the Teradata BTEQ chain after pmcmd returned 0 ("temporarily", 2022).
+          # That edge belongs to the teradata-bteq unit; kept here as a run_job_task placeholder so the dependency
+          # is visible in the graph and not lost with the wrapper.
+          depends_on:
+            - task_key: s_m_POLICY_MASTER_DAILY
+          run_if: ALL_SUCCESS
+          run_job_task:
+            job_id: ${resources.jobs.run_insurance_bteq.id}
+
+  pipelines:
+    m_policy_master_daily:
+      name: "m_POLICY_MASTER_DAILY"
+      catalog: "<migration_catalog>"
+      schema: "stg"
+      libraries:
+        - file:
+            path: ./converted.py
+      configuration:
+        informatica.RUNDATE: ${var.rundate}
+        informatica.landing_path: ${var.landing_path}
+        informatica.xref_client_party_table: ${var.xref_client_party_table}

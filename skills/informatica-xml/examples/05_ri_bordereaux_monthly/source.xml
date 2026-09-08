@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE POWERMART SYSTEM "powrmart.dtd">
+<POWERMART CREATION_DATE="02/06/2025 14:47:03" REPOSITORY_VERSION="187.96">
+<REPOSITORY NAME="ALB_PROD_REPO" VERSION="187" CODEPAGE="Latin1" DATABASETYPE="Teradata">
+<FOLDER NAME="RI_CESSIONS" GROUP="" OWNER="ri_etl" SHARED="NOTSHARED" DESCRIPTION="Reinsurance cessions + broker bordereaux ingestion." PERMISSIONS="rwx---r--" UUID="c31aa8d0-1f2b-4b8e-b0d3-6f5522c88e70">
+
+    <MAPPING DESCRIPTION ="Monthly: (1) ingest broker claims bordereaux CSVs (each broker has its own column conventions - 14 broker-specific source definitions maintained by hand); (2) compute ceded claims per quota-share treaties; (3) produce Lloyd's-format outward bordereau. Policy ref arrives as 'AL/MOT/9999999' and must be re-keyed to 'ALB-MOT-9999999' (EXP_REKEY_POLICY). Amounts arrive as text with pound-sign and thousands commas." ISVALID ="YES" NAME ="m_RI_BORDEREAUX_MONTHLY" OBJECTVERSION ="1" VERSIONNUMBER ="11">
+
+        <TRANSFORMATION DESCRIPTION ="Re-key broker policy reference format to POLARIS format." NAME ="EXP_REKEY_POLICY" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="4">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_POLICY_REF" EXPRESSIONTYPE ="GENERAL" NAME ="in_POLICY_REF" PORTTYPE ="INPUT" PRECISION ="20" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="REPLACECHR(0, REPLACESTR(0, in_POLICY_REF, 'AL/', 'ALB-'), '/', '-')" EXPRESSIONTYPE ="GENERAL" NAME ="out_POLICY_NO" PORTTYPE ="OUTPUT" PRECISION ="18" SCALE ="0"/>
+        </TRANSFORMATION>
+
+        <TRANSFORMATION DESCRIPTION ="Currency text to decimal: strips pound sign and commas." NAME ="EXP_AMT_CLEAN" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="3">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_AMT_TXT" EXPRESSIONTYPE ="GENERAL" NAME ="in_AMT_TXT" PORTTYPE ="INPUT" PRECISION ="20" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="decimal" EXPRESSION ="TO_DECIMAL(REPLACECHR(0, REPLACECHR(0, in_AMT_TXT, CHR(163), ''), ',', ''))" EXPRESSIONTYPE ="GENERAL" NAME ="out_AMT" PORTTYPE ="OUTPUT" PRECISION ="12" SCALE ="2"/>
+        </TRANSFORMATION>
+
+        <TRANSFORMATION DESCRIPTION ="Albion product -> Solvency II LoB mapping. DRIFTED from the SAS copy (08_solvency_ii_qrt_prep.sas): PET maps to 'Other motor' here since a 2023 fat-finger edit; SAS maps PET to 'Miscellaneous financial loss'. QRT and outward bordereau therefore report PET under different LoBs." NAME ="LKP_SII_LOB" OBJECTVERSION ="1" REUSABLE ="YES" TYPE ="Lookup Procedure" VERSIONNUMBER ="6">
+            <TABLEATTRIBUTE NAME ="Lookup table name" VALUE ="REF_DB.SII_LOB_MAP"/>
+            <TABLEATTRIBUTE NAME ="Lookup caching enabled" VALUE ="YES"/>
+        </TRANSFORMATION>
+    </MAPPING>
+
+    <WORKFLOW DESCRIPTION ="Monthly WD3 after all broker BDX files arrive (file watcher per broker; BRK0007 habitually 2 days late - manual restart runbook in Confluence, page last edited 2022)." ISENABLED ="YES" ISVALID ="YES" NAME ="wf_REINSURANCE_BORDEREAUX_MONTHLY" SERVERNAME ="ALB_INT_SVC" SERVER_DOMAINNAME ="Domain_ALB_PROD" VERSIONNUMBER ="17">
+        <TASK NAME ="Start" REUSABLE ="NO" TYPE ="Start" VERSIONNUMBER ="1"/>
+        <TASK NAME ="s_m_RI_BORDEREAUX_MONTHLY" REUSABLE ="NO" TYPE ="Session" VERSIONNUMBER ="12">
+            <ATTRIBUTE NAME ="Parameter Filename" VALUE ="/opt/informatica/parms/wf_REINSURANCE_BORDEREAUX_MONTHLY.par"/>
+        </TASK>
+        <WORKFLOWLINK CONDITION ="" FROMTASK ="Start" TOTASK ="s_m_RI_BORDEREAUX_MONTHLY"/>
+    </WORKFLOW>
+</FOLDER>
+</REPOSITORY>
+</POWERMART>

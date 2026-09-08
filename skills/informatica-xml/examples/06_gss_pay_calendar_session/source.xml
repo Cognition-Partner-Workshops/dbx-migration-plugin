@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE POWERMART SYSTEM "powrmart.dtd">
+<POWERMART CREATION_DATE="06/27/2019 19:02:47" REPOSITORY_VERSION="187.96">
+<REPOSITORY NAME="Prd_Repo_Srvc" VERSION="187" CODEPAGE="Latin1" DATABASETYPE="Oracle">
+<FOLDER NAME="Pay_Calendar" GROUP="" OWNER="[owner-redacted]" SHARED="NOTSHARED" DESCRIPTION="" PERMISSIONS="rwx---r--" UUID="79a98a26-c343-4884-b923-579f78c91520">
+    <!-- excerpt: mapping m_Pay_Calendar_Reset_Pay_Calendar, workflow header, session s_Pay_Calendar_Reset_Pay_Calendar, links, and its workflow variables; other mappings/sessions elided -->
+    <MAPPING DESCRIPTION ="This mapping retrieves the record from the Pay Period table currently set to current and resets that record to the default." ISVALID ="YES" NAME ="m_Pay_Calendar_Reset_Pay_Calendar" OBJECTVERSION ="1" VERSIONNUMBER ="1">
+        <TRANSFORMATION DESCRIPTION ="The filter condition on the Properties Tab will return the record where the CURR_PP_FLAG  is set to &apos;Y&apos;." NAME ="SQ_PAY_PERIOD_RESET" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Source Qualifier" VERSIONNUMBER ="1">
+            <TRANSFORMFIELD DATATYPE ="decimal" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="PP_NUM" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="2" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="decimal" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="PP_END_YEAR" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="4" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="date/time" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="PP_START_DTE" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="29" SCALE ="9"/>
+            <TRANSFORMFIELD DATATYPE ="date/time" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="PP_END_DTE" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="29" SCALE ="9"/>
+            <TRANSFORMFIELD DATATYPE ="decimal" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="LV_NUM" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="2" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="decimal" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="LV_YEAR" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="4" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="date/time" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="PAY_DTE" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="29" SCALE ="9"/>
+            <TRANSFORMFIELD DATATYPE ="string" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="CURR_PP_FLAG" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="1" SCALE ="0"/>
+            <TABLEATTRIBUTE NAME ="Sql Query" VALUE =""/>
+            <TABLEATTRIBUTE NAME ="User Defined Join" VALUE =""/>
+            <TABLEATTRIBUTE NAME ="Source Filter" VALUE ="PAY_PERIOD.CURR_PP_FLAG = &apos;Y&apos;"/>
+            <TABLEATTRIBUTE NAME ="Number Of Sorted Ports" VALUE ="0"/>
+            <TABLEATTRIBUTE NAME ="Tracing Level" VALUE ="Normal"/>
+            <TABLEATTRIBUTE NAME ="Select Distinct" VALUE ="NO"/>
+            <TABLEATTRIBUTE NAME ="Is Partitionable" VALUE ="NO"/>
+            <TABLEATTRIBUTE NAME ="Pre SQL" VALUE =""/>
+            <TABLEATTRIBUTE NAME ="Post SQL" VALUE =""/>
+            <TABLEATTRIBUTE NAME ="Output is deterministic" VALUE ="NO"/>
+            <TABLEATTRIBUTE NAME ="Output is repeatable" VALUE ="Never"/>
+        </TRANSFORMATION>
+        <TRANSFORMATION DESCRIPTION ="This transformation sets the field CURR_PP_FLAG to the default value of NULL." NAME ="exp_Initial" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="1">
+            <TRANSFORMFIELD DATATYPE ="decimal" DEFAULTVALUE ="" DESCRIPTION ="" EXPRESSION ="PP_NUM" EXPRESSIONTYPE ="GENERAL" NAME ="PP_NUM" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="2" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="decimal" DEFAULTVALUE ="" DESCRIPTION ="" EXPRESSION ="PP_END_YEAR" EXPRESSIONTYPE ="GENERAL" NAME ="PP_END_YEAR" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="4" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="CURR_PP_FLAG" PICTURETEXT ="" PORTTYPE ="INPUT" PRECISION ="1" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" DEFAULTVALUE ="ERROR(&apos;transformation error&apos;)" DESCRIPTION ="" EXPRESSION ="NULL" EXPRESSIONTYPE ="GENERAL" NAME ="o_CURR_PP_FLAG" PICTURETEXT ="" PORTTYPE ="OUTPUT" PRECISION ="1" SCALE ="0"/>
+            <TABLEATTRIBUTE NAME ="Tracing Level" VALUE ="Normal"/>
+        </TRANSFORMATION>
+        <TRANSFORMATION DESCRIPTION ="This update strategy will flag the row for an Update at run time.  The reserved word of DD_UPDATE is used in the Update Strategy Expression on the Properties tab." NAME ="upd_Reset_Current_PP" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Update Strategy" VERSIONNUMBER ="1">
+            <TRANSFORMFIELD DATATYPE ="decimal" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="PP_NUM" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="2" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="decimal" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="PP_END_YEAR" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="4" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" DEFAULTVALUE ="" DESCRIPTION ="" NAME ="CURR_PP_FLAG" PICTURETEXT ="" PORTTYPE ="INPUT/OUTPUT" PRECISION ="1" SCALE ="0"/>
+            <TABLEATTRIBUTE NAME ="Update Strategy Expression" VALUE ="DD_UPDATE"/>
+            <TABLEATTRIBUTE NAME ="Forward Rejected Rows" VALUE ="YES"/>
+            <TABLEATTRIBUTE NAME ="Tracing Level" VALUE ="Normal"/>
+        </TRANSFORMATION>
+        <INSTANCE DESCRIPTION ="" NAME ="RESET_PAY_PERIOD" TRANSFORMATION_NAME ="PAY_PERIOD" TRANSFORMATION_TYPE ="Target Definition" TYPE ="TARGET"/>
+        <INSTANCE DBDNAME ="ORA_BIIS" DESCRIPTION ="" NAME ="PAY_PERIOD1" TRANSFORMATION_NAME ="PAY_PERIOD" TRANSFORMATION_TYPE ="Source Definition" TYPE ="SOURCE"/>
+        <INSTANCE DESCRIPTION ="The filter condition on the Properties Tab will return the record where the CURR_PP_FLAG  is set to &apos;Y&apos;." NAME ="SQ_PAY_PERIOD_RESET" REUSABLE ="NO" TRANSFORMATION_NAME ="SQ_PAY_PERIOD_RESET" TRANSFORMATION_TYPE ="Source Qualifier" TYPE ="TRANSFORMATION">
+            <ASSOCIATED_SOURCE_INSTANCE NAME ="PAY_PERIOD1"/>
+        </INSTANCE>
+        <INSTANCE DESCRIPTION ="This transformation sets the field CURR_PP_FLAG to the default value of NULL." NAME ="exp_Initial" REUSABLE ="NO" TRANSFORMATION_NAME ="exp_Initial" TRANSFORMATION_TYPE ="Expression" TYPE ="TRANSFORMATION"/>
+        <INSTANCE DESCRIPTION ="This update strategy will flag the row for an Update at run time.  The reserved word of DD_UPDATE is used in the Update Strategy Expression on the Properties tab." NAME ="upd_Reset_Current_PP" REUSABLE ="NO" TRANSFORMATION_NAME ="upd_Reset_Current_PP" TRANSFORMATION_TYPE ="Update Strategy" TYPE ="TRANSFORMATION"/>
+        <CONNECTOR FROMFIELD ="PP_NUM" FROMINSTANCE ="upd_Reset_Current_PP" FROMINSTANCETYPE ="Update Strategy" TOFIELD ="PP_NUM" TOINSTANCE ="RESET_PAY_PERIOD" TOINSTANCETYPE ="Target Definition"/>
+        <CONNECTOR FROMFIELD ="PP_END_YEAR" FROMINSTANCE ="upd_Reset_Current_PP" FROMINSTANCETYPE ="Update Strategy" TOFIELD ="PP_END_YEAR" TOINSTANCE ="RESET_PAY_PERIOD" TOINSTANCETYPE ="Target Definition"/>
+        <CONNECTOR FROMFIELD ="CURR_PP_FLAG" FROMINSTANCE ="upd_Reset_Current_PP" FROMINSTANCETYPE ="Update Strategy" TOFIELD ="CURR_PP_FLAG" TOINSTANCE ="RESET_PAY_PERIOD" TOINSTANCETYPE ="Target Definition"/>
+        <CONNECTOR FROMFIELD ="PP_NUM" FROMINSTANCE ="PAY_PERIOD1" FROMINSTANCETYPE ="Source Definition" TOFIELD ="PP_NUM" TOINSTANCE ="SQ_PAY_PERIOD_RESET" TOINSTANCETYPE ="Source Qualifier"/>
+        <CONNECTOR FROMFIELD ="PP_END_YEAR" FROMINSTANCE ="PAY_PERIOD1" FROMINSTANCETYPE ="Source Definition" TOFIELD ="PP_END_YEAR" TOINSTANCE ="SQ_PAY_PERIOD_RESET" TOINSTANCETYPE ="Source Qualifier"/>
+        <CONNECTOR FROMFIELD ="PP_START_DTE" FROMINSTANCE ="PAY_PERIOD1" FROMINSTANCETYPE ="Source Definition" TOFIELD ="PP_START_DTE" TOINSTANCE ="SQ_PAY_PERIOD_RESET" TOINSTANCETYPE ="Source Qualifier"/>
+        <CONNECTOR FROMFIELD ="PP_END_DTE" FROMINSTANCE ="PAY_PERIOD1" FROMINSTANCETYPE ="Source Definition" TOFIELD ="PP_END_DTE" TOINSTANCE ="SQ_PAY_PERIOD_RESET" TOINSTANCETYPE ="Source Qualifier"/>
+        <CONNECTOR FROMFIELD ="LV_NUM" FROMINSTANCE ="PAY_PERIOD1" FROMINSTANCETYPE ="Source Definition" TOFIELD ="LV_NUM" TOINSTANCE ="SQ_PAY_PERIOD_RESET" TOINSTANCETYPE ="Source Qualifier"/>
+        <CONNECTOR FROMFIELD ="LV_YEAR" FROMINSTANCE ="PAY_PERIOD1" FROMINSTANCETYPE ="Source Definition" TOFIELD ="LV_YEAR" TOINSTANCE ="SQ_PAY_PERIOD_RESET" TOINSTANCETYPE ="Source Qualifier"/>
+        <CONNECTOR FROMFIELD ="PAY_DTE" FROMINSTANCE ="PAY_PERIOD1" FROMINSTANCETYPE ="Source Definition" TOFIELD ="PAY_DTE" TOINSTANCE ="SQ_PAY_PERIOD_RESET" TOINSTANCETYPE ="Source Qualifier"/>
+        <CONNECTOR FROMFIELD ="CURR_PP_FLAG" FROMINSTANCE ="PAY_PERIOD1" FROMINSTANCETYPE ="Source Definition" TOFIELD ="CURR_PP_FLAG" TOINSTANCE ="SQ_PAY_PERIOD_RESET" TOINSTANCETYPE ="Source Qualifier"/>
+        <CONNECTOR FROMFIELD ="PP_NUM" FROMINSTANCE ="SQ_PAY_PERIOD_RESET" FROMINSTANCETYPE ="Source Qualifier" TOFIELD ="PP_NUM" TOINSTANCE ="exp_Initial" TOINSTANCETYPE ="Expression"/>
+        <CONNECTOR FROMFIELD ="PP_END_YEAR" FROMINSTANCE ="SQ_PAY_PERIOD_RESET" FROMINSTANCETYPE ="Source Qualifier" TOFIELD ="PP_END_YEAR" TOINSTANCE ="exp_Initial" TOINSTANCETYPE ="Expression"/>
+        <CONNECTOR FROMFIELD ="CURR_PP_FLAG" FROMINSTANCE ="SQ_PAY_PERIOD_RESET" FROMINSTANCETYPE ="Source Qualifier" TOFIELD ="CURR_PP_FLAG" TOINSTANCE ="exp_Initial" TOINSTANCETYPE ="Expression"/>
+        <CONNECTOR FROMFIELD ="o_CURR_PP_FLAG" FROMINSTANCE ="exp_Initial" FROMINSTANCETYPE ="Expression" TOFIELD ="CURR_PP_FLAG" TOINSTANCE ="upd_Reset_Current_PP" TOINSTANCETYPE ="Update Strategy"/>
+        <CONNECTOR FROMFIELD ="PP_NUM" FROMINSTANCE ="exp_Initial" FROMINSTANCETYPE ="Expression" TOFIELD ="PP_NUM" TOINSTANCE ="upd_Reset_Current_PP" TOINSTANCETYPE ="Update Strategy"/>
+        <CONNECTOR FROMFIELD ="PP_END_YEAR" FROMINSTANCE ="exp_Initial" FROMINSTANCETYPE ="Expression" TOFIELD ="PP_END_YEAR" TOINSTANCE ="upd_Reset_Current_PP" TOINSTANCETYPE ="Update Strategy"/>
+        <TARGETLOADORDER ORDER ="1" TARGETINSTANCE ="RESET_PAY_PERIOD"/>
+        <ERPINFO/>
+    </MAPPING>
+    <WORKFLOW DESCRIPTION ="This workflow will update the Pay Period table and notify the appropriate parties of the new Current Pay Period." ISENABLED ="YES" ISRUNNABLESERVICE ="NO" ISSERVICE ="NO" ISVALID ="YES" NAME ="wf_Pay_Calendar" REUSABLE_SCHEDULER ="NO" SCHEDULERNAME ="Scheduler" SERVERNAME ="Prd_IS" SERVER_DOMAINNAME ="Dom_Prd" SUSPEND_ON_ERROR ="NO" TASKS_MUST_RUN_ON_SERVER ="NO" VERSIONNUMBER ="1">
+        <SCHEDULER DESCRIPTION ="" NAME ="Scheduler" REUSABLE ="NO" VERSIONNUMBER ="1">
+            <SCHEDULEINFO SCHEDULETYPE ="ONDEMAND"/>
+        </SCHEDULER>
+        <TASK DESCRIPTION ="This task uses the workflow variables WF_SUBJECT and WF_MESSAGE to notify operators of the Current Pay Period." NAME ="Email_Pay_Calendar" REUSABLE ="NO" TYPE ="Email" VERSIONNUMBER ="1">
+            <ATTRIBUTE NAME ="Email User Name" VALUE ="$$WF_PAY_CALENDAR_EMAIL_LIST"/>
+            <ATTRIBUTE NAME ="Email Subject" VALUE ="$$WF_SUBJECT"/>
+            <ATTRIBUTE NAME ="Email Text" VALUE ="$$WF_MESSAGE"/>
+        </TASK>
+        <TASK DESCRIPTION ="" NAME ="Start" REUSABLE ="NO" TYPE ="Start" VERSIONNUMBER ="1"/>
+        <SESSION DESCRIPTION ="This session retrieves the record from the Pay Period table currently set to current and resets that record to the default." ISVALID ="YES" MAPPINGNAME ="m_Pay_Calendar_Reset_Pay_Calendar" NAME ="s_Pay_Calendar_Reset_Pay_Calendar" REUSABLE ="NO" SORTORDER ="Binary" VERSIONNUMBER ="1">
+            <SESSTRANSFORMATIONINST ISREPARTITIONPOINT ="YES" PARTITIONTYPE ="PASS THROUGH" PIPELINE ="1" SINSTANCENAME ="RESET_PAY_PERIOD" STAGE ="1" TRANSFORMATIONNAME ="RESET_PAY_PERIOD" TRANSFORMATIONTYPE ="Target Definition"/>
+            <SESSTRANSFORMATIONINST ISREPARTITIONPOINT ="NO" PIPELINE ="0" SINSTANCENAME ="PAY_PERIOD1" STAGE ="0" TRANSFORMATIONNAME ="PAY_PERIOD1" TRANSFORMATIONTYPE ="Source Definition"/>
+            <SESSTRANSFORMATIONINST ISREPARTITIONPOINT ="YES" PARTITIONTYPE ="PASS THROUGH" PIPELINE ="1" SINSTANCENAME ="SQ_PAY_PERIOD_RESET" STAGE ="2" TRANSFORMATIONNAME ="SQ_PAY_PERIOD_RESET" TRANSFORMATIONTYPE ="Source Qualifier"/>
+            <SESSTRANSFORMATIONINST ISREPARTITIONPOINT ="NO" PIPELINE ="1" SINSTANCENAME ="exp_Initial" STAGE ="2" TRANSFORMATIONNAME ="exp_Initial" TRANSFORMATIONTYPE ="Expression">
+                <PARTITION DESCRIPTION ="" NAME ="Partition #1"/>
+            </SESSTRANSFORMATIONINST>
+            <SESSTRANSFORMATIONINST ISREPARTITIONPOINT ="NO" PIPELINE ="1" SINSTANCENAME ="upd_Reset_Current_PP" STAGE ="2" TRANSFORMATIONNAME ="upd_Reset_Current_PP" TRANSFORMATIONTYPE ="Update Strategy">
+                <PARTITION DESCRIPTION ="" NAME ="Partition #1"/>
+            </SESSTRANSFORMATIONINST>
+            <CONFIGREFERENCE REFOBJECTNAME ="default_session_config" TYPE ="Session config"/>
+            <SESSIONCOMPONENT REFOBJECTNAME ="on_failure_mail" REUSABLE ="NO" TYPE ="Failure Email">
+                <TASK DESCRIPTION ="" NAME ="on_failure_mail" REUSABLE ="NO" TYPE ="Email" VERSIONNUMBER ="1">
+                    <ATTRIBUTE NAME ="Email User Name" VALUE ="$$WF_PAY_CALENDAR_EMAIL_LIST"/>
+                    <ATTRIBUTE NAME ="Email Subject" VALUE ="Error Resetting Pay Period"/>
+                    <ATTRIBUTE NAME ="Email Text" VALUE ="Session completed with errors.&#xD;&#xA;&#x5c;n&#xD;&#xA;Session name: %s&#xD;&#xA;&#x5c;n&#xD;&#xA;Session start time: %b&#xD;&#xA;&#x5c;n&#xD;&#xA;Session completion time: %c&#xD;&#xA;&#x5c;n&#xD;&#xA;&#xD;&#xA;Please read the attached session log for further details.&#xD;&#xA;%g"/>
+                </TASK>
+            </SESSIONCOMPONENT>
+            <SESSIONCOMPONENT REFOBJECTNAME ="presession_variable_assignment" REUSABLE ="NO" TYPE ="Pre-session variable assignment">
+                <TASK DESCRIPTION ="" NAME ="presession_variable_assignment" REUSABLE ="NO" TYPE ="Command" VERSIONNUMBER ="1">
+                    <ATTRIBUTE NAME ="Fail task if any command fails" VALUE ="NO"/>
+                    <ATTRIBUTE NAME ="Recovery Strategy" VALUE ="Fail task and continue workflow"/>
+                </TASK>
+            </SESSIONCOMPONENT>
+            <SESSIONCOMPONENT REFOBJECTNAME ="postsession_success_variable_assignment" REUSABLE ="NO" TYPE ="Post-session success variable assignment">
+                <TASK DESCRIPTION ="" NAME ="postsession_success_variable_assignment" REUSABLE ="NO" TYPE ="Command" VERSIONNUMBER ="1">
+                    <ATTRIBUTE NAME ="Fail task if any command fails" VALUE ="NO"/>
+                    <ATTRIBUTE NAME ="Recovery Strategy" VALUE ="Fail task and continue workflow"/>
+                </TASK>
+            </SESSIONCOMPONENT>
+            <SESSIONCOMPONENT REFOBJECTNAME ="postsession_failure_variable_assignment" REUSABLE ="NO" TYPE ="Post-session failure variable assignment">
+                <TASK DESCRIPTION ="" NAME ="postsession_failure_variable_assignment" REUSABLE ="NO" TYPE ="Command" VERSIONNUMBER ="1">
+                    <ATTRIBUTE NAME ="Fail task if any command fails" VALUE ="NO"/>
+                    <ATTRIBUTE NAME ="Recovery Strategy" VALUE ="Fail task and continue workflow"/>
+                </TASK>
+            </SESSIONCOMPONENT>
+            <SESSIONEXTENSION NAME ="Relational Writer" SINSTANCENAME ="RESET_PAY_PERIOD" SUBTYPE ="Relational Writer" TRANSFORMATIONTYPE ="Target Definition" TYPE ="WRITER">
+                <CONNECTIONREFERENCE CNXREFNAME ="DB Connection" CONNECTIONNAME ="INFO_TARGET" CONNECTIONNUMBER ="1" CONNECTIONSUBTYPE ="Oracle" CONNECTIONTYPE ="Relational" VARIABLE =""/>
+                <ATTRIBUTE NAME ="Target load type" VALUE ="Normal"/>
+                <ATTRIBUTE NAME ="Insert" VALUE ="YES"/>
+                <ATTRIBUTE NAME ="Update as Update" VALUE ="YES"/>
+                <ATTRIBUTE NAME ="Update as Insert" VALUE ="NO"/>
+                <ATTRIBUTE NAME ="Update else Insert" VALUE ="NO"/>
+                <ATTRIBUTE NAME ="Delete" VALUE ="YES"/>
+                <ATTRIBUTE NAME ="Truncate target table option" VALUE ="NO"/>
+                <ATTRIBUTE NAME ="Reject file directory" VALUE ="$PMBadFileDir&#x5c;"/>
+                <ATTRIBUTE NAME ="Reject filename" VALUE ="reset_pay_period1.bad"/>
+            </SESSIONEXTENSION>
+            <SESSIONEXTENSION DSQINSTNAME ="SQ_PAY_PERIOD_RESET" DSQINSTTYPE ="Source Qualifier" NAME ="Relational Reader" SINSTANCENAME ="PAY_PERIOD1" SUBTYPE ="Relational Reader" TRANSFORMATIONTYPE ="Source Definition" TYPE ="READER"/>
+            <SESSIONEXTENSION NAME ="Relational Reader" SINSTANCENAME ="SQ_PAY_PERIOD_RESET" SUBTYPE ="Relational Reader" TRANSFORMATIONTYPE ="Source Qualifier" TYPE ="READER">
+                <CONNECTIONREFERENCE CNXREFNAME ="DB Connection" CONNECTIONNAME ="INFO_TARGET" CONNECTIONNUMBER ="1" CONNECTIONSUBTYPE ="Oracle" CONNECTIONTYPE ="Relational" VARIABLE =""/>
+            </SESSIONEXTENSION>
+            <ATTRIBUTE NAME ="General Options" VALUE =""/>
+            <ATTRIBUTE NAME ="Write Backward Compatible Session Log File" VALUE ="NO"/>
+            <ATTRIBUTE NAME ="Session Log File Name" VALUE ="s_Pay_Calendar_Reset_Pay_Calendar.log"/>
+            <ATTRIBUTE NAME ="Session Log File directory" VALUE ="$PMSessionLogDir&#x5c;"/>
+            <ATTRIBUTE NAME ="Parameter Filename" VALUE =""/>
+            <ATTRIBUTE NAME ="Enable Test Load" VALUE ="NO"/>
+            <ATTRIBUTE NAME ="$Source connection value" VALUE =""/>
+            <ATTRIBUTE NAME ="$Target connection value" VALUE =""/>
+            <ATTRIBUTE NAME ="Treat source rows as" VALUE ="Data driven"/>
+            <ATTRIBUTE NAME ="Commit Type" VALUE ="Target"/>
+            <ATTRIBUTE NAME ="Commit Interval" VALUE ="10000"/>
+            <ATTRIBUTE NAME ="Commit On End Of File" VALUE ="YES"/>
+            <ATTRIBUTE NAME ="Rollback Transactions on Errors" VALUE ="NO"/>
+            <ATTRIBUTE NAME ="Recovery Strategy" VALUE ="Fail task and continue workflow"/>
+        </SESSION>
+        <!-- ... three further sessions elided ... -->
+        <WORKFLOWLINK CONDITION ="" FROMTASK ="Start" TOTASK ="s_Pay_Calendar_Reset_Pay_Calendar"/>
+        <WORKFLOWLINK CONDITION ="$s_Pay_Calendar_Build_Message.Status = Succeeded" FROMTASK ="s_Pay_Calendar_Build_Message" TOTASK ="Email_Pay_Calendar"/>
+        <WORKFLOWLINK CONDITION ="$s_Pay_Calendar_Verify_Pay_Calendar.Status = Succeeded" FROMTASK ="s_Pay_Calendar_Verify_Pay_Calendar" TOTASK ="s_Pay_Calendar_Build_Message"/>
+        <WORKFLOWLINK CONDITION ="$s_Pay_Calendar_Reset_Pay_Calendar.Status = Succeeded" FROMTASK ="s_Pay_Calendar_Reset_Pay_Calendar" TOTASK ="s_Pay_Calendar_Set_Pay_Calendar"/>
+        <WORKFLOWLINK CONDITION ="$s_Pay_Calendar_Set_Pay_Calendar.Status = Succeeded" FROMTASK ="s_Pay_Calendar_Set_Pay_Calendar" TOTASK ="s_Pay_Calendar_Verify_Pay_Calendar"/>
+        <WORKFLOWVARIABLE DATATYPE ="date/time" DEFAULTVALUE ="" DESCRIPTION ="The time this task started" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.StartTime" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="date/time" DEFAULTVALUE ="" DESCRIPTION ="The time this task completed" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.EndTime" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="Status of this task&apos;s execution" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.Status" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="Status of the previous task that is not disabled" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.PrevTaskStatus" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="Error code for this task&apos;s execution" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.ErrorCode" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="string" DEFAULTVALUE ="" DESCRIPTION ="Error message for this task&apos;s execution" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.ErrorMsg" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="Rows successfully read" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.SrcSuccessRows" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="Rows failed to read" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.SrcFailedRows" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="Rows successfully loaded" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.TgtSuccessRows" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="Rows failed to load" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.TgtFailedRows" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="Total number of transformation errors" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.TotalTransErrors" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="integer" DEFAULTVALUE ="" DESCRIPTION ="First error code" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.FirstErrorCode" USERDEFINED ="NO"/>
+        <WORKFLOWVARIABLE DATATYPE ="string" DEFAULTVALUE ="" DESCRIPTION ="First error message" ISNULL ="NO" ISPERSISTENT ="NO" NAME ="$s_Pay_Calendar_Reset_Pay_Calendar.FirstErrorMsg" USERDEFINED ="NO"/>
+    </WORKFLOW>
+</FOLDER>
+</REPOSITORY>
+</POWERMART>

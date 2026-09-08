@@ -1,0 +1,44 @@
+[
+  {
+    "rule": "decimal_round",
+    "applies_to": "decimal(p,s)->DECIMAL(p,s)",
+    "params": {"mode": "half_up", "places": 10},
+    "why": "Informatica ROUND rounds half away from zero and sessions with 'Enable high precision = NO' compute decimals in double (15 significant digits); places 10 neutralises sub-1e-10 double noise while last-digit errors at the port scale still fail Tier 3. Tighten per unit only under a recorded decision."
+  },
+  {
+    "rule": "datetime_utc_truncate_ms",
+    "applies_to": "date/time(29,9),TIMESTAMP(6)->TIMESTAMP_NTZ,TIMESTAMP",
+    "params": {},
+    "why": "date/time ports carry nanoseconds, Teradata/Oracle sources microseconds, Delta microseconds; SYSDATE/SESSSTARTTIME audit columns and 'Pre 85 Timestamp Compatibility' sessions differ below the millisecond. Zoned values are normalised to UTC first."
+  },
+  {
+    "rule": "rstrip_spaces",
+    "applies_to": "CHAR(n),string(fixed-width flat file)->STRING",
+    "params": {},
+    "why": "CHAR-origin ports (Teradata, DB2, mainframe) and fixed-width flat files with STRIPTRAILINGBLANKS=NO deliver padded strings; IS_SPACES ports become '' after trimming. Evaluate IS_SPACES/LENGTH on the untrimmed value in converted code."
+  },
+  {
+    "rule": "empty_string_is_null",
+    "applies_to": "string,varchar->STRING",
+    "params": {"policy": "SET_AT_STOP_A"},
+    "why": "Flat-file NULL_CHARACTER, Oracle targets folding '' to NULL (fixture ORA_MDM_HUB_PROD), REG_EXTRACT no-match ('' in Spark, NULL in Informatica) and two-argument IIF returning ''. Whether '' and NULL compare equal is the STOP A policy."
+  },
+  {
+    "rule": "null_missing_equiv",
+    "applies_to": "*",
+    "params": {},
+    "why": "Unconnected output ports and unmatched lookup ports are NULL on the legacy side while the converted keyed-diff document may omit the column."
+  },
+  {
+    "rule": "collation_casefold",
+    "applies_to": "STRING",
+    "params": {"enabled_if": "case-insensitive compare flags found in census (REPLACESTR/REPLACECHR/IN caseFlag 0, Lookup/Joiner 'Case Sensitive String Comparison = NO', Sorter 'Case Sensitive = NO')"},
+    "why": "Only for columns whose legacy comparison was case-insensitive; Informatica string comparison is case-sensitive by default, so this rule is never bound globally."
+  },
+  {
+    "rule": "identity",
+    "applies_to": "*",
+    "params": {},
+    "why": "Explicit no-op for fields that must compare raw. Sequence Generator surrogate keys are excluded from Tier 3 rather than canonicalised."
+  }
+]

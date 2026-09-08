@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE POWERMART SYSTEM "powrmart.dtd">
+<POWERMART CREATION_DATE="05/09/2024 09:18:55" REPOSITORY_VERSION="187.96">
+<REPOSITORY NAME="ALB_PROD_REPO" VERSION="187" CODEPAGE="Latin1" DATABASETYPE="Teradata">
+<FOLDER NAME="MDM_PARTY" GROUP="" OWNER="mdm_etl" SHARED="SHARED" DESCRIPTION="Party golden record sync. Uses mplt_DQ_PARTY_STANDARDISE (see mapplets/)." PERMISSIONS="rwx---r--" UUID="0f81b2ce-6a5d-4e30-92a4-770ac1de9b14">
+
+    <MAPPING DESCRIPTION ="Nightly golden-record sync POLARIS PARTY -> MDM hub. Survivorship: most-recent-update wins EXCEPT email where longest-string wins (undocumented decision, 2020). Uses NINO exact + NAME_DOB fuzzy match to attach LEGACY_CUSTOMER_ID from APF banking customers. Match rate stuck at ~55% since 2024 audit; unmatched pairs accumulate in MDM_SUSPECT_QUEUE (currently 41k rows, unworked)." ISVALID ="YES" NAME ="m_PARTY_MDM_SYNC" OBJECTVERSION ="1" VERSIONNUMBER ="18">
+
+        <TRANSFORMATION DESCRIPTION ="Email DQ + normalisation - DQR-007 variant B: lowercases then full RFC-ish regex. The BTEQ variant checks only for '@'. The banking customer pipeline does no email validation at all." NAME ="EXP_EMAIL_DQ" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="6">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_EMAIL" EXPRESSIONTYPE ="GENERAL" NAME ="in_EMAIL" PORTTYPE ="INPUT" PRECISION ="120" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="LOWER(LTRIM(RTRIM(in_EMAIL)))" EXPRESSIONTYPE ="GENERAL" NAME ="out_EMAIL_STD" PORTTYPE ="OUTPUT" PRECISION ="120" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="IIF(REG_MATCH(LOWER(LTRIM(RTRIM(in_EMAIL))),'^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$'),'VALID','INVALID')" EXPRESSIONTYPE ="GENERAL" NAME ="out_EMAIL_DQ_STATUS" PORTTYPE ="OUTPUT" PRECISION ="7" SCALE ="0"/>
+        </TRANSFORMATION>
+
+        <TRANSFORMATION DESCRIPTION ="NINO masking for downstream marts (ports logic of legacy GSS Pseudossn job). NOTE the SAS fraud pipeline reads PARTY.NINO raw - masking here protects only the Informatica-fed marts." NAME ="EXP_NINO_MASK" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="2">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_NINO" EXPRESSIONTYPE ="GENERAL" NAME ="in_NINO" PORTTYPE ="INPUT" PRECISION ="9" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="IIF(ISNULL(in_NINO) OR LENGTH(in_NINO) &lt; 9, NULL, SUBSTR(in_NINO,1,2) || '*****' || SUBSTR(in_NINO,8,2))" EXPRESSIONTYPE ="GENERAL" NAME ="out_NINO_MASKED" PORTTYPE ="OUTPUT" PRECISION ="9" SCALE ="0"/>
+        </TRANSFORMATION>
+
+        <TRANSFORMATION DESCRIPTION ="Fuzzy NAME_DOB match to APF banking CUSTOMERS where NINO match fails. Soundex surname + exact DOB. DOB in PARTY is DD/MM/YYYY *text*, DOB in CUSTOMERS is ISO date - conversion inline." NAME ="EXP_XMATCH_APF" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="5">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_LAST_NAME" EXPRESSIONTYPE ="GENERAL" NAME ="in_LAST_NAME" PORTTYPE ="INPUT" PRECISION ="50" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_BIRTH_DT_TXT" EXPRESSIONTYPE ="GENERAL" NAME ="in_BIRTH_DT_TXT" PORTTYPE ="INPUT" PRECISION ="10" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="SOUNDEX(UPPER(in_LAST_NAME))" EXPRESSIONTYPE ="GENERAL" NAME ="out_SURNAME_SOUNDEX" PORTTYPE ="OUTPUT" PRECISION ="4" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="date/time" EXPRESSION ="TO_DATE(in_BIRTH_DT_TXT,'DD/MM/YYYY')" EXPRESSIONTYPE ="GENERAL" NAME ="out_BIRTH_DT" PORTTYPE ="OUTPUT" PRECISION ="29" SCALE ="9"/>
+        </TRANSFORMATION>
+    </MAPPING>
+
+    <WORKFLOW DESCRIPTION ="Nightly 01:30. Control-M ALB-MDM-0003. Must finish before wf_POLICY_MASTER_DAILY (03:15) - no explicit dependency defined, relies on runtime luck." ISENABLED ="YES" ISVALID ="YES" NAME ="wf_PARTY_MDM_SYNC" SERVERNAME ="ALB_INT_SVC" SERVER_DOMAINNAME ="Domain_ALB_PROD" VERSIONNUMBER ="24">
+        <TASK NAME ="Start" REUSABLE ="NO" TYPE ="Start" VERSIONNUMBER ="1"/>
+        <TASK NAME ="s_m_PARTY_MDM_SYNC" REUSABLE ="NO" TYPE ="Session" VERSIONNUMBER ="19">
+            <ATTRIBUTE NAME ="Parameter Filename" VALUE ="/opt/informatica/parms/wf_PARTY_MDM_SYNC.par"/>
+        </TASK>
+        <WORKFLOWLINK CONDITION ="" FROMTASK ="Start" TOTASK ="s_m_PARTY_MDM_SYNC"/>
+    </WORKFLOW>
+</FOLDER>
+</REPOSITORY>
+</POWERMART>

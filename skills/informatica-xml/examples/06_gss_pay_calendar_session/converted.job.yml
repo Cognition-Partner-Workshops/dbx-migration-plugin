@@ -1,0 +1,69 @@
+# wf_Pay_Calendar -> Lakeflow Job (shapes: databricks-jobs references/task-types.md "Run SQL File",
+# references/dependencies-control-flow.md `depends_on` + `run_if`, references/notifications-monitoring.md
+# "Email Notifications"; databricks-dabs bundle-structure.md for ${var.*}).
+#
+# Legacy DAG (WORKFLOWLINK rows, all conditions `$<session>.Status = Succeeded`):
+#   Start -> s_Reset -> s_Set -> s_Verify -> s_Build_Message -> Email_Pay_Calendar
+# SCHEDULEINFO SCHEDULETYPE="ONDEMAND": no schedule; the workflow is started by an external caller (SKILL.md
+# section 2 "Scheduler edges": look for it in Control-M / cron / pmcmd wrappers - none found in the fixture for this
+# GSS workflow, recorded as an INFERRED manual start).
+#
+# Session-level settings and their job-level equivalents (SKILL.md section 6):
+#   Recovery Strategy "Fail task and continue workflow"  -> max_retries: 0; downstream run_if ALL_SUCCESS means the
+#                                                           chain stops at the failure exactly as the link condition did
+#   Failure Email session component (on_failure_mail)     -> task email_notifications.on_failure
+#   Pre/post-session variable assignment components       -> the OUT parameter of the procedure (TgtSuccessRows);
+#                                                           promoted to a task value only if s_Build_Message reads it
+#   Commit Interval / Commit Type / Rollback on Errors    -> no equivalent needed (single atomic MERGE, see converted.sql)
+#   $$WF_PAY_CALENDAR_EMAIL_LIST, $$WF_SUBJECT, $$WF_MESSAGE -> bundle variables (names only; values live in the
+#                                                           parameter file / Build_Message session, not in this repo)
+resources:
+  jobs:
+    wf_pay_calendar:
+      name: "wf_Pay_Calendar"
+      max_concurrent_runs: 1
+      # ONDEMAND: no `schedule:` block by design.
+      email_notifications:
+        on_failure:
+          - ${var.wf_pay_calendar_email_list}      # $$WF_PAY_CALENDAR_EMAIL_LIST (Email_Pay_Calendar + on_failure_mail recipient)
+      tasks:
+        - task_key: s_Pay_Calendar_Reset_Pay_Calendar
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./converted.sql                 # CALL of the procedure defined there
+              source: WORKSPACE
+          max_retries: 0
+        - task_key: s_Pay_Calendar_Set_Pay_Calendar       # elided in the source excerpt; shape only
+          depends_on:
+            - task_key: s_Pay_Calendar_Reset_Pay_Calendar
+          run_if: ALL_SUCCESS
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./s_pay_calendar_set_pay_calendar.sql   # not included
+              source: WORKSPACE
+          max_retries: 0
+        - task_key: s_Pay_Calendar_Verify_Pay_Calendar    # elided in the source excerpt; shape only
+          depends_on:
+            - task_key: s_Pay_Calendar_Set_Pay_Calendar
+          run_if: ALL_SUCCESS
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./s_pay_calendar_verify_pay_calendar.sql  # not included
+              source: WORKSPACE
+          max_retries: 0
+        - task_key: s_Pay_Calendar_Build_Message          # elided in the source excerpt; shape only
+          depends_on:
+            - task_key: s_Pay_Calendar_Verify_Pay_Calendar
+          run_if: ALL_SUCCESS
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./s_pay_calendar_build_message.sql   # not included; sets $$WF_SUBJECT / $$WF_MESSAGE
+              source: WORKSPACE
+          max_retries: 0
+        # Email_Pay_Calendar (Email task with $$WF_SUBJECT / $$WF_MESSAGE bodies): Lakeflow email notifications carry
+        # run metadata, not a computed body. Like-for-like is job-level `email_notifications.on_success`; if the
+        # computed message text is a hard requirement, a notebook/python task sending mail is a D5 decision.

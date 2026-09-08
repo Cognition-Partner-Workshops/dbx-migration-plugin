@@ -1,0 +1,42 @@
+# wf_PARTY_MDM_SYNC -> Lakeflow Job (shapes: databricks-jobs references/triggers-schedules.md "Cron Schedules",
+# references/task-types.md "Pipeline Task"; databricks-dabs references/bundle-structure.md for ${var.*}).
+#
+# Legacy: Start -> s_m_PARTY_MDM_SYNC, no Informatica scheduler; Control-M ALB-MDM-0003 starts it at 01:30 with
+# `pmcmd startworkflow -f MDM_PARTY wf_PARTY_MDM_SYNC`. Control-M has NO INCOND linking it to ALB-DWH-0032
+# (wf_POLICY_MASTER_DAILY, 03:15) although the workflow description says it must finish first.
+#
+# Two faithful options; the choice is a D5 decision, not a converter default:
+#   (a) keep two independent jobs with the legacy times (reproduces "runtime luck");
+#   (b) make wf_POLICY_MASTER_DAILY a downstream task of this job (adds a dependency the estate never had).
+# This file implements (a) and records (b) as a commented alternative.
+resources:
+  jobs:
+    wf_party_mdm_sync:
+      name: "wf_PARTY_MDM_SYNC"
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 30 1 * * ?"      # 01:30 daily (Control-M TIMEFROM=0130)
+        timezone_id: "Europe/London"
+        pause_status: PAUSED                        # unpause after parallel-run sign-off
+      tasks:
+        - task_key: s_m_PARTY_MDM_SYNC
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.m_party_mdm_sync.id}
+        # Option (b):
+        # - task_key: wf_POLICY_MASTER_DAILY
+        #   depends_on: [{task_key: s_m_PARTY_MDM_SYNC}]
+        #   run_job_task: {job_id: ${resources.jobs.wf_policy_master_daily.id}}
+
+  pipelines:
+    m_party_mdm_sync:
+      name: "m_PARTY_MDM_SYNC"
+      catalog: "<migration_catalog>"
+      schema: "mdm"
+      libraries:
+        - file:
+            path: ./converted.py                    # includes the shared mapplet functions (wave-0 module)
+      configuration:
+        informatica.MATCH_CONFIDENCE_FLOOR: "0.82"  # $$MATCH_CONFIDENCE_FLOOR
+        informatica.SUSPECT_QUEUE_CAP: "50000"      # $$SUSPECT_QUEUE_CAP
+        informatica.party_table: ${var.party_table}                 # TD_POLICY_ADMIN_PROD.PARTY  (read-only legacy)
+        informatica.apf_customers_table: ${var.apf_customers_table} # TD_CORE_BANKING_PROD.CUSTOMERS
