@@ -18,11 +18,17 @@ CREATE TABLE IF NOT EXISTS ${catalog}.pkg_policy_renewal.run_log (
   status        STRING
 );
 
--- FUNCTION broker_uplift: NO_DATA_FOUND -> default, TOO_MANY_ROWS -> RAISE_APPLICATION_ERROR(-20002).
--- A SQL scalar function cannot raise on duplicates, so uniqueness is a precondition asserted in the procedure below.
+-- FUNCTION broker_uplift. Three Oracle outcomes, kept apart:
+--   one row            -> 1 + NVL(commission_pct, 0) / 100   (a NULL commission on an existing broker is 1.0)
+--   NO_DATA_FOUND      -> c_default_uplift (1.035)            (the scalar subquery is NULL, so the OUTER coalesce applies)
+--   TOO_MANY_ROWS      -> RAISE_APPLICATION_ERROR(-20002)     (a SQL scalar function cannot raise it: the procedure below
+--                                                              asserts uniqueness for the brokers it will call this for)
 CREATE OR REPLACE FUNCTION ${catalog}.pkg_policy_renewal.broker_uplift(p_broker_id BIGINT)
 RETURNS DECIMAL(38,10)
-RETURN 1 + coalesce((SELECT max(b.commission_pct) FROM ${catalog}.poladm.broker b WHERE b.broker_id = p_broker_id), 0) / 100;
+RETURN coalesce((SELECT 1 + coalesce(b.commission_pct, 0) / 100
+                   FROM ${catalog}.poladm.broker b
+                  WHERE b.broker_id = p_broker_id),
+                1.035);                                        -- c_default_uplift
 -- Oracle NUMBER arithmetic is exact to 38 digits; DECIMAL(38,10) division truncates at scale 10 (§7 trap 25): Tier 2 on
 -- SUM(annual_premium) with decimal_round(2) is the agreed tolerance because the result is ROUNDed to 2 dp before storage.
 
@@ -37,7 +43,10 @@ RETURN
      AND p.expiry_dt <  p_as_of_dt + make_interval(0, 0, 0, p_horizon_days) -- d + n days (§5 #56)
    ORDER BY p.expiry_dt, p.policy_id;
 
--- PROCEDURE renew_expiring: the cursor/BULK COLLECT/FORALL loop is one set-based UPDATE + one INSERT.
+-- PROCEDURE renew_expiring: the cursor/BULK COLLECT/FORALL loop is one set-based UPDATE + one INSERT, plus the row-level
+-- side effects of TRG_POLICY_BIU (BEFORE UPDATE on poladm.policy, fixture 07) that Oracle applies to every updated row and
+-- Delta has no trigger for: row_version/updated_*, policy_no re-normalisation, active_policy_flag recomputed from the NEW
+-- values, and one policy_audit_log row per policy whose status or premium changed (via prc_log_event / audit_seq).
 -- OUT parameters cannot carry DEFAULT; the IN defaults are kept.
 CREATE OR REPLACE PROCEDURE ${catalog}.pkg_policy_renewal.renew_expiring(
     IN  p_as_of_dt     TIMESTAMP_NTZ  DEFAULT date_trunc('DAY', current_timestamp())::TIMESTAMP_NTZ,   -- TRUNC(SYSDATE)
@@ -72,21 +81,39 @@ AS BEGIN
       VALUES (NULL, 'ERROR', 'renew_expiring failed', current_timestamp(), current_user());
     END;
 
-  -- TOO_MANY_ROWS guard for broker_uplift (a scalar UDF cannot raise it)
-  SET l_dup_brokers = (SELECT count(*) FROM (SELECT broker_id FROM ${catalog}.poladm.broker GROUP BY broker_id HAVING count(*) > 1));
-  IF l_dup_brokers > 0 THEN
-    SIGNAL duplicate_broker SET MESSAGE_TEXT = 'Duplicate broker rows';
-  END IF;
-
   -- Candidate set = the FOR UPDATE cursor (SKIP LOCKED has no equivalent: Delta has no row locks; the whole
   -- BEGIN ATOMIC block is one snapshot-isolated transaction instead [dbsql:sql-scripting.md#Isolation Levels]).
-  CREATE OR REPLACE TEMPORARY VIEW renew_candidates AS
+  -- Materialised as a TEMP TABLE, not a TEMP VIEW: a temp view is re-executed on every access
+  -- [dbsql:materialized-views-pipes.md#Temporary Tables vs Temporary Views], so after the MERGE below it would re-read
+  -- poladm.policy and no longer see the rows it just renewed (the audit INSERT and premium_txn INSERT would be empty).
+  -- The :OLD values the trigger compares against (policy_status, annual_premium) are captured here, before any write.
+  DROP TABLE IF EXISTS renew_candidates;
+  CREATE TEMPORARY TABLE renew_candidates AS
     SELECT p.policy_id,
-           p.annual_premium,
-           round(p.annual_premium * coalesce(p_uplift, ${catalog}.pkg_policy_renewal.broker_uplift(p.broker_id)), 2) AS new_premium
+           p.policy_status,                                   -- :OLD.policy_status (always 'LIVE' here)
+           p.annual_premium,                                  -- :OLD.annual_premium
+           p.broker_id,
+           cast(NULL AS DECIMAL(38,10))    AS new_premium
       FROM ${catalog}.poladm.policy p
      WHERE p.policy_status = 'LIVE'
        AND p.expiry_dt BETWEEN p_as_of_dt AND p_as_of_dt + make_interval(0, 0, 0, p_horizon_days);
+
+  -- TOO_MANY_ROWS guard for broker_uplift (a scalar UDF cannot raise it). Same scope as the Oracle calls: the PL/SQL
+  -- NVL(p_uplift, broker_uplift(..)) evaluates both actual parameters before NVL runs, so the function is called for every
+  -- candidate broker even when p_uplift is supplied; the guard therefore covers candidate brokers unconditionally.
+  SET l_dup_brokers = (SELECT count(*)
+                         FROM (SELECT b.broker_id
+                                 FROM ${catalog}.poladm.broker b
+                                WHERE b.broker_id IN (SELECT c.broker_id FROM renew_candidates c)
+                                GROUP BY b.broker_id
+                               HAVING count(*) > 1));
+  IF l_dup_brokers > 0 THEN
+    SIGNAL duplicate_broker SET MESSAGE_TEXT = 'Duplicate broker rows';   -- caught by the SQLEXCEPTION handler -> 'ERR', as WHEN OTHERS does for -20002
+  END IF;
+
+  -- l_new_premium(i) := ROUND(annual_premium * NVL(p_uplift, broker_uplift(broker_id)), 2)
+  UPDATE renew_candidates
+     SET new_premium = round(annual_premium * coalesce(p_uplift, ${catalog}.pkg_policy_renewal.broker_uplift(broker_id)), 2);
 
   -- IF l_new_premium(i) < 0 THEN RAISE e_premium_negative (checked before any write, as the Oracle loop does per batch)
   IF EXISTS (SELECT 1 FROM renew_candidates WHERE new_premium < 0) THEN
@@ -99,16 +126,32 @@ AS BEGIN
   -- one atomic unit (both or neither), which is the whole-run equivalent of the per-batch savepoint (decision in
   -- 06_decisions.md: per-batch partial commits are not reproduced). Requires catalogManaged tables.
   BEGIN ATOMIC
-    -- FORALL ... UPDATE poladm.policy
+    -- FORALL ... UPDATE poladm.policy, with the BEFORE UPDATE trigger body folded in (fixture 07_trg_policy_biu.sql)
     MERGE INTO ${catalog}.poladm.policy AS t
     USING renew_candidates AS c ON t.policy_id = c.policy_id
     WHEN MATCHED THEN UPDATE SET
-      t.annual_premium = c.new_premium,
-      t.expiry_dt      = add_months(t.expiry_dt, 12),                     -- ADD_MONTHS month-end clamping matches (§5 #57)
-      t.policy_status  = 'LIVE',
-      t.row_version    = t.row_version + 1,                                -- trigger fan-out (example 04)
-      t.updated_dt     = current_timestamp(),
-      t.updated_by     = current_user();
+      t.annual_premium     = c.new_premium,
+      t.expiry_dt          = add_months(t.expiry_dt, 12),                 -- ADD_MONTHS month-end clamping matches (§5 #57)
+      t.policy_status      = 'LIVE',
+      -- trigger, UPDATING branch:
+      t.row_version        = coalesce(t.row_version, 0) + 1,              -- NVL(:OLD.row_version, 0) + 1
+      t.updated_dt         = current_timestamp(),                         -- SYSDATE
+      t.updated_by         = current_user(),                              -- SYS_CONTEXT('USERENV','SESSION_USER')
+      t.policy_no          = replace(upper(trim(t.policy_no)), 'AL/', 'ALB-'),   -- re-normalised on every row the trigger sees
+      -- :NEW.active_policy_flag from the NEW status ('LIVE') and the NEW expiry (+12 months), TRUNC(date) compares
+      t.active_policy_flag = CASE WHEN current_date() BETWEEN to_date(t.inception_dt) AND to_date(add_months(t.expiry_dt, 12))
+                                  THEN 'Y' ELSE 'N' END;
+
+    -- trigger, prc_log_event branch: fires when NVL(:OLD.policy_status,'~') <> :NEW.policy_status OR
+    -- NVL(:OLD.annual_premium,-1) <> :NEW.annual_premium (so an uplift of exactly 1.0 logs nothing, as in Oracle).
+    -- audit_id = audit_seq.NEXTVAL -> identity column on the Delta copy (§7 trap 10). PRAGMA AUTONOMOUS_TRANSACTION
+    -- difference accepted in example 04: these rows are part of the atomic block, so a failed run has none of them.
+    INSERT INTO ${catalog}.poladm.policy_audit_log
+      (policy_id, event_cd, old_status, new_status, old_premium, new_premium, event_ts, session_user)
+    SELECT c.policy_id, 'UPDATE', c.policy_status, 'LIVE', c.annual_premium, c.new_premium, current_timestamp(), current_user()
+      FROM renew_candidates c
+     WHERE coalesce(c.policy_status, '~') <> 'LIVE'
+        OR coalesce(c.annual_premium, -1) <> c.new_premium;
 
     -- FORALL ... INSERT INTO poladm.premium_txn (txn_id = policy_seq.NEXTVAL -> identity column on the Delta copy)
     INSERT INTO ${catalog}.poladm.premium_txn
@@ -154,5 +197,6 @@ END;
 -- The BULK COLLECT/FORALL loop still collapses to UPDATE ... FROM + INSERT ... SELECT; FOR UPDATE SKIP LOCKED exists in
 -- Postgres and is kept; SAVEPOINT/ROLLBACK TO exist [pg17:sql-savepoint] and are kept per batch if batching is retained;
 -- RAISE EXCEPTION USING ERRCODE = 'P0001' replaces RAISE_APPLICATION_ERROR [pg17:plpgsql-errors-and-messages];
--- policy_seq.NEXTVAL -> nextval(); the trigger from example 04 maintains row_version/updated_*; package state ->
--- the same run_log table (or a session-scoped temp table).
+-- policy_seq.NEXTVAL -> nextval(); the trigger from example 04 fires on the UPDATE and maintains row_version/updated_*/
+-- active_policy_flag/policy_no and writes the audit rows itself, so NONE of the folded-in trigger columns or the audit
+-- INSERT above are repeated on Lakebase; package state -> the same run_log table (or a session-scoped temp table).

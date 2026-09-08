@@ -17,7 +17,8 @@ commented at the bottom because the two differ on sequences and trigger fan-out.
 | `NULLIF(TRIM(cover_note_ref), '')` (Oracle: `''` already NULL) | kept explicitly | §7 trap 1 |
 | `TRUNC(inception_dt)` | `date_trunc('DAY', ...)` on `TIMESTAMP_NTZ` | §5 #61; §7 trap 3 |
 | `CHAR(1) feed_action` | `rtrim()` at read | §7 trap 5 |
-| trigger-maintained `row_version`, `updated_*` | folded into `UPDATE SET` on Delta; left to the trigger on Lakebase | §2 trigger fan-out; example 04 |
+| `TRG_POLICY_BIU` (BEFORE INSERT OR UPDATE, fixture 07) firing on the `MERGE` | Delta: `row_version`/`updated_*`/`active_policy_flag` folded into `UPDATE SET`, `row_version = 1`/`created_*`/`active_policy_flag` into the `INSERT`, and a `policy_audit_log` `INSERT ... SELECT` driven by a pre-`MERGE` `:OLD` image temp table (`'INSERT'` for every inserted row, `'UPDATE'` for updated rows whose status or premium changed, including rows the `'D'` branch deletes *after* the update; nothing for the delete itself, the trigger has no `DELETE` event). Lakebase: left to the trigger | §2 trigger fan-out; §6 triggers; example 04 |
+| `USING (subquery)` referenced by pre-check, pre-image, `MERGE`, audit | `CREATE TEMPORARY TABLE stg_policy_src AS ...` (drop-first) so all four statements see one feed snapshot | §6 temporary tables |
 | `COMMIT` | dropped (one Delta transaction per statement) or `BEGIN ATOMIC` | §6 commit/rollback |
 
 ## Recon tier that catches a wrong conversion
@@ -33,7 +34,13 @@ commented at the bottom because the two differ on sequences and trigger fan-out.
 - **Tier 3** keyed on `policy_no` (never `policy_id`, which is sequence/identity-assigned): catches `cover_note_ref`
   `''` vs `NULL` (with `empty_string_is_null` on, the diff disappears, which is the intended canonicalization,
   recorded in `06_decisions.md`), `inception_dt` retaining a time component if `date_trunc` is dropped, and
-  `row_version` drift if the trigger fold-in is forgotten.
+  `row_version` / `active_policy_flag` drift if the trigger fold-in is forgotten (a feed that moves a policy from
+  `LIVE` to `LAPSED` leaves `active_policy_flag = 'Y'` without it).
+- **Tier 1** on `poladm.policy_audit_log` per `event_cd` and run date: Oracle has one `'INSERT'` row per new policy and
+  one `'UPDATE'` row per changed policy (including those then deleted); a conversion without the audit `INSERT` has zero,
+  one that logs every matched row over-counts the unchanged ones. **Tier 3** on those rows keyed on
+  `(policy_no, event_cd)`: `old_status`/`old_premium` must be the pre-`MERGE` values (a pre-image taken after the
+  `MERGE`, or a temp *view* re-evaluated after it, yields `old = new`).
 
 ## Canonicalization used
 
@@ -43,8 +50,10 @@ commented at the bottom because the two differ on sequences and trigger fan-out.
 ## Not verified live
 
 `MERGE ... WHEN MATCHED AND ... THEN DELETE` ordering on a real Delta table; `assert_true` inside an aggregate over an
-empty `HAVING` result (one row, `count(*) = 0`) as the first statement of a `sql_task`; Postgres 17 `MERGE`
-duplicate-source behaviour on Lakebase; `BEGIN ATOMIC` with `catalogManaged` tables.
+empty `HAVING` result (one row, `count(*) = 0`) as the first statement of a `sql_task`; `DROP TABLE IF EXISTS` on a
+session temp table plus `CREATE TEMPORARY TABLE ... AS` with an `IN (subquery)` predicate; reading identity-assigned
+`policy_id` back from the Delta table in the statement after the `MERGE`; Postgres 17 `MERGE` duplicate-source behaviour
+on Lakebase; `BEGIN ATOMIC` with `catalogManaged` tables.
 
 ## Open decision
 

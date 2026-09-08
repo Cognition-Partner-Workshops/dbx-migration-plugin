@@ -75,9 +75,94 @@ class Edge:
     detail: str = ""
 
 
+QQUOTE_CLOSER = {"[": "]", "(": ")", "{": "}", "<": ">"}
+
+
 def strip_comments(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    return "\n".join(re.sub(r"--.*$", "", ln) for ln in text.splitlines())
+    """Lexical comment removal. '...' ('' escape), q'[...]' (any delimiter) and "quoted identifiers" are opaque,
+    so `--` or `/*` inside a literal never swallows the SQL that follows it; comments become spaces, newlines are kept."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "-" and text.startswith("--", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if ch == "/" and text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(re.sub(r"[^\n]", " ", text[i:j]))
+            i = j
+            continue
+        if ch in "qQ" and i + 2 < n and text[i + 1] == "'" and (i == 0 or not re.match(r"[\w$#]", text[i - 1])):
+            closer = QQUOTE_CLOSER.get(text[i + 2], text[i + 2]) + "'"
+            j = text.find(closer, i + 3)
+            j = n if j < 0 else j + 2
+            out.append(text[i:j])
+            i = j
+            continue
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == "'":
+                    if j + 1 < n and text[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            j = min(j + 1, n)
+            out.append(text[i:j])
+            i = j
+            continue
+        if ch == '"':
+            j = text.find('"', i + 1)
+            j = n if j < 0 else j + 1
+            out.append(text[i:j])
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def named_args(text: str) -> list[tuple[str, str]]:
+    """`name => value` pairs of a PL/SQL call, splitting on top-level commas only: a value may be a full expression
+    such as TO_TIMESTAMP_TZ('...', '...') (balanced parentheses, '...' and q'[...]' literals are opaque)."""
+    parts: list[str] = []
+    depth, start, i, n = 0, 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "qQ" and i + 2 < n and text[i + 1] == "'" and (i == 0 or not re.match(r"[\w$#]", text[i - 1])):
+            j = text.find(QQUOTE_CLOSER.get(text[i + 2], text[i + 2]) + "'", i + 3)
+            i = n if j < 0 else j + 2
+            continue
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == "'":
+                    if j + 1 < n and text[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            i = min(j + 1, n)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+        i += 1
+    parts.append(text[start:])
+    out: list[tuple[str, str]] = []
+    for p in parts:
+        m = re.match(r"\s*(\w+)\s*=>\s*(.*?)\s*$", p, re.S)
+        if m:
+            out.append((m.group(1), m.group(2)))
+    return out
 
 
 def lift_qquotes(text: str) -> tuple[str, dict[str, str]]:
@@ -127,7 +212,9 @@ class Estate:
         if key in self.nodes:
             return key, "FACT", ""
         _owner, bare = key.split(".", 1)
-        syn = self.synonyms.get(key) or self.public_synonyms.get(bare)
+        # Oracle resolution order for an UNQUALIFIED name: own-schema object, private synonym, public synonym.
+        # A qualified OWNER.NAME never falls through to a same-named public synonym.
+        syn = self.synonyms.get(key) or (self.public_synonyms.get(bare) if "." not in raw else None)
         if syn:
             if "@" in syn:
                 self.add(syn, "EXTERNAL_TABLE", "-").status = "external"
@@ -157,7 +244,6 @@ PUBLIC_SYN_RE = re.compile(rf"CREATE\s+(?:OR\s+REPLACE\s+)?PUBLIC\s+SYNONYM\s+({
 PRIV_SYN_RE = re.compile(rf"CREATE\s+(?:OR\s+REPLACE\s+)?SYNONYM\s+({QNAME})\s+FOR\s+({QNAME}(?:@{IDENT})?)", re.I)
 MEMBER_RE = re.compile(rf"^\s*(PROCEDURE|FUNCTION)\s+({IDENT})", re.I | re.M)
 SCHED_RE = re.compile(r"DBMS_SCHEDULER\.CREATE_(JOB|PROGRAM)\s*\((.*?)\);", re.I | re.S)
-ARG_RE = re.compile(r"(\w+)\s*=>\s*('(?:[^']|'')*'|[^,)]+)", re.S)
 RLS_RE = re.compile(r"DBMS_RLS\.ADD_POLICY\s*\((.*?)\);", re.I | re.S)
 REDACT_RE = re.compile(r"DBMS_REDACT\.ADD_POLICY\s*\((.*?)\);", re.I | re.S)
 GRANT_RE = re.compile(rf"GRANT\s+([A-Z ,()_]+?)\s+ON\s+({QNAME})\s+TO\s+({IDENT})", re.I)
@@ -233,7 +319,7 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
                 node.signals["refresh"] = " ".join(re.findall(r"REFRESH\s+(\w+)\s+ON\s+(\w+)", unit_text, re.I)[0]) if re.search(
                     r"REFRESH\s+\w+\s+ON", unit_text, re.I) else "?"
     for m in SCHED_RE.finditer(text):
-        args = {k.lower(): v.strip().strip("'") for k, v in ARG_RE.findall(m.group(2))}
+        args = {k.lower(): v.strip().strip("'") for k, v in named_args(m.group(2))}
         name = args.get("job_name") or args.get("program_name")
         cls = "SCHEDULER " + m.group(1).upper()
         key = norm(name, default_owner)
@@ -245,13 +331,13 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
         if action:
             proc_units.append((key, cls, action.replace("''", "'")))
     for m in RLS_RE.finditer(text):
-        args = {k.lower(): v.strip().strip("'") for k, v in ARG_RE.findall(m.group(1))}
+        args = {k.lower(): v.strip().strip("'") for k, v in named_args(m.group(1))}
         key = f"{args['object_schema']}.{args['policy_name']}".upper()
         est.add(key, "VPD POLICY", fname)
         est.edges.append(Edge(key, f"{args['object_schema']}.{args['object_name']}".upper(), "defines-on", "FACT"))
         est.edges.append(Edge(key, f"{args['function_schema']}.{args['policy_function']}".upper(), "calls", "FACT"))
     for m in REDACT_RE.finditer(text):
-        args = {k.lower(): v.strip().strip("'") for k, v in ARG_RE.findall(m.group(1))}
+        args = {k.lower(): v.strip().strip("'") for k, v in named_args(m.group(1))}
         key = f"{args['object_schema']}.{args['policy_name']}".upper()
         est.add(key, "REDACTION POLICY", fname, column=args.get("column_name"))
         est.edges.append(Edge(key, f"{args['object_schema']}.{args['object_name']}".upper(), "defines-on", "FACT"))
@@ -276,6 +362,8 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
 # --------------------------------------------------------------------------- lineage (section 2)
 
 READ_RE = re.compile(rf"\b(?:FROM|JOIN)\s+({QNAME}(?:@{IDENT})?)\b(?!\s*\()", re.I)
+# names declared by a WITH clause: `WITH n [(cols)] AS (` and every following `), n [(cols)] AS (` (recursive ones included)
+CTE_RE = re.compile(rf"(?:\bWITH\s+(?:RECURSIVE\s+)?|\)\s*,\s*)({IDENT})\s*(?:\([^)]*\))?\s+AS\s*\(", re.I)
 WRITE_RE = re.compile(rf"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|DELETE|MERGE\s+INTO|TRUNCATE\s+TABLE)\s+({QNAME})", re.I)
 SEQ_RE = re.compile(rf"\b({QNAME})\.(?:NEXTVAL|CURRVAL)\b", re.I)
 TRIGGER_ON_RE = re.compile(rf"\bON\s+({QNAME})\s+(?:FOR\s+EACH\s+ROW|REFERENCING|WHEN|DECLARE|BEGIN)", re.I | re.S)
@@ -397,11 +485,15 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
         if tm:
             est.edge(key, tm.group(1), "defines-on", owner)
             est.edge(key, tm.group(1), "writes", owner, ":NEW in-flight row")
-    for m in READ_RE.finditer(static):
-        name = m.group(1)
-        if name.split(".")[-1].upper() in KEYWORDS or name.upper().startswith("TABLE("):
-            continue
-        est.edge(key, name, "reads", owner)
+    for stmt in static.split(";"):                      # CTE names are statement-local: scope them per statement
+        ctes = {m.group(1).upper() for m in CTE_RE.finditer(stmt)}
+        for m in READ_RE.finditer(stmt):
+            name = m.group(1)
+            if name.split(".")[-1].upper() in KEYWORDS or name.upper().startswith("TABLE("):
+                continue
+            if "." not in name and name.upper() in ctes:
+                continue                                 # a WITH-clause alias, not a physical object (its body is scanned)
+            est.edge(key, name, "reads", owner)
     for m in WRITE_RE.finditer(static):
         if m.group(1).split(".")[-1].upper() in KEYWORDS | {"OF", "FROM"}:
             continue  # `UPDATE ON t`, `UPDATE OF col`, `UPDATE SET` inside MERGE are not writes
@@ -598,6 +690,51 @@ BEGIN
 END;
 /
 """
+# name: (Oracle text, edges that MUST exist as (src, dst, kind), node keys that must NOT exist)
+POSITIVE_CASES: dict[str, tuple[str, set[tuple[str, str, str]], set[str]]] = {
+    "cte_multiple": (
+        "CREATE OR REPLACE VIEW poladm.v_cte AS\n"
+        "WITH recent AS (SELECT * FROM poladm.policy WHERE d > SYSDATE - 7),\n"
+        "     agg (n) AS (SELECT count(*) FROM recent r JOIN poladm.broker b ON b.id = r.broker_id)\n"
+        "SELECT * FROM agg JOIN recent ON 1 = 1;",
+        {("POLADM.V_CTE", "POLADM.POLICY", "reads"), ("POLADM.V_CTE", "POLADM.BROKER", "reads")},
+        {"POLADM.RECENT", "POLADM.AGG"},
+    ),
+    "cte_recursive": (
+        "CREATE OR REPLACE VIEW poladm.v_tree AS\n"
+        "WITH tree (id, lvl) AS (SELECT id, 1 FROM poladm.broker WHERE parent_id IS NULL\n"
+        "  UNION ALL SELECT b.id, t.lvl + 1 FROM tree t JOIN poladm.broker b ON b.parent_id = t.id)\n"
+        "SELECT * FROM tree;",
+        {("POLADM.V_TREE", "POLADM.BROKER", "reads")},
+        {"POLADM.TREE"},
+    ),
+    "cte_scope_is_per_statement": (
+        "CREATE OR REPLACE PROCEDURE poladm.p_cte IS l_n NUMBER; BEGIN\n"
+        "  WITH recent AS (SELECT id FROM poladm.policy) SELECT count(*) INTO l_n FROM recent;\n"
+        "  SELECT count(*) INTO l_n FROM recent;   -- a real table in the next statement, no WITH in scope\n"
+        "END;",
+        {("POLADM.P_CTE", "POLADM.POLICY", "reads"), ("POLADM.P_CTE", "POLADM.RECENT", "reads")},
+        set(),
+    ),
+    "qualified_name_ignores_public_synonym": (
+        "CREATE OR REPLACE PUBLIC SYNONYM broker FOR poladm.broker;\n"
+        "CREATE OR REPLACE VIEW ods.v_a AS SELECT 1 FROM claims.broker;\n"
+        "CREATE OR REPLACE VIEW ods.v_b AS SELECT 1 FROM broker;",
+        {("ODS.V_A", "CLAIMS.BROKER", "reads"), ("ODS.V_B", "POLADM.BROKER", "reads")},
+        set(),
+    ),
+    "comment_markers_inside_literals": (
+        "CREATE OR REPLACE PROCEDURE poladm.p_lit IS l_s VARCHAR2(200); l_n NUMBER; BEGIN\n"
+        "  SELECT '-- not a comment' INTO l_s FROM poladm.t_a;\n"
+        "  SELECT 'it''s /* not a comment' INTO l_s FROM poladm.t_b;\n"
+        "  l_s := q'{ -- q-quoted /* }'; SELECT 1 INTO l_n FROM poladm.t_c;\n"
+        "  EXECUTE IMMEDIATE 'DELETE FROM poladm.t_d WHERE note = ''--'' /* ';\n"
+        "  SELECT 1 AS \"x -- /* y\" INTO l_n FROM poladm.t_e; /* real comment -- */ SELECT 1 INTO l_n FROM poladm.t_f; -- real\n"
+        "END;",
+        {("POLADM.P_LIT", f"POLADM.T_{c}", "reads") for c in "ABCEF"} | {("POLADM.P_LIT", "POLADM.T_D", "writes")},
+        set(),
+    ),
+}
 
 
 def selftest() -> int:
@@ -623,6 +760,19 @@ def selftest() -> int:
         kinds = {(e.kind, e.dst) for e in res["edges"] if e.src == "POLADM.P_OK"}
         if ("writes", "POLADM.T_OK") not in kinds or ("reads", "POLADM.T_OK") not in kinds:
             failures.append(f"positive: expected reads+writes of POLADM.T_OK, got {sorted(kinds)}")
+        for name, (sql, want, forbid) in POSITIVE_CASES.items():
+            d = Path(td) / name
+            d.mkdir()
+            (d / f"{name}.sql").write_text(sql + "\n/\n")
+            res = run(d, None)
+            have = {(e.src, e.dst, e.kind) for e in res["edges"]}
+            for w in sorted(want - have):
+                failures.append(f"{name}: missing edge {w}; got {sorted(have)}")
+            for k in sorted(forbid & set(res["nodes"])):
+                failures.append(f"{name}: phantom node {k} ({res['nodes'][k].cls}, {res['nodes'][k].status})")
+            bad = [e for e in res["edges"] if e.evidence == "UNVERIFIABLE"]
+            if bad:
+                failures.append(f"{name}: supported syntax flagged: " + "; ".join(f"{e.risk} [{e.detail}]" for e in bad))
     # real fixture: zero UNVERIFIABLE, transitive trigger fan-out present, no Albion-only nodes without Albion
     res = run(FIXTURE, None)
     if any(e.evidence == "UNVERIFIABLE" for e in res["edges"]):
@@ -636,6 +786,12 @@ def selftest() -> int:
     have = {(e.src, e.dst, e.kind) for e in res["edges"]}
     for w in sorted(want - have):
         failures.append(f"fixture: missing transitive trigger fan-out edge {w}")
+    job = res["nodes"].get("POLADM.JOB_NIGHTLY_RENEWAL")
+    want_start = "TO_TIMESTAMP_TZ('2019-04-01 02:40:00 Europe/London', 'YYYY-MM-DD HH24:MI:SS TZR')"
+    if not job or job.signals.get("start_date") != want_start:
+        failures.append(f"fixture: scheduler start_date truncated: {job.signals.get('start_date') if job else None!r}")
+    if any(k in res["nodes"] for k in ("POLADM.H", "ODS.H")):
+        failures.append("fixture: CTE alias became a node")
     if ALBION_DEFAULT.exists():
         res = run(FIXTURE, ALBION_DEFAULT)
         if not any(e.src == "TERADATA.STG_POLICY_360" for e in res["edges"]):
@@ -644,7 +800,7 @@ def selftest() -> int:
             failures.append("albion run: UNVERIFIABLE edges present")
     for f in failures:
         print("FAIL", f)
-    print(f"selftest: {len(NEGATIVE_CASES)} negative cases, 1 positive case, fixture checks -> {'FAIL' if failures else 'OK'}")
+    print(f"selftest: {len(NEGATIVE_CASES)} negative cases, {1 + len(POSITIVE_CASES)} positive cases, fixture checks -> {'FAIL' if failures else 'OK'}")
     return 1 if failures else 0
 
 

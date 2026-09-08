@@ -8,15 +8,15 @@
 CREATE OR REPLACE VIEW ${catalog}.ods.v_broker_hierarchy AS
 WITH RECURSIVE h (
   depth, region_ref, broker_id, parent_broker_id, broker_ref, broker_name, tier_cd,
-  path_refs, effective_commission_pct, parent_commission_pct, path_ids, sort_key
+  path_refs, commission_pct, effective_commission_pct, path_ids, sort_key
 ) MAX RECURSION LEVEL 20 AS (
   -- START WITH b.parent_broker_id IS NULL
   SELECT 1                                          AS depth,
          b.broker_ref                               AS region_ref,          -- CONNECT_BY_ROOT broker_ref
          b.broker_id, b.parent_broker_id, b.broker_ref, b.broker_name, b.tier_cd,
          b.broker_ref                               AS path_refs,           -- LTRIM(SYS_CONNECT_BY_PATH(ref,'/'),'/')
-         b.commission_pct                           AS effective_commission_pct,   -- PRIOR is NULL at the root
-         cast(NULL AS DECIMAL(38,10))               AS parent_commission_pct,
+         b.commission_pct                           AS commission_pct,       -- the row's own (raw) value, what PRIOR reads one level down
+         b.commission_pct                           AS effective_commission_pct,   -- NVL(col, PRIOR col): PRIOR is NULL at the root
          array(b.broker_id)                         AS path_ids,            -- for NOCYCLE detection
          lpad(b.broker_name, 200, ' ')              AS sort_key             -- ORDER SIBLINGS BY broker_name
     FROM ${catalog}.poladm.broker b
@@ -27,8 +27,10 @@ WITH RECURSIVE h (
          h.region_ref,
          b.broker_id, b.parent_broker_id, b.broker_ref, b.broker_name, b.tier_cd,
          concat(h.path_refs, '/', b.broker_ref),
-         nvl(b.commission_pct, h.effective_commission_pct),                  -- NVL(col, PRIOR col): §5 #82
-         h.effective_commission_pct,
+         b.commission_pct,
+         -- NVL(b.commission_pct, PRIOR b.commission_pct): PRIOR reads the parent's RAW column, not the parent's already
+         -- derived effective value, so a NULL parent under a non-NULL grandparent yields NULL here, as in Oracle (§5 #82)
+         nvl(b.commission_pct, h.commission_pct),
          array_append(h.path_ids, b.broker_id),
          concat(h.sort_key, '|', lpad(b.broker_name, 200, ' '))
     FROM h
@@ -55,7 +57,7 @@ SELECT h.depth,
                           WHERE c.parent_broker_id = h.broker_id AND c.active_flag = 'Y'
                             AND array_contains(h.path_ids, c.broker_id))
             THEN 1 ELSE 0 END                        AS is_cycle,
-       h.effective_commission_pct,
+       h.effective_commission_pct,                   -- one level of inheritance only; see NOTE.md for the 3-level case
        h.sort_key                                    -- exposed so consumers can reproduce ORDER SIBLINGS BY; a view has no order (§7 trap 6)
   FROM h;
 
