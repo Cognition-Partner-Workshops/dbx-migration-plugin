@@ -11,7 +11,7 @@
 # $DBConnection_APF=TD_CORE_BANKING_PROD (CUSTOMERS), $DBConnection_TGT=ORA_MDM_HUB_PROD (Oracle MDM hub).
 
 from pyspark import pipelines as dp
-from pyspark.sql import Column, functions as F
+from pyspark.sql import Column, Window, functions as F
 
 MATCH_CONFIDENCE_FLOOR = float(spark.conf.get("informatica.MATCH_CONFIDENCE_FLOOR"))   # $$MATCH_CONFIDENCE_FLOOR=0.82
 SUSPECT_QUEUE_CAP = int(spark.conf.get("informatica.SUSPECT_QUEUE_CAP"))               # $$SUSPECT_QUEUE_CAP=50000
@@ -90,14 +90,31 @@ def mdm_party_golden():
     xm = spark.read.table("exp_xmatch_apf")
     cust = spark.read.table(CUSTOMERS_TABLE).select(
         F.col("CUSTOMER_ID").alias("LEGACY_CUSTOMER_ID"), "NINO",
-        F.soundex(F.upper(F.col("LAST_NAME"))).alias("cust_soundex"), F.col("DOB").alias("cust_dob"))
+        F.soundex(F.upper(F.col("LAST_NAME"))).alias("cust_soundex"), F.col("DOB").alias("cust_dob"),
+        F.col("LAST_UPDATED_TS").alias("cust_updated_ts"))                       # INFERRED column name
 
     # Survivorship and the NINO-exact / NAME_DOB-fuzzy match order are described only in the MAPPING DESCRIPTION
     # (no Lookup/Joiner transformations are in the export): everything from here to the target is INFERRED.
-    nino_match = party.join(cust, party.NINO == cust.NINO, "left").select("PARTY_ID", "LEGACY_CUSTOMER_ID")
-    fuzzy = (xm.join(cust, (xm.out_SURNAME_SOUNDEX == cust.cust_soundex) &
-                           (F.to_date(xm.out_BIRTH_DT) == cust.cust_dob), "left")
-               .select("PARTY_ID", F.col("LEGACY_CUSTOMER_ID").alias("fuzzy_customer_id")))
+    # Both matches can hit several APF customers per PARTY_ID (shared NINO, common surname + DOB). A connected
+    # Lookup returns ONE row (row 74 'Use First Value' / 'Use Last Value'), so each match is reduced to one row per
+    # PARTY_ID before it is joined back; "most-recent-update wins" is the documented survivorship and
+    # LEGACY_CUSTOMER_ID is the deterministic tie-breaker (a cache-order dependency in the legacy engine, trap 9).
+    survivor = Window.partitionBy("PARTY_ID").orderBy(F.col("cust_updated_ts").desc_nulls_last(),
+                                                     F.col("LEGACY_CUSTOMER_ID").asc())
+
+    def one_per_party(matches, out_col):
+        return (matches.withColumn("rn", F.row_number().over(survivor))
+                       .filter(F.col("rn") == 1)
+                       .select("PARTY_ID", F.col("LEGACY_CUSTOMER_ID").alias(out_col)))
+
+    nino_match = one_per_party(
+        party.join(cust, party.NINO == cust.NINO, "inner").select("PARTY_ID", "LEGACY_CUSTOMER_ID", "cust_updated_ts"),
+        "nino_customer_id")
+    fuzzy = one_per_party(
+        xm.join(cust, (xm.out_SURNAME_SOUNDEX == cust.cust_soundex) &
+                      (F.to_date(xm.out_BIRTH_DT) == cust.cust_dob), "inner")
+          .select("PARTY_ID", "LEGACY_CUSTOMER_ID", "cust_updated_ts"),
+        "fuzzy_customer_id")
 
     return (
         party.join(email, "PARTY_ID", "left").join(nino, "PARTY_ID", "left").join(xm, "PARTY_ID", "left")
@@ -114,7 +131,8 @@ def mdm_party_golden():
                  F.col("out_NINO_MASKED").alias("NINO_MASKED"),
                  F.col("out_SURNAME_SOUNDEX").alias("SURNAME_SOUNDEX"),
                  F.col("out_BIRTH_DT").alias("BIRTH_DT"),
-                 F.coalesce(F.col("LEGACY_CUSTOMER_ID"), F.col("fuzzy_customer_id")).alias("LEGACY_CUSTOMER_ID"),
+                 # match-order precedence: NINO exact first, NAME_DOB fuzzy only when no NINO match
+                 F.coalesce(F.col("nino_customer_id"), F.col("fuzzy_customer_id")).alias("LEGACY_CUSTOMER_ID"),
                  F.col("birth_dt_present"),
              )
     )

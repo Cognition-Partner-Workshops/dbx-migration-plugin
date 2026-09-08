@@ -51,7 +51,7 @@ def exp_amt_clean():
     stripped = F.translate(F.col("AMT_TXT"), "\u00a3,", "")      # CHR(163) in Latin1 = U+00A3; two REPLACECHR -> one translate
     parsed = F.expr(f"try_cast(translate(AMT_TXT, '\u00a3,', '') AS DECIMAL(12,2))")
     return src.select(
-        "CLAIM_REF",
+        "BROKER_ID", "CLAIM_REF",                                  # brokers reuse CLAIM_REF: keep the full grain
         F.coalesce(parsed, F.lit(0).cast("decimal(12,2)")).alias("out_AMT"),
         (F.col("AMT_TXT").isNotNull() & (F.trim(stripped) != "") & parsed.isNull()).alias("amt_unparsable"),
     )
@@ -69,12 +69,16 @@ def lkp_sii_lob():
 @dp.expect("amount_parsable", "NOT amt_unparsable")            # legacy silently produced 0: warn, do not drop
 @dp.expect_or_drop("policy_rekeyed", "POLICY_NO RLIKE '^ALB-[A-Z]{3}-[0-9]{7}$'")   # INFERRED POLARIS key shape
 def ri_claims_bdx_std():
+    # Every Expression view is re-joined on the declared grain (BROKER_ID, CLAIM_REF), never on CLAIM_REF alone:
+    # the same CLAIM_REF appears in more than one broker's file. If a broker file itself repeats a CLAIM_REF the
+    # legacy row pipeline emitted both rows too; that duplication is caught by Tier 1 counts, not hidden here.
+    grain = ["BROKER_ID", "CLAIM_REF"]
     raw = spark.read.table("bdx_claims_raw")
     key = spark.read.table("exp_rekey_policy")
     amt = spark.read.table("exp_amt_clean")
     lob = spark.read.table("lkp_sii_lob")
-    return (raw.join(key, ["BROKER_ID", "CLAIM_REF"], "left")
-               .join(amt, "CLAIM_REF", "left")
+    return (raw.join(key, grain, "left")
+               .join(amt, grain, "left")
                .join(lob, raw.PRODUCT_CD == lob.PRODUCT_CD, "left")
                .select(raw.BROKER_ID, raw.CLAIM_REF,
                        key.out_POLICY_NO.alias("POLICY_NO"),

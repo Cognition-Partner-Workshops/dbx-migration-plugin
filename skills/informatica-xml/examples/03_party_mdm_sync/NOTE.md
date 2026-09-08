@@ -44,7 +44,10 @@ Fixture: `informatica/XML/wf_PARTY_MDM_SYNC.xml` (`source.xml`), `informatica/ma
 - Match order (NINO exact, then Soundex+DOB fuzzy), survivorship ("most-recent wins except email longest wins"),
   `$$MATCH_CONFIDENCE_FLOOR`, and the suspect queue are only in `DESCRIPTION` text; no Lookup/Joiner/Router
   transformations are exported. The join logic in `converted.py` is INFERRED and the confidence threshold and queue
-  cap are surfaced as pipeline configuration but not wired to any exported expression.
+  cap are surfaced as pipeline configuration but not wired to any exported expression. Each match (NINO, fuzzy) is
+  reduced to one row per `PARTY_ID` (most recent `LAST_UPDATED_TS`, then lowest `LEGACY_CUSTOMER_ID`) before it is
+  joined back, so an ambiguous match cannot multiply golden rows; the tie-break column name is INFERRED and must be
+  confirmed against the live APF schema.
 - NINO is masked here but read raw by the SAS fraud pipeline: a governance finding for section 9 (column mask in UC),
   not something the conversion changes.
 - The mapplet's postcode logic named in its description (DQR-014 variant A) is not in the exported mapplet XML;
