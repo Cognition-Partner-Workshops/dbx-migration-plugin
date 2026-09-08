@@ -330,7 +330,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
 
-    report = run(a.workspace, a.plugin_root, a.role, a.hook_probe_result, a.expect_identity, a.no_databricks)
+    report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
+                 a.expect_identity, a.no_databricks)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
