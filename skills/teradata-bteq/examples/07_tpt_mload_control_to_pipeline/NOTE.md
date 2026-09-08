@@ -1,0 +1,62 @@
+# 07 — TPT (FastLoad protocol) and MLOAD control files -> declarative pipeline with quarantine + AUTO CDC
+
+Source: two skill-authored minimal control files (the estate has none): `source.stg_transactions_load.tpt`
+(TPT job, DataConnector producer -> Load operator into `STG_TRANSACTIONS`) and `source.dim_exchange_rates_upsert.mload`
+(MLOAD upsert into `DIM_EXCHANGE_RATES`). Target: one Lakeflow Spark Declarative Pipeline (SQL).
+
+## Constructs exercised
+- TPT `DEFINE SCHEMA` (all VARCHAR) -> `read_files(... inferColumnTypes => false)`; typing moved to the silver step.
+- `DEFINE OPERATOR ... TYPE DATACONNECTOR PRODUCER` attributes -> `read_files` options: `TextDelimiter` -> `sep`,
+  `SkipRows = 1` -> `header => true`, `NullColumns = 'Y'` -> `nullValue => ''`, `AcceptMissingColumns` ->
+  `rescuedDataColumn`; `DirectoryPath`/`FileName` -> volume path + `_metadata.file_path`.
+- `DEFINE OPERATOR ... TYPE LOAD` (FastLoad protocol) -> streaming table append; `TargetTable` keeps its name;
+  `LogTable` -> pipeline event log (no artifact); `MaxSessions/MinSessions` -> no equivalent (dropped).
+- `ErrorTable1` / `ErrorTable2` -> one quarantine streaming table with `ERROR_REASON`; `ErrorLimit` -> `FAIL UPDATE`
+  on the non-negotiable invariant + job-level count check on the quarantine table (skill §7 "ErrorLimit").
+- `APPLY ('INSERT ... VALUES (:f (DATE, FORMAT ''YYYY-MM-DD''), :a (DECIMAL(15,2)) ...)')` -> `CAST`s in the silver
+  `SELECT`; `CURRENT_DATE` -> `current_date()`; `TIME(0)` -> `STRING`.
+- `@Variable` job variables / `$tdpid/$user/$password` -> pipeline configuration + service principal; no secret inline.
+- MLOAD `.LOGTABLE`, `.BEGIN IMPORT MLOAD ... WORKTABLES/ERRORTABLES/ERRLIMIT/CHECKPOINT/SESSIONS` -> pipeline
+  bookkeeping (no artifacts); `.LAYOUT` `.FIELD`/`.FILLER` -> `schemaHints` + a typed temporary view excluding the
+  filler.
+- `.DML LABEL ... DO INSERT FOR MISSING UPDATE ROWS; UPDATE ...; INSERT ...` (upsert) -> `AUTO CDC INTO ... KEYS (...)
+  SEQUENCE BY ... STORED AS SCD TYPE 1`.
+- `.IMPORT INFILE ... FORMAT VARTEXT '|' LAYOUT ... APPLY ...` -> `FROM STREAM read_files(... sep => '|', header => false)`.
+- `ETL_INSERT_TS`/`ETL_UPDATE_TS` = `CURRENT_TIMESTAMP(0)` -> excluded from recon as operational columns.
+
+## Recon tier that catches a wrong conversion
+- Header row loaded as data (`header => false` on the TPT feed): **Tier 1** row-count excess of exactly one per file
+  and a `CAST_DATE` quarantine row per file.
+- Delimiter/quote mismatch shifting columns: **Tier 3** keyed diff on `STG_TRANSACTIONS` by `TRANSACTION_ID`
+  (`MERCHANT_NAME` containing `|` is the usual culprit); **Tier 1** on the quarantine table catches the gross case.
+- Rejects silently dropped instead of quarantined (no `_rescued_data`): **Tier 1** `legacy ET rows + loaded rows =
+  source lines` conservation check per file.
+- Duplicate `TRANSACTION_ID` kept (FastLoad UPI dropped it to ErrorTable2): **Tier 1** `count(*)` vs
+  `count(distinct TRANSACTION_ID)` on `STG_TRANSACTIONS`; downstream `FACT_TRANSACTION` row-count excess.
+- `AUTO CDC` keyed on fewer columns than the MLOAD `WHERE` (e.g. missing `RATE_DATE`): **Tier 1** on
+  `DIM_EXCHANGE_RATES` (rows collapse to one per pair); **Tier 2** `sum(BASE_CURRENCY_AMOUNT)` drift in example 04.
+- `SEQUENCE BY` ordering differing from MLOAD file order when two files carry the same key: **Tier 3** keyed diff on
+  `EXCHANGE_RATE`, neutralised by `decimal_round` only if within tolerance — otherwise a real ordering defect.
+- `DECIMAL(18,8)` cast vs Teradata implicit conversion of `CHAR(18)`: **Tier 3** last-digit diffs; `decimal_round`.
+
+## Citations
+- `FROM STREAM read_files(...)`, option names, "Unity Catalog pipelines must use external locations": `databricks-pipelines`
+  `references/auto-loader-sql.md`.
+- CSV option names (`sep`, `header`, `nullValue`, `skipRows`, `rescuedDataColumn`): `references/options-csv.md`.
+- `CONSTRAINT ... EXPECT ... ON VIOLATION DROP ROW | FAIL UPDATE`, warn default, "No subqueries": `references/expectations-sql.md`.
+- Quarantine branch on `_rescued_data`: `references/streaming-patterns.md` "Rescue-Data Quarantine".
+- `_metadata.file_path`: `references/dlt-migration.md` (file metadata row).
+- Streaming temporary view read via `FROM STREAM(view_name)`: `references/temporary-view-sql.md`.
+- `AUTO CDC INTO ... KEYS ... SEQUENCE BY ... COLUMNS * EXCEPT ... STORED AS SCD TYPE 1`, pre-filter via temporary view,
+  "FROM STREAM(...) accepts only a table/view identifier": `references/auto-cdc-sql.md`.
+- Backfill alternative (`COPY INTO`) named in the v0 stub is not documented in the official skills read; route through
+  `target-routing` before using it.
+
+## Not verified live
+- `SEQUENCE BY _ingested_at` (a `current_timestamp()` column) reproduces MLOAD file-order semantics only when files
+  arrive in order; two same-key rows in one micro-batch tie. A file-modification-time column would be stricter but is
+  not documented in the official skills read.
+- `try_cast` inside a streaming table select and `length()` inside an expectation (both plain SQL functions, allowed
+  per `expectations-sql.md`, but not exercised here).
+- Whether a `FAIL UPDATE` violation leaves the quarantine table populated for the same update (the reference says the
+  transaction rolls back).

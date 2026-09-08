@@ -1,0 +1,88 @@
+# Lakeflow Job replacing dml/scripts/bteq_daily_load.btq. Deployed as a bundle resource (target-routing: databricks-dabs);
+# schedule lands PAUSED per target-routing "Deploy and schedule".
+# Shape: databricks-jobs SKILL.md "Core Concepts / Multi-Task Workflows" (depends_on, run_if);
+# sql_task file form: databricks-jobs references/task-types.md "SQL Task / Run SQL File";
+# retries/timeouts: databricks-jobs references/notifications-monitoring.md "Retry Configuration", "Timeout Configuration";
+# ${var.*}: databricks-dabs references/bundle-structure.md (variables / substitution table).
+# The SQL files carry ${catalog}.${schema} placeholders substituted at build time from .migration/allowed_targets.json
+# (factory convention); the batch date is current_date(), as the BTEQ used CURRENT_DATE.
+#
+# BTEQ control flow -> job graph, not line-by-line emulation:
+#   .IF ACTIVITYCOUNT = 0 THEN .GOTO NOSTAGING   -> 01_staging_check raises (SIGNAL) when nothing is staged;
+#                                                  nostaging_warning runs with run_if AT_LEAST_ONE_FAILED on that task only
+#   .IF ERRORCODE <> 0 THEN .GOTO ERRORHANDLER   -> default run_if ALL_SUCCESS on every downstream task;
+#                                                  errorhandler_mark_failed runs with run_if AT_LEAST_ONE_FAILED
+#   .QUIT 0 / .QUIT 4 / .QUIT 8                   -> job run state (success / failed) + BATCH_STATUS row; the numeric
+#                                                  return code is recorded in ETL_BATCH_CONTROL, not as a process exit code
+#   VT_BATCH volatile table                       -> persisted STARTED row in ETL_BATCH_CONTROL (02_new_batch_id), re-read by
+#                                                  later tasks; no shared temp object across tasks
+#   .EXPORT REPORT FILE=...                       -> 06_export_recon_report writes a Delta table the report consumer reads
+#   .LOGON TDPROD/etl_svc_acct,;                  -> job run_as migration service principal (target-routing "Auth")
+resources:
+  jobs:
+    banking_dw_daily_load:
+      name: banking_dw_daily_load
+      timeout_seconds: 7200
+      tasks:
+        - task_key: staging_check                       # Step 1 + .IF ACTIVITYCOUNT = 0
+          sql_task:
+            file: {path: ./sql/01_staging_check.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"
+
+        - task_key: new_batch_id                        # Step 2 + VT_BATCH
+          depends_on: [{task_key: staging_check}]
+          sql_task:
+            file: {path: ./sql/02_new_batch_id.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"
+
+        - task_key: customer_scd2                       # Step 3: CALL SP_CUSTOMER_SCD2
+          depends_on: [{task_key: new_batch_id}]
+          max_retries: 0                                # BTEQ had no retry; keep parity until the target profile says otherwise
+          sql_task:
+            file: {path: ./sql/03_call_customer_scd2.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"
+
+        - task_key: load_daily_transactions             # Step 4: CALL SP_LOAD_DAILY_TRANSACTIONS (example 04)
+          depends_on: [{task_key: customer_scd2}]
+          sql_task:
+            file: {path: ./sql/04_call_load_daily_transactions.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"
+
+        - task_key: daily_balance_check                 # Step 5: EXEC DAILY_BALANCE_CHECK macro (example 05 pattern)
+          depends_on: [{task_key: load_daily_transactions}]
+          sql_task:
+            file: {path: ./sql/05_daily_balance_check.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"
+
+        - task_key: export_recon_report                 # Step 6: .EXPORT REPORT
+          depends_on: [{task_key: daily_balance_check}]
+          sql_task:
+            file: {path: ./sql/06_export_recon_report.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"
+
+        - task_key: mark_batch_completed                # Step 7 + .QUIT 0
+          depends_on: [{task_key: export_recon_report}]
+          run_if: ALL_SUCCESS
+          sql_task:
+            file: {path: ./sql/07_mark_batch_completed.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"
+
+        - task_key: nostaging_warning                   # .LABEL NOSTAGING / .QUIT 4
+          depends_on: [{task_key: staging_check}]
+          run_if: AT_LEAST_ONE_FAILED
+          sql_task:
+            file: {path: ./sql/90_nostaging_warning.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"
+
+        - task_key: errorhandler_mark_failed            # .LABEL ERRORHANDLER / .QUIT 8
+          depends_on:
+            - {task_key: new_batch_id}
+            - {task_key: customer_scd2}
+            - {task_key: load_daily_transactions}
+            - {task_key: daily_balance_check}
+            - {task_key: export_recon_report}
+            - {task_key: mark_batch_completed}
+          run_if: AT_LEAST_ONE_FAILED
+          sql_task:
+            file: {path: ./sql/91_errorhandler_mark_failed.sql, source: WORKSPACE}
+            warehouse_id: "${var.warehouse_id}"

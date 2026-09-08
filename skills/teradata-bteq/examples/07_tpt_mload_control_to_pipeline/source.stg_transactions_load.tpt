@@ -1,0 +1,91 @@
+/* Skill-authored minimal fixture (the estate has no load-utility control files). Loads the daily transaction
+   extract into BANKING_DW.STG_TRANSACTIONS, the table read by SP_LOAD_DAILY_TRANSACTIONS / bteq_daily_load.btq.
+   Exercises: TPT job with DEFINE SCHEMA, DataConnector producer (delimited file), Load operator (FastLoad
+   protocol), error tables, ErrorLimit, variables from a job-variables file, APPLY with a typed INSERT. */
+
+DEFINE JOB LOAD_STG_TRANSACTIONS
+DESCRIPTION 'Daily transaction extract -> STG_TRANSACTIONS (FastLoad protocol)'
+(
+    DEFINE SCHEMA STG_TXN_SCHEMA
+    (
+        TRANSACTION_ID      VARCHAR(20),
+        TRANSACTION_DATE    VARCHAR(10),      /* YYYY-MM-DD */
+        TRANSACTION_TIME    VARCHAR(8),       /* HH:MI:SS  */
+        ACCOUNT_ID          VARCHAR(20),
+        TRANSACTION_TYPE    VARCHAR(20),
+        TRANSACTION_SUBTYPE VARCHAR(30),
+        CHANNEL             VARCHAR(20),
+        TRANSACTION_AMOUNT  VARCHAR(20),
+        CURRENCY_CODE       VARCHAR(3),
+        MERCHANT_ID         VARCHAR(20),
+        MERCHANT_NAME       VARCHAR(100),
+        MERCHANT_CATEGORY   VARCHAR(50),
+        COUNTERPARTY_ACCT   VARCHAR(34),
+        REFERENCE_NUMBER    VARCHAR(35),
+        DESCRIPTION_TEXT    VARCHAR(200),
+        POSTING_DATE        VARCHAR(10),
+        VALUE_DATE          VARCHAR(10)
+    );
+
+    DEFINE OPERATOR FILE_READER
+    TYPE DATACONNECTOR PRODUCER
+    SCHEMA STG_TXN_SCHEMA
+    ATTRIBUTES
+    (
+        VARCHAR DirectoryPath    = @LandingDir,          /* /etl/landing/txn/            */
+        VARCHAR FileName         = @FileName,            /* txn_extract_YYYYMMDD.csv     */
+        VARCHAR Format           = 'Delimited',
+        VARCHAR TextDelimiter    = '|',
+        VARCHAR OpenMode         = 'Read',
+        INTEGER SkipRows         = 1,                    /* header row                   */
+        VARCHAR AcceptMissingColumns = 'Y',
+        VARCHAR NullColumns      = 'Y'                   /* empty field -> NULL          */
+    );
+
+    DEFINE OPERATOR STG_LOADER
+    TYPE LOAD
+    SCHEMA *
+    ATTRIBUTES
+    (
+        VARCHAR TdpId            = @TdpId,
+        VARCHAR UserName         = @UserName,
+        VARCHAR UserPassword     = @UserPassword,        /* from job-variables file, never inline */
+        VARCHAR TargetTable      = 'BANKING_DW.STG_TRANSACTIONS',
+        VARCHAR LogTable         = 'BANKING_DW.STG_TRANSACTIONS_LOG',
+        VARCHAR ErrorTable1      = 'BANKING_DW.STG_TRANSACTIONS_ET',   /* constraint / conversion errors */
+        VARCHAR ErrorTable2      = 'BANKING_DW.STG_TRANSACTIONS_UV',   /* unique-violation rows          */
+        INTEGER ErrorLimit       = 1000,
+        INTEGER MaxSessions      = 8,
+        INTEGER MinSessions      = 2
+    );
+
+    APPLY
+    (
+        'INSERT INTO BANKING_DW.STG_TRANSACTIONS (
+            TRANSACTION_ID, TRANSACTION_DATE, TRANSACTION_TIME, ACCOUNT_ID, TRANSACTION_TYPE,
+            TRANSACTION_SUBTYPE, CHANNEL, TRANSACTION_AMOUNT, CURRENCY_CODE, MERCHANT_ID, MERCHANT_NAME,
+            MERCHANT_CATEGORY, COUNTERPARTY_ACCT, REFERENCE_NUMBER, DESCRIPTION_TEXT, POSTING_DATE, VALUE_DATE,
+            LOAD_DATE)
+         VALUES (
+            :TRANSACTION_ID,
+            :TRANSACTION_DATE  (DATE, FORMAT ''YYYY-MM-DD''),
+            :TRANSACTION_TIME  (TIME(0), FORMAT ''HH:MI:SS''),
+            :ACCOUNT_ID,
+            :TRANSACTION_TYPE,
+            :TRANSACTION_SUBTYPE,
+            :CHANNEL,
+            :TRANSACTION_AMOUNT (DECIMAL(15,2)),
+            :CURRENCY_CODE,
+            :MERCHANT_ID,
+            :MERCHANT_NAME,
+            :MERCHANT_CATEGORY,
+            :COUNTERPARTY_ACCT,
+            :REFERENCE_NUMBER,
+            :DESCRIPTION_TEXT,
+            :POSTING_DATE (DATE, FORMAT ''YYYY-MM-DD''),
+            :VALUE_DATE   (DATE, FORMAT ''YYYY-MM-DD''),
+            CURRENT_DATE);'
+    )
+    TO OPERATOR ( STG_LOADER[2] )
+    SELECT * FROM OPERATOR ( FILE_READER[2] );
+);
