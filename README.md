@@ -19,6 +19,8 @@ The repo root *is* the plugin, so the repo itself is the installable unit.
 AGENTS.md                   always-on guardrails
 hooks.json, hooks/          PreToolUse write-scope guard (hard block) + PostToolUse auth/scope hint
 skills/                     one directory per skill
+skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills (child-session brief)
+skills/lakebridge/          analyzer/transpiler invocation, dialect flags, seeded coverage table
 skills/target-routing/      step -> official databricks skill map, plus migration-only deltas
 skills/factory-doctor/      read-only preflight: CLI, identity, harness, .migration/ integrity, hooks
 skills/install-dbx-factory/ bootstrap skill; carries the 14 DBX playbooks in playbooks/
