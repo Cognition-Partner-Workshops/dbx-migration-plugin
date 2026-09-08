@@ -643,7 +643,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             "JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id "
             "JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id "
             "JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id "
-            "WHERE s.name = ? AND o.name = ? ORDER BY fk.name, fkc.constraint_column_id", (schema, name))
+            "WHERE s.name = ? AND o.name = ? AND fk.is_disabled = 0 "
+            "ORDER BY fk.name, fkc.constraint_column_id", (schema, name))
         by_fk: dict[str, list] = {}
         for fk_name, col, ref_table, ref_col in rows:
             entry = by_fk.setdefault(fk_name, [[], ref_table, []])
@@ -664,7 +665,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
         (n,) = self._rows(
             "SELECT COUNT(*) FROM sys.check_constraints cc "
             "JOIN sys.objects o ON o.object_id = cc.parent_object_id "
-            "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = ? AND o.name = ?",
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "WHERE s.name = ? AND o.name = ? AND cc.is_disabled = 0",
             (schema, name))[0]
         facts.check_count = int(n)
         return facts

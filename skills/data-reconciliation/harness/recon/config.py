@@ -7,6 +7,7 @@ run if any is missing a version field, because an unversioned input cannot be ci
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -250,6 +251,18 @@ def _flag(data: dict, key: str, path: Path) -> bool:
     return value
 
 
+def _bound(data: dict, key: str, default: float, path: Path) -> float:
+    """A tolerance bound is a finite, non-negative JSON number. NaN compares false against
+    everything, so `lag > NaN` would never fail; infinity and negatives widen or invert the
+    check; booleans and numeric strings are refused rather than coerced."""
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{path}: {key} must be a JSON number, got {value!r}")
+    if not math.isfinite(value) or value < 0:
+        raise ConfigError(f"{path}: {key} must be finite and >= 0, got {value!r}")
+    return float(value)
+
+
 def load_tolerances(path: Path) -> Tolerances:
     data = json.loads(path.read_text())
     version = _require_version(data, path)
@@ -257,10 +270,10 @@ def load_tolerances(path: Path) -> Tolerances:
         version=version,
         full_diff_row_threshold=int(data.get("full_diff_row_threshold", 100_000)),
         sample_size=int(data.get("sample_size", 1_000)),
-        numeric_abs_tol=float(data.get("numeric_abs_tol", 0.0)),
-        aggregate_rel_tol=float(data.get("aggregate_rel_tol", 0.0)),
+        numeric_abs_tol=_bound(data, "numeric_abs_tol", 0.0, path),
+        aggregate_rel_tol=_bound(data, "aggregate_rel_tol", 0.0, path),
         source_concurrency=int(data.get("source_concurrency", 1)),
-        cdc_lag_max_s=float(data.get("cdc_lag_max_s", 0.0)),
+        cdc_lag_max_s=_bound(data, "cdc_lag_max_s", 0.0, path),
         pk_set_ranges=int(data.get("pk_set_ranges", 64)),
         pk_set_stream_every_range=_flag(data, "pk_set_stream_every_range", path),
         accept_marker_only_window=_flag(data, "accept_marker_only_window", path),

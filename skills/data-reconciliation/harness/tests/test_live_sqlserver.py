@@ -1,0 +1,52 @@
+"""Catalog reads that only a real SQL Server can exercise. Skipped unless RECON_TEST_SQLSERVER_ODBC
+names a throwaway database (the rehearsal fixture, never a legacy estate); the test owns one
+temporary schema and drops it. The fixture is the only thing written to."""
+
+import os
+import uuid
+
+import pytest
+
+from recon.adapters import SqlServerSourceAdapter
+
+pyodbc = pytest.importorskip("pyodbc")
+
+DSN_VAR = "RECON_TEST_SQLSERVER_ODBC"
+pytestmark = pytest.mark.skipif(DSN_VAR not in os.environ, reason=f"{DSN_VAR} not set")
+
+
+@pytest.fixture
+def schema():
+    name = f"recon_test_{uuid.uuid4().hex[:8]}"
+    conn = pyodbc.connect(os.environ[DSN_VAR], autocommit=True)
+    cur = conn.cursor()
+    cur.execute(f"CREATE SCHEMA {name}")
+    cur.execute(f"CREATE TABLE {name}.Parent (Parent_ID INT PRIMARY KEY, Other_ID INT UNIQUE)")
+    cur.execute(f"CREATE TABLE {name}.Child (Child_ID INT PRIMARY KEY, Parent_ID INT NOT NULL, "
+                f"Other_ID INT, Amount DECIMAL(10,2), Status VARCHAR(10), "
+                f"CONSTRAINT FK_Child_Parent FOREIGN KEY (Parent_ID) REFERENCES {name}.Parent(Parent_ID), "
+                f"CONSTRAINT FK_Child_Other FOREIGN KEY (Other_ID) REFERENCES {name}.Parent(Other_ID), "
+                f"CONSTRAINT CK_Child_Amount CHECK (Amount >= 0), "
+                f"CONSTRAINT CK_Child_Status CHECK (Status IN ('open', 'closed')))")
+    # disabled constraints are catalogued but enforce nothing: the legacy app writes past them
+    cur.execute(f"ALTER TABLE {name}.Child NOCHECK CONSTRAINT FK_Child_Other")
+    cur.execute(f"ALTER TABLE {name}.Child NOCHECK CONSTRAINT CK_Child_Status")
+    cur.execute(f"INSERT INTO {name}.Parent VALUES (1, 10)")
+    cur.execute(f"INSERT INTO {name}.Child VALUES (1, 1, 999, 5.00, 'weird')")  # violates both disabled ones
+    try:
+        yield name
+    finally:
+        cur.execute(f"DROP TABLE {name}.Child")
+        cur.execute(f"DROP TABLE {name}.Parent")
+        cur.execute(f"DROP SCHEMA {name}")
+        conn.close()
+
+
+def test_disabled_constraints_never_count_as_enforced(schema, monkeypatch):
+    monkeypatch.setenv("RECON_TEST_SOURCE", os.environ[DSN_VAR])
+    source = SqlServerSourceAdapter("RECON_TEST_SOURCE")
+    facts = source.schema_facts(f"{schema}.Child")
+    assert facts.primary_key == ("Child_ID",)
+    assert facts.foreign_keys == {(("Parent_ID",), f"{schema}.Parent", ("Parent_ID",))}
+    assert facts.check_count == 1
+    assert facts.not_null == {"Child_ID", "Parent_ID"}

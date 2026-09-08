@@ -401,12 +401,15 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
 
 
 def _column_map(spec: MappingSpec, c: ObjectMapping) -> dict[str, str]:
-    m = {s: t for s, t in zip(c.key_source, c.key_target)}
-    m.update({f.source: f.target for f in c.fields})
+    """Source column -> target column, both lower-cased: catalogs return identifiers in stored
+    case (SQL Server keeps whatever the DDL said, Postgres folds unquoted names) while the
+    mapping spec is written by hand, so parity is judged on case-folded names throughout."""
+    m = {s.lower(): t.lower() for s, t in zip(c.key_source, c.key_target)}
+    m.update({f.source.lower(): f.target.lower() for f in c.fields})
     if c.watermark_source and c.watermark_target:
-        m[c.watermark_source] = c.watermark_target
+        m[c.watermark_source.lower()] = c.watermark_target.lower()
     if c.identity_source and c.identity_target:
-        m[c.identity_source] = c.identity_target
+        m[c.identity_source.lower()] = c.identity_target.lower()
     return m
 
 
@@ -415,12 +418,24 @@ def _table_map(spec: MappingSpec) -> dict[str, str]:
 
 
 def _map_cols(cols: tuple, colmap: dict[str, str]) -> tuple:
-    return tuple(colmap.get(col, col).lower() for col in cols)
+    return tuple(colmap.get(col.lower(), col.lower()) for col in cols)
+
+
+def _lower_facts(f: SchemaFacts) -> SchemaFacts:
+    return SchemaFacts(
+        primary_key=tuple(x.lower() for x in f.primary_key),
+        unique={tuple(x.lower() for x in u) for u in f.unique},
+        foreign_keys={(tuple(x.lower() for x in cols), ref.split(".")[-1].lower(),
+                       tuple(x.lower() for x in rcols)) for cols, ref, rcols in f.foreign_keys},
+        not_null={x.lower() for x in f.not_null},
+        indexes={tuple(x.lower() for x in i) for i in f.indexes},
+        check_count=f.check_count, identity_columns={x.lower() for x in f.identity_columns},
+        partial={tuple(x.lower() for x in p) for p in f.partial})
 
 
 def _covered(leading: tuple, facts: SchemaFacts) -> bool:
     candidates = [facts.primary_key] + list(facts.unique) + list(facts.indexes)
-    return any(tuple(x.lower() for x in cand[:len(leading)]) == leading for cand in candidates)
+    return any(cand[:len(leading)] == leading for cand in candidates)
 
 
 def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> TierResult:
@@ -440,22 +455,15 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
 
     for c in spec.objects:
         colmap = _column_map(spec, c)
-        mapped_targets = {v.lower() for v in colmap.values()}
+        mapped_targets = set(colmap.values())
         try:
-            s = source.schema_facts(c.root_table)
-            t = target.schema_facts(c.object)
+            s_raw = source.schema_facts(c.root_table)
+            t_raw = target.schema_facts(c.object)
         except NotImplementedError as exc:
             stats.setdefault("unverified", []).append(f"{c.object}: {exc}")
             continue
         checks += 1
-        t_lower = SchemaFacts(
-            primary_key=tuple(x.lower() for x in t.primary_key),
-            unique={tuple(x.lower() for x in u) for u in t.unique},
-            foreign_keys={(tuple(x.lower() for x in cols), ref.split(".")[-1].lower(),
-                           tuple(x.lower() for x in rcols)) for cols, ref, rcols in t.foreign_keys},
-            not_null={x.lower() for x in t.not_null},
-            indexes={tuple(x.lower() for x in i) for i in t.indexes},
-            check_count=t.check_count, identity_columns={x.lower() for x in t.identity_columns})
+        s, t, t_lower = _lower_facts(s_raw), t_raw, _lower_facts(t_raw)
         pk = _map_cols(s.primary_key, colmap)
         if pk != t_lower.primary_key:
             findings.append(Finding(c.object, "primary_key_mismatch",
@@ -495,9 +503,9 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                 tightened(Finding(c.object, "foreign_key_extra",
                                   f"target FK {cols} -> {ref}{rcols} has no source counterpart: "
                                   "legacy-valid orphans would be rejected"))
-        expected_not_null = {colmap[col].lower() for col in s.not_null if col in colmap}
+        expected_not_null = {colmap[col] for col in s.not_null if col in colmap}
         for col in sorted(s.not_null):
-            mapped = colmap.get(col, col).lower()
+            mapped = colmap.get(col, col)
             if col in colmap and mapped not in t_lower.not_null:
                 findings.append(Finding(c.object, "not_null_missing",
                                         f"source NOT NULL {col} -> target {mapped} is nullable"))
@@ -542,7 +550,7 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                                             f"target next value {t_next} <= source max "
                                             f"{c.identity_source}={s_max}: new inserts would collide",
                                             s_max, t_next))
-        stats[c.object] = {"source": _facts_dict(s), "target": _facts_dict(t), "identity": seq_note}
+        stats[c.object] = {"source": _facts_dict(s_raw), "target": _facts_dict(t_raw), "identity": seq_note}
     return TierResult(7, "schema_parity", not findings, checks, findings, stats)
 
 

@@ -1,5 +1,6 @@
 """--mode transactional: consistency window, PK-set diff, CDC lag/ordering, schema parity."""
 
+import dataclasses
 import datetime as dt
 import json
 
@@ -443,6 +444,36 @@ def test_tolerance_switches_load_real_booleans_and_default_off(tmp_path):
     assert tol.accept_target_only_constraints is False
 
 
+@pytest.mark.parametrize("key", ["cdc_lag_max_s", "numeric_abs_tol", "aggregate_rel_tol"])
+@pytest.mark.parametrize("value, needle", [
+    (float("nan"), "finite"), (float("inf"), "finite"), (-1, "finite and >= 0"),
+    (True, "JSON number"), ("60", "JSON number"), (None, "JSON number"), ([], "JSON number"),
+])
+def test_tolerance_bounds_must_be_finite_non_negative_numbers(tmp_path, key, value, needle):
+    path = tmp_path / "tol.json"
+    path.write_text(json.dumps({"version": "t1", key: value}))  # json emits NaN/Infinity literals
+    with pytest.raises(ConfigError, match=f"{key} must be .*{needle}"):
+        load_tolerances(path)
+
+
+def test_a_nan_lag_tolerance_cannot_reach_tier6(tmp_path):
+    path = tmp_path / "tol.json"
+    path.write_text('{"version": "t1", "cdc_lag_max_s": NaN}')
+    with pytest.raises(ConfigError, match="cdc_lag_max_s must be finite"):
+        load_tolerances(path)
+    path.write_text('{"version": "t1", "cdc_lag_max_s": 60}')
+    assert load_tolerances(path).cdc_lag_max_s == 60.0
+
+
+def test_a_stale_target_fails_lag_under_any_loadable_tolerance():
+    """The largest lag the loader accepts is still a finite number a real lag can exceed."""
+    loans, borrowers = _rows(6)
+    stale = [dict(r, modified_date=_ts(-7200)) for r in loans]
+    source, target = _sides(loans, stale, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=3600.0))
+    assert "cdc_lag_exceeded" in _codes(result, "cdc_lag_ordering")
+
+
 def _tokened(source, counter):
     """A marker-fallback source whose engine exposes a per-table write counter."""
     source.pin = "none"
@@ -663,6 +694,59 @@ def test_target_only_constraints_on_unmapped_columns_or_out_of_scope_tables_are_
     assert stats["target_only_columns_unverified"] == [
         "loans: unique ('servicer_ref',) covers a column outside the mapping"]
     assert stats["foreign_keys_out_of_scope"] == ["loans: target FK ('servicer_id',) -> servicers"]
+
+
+def _sqlserver_cased(f: SchemaFacts) -> SchemaFacts:
+    """Catalog identifiers as a case-insensitive SQL Server returns them: the DDL's casing."""
+    def up(x: str) -> str:
+        return "_".join(p[:1].upper() + p[1:] for p in x.split("_")).replace("Id", "ID")
+    return SchemaFacts(
+        primary_key=tuple(up(x) for x in f.primary_key),
+        unique={tuple(up(x) for x in u) for u in f.unique},
+        foreign_keys={(tuple(up(x) for x in c), "dbo.Borrowers", tuple(up(x) for x in rc))
+                      for c, _r, rc in f.foreign_keys},
+        not_null={up(x) for x in f.not_null}, indexes={tuple(up(x) for x in i) for i in f.indexes},
+        check_count=f.check_count, identity_columns={up(x) for x in f.identity_columns})
+
+
+def _renamed_spec() -> MappingSpec:
+    spec = _spec()
+    loans = spec.objects[0]
+    fields = [FieldMapping("current_balance", "balance_current", "money", "decimal(19,4)")
+              if f.source == "current_balance" else f for f in loans.fields]
+    return MappingSpec(spec.version, [dataclasses.replace(loans, fields=fields), *spec.objects[1:]])
+
+
+def _renamed_rows(loans: list[dict]) -> list[dict]:
+    return [{("balance_current" if k == "current_balance" else k): v for k, v in r.items()} for r in loans]
+
+
+def test_catalog_casing_never_changes_parity_including_a_renamed_target_column():
+    cased = _sqlserver_cased(LOANS_FACTS)
+    assert cased.primary_key == ("Loan_ID",) and "Current_Balance" in cased.not_null
+    loans, borrowers = _rows(6)
+    tgt = _tightened(not_null=(TARGET_LOANS_FACTS.not_null - {"current_balance"}) | {"balance_current"})
+    source, target = _sides(loans, _renamed_rows(loans), borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = cased
+    source.schema["dbo.borrowers"] = _sqlserver_cased(BORROWER_FACTS)
+    result = _run(source, target, spec=_renamed_spec())
+    assert result["verdict"] == "PASS", _tier(result, "schema_parity")["findings"]
+    assert _codes(result, "schema_parity") == []
+    # the catalog's own spelling is what the evidence records
+    assert _tier(result, "schema_parity")["stats"]["loans"]["source"]["primary_key"] == ["Loan_ID"]
+
+
+def test_catalog_casing_never_hides_a_missing_constraint_on_a_renamed_column():
+    loans, borrowers = _rows(6)
+    tgt = _tightened(not_null=TARGET_LOANS_FACTS.not_null - {"current_balance"})  # renamed col nullable
+    source, target = _sides(loans, _renamed_rows(loans), borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = _sqlserver_cased(LOANS_FACTS)
+    source.schema["dbo.borrowers"] = _sqlserver_cased(BORROWER_FACTS)
+    result = _run(source, target, spec=_renamed_spec())
+    assert result["verdict"] == "FAIL"
+    assert _codes(result, "schema_parity") == ["not_null_missing"]
+    assert "current_balance -> target balance_current is nullable" in \
+        _tier(result, "schema_parity")["findings"][0]["detail"]
 
 
 def test_primary_key_mismatch_is_reported():
