@@ -8,8 +8,13 @@ resource) plus one SQL file per task under `converted/sql/`.
   credential in the artifact.
 - `.SET WIDTH / .SET ERROROUT / .SET ERRORLEVEL ... SEVERITY` -> dropped (BTEQ session formatting/severity map;
   the severity semantics survive as which tasks are allowed to fail).
-- `.IF ACTIVITYCOUNT = 0 THEN .GOTO NOSTAGING` -> `staging_check` task SIGNALs when the count is 0; the
-  `nostaging_warning` task depends on it with `run_if: AT_LEAST_ONE_FAILED`.
+- `.IF ACTIVITYCOUNT = 0 THEN .GOTO NOSTAGING` -> `nostaging_warning` task with `run_if: AT_LEAST_ONE_FAILED` on
+  `staging_check`, and **no** count-based branch. Step 1 is an aggregate `SEL COUNT(*) ...` without `GROUP BY`: it
+  returns one row whatever the table holds, so `ACTIVITYCOUNT` is 1 and the source branch is reachable only when the
+  request errors (skill §7 trap "ACTIVITYCOUNT after an aggregate"). A failed task is that condition on the target.
+  Turning "0 staged rows" into a stop is what the script author probably intended, but it is a business-logic
+  correction that needs a `.migration/06_decisions.md` row; the first pass is like-for-like (`01_staging_check.sql`
+  header says where the guard would go).
 - `.IF ERRORCODE <> 0 THEN .GOTO ERRORHANDLER` (repeated after every step) -> default `run_if: ALL_SUCCESS` on the
   main chain and one `errorhandler_mark_failed` task with `run_if: AT_LEAST_ONE_FAILED` over every step.
 - `.LABEL` / `.GOTO` -> task keys and `depends_on` edges; `.QUIT 0/4/8` -> job run state + `BATCH_STATUS`; the
@@ -38,7 +43,11 @@ resource) plus one SQL file per task under `converted/sql/`.
   reached only through this script and the procedures, so lineage marks them INFERRED (skill §2) and the census must
   pull their DDL from `DBC.TablesV`/`SHOW TABLE` on a live engine (PR "Not verified live").
 - `nostaging_warning` wired to `ALL_SUCCESS` instead of `AT_LEAST_ONE_FAILED` (branch inverted): **Tier 1** row
-  count on `ETL_LOG` where `LOG_LEVEL = 'WARN'` on a day with no staging rows.
+  count on `ETL_LOG` where `LOG_LEVEL = 'WARN'` on a day when `staging_check` succeeded.
+- Empty-staging parity case: on a day with 0 rows in `STG_TRANSACTIONS` the source runs every step and writes a
+  `COMPLETED` batch (0 loaded rows) and no `WARN` row. A converted `staging_check` that SIGNALs on `staged = 0`
+  shows as **Tier 1** on `ETL_BATCH_CONTROL` (`COMPLETED` count 0 vs 1 for that `BATCH_DATE`) and **Tier 1** excess
+  on `ETL_LOG` `WARN` rows. This case must be in the shadow-run calendar, not just the busy days.
 - Emulating `VT_BATCH` with a temporary table (scoped to one task) -> later tasks fail to find the batch: **Tier 1**
   on `FACT_TRANSACTION` for the batch (`ETL_BATCH_ID` never populated).
 - Writing a second `COMPLETED` row instead of updating the `STARTED` one: **Tier 1** row-count excess on
@@ -59,6 +68,8 @@ resource) plus one SQL file per task under `converted/sql/`.
   "Temporary Tables and Temporary Views".
 
 ## Not verified live
+- BTEQ `ACTIVITYCOUNT` after a *failed* request is 0 (which is what makes `.GOTO NOSTAGING` reachable on an error);
+  the conversion depends only on the aggregate-returns-one-row half, which holds by SQL semantics.
 - That a `sql_task` running a `.sql` file accepts a multi-statement `BEGIN ... END` compound (the official skill shows
   the file form but not a scripting body inside it). If it does not, each file becomes a `CALL` of a small procedure.
 - Actual job-run behaviour of `AT_LEAST_ONE_FAILED` fan-in when an upstream task was skipped rather than failed, and

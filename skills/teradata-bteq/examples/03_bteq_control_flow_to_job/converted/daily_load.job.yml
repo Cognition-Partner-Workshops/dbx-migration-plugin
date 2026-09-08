@@ -9,8 +9,10 @@
 # (factory convention); the batch date is current_date(), as the BTEQ used CURRENT_DATE.
 #
 # BTEQ control flow -> job graph, not line-by-line emulation:
-#   .IF ACTIVITYCOUNT = 0 THEN .GOTO NOSTAGING   -> 01_staging_check raises (SIGNAL) when nothing is staged;
-#                                                  nostaging_warning runs with run_if AT_LEAST_ONE_FAILED on that task only
+#   .IF ACTIVITYCOUNT = 0 THEN .GOTO NOSTAGING   -> Step 1 is an aggregate SELECT (ACTIVITYCOUNT is 1 even on an empty
+#                                                  table), so the source branch fires only if that request errors;
+#                                                  nostaging_warning runs with run_if AT_LEAST_ONE_FAILED on that task only,
+#                                                  which is the same condition. No count-based SIGNAL (see 01_staging_check.sql)
 #   .IF ERRORCODE <> 0 THEN .GOTO ERRORHANDLER   -> default run_if ALL_SUCCESS on every downstream task;
 #                                                  errorhandler_mark_failed runs with run_if AT_LEAST_ONE_FAILED
 #   .QUIT 0 / .QUIT 4 / .QUIT 8                   -> job run state (success / failed) + BATCH_STATUS row; the numeric

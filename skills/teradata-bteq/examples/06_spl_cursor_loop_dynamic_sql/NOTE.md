@@ -12,15 +12,22 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
 - `CASE v WHEN ... THEN ... ELSE ... END CASE` -> same syntax.
 - `CALL DBC.SysExecSQL(v_sql)` -> `EXECUTE IMMEDIATE`; string-spliced key -> `USING ?` parameter marker; row count via
   `EXECUTE IMMEDIATE ... INTO`. The schema name cannot go through a marker (identifiers are not bind values), so
-  `p_archive_schema` is validated against a strict identifier regex (`RLIKE '^[A-Za-z_][A-Za-z0-9_]{0,127}$'`) and
-  the procedure `SIGNAL`s before any dynamic statement runs; the write-scope hook is the second gate. The source
-  `TRIM(p_archive_db)` splice carried the same injection surface -- conversion is where it gets closed.
+  `p_archive_schema` is checked against a build-time allowlist (`NOT IN ('${schema}', '${archive_schema}')`, both
+  substituted from the unit mapping like `${catalog}.${schema}`) and the procedure `SIGNAL`s before any dynamic
+  statement runs. The catalog is a literal, so the caller can move neither catalog nor schema; the write-scope hook
+  is the outer gate on the catalog. The source `TRIM(p_archive_db)` splice carried the full injection surface --
+  conversion is where it gets closed. (An identifier-shape regex alone would still let a caller pick any well-formed
+  schema the invoker can write to.)
 - `CREATE MULTISET TABLE x AS y WITH NO DATA` -> `CREATE TABLE IF NOT EXISTS x AS SELECT * FROM y WHERE 1 = 0`.
 - `BT; ... ET;` + `ROLLBACK` in the handler -> no drop-in multi-statement transaction for a compound (skill §6 row
   "Transactions", §7 trap "BT/ET"); loop body made idempotent instead: the archive `INSERT` carries
   `NOT EXISTS (... a.TRANSACTION_ID = ft.TRANSACTION_ID)` so a retry after a failure between INSERT and DELETE copies
   nothing twice; DELETE and the status UPDATE are repeatable by construction. Conservation invariant: every
   `TRANSACTION_ID` is in the fact, in the archive, or transiently in both -- never twice in the archive.
+  Because partial work is kept rather than rolled back, the EXIT handler also writes back the consumed budget
+  (`p_max_batch = p_max_batch - p_accounts_done`): the source's ROLLBACK left the budget untouched *and* the accounts
+  untouched; here the accounts stay archived, so the budget must follow. Retry contract: call again with the returned
+  `p_max_batch`; an account interrupted mid-triple was not counted, is redone idempotently, then counted.
 - `SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT` -> same syntax.
 - `INOUT` parameter -> `INOUT` (same).
 - `EXTRACT(YEAR FROM d) (FORMAT '9999')`, `TRIM(n (FORMAT '-(18)9'))` -> `CAST(year(d) AS STRING)` / parameter marker.
@@ -36,10 +43,14 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   tables is a **Tier 3** keyed diff on `TRANSACTION_ID`. An archive copy without the `NOT EXISTS` guard shows up as
   **Tier 1** `count(*) > count(distinct TRANSACTION_ID)` on the archive table after any retried run.
 - Unvalidated `p_archive_schema` (writes redirected outside the declared scope): not a recon signature at all -- the
-  write-scope hook blocks it at run time, and the regex `SIGNAL` in the procedure is the in-band gate.
+  allowlist `SIGNAL` in the procedure is the in-band gate and the write-scope hook is the catalog-level outer gate.
 - LOAN branch mis-mapped (archived anyway): **Tier 1** on `FACT_TRANSACTION` rows for loan accounts.
 - `INOUT` remaining budget not written back: caught only by the caller's next batch size — **Tier 1** over the whole
   archive campaign (total accounts archived vs legacy).
+- Failure after k accounts, then retry with the original budget (handler not reconciling `p_max_batch`): the campaign
+  archives up to `k` accounts more than the source did for the same sequence of calls -> **Tier 1** on
+  `DIM_ACCOUNT WHERE ACCOUNT_STATUS = 'ARCHIVED'` after the retry (`p_max_batch + k` vs `p_max_batch`). The shadow-run
+  must include one injected failure after at least one completed account, followed by the retry.
 
 ## Citations
 - `FOR ... AS query DO`, `WHILE`, `LEAVE`, `CASE` statement: `databricks-dbsql` `references/sql-scripting.md`
@@ -56,3 +67,5 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
 - Whether an atomic block (`BEGIN ATOMIC ... END`, per the "Multi-Statement Transactions" section's preview status)
   can wrap the per-account triple to restore BT/ET semantics; the example does not depend on it.
 - Reading SQLSTATE inside a handler; row-count register after DML.
+- That `INOUT`/`OUT` values assigned inside an EXIT handler are returned to the caller (the budget write-back relies on
+  it); if not, the remaining budget must be persisted to a control row from the handler instead.

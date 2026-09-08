@@ -24,13 +24,19 @@ AS BEGIN
     -- CONTINUE HANDLER FOR NOT FOUND + FETCH loop: not needed; FOR ... DO iterates the cursor and ends on exhaustion.
     -- EXIT HANDLER: ROLLBACK has no cited equivalent for a multi-statement compound (no BT/ET); the handler records
     -- the failure and leaves partial work to be repaired by the idempotent re-run (accounts already ARCHIVED are
-    -- skipped by the cursor predicate). Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
+    -- skipped by the cursor predicate). Because that partial work is *kept* (the source rolled it back), the INOUT
+    -- budget must be reduced by the accounts already completed, otherwise a retry with the caller's unchanged
+    -- p_max_batch archives a full second batch on top of the partial one. p_accounts_done is incremented only after
+    -- an account's status UPDATE, so an account interrupted mid-triple is not counted here and is redone (and then
+    -- counted) by the retry. Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         SET p_return_code = -1;
+        SET p_max_batch = p_max_batch - p_accounts_done;                    -- budget consumed by the kept partial work
         INSERT INTO ${catalog}.${schema}.ETL_LOG (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
         VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR',
-                'SQLEXCEPTION during archive (partial batch; re-run is idempotent)', current_timestamp());
+                'SQLEXCEPTION during archive after ' || CAST(p_accounts_done AS STRING)
+                || ' accounts (partial batch kept; re-run with the returned budget is idempotent)', current_timestamp());
     END;
 
     SET p_return_code = 0;
@@ -41,14 +47,17 @@ AS BEGIN
     END IF;
 
     -- p_archive_schema is spliced into dynamic SQL as an identifier (a `?` marker cannot carry an identifier), so it is
-    -- checked against a strict identifier shape first; anything else (quotes, dots, spaces, statement separators) is
-    -- rejected before any EXECUTE IMMEDIATE runs. The source had the same exposure through TRIM(p_archive_db).
-    IF p_archive_schema IS NULL OR NOT (p_archive_schema RLIKE '^[A-Za-z_][A-Za-z0-9_]{0,127}$') THEN
-        SIGNAL SQLSTATE '75002' SET MESSAGE_TEXT = 'p_archive_schema is not a plain identifier';
+    -- checked against the unit's declared archive schemas before any EXECUTE IMMEDIATE runs: ${schema} and
+    -- ${archive_schema} are build-time constants substituted from the unit mapping (the same place ${catalog}.${schema}
+    -- come from), so the set of schemas this procedure can write is fixed at build time, not chosen by the caller.
+    -- An allowlist is stricter than an identifier-shape check: a well-formed name for some other schema the invoker
+    -- happens to own is rejected too. The source had the full exposure through TRIM(p_archive_db).
+    IF p_archive_schema IS NULL OR p_archive_schema NOT IN ('${schema}', '${archive_schema}') THEN
+        SIGNAL SQLSTATE '75002' SET MESSAGE_TEXT = 'p_archive_schema is not a declared archive target for this unit';
     END IF;
 
-    -- Dynamic DDL via EXECUTE IMMEDIATE. The archive schema must also be inside the unit's declared write scope
-    -- (.migration/allowed_targets.json); the factory's write-scope hook rejects anything else.
+    -- Dynamic DDL via EXECUTE IMMEDIATE. ${catalog} is a literal, so the catalog cannot move either; the factory's
+    -- write-scope hook (.migration/allowed_targets.json) is the outer gate on the catalog.
     SET v_year = CAST(year(p_closed_before) AS STRING);                     -- EXTRACT(YEAR ...) (FORMAT '9999')
     SET v_arch_table = '${catalog}.' || p_archive_schema || '.FACT_TRANSACTION_ARCH_' || v_year;
     EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS ' || v_arch_table
