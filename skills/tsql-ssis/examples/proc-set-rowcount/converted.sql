@@ -12,8 +12,7 @@ CREATE OR REPLACE PROCEDURE ${catalog}.${schema}.sp_apply_late_fees(
 LANGUAGE SQL
 SQL SECURITY INVOKER
 AS BEGIN
-    DECLARE total_rows INT           DEFAULT 0;
-    DECLARE total_fees DECIMAL(19,4) DEFAULT 0;
+    DECLARE total_rows INT DEFAULT 0;
 
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
@@ -24,9 +23,10 @@ AS BEGIN
 
     SET p_rc = 0;
 
-    -- Fee schedule shared by the UPDATE and the total: one definition, no drift between them.
-    -- The source computed @total_fees from a second query keyed on late_fee_assessed = MAX(...);
-    -- here the fee amount is computed once, before the update, from the same predicate.
+    -- Fee schedule computed once, before the update, from the same predicate the UPDATE uses.
+    -- The source also accumulates @total_fees (and @batch_count) from a second query keyed on
+    -- late_fee_assessed = MAX(...), but never emits either: not an output, not audited, not
+    -- returned. They are dropped here rather than written anywhere the source does not write.
     CREATE TEMP TABLE fee_targets AS
     SELECT loan_id,
            CASE rtrim(loan_type)              -- CHAR(4): 'FHA ' / 'VA  ' padding (§7)
@@ -42,7 +42,7 @@ AS BEGIN
       AND (last_fee_date IS NULL OR last_fee_date < p_cutoff_date)
       AND rtrim(loan_type) != 'VA';       -- defense in depth, as in the source
 
-    SET (total_rows, total_fees) = (SELECT count(*), coalesce(sum(fee_amt), 0) FROM fee_targets);
+    SET total_rows = (SELECT count(*) FROM fee_targets);   -- sum of per-batch @@rowcount
 
     -- SET ROWCOUNT 1000 / WHILE 1=1 / IF @@rowcount = 0 BREAK / SET ROWCOUNT 0  ->  one MERGE.
     MERGE INTO ${catalog}.${schema}.loans t
@@ -54,9 +54,12 @@ AS BEGIN
         t.last_fee_date     = p_cutoff_date,
         t.modified_date     = current_timestamp();
 
+    -- Same column list as the source: new_value stays NULL (the source never records the fee total
+    -- anywhere) and user_name comes from the converted table's default, the port of the source's
+    -- DEFAULT SUSER_NAME() on dbo.audit_trail.
     INSERT INTO ${catalog}.${schema}.audit_trail
-        (action_type, action_date, table_name, record_count, new_value, user_name)
-    VALUES ('LATE_FEE', p_cutoff_date, 'loans', total_rows, cast(total_fees AS STRING), current_user());
+        (action_type, action_date, table_name, record_count)
+    VALUES ('LATE_FEE', p_cutoff_date, 'loans', total_rows);
 
     DROP TABLE IF EXISTS fee_targets;
 END;

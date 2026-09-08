@@ -52,9 +52,11 @@ AS BEGIN
     -- TBLPROPERTIES ('delta.feature.catalogManaged' = 'supported'): wrap the four writes below in
     -- BEGIN ATOMIC ... END (sql-scripting.md "SQL Scripting Atomic Blocks", Preview) and drop the
     -- compensation. Not verified live: BEGIN ATOMIC nested inside a procedure body.
-    -- Edge: if a temp-table CREATE itself fails, nothing permanent has been written; p_batch_id is
-    -- NULL and no BATCH_START row exists, so the DELETEs and the UPDATE match no rows and the guarded
-    -- MERGE is skipped.
+    -- Statement order matches the source: BATCH_START first (Step 1), then the snapshot. A failure in
+    -- the snapshot or waterfall CREATE therefore still leaves the source-shaped BATCH_START row and a
+    -- reportable p_batch_id, exactly like the source's GOTO error_handler from Step 2. Only a failure of
+    -- the BATCH_START INSERT itself leaves nothing permanent (p_batch_id NULL, every compensating
+    -- statement matches no rows), which is also the source's state when its Step 1 fails.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         DELETE FROM ${catalog}.${schema}.audit_trail
@@ -81,7 +83,19 @@ AS BEGIN
 
     SET p_rc = 0;
 
-    -- Step 1: eligible loans snapshot (SELECT INTO #eligible_loans -> session-scoped temp table).
+    -- Step 1: batch record. audit_id is GENERATED ALWAYS AS IDENTITY in the converted table;
+    -- read it back by the run_key business key instead of @@identity (trigger-hijackable in ASE).
+    -- (SET var = (scalar subquery): databricks-dbsql sql-scripting.md "Variable Assignment (SET)".)
+    -- Written BEFORE the snapshot, as in the source, so every later failure is attributable to a batch.
+    INSERT INTO ${catalog}.${schema}.audit_trail
+        (action_type, action_date, table_name, record_count, user_name, new_value)
+    VALUES ('BATCH_START', p_processing_date, 'payments', 0, current_user(), run_key);
+
+    SET p_batch_id = (SELECT audit_id
+                      FROM ${catalog}.${schema}.audit_trail
+                      WHERE action_type = 'BATCH_START' AND new_value = run_key);
+
+    -- Step 2: eligible loans snapshot (SELECT INTO #eligible_loans -> session-scoped temp table).
     CREATE TEMP TABLE eligible_loans AS
     SELECT l.loan_id,
            l.current_balance,
@@ -98,17 +112,6 @@ AS BEGIN
       AND l.servicer_id = p_servicer_id;                -- column vs parameter: no shadowing possible
 
     SET eligible_rows = (SELECT count(*) FROM eligible_loans);   -- @@rowcount has no equivalent
-
-    -- Step 2: batch record. audit_id is GENERATED ALWAYS AS IDENTITY in the converted table;
-    -- read it back by the run_key business key instead of @@identity (trigger-hijackable in ASE).
-    -- (SET var = (scalar subquery): databricks-dbsql sql-scripting.md "Variable Assignment (SET)".)
-    INSERT INTO ${catalog}.${schema}.audit_trail
-        (action_type, action_date, table_name, record_count, user_name, new_value)
-    VALUES ('BATCH_START', p_processing_date, 'payments', 0, current_user(), run_key);
-
-    SET p_batch_id = (SELECT audit_id
-                      FROM ${catalog}.${schema}.audit_trail
-                      WHERE action_type = 'BATCH_START' AND new_value = run_key);
 
     -- Step 3: the cursor loop becomes one set-based INSERT ... SELECT.
     -- MONEY arithmetic in ASE rounds to 4 places at each step: reproduce with round(..., 4)

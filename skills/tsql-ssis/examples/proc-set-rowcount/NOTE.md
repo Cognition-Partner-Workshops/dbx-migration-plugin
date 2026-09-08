@@ -16,7 +16,7 @@ Reads: `loans`. Writes: `loans`, `audit_trail`. Scheduler edge: cron daily (fixt
 
 ## Recon tier that catches a wrong conversion
 - **Tier 2 (aggregates)**: `sum(late_fee_balance)`, `sum(late_fee_assessed)`, `count(*) WHERE last_fee_date = <cutoff>` on `loans` after the run vs source. A conversion that kept a batching loop with an off-by-one exit, or that re-applied fees to rows already stamped with `last_fee_date = cutoff`, drifts here. The invariant check `count(*) WHERE rtrim(loan_type) = 'VA' AND late_fee_balance > 0` must be 0 on both sides (fixture README parity control).
-- **Tier 1** on `audit_trail WHERE action_type = 'LATE_FEE'`: exactly one row per run; the `record_count` value is checked at Tier 2.
+- **Tier 1** on `audit_trail WHERE action_type = 'LATE_FEE'`: exactly one row per run; the `record_count` value is checked at Tier 2, and Tier 3 on that row must show `new_value IS NULL` on both sides (the source never records the fee total; a conversion that "helpfully" writes it there fails here).
 - Tier 3 keyed on `loan_id` catches the `CHAR(4)` padding mistake (a converted `CASE loan_type WHEN 'FHA'` without `rtrim` charges `$50` instead of `$35`).
 
 ## INFERRED edges
