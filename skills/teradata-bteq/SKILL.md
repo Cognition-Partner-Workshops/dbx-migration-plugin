@@ -15,14 +15,14 @@ BTEQ is imperative: parse each script's SQL statements in order for reads/writes
 Loss-prone rows: `DECIMAL(38)` precision at the boundary; `BYTEINT` -> tinyint; `PERIOD` types have no Delta equivalent (decompose to start/end columns, record the mapping); `CHAR` blank padding; Teradata's `NOT CASESPECIFIC` default makes string comparison case-insensitive, the single most common recon trap; `TIMESTAMP(6)` precision vs the engagement rule; `TITLE`/`FORMAT` clauses are display-only, drop with a note.
 
 ## 4. Conversion rules
-- BTEQ control flow (`.IF ERRORCODE`, `.LABEL`, `.QUIT`) -> job task dependencies and error handling in Workflows, not emulated line by line.
+- BTEQ control flow (`.IF ERRORCODE`, `.LABEL`, `.QUIT`) -> Lakeflow Jobs task dependencies and run-if conditions (`databricks-jobs`), not emulated line by line. Stored procedures and macros -> DBSQL `CREATE PROCEDURE` / SQL scripting (`databricks-dbsql` `references/sql-scripting.md`) first; PySpark only where the procedure leaves SQL.
 - `MERGE`/`UPD ... ELSE INS` upsert idioms -> Delta MERGE; `QUALIFY` is supported in Databricks SQL (keep it); `SAMPLE` -> TABLESAMPLE with different semantics (flag for recon).
 - Teradata-specific functions: `INDEX` -> `instr`, `SUBSTR` 1-based edge cases, `TRIM(BOTH FROM ...)`, `ADD_MONTHS` end-of-month behavior, integer division truncates, implicit `FORMAT`-based casting must become explicit casts.
 - MLOAD/FASTLOAD/TPT -> Auto Loader or `COPY INTO` per the backfill plan; error-table semantics map to expectations/quarantine tables with reject counts reconciled.
 - PI/PPI (primary/partitioned primary index) -> liquid clustering or partitioning per target state.
 
 ## 5. Known traps (append per engagement)
-- NOT CASESPECIFIC: legacy joins and DISTINCT collapse case variants that Databricks keeps distinct; decide the normalization rule before recon, not after the first red diff.
+- NOT CASESPECIFIC: legacy joins and DISTINCT collapse case variants that Databricks keeps distinct. Declare affected target columns `STRING COLLATE UTF8_LCASE` (DBR 16.1+) so joins, GROUP BY, and DISTINCT collapse the same way, and record the collation in the mapping so recon compares under the same rule; decide this before recon, not after the first red diff. Teradata's session-collation and `CASESPECIFIC` overrides mean the rule can differ per column.
 - Teradata rounds decimals half-even in some contexts where Spark rounds half-up; the tolerance record decides.
 - SET tables silently deduplicate full-row duplicates; MULTISET semantics on Delta will show extra rows in recon on estates relying on SET dedup.
 
