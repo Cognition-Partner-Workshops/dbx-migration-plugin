@@ -25,6 +25,7 @@ AS BEGIN
     DECLARE eligible_rows  INT    DEFAULT 0;
     DECLARE total_applied  DECIMAL(19,4) DEFAULT 0;
     DECLARE payment_failed CONDITION FOR SQLSTATE '45001';   -- source RAISERROR 50001
+    DECLARE negative_balance CONDITION FOR SQLSTATE '45050'; -- trg_validate_loan_amount RAISERROR 50050
     DECLARE balances_applied BOOLEAN DEFAULT false;          -- set after the loans MERGE commits
 
     -- error_handler (source: @@error + GOTO, with a per-loan BEGIN TRAN ... COMMIT / ROLLBACK).
@@ -154,6 +155,36 @@ AS BEGIN
            'type=' || p.payment_type || ' amt=' || cast(p.total_amt AS STRING), current_user()
     FROM ${catalog}.${schema}.payments p
     WHERE p.batch_id = p_batch_id;                       -- was `p.batch_id = batch_id`: column = itself
+
+    -- trg_validate_loan_amount (FOR UPDATE on loans, IF UPDATE(current_balance)) folded into the writer as
+    -- the pre-check from examples/trigger-validate/converted.sql, Shape A. `inserted` is the post-image the
+    -- MERGE below would write (t.current_balance - w.principal_due), `deleted` the current row. On a hit the
+    -- source trigger logged BALANCE_VIOLATION, RAISERROR 50050 and ROLLBACK'd the per-loan transaction (the
+    -- UPDATE, that loan's payment INSERT and the trigger's own audit row), and the caller's @@error check
+    -- jumped to error_handler; here SIGNAL raises before any balance changes and the EXIT HANDLER removes
+    -- the whole batch's payments / PAYMENT_INS rows (balances_applied is still false, so no reversal). The
+    -- BALANCE_VIOLATION row survives on the converted side: the tolerance-record difference recorded in
+    -- trigger-validate/NOTE.md. The waterfall already clamps principal_due to the snapshot balance, so in
+    -- practice this fires only when a concurrent writer lowered current_balance after the snapshot.
+    IF EXISTS (
+        SELECT 1
+        FROM ${catalog}.${schema}.loans t
+        JOIN waterfall w ON t.loan_id = w.loan_id
+        WHERE t.current_balance - w.principal_due < 0
+          AND t.loan_status NOT IN ('CO', 'PO')
+    ) THEN
+        INSERT INTO ${catalog}.${schema}.audit_trail
+            (action_type, action_date, table_name, loan_id, old_value, new_value, user_name)
+        SELECT 'BALANCE_VIOLATION', current_timestamp(), 'loans', t.loan_id,
+               cast(t.current_balance AS STRING),
+               cast(t.current_balance - w.principal_due AS STRING),
+               current_user()
+        FROM ${catalog}.${schema}.loans t
+        JOIN waterfall w ON t.loan_id = w.loan_id
+        WHERE t.current_balance - w.principal_due < 0
+          AND t.loan_status NOT IN ('CO', 'PO');
+        SIGNAL negative_balance SET MESSAGE_TEXT = 'Negative balance not allowed for active loans';
+    END IF;
 
     -- UPDATE dbo.loans per cursor row -> one MERGE keyed on loan_id.
     MERGE INTO ${catalog}.${schema}.loans t

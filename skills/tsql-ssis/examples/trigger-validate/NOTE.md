@@ -13,7 +13,7 @@ Source: fixture `triggers/trg_validate_loan_amount.sql` (FOR UPDATE on `loans`) 
 - Shape B for the audit trigger: `CREATE OR REFRESH STREAMING TABLE ... FROM STREAM(payments)` (`databricks-pipelines` references/streaming-table-sql.md "STREAM(...) source"); `user_name` is not available there.
 
 ## Lineage (FACT)
-`trg_validate_loan_amount`: reads `inserted`/`deleted` of `loans`, writes `audit_trail`; implied edge `loans -> audit_trail` for every writer of `loans.current_balance` (`sp_process_monthly_payments`, `sp_nightly_accrual`, `sp_apply_late_fees`, CRUD procs). `trg_audit_payment`: `payments -> audit_trail` for every writer of `payments`. Neither is a standalone unit; both are members of every writer's unit (SKILL §3).
+`trg_validate_loan_amount`: reads `inserted`/`deleted` of `loans`, writes `audit_trail`; implied edge `loans -> audit_trail` for every writer whose SET list names `loans.current_balance` (fixture: `sp_process_monthly_payments`, `sp_loan_modification`; `sp_nightly_accrual`, `sp_apply_late_fees` and the CRUD procs update other `loans` columns, so `IF UPDATE(current_balance)` is false and the pre-check is not attached to them). `trg_audit_payment`: `payments -> audit_trail` for every writer of `payments`. Neither is a standalone unit; both are members of every writer's unit (SKILL §3).
 
 ## Recon tier that catches a wrong conversion
 - **Tier 1** on `audit_trail` grouped by `action_type`: a writer that forgot to fold `trg_audit_payment` has zero `PAYMENT_INS` rows for its batch; `BALANCE_VIOLATION` counts are expected to be >= source (documented).

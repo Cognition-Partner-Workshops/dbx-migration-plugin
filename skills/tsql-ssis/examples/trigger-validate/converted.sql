@@ -9,8 +9,10 @@
 --    runs BEFORE its UPDATE/MERGE, inside the same scripting block. SIGNAL aborts the block, so the
 --    DML that would have violated the rule never executes (source: rollback after the fact).
 -----------------------------------------------------------------------------------------------
--- Inlined into sp_process_monthly_payments / sp_apply_late_fees / sp_nightly_accrual etc.
--- immediately before the MERGE INTO ${catalog}.${schema}.loans that changes current_balance:
+-- Inlined into every writer whose SET list names current_balance (IF UPDATE(current_balance) gate;
+-- fixture: sp_process_monthly_payments and sp_loan_modification, not sp_apply_late_fees / sp_nightly_accrual,
+-- which touch other loans columns) immediately before the UPDATE / MERGE INTO ${catalog}.${schema}.loans
+-- (worked instance: examples/proc-cursor-payments/converted.sql, the block before its loans MERGE):
 --
 --   DECLARE negative_balance CONDITION FOR SQLSTATE '45050';  -- source RAISERROR 50050
 --   IF EXISTS (
