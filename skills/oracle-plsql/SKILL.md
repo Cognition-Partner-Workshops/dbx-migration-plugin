@@ -87,9 +87,9 @@ contain (Albion's `ods_policy_360`, whose DDL is not in the repo) is still a FAC
 
 | Object class | Reads (FACT) | Writes (FACT) | INFERRED cases (named risk) |
 |---|---|---|---|
-| View / MV | every `FROM`/`JOIN` table, view, MV, synonym-resolved object; `@dblink` targets are edges to an external estate node | MV writes its container table; MV log rows are edges `MASTER -> MLOG$_MASTER` | `@dblink` where `dba_db_links` is not readable (`risk=external-db-link`); `TABLE(fn(...))` (`risk=pipelined-function`) |
+| View / MV | every `FROM`/`JOIN` table, view, MV, synonym-resolved object, including every member of a comma-separated `FROM a x, b y, (subquery) s, c@lnk z` list (also after an ANSI join clause: `FROM a JOIN b ON ..., c`), nested at any depth; `@dblink` targets are edges to an external estate node | MV writes its container table; MV log rows are edges `MASTER -> MLOG$_MASTER` | `@dblink` where `dba_db_links` is not readable (`risk=external-db-link`); `TABLE(fn(...))` (`risk=pipelined-function`) |
 | Package / procedure / function | `SELECT ... INTO`, `CURSOR c IS SELECT`, `OPEN c FOR SELECT` (static), `FOR r IN (SELECT ...)`, `%TYPE`/`%ROWTYPE` anchors, called subprograms (edge to `OWNER.PKG.MEMBER`) | `INSERT INTO`, `UPDATE`, `DELETE FROM`, `MERGE INTO`, `FORALL ... INSERT/UPDATE/DELETE`, `EXECUTE IMMEDIATE '<literal DDL/DML>'` with a constant string, `seq.NEXTVAL` (edge `PKG -> SEQ` typed `consumes-sequence`) | `EXECUTE IMMEDIATE` with concatenated identifiers (`risk=dynamic-sql`, record the literal prefix e.g. `INSERT INTO poladm.<var>`), `OPEN c FOR l_sql`, `DBMS_SQL.*`, `TABLE(CAST(... AS type))`, `%ROWTYPE` of a synonym to a dblink, `DBMS_*` calls that read/write outside SQL (`UTL_FILE`, `UTL_HTTP`, `DBMS_AQ`, `DBMS_PIPE`, `DBMS_LOB.LOADFROMFILE`: `risk=external-io`), `AUTHID CURRENT_USER` units (`risk=invoker-rights`, the referenced schema depends on the caller) |
-| Trigger | the base table (`:OLD`), any `SELECT` in the body, called subprograms | the base table (`:NEW` is an in-flight write), every DML in the body, `seq.NEXTVAL`; the trigger's *transitive* side-effect closure (its own writes/`NEXTVAL`, plus those of every routine it calls, recursively, cycle-safe, plus the triggers on the tables that closure writes) is added to every unit whose write of the base table fires one of the trigger's declared events (`BEFORE INSERT OR UPDATE OF col` fires for `INSERT`, `UPDATE`, `MERGE`; not for `DELETE` or `TRUNCATE`; a `MERGE` with `DELETE WHERE` also fires `DELETE` triggers); every `writes` edge carries its events (`ops=INSERT|UPDATE`) and the fan-out edge records `detail="trigger fan-out via TRG -> callee"` | body dynamic SQL as above; `WHEN` clause referencing `SYS_CONTEXT` (`risk=session-context`) |
+| Trigger | the base table (`:OLD`), any `SELECT` in the body, called subprograms | the base table (`:NEW` is an in-flight write), every DML in the body, `seq.NEXTVAL`; the trigger's *transitive* side-effect closure (its own writes/`NEXTVAL`, plus those of every routine it calls, recursively, cycle-safe, plus the triggers on the tables that closure writes) is added to every unit whose write of the base table fires one of the trigger's declared events and, for `UPDATE OF col1, col2`, assigns one of those columns (`BEFORE INSERT OR UPDATE OF status` fires for `INSERT`, `UPDATE ... SET status = `, `MERGE ... WHEN MATCHED THEN UPDATE SET t.status = `; not for `UPDATE ... SET premium = `, `DELETE` or `TRUNCATE`; a `MERGE` with `DELETE WHERE` also fires `DELETE` triggers); every `writes` edge carries its events with the assigned columns (`ops=INSERT|UPDATE(EXPIRY_DT,POLICY_STATUS)`, `(a, b) = (subquery)` lists included) and the fan-out edge records `detail="trigger fan-out via TRG -> callee"`. An `UPDATE` whose `SET` list the parser cannot read (`SET ROW = rec`) carries a bare `UPDATE`; against an `UPDATE OF` trigger it fans out as INFERRED `risk=update-columns-unknown` instead of a FACT | body dynamic SQL as above; `WHEN` clause referencing `SYS_CONTEXT` (`risk=session-context`) |
 | Table / index | `CREATE TABLE ... AS SELECT` (also `GLOBAL TEMPORARY ... AS (SELECT ...)`, `AS WITH ...`): every source of the subquery is a `reads` edge of the new table; `CREATE [UNIQUE|BITMAP] INDEX ix ON t (...)` is a `defines-on` edge `IX -> T` (function-based columns, `TABLESPACE`/`LOCAL` clauses do not matter) | a plain `CREATE TABLE` owns its text (`REFERENCES ... ON DELETE CASCADE` is not DML) and draws no edge | an index whose target is not a plain `ON name (` (quoted identifier, `ON CLUSTER c`) -> `UNVERIFIABLE risk=unparsed-index-target` rather than a silent omission |
 | Sequence | none | none; edges point *at* it | none. Record `last_number` for Lakebase `setval` parity |
 | Scheduler job / program / chain | `job_action`/`program_action` parsed like an anonymous block: every named subprogram is a `schedules` edge; chain steps -> programs | none directly | `job_type='EXECUTABLE'` or `EXTERNAL_SCRIPT` (`risk=os-script`), `job_action` referencing `&`/bind-like placeholders, `event_condition` jobs (`risk=aq-event`) |
@@ -117,6 +117,12 @@ class. SQL*Plus directives may be indented. A file that mixes DDL with top-level
 `TRUNCATE` (outside every PL/SQL unit) gets one extra `DML SCRIPT` row named after the file that owns those writes;
 `ON DELETE CASCADE` and `GRANT ... DELETE ON` are not DML. `DELETE FROM t` is a write only: the `FROM` after `DELETE`
 is never a read, while `FROM`/`IN (SELECT ... FROM u)` subqueries inside the same `DELETE` remain reads of `u`.
+A `FROM` list is walked item by item across top-level commas (parentheses balanced, literals opaque, `PARTITION (p)` /
+`SAMPLE (n)` modifiers and aliases skipped, `ON`/`USING` join conditions crossed): `FROM a, b c, (SELECT ...) s, d`
+reads `a`, `b`, `d` and the subquery's own sources; `EXTRACT(YEAR FROM col), other_col` and `GROUP BY g1, g2` are not
+sources. A comma-joined member the walker cannot resolve (`"Quoted"`, a table function not in the census, another
+shape) is an `UNVERIFIABLE` edge (`quoted-identifier`, `table-function-not-in-census`, `unparsed-operand`) rather than
+a silent omission.
 
 Round-trip on the fixture (`python3 examples/round_trip.py`, static text only, writes `examples/round_trip_report.md`):
 15 files, 48 census rows (6 tables, 5 indexes, 2 sequences, 3 views, 1 MV + 2 MV logs, package + 4 members,
@@ -128,11 +134,14 @@ INFERRED three are exactly the constructs built to be dynamic: `PKG_POLICY_RENEW
 literal position (`TO_DATE('&as_of', ...)`), so its three reads stay FACT. Five of the FACT edges are transitive
 trigger fan-out: `MRG_POLICY_FROM_STG` and `PKG_POLICY_RENEWAL` write `POLICY`, `TRG_POLICY_BIU` calls
 `PRC_LOG_EVENT`, so both inherit `writes POLICY_AUDIT_LOG` and `consumes-sequence AUDIT_SEQ` (`MRG_POLICY_FROM_STG`
-writes with `DELETE|INSERT|UPDATE`, `PKG_POLICY_RENEWAL` with `UPDATE`; both overlap the trigger's `INSERT|UPDATE`).
+writes with `DELETE|INSERT|UPDATE(ANNUAL_PREMIUM,BROKER_ID,COVER_NOTE_REF,EXPIRY_DT,POLICY_STATUS)`, `PKG_POLICY_RENEWAL`
+with `UPDATE(ANNUAL_PREMIUM,EXPIRY_DT,POLICY_STATUS)`; both overlap the trigger's `INSERT|UPDATE`, which names no
+`OF` columns).
 Five FACT edges are index `defines-on` (`POLICY_PARTY_IX -> POLICY`, ...) and two are synonym `alias-of`
 (`PUBLIC.BROKER -> POLADM.BROKER`, `ODS.POLICY -> POLADM.POLICY`).
-`python3 examples/round_trip.py --selftest` runs 15 negative cases (one unsupported construct each, must produce the
-named `UNVERIFIABLE` risk, including a quoted index target), 18 positive cases (look-alike supported syntax `FOR UPDATE OF`, `EXTRACT(... FROM)`,
+`python3 examples/round_trip.py --selftest` runs 17 negative cases (one unsupported construct each, must produce the
+named `UNVERIFIABLE` risk, including a quoted index target and a quoted / not-enumerated-function second member of a
+comma join), 22 positive cases (look-alike supported syntax `FOR UPDATE OF`, `EXTRACT(... FROM)`,
 `WHEN MATCHED THEN UPDATE ... DELETE WHERE`, `coll.DELETE`, `DELETE t` without `FROM`, must produce none; multiple and
 recursive CTEs keep their base-table edges and create no alias nodes; a CTE name reused as a real table in the next
 statement is an edge; a qualified `claims.broker` bypasses the `PUBLIC` synonym while unqualified `broker` uses it;
@@ -148,8 +157,12 @@ CTAS, GTT-as-select and `AS WITH` tables read every source without a CTE node; `
 (SELECT ... FROM p)` and `... IN (SELECT ... FROM q)` write `t` and read only `p`/`q`; `INSERT`-, `UPDATE OF`- and
 `DELETE`-only triggers fan out only to procedures performing that operation, a `MERGE` without `DELETE WHERE` fires the
 first two, a dynamic `TRUNCATE` fires none; an enumerated private or `PUBLIC` synonym resolves readers to its target
-while keeping its alias row and `alias-of` edge, including targets missing from the census and targets over a db link),
-and the fixture
+while keeping its alias row and `alias-of` edge, including targets missing from the census and targets over a db link;
+two-, three- and nested comma joins, mixed with an ANSI `JOIN ... ON` and a `@dblink` member, read every table and
+create no alias nodes while `EXTRACT(YEAR FROM d), col`, `GROUP BY g1, g2`, `ORDER BY 1, 2` and `IN (1, 2)` add none;
+an `UPDATE OF status, id` trigger fans out to `UPDATE ... SET t.status =`, to `SET premium = ..., id = id` and to a
+`MERGE ... UPDATE SET t.status =` but not to `SET premium = (subquery) RETURNING premium, id INTO` nor to a `MERGE ...
+UPDATE SET t.premium =`, and `SET ROW = rec` fans out as INFERRED `update-columns-unknown`), and the fixture
 invariants (zero `UNVERIFIABLE`, the transitive fan-out edges present, the scheduler `start_date` captured as the full
 `TO_TIMESTAMP_TZ(...)` expression, no CTE alias node, no Albion-only nodes without the Albion input). Albion
 `pkg_policy_inquiry.sql`: 3 census

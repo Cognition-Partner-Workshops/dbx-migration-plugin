@@ -194,9 +194,36 @@ def statement_end(text: str, start: int) -> int:
     return n
 
 
-def named_args(text: str) -> list[tuple[str, str]]:
-    """`name => value` pairs of a PL/SQL call, splitting on top-level commas only: a value may be a full expression
-    such as TO_TIMESTAMP_TZ('...', '...') (balanced parentheses, literals opaque)."""
+def skip_balanced(text: str, open_paren: int) -> int:
+    """Index just past the ')' that balances the '(' at `open_paren` (literals opaque)."""
+    return min(len(text), open_paren + 1 + len(call_args(text, open_paren)) + 1)
+
+
+def top_level_cut(text: str, stop: re.Pattern) -> str:
+    """`text` up to the first match of `stop` at parenthesis depth 0, or up to an unmatched ')' (literals opaque)."""
+    depth, i, n = 0, 0, len(text)
+    while i < n:
+        j = literal_end(text, i)
+        if j > i:
+            i = j
+            continue
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return text[:i]
+        elif depth == 0:
+            m = stop.match(text, i)
+            if m and (not m.group(0)[0].isalpha() or i == 0 or not re.match(r"[\w$#]", text[i - 1])):
+                return text[:i]
+        i += 1
+    return text
+
+
+def split_top_level(text: str) -> list[str]:
+    """Split on commas at parenthesis depth 0 (literals opaque)."""
     parts: list[str] = []
     depth, start, i, n = 0, 0, 0, len(text)
     while i < n:
@@ -214,8 +241,14 @@ def named_args(text: str) -> list[tuple[str, str]]:
             start = i + 1
         i += 1
     parts.append(text[start:])
+    return parts
+
+
+def named_args(text: str) -> list[tuple[str, str]]:
+    """`name => value` pairs of a PL/SQL call, splitting on top-level commas only: a value may be a full expression
+    such as TO_TIMESTAMP_TZ('...', '...') (balanced parentheses, literals opaque)."""
     out: list[tuple[str, str]] = []
-    for p in parts:
+    for p in split_top_level(text):
         m = re.match(r"\s*(\w+)\s*=>\s*(.*?)\s*$", p, re.S)
         if m:
             out.append((m.group(1), m.group(2)))
@@ -474,27 +507,212 @@ LINEAGE_KW_RE = re.compile(
 NEXT_IDENT_RE = re.compile(rf"^{QNAME}(?:@{IDENT})?\b")
 
 
-TRIGGER_EVENTS_RE = re.compile(r"\b(INSERT|UPDATE|DELETE)\b", re.I)
+# DML events on an edge: `INSERT|UPDATE(COL_A,COL_B)|DELETE`; `UPDATE` without a column list means any / unknown columns
+TRIGGER_EVENTS_RE = re.compile(rf"\b(INSERT|DELETE|UPDATE(?:\s+OF\s+((?:{IDENT}\s*,\s*)*{IDENT}))?)\b", re.I)
+OPS_TOKEN_RE = re.compile(r"(\w+)(?:\(([^)]*)\))?")
+SET_STOP_RE = re.compile(r"WHERE\b|RETURNING\b|LOG\s+ERRORS\b|WHEN\s+(?:NOT\s+)?MATCHED\b", re.I)
+
+
+def parse_ops(ops: str) -> dict[str, set[str] | None]:
+    """{'UPDATE': {'A', 'B'}, 'INSERT': None} for 'INSERT|UPDATE(A,B)'; None = every column / unknown."""
+    out: dict[str, set[str] | None] = {}
+    for tok in filter(None, ops.split("|")):
+        m = OPS_TOKEN_RE.fullmatch(tok)
+        if not m:
+            continue
+        ev = m.group(1).upper()
+        cols = {c.strip().upper() for c in m.group(2).split(",") if c.strip()} if m.group(2) is not None else None
+        out[ev] = None if cols is None or (ev in out and out[ev] is None) else (out.get(ev) or set()) | cols
+    return out
+
+
+def format_ops(parsed: dict[str, set[str] | None]) -> str:
+    return "|".join(ev + (f"({','.join(sorted(cols))})" if cols is not None else "") for ev, cols in sorted(parsed.items()))
+
+
+def merge_ops(a: str, b: str) -> str:
+    """Union of two event strings: columns union per event, an unbounded UPDATE absorbs a bounded one."""
+    pa, pb = parse_ops(a), parse_ops(b)
+    for ev, cols in pb.items():
+        if ev not in pa:
+            pa[ev] = cols
+        elif pa[ev] is None or cols is None:
+            pa[ev] = None
+        else:
+            pa[ev] = pa[ev] | cols
+    return format_ops(pa)
 
 
 def trigger_events(header: str) -> str:
-    """'INSERT|UPDATE' for `BEFORE INSERT OR UPDATE OF col ON t`; '' when the timing clause is not recognised."""
+    """'INSERT|UPDATE(STATUS)' for `BEFORE INSERT OR UPDATE OF status ON t`; '' when the timing clause is not
+    recognised."""
     tm = re.search(r"\b(?:BEFORE|AFTER|INSTEAD\s+OF)\b(.*?)\bON\b", header, re.I | re.S)
     if not tm:
         return ""
-    return "|".join(sorted({e.upper() for e in TRIGGER_EVENTS_RE.findall(tm.group(1))}))
+    ops = ""
+    for ev, cols in TRIGGER_EVENTS_RE.findall(tm.group(1)):
+        ev = ev.split()[0].upper()
+        ops = merge_ops(ops, ev + (f"({','.join(c.strip().upper() for c in cols.split(','))})" if cols else ""))
+    return ops
+
+
+def set_columns(clause: str) -> str:
+    """'(A,B)' for the columns assigned by a SET list (`col = expr`, `t.col = expr`, `(a, b) = (subquery)`); '' when an
+    item has another shape (SET ROW = rec, ...), which callers treat as "any column"."""
+    cols: set[str] = set()
+    for part in split_top_level(top_level_cut(clause, SET_STOP_RE)):
+        m = re.match(rf"\s*(?:{IDENT}\.)?({IDENT})\s*=", part)
+        gm = re.match(rf"\s*\(\s*((?:{IDENT}\s*,\s*)*{IDENT})\s*\)\s*=", part)
+        if m and m.group(1).upper() != "ROW":
+            cols.add(m.group(1).upper())
+        elif gm:
+            cols |= {c.strip().upper() for c in gm.group(1).split(",")}
+        else:
+            return ""
+    return f"({','.join(sorted(cols))})" if cols else ""
 
 
 def dml_ops(verb: str, statement: str) -> str:
-    """DML events a statement fires on its target: MERGE is INSERT|UPDATE (+DELETE with `DELETE WHERE`); TRUNCATE is
-    DDL and fires no row trigger, so it carries the pseudo-event TRUNCATE."""
+    """DML events a statement fires on its target, with the assigned columns of an UPDATE: `UPDATE t SET a = 1` ->
+    'UPDATE(A)'; MERGE -> its INSERT / UPDATE(cols) / DELETE (`DELETE WHERE`) branches; TRUNCATE is DDL and fires no
+    row trigger, so it carries the pseudo-event TRUNCATE. A SET list the parser cannot read yields a bare UPDATE."""
     verb = re.sub(r"\s+", " ", verb.strip())
     if verb.startswith("MERGE"):
-        ops = {"INSERT", "UPDATE"}
+        ops = ""
+        if re.search(r"\bNOT\s+MATCHED\s+THEN\s+INSERT\b", statement, re.I):
+            ops = merge_ops(ops, "INSERT")
+        um = re.search(r"\bMATCHED\s+THEN\s+UPDATE\s+SET\b", statement, re.I)
+        if um:
+            ops = merge_ops(ops, "UPDATE" + set_columns(statement[um.end():]))
         if re.search(r"\bDELETE\s+WHERE\b", statement, re.I):
-            ops.add("DELETE")
-        return "|".join(sorted(ops))
+            ops = merge_ops(ops, "DELETE")
+        return ops or "INSERT|UPDATE"
+    if verb == "UPDATE":
+        sm = re.search(r"\bSET\b", statement, re.I)
+        return "UPDATE" + (set_columns(statement[sm.end():]) if sm else "")
     return verb.split(" ")[0]
+
+
+def ops_fire(trigger_ops: str, writer_ops: str) -> tuple[bool, str]:
+    """Does a write with `writer_ops` fire a trigger declared for `trigger_ops`? (fires, risk): an `UPDATE OF cols`
+    trigger fires for an UPDATE whose SET list names one of its columns; an UPDATE with an unreadable SET list fires
+    with risk 'update-columns-unknown'. Unknown shapes on either side fire (conservative)."""
+    t, w = parse_ops(trigger_ops), parse_ops(writer_ops)
+    if not t or not w:
+        return True, ""
+    unknown = False
+    for ev, tcols in t.items():
+        if ev not in w:
+            continue
+        wcols = w[ev]
+        if ev != "UPDATE" or tcols is None or (wcols is not None and tcols & wcols):
+            return True, ""
+        if wcols is None:
+            unknown = True
+    return (True, "update-columns-unknown") if unknown else (False, "")
+
+
+FROM_KW_RE = re.compile(r"\bFROM\b", re.I)
+EXPR_FROM_WORDS = {"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "TIMEZONE_HOUR", "TIMEZONE_MINUTE", "TIMEZONE_REGION",
+                   "TIMEZONE_ABBR", "LEADING", "TRAILING", "BOTH"}
+# words that end a FROM list item's alias position (an Oracle table alias is never one of these)
+FROM_LIST_STOP = KEYWORDS | {
+    "GROUP", "HAVING", "ORDER", "UNION", "MINUS", "INTERSECT", "FOR", "JOIN", "LEFT", "RIGHT", "FULL", "INNER", "CROSS",
+    "NATURAL", "OUTER", "PIVOT", "UNPIVOT", "MODEL", "WITH", "VERSIONS", "FETCH", "OFFSET", "RETURNING", "BETWEEN", "LIKE",
+    "PARTITION", "SUBPARTITION", "SAMPLE", "BULK", "LIMIT", "WHERE", "FROM", "ON", "USING",
+}
+JOIN_HEAD_RE = re.compile(
+    r"(?:(?:LEFT|RIGHT|FULL|INNER|CROSS)\s+(?:OUTER\s+)?|NATURAL\s+(?:(?:LEFT|RIGHT|FULL|INNER)\s+)?(?:OUTER\s+)?)?JOIN\b", re.I)
+JOIN_COND_STOP_RE = re.compile(
+    r",|WHERE\b|GROUP\b|HAVING\b|ORDER\b|START\b|CONNECT\b|UNION\b|MINUS\b|INTERSECT\b|FOR\b|MODEL\b|PIVOT\b|UNPIVOT\b|"
+    r"FETCH\b|OFFSET\b|LEFT\b|RIGHT\b|FULL\b|INNER\b|CROSS\b|NATURAL\b|JOIN\b", re.I)
+TABLE_EXPR_RE = re.compile(r"(?:TABLE|LATERAL)\s*\(", re.I)
+QUOTED_QNAME_RE = re.compile(rf'"[^"]*"(?:\s*\.\s*(?:"[^"]*"|{IDENT}))*')
+SOURCE_NAME_RE = re.compile(rf"{QNAME}(?:@{IDENT})?")
+ALIAS_MOD_RE = re.compile(r"(?:PARTITION|SUBPARTITION|SAMPLE)\s*(?:BLOCK\s*)?\(", re.I)
+
+
+def from_list_tail(stmt: str, pos: int) -> list[tuple[str, str]]:
+    """The items after the first one of the FROM list starting at `pos` (just past FROM), as (kind, text) with kind
+    'name' | 'function' | 'quoted' | 'subst' | 'subquery' | 'other'. The first item is consumed by READ_RE / the
+    completeness pass; later items are separated from it by top-level commas, optionally through ANSI join clauses
+    (`FROM a JOIN b ON a.x = b.x, c`). Stops at ')', ';' or a clause keyword."""
+    n = len(stmt)
+
+    def skip_ws(i: int) -> int:
+        return i + len(stmt[i:]) - len(stmt[i:].lstrip())
+
+    def source(i: int) -> tuple[str, str, int] | None:
+        """One table expression at i: (kind, text, index after it) or None when nothing parseable starts here."""
+        if i >= n:
+            return None
+        ch = stmt[i]
+        if ch == "(":
+            return "subquery", "", skip_balanced(stmt, i)
+        if ch == '"':
+            qm = QUOTED_QNAME_RE.match(stmt, i)
+            return "quoted", qm.group(0), qm.end()
+        if ch == "&":
+            sm = re.match(r"&&?\w+", stmt[i:])
+            if sm:
+                return "subst", sm.group(0), i + sm.end()
+            return None
+        tm = TABLE_EXPR_RE.match(stmt, i)
+        if tm:
+            return "subquery", "", skip_balanced(stmt, tm.end() - 1)
+        nm = SOURCE_NAME_RE.match(stmt, i)
+        if not nm:
+            return None
+        fm = re.match(r"\s*\(", stmt[nm.end():])
+        if fm:
+            return "function", nm.group(0), skip_balanced(stmt, nm.end() + fm.end() - 1)
+        return "name", nm.group(0), nm.end()
+
+    def alias(i: int) -> int:
+        """Skip PARTITION (...) / SAMPLE (...) modifiers and an optional alias."""
+        while True:
+            i = skip_ws(i)
+            pm = ALIAS_MOD_RE.match(stmt, i)
+            if pm:
+                i = skip_balanced(stmt, pm.end() - 1)
+                continue
+            am = re.match(IDENT, stmt[i:])
+            if am and am.group(0).upper() not in FROM_LIST_STOP:
+                i += am.end()
+                continue
+            return i
+
+    items: list[tuple[str, str]] = []
+    i, first = pos, True
+    while True:
+        i = skip_ws(i)
+        src = source(i)
+        if src is None:
+            if not first and i < n:
+                items.append(("other", stmt[i:i + 20].split("\n")[0]))
+            break
+        kind, item, i = src
+        if not first:
+            items.append((kind, item))
+        first = False
+        while True:                                 # after a source: alias, then `,` | ANSI join | end of list
+            i = alias(i)
+            if i < n and stmt[i] == ",":
+                i += 1
+                break
+            jm = JOIN_HEAD_RE.match(stmt, i)
+            if not jm:
+                return items
+            joined = source(skip_ws(jm.end()))         # the joined source itself is READ_RE's (JOIN x)
+            if joined is None:
+                return items
+            i = alias(joined[2])
+            um = re.match(r"USING\s*\(", stmt[i:], re.I)
+            if um:
+                i = skip_balanced(stmt, i + um.end() - 1)
+            elif re.match(r"ON\b", stmt[i:], re.I):
+                i += 2 + len(top_level_cut(stmt[i + 2:], JOIN_COND_STOP_RE))
+    return items
 
 
 def preceding_word(text: str, pos: int) -> str:
@@ -609,7 +827,25 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
                 continue                                 # a WITH-clause alias, not a physical object (its body is scanned)
             if preceding_word(stmt, m.start()) == "DELETE":
                 continue                                 # DELETE FROM t: a write (WRITE_RE), not a query source
+            if preceding_word(stmt, m.start()) in EXPR_FROM_WORDS:
+                continue                                 # EXTRACT(YEAR FROM col), TRIM(LEADING x FROM col): a column
             est.edge(key, name, "reads", owner)
+        for fm in FROM_KW_RE.finditer(stmt):             # `FROM a, b c, (subquery) s, d`: every comma-joined source
+            for kind, item in from_list_tail(stmt, fm.end()):
+                if kind == "name":
+                    if item.split(".")[-1].upper() in KEYWORDS or ("." not in item and item.upper() in ctes):
+                        continue
+                    est.edge(key, item, "reads", owner)
+                elif kind == "function":
+                    fn = norm(item, owner)
+                    if not (fn in est.nodes and est.nodes[fn].cls in PROCEDURAL_CLASSES):
+                        unverifiable(est, key, owner, "reads", "table-function-not-in-census", ", " + item)
+                elif kind == "quoted":
+                    unverifiable(est, key, owner, "reads", "quoted-identifier", ", " + item)
+                elif kind == "subst":
+                    est.edges.append(Edge(key, f"{owner}.<&var>", "reads", "INFERRED", "substitution-in-identifier"))
+                elif kind == "other":
+                    unverifiable(est, key, owner, "reads", "unparsed-operand", ", " + item)
     for m in WRITE_RE.finditer(static):
         if m.group(1).split(".")[-1].upper() in KEYWORDS | {"OF", "FROM"}:
             continue  # `UPDATE ON t`, `UPDATE OF col`, `UPDATE SET` inside MERGE are not writes
@@ -690,7 +926,7 @@ def dedupe_edges(est: Estate) -> None:
         k = (e.src, e.dst, e.kind, e.evidence, e.risk)
         if k in keep:
             if e.ops and keep[k].ops != e.ops:
-                keep[k].ops = "|".join(sorted(set(keep[k].ops.split("|")) | set(e.ops.split("|")))) if keep[k].ops else e.ops
+                keep[k].ops = merge_ops(keep[k].ops, e.ops) if keep[k].ops else e.ops
         else:
             keep[k] = e
     est.edges = list(keep.values())
@@ -727,16 +963,21 @@ def trigger_fan_out(est: Estate) -> None:
         existing = {(e.src, e.dst, e.kind) for e in est.edges}
         for t in triggers:
             closure = [c for c in side_effect_closure(est, t.src) if c.dst != t.dst]
-            events = set(t.ops.split("|")) if t.ops else set()
-            # only writers whose DML events the trigger declares fire it; a write of unknown shape is assumed to fire
-            writers = {w.src for w in est.edges if w.kind == "writes" and w.dst == t.dst and w.src != t.src
-                       and (not events or not w.ops or events & set(w.ops.split("|")))}
-            for w in writers:
+            # only writers whose DML events (and, for UPDATE OF, columns) the trigger declares fire it; a write of
+            # unknown shape is assumed to fire, an UPDATE with an unreadable SET list fires as INFERRED
+            writers: dict[str, str] = {}
+            for w in est.edges:
+                if w.kind != "writes" or w.dst != t.dst or w.src == t.src:
+                    continue
+                fires, risk = ops_fire(t.ops, w.ops)
+                if fires and (w.src not in writers or not risk):
+                    writers[w.src] = risk
+            for w, risk in writers.items():
                 for c in closure:
                     if w in (c.src, c.dst) or (w, c.dst, c.kind) in existing:
                         continue
                     via = f"trigger fan-out via {t.src}" + (f" -> {c.src}" if c.src != t.src else "")
-                    est.edges.append(Edge(w, c.dst, c.kind, "FACT", "", via, c.ops))
+                    est.edges.append(Edge(w, c.dst, c.kind, "INFERRED" if risk else "FACT", risk, via, c.ops))
                     existing.add((w, c.dst, c.kind))
                     added += 1
         if not added:
@@ -800,6 +1041,10 @@ NEGATIVE_CASES: dict[str, tuple[str, str]] = {
     "unresolved_pkg_call": ("CREATE OR REPLACE PROCEDURE poladm.p_up IS BEGIN some_unknown_pkg.do_it(1); END;", "unresolved-qualified-call"),
     "mview_refresh_var": ("CREATE OR REPLACE PROCEDURE poladm.p_mv (l IN VARCHAR2) IS BEGIN DBMS_MVIEW.REFRESH(l); END;", "mview-refresh-non-literal"),
     "index_quoted_target": ("CREATE INDEX poladm.ix_q ON \"POLADM\".\"Policy\" (id);", "unparsed-index-target"),
+    "comma_join_quoted_second_table": ("CREATE OR REPLACE VIEW poladm.v_cq AS SELECT 1 FROM poladm.a x, \"POLADM\".\"Policy\" p;",
+                                       "quoted-identifier"),
+    "comma_join_table_function_second": ("CREATE OR REPLACE VIEW poladm.v_cf AS SELECT 1 FROM poladm.a x, fn_not_enumerated(x.id) f;",
+                                         "table-function-not-in-census"),
 }
 POSITIVE_TEXT = """
 CREATE TABLE poladm.t_ok (id NUMBER, d DATE);
@@ -827,6 +1072,7 @@ class Case:
     forbid: set = field(default_factory=set)
     want_nodes: set = field(default_factory=set)
     forbid_edges: set = field(default_factory=set)
+    want_evidence: set = field(default_factory=set)   # (src, dst, kind, evidence, risk) that MUST exist exactly so
 
 
 POSITIVE_CASES: dict[str, Case] = {
@@ -1017,6 +1263,59 @@ POSITIVE_CASES: dict[str, Case] = {
 }
 
 
+POSITIVE_CASES.update({
+    "comma_join_two_tables": Case(
+        "CREATE OR REPLACE VIEW poladm.v_c2 AS SELECT a.id, b.v FROM poladm.t_ca a, poladm.t_cb b WHERE a.id = b.id;",
+        want={("POLADM.V_C2", "POLADM.T_CA", "reads"), ("POLADM.V_C2", "POLADM.T_CB", "reads")},
+        forbid={"POLADM.A", "POLADM.B"},
+    ),
+    "comma_join_three_tables_and_ansi_mix": Case(
+        "CREATE OR REPLACE VIEW poladm.v_c3 AS\n"
+        "SELECT a.id, b.v, c.w, d.x FROM poladm.t_ca a, poladm.t_cb b JOIN poladm.t_cc c ON c.id = b.id AND c.k IN (1, 2),\n"
+        "  claims.t_cd d, poladm.t_ce@ods_link e\n"
+        " WHERE a.id = b.id AND d.id = a.id GROUP BY a.id, b.v, c.w, d.x ORDER BY 1, 2;",
+        want={("POLADM.V_C3", "POLADM.T_CA", "reads"), ("POLADM.V_C3", "POLADM.T_CB", "reads"),
+              ("POLADM.V_C3", "POLADM.T_CC", "reads"), ("POLADM.V_C3", "CLAIMS.T_CD", "reads"),
+              ("POLADM.V_C3", "POLADM.T_CE@ODS_LINK", "reads")},
+        forbid={"POLADM.A", "POLADM.B", "POLADM.C", "POLADM.D", "POLADM.E", "POLADM.V", "POLADM.W", "POLADM.X"},
+    ),
+    "comma_join_nested_and_select_list_commas": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.p_cn IS l_n NUMBER; l_y NUMBER; BEGIN\n"
+        "  FOR r IN (SELECT s.id FROM (SELECT i.id FROM poladm.t_in i, poladm.t_in2 j WHERE i.id = j.id) s, poladm.t_out o\n"
+        "            WHERE o.id = s.id) LOOP NULL; END LOOP;\n"
+        "  SELECT EXTRACT(YEAR FROM d), other_col INTO l_y, l_n FROM poladm.t_dates WHERE k IN (1, 2);\n"
+        "  SELECT count(*) INTO l_n FROM poladm.t_g GROUP BY g1, g2 ORDER BY g1, g2;\n"
+        "  DELETE FROM poladm.t_del WHERE id IN (SELECT id FROM poladm.t_x, poladm.t_y);\n"
+        "END;",
+        want={("POLADM.P_CN", "POLADM.T_IN", "reads"), ("POLADM.P_CN", "POLADM.T_IN2", "reads"),
+              ("POLADM.P_CN", "POLADM.T_OUT", "reads"), ("POLADM.P_CN", "POLADM.T_DATES", "reads"),
+              ("POLADM.P_CN", "POLADM.T_G", "reads"), ("POLADM.P_CN", "POLADM.T_X", "reads"),
+              ("POLADM.P_CN", "POLADM.T_Y", "reads"), ("POLADM.P_CN", "POLADM.T_DEL", "writes")},
+        forbid={"POLADM.S", "POLADM.O", "POLADM.OTHER_COL", "POLADM.G1", "POLADM.G2", "POLADM.D", "POLADM.I", "POLADM.J"},
+    ),
+    "trigger_update_of_columns": Case(
+        "CREATE TABLE poladm.t_c (id NUMBER, status VARCHAR2(10), premium NUMBER);\n"
+        "CREATE OR REPLACE PROCEDURE poladm.log_s IS BEGIN INSERT INTO poladm.log_status VALUES (1); END;\n/\n"
+        "CREATE OR REPLACE TRIGGER poladm.trg_s AFTER UPDATE OF status, id ON poladm.t_c FOR EACH ROW BEGIN poladm.log_s(); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_status IS BEGIN UPDATE poladm.t_c t SET t.status = 'X' WHERE id = 1; END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_prem IS BEGIN UPDATE poladm.t_c SET premium = premium * 1.1, id = id WHERE 1 = 1; END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_prem_only IS BEGIN UPDATE poladm.t_c SET premium = (SELECT 1 FROM dual WHERE 1 = 1)\n"
+        "  RETURNING premium, id INTO l_a, l_b; END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_mrg_s IS BEGIN MERGE INTO poladm.t_c t USING poladm.src s ON (t.id = s.id)\n"
+        "  WHEN MATCHED THEN UPDATE SET t.status = s.status WHEN NOT MATCHED THEN INSERT (id, status) VALUES (s.id, s.status); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_mrg_p IS BEGIN MERGE INTO poladm.t_c t USING poladm.src s ON (t.id = s.id)\n"
+        "  WHEN MATCHED THEN UPDATE SET t.premium = s.premium WHERE t.status IS NOT NULL\n"
+        "  WHEN NOT MATCHED THEN INSERT (id, premium) VALUES (s.id, s.premium); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_row IS l_rec poladm.t_c%ROWTYPE; BEGIN UPDATE poladm.t_c SET ROW = l_rec WHERE id = 1; END;",
+        want={("POLADM.P_STATUS", "POLADM.LOG_STATUS", "writes"), ("POLADM.P_PREM", "POLADM.LOG_STATUS", "writes"),
+              ("POLADM.P_MRG_S", "POLADM.LOG_STATUS", "writes")},
+        forbid_edges={("POLADM.P_PREM_ONLY", "POLADM.LOG_STATUS", "writes"), ("POLADM.P_MRG_P", "POLADM.LOG_STATUS", "writes")},
+        want_evidence={("POLADM.P_STATUS", "POLADM.LOG_STATUS", "writes", "FACT", ""),
+                       ("POLADM.P_ROW", "POLADM.LOG_STATUS", "writes", "INFERRED", "update-columns-unknown")},
+    ),
+})
+
+
 def selftest() -> int:
     failures: list[str] = []
     with tempfile.TemporaryDirectory() as td:
@@ -1050,6 +1349,9 @@ def selftest() -> int:
                 failures.append(f"{name}: missing edge {w}; got {sorted(have)}")
             for w in sorted(case.forbid_edges & have):
                 failures.append(f"{name}: wrongly attributed edge {w}")
+            graded = {(e.src, e.dst, e.kind, e.evidence, e.risk) for e in res["edges"]}
+            for w in sorted(case.want_evidence - graded):
+                failures.append(f"{name}: missing edge {w}; got {sorted(g for g in graded if g[:3] == w[:3])}")
             for k in sorted(case.forbid & set(res["nodes"])):
                 failures.append(f"{name}: phantom node {k} ({res['nodes'][k].cls}, {res['nodes'][k].status})")
             for k, cls in sorted(case.want_nodes):
