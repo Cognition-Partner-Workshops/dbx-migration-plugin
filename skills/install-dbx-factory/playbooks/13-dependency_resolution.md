@@ -15,7 +15,7 @@ Dependencies, not conversion difficulty, are what make data migrations slow and 
 | D2 | shared object used by 2+ pipelines | migrate once in wave 0; owner pipeline per the shared-object map |
 | D3 | upstream feed from a non-migrating system | federate for reads; ingestion contract (Auto Loader, CDC) at cutover |
 | D4 | downstream consumer of legacy output | re-point at cutover; dual-publish during coexistence; rebuild |
-| D5 | scheduler / orchestration dependency | replace with Workflows; keep external scheduler triggering Databricks; hybrid with completion signal |
+| D5 | scheduler / orchestration dependency | replace with Lakeflow Jobs; keep external scheduler triggering Databricks; hybrid with completion signal |
 | D6 | shared table with non-migrated writers | dual-write window; legacy remains writer + federated read; documented deferral |
 | D7 | external hand-off (SFTP, queue, partner feed) | preserve format contract exactly; re-platform the transport at cutover |
 | D8 | security / governance contract | reproduce in UC (row filters, masks, grants) before any consumer re-points |
