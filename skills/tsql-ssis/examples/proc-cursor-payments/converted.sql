@@ -43,12 +43,18 @@ AS BEGIN
     --     reversal ADDS BACK w.principal_due per loan (a delta, not an absolute restore from the
     --     eligible_loans snapshot, which would erase any balance change a concurrent writer made in
     --     between). modified_date is left as written; NOTE.md excludes it from the failure-replay Tier 3.
+    --   * the BATCH_START row is KEPT: the source inserts it outside every transaction and error_handler
+    --     never removes it, so a failed source run always leaves one BATCH_START row with record_count 0
+    --     and new_value NULL (Step 4 never ran). Deleting it would produce a state the source cannot
+    --     produce and lose the batch id the SIGNAL message reports. The handler only clears the run_key
+    --     from new_value so the row matches the source's failed-batch row column for column.
     -- Alternative when payments, audit_trail and loans are all created with
     -- TBLPROPERTIES ('delta.feature.catalogManaged' = 'supported'): wrap the four writes below in
     -- BEGIN ATOMIC ... END (sql-scripting.md "SQL Scripting Atomic Blocks", Preview) and drop the
     -- compensation. Not verified live: BEGIN ATOMIC nested inside a procedure body.
     -- Edge: if a temp-table CREATE itself fails, nothing permanent has been written; p_batch_id is
-    -- NULL, so both DELETEs match no rows and the guarded MERGE is skipped.
+    -- NULL and no BATCH_START row exists, so the DELETEs and the UPDATE match no rows and the guarded
+    -- MERGE is skipped.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         DELETE FROM ${catalog}.${schema}.audit_trail
@@ -56,6 +62,9 @@ AS BEGIN
           AND table_name  = 'payments'
           AND record_id IN (SELECT payment_id FROM ${catalog}.${schema}.payments WHERE batch_id = p_batch_id);
         DELETE FROM ${catalog}.${schema}.payments WHERE batch_id = p_batch_id;
+        UPDATE ${catalog}.${schema}.audit_trail
+        SET new_value = NULL, record_count = 0
+        WHERE action_type = 'BATCH_START' AND new_value = run_key;   -- keep the row, source-shaped
         IF balances_applied THEN
             MERGE INTO ${catalog}.${schema}.loans t
             USING waterfall w

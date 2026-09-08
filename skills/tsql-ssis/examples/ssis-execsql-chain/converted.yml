@@ -5,7 +5,8 @@
 # https://docs.databricks.com/aws/en/jobs/conditional-tasks (Run if semantics: AT_LEAST_ONE_FAILED tasks
 # are Excluded when unmet; Excluded cascades along linear chains), /aws/en/jobs/parameter-use (SQL tasks
 # read key-value parameters as :name; job parameters are pushed down to SQL tasks) and
-# /aws/en/jobs/dynamic-value-references ({{job.run_id}}), /aws/en/jobs/if-else and /aws/en/jobs/task-values
+# /aws/en/jobs/dynamic-value-references ({{job.run_id}}; {{tasks.<task_name>.result_state}} with values success /
+# failed / excluded / ...; {{tasks.<task_name>.error_code}}, empty string for successful tasks), /aws/en/jobs/if-else and /aws/en/jobs/task-values
 # (If/else condition task on {{tasks.<task>.values.<key>}}; task values are set from Python notebooks with
 # dbutils.jobs.taskValues.set), and the condition_task / depends_on.outcome YAML shape from
 # /aws/en/dev-tools/bundles/resources (job example: condition_task op/left/right, depends_on outcome: 'true').
@@ -16,10 +17,14 @@
 #                                                      outcome 'true'. When false, accrual is Excluded and the exclusion
 #                                                      cascades to fees and EOD, exactly like the unmet SSIS constraint.
 #   Success constraints (LogicalAnd)            ->  depends_on + run_if: ALL_SUCCESS (default).
-#   Failure constraints, LogicalAnd="False"     ->  one task with several depends_on + run_if: AT_LEAST_ONE_FAILED.
+#   Failure constraints, LogicalAnd="False"     ->  one task (log_failure, BATCH_FAILED row) with the three proc tasks
+#                                                  as depends_on + run_if: AT_LEAST_ONE_FAILED.
 #   FailPackageOnFailure="True"                 ->  default: any failed task fails the run.
-#   OnError event handler (audit_trail row)     ->  same AT_LEAST_ONE_FAILED task (also depending on count_eligible,
-#                                                  since OnError is package-wide) + on_failure notification.
+#   OnError event handler (SSIS_ONERROR row)    ->  a SEPARATE task (on_error_audit) with the same run_if over every
+#                                                  task in the package, because the handler is package-wide and its
+#                                                  row is a distinct audit_trail event the source writes in addition
+#                                                  to BATCH_FAILED. The on_failure notification is an extra signal,
+#                                                  it does not replace either row.
 #   $Project::ServerName connection manager     ->  catalog/schema job parameters (no server name survives).
 #   $Package::ServicerId (7) / User::ProcessingDate ((DT_DBDATE)GETDATE()) -> job parameters; ProcessingDate
 #     is evaluated inside SQL as current_date() so the job does not need a runtime-expression variable.
@@ -111,18 +116,20 @@ resources:
               source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
 
-        # Three Failure constraints with LogicalAnd="False" (OR) into SQL Log failure, plus the package
-        # OnError handler (which also covers Count eligible): one task, AT_LEAST_ONE_FAILED. Excluded (not
-        # failed) when the run is clean, and skipped on a zero-count run too (no dependency failed; skipped
-        # upstreams count as success for run_if: docs /jobs/conditional-tasks).
-        # System::SourceName / System::ErrorDescription have no SQL-task equivalent; the run page and the
-        # on_failure email carry them, the audit row records the job + run id instead.
+        # Three Failure constraints with LogicalAnd="False" (OR) into SQL Log failure: one task,
+        # AT_LEAST_ONE_FAILED over the three procedure tasks exactly as the constraints are drawn. Excluded
+        # (not failed) when the run is clean, and skipped on a zero-count run too (no dependency failed;
+        # skipped upstreams count as success for run_if: docs /jobs/conditional-tasks).
+        # Delta from SSIS: "Upstream tasks marked Upstream failed ... are treated as failed" (same page), so
+        # when count_eligible itself fails the three proc tasks are Upstream failed and this task RUNS,
+        # whereas the SSIS Failure constraints never fired (their source tasks never executed). The SQL
+        # therefore inserts only when one of the three procs' own result_state is 'failed'; otherwise it
+        # writes nothing and only on_error_audit below records the run, as in the source.
+        # The source binds ? to User::EligibleCount (record_count column): the task value is passed in
+        # (try_cast: an unset task value arrives as the literal reference string, docs dynamic-value-references
+        # "non-existent dynamic reference values ... are ... treated as literal strings").
         - task_key: log_failure
           depends_on:
-            - task_key: count_eligible
-            # no `outcome`: fan-in on completion of the If/else itself, so a failed evaluation
-            # (e.g. a non-numeric task value) logs like any other task failure
-            - task_key: check_eligible
             - task_key: nightly_accrual
             - task_key: apply_late_fees
             - task_key: eod_reconciliation
@@ -132,11 +139,71 @@ resources:
               path: ../sql/log_batch_failure.sql
               # INSERT INTO IDENTIFIER(:catalog||'.'||:schema||'.audit_trail')
               #   (action_type, action_date, table_name, record_count, new_value)
-              # VALUES ('BATCH_FAILED', current_timestamp(), 'loans', NULL, 'nightly_servicing:' || :run_id);
+              # SELECT 'BATCH_FAILED', current_timestamp(), 'loans', try_cast(:eligible_count AS INT),
+              #        'NightlyServicing.dtsx run ' || :run_id
+              # WHERE 'failed' IN (:s_accr, :s_fees, :s_eod);
               source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
             parameters:
               run_id: "{{job.run_id}}"      # task-level key-value parameter, read as :run_id
+              eligible_count: "{{tasks.count_eligible.values.eligible_count}}"
+              s_accr: "{{tasks.nightly_accrual.result_state}}"
+              s_fees: "{{tasks.apply_late_fees.result_state}}"
+              s_eod:  "{{tasks.eod_reconciliation.result_state}}"
+
+        # Package-scope OnError event handler: INSERT INTO dbo.audit_trail (action_type, action_date,
+        # table_name, new_value) VALUES ('SSIS_ONERROR', GETDATE(), System::SourceName, System::ErrorDescription).
+        # A distinct audit event the source writes for ANY error in the package (Count eligible and the
+        # expression evaluation included, and Log failure itself), so it fans in on every task with
+        # AT_LEAST_ONE_FAILED; Excluded on a clean run, so clean-run semantics are unchanged.
+        #   table_name (System::SourceName)      -> the failed task key(s), derived from each task's result_state
+        #   new_value  (System::ErrorDescription) -> the non-empty error_code(s) plus the run id; the full message
+        #                                            is on the run page, keyed by the run id.
+        # SSIS fires the handler once per error event (a failing task usually raises more than one), so the
+        # source can leave several SSIS_ONERROR rows per failed run; the conversion writes exactly one
+        # (recorded delta, NOTE.md). Recon on failure-injection runs compares presence per run, not count.
+        - task_key: on_error_audit
+          depends_on:
+            - task_key: count_eligible
+            # no `outcome`: fan-in on completion of the If/else itself, so a failed evaluation
+            # (e.g. a non-numeric task value) is audited like any other task failure
+            - task_key: check_eligible
+            - task_key: nightly_accrual
+            - task_key: apply_late_fees
+            - task_key: eod_reconciliation
+            - task_key: log_failure
+          run_if: AT_LEAST_ONE_FAILED
+          sql_task:
+            file:
+              path: ../sql/log_ssis_onerror.sql
+              # INSERT INTO IDENTIFIER(:catalog||'.'||:schema||'.audit_trail')
+              #   (action_type, action_date, table_name, new_value)
+              # VALUES ('SSIS_ONERROR', current_timestamp(),
+              #         concat_ws(',', CASE WHEN :s_count = 'failed' THEN 'count_eligible' END,
+              #                        CASE WHEN :s_check = 'failed' THEN 'check_eligible' END,
+              #                        CASE WHEN :s_accr  = 'failed' THEN 'nightly_accrual' END,
+              #                        CASE WHEN :s_fees  = 'failed' THEN 'apply_late_fees' END,
+              #                        CASE WHEN :s_eod   = 'failed' THEN 'eod_reconciliation' END,
+              #                        CASE WHEN :s_log   = 'failed' THEN 'log_failure' END),
+              #         concat_ws(' ', nullif(:e_count, ''), nullif(:e_check, ''), nullif(:e_accr, ''),
+              #                        nullif(:e_fees, ''), nullif(:e_eod, ''), nullif(:e_log, ''),
+              #                        'run ' || :run_id));
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              run_id:  "{{job.run_id}}"
+              s_count: "{{tasks.count_eligible.result_state}}"
+              s_check: "{{tasks.check_eligible.result_state}}"
+              s_accr:  "{{tasks.nightly_accrual.result_state}}"
+              s_fees:  "{{tasks.apply_late_fees.result_state}}"
+              s_eod:   "{{tasks.eod_reconciliation.result_state}}"
+              s_log:   "{{tasks.log_failure.result_state}}"
+              e_count: "{{tasks.count_eligible.error_code}}"
+              e_check: "{{tasks.check_eligible.error_code}}"
+              e_accr:  "{{tasks.nightly_accrual.error_code}}"
+              e_fees:  "{{tasks.apply_late_fees.error_code}}"
+              e_eod:   "{{tasks.eod_reconciliation.error_code}}"
+              e_log:   "{{tasks.log_failure.error_code}}"
 
 # Not represented (SKILL §6 "SSIS Checkpoints"): the package had no CheckpointFileName, so no repair-run
 # note. ProtectionLevel=EncryptSensitiveWithUserKey is a §9 governance finding: the package can only be

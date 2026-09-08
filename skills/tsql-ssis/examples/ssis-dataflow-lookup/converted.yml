@@ -1,0 +1,89 @@
+# Job + pipeline wrapper for converted.sql (LoadPaymentFact.dtsx), under skills/tsql-ssis/SKILL.md §6
+# "SSIS Data Flow Task" and "SSIS event handlers" rows.
+# Shapes per databricks-pipelines references/1-project-initialization-with-dab.md (pipeline resource:
+# catalog/schema/serverless/continuous: false/libraries glob; job with pipeline_task referencing
+# ${resources.pipelines.<name>.id}; daily periodic trigger), references/pipeline-configuration.md
+# (`configuration` key-value, read in SQL as ${key}), databricks-jobs references/task-types.md
+# ("Pipeline Task", "SQL Task": sql_task.file + warehouse_id), notifications-monitoring.md (on_failure),
+# https://docs.databricks.com/aws/en/jobs/conditional-tasks (run_if AT_LEAST_ONE_FAILED; Excluded when unmet),
+# /aws/en/jobs/parameter-use (SQL tasks read key-value parameters as :name) and
+# /aws/en/jobs/dynamic-value-references ({{job.run_id}}, {{tasks.<task_name>.result_state}},
+# {{tasks.<task_name>.error_code}}: "The error code for task <task_name> if an error occurred running the
+# task ... For successful tasks, this evaluates to an empty string").
+#
+# Mapping from source.dtsx:
+#   DFT Load fact_payment (Data Flow Task)          -> pipeline load_payment_fact (converted.sql), triggered
+#                                                      once a day like the SQL Agent schedule that ran the package.
+#   $Package::ServicerId                            -> pipeline configuration key servicer_id (${servicer_id}).
+#   User::LoadDate                                  -> no equivalent needed: the streaming checkpoint is the
+#                                                      incremental bookmark (converted.sql header).
+#   OnError handler "SQL Log OnError" -> dw.etl_log -> sql_task log_onerror, run_if AT_LEAST_ONE_FAILED after
+#                                                      the pipeline task. Same table, same columns, same event
+#                                                      literal 'OnError'; the customer's ops queries over
+#                                                      etl_log keep working. The on_failure notification is
+#                                                      an ADDITIONAL signal, not a replacement for the row.
+#   System::ErrorDescription (message column)       -> {{tasks.load_payment_fact.error_code}} plus the job run
+#                                                      id; the full error text lives in the pipeline event log,
+#                                                      which the run id keys into.
+#   Package name (package_name column)              -> the literal 'LoadPaymentFact' (System::PackageName).
+resources:
+  pipelines:
+    load_payment_fact:
+      name: load_payment_fact            # LoadPaymentFact.dtsx / DFT Load fact_payment
+      catalog: ${var.catalog}
+      schema: ${var.schema}              # dw schema of the loan_mart target catalog
+      serverless: true
+      continuous: false                  # one triggered update per day == one package execution
+      configuration:
+        servicer_id: "7"                 # $Package::ServicerId default value; read as ${servicer_id}
+      libraries:
+        - glob:
+            include: ../src/load_payment_fact/**    # converted.sql lives here
+
+  jobs:
+    load_payment_fact_job:
+      name: load_payment_fact_job
+      description: "Converted from LoadPaymentFact.dtsx (SQL Agent daily schedule)"
+      max_concurrent_runs: 1             # SSIS packages are not re-entrant
+      trigger:
+        periodic:
+          interval: 1
+          unit: DAYS
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+      email_notifications:
+        on_failure:
+          - ${var.ops_email}
+      tasks:
+        - task_key: load_payment_fact
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.load_payment_fact.id}
+            full_refresh: false          # a full refresh rebuilds fact_payment / err_payment_no_loan from all of
+                                         # payments; only used deliberately to re-load history, never on schedule
+
+        # OnError event handler: INSERT INTO dw.etl_log (package_name, event, message, logged_at)
+        # VALUES (?, 'OnError', ?, GETDATE()). Runs only when the pipeline task failed (Excluded on a clean
+        # run: docs /jobs/conditional-tasks), so clean-run semantics are unchanged.
+        # SSIS fires the handler once per error event (several rows per failed run are possible); the
+        # conversion writes exactly one row per failed run (recorded delta, NOTE.md).
+        - task_key: log_onerror
+          depends_on:
+            - task_key: load_payment_fact
+          run_if: AT_LEAST_ONE_FAILED
+          sql_task:
+            file:
+              path: ../sql/log_onerror_etl_log.sql
+              # INSERT INTO IDENTIFIER(:catalog||'.'||:schema||'.etl_log')
+              #   (package_name, event, message, logged_at)
+              # VALUES ('LoadPaymentFact', 'OnError',
+              #         'load_payment_fact ' || :result_state || ' ' || :error_code || ' run ' || :run_id,
+              #         current_timestamp());
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              run_id: "{{job.run_id}}"
+              result_state: "{{tasks.load_payment_fact.result_state}}"
+              error_code: "{{tasks.load_payment_fact.error_code}}"
