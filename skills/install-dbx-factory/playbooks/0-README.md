@@ -91,7 +91,7 @@ Each row is a way a migration goes wrong and the one thing in the kit that catch
 
 ## Design principles
 
-1. **Target is constant, source varies.** Every engagement lands on the same target shape (Unity Catalog, Delta, Databricks SQL/PySpark, Jobs or DLT, Asset Bundles). All source-stack specifics live in pluggable skills, never in the playbooks.
+1. **Target is constant, source varies.** Every engagement lands on the same target shape (Unity Catalog, Delta, Databricks SQL/PySpark, Lakeflow Jobs or Lakeflow Spark Declarative Pipelines, Declarative Automation Bundles; Lakebase for the operational track). How that target works today comes from the official `databricks` plugin via the `target-routing` skill; all source-stack specifics live in pluggable dialect skills, never in the playbooks.
 2. **Pre-migration is knowledge ingestion.** The engagement's target state and working context are captured as committed artifacts plus knowledge notes before any migration work, so child and resumed sessions start from fact instead of chat history.
 3. **Estate coverage is proven, not assumed.** The inventory proves object-level arithmetic: every mapping, job, SQL object, and script in scope is assigned to a pipeline, the shared set, or the explicitly-excluded set, with cites.
 4. **The user picks the pipeline.** Devin enumerates and recommends; it never chooses the slice or widens the scope.
@@ -166,8 +166,9 @@ Each entry records the full contract, then a decision (federate / re-point / dua
 The kit ships as two packages with different lifecycles:
 
 **The plugin (`dbx-migration-factory`)** carries everything environment-shaped and customer-invariant, versioned centrally and installed into the customer's Devin org in one step:
-- the target-convention skills and harness skills (installed with this plugin);
-- MCP servers: a Databricks MCP (workspace, jobs, Unity Catalog metadata, Statement Execution) and source-side MCPs where they exist;
+- the `target-routing` skill and a declared dependency on the official `databricks` plugin (`databricks/databricks-agent-skills`), which supplies every Databricks product skill (DBSQL, Lakeflow Pipelines/Jobs/Connect, bundles, Unity Catalog, Lakebase, serverless); the factory carries only migration-specific deltas on top;
+- the harness skills (`data-reconciliation`, `prediction-parity`, `migration-fanout`, `backfill-planner`, `governance-mapping`, `lakehouse-federation`) and the `factory-doctor` preflight;
+- enforcement hooks (`hooks.json`): a PreToolUse guard that blocks writes outside `.migration/allowed_targets.json` and non-read statements against legacy sources, and a PostToolUse hint that recognises Databricks auth/scope failures;
 - always-on rules that mirror the kit's guardrails (never modify legacy source, reference secrets by name only, write only to the migration catalog), so even off-playbook sessions inherit them;
 - accelerator tool wrappers, chiefly the `lakebridge` skill (see the catalog): install, dialect coverage, output interpretation;
 - the `install-dbx-factory` bootstrap skill, which imports the playbooks and proposes the environment blueprint.

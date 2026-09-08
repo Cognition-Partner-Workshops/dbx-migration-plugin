@@ -1,6 +1,6 @@
 ---
 name: informatica-xml
-description: Source-dialect skill for Informatica PowerCenter/IICS estates. Use when parsing Informatica XML exports, extracting mapping lineage, or converting mappings/sessions/workflows to Databricks (PySpark/DLT/Jobs). v0 stub, hardened on first engagement.
+description: Source-dialect skill for Informatica PowerCenter/IICS estates. Use when parsing Informatica XML exports, extracting mapping lineage, or converting mappings/sessions/workflows to Databricks (Lakeflow Spark Declarative Pipelines, PySpark, Lakeflow Jobs). v0 stub, hardened on first engagement.
 ---
 
 # Informatica PowerCenter / IICS Dialect (v0)
@@ -17,7 +17,7 @@ Reads: `SOURCE` definitions plus Source Qualifier SQL overrides (parse the overr
 Informatica transformation datatypes -> Delta: decimal(p,s) preserved exactly (precision loss is a recon failure), string widths dropped (Delta strings are unbounded; flag consumers relying on truncation), date/time to timestamp with the engagement timezone rule. Loss-prone rows: high-precision decimals, packed/COMP fields from mainframe sources, string trailing-space semantics.
 
 ## 4. Conversion rules
-Default target form comes from the engagement target state (PySpark or DLT). Transformation mapping to build out per engagement: Source Qualifier -> read + filter/join pushup; Expression -> withColumn chains; Aggregator -> groupBy (watch sorted-input assumptions); Lookup -> broadcast join (connected) / scalar subquery (unconnected); Update Strategy -> MERGE; Router/Filter -> when/filter; Sequence Generator -> identity column or monotonically_increasing_id with the gap-semantics difference recorded; Normalizer, Java/SQL transformations -> flag as high-risk, hand-convert.
+Default target form comes from the engagement target state (Lakeflow Spark Declarative Pipelines via `databricks-pipelines`, or PySpark on Lakeflow Jobs); use the modern `pyspark.pipelines` API, never `import dlt`. Transformation mapping to build out per engagement: Source Qualifier -> read + filter/join pushup; Expression -> withColumn chains; Aggregator -> groupBy (watch sorted-input assumptions); Lookup -> broadcast join (connected) / scalar subquery (unconnected); Update Strategy -> `create_auto_cdc_flow` in a declarative pipeline or MERGE in a job task; Router/Filter -> when/filter; Sequence Generator -> identity column or monotonically_increasing_id with the gap-semantics difference recorded; Normalizer, Java/SQL transformations -> flag as high-risk, hand-convert.
 
 ## 5. Known traps (append per engagement)
 - Session-level SQL overrides silently replace mapping logic; always diff session config against the mapping before converting.
