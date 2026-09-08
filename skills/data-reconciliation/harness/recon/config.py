@@ -108,6 +108,11 @@ class Tolerances:
     # watermark), and the number of key ranges the PK-set diff counts before streaming keys.
     cdc_lag_max_s: float = 0.0
     pk_set_ranges: int = 64
+    # A side with no pinned snapshot and no engine change token proves stillness only by
+    # (count, max watermark) markers, which miss updates below the max and balanced
+    # insert+delete pairs. False (default): such a run is not merge-eligible. True records the
+    # STOP A decision to accept marker-only evidence (Sybase ASE, logins without VIEW SERVER STATE).
+    accept_marker_only_window: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,6 +245,7 @@ def load_tolerances(path: Path) -> Tolerances:
         source_concurrency=int(data.get("source_concurrency", 1)),
         cdc_lag_max_s=float(data.get("cdc_lag_max_s", 0.0)),
         pk_set_ranges=int(data.get("pk_set_ranges", 64)),
+        accept_marker_only_window=bool(data.get("accept_marker_only_window", False)),
     )
 
 

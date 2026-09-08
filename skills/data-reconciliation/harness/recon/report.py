@@ -138,8 +138,14 @@ def render_summary(result: dict) -> str:
         iso = window["stats"].get("isolation", {})
         in_flight = {o: m["in_flight_at_open"] for o, m in window["stats"].get("markers", {}).items()
                      if m.get("in_flight_at_open")}
-        lines.append(f"- Consistency window: source isolation `{iso.get('source')}`, target isolation "
-                     f"`{iso.get('target')}`, {'held' if window['passed'] else 'MOVED'}"
+        strength = window["stats"].get("strength", {})
+        def side(name):
+            how = strength.get(name)
+            return f"`{iso.get(name)}`" + (f" ({how})" if how and how != "snapshot" else "")
+        codes = {f["check"] for f in window["findings"]}
+        state = "held" if window["passed"] else ("MOVED" if "window_unstable" in codes else "UNPROVEN")
+        lines.append(f"- Consistency window: source isolation {side('source')}, target isolation "
+                     f"{side('target')}, {state}"
                      + (f"; in flight at open: `{json.dumps(in_flight)}`" if in_flight else ""))
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")

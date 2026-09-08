@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import datetime
+import datetime as dt
 import json
 import decimal
+from decimal import Decimal
 from collections import Counter
 from typing import Any, Iterable
 
 from recon.adapters import SchemaFacts, Stratum
 from recon.paths import get_path
 from recon.canon import MISSING
+
+
+_EPOCH = dt.datetime(1970, 1, 1)  # noqa: DTZ001  fixtures use naive datetimes throughout
 
 
 def _matches(row: dict, where: str | None) -> bool:
@@ -59,6 +64,17 @@ class _TransactionalMixin:
         self.window_open = False
         # called between open and close by tests that simulate a side moving mid-run
         self.on_open = None
+        # what open_window pins: "fake_snapshot" (default) or "none" for a side whose engine
+        # refused a snapshot; with "none", `change_token` (a callable) feeds the markers
+        self.pin = "fake_snapshot"
+        self.change_token = None
+        # optional per-method failure injection: {"method": Exception}
+        self.fail_on: dict = {}
+
+    def _maybe_fail(self, method):
+        exc = self.fail_on.get(method)
+        if exc is not None:
+            raise exc
 
     def _tx_rows(self, table, where):
         return [r for r in self._all_rows(table) if _matches(r, where)]
@@ -69,39 +85,75 @@ class _TransactionalMixin:
     def open_window(self) -> str:
         self.calls["open_window"] += 1
         self.window_open = True
-        self.isolation = "fake_snapshot"
+        self.isolation = self.pin
         if self.on_open:
             self.on_open()
         return self.isolation
 
     def close_window(self) -> None:
         self.calls["close_window"] += 1
+        self._maybe_fail("close_window")
         self.window_open = False
+
+    def window_strength(self) -> str:
+        if self.isolation == "fake_snapshot":
+            return "snapshot"
+        return "change_token" if self.change_token else "markers"
 
     def window_marker(self, table, key_cols, watermark, where=None) -> tuple:
         self.calls["window_marker"] += 1
         self.statements += 1
+        self._maybe_fail("window_marker")
         rows = self._tx_rows(table, where)
         if watermark:
             vals = [r.get(watermark) for r in rows if r.get(watermark) is not None]
-            return (len(rows), max(vals) if vals else None)
-        keys = [self._tx_key(r, key_cols) for r in rows]
-        return (len(rows),) + tuple(max(k[i] for k in keys) if keys else None for i in range(len(key_cols)))
+            marker = (len(rows), max(vals) if vals else None)
+        else:
+            keys = [self._tx_key(r, key_cols) for r in rows]
+            marker = (len(rows),) + tuple(max(k[i] for k in keys) if keys else None
+                                         for i in range(len(key_cols)))
+        if self.isolation != "fake_snapshot" and self.change_token:
+            marker += (self.change_token(table),)
+        return marker
 
-    def range_counts(self, table, key_cols, ranges, where=None) -> list[int]:
-        self.calls["range_counts"] += 1
+    @staticmethod
+    def _digest(value):
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, (int, float, Decimal)):
+            return Decimal(str(value))
+        if isinstance(value, dt.datetime):
+            return Decimal(int((value.replace(tzinfo=None) - _EPOCH).total_seconds() * 1_000_000))
+        if isinstance(value, dt.date):
+            return Decimal((value - dt.date(1970, 1, 1)).days * 86_400_000_000)
+        return None
+
+    def range_fingerprints(self, table, key_cols, key_kinds, watermark, wm_kind, ranges,
+                           where=None) -> list[tuple]:
+        self.calls["range_fingerprints"] += 1
         self.statements += 1
-        keys = [self._tx_key(r, key_cols) for r in self._tx_rows(table, where)]
+        self._maybe_fail("range_fingerprints")
+        rows = self._tx_rows(table, where)
+        keyed = [(self._tx_key(r, key_cols), r.get(watermark) if watermark else None) for r in rows]
+        digestible_keys = all(kind in ("number", "datetime") for kind in key_kinds)
+        digest_wm = bool(watermark and wm_kind in ("number", "datetime"))
         out = []
         for lo, hi in ranges:
             lo = lo if lo is None or isinstance(lo, tuple) else (lo,)
             hi = hi if hi is None or isinstance(hi, tuple) else (hi,)
-            out.append(sum(1 for k in keys if (lo is None or k >= lo) and (hi is None or k <= hi)))
+            hit = [(k, wm) for k, wm in keyed if (lo is None or k >= lo) and (hi is None or k <= hi)]
+            key_sum = None
+            if digestible_keys:
+                key_sum = tuple(sum((self._digest(k[i]) or 0 for k, _ in hit), Decimal(0))
+                                for i in range(len(key_cols)))
+            wm_sum = sum((self._digest(wm) or 0 for _, wm in hit), Decimal(0)) if digest_wm else None
+            out.append((len(hit), key_sum, wm_sum))
         return out
 
     def keys_in_range(self, table, key_cols, lo, hi, where=None, extra_cols=None) -> list[tuple]:
         self.calls["keys_in_range"] += 1
         self.statements += 1
+        self._maybe_fail("keys_in_range")
         lo = lo if lo is None or isinstance(lo, tuple) else (lo,)
         hi = hi if hi is None or isinstance(hi, tuple) else (hi,)
         out = []

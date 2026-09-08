@@ -15,6 +15,7 @@ import json
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
 from .paths import get_path
@@ -32,6 +33,20 @@ class Stratum:
 
 def _as_key(value: Any) -> tuple:
     return value if isinstance(value, tuple) else (value,)
+
+
+def _digest_value(value: Any) -> Any:
+    """Normalise an engine's SUM result so equal digests compare equal across drivers
+    (Decimal('5.000000') vs int 5 vs float 5.0)."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else value
+    return value
 
 
 @dataclass
@@ -82,17 +97,30 @@ class StratifiedKeys(Protocol):
     def duplicate_key_count(self, table: str, key_cols: list[str], where: str | None = None) -> int: ...
 
 
+# How a side proves the rows it served did not change between open_window and close_window:
+#   snapshot      - the engine pinned one snapshot for the whole run (SNAPSHOT / REPEATABLE READ)
+#   change_token  - plain reads, but the markers carry an engine counter that moves on every
+#                   write to the table (SQL Server sys.dm_db_index_usage_stats.user_updates)
+#   markers       - plain reads and only (COUNT, MAX(watermark)) to compare; a write below the
+#                   max or a balanced insert+delete is invisible, so a run on this footing is
+#                   not merge-eligible unless the tolerances record that decision
+WINDOW_STRENGTHS = ("snapshot", "change_token", "markers")
+
+
 @runtime_checkable
 class TransactionalSide(Protocol):
     """What --mode transactional needs from a live side. Both sides implement it; the tiers
-    compare the two. `window_marker` is read at open and close to prove the window held."""
+    compare the two. `window_marker` is read at open and close to prove the window held;
+    `window_strength` says how much that proof is worth (see WINDOW_STRENGTHS)."""
     def open_window(self) -> str: ...
     def close_window(self) -> None: ...
+    def window_strength(self) -> str: ...
     def window_marker(self, table: str, key_cols: list[str], watermark: str | None,
                       where: str | None = None) -> tuple: ...
-    def range_counts(self, table: str, key_cols: list[str],
-                     ranges: list[tuple[tuple | None, tuple | None]],
-                     where: str | None = None) -> list[int]: ...
+    def range_fingerprints(self, table: str, key_cols: list[str], key_kinds: list[str],
+                           watermark: str | None, wm_kind: str | None,
+                           ranges: list[tuple[tuple | None, tuple | None]],
+                           where: str | None = None) -> list[tuple[int, tuple | None, Any]]: ...
     def keys_in_range(self, table: str, key_cols: list[str], lo: tuple | None, hi: tuple | None,
                       where: str | None = None, extra_cols: list[str] | None = None) -> list[tuple]: ...
     def max_watermark(self, table: str, watermark: str, where: str | None = None) -> Any: ...
@@ -136,11 +164,19 @@ class _SqlAdapterBase:
     # (the level is session-scoped on SQL Server, so a rollback alone leaves it in force).
     snapshot_reset_sql: str | None = None
 
+    # Cumulative per-table write counter read alongside the markers when no snapshot is pinned
+    # ({table} is formatted in); None when the engine exposes none.
+    change_token_sql: str | None = None
+    # Portable digests for range fingerprints: exact decimal sums compare equal across engines.
+    number_digest_sql = "CAST({col} AS DECIMAL(38,6))"
+    datetime_digest_sql: str | None = None  # whole microseconds since the epoch
+
     def __init__(self, conn):
         self._conn = conn
         self.statements = 0
         self.rows_fetched = 0
         self.isolation = "none"
+        self._token_ok: bool | None = None
 
     def _execute(self, sql: str, params=()):
         cur = self._conn.cursor()
@@ -349,6 +385,24 @@ class _SqlAdapterBase:
         if hasattr(self._conn, "rollback"):
             self._conn.rollback()
 
+    def window_strength(self) -> str:
+        if self.isolation in ("snapshot", "repeatable_read"):
+            return "snapshot"
+        return "change_token" if self._token_ok else "markers"
+
+    def _change_token(self, table: str) -> Any:
+        """Engine write counter for the table, or None when the engine has none or the login
+        cannot read it; both cases leave the window on markers alone."""
+        if not self.change_token_sql or self._token_ok is False:
+            return None
+        try:
+            (token,) = self._rows(self.change_token_sql.format(table=table))[0]
+        except Exception:  # noqa: BLE001  driver-specific error type (missing DMV / permission)
+            self._token_ok = False
+            return None
+        self._token_ok = True
+        return token
+
     def window_marker(self, table: str, key_cols: list[str], watermark: str | None,
                       where: str | None = None) -> tuple:
         w = f" WHERE {where}" if where else ""
@@ -366,7 +420,10 @@ class _SqlAdapterBase:
                 self._execute(self.snapshot_reset_sql)
             self.isolation = "none"
             row = self._rows(sql)[0]
-        return tuple(row)
+        marker = tuple(row)
+        if self.isolation not in ("snapshot", "repeatable_read"):
+            marker += (self._change_token(table),)
+        return marker
 
     def _range_predicate(self, key_cols: list[str], lo: tuple | None, hi: tuple | None,
                          offset: int) -> tuple[str, list[Any]]:
@@ -381,20 +438,45 @@ class _SqlAdapterBase:
             values += vals
         return (" AND ".join(parts) if parts else "1 = 1"), values
 
-    def range_counts(self, table: str, key_cols: list[str],
-                     ranges: list[tuple[tuple | None, tuple | None]],
-                     where: str | None = None) -> list[int]:
-        """Row count per key range, one statement for every range (SUM over CASE)."""
+    def _digest_sql(self, col: str, kind: str) -> str | None:
+        if kind == "number":
+            return self.number_digest_sql.format(col=col)
+        if kind == "datetime" and self.datetime_digest_sql:
+            return self.datetime_digest_sql.format(col=col)
+        return None
+
+    def range_fingerprints(self, table: str, key_cols: list[str], key_kinds: list[str],
+                           watermark: str | None, wm_kind: str | None,
+                           ranges: list[tuple[tuple | None, tuple | None]],
+                           where: str | None = None) -> list[tuple[int, tuple | None, Any]]:
+        """Per key range: (row count, per-key-column sums, watermark sum) in one statement (SUM
+        over CASE). Sums are exact decimals so a key swapped for another or one row's watermark
+        moved inside a range changes the fingerprint even when the count does not. A digest is
+        None when the column kind has no portable sum (strings, uuids)."""
         if not ranges:
             return []
+        key_digests = [self._digest_sql(k, kind) for k, kind in zip(key_cols, key_kinds)]
+        key_digestible = all(d is not None for d in key_digests)
+        wm_digest = self._digest_sql(watermark, wm_kind) if watermark and wm_kind else None
         exprs, values = [], []
         for lo, hi in ranges:
-            pred, vals = self._range_predicate(key_cols, lo, hi, len(values))
-            values += vals
-            exprs.append(f"SUM(CASE WHEN {pred} THEN 1 ELSE 0 END)")
+            # each CASE binds its own copy of the bounds: positional drivers cannot reuse them
+            terms = ["1"] + (key_digests if key_digestible else []) + ([wm_digest] if wm_digest else [])
+            for term in terms:
+                pred, vals = self._range_predicate(key_cols, lo, hi, len(values))
+                values += vals
+                exprs.append(f"SUM(CASE WHEN {pred} THEN {term} ELSE 0 END)")
         w = f" WHERE {where}" if where else ""
-        row = self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}", self._params(values))[0]
-        return [int(v or 0) for v in row]
+        row = list(self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}", self._params(values))[0])
+        out: list[tuple[int, tuple | None, Any]] = []
+        for _ in ranges:
+            n = int(row.pop(0) or 0)
+            keys = None
+            if key_digestible:
+                keys = tuple(_digest_value(row.pop(0)) for _ in key_cols)
+            wm = _digest_value(row.pop(0)) if wm_digest else None
+            out.append((n, keys, wm))
+        return out
 
     def keys_in_range(self, table: str, key_cols: list[str], lo: tuple | None, hi: tuple | None,
                       where: str | None = None, extra_cols: list[str] | None = None) -> list[tuple]:
@@ -465,10 +547,17 @@ def _split_table(table: str, default_schema: str | None) -> tuple[str | None, st
 class SqlServerSourceAdapter(_SqlAdapterBase):
     """Secret value: an ODBC connection string. Also the Sybase ASE stand-in for the OLTP track
     (same T-SQL catalog shape through sys.* views on SQL Server; ASE itself has no snapshot
-    isolation, which the fallback covers)."""
+    isolation and no usage-stats DMV, so there the window rests on markers alone)."""
 
     snapshot_sql = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT"
     snapshot_reset_sql = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    # Every INSERT/UPDATE/DELETE statement against the table bumps user_updates, committed or
+    # not, so a window whose token held saw no write at all. Needs VIEW SERVER STATE (2019) /
+    # VIEW DATABASE PERFORMANCE STATE (2022+) on the read-only login; without it the token is
+    # unreadable and the window is markers-only.
+    change_token_sql = ("SELECT ISNULL(SUM(user_updates), 0) FROM sys.dm_db_index_usage_stats "
+                        "WHERE database_id = DB_ID() AND object_id = OBJECT_ID('{table}')")
+    datetime_digest_sql = "CAST(DATEDIFF_BIG(MICROSECOND, '19700101', {col}) AS DECIMAL(38,0))"
 
     def __init__(self, dsn_secret: str):
         import pyodbc  # lazy: optional extra
@@ -656,6 +745,8 @@ class _PostgresBase(_SqlAdapterBase):
     """Postgres wire protocol via psycopg 3: Lakebase branches and any stand-in Postgres."""
 
     paramstyle = "format"
+    # EXTRACT returns an exact numeric on Postgres 14+ (Lakebase is 16), so no float rounding
+    datetime_digest_sql = "TRUNC(EXTRACT(EPOCH FROM {col}) * 1000000)"
 
     def open_window(self) -> str:
         """Every statement until close_window reads one REPEATABLE READ snapshot."""
@@ -798,8 +889,11 @@ class LakebaseTargetAdapter(_PostgresBase):
                       where: str | None = None) -> tuple:
         return super().window_marker(self._q(object), key_cols, watermark, where)
 
-    def range_counts(self, object: str, key_cols: list[str], ranges, where: str | None = None) -> list[int]:
-        return super().range_counts(self._q(object), key_cols, ranges, where)
+    def range_fingerprints(self, object: str, key_cols: list[str], key_kinds: list[str],
+                           watermark: str | None, wm_kind: str | None, ranges,
+                           where: str | None = None) -> list[tuple[int, tuple | None, Any]]:
+        return super().range_fingerprints(self._q(object), key_cols, key_kinds, watermark,
+                                          wm_kind, ranges, where)
 
     def keys_in_range(self, object: str, key_cols: list[str], lo, hi, where: str | None = None,
                       extra_cols: list[str] | None = None) -> list[tuple]:

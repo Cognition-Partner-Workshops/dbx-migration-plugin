@@ -82,10 +82,10 @@ databricks`) wraps tiers 1-3 in a consistency window and adds the tiers an OLTP 
 
 | Tier | Check | What a FAIL means |
 |---|---|---|
-| 0 | Consistency window: both sides pinned (SQL Server `SNAPSHOT` / Postgres `REPEATABLE READ`; falls back to marker reads and records `isolation: none` when the engine refuses), open and close markers (count, max watermark) compared | A side moved during the run; nothing graded in between is evidence. |
+| 0 | Consistency window: both sides pinned (SQL Server `SNAPSHOT` / Postgres `REPEATABLE READ`), open and close markers (count, max watermark) compared. A side whose engine refuses the snapshot records `isolation: none` and its window strength: `change_token` when the engine exposes a per-table write counter (SQL Server `sys.dm_db_index_usage_stats.user_updates`, read into the marker), else `markers` | `window_unstable`: a side moved during the run; nothing graded in between is evidence. `window_unproven`: a side ran on markers alone, which cannot see an update below the max watermark or a balanced insert+delete, so the run is not merge-eligible unless the tolerance record carries `accept_marker_only_window: true` (a STOP A decision). |
 | 1-3 | As above, but rows newer than the target's applied CDC watermark are *in flight*: a count gap within the in-flight count, and in-flight keys, are not defects | Same as the analytical tiers, on applied rows only. |
-| 5 | PK set diff: equal-count key ranges compared by count on each side, keys streamed only for ranges that differ | `pk_missing_on_target` older than the watermark = lost change; `pk_extra_on_target` = unapplied delete or stray write. |
-| 6 | CDC lag (source max watermark - target max watermark vs `cdc_lag_max_s`) and ordering (`target_ahead_of_source` = replay or out-of-order apply) | Pipeline behind or applying out of order; cutover cannot be scheduled. |
+| 5 | PK set diff: equal-count key ranges compared by fingerprint (count, sum of each key column, sum of the watermark, all as exact decimals) on each side, keys and per-key watermarks streamed only for ranges whose fingerprint differs; string/uuid keys have no portable digest, so every range streams and `stats.fingerprint` says so | `pk_missing_on_target` older than the watermark = lost change; `pk_extra_on_target` = unapplied delete or stray write. A key swapped for a stray in the same range is caught even though the count is unchanged. |
+| 6 | CDC lag (source max watermark - target max watermark vs `cdc_lag_max_s`), global ordering (`target_ahead_of_source`) and per-key ordering from the tier 5 stream: `row_ahead_of_source` (one applied row newer than its source row while the global max is not), `row_behind_applied_watermark` (a row older than its source row although the target has applied past it) | Pipeline behind, replaying, or skipping changes; cutover cannot be scheduled. |
 | 7 | Schema parity through the mapping: PK, unique, FK, NOT NULL, CHECK count, index coverage (a longer target index covers a shorter source one), and identity/sequence headroom (`sequence_behind_source`: the target's next value would collide with rows already loaded) | Constraint or index dropped in conversion, or new inserts after cutover would fail. |
 
 Tiers 5-7 run even when tier 1 fails, so a FAIL names the keys, lag, and schema gaps rather
@@ -94,7 +94,11 @@ tables, `identity`; the tolerance record needs `cdc_lag_max_s` and optionally `p
 A table without a watermark is graded strictly (no in-flight allowance). Embedded arrays are
 refused on a Lakebase target: map operational children as separate objects.
 `harness/examples/lakebase_rehearsal/` is the rehearsed SQL Server -> Postgres run (mapping,
-tolerances, DDL, loader, and two defect scripts with the findings each one must produce).
+tolerances, DDL, loader, and three defect scripts with the findings each one must produce; the
+third plants defects that keep every count and every max watermark unchanged).
+
+A tier or marker query that raises releases both windows before the error propagates; one
+side failing to close never leaves the other pinned.
 
 Aggregates and stratification run natively on each engine, so only chosen keys and their rows
 cross the wire; an adapter without stratification support falls back to a streamed key

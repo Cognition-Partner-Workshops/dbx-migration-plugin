@@ -5,14 +5,21 @@ never still, so this mode adds what a set-based diff cannot say:
 
   tier 0  consistency_window   count + max(watermark) markers on both sides at open and at
                                close; a side that moved during the run is a finding, so a PASS
-                               is scoped to a window that provably held
-  tier 5  pk_set_diff          key-range counts on both sides (one statement each), then the
-                               keys of mismatched ranges only; missing keys whose source
-                               watermark is newer than the target's applied watermark are in
-                               flight, not defects
+                               is scoped to a window that provably held. Markers alone cannot
+                               see a write below the max or a balanced insert+delete, so a side
+                               with neither a pinned snapshot nor an engine change token makes
+                               the run ineligible for merge unless the tolerances accept that
+  tier 5  pk_set_diff          key-range fingerprints on both sides (one statement each: count,
+                               exact key sums, watermark sum), then the keys and watermarks of
+                               every range whose fingerprint differs; a swapped key or a moved
+                               watermark is caught even when the counts agree. Missing keys
+                               whose source watermark is newer than the target's applied
+                               watermark are in flight, not defects
   tier 6  cdc_lag_ordering     max(source watermark) - max(target watermark) against the
-                               tolerance; a target ahead of its source is a replay/ordering
-                               violation, never lag
+                               tolerance, plus the per-key ordering that tier 5 streamed: a
+                               target row ahead of its source row is a replay/ordering
+                               violation, never lag; one behind an applied watermark is a lost
+                               or misordered change
   tier 7  schema_parity        primary key, unique, foreign-key, not-null, index coverage,
                                check-constraint count and identity/sequence headroom, mapped
                                through the spec's column names
@@ -43,10 +50,22 @@ class ObjectWindow:
 
 
 @dataclass
+class KeyDiff:
+    """What tier 5 learned from the streamed ranges of one object; tier 6 grades the ordering."""
+    missing: list[tuple] = field(default_factory=list)
+    extra: list[tuple] = field(default_factory=list)
+    in_flight_missing: int = 0
+    in_flight_updates: int = 0
+    ahead: list[tuple] = field(default_factory=list)     # target watermark newer than source
+    behind: list[tuple] = field(default_factory=list)    # target older, source already applied
+
+
+@dataclass
 class TransactionalContext:
     """Per-object facts the shared tiers consult in transactional mode."""
     windows: dict[str, ObjectWindow] = field(default_factory=dict)
     open_markers: dict[str, tuple[tuple, tuple]] = field(default_factory=dict)
+    key_diffs: dict[str, KeyDiff] = field(default_factory=dict)
 
     def in_flight(self, c: ObjectMapping) -> int:
         return self.windows.get(c.object, ObjectWindow()).in_flight
@@ -131,11 +150,36 @@ def _literal(value: Any) -> str:
     return str(value)
 
 
-def close_window(spec: MappingSpec, ctx: TransactionalContext, source, target) -> TierResult:
+def abandon_window(source, target) -> None:
+    """Release both sides after a failed run; one side's failure never keeps the other pinned."""
+    errors = []
+    for side in (source, target):
+        try:
+            side.close_window()
+        except Exception as exc:  # noqa: BLE001  driver-specific error type
+            errors.append(exc)
+    if errors:
+        raise errors[0]
+
+
+def close_window(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
+                 source, target) -> TierResult:
     findings, checks = [], 0
+    strength = {"source": source.window_strength(), "target": target.window_strength()}
     stats: dict[str, Any] = {"isolation": {"source": source.isolation if hasattr(source, "isolation") else "none",
                                            "target": target.isolation if hasattr(target, "isolation") else "none"},
-                             "markers": {}}
+                             "strength": strength, "markers": {}}
+    for side, how in strength.items():
+        if how == "markers" and not tol.accept_marker_only_window:
+            checks += 1
+            findings.append(Finding("*", "window_unproven",
+                                    f"{side} pinned no snapshot and exposes no change token: "
+                                    "(count, max watermark) markers cannot see an update below the "
+                                    "max or a balanced insert+delete, so this run cannot be merge-"
+                                    "eligible; enable snapshot isolation / grant the usage-stats "
+                                    "view, or record accept_marker_only_window in the tolerances"))
+        elif how == "markers":
+            stats.setdefault("accepted_marker_only", []).append(side)
     for c in spec.objects:
         checks += 1
         s_open, t_open = ctx.open_markers[c.object]
@@ -168,16 +212,40 @@ def _ranges(source: StratifiedKeys, c: ObjectMapping, n: int, tol: Tolerances) -
     return [(None, strata[0].lo)] + [(s.lo, s.hi) for s in strata] + [(strata[-1].hi, None)]
 
 
+def _kind(value: Any) -> str:
+    """Digest family of a key/watermark value: what portable sum the adapters can compute."""
+    if isinstance(value, bool):
+        return "other"
+    if isinstance(value, (int, float, decimal.Decimal)):
+        return "number"
+    if isinstance(value, (dt.datetime, dt.date)):
+        return "datetime"
+    return "other"
+
+
+def _fingerprint_complete(fps: list[tuple], nk: int, watermark: bool) -> bool:
+    """True when every range carries a key digest (and a watermark digest if one is declared),
+    so equal fingerprints really do mean equal key sets and equal watermarks."""
+    return all(f[1] is not None and len(f[1]) == nk and (not watermark or f[2] is not None)
+               for f in fps)
+
+
 def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                  source, target) -> TierResult:
-    """Full primary-key set comparison at range granularity, streaming keys only where the range
-    counts disagree. Cost: strata + one count statement per side per table, plus one key fetch
-    per side per mismatched range."""
+    """Full primary-key set comparison at range granularity. Both sides fingerprint every range
+    in one statement (count, exact sum per key column, sum of the watermark as epoch
+    microseconds); only ranges whose fingerprints differ stream their keys and watermarks, which
+    is where missing/extra keys and per-row ordering are graded. Keys or watermarks with no
+    portable digest (strings, uuids) stream every range instead, so the comparison stays
+    complete at the cost of the extra fetch. Cost: strata + one fingerprint statement per side
+    per table, plus one fetch per side per streamed range."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
     for c in spec.objects:
         n = source.row_count(c.root_table, c.root_where)
         checks += 1
+        diff = KeyDiff()
+        ctx.key_diffs[c.object] = diff
         if n == 0:
             t_n = target.target_row_count(c.object, c.target_where)
             stats[c.object] = {"ranges": 0, "population": 0, "target_population": t_n}
@@ -188,36 +256,73 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         if not isinstance(source, StratifiedKeys):
             raise ConfigError("tier 5 needs a source adapter with server-side key strata")
         ranges = _ranges(source, c, n, tol)
-        s_counts = source.range_counts(c.root_table, c.key_source, ranges, c.root_where)
-        t_counts = target.range_counts(c.object, c.key_target, ranges, c.target_where)
-        mismatched = [i for i, (a, b) in enumerate(zip(s_counts, t_counts)) if a != b]
+        nk = len(c.key_source)
+        has_wm = bool(c.watermark_source and c.watermark_target)
+        first = next((r[0] for r in ranges if r[0] is not None), ())
+        key_kinds = [_kind(v) for v in first] if len(first) == nk else ["other"] * nk
+        s_open_wm = ctx.open_markers[c.object][0][1] if has_wm else None
+        wm_kind = _kind(s_open_wm) if has_wm and s_open_wm is not None else None
+        s_fps = source.range_fingerprints(c.root_table, c.key_source, key_kinds, c.watermark_source,
+                                          wm_kind, ranges, c.root_where)
+        t_fps = target.range_fingerprints(c.object, c.key_target, key_kinds, c.watermark_target,
+                                          wm_kind, ranges, c.target_where)
+        complete = _fingerprint_complete(s_fps, nk, has_wm) and _fingerprint_complete(t_fps, nk, has_wm)
+        if complete:
+            streamed_ranges = [i for i, (a, b) in enumerate(zip(s_fps, t_fps)) if a != b]
+        else:
+            streamed_ranges = list(range(len(ranges)))
+        s_wm_cols = [c.watermark_source] if has_wm else []
+        t_wm_cols = [c.watermark_target] if has_wm else []
+        hwm = ctx.hwm(c)
+        # edge ranges share one key with their neighbouring stratum, so every bucket is a set
         missing: set[tuple] = set()
         extra: set[tuple] = set()
         in_flight_missing: set[tuple] = set()
-        wm_cols = [c.watermark_source] if c.watermark_source else []
-        nk = len(c.key_source)
+        in_flight_updates: set[tuple] = set()
+        ahead: set[tuple] = set()
+        behind: set[tuple] = set()
         streamed = 0
-        for i in mismatched:
+        for i in streamed_ranges:
             lo, hi = ranges[i]
-            s_keys = source.keys_in_range(c.root_table, c.key_source, lo, hi, c.root_where, wm_cols)
-            t_keys = target.keys_in_range(c.object, c.key_target, lo, hi, c.target_where)
+            s_keys = source.keys_in_range(c.root_table, c.key_source, lo, hi, c.root_where, s_wm_cols)
+            t_keys = target.keys_in_range(c.object, c.key_target, lo, hi, c.target_where, t_wm_cols)
             streamed += len(s_keys) + len(t_keys)
             s_index = {tuple(k[:nk]): k[nk:] for k in s_keys}
-            t_set = {tuple(k[:nk]) for k in t_keys}
+            t_index = {tuple(k[:nk]): k[nk:] for k in t_keys}
             for key, rest in s_index.items():
-                if key in t_set:
+                s_wm = rest[0] if has_wm and rest else None
+                unapplied = has_wm and hwm is not None and s_wm is not None and _later(s_wm, hwm)
+                if key not in t_index:
+                    if unapplied:
+                        in_flight_missing.add(key)
+                    else:
+                        missing.add(key)
                     continue
-                if wm_cols and ctx.hwm(c) is not None and rest and rest[0] is not None \
-                        and _later(rest[0], ctx.hwm(c)):
-                    in_flight_missing.add(key)
+                if not has_wm:
+                    continue
+                t_wm = t_index[key][0] if t_index[key] else None
+                if s_wm == t_wm or (s_wm is None and t_wm is None):
+                    continue
+                if t_wm is not None and (s_wm is None or _later(t_wm, s_wm)):
+                    ahead.add(key)
+                elif unapplied:
+                    in_flight_updates.add(key)
                 else:
-                    missing.add(key)
-            extra |= {k for k in t_set if k not in s_index}
+                    behind.add(key)
+            extra |= {k for k in t_index if k not in s_index}
         missing_l, extra_l = sorted(missing, key=repr), sorted(extra, key=repr)
+        diff.missing, diff.extra, diff.in_flight_missing = missing_l, extra_l, len(in_flight_missing)
+        diff.in_flight_updates = len(in_flight_updates)
+        diff.ahead, diff.behind = sorted(ahead, key=repr), sorted(behind, key=repr)
         stats[c.object] = {"ranges": len(ranges), "population": n,
-                           "mismatched_ranges": len(mismatched), "keys_streamed": streamed,
+                           "fingerprint": "count+key_sum" + ("+watermark_sum" if has_wm else "")
+                           if complete else "unavailable: every range streamed",
+                           "mismatched_ranges": len(streamed_ranges), "keys_streamed": streamed,
                            "missing_on_target": len(missing_l), "extra_on_target": len(extra_l),
-                           "in_flight_missing": len(in_flight_missing)}
+                           "in_flight_missing": len(in_flight_missing),
+                           "in_flight_updates": diff.in_flight_updates,
+                           "rows_ahead_on_target": len(diff.ahead),
+                           "rows_behind_on_target": len(diff.behind)}
         if missing_l:
             findings.append(Finding(c.object, "pk_missing_on_target",
                                     f"{len(missing_l)} source keys absent on target; first "
@@ -244,9 +349,24 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         s_open, t_open = ctx.open_markers[c.object]
         s_wm, t_wm = s_open[1], t_open[1]
         lag = _lag_seconds(s_wm, t_wm)
+        diff = ctx.key_diffs.get(c.object, KeyDiff())
         stats[c.object] = {"watermark": f"{c.watermark_source}->{c.watermark_target}",
                            "source_max": s_wm, "target_max": t_wm, "lag_s": lag,
-                           "in_flight": ctx.in_flight(c)}
+                           "in_flight": ctx.in_flight(c),
+                           "rows_ahead_on_target": len(diff.ahead),
+                           "rows_behind_on_target": len(diff.behind)}
+        if diff.ahead:
+            findings.append(Finding(c.object, "row_ahead_of_source",
+                                    f"{len(diff.ahead)} target rows carry a newer {c.watermark_target} "
+                                    f"than their source row: replay or out-of-order apply; first "
+                                    f"{min(len(diff.ahead), MAX_KEYS_IN_FINDING)}: "
+                                    f"{diff.ahead[:MAX_KEYS_IN_FINDING]}"))
+        if diff.behind:
+            findings.append(Finding(c.object, "row_behind_applied_watermark",
+                                    f"{len(diff.behind)} source rows changed at or before the target's "
+                                    f"applied watermark {t_wm!r} but the target row is older: lost or "
+                                    f"misordered change; first {min(len(diff.behind), MAX_KEYS_IN_FINDING)}: "
+                                    f"{diff.behind[:MAX_KEYS_IN_FINDING]}"))
         if s_wm is None and t_wm is None:
             continue
         if lag is None:

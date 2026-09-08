@@ -150,7 +150,26 @@ def test_pk_set_diff_reports_missing_and_extra_keys_only_for_mismatched_ranges()
     assert stats["missing_on_target"] == 2 and stats["extra_on_target"] == 1
     # only the mismatched ranges streamed keys, never the whole table
     assert stats["keys_streamed"] < 2 * len(loans)
-    assert source.calls["range_counts"] == 2 and target.calls["range_counts"] == 2
+    assert source.calls["range_fingerprints"] == 2 and target.calls["range_fingerprints"] == 2
+    assert stats["fingerprint"] == "count+key_sum+watermark_sum"
+
+
+def test_a_key_swapped_for_another_in_the_same_range_is_caught_when_counts_agree():
+    # one source key absent, one stray target key present in the same range: the range counts
+    # are equal, only the key digest differs; tier 3 is sampled so it may fetch neither row
+    _, borrowers = _rows()
+    loans = [_loan(2 * i, changed=i, borrower_id=1 + i % 3) for i in range(1, 41)]  # even keys
+    tgt = [dict(r) for r in loans if r["loan_id"] != 74]
+    tgt.append(_loan(75, changed=37, borrower_id=1))
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, sample_size=2), depth="sampled")
+    pk = _tier(result, "pk_set_diff")
+    assert result["verdict"] == "FAIL"
+    assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
+    assert "(74,)" in pk["findings"][0]["detail"] and "(75,)" in pk["findings"][1]["detail"]
+    stats = pk["stats"]["loans"]
+    assert stats["mismatched_ranges"] == 1 and stats["keys_streamed"] < len(loans)
+    assert _tier(result, "counts_through_mapping")["passed"] is True  # counts alone saw nothing
 
 
 def test_in_flight_rows_are_not_defects_when_lag_is_tolerated():
@@ -221,8 +240,209 @@ def test_target_ahead_of_source_is_an_ordering_violation_not_lag():
     source, target = _sides(loans, tgt, borrowers)
     result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=1000))
     assert result["verdict"] == "FAIL"
-    assert _codes(result, "cdc_lag_ordering") == ["target_ahead_of_source"]
+    assert _codes(result, "cdc_lag_ordering") == ["row_ahead_of_source", "target_ahead_of_source"]
     assert "row_ahead_of_source" in _codes(result, "keyed_diffs")
+
+
+def test_one_row_ahead_of_its_source_is_caught_when_the_global_max_is_not():
+    # loan 3 on the target carries a newer watermark than its source row, but loan 40 (the
+    # global max on both sides) is untouched, so max(target) is not ahead of max(source);
+    # tier 3 samples two keys and may never fetch loan 3
+    loans, borrowers = _rows(40)
+    tgt = [dict(r) for r in loans]
+    tgt[2]["modified_date"] = _ts(30)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, sample_size=2),
+                  depth="sampled")
+    assert result["verdict"] == "FAIL"
+    cdc = _tier(result, "cdc_lag_ordering")
+    assert [f["check"] for f in cdc["findings"]] == ["row_ahead_of_source"]
+    assert "(3,)" in cdc["findings"][0]["detail"]
+    assert cdc["stats"]["loans"]["lag_s"] == 0.0
+    assert _tier(result, "pk_set_diff")["stats"]["loans"]["mismatched_ranges"] == 1
+
+
+def test_a_row_behind_the_applied_watermark_is_a_lost_change_not_lag():
+    # the target applied up to loan 12 (its watermark) but loan 5's row still shows an older
+    # modified_date than its source: the change was skipped or applied out of order
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    tgt[4]["modified_date"] = _ts(1)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=1000), depth="full")
+    assert result["verdict"] == "FAIL"
+    assert "row_behind_applied_watermark" in _codes(result, "cdc_lag_ordering")
+
+
+def test_an_unapplied_update_in_flight_is_not_an_ordering_finding():
+    # loans 11 and 12 changed on the source after the target's applied watermark (_ts(10)): the
+    # target still holds their previous versions, which is lag, not a defect
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    tgt[10]["modified_date"] = _ts(9)
+    tgt[11]["modified_date"] = _ts(10)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=5))
+    assert result["verdict"] == "PASS", result
+    assert _tier(result, "pk_set_diff")["stats"]["loans"]["in_flight_updates"] == 2
+
+
+def test_string_keys_stream_every_range_rather_than_trusting_counts():
+    loans, borrowers = _rows(12)
+    spec = _spec()
+    spec.objects[0].key_source[:] = ["loan_number"]
+    spec.objects[0].key_target[:] = ["loan_number"]
+    tgt = [dict(r) for r in loans if r["loan_id"] != 7]
+    tgt.append(_loan(7, changed=7, borrower_id=1) | {"loan_number": "LN99999"})
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=spec, tol=Tolerances("t1", pk_set_ranges=4))
+    pk = _tier(result, "pk_set_diff")
+    assert pk["stats"]["loans"]["fingerprint"] == "unavailable: every range streamed"
+    assert pk["stats"]["loans"]["mismatched_ranges"] == pk["stats"]["loans"]["ranges"]
+    assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
+
+
+def _marker_only(source):
+    source.pin = "none"
+    return source
+
+
+def test_a_side_without_snapshot_or_change_token_is_not_merge_eligible():
+    loans, borrowers = _rows(12)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    result = _run(_marker_only(source), target)
+    window = _tier(result, "consistency_window")
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    assert [f["check"] for f in window["findings"]] == ["window_unproven"]
+    assert "source" in window["findings"][0]["detail"]
+    assert window["stats"]["strength"] == {"source": "markers", "target": "snapshot"}
+    assert window["stats"]["isolation"]["source"] == "none"
+    assert ("- Consistency window: source isolation `none` (markers), target isolation "
+            "`fake_snapshot`, UNPROVEN") in render_summary(result)
+
+
+def test_marker_only_window_is_accepted_only_by_a_recorded_tolerance():
+    loans, borrowers = _rows(12)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    result = _run(_marker_only(source), target, tol=Tolerances("t1", accept_marker_only_window=True))
+    assert result["verdict"] == "PASS" and result["merge_eligible"] is True
+    window = _tier(result, "consistency_window")
+    assert window["stats"]["accepted_marker_only"] == ["source"]
+
+
+def _tokened(source, counter):
+    """A marker-fallback source whose engine exposes a per-table write counter."""
+    source.pin = "none"
+    source.change_token = lambda table: counter[table]
+    return source
+
+
+def test_an_update_below_the_max_watermark_during_fallback_is_caught_by_the_change_token():
+    loans, borrowers = _rows(12)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    writes = {"dbo.loans": 10, "dbo.borrowers": 3}
+    _tokened(source, writes)
+    original = source.range_fingerprints
+
+    def write_mid_run(*a, **kw):
+        # count and max(modified_date) are unchanged: loan 2 is edited in place
+        loans[1]["current_balance"] += 1
+        writes["dbo.loans"] += 1
+        return original(*a, **kw)
+    source.range_fingerprints = write_mid_run
+    result = _run(source, target)
+    assert result["verdict"] == "FAIL"
+    window = _tier(result, "consistency_window")
+    assert [f["check"] for f in window["findings"]] == ["window_unstable"]
+    assert window["stats"]["strength"]["source"] == "change_token"
+    assert window["stats"]["markers"]["loans"]["source_open"][:2] == \
+        window["stats"]["markers"]["loans"]["source_close"][:2]
+    assert "source isolation `none` (change_token), target isolation `fake_snapshot`, MOVED" in \
+        render_summary(result)
+
+
+def test_a_balanced_insert_and_delete_during_fallback_is_caught_by_the_change_token():
+    loans, borrowers = _rows(12)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    writes = {"dbo.loans": 10, "dbo.borrowers": 3}
+    _tokened(source, writes)
+    original = source.range_fingerprints
+
+    def churn_mid_run(*a, **kw):
+        # delete loan 5 and insert a new loan 5 twin with an older watermark: count and max hold
+        loans[:] = [r for r in loans if r["loan_id"] != 5] + [_loan(13, changed=1, borrower_id=1)]
+        writes["dbo.loans"] += 2
+        return original(*a, **kw)
+    source.range_fingerprints = churn_mid_run
+    result = _run(source, target)
+    assert result["verdict"] == "FAIL"
+    assert "window_unstable" in _codes(result, "consistency_window")
+    assert result["merge_eligible"] is False
+
+
+def test_the_same_writes_are_invisible_to_markers_alone_and_that_is_why_they_do_not_pass():
+    # sanity check of the premise: without a token the markers hold, and the only thing that
+    # stops a merge is the window_unproven finding
+    loans, borrowers = _rows(12)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    _marker_only(source)
+    original = source.range_fingerprints
+
+    def write_mid_run(*a, **kw):
+        loans[1]["current_balance"] += 1
+        return original(*a, **kw)
+    source.range_fingerprints = write_mid_run
+    result = _run(source, target)
+    assert _codes(result, "consistency_window") == ["window_unproven"]
+    assert result["merge_eligible"] is False
+
+
+def test_a_shared_tier_that_raises_still_closes_both_windows():
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    def failing_target_count(object, where=None):
+        raise RuntimeError("connection reset during tier 1")
+    target.target_row_count = failing_target_count
+    with pytest.raises(RuntimeError, match="tier 1"):
+        _run(source, target)
+    assert source.calls["close_window"] == 1 and target.calls["close_window"] == 1
+    assert not source.window_open and not target.window_open
+
+
+def test_a_transactional_tier_that_raises_still_closes_both_windows():
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    target.fail_on["range_fingerprints"] = RuntimeError("lakebase branch went away")
+    with pytest.raises(RuntimeError, match="lakebase"):
+        _run(source, target)
+    assert source.calls["close_window"] == 1 and target.calls["close_window"] == 1
+
+
+def test_a_failing_marker_query_at_open_still_closes_both_windows():
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    target.fail_on["window_marker"] = RuntimeError("permission denied for marker")
+    with pytest.raises(RuntimeError, match="marker"):
+        _run(source, target)
+    assert source.calls["close_window"] == 1 and target.calls["close_window"] == 1
+
+
+def test_one_side_failing_to_close_does_not_leave_the_other_pinned():
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    target.fail_on["range_fingerprints"] = RuntimeError("tier failure")
+    source.fail_on["close_window"] = RuntimeError("source rollback failed")
+    with pytest.raises(RuntimeError, match="source rollback failed"):
+        _run(source, target)
+    assert target.calls["close_window"] == 1 and not target.window_open
+
+
+def test_a_clean_run_closes_each_window_exactly_once():
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    result = _run(source, target)
+    assert result["verdict"] == "PASS"
+    assert source.calls["close_window"] == 1 and target.calls["close_window"] == 1
 
 
 def test_field_diff_is_still_graded_for_applied_rows():
