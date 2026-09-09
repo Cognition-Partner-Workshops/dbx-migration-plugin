@@ -16,6 +16,7 @@ from recon.adapters import (
     _index_key_text,
     _PostgresBase,
     _SqlAdapterBase,
+    SqlServerSourceAdapter,
 )
 from recon.cli import main
 from recon.config import (
@@ -1558,6 +1559,25 @@ def test_watermark_literal_carries_the_utc_offset_only_where_the_engine_needs_it
     assert _newer_predicate("modified_date", hwm, generic.watermark_literal) == \
         "modified_date >= '2026-09-08 16:43:52.164113'"
     assert pg.watermark_literal(41) == generic.watermark_literal(41) == "41"
+
+
+class _SqlServerLike(SqlServerSourceAdapter):
+    def __init__(self, conn):
+        _SqlAdapterBase.__init__(self, conn)
+
+
+def test_sql_server_types_the_datetime_bound_so_coarse_columns_compare_exactly():
+    # a bare literal is converted to the column's type first: datetime (3.33 ms ticks) and
+    # smalldatetime (minutes) would round the next-microsecond bound back onto the watermark,
+    # so rows equal to the applied HWM would count as in flight and leave the tier 2 aggregates
+    hwm = dt.datetime(2026, 1, 1, 10, 0, 0, 167000)  # noqa: DTZ001  naive = UTC by contract
+    mssql = _SqlServerLike(_StubConn())
+    assert _newer_predicate("modified_date", hwm, mssql.watermark_literal) == \
+        "modified_date >= CAST('2026-01-01 10:00:00.167001' AS datetime2(7))"
+    assert _applied_predicate("modified_date", hwm, mssql.watermark_literal) == \
+        "(modified_date < CAST('2026-01-01 10:00:00.167001' AS datetime2(7)) OR modified_date IS NULL)"
+    assert mssql.watermark_literal(41) == "41"
+    assert mssql.watermark_literal(dt.date(2026, 1, 1)) == "'2026-01-01'"
 
 
 def test_transactional_predicates_use_the_source_engine_literal(monkeypatch):

@@ -8,6 +8,7 @@ import uuid
 import pytest
 
 from recon.adapters import SqlServerSourceAdapter
+from recon.transactional import _applied_predicate, _newer_predicate
 
 pyodbc = pytest.importorskip("pyodbc")
 
@@ -83,3 +84,27 @@ def test_a_nullable_unique_key_keeps_one_null_row(schema, monkeypatch):
     assert facts.unique_nulls_equal == {("Other_ID",)}
     assert "Other_ID" not in facts.not_null
 
+
+
+def test_datetime_bounds_are_exact_on_every_datetime_family_column(schema, monkeypatch):
+    # rows equal to the applied watermark are applied, the next tick is in flight, on datetime
+    # (3.33 ms ticks), smalldatetime (minutes) and datetime2(7) alike; a bare literal would be
+    # converted to the column's type first (datetime rejects the 6-digit form outright)
+    monkeypatch.setenv("RECON_TEST_SOURCE", os.environ[DSN_VAR])
+    source = SqlServerSourceAdapter("RECON_TEST_SOURCE")
+    conn = pyodbc.connect(os.environ[DSN_VAR], autocommit=True)
+    cur = conn.cursor()
+    cur.execute(f"CREATE TABLE {schema}.Stamps (Id INT PRIMARY KEY, D DATETIME, SD SMALLDATETIME, D2 DATETIME2(7))")
+    cur.execute(f"INSERT INTO {schema}.Stamps VALUES (1, '2026-01-01 10:00:00.163', '2026-01-01 10:00:00', '2026-01-01 10:00:00.1630000')")
+    cur.execute(f"INSERT INTO {schema}.Stamps VALUES (2, '2026-01-01 10:00:00.167', '2026-01-01 10:01:00', '2026-01-01 10:00:00.1670000')")
+    cur.execute(f"INSERT INTO {schema}.Stamps VALUES (3, '2026-01-01 10:00:00.170', '2026-01-01 10:02:00', '2026-01-01 10:00:00.1700000')")
+    try:
+        (d, sd, d2) = cur.execute(f"SELECT D, SD, D2 FROM {schema}.Stamps WHERE Id = 2").fetchone()
+        for column, hwm in (("D", d), ("SD", sd), ("D2", d2)):
+            newer = _newer_predicate(column, hwm, source.watermark_literal)
+            applied = _applied_predicate(column, hwm, source.watermark_literal)
+            assert source.row_count(f"{schema}.Stamps", newer) == 1, column
+            assert source.row_count(f"{schema}.Stamps", applied) == 2, column
+    finally:
+        cur.execute(f"DROP TABLE {schema}.Stamps")
+        conn.close()

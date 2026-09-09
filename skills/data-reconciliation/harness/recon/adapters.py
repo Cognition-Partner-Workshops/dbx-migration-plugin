@@ -289,6 +289,10 @@ class _SqlAdapterBase:
     square_digest_sql = "CAST({r} * {r} AS DECIMAL(38,0))"
     # Whether datetime watermark literals carry an explicit +00:00 (see watermarks.literal).
     watermark_literal_utc_offset = False
+    # How a datetime watermark literal is typed for a predicate against this engine. The bound
+    # sits one microsecond past the applied watermark, so the engine must compare it at that
+    # precision rather than convert it to the column's coarser type first.
+    datetime_bound_sql = "{lit}"
 
     def __init__(self, conn):
         self._conn = conn
@@ -559,7 +563,8 @@ class _SqlAdapterBase:
 
     def watermark_literal(self, value: Any) -> str:
         """How this engine wants a watermark bound in a predicate against its own column."""
-        return watermark_literal(value, utc_offset=self.watermark_literal_utc_offset)
+        lit = watermark_literal(value, utc_offset=self.watermark_literal_utc_offset)
+        return self.datetime_bound_sql.format(lit=lit) if isinstance(value, dt.datetime) else lit
 
     def _change_token(self, table: str) -> Any:
         """Engine write counter for the table, or None when the engine has none or the login
@@ -837,6 +842,11 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
     change_token_sql = ("SELECT ISNULL(SUM(user_updates), 0) FROM sys.dm_db_index_usage_stats "
                         "WHERE database_id = DB_ID() AND object_id = OBJECT_ID('{table}')")
     datetime_digest_sql = "CAST(DATEDIFF_BIG(MICROSECOND, '19700101', {col}) AS DECIMAL(38,0))"
+    # A bare literal against a datetime / smalldatetime column is converted to that column's
+    # type first (datetime rejects 6 fractional digits outright; a shorter literal would round
+    # to the 3.33 ms tick or the minute and could land back on the watermark itself). Typing
+    # the bound makes the comparison exact for every datetime family column.
+    datetime_bound_sql = "CAST({lit} AS datetime2(7))"
 
     def __init__(self, dsn_secret: str):
         import pyodbc  # lazy: optional extra
