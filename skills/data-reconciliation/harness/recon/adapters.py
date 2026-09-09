@@ -86,6 +86,10 @@ class SchemaFacts:
     table: str = ""
     primary_key: tuple[str, ...] = ()
     unique: set[tuple[str, ...]] = field(default_factory=set)
+    # the unique keys whose engine treats NULL keys as equal, so a second row with a NULL key is
+    # rejected (SQL Server/ASE always; Postgres only under UNIQUE NULLS NOT DISTINCT). A key
+    # absent here follows the SQL standard: NULLs are distinct and any number of them pass.
+    unique_nulls_equal: set[tuple[str, ...]] = field(default_factory=set)
     foreign_keys: set[tuple[tuple[str, ...], str, tuple[str, ...]]] = field(default_factory=set)
     # (on update, on delete) per foreign key, spelled `no action` / `cascade` / `set null` /
     # `set default`; RESTRICT is folded into `no action` (same outcome, engine-specific timing)
@@ -777,6 +781,7 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
                 facts.partial.add(tuple(cols))
             elif is_unique:
                 facts.unique.add(tuple(cols))
+                facts.unique_nulls_equal.add(tuple(cols))
             else:
                 facts.indexes.add(tuple(cols))
         rows = self._rows(
@@ -1019,9 +1024,10 @@ class _PostgresBase(_SqlAdapterBase):
             elif ctype == "c":
                 facts.check_count += 1
         # attnum 0 in indkey marks an expression key; a LEFT JOIN keeps those indexes visible
+        nulls_equal = "ix.indnullsnotdistinct" if self._server_version() >= 150000 else "FALSE"
         rows = self._rows(
             "SELECT ix.indexrelid, ix.indisunique, ix.indpred IS NOT NULL, ix.indexprs IS NOT NULL, "
-            "a.attname, k.ord, pg_get_indexdef(ix.indexrelid) "
+            f"a.attname, k.ord, pg_get_indexdef(ix.indexrelid), {nulls_equal} "
             "FROM pg_index ix JOIN pg_class c ON c.oid = ix.indrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON k.ord <= ix.indnkeyatts "
@@ -1030,10 +1036,10 @@ class _PostgresBase(_SqlAdapterBase):
             "AND ix.indisvalid AND ix.indisready AND ix.indislive "
             "ORDER BY ix.indexrelid, k.ord", (schema, name))
         by_index: dict[Any, dict[str, Any]] = {}
-        for indexrelid, is_unique, is_partial, has_exprs, col, _ord, indexdef in rows:
+        for indexrelid, is_unique, is_partial, has_exprs, col, _ord, indexdef, nulls_eq in rows:
             entry = by_index.setdefault(indexrelid, {
                 "cols": [], "unique": bool(is_unique), "partial": bool(is_partial),
-                "expr": bool(has_exprs), "def": indexdef})
+                "expr": bool(has_exprs), "def": indexdef, "nulls_equal": bool(nulls_eq)})
             entry["cols"].append(col)
         for entry in by_index.values():
             if entry["expr"]:
@@ -1046,6 +1052,8 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.partial.add(tuple(entry["cols"]))
             elif entry["unique"]:
                 facts.unique.add(tuple(entry["cols"]))
+                if entry["nulls_equal"]:
+                    facts.unique_nulls_equal.add(tuple(entry["cols"]))
             else:
                 facts.indexes.add(tuple(entry["cols"]))
         rows = self._rows(
@@ -1062,13 +1070,26 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.identity_columns.add(col)
         return facts
 
+    def _server_version(self) -> int:
+        if not hasattr(self, "_server_version_num"):
+            (v,) = self._rows("SELECT current_setting('server_version_num')")[0]
+            self._server_version_num = int(v)
+        return self._server_version_num
+
     def numeric_columns(self, table: str) -> set[str]:
         schema, name = _split_table(table, "public")
+        # a domain (typtype 'd') is classified by the base type at the bottom of its chain
         rows = self._rows(
-            "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid "
-            "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped "
-            "AND t.typname IN ('int2', 'int4', 'int8', 'numeric', 'float4', 'float8', 'money')",
+            "WITH RECURSIVE col_type AS ("
+            "  SELECT a.attname, t.typname, t.typtype, t.typbasetype "
+            "  FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "  JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid "
+            "  WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped "
+            "  UNION ALL "
+            "  SELECT ct.attname, t.typname, t.typtype, t.typbasetype "
+            "  FROM col_type ct JOIN pg_type t ON t.oid = ct.typbasetype WHERE ct.typtype = 'd') "
+            "SELECT attname FROM col_type WHERE typtype <> 'd' "
+            "AND typname IN ('int2', 'int4', 'int8', 'numeric', 'float4', 'float8', 'money')",
             (schema, name))
         return {col for (col,) in rows}
 

@@ -501,6 +501,7 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         table=_norm_table(f.table),
         primary_key=tuple(x.lower() for x in f.primary_key),
         unique={tuple(x.lower() for x in u) for u in f.unique},
+        unique_nulls_equal={tuple(x.lower() for x in u) for u in f.unique_nulls_equal},
         foreign_keys={_lower_fk(fk) for fk in f.foreign_keys},
         foreign_key_actions={_lower_fk(fk): a for fk, a in f.foreign_key_actions.items()},
         not_null={x.lower() for x in f.not_null},
@@ -601,11 +602,28 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
             if frozenset(want) not in target_unique:
                 findings.append(Finding(c.object, "unique_missing",
                                         f"source unique {u} has no target unique {want}"))
-            elif want not in t_lower.unique:
-                have = next(t for t in sorted(t_lower.unique) if frozenset(t) == frozenset(want))
+                continue
+            have = next(t for t in sorted(t_lower.unique) if frozenset(t) == frozenset(want))
+            if have != want:
                 stats.setdefault("unique_reordered", []).append(
                     f"{c.object}: source unique {u} is enforced on the target as {have}, not "
                     f"{want}; same constraint, different access path")
+            # the same column set still admits different rows when a key column is nullable:
+            # an engine that treats NULL keys as equal keeps one NULL row, one that treats them
+            # as distinct keeps any number. Irrelevant while every key column is NOT NULL.
+            if all(col in s.not_null for col in u):
+                continue
+            s_eq, t_eq = u in s.unique_nulls_equal, have in t_lower.unique_nulls_equal
+            if s_eq and not t_eq:
+                findings.append(Finding(c.object, "unique_nulls_equal_missing",
+                                        f"source unique {u} allows one NULL key; target unique {have} "
+                                        "treats NULLs as distinct, so duplicate NULL keys the source "
+                                        "rejects would be accepted", "nulls equal", "nulls distinct"))
+            elif t_eq and not s_eq:
+                tightened(Finding(c.object, "unique_nulls_equal_extra",
+                                  f"target unique {have} allows one NULL key; source unique {u} "
+                                  "treats NULLs as distinct, so a second legacy-valid NULL key would "
+                                  "be rejected", "nulls distinct", "nulls equal"))
         for u in sorted(t_lower.unique):
             if frozenset(u) in expected_unique or frozenset(u) == frozenset(t_lower.primary_key):
                 continue
@@ -787,6 +805,7 @@ def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any
 
 def _facts_dict(f: SchemaFacts) -> dict:
     return {"primary_key": list(f.primary_key), "unique": sorted(map(list, f.unique)),
+            "unique_nulls_equal": sorted(map(list, f.unique_nulls_equal)),
             "foreign_keys": sorted([list(c), r, list(rc), *f.foreign_key_actions.get((c, r, rc), ())]
                                    for c, r, rc in f.foreign_keys),
             "not_null": sorted(f.not_null), "indexes": sorted(map(list, f.indexes)),

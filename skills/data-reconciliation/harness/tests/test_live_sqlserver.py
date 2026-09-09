@@ -53,3 +53,15 @@ def test_disabled_constraints_never_count_as_enforced(schema, monkeypatch):
     assert facts.foreign_key_actions == {fk: ("cascade", "no action")}
     assert facts.check_count == 1
     assert facts.not_null == {"Child_ID", "Parent_ID"}
+
+
+def test_a_nullable_unique_key_keeps_one_null_row(schema, monkeypatch):
+    # SQL Server treats NULL as a value for uniqueness: a unique index admits one NULL key,
+    # unlike a default Postgres unique which admits any number of them
+    monkeypatch.setenv("RECON_TEST_SOURCE", os.environ[DSN_VAR])
+    source = SqlServerSourceAdapter("RECON_TEST_SOURCE")
+    facts = source.schema_facts(f"{schema}.Parent")
+    assert facts.unique == {("Other_ID",)}
+    assert facts.unique_nulls_equal == {("Other_ID",)}
+    assert "Other_ID" not in facts.not_null
+

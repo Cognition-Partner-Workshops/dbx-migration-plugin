@@ -1459,6 +1459,41 @@ def test_composite_unique_is_unordered_but_a_composite_index_is_not(src, tgt, co
         assert "('borrower_id', 'loan_number')" in line and "('loan_number', 'borrower_id')" in line
 
 
+@pytest.mark.parametrize("src, tgt, codes, accepted", [
+    # SQL Server keeps one NULL loan_number; a default Postgres unique keeps any number of them
+    ({"unique_nulls_equal": {("loan_number",)}}, {}, ["unique_nulls_equal_missing"], []),
+    # the reverse tightens the target: a second NULL the legacy app writes today is rejected
+    ({}, {"unique_nulls_equal": {("loan_number",)}}, ["unique_nulls_equal_extra"], ["unique_nulls_equal_extra"]),
+    ({"unique_nulls_equal": {("loan_number",)}}, {"unique_nulls_equal": {("loan_number",)}}, [], []),
+    ({}, {}, [], []),
+])
+def test_nullable_unique_keys_must_agree_on_how_nulls_compare(src, tgt, codes, accepted):
+    loans, borrowers = _rows(6)
+    nullable = LOANS_FACTS.not_null - {"loan_number"}
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
+                            tgt_facts=_tightened(not_null=nullable, **tgt))
+    source.schema["dbo.loans"] = _facts(LOANS_FACTS, not_null=nullable, **src)
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == codes
+    if codes:
+        (f,) = _tier(result, "schema_parity")["findings"]
+        assert "('loan_number',)" in f["detail"] and {f["source_value"], f["target_value"]} == {repr("nulls equal"), repr("nulls distinct")}
+    result = _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))
+    assert _codes(result, "schema_parity") == [c for c in codes if c not in accepted]
+    assert result["verdict"] == "PASS" or codes != accepted
+
+
+def test_null_semantics_are_not_graded_while_every_key_column_is_not_null():
+    # loan_number is NOT NULL on both sides: no NULL key can ever exist, so the engines' NULL
+    # handling cannot disagree on a real row
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    source.schema["dbo.loans"] = _facts(LOANS_FACTS, unique_nulls_equal={("loan_number",)})
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == []
+    assert _tier(result, "schema_parity")["stats"]["loans"]["source"]["unique_nulls_equal"] == [["loan_number"]]
+
+
 def _undeclared_spec() -> MappingSpec:
     # a field with no declared target type: tier 2 has to find out whether it takes a SUM
     loans = _spec().objects[0]

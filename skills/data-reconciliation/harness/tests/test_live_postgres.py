@@ -170,3 +170,46 @@ def test_catalog_typing_spares_the_repeatable_read_window_that_a_sum_probe_ends(
         assert source.field_aggregates(table, "amount")["sum"] == Decimal("1050.00")  # the write shows
     finally:
         source._conn.close()
+
+
+def test_unique_null_semantics_follow_the_index_declaration(schema, monkeypatch):
+    dsn = os.environ[DSN_VAR]
+    table = f"{schema}.u"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        (version,) = conn.execute("SELECT current_setting('server_version_num')::int").fetchone()
+        conn.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY, a INT, b INT, UNIQUE (a))")
+        if version >= 150000:
+            conn.execute(f"CREATE UNIQUE INDEX u_b_nnd ON {table} (b) NULLS NOT DISTINCT")
+    monkeypatch.setenv("RECON_TEST_TARGET", dsn)
+    target = LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), schema)
+    facts = target.schema_facts("u")
+    # a default unique lets any number of NULL keys through, so it is not in the nulls-equal set
+    assert ("a",) in facts.unique and ("a",) not in facts.unique_nulls_equal
+    if version >= 150000:
+        assert facts.unique_nulls_equal == {("b",)}
+    else:
+        assert facts.unique_nulls_equal == set()
+    assert facts.unique == {("a",), ("b",)} if version >= 150000 else facts.unique == {("a",)}
+
+
+def test_numeric_domains_are_numeric_columns_and_take_a_sum(schema, monkeypatch):
+    # a domain over NUMERIC (and a domain over that domain) is still a number for tier 2
+    dsn = os.environ[DSN_VAR]
+    table = f"{schema}.d"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE DOMAIN {schema}.amount_d AS NUMERIC(12,2) CHECK (VALUE >= 0)")
+        conn.execute(f"CREATE DOMAIN {schema}.fee_d AS {schema}.amount_d")
+        conn.execute(f"CREATE DOMAIN {schema}.code_d AS TEXT")
+        conn.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY, amount {schema}.amount_d, "
+                     f"fee {schema}.fee_d, code {schema}.code_d)")
+        conn.execute(f"INSERT INTO {table} VALUES (1, 10.50, 1, 'x'), (2, 20, 2.25, 'y')")
+    monkeypatch.setenv("RECON_TEST_SOURCE", dsn)
+    source = PostgresSourceAdapter("RECON_TEST_SOURCE")
+    try:
+        assert source.numeric_columns(table) == {"id", "amount", "fee"}
+        aggs = source.table_aggregates(table, ["amount", "fee", "code"], ["amount", "fee"])
+        assert aggs["amount"]["sum"] == Decimal("30.50") and aggs["fee"]["sum"] == Decimal("3.25")
+        assert "sum" not in aggs["code"] or aggs["code"]["sum"] is None
+    finally:
+        source._conn.close()
+
