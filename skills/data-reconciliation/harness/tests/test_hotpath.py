@@ -86,7 +86,7 @@ def test_probed_field_costs_one_statement_on_top_of_the_batched_one():
                 FieldMapping("name", "name", "TEXT", "int")])])  # conversion mapping -> probe
     source, s_conn = sqlite_adapter(ROWS)
     target, t_conn = sqlite_adapter(ROWS)
-    s_all, t_all = _object_aggregates(spec.objects[0], source, target)
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
     assert len(s_conn.statements) == 2 and len(t_conn.statements) == 2
     assert s_conn.statements[1].startswith("SELECT SUM(name)")
     assert t_conn.statements[1].startswith("SELECT SUM(amt)")
@@ -120,7 +120,7 @@ def test_one_source_field_mapped_to_numeric_and_nonnumeric_targets_keeps_both_su
                                     [(i, str(i)) for i in range(1, 11)])
     target, t_conn = _typed_adapter("CREATE TABLE t (id INTEGER, code TEXT, code_n INTEGER)",
                                     [(i, str(i), i + (1 if i == 5 else 0)) for i in range(1, 11)])
-    s_all, t_all = _object_aggregates(spec.objects[0], source, target)
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
     assert [s.split(" FROM")[0] for s in s_conn.statements[1:]] == ["SELECT SUM(code)"]
     assert s_all["code"]["sum"] == 55 and s_all["code"]["count"] == 10   # batched metrics kept
     assert t_all["code_n"]["sum"] == 56 and t_all["code"].get("sum") is None
@@ -144,7 +144,7 @@ def test_many_source_fields_mapped_to_one_target_field_keep_the_probe_the_conver
                                     [(i, i, str(i)) for i in range(1, 11)])
     target, t_conn = _typed_adapter("CREATE TABLE t (id INTEGER, label TEXT)",
                                     [(i, str(i + (1 if i == 5 else 0))) for i in range(1, 11)])
-    s_all, t_all = _object_aggregates(spec.objects[0], source, target)
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
     assert len(s_conn.statements) == 1 and s_all["qty"]["sum"] == 55      # qty batched, label skipped
     assert [s.split(" FROM")[0] for s in t_conn.statements[1:]] == ["SELECT SUM(label)"]
     assert t_all["label"]["sum"] == 56 and t_all["label"]["count"] == 10  # one probe, metrics kept

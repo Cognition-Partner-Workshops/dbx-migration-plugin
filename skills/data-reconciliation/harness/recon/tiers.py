@@ -12,14 +12,27 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import BatchAggregates, NullKeyCounting, StratifiedKeys, SumProbe
+from .adapters import (
+    BatchAggregates,
+    ColumnTypes,
+    KeyExcludingAggregates,
+    NullKeyCounting,
+    StratifiedKeys,
+    SumProbe,
+)
 from .canon import MISSING, Canonicalizer
 from .config import MappingSpec, ObjectMapping, Tolerances
 from .paths import get_path
+from .watermarks import family, instant, later
 
 # Tier 3 sampling: at most this many strata per table; each stratum contributes
 # ceil(sample_size / strata) keys plus the range edges (first/last keys are always graded).
 MAX_STRATA = 32
+
+# Tier 2 in transactional mode excludes the in-flight source keys from the target's aggregates
+# by listing them in one statement; above this many keys the object is graded ungraded instead
+# of shipping an oversized predicate (a feed that far behind fails tier 6 on lag anyway).
+IN_FLIGHT_EXCLUSION_CAP = 10_000
 
 
 @dataclass
@@ -55,9 +68,10 @@ class TierResult:
 _get_path = get_path
 
 
-def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
+def tier1_counts(spec: MappingSpec, source, target, ctx=None) -> TierResult:
     """Counts THROUGH the mapping: root docs vs root rows; embedded array cardinality vs
-    child-table rows. A naive docs-vs-rows count is wrong by construction for embeds."""
+    child-table rows. A naive docs-vs-rows count is wrong by construction for embeds.
+    In transactional mode `ctx` bounds how many source rows may not have reached the target yet."""
     findings, checks = [], 0
     stats: dict[str, Any] = {"source_counts": {}}
     for c in spec.objects:
@@ -65,9 +79,14 @@ def tier1_counts(spec: MappingSpec, source, target) -> TierResult:
         src_n = source.row_count(c.root_table, c.root_where)
         tgt_n = target.target_row_count(c.object, c.target_where)
         stats["source_counts"][c.root_table] = src_n
-        if src_n != tgt_n:
+        in_flight = ctx.in_flight(c) if ctx is not None else 0
+        if src_n != tgt_n and 0 <= src_n - tgt_n <= in_flight:
+            stats.setdefault("count_gap_within_in_flight", {})[c.object] = {
+                "gap": src_n - tgt_n, "in_flight": in_flight}
+        elif src_n != tgt_n:
             findings.append(Finding(c.object, "root_count",
-                                    f"rows({c.root_table})={src_n} vs target rows={tgt_n}"))
+                                    f"rows({c.root_table})={src_n} vs target rows={tgt_n}"
+                                    + (f" ({in_flight} in flight)" if in_flight else "")))
         for e in c.embeds:
             checks += 1
             child_n = source.row_count(e.child_table, e.child_where)
@@ -86,6 +105,8 @@ def _agg_close(a: Any, b: Any, rel_tol: float) -> bool:
         da, db = decimal.Decimal(str(a)), decimal.Decimal(str(b))
         denom = max(abs(da), abs(db), decimal.Decimal("1e-12"))
         return abs(da - db) <= decimal.Decimal(str(rel_tol)) * denom
+    if family(a) == family(b) == "datetime":
+        return instant(a) == instant(b)
     return a == b
 
 
@@ -136,9 +157,9 @@ def _side_numeric(plan: str, agg: dict) -> bool:
     return plan == "probe" and isinstance(s, _NUMERIC_VALUE) and not isinstance(s, bool)
 
 
-def _is_numeric_field(f, s: dict, t: dict) -> bool:
-    return (_side_numeric(sum_plan(f.source_type, f.target_type), s)
-            and _side_numeric(sum_plan(f.target_type, f.source_type), t))
+def _is_numeric_field(f, s: dict, t: dict, s_plan: str | None = None, t_plan: str | None = None) -> bool:
+    return (_side_numeric(s_plan or sum_plan(f.source_type, f.target_type), s)
+            and _side_numeric(t_plan or sum_plan(f.target_type, f.source_type), t))
 
 
 _PLAN_RANK = {"skip": 0, "probe": 1, "batch": 2}
@@ -155,54 +176,111 @@ def _column_plans(plans: list[tuple[str, str]]) -> dict[str, str]:
     return out
 
 
-def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict], dict[str, dict]]:
-    """All field aggregates for one object: one statement per side when the adapter batches,
-    one per field otherwise. Each side requests SUM per its own `sum_plan`; a probed field keeps
-    the batched metrics and adds one isolated SUM statement (`SumProbe`) so a SUM that errors
-    never aborts the batched one; adapters without `SumProbe` fall back to the per-column statement."""
-    s_plan = _column_plans([(f.source, sum_plan(f.source_type, f.target_type)) for f in c.fields])
+def _sum_plans(pairs: list[tuple[str, str, str]], adapter, table: str) -> dict[str, str]:
+    """col -> `sum_plan` for one side. A field that would be probed is typed from the catalog
+    instead when the adapter exposes it (`ColumnTypes`): the probe's error handling rolls the
+    connection back, which on a pinned transactional window silently ends the snapshot."""
+    plan = _column_plans([(col, sum_plan(own, other)) for col, own, other in pairs])
+    if "probe" in plan.values() and isinstance(adapter, ColumnTypes):
+        try:
+            typed = adapter.numeric_columns(table)
+        except NotImplementedError:  # an engine whose catalog the adapter does not read yet
+            typed = None
+        if typed is not None:
+            typed_names = {name.lower() for name in typed}
+            for col, p in plan.items():
+                if p == "probe":
+                    plan[col] = "batch" if col.lower() in typed_names else "skip"
+    return plan
+
+
+def _object_aggregates(c: ObjectMapping, source, target, source_where: str | None = None,
+                       exclude_keys: list[tuple] | None = None
+                       ) -> tuple[dict[str, dict], dict[str, dict], dict[str, str], dict[str, str]]:
+    """All field aggregates for one object plus each side's plan: one statement per side when the
+    adapter batches, one per field otherwise. Each side requests SUM per its own `sum_plan` (its
+    declared type, or its catalog); a probed field keeps the batched metrics and adds one isolated
+    SUM statement (`SumProbe`) so a SUM that errors never aborts the batched one. In transactional mode the source is bounded to its applied
+    rows (`source_where`) and the target excludes the same keys (`exclude_keys`), so both
+    aggregates describe one set."""
+    s_where = source_where if source_where is not None else c.root_where
+    s_plan = _sum_plans([(f.source, f.source_type, f.target_type) for f in c.fields], source, c.root_table)
     cols = list(s_plan)
     if isinstance(source, BatchAggregates):
         s_all = source.table_aggregates(c.root_table, cols, [k for k, p in s_plan.items() if p == "batch"],
-                                        c.root_where)
+                                        s_where)
         for col, p in s_plan.items():
             if p == "probe":
                 if isinstance(source, SumProbe):
-                    s_all[col]["sum"] = source.sum_probe(c.root_table, col, c.root_where)
+                    s_all[col]["sum"] = source.sum_probe(c.root_table, col, s_where)
                 else:
-                    s_all[col] = source.field_aggregates(c.root_table, col, c.root_where)
+                    s_all[col] = source.field_aggregates(c.root_table, col, s_where)
     else:
-        s_all = {col: source.field_aggregates(c.root_table, col, c.root_where) for col in cols}
-    t_plan = _column_plans([(f.target, sum_plan(f.target_type, f.source_type)) for f in c.fields])
+        s_all = {col: source.field_aggregates(c.root_table, col, s_where) for col in cols}
+    t_plan = _sum_plans([(f.target, f.target_type, f.source_type) for f in c.fields], target, c.object)
+    t_batch = [k for k, p in t_plan.items() if p == "batch"]
 
     def t_probe(col: str) -> dict:
+        if exclude_keys is not None:
+            return target.table_aggregates_excluding(c.object, [col], [col], list(c.key_target),
+                                                     exclude_keys, c.target_where)[col]
         return (target.field_aggregates(c.object, col, c.target_where)
                 if c.target_where is not None else target.field_aggregates(c.object, col))
 
-    if isinstance(target, BatchAggregates):
-        t_all = target.table_aggregates(c.object, list(t_plan), [k for k, p in t_plan.items() if p == "batch"],
-                                        c.target_where)
+    if exclude_keys is not None:
+        t_all = target.table_aggregates_excluding(c.object, list(t_plan), t_batch, list(c.key_target),
+                                                  exclude_keys, c.target_where)
+    elif isinstance(target, BatchAggregates):
+        t_all = target.table_aggregates(c.object, list(t_plan), t_batch, c.target_where)
+    else:
+        t_all = {col: t_probe(col) for col in t_plan}
+    if exclude_keys is not None or isinstance(target, BatchAggregates):
         for col, p in t_plan.items():
             if p == "probe":
-                if isinstance(target, SumProbe):
+                if exclude_keys is None and isinstance(target, SumProbe):
                     t_all[col]["sum"] = target.sum_probe(c.object, col, c.target_where)
                 else:
                     t_all[col] = t_probe(col)
-    else:
-        t_all = {col: t_probe(col) for col in t_plan}
-    return s_all, t_all
+    return s_all, t_all, s_plan, t_plan
 
 
 def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
-                     source, target) -> TierResult:
+                     source, target, ctx=None) -> TierResult:
     findings, checks = [], 0
     deferred: list[str] = []
+    applied_subset: dict[str, dict[str, Any]] = {}
     for c in spec.objects:
-        s_all, t_all = _object_aggregates(c, source, target)
+        in_flight = ctx.in_flight(c) if ctx is not None else 0
+        if in_flight:
+            # aggregate the applied set on both sides: the source bounded by the target's applied
+            # watermark, the target minus the very keys that are in flight (their target values
+            # are the pre-change ones). Every applied row stays in the comparison, so drift in a
+            # row tier 3's sample never visits is still caught
+            if not isinstance(target, KeyExcludingAggregates):
+                checks += 1
+                findings.append(Finding(c.object, "aggregates_ungraded_in_flight",
+                                        f"{in_flight} source rows in flight and the target adapter "
+                                        "cannot exclude keys from its aggregates"))
+                continue
+            # the exclusion is one statement on the target: its capacity is the smaller of the
+            # tier's own cap and what the adapter can bind for a key this wide
+            cap = min(IN_FLIGHT_EXCLUSION_CAP, target.exclusion_capacity(len(c.key_target)))
+            if in_flight > cap:
+                checks += 1
+                findings.append(Finding(c.object, "aggregates_ungraded_in_flight",
+                                        f"{in_flight} source rows in flight exceeds the {cap}-key "
+                                        f"exclusion cap for a {len(c.key_target)}-column key; let "
+                                        "the feed catch up before grading aggregates"))
+                continue
+            keys = ctx.in_flight_keys(c, source)
+            applied_subset[c.object] = {"in_flight": in_flight, "excluded_keys": len(keys)}
+            s_all, t_all, s_plan, t_plan = _object_aggregates(c, source, target, ctx.applied_where(c), keys)
+        else:
+            s_all, t_all, s_plan, t_plan = _object_aggregates(c, source, target)
         for f in c.fields:
             checks += 1
             s, t = s_all[f.source], t_all[f.target]
-            numeric = _is_numeric_field(f, s, t)
+            numeric = _is_numeric_field(f, s, t, s_plan[f.source], t_plan[f.target])
             stats_to_check: tuple[str, ...] = ("null_rate", "distinct_count", "min", "max")
             if numeric:
                 stats_to_check += ("sum",)
@@ -225,7 +303,9 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                 if not _agg_close(sv, tv, tol.aggregate_rel_tol):
                     findings.append(Finding(c.object, f"aggregate_{stat}",
                                             f"field {f.source}->{f.target}", sv, tv, f.rules))
-    stats = {"deferred_to_tier3": deferred} if deferred else {}
+    stats: dict[str, Any] = {"deferred_to_tier3": deferred} if deferred else {}
+    if applied_subset:
+        stats["applied_subset"] = applied_subset
     return TierResult(2, "per_field_aggregates", not findings, checks, findings, stats)
 
 
@@ -314,15 +394,19 @@ def _null_key_rows(c: ObjectMapping, source, target) -> dict[str, int]:
 
 
 def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
-                source, target, seed: int = 0, depth: str = "threshold") -> TierResult:
+                source, target, seed: int = 0, depth: str = "threshold", ctx=None) -> TierResult:
     """Full keyed diff below the tolerance row threshold; keyed stratified sampling above.
     `depth` overrides the threshold: "full" always diffs every key, "sampled" always samples.
     Embedded arrays with declared element keys/fields are value-graded; the rest are
-    reported UNGRADED."""
+    reported UNGRADED. In transactional mode `ctx` classifies source rows changed after the
+    target's applied watermark as in flight (not graded) and a target row newer than its
+    source row as an ordering violation."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
     rng = random.Random(seed)
     for c in spec.objects:
+        wm = bool(ctx is not None and c.watermark_source and c.watermark_target)
+        src_cols = [f.source for f in c.fields] + ([c.watermark_source] if wm else [])
         n = source.row_count(c.root_table, c.root_where)
         null_keys = _null_key_rows(c, source, target)
         for side, count in null_keys.items():
@@ -355,8 +439,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
 
         if sampled and isinstance(source, StratifiedKeys):
             keys, n_strata = _stratified_keys(c, source, n, tol.sample_size, rng)
-            fetched = source.fetch_keyed(c.root_table, c.key_source,
-                                         [f.source for f in c.fields],
+            fetched = source.fetch_keyed(c.root_table, c.key_source, src_cols,
                                          where=c.root_where, keys=keys)
             src_rows = {tuple(r[k] for k in c.key_source): r for r in fetched}
             dup_keys = source.duplicate_key_count(c.root_table, c.key_source, c.root_where)
@@ -382,8 +465,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                         reservoir[slot] = key
             chosen = set(first + last + reservoir)
             keys = sorted(chosen)
-            fetched = source.fetch_keyed(c.root_table, c.key_source,
-                                         [f.source for f in c.fields],
+            fetched = source.fetch_keyed(c.root_table, c.key_source, src_cols,
                                          where=c.root_where, keys=keys)
             src_rows = {tuple(r[k] for k in c.key_source): r for r in fetched}
             stats[c.object] = {"mode": "stratified_sample", "sampling": "reservoir",
@@ -391,8 +473,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                "coverage": round(len(src_rows) / n, 6) if n else 1.0}
         else:
             src_rows = {}
-            for r in source.fetch_keyed(c.root_table, c.key_source,
-                                        [f.source for f in c.fields], where=c.root_where):
+            for r in source.fetch_keyed(c.root_table, c.key_source, src_cols, where=c.root_where):
                 key = tuple(r[k] for k in c.key_source)
                 record_source_key(key)
                 src_rows[key] = r
@@ -408,8 +489,10 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                         f"key={key} seen {count} times" if key is not None
                                         else "a source key occurs more than once (server-side count)"))
         tgt_docs = {}
-        proj = [f.target for f in c.fields] + [e.array_path for e in c.embeds]
+        proj = ([f.target for f in c.fields] + [e.array_path for e in c.embeds]
+                + ([c.watermark_target] if wm else []))
         target_counts = {}
+        in_flight_rows = 0
         for d in target.fetch_keyed(c.object, c.key_target, proj,
                                     where=c.target_where, keys=keys):
             key = tuple(_get_path(d, key_field) for key_field in c.key_target)
@@ -423,9 +506,18 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         for k, row in src_rows.items():
             checks += 1
             doc = tgt_docs.get(k)
+            if wm and ctx.row_in_flight(c, row):
+                in_flight_rows += 1
+                continue
             if doc is None:
                 findings.append(Finding(c.object, "missing_doc", f"key={k}"))
                 continue
+            if wm:
+                s_wm, t_wm = row.get(c.watermark_source), _get_path(doc, c.watermark_target)
+                if s_wm is not None and t_wm is not None and later(t_wm, s_wm):
+                    findings.append(Finding(c.object, "row_ahead_of_source",
+                                            f"key={k} target {c.watermark_target} newer than source "
+                                            f"{c.watermark_source}", s_wm, t_wm))
             for f in c.fields:
                 sv = row.get(f.source, MISSING)
                 tv = _get_path(doc, f.target)
@@ -438,6 +530,8 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
             if k not in src_rows and not sampled:
                 checks += 1
                 findings.append(Finding(c.object, "extra_doc", f"key={k}"))
+        if wm:
+            stats[c.object]["in_flight_rows"] = in_flight_rows
         checks += _grade_embeds(c, canon, tol, source, src_rows, tgt_docs, sampled,
                                 findings, stats)
     return TierResult(3, "keyed_diffs", not findings, checks, findings, stats)
