@@ -55,13 +55,18 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   (docs.databricks.com/aws/en/optimizations/isolation/row-level-concurrency, opened), the loser's `UPDATE` raises and
   its handler runs -- so exactly one call owns the row and its cursor is the only one selecting `CLOSED` accounts:
   every account it archives is claimed by it alone. The handler and the normal exit release the lock with
-  `WHERE OWNER_RUN_ID = v_run_id`, so a call that failed *on* the lock never frees the owner's; in the handler the
-  release is the *last* statement, after the ledger-and-`ARCHIVED` count, the budget deduction and the log row. The
-  count is only exact while no other call can flip a status: a ledgered-but-unmarked account is still `CLOSED`, and
-  if the lock were freed first a waiting call could archive it before this handler counted, pairing this call's
-  ledger row with an `ARCHIVED` the other call set -- both would charge it and the campaign ends one short. A failure
-  *inside* the handler (e.g. the `ETL_LOG` insert) leaves the lock held, which is the stale-lock path below, not a
-  double charge. A call refused the lock has archived and charged nothing; the caller retries with an unchanged budget
+  `WHERE OWNER_RUN_ID = v_run_id`, so a call that failed *on* the lock never frees the owner's. The handler is ordered
+  count-and-deduct, release, log. The count must run *under* the lock: it is only exact while no other call can flip a
+  status -- a ledgered-but-unmarked account is still `CLOSED`, and if the lock were freed first a waiting call could
+  archive it before this handler counted, pairing this call's ledger row with an `ARCHIVED` the other call set, so both
+  would charge it and the campaign ends one short. The `ETL_LOG` row is diagnostic, so it runs *after* the release: a
+  failing log insert (including the case where `ETL_LOG` caused the original failure) must not strand the lock. Both
+  the count and the log sit in nested compounds with their own `EXIT HANDLER` (the sql-scripting reference allows a
+  nested `BEGIN...END` as the handler action and states a handler does not apply to its own body), so neither can
+  abort the outer handler before the release: a failed count returns `p_max_batch = NULL` (rejected by the
+  parameter check on the next `CALL`, forcing the caller to recompute the campaign's consumption from the ledger), a
+  failed log returns `p_return_code = -2`. The stranding paths left are the release `UPDATE` itself and session death,
+  handled below. A call refused the lock has archived and charged nothing; the caller retries with an unchanged budget
   once the owner finishes (on the source it would have waited on the lock instead of returning). Session death while
   holding the lock leaves
   `OWNER_RUN_ID` set: the next call is refused with that id in its message; the operator confirms the run is dead
@@ -71,7 +76,8 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
 - `SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT` -> same syntax.
 - `INOUT` parameter -> `INOUT` (same).
 - `EXTRACT(YEAR FROM d) (FORMAT '9999')`, `TRIM(n (FORMAT '-(18)9'))` -> `CAST(year(d) AS STRING)` / parameter marker.
-- `SQLSTATE`/`SQLCODE` read in handler -> fixed code + message (no cited read; Not verified live).
+- `SQLSTATE`/`SQLCODE` read in handler -> fixed codes (`-1` failed; `-2` failed and could not log) + message (no cited
+  read; Not verified live).
 - Teradata database name parameter -> UC schema name; archive schema must be in the unit's write scope.
 
 ## Recon tier that catches a wrong conversion
@@ -118,8 +124,11 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   charge it -> the two calls' returned `p_accounts_done` sum to one more than the campaign's `ARCHIVED` delta
   (**Tier 1** on `DIM_ACCOUNT` vs the sum of the OUT values) and the interrupted account has two ledger rows both
   pairing `LEDGER_TS < ETL_UPDATE_TS`; needs the injected failure placed *between* the ledger insert and the status
-  `UPDATE` with the retry queued behind the lock, which the fault-injection list must include. Lock never released on
-  success: the second scheduled campaign is refused forever -> **Tier 1** zero archived rows for every later campaign.
+  `UPDATE` with the retry queued behind the lock, which the fault-injection list must include. Lock released *after*
+  the log insert, or log insert not isolated in its own compound: an `ETL_LOG` failure (the fault list must include
+  one -- e.g. revoke the write on `ETL_LOG` for one call) leaves `OWNER_RUN_ID` set and every later call is refused ->
+  **Tier 1** zero archived rows for every later campaign until an operator clears the row; same signature as a lock
+  never released on success.
 
 ## Citations
 - `FOR ... AS query DO`, `WHILE`, `LEAVE`, `CASE` statement: `databricks-dbsql` `references/sql-scripting.md`
@@ -141,6 +150,10 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
 - Whether an atomic block (`BEGIN ATOMIC ... END`, per the "Multi-Statement Transactions" section's preview status)
   can wrap the per-account triple to restore BT/ET semantics; the example does not depend on it.
 - Reading SQLSTATE inside a handler; row-count register after DML.
+- That a nested compound *inside an EXIT handler body*, carrying its own `EXIT HANDLER`, catches its statement's failure
+  and returns control to the enclosing handler's next statement (the reference documents nested `BEGIN...END` as a
+  handler action and handler scoping, not this exact nesting). If it does not, the release must move to a position
+  before the count and the double-charge window reopens -- an engagement decision, not a silent fallback.
 - That `INOUT`/`OUT` values assigned inside an EXIT handler are returned to the caller (the budget write-back relies on
   it); if not, the remaining budget must be persisted to a control row from the handler instead.
 - That a procedure-local `DECLARE`d variable assigned from `uuid()` (docs.databricks.com/aws/en/sql/language-manual/

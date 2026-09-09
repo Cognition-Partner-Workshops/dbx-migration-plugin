@@ -78,27 +78,48 @@ AS BEGIN
     -- a ledger row under each RUN_ID). Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
     -- The handler also frees the campaign lock, but only if this call holds it (OWNER_RUN_ID = v_run_id): when the
     -- failure *is* the lock (another call owns it, or this call's UPDATE lost the commit race) the release is a no-op
-    -- and the owner keeps running. The release is the handler's *last* statement: the ledger-and-ARCHIVED count is
-    -- only exact while nobody else can flip a status. An account this call ledgered but never marked is still CLOSED;
-    -- if the lock were freed first, a waiting call could archive it between the release and the count, this call
-    -- would then find its own ledger row paired with ARCHIVED and charge it, and the other call charges it too --
-    -- one account, two budgets, the campaign short by one. Counting, deducting and logging under the lock, then
-    -- releasing, makes "ARCHIVED with my ledger row" mean "marked by me" for the whole handler.
+    -- and the owner keeps running. Ordering inside the handler: (1) count and deduct *under the lock* -- the
+    -- ledger-and-ARCHIVED count is only exact while nobody else can flip a status; an account this call ledgered but
+    -- never marked is still CLOSED, and if the lock were freed first a waiting call could archive it between the
+    -- release and the count, this call would find its own ledger row paired with ARCHIVED and charge it, the other
+    -- call charges it too, one account, two budgets, the campaign short by one; (2) release; (3) log. The log row is
+    -- diagnostic and must not be able to strand the lock, so it comes after the release and, like the count, sits in
+    -- its own nested compound with its own EXIT handler ("Handler Declaration": the action may be a nested
+    -- BEGIN...END; a handler does not apply to its own body). If the count itself fails, the budget is unknown: the
+    -- nested handler returns p_max_batch = NULL, which the parameter check at the top rejects on the next CALL, so the
+    -- caller has to recover the campaign's consumption from the ledger (header) before retrying -- and the lock is
+    -- still released. If the log insert fails the return code becomes -2 ("failed, and could not log"); the lock is
+    -- already free. The only stranding paths left are the release UPDATE itself and session death, both the
+    -- operator path in NOTE.md.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         SET p_return_code = -1;
-        SET p_accounts_done = (SELECT COUNT(*)
-                               FROM ${catalog}.${schema}.ARCHIVE_RUN_LEDGER l
-                               JOIN ${catalog}.${schema}.DIM_ACCOUNT a ON a.ACCOUNT_KEY = l.ACCOUNT_KEY
-                               WHERE l.RUN_ID = v_run_id AND a.ACCOUNT_STATUS = 'ARCHIVED');
-        SET p_max_batch = p_max_batch - p_accounts_done;                    -- budget consumed by the kept partial work
-        INSERT INTO ${catalog}.${schema}.ETL_LOG (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
-        VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR',
-                'SQLEXCEPTION during archive run ' || v_run_id || ' after ' || CAST(p_accounts_done AS STRING)
-                || ' accounts (partial batch kept; re-run with the returned budget is idempotent)', current_timestamp());
+        BEGIN
+            DECLARE EXIT HANDLER FOR SQLEXCEPTION
+            BEGIN
+                SET p_accounts_done = NULL;
+                SET p_max_batch = NULL;                                     -- unknown: recover from the ledger before retrying
+            END;
+            SET p_accounts_done = (SELECT COUNT(*)
+                                   FROM ${catalog}.${schema}.ARCHIVE_RUN_LEDGER l
+                                   JOIN ${catalog}.${schema}.DIM_ACCOUNT a ON a.ACCOUNT_KEY = l.ACCOUNT_KEY
+                                   WHERE l.RUN_ID = v_run_id AND a.ACCOUNT_STATUS = 'ARCHIVED');
+            SET p_max_batch = p_max_batch - p_accounts_done;                -- budget consumed by the kept partial work
+        END;
         UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
         SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
         WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;
+        BEGIN
+            DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                SET p_return_code = -2;                                     -- failed, and could not write ETL_LOG
+            INSERT INTO ${catalog}.${schema}.ETL_LOG (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
+            VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', COALESCE(p_max_batch, -1), 'ERROR',
+                    'SQLEXCEPTION during archive run ' || v_run_id || ' after '
+                    || COALESCE(CAST(p_accounts_done AS STRING), 'an unknown number of')
+                    || ' accounts (partial batch kept; re-run with the returned budget is idempotent'
+                    || CASE WHEN p_max_batch IS NULL THEN '; budget unknown, recover it from ARCHIVE_RUN_LEDGER' ELSE '' END
+                    || ')', current_timestamp());
+        END;
     END;
 
     SET p_return_code = 0;
