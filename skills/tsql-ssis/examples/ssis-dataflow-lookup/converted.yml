@@ -3,10 +3,14 @@
 # Shapes per databricks-pipelines references/1-project-initialization-with-dab.md (pipeline resource:
 # catalog/schema/serverless/continuous: false/libraries glob; job with pipeline_task referencing
 # ${resources.pipelines.<name>.id}; daily periodic trigger), references/pipeline-configuration.md
-# (`configuration` key-value, read in SQL as ${key}), databricks-jobs references/task-types.md
+# (`configuration` is deploy-time key-value), databricks-jobs references/task-types.md
 # ("Pipeline Task", "SQL Task": sql_task.file + warehouse_id), notifications-monitoring.md (on_failure),
 # https://docs.databricks.com/aws/en/jobs/conditional-tasks (run_if AT_LEAST_ONE_FAILED; Excluded when unmet),
-# /aws/en/jobs/parameter-use (SQL tasks read key-value parameters as :name) and
+# /aws/en/jobs/pipeline "Parameters" (Beta: "You can access job or task parameters in your pipeline task using
+# dynamic value references. You can override parameters by adding Key-Value pairs in the Parameters of your
+# task configuration"; Jobs API jobs/create: pipeline_task.parameters, "Key/value-map of parameters passed to
+# the pipeline execution"), /aws/en/jobs/parameter-use ("When you are running SQL in a notebook or pipeline
+# task, you can use the named parameter syntax" :name; SQL tasks read key-value parameters as :name) and
 # /aws/en/jobs/dynamic-value-references ({{job.run_id}}, {{tasks.<task_name>.result_state}},
 # {{tasks.<task_name>.error_code}}: "The error code for task <task_name> if an error occurred running the
 # task ... For successful tasks, this evaluates to an empty string").
@@ -14,7 +18,16 @@
 # Mapping from source.dtsx:
 #   DFT Load fact_payment (Data Flow Task)          -> pipeline load_payment_fact (converted.sql), triggered
 #                                                      once a day like the SQL Agent schedule that ran the package.
-#   $Package::ServicerId                            -> pipeline configuration key servicer_id (${servicer_id}).
+#   $Package::ServicerId (Required="True", value 7)  -> job parameter servicer_id (default "7", the package's
+#                                                      design value) -> pipeline_task.parameters.servicer_id
+#                                                      = {{job.parameters.servicer_id}} -> :servicer_id in
+#                                                      converted.sql. Required=True means the executor supplied
+#                                                      the value per execution (dtexec /Par, the SQL Agent step);
+#                                                      the Jobs equivalent is a per-run override of the job
+#                                                      parameter ("Run now with different parameters" / API
+#                                                      job_parameters), which the pipeline task forwards. A
+#                                                      pipeline `configuration` key cannot do this: it is fixed
+#                                                      at deploy time, so every run would load servicer 7.
 #   User::LoadDate                                  -> no equivalent needed: the streaming checkpoint is the
 #                                                      incremental bookmark (converted.sql header).
 #   OnError handler "SQL Log OnError" -> dw.etl_log -> sql_task log_onerror, run_if AT_LEAST_ONE_FAILED after
@@ -34,8 +47,12 @@ resources:
       schema: ${var.schema}              # dw schema of the loan_mart target catalog
       serverless: true
       continuous: false                  # one triggered update per day == one package execution
-      configuration:
-        servicer_id: "7"                 # $Package::ServicerId default value; read as ${servicer_id}
+      # No `configuration.servicer_id`: the value arrives per run from the job (pipeline_task.parameters
+      # below). Fallback where the pipeline-task Parameters Beta is not enabled in the workspace: one
+      # pipeline resource per servicer (load_payment_fact_s7, _s12, ...), each with
+      #   configuration: { servicer_id: "<n>" }
+      # and converted.sql reading ${servicer_id} instead of :servicer_id; the job then carries one
+      # pipeline_task per servicer. Never a single pipeline with the value fixed in `configuration`.
       libraries:
         - glob:
             include: ../src/load_payment_fact/**    # converted.sql lives here
@@ -54,6 +71,9 @@ resources:
           default: ${var.catalog}
         - name: schema
           default: ${var.schema}
+        - name: servicer_id             # $Package::ServicerId; override per run exactly as dtexec /Par did
+          default: "7"                   #   (the package's ParameterValue). Scheduled runs use the default,
+                                         #   which is what the SQL Agent step passed.
       email_notifications:
         on_failure:
           - ${var.ops_email}
@@ -61,6 +81,8 @@ resources:
         - task_key: load_payment_fact
           pipeline_task:
             pipeline_id: ${resources.pipelines.load_payment_fact.id}
+            parameters:                  # Beta (docs /jobs/pipeline "Parameters"; Jobs API pipeline_task.parameters)
+              servicer_id: "{{job.parameters.servicer_id}}"   # read as :servicer_id in converted.sql
             full_refresh: false          # a full refresh rebuilds fact_payment / err_payment_no_loan from all of
                                          # payments; only used deliberately to re-load history, never on schedule
 

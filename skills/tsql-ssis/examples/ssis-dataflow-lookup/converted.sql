@@ -21,8 +21,15 @@
 -- NOTE.md, not reproduced). Re-loading one historical day on purpose is a full refresh of the table (the
 -- streaming table rebuilds from the whole payments history), never a partial re-run.
 --
--- The package parameter ServicerId becomes a pipeline `configuration` key read as ${servicer_id}
--- (databricks-pipelines references/pipeline-configuration.md "configuration"; SKILL §6 "SSIS Variables").
+-- The package parameter ServicerId (Required="True": supplied per execution) arrives per run as a pipeline-task
+-- parameter and is read as the named parameter :servicer_id (docs /aws/en/jobs/parameter-use: "When you are
+-- running SQL in a notebook or pipeline task, you can use the named parameter syntax"; the job forwards
+-- pipeline_task.parameters.servicer_id = {{job.parameters.servicer_id}}, docs /aws/en/jobs/pipeline
+-- "Parameters", Beta; converted.yml). It is NOT a pipeline `configuration` key (${servicer_id}): that is fixed
+-- at deploy time, so every run would load the design-time default. Fallback without the Beta: one pipeline
+-- per servicer with `configuration.servicer_id` and ${servicer_id} here (converted.yml comment; SKILL §6
+-- "SSIS Variables").
+-- Not verified live: named-parameter syntax inside an SDP SQL source file driven by pipeline_task.parameters.
 -- User::LoadDate has no configuration key any more: the daily window was the package's own incremental
 -- bookmark, and the checkpoint replaces it; load_date is derived per row below.
 -- Runs as a pipeline_task inside converted.yml (databricks-jobs task-types.md), whose failure task keeps
@@ -54,7 +61,7 @@ SELECT s.*,
 FROM STREAM(src_payments) s
 LEFT JOIN (SELECT loan_id, loan_type, servicer_id, investor_code, property_state
            FROM ${catalog}.${schema}.loans
-           WHERE servicer_id = ${servicer_id}) l
+           WHERE servicer_id = :servicer_id) l              -- $Package::ServicerId, per run
   ON s.loan_id = l.loan_id;
 
 -- DER payment attrs (Derived Column). SSIS expression -> SQL (SKILL §6 "SSIS Derived Column"):

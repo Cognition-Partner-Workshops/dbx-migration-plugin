@@ -6,15 +6,24 @@
 -----------------------------------------------------------------------------------------------
 -- 1. trg_validate_loan_amount (FOR UPDATE on loans, RAISERROR 50050 + ROLLBACK)
 --    Shape A, analytical/DBSQL track: a pre-check statement that every writer of loans.current_balance
---    runs BEFORE its UPDATE/MERGE, inside the same scripting block. SIGNAL aborts the block, so the
---    DML that would have violated the rule never executes (source: rollback after the fact).
+--    runs BEFORE its UPDATE/MERGE, inside the same BEGIN ATOMIC ... END block as that DML (docs
+--    /aws/en/transactions/transaction-modes: IF ... SIGNAL ... END IF + MERGE in one non-interactive
+--    transaction). The block reads loans from one snapshot, so the pre-check validates exactly the
+--    post-image the DML writes and a balance committed by another writer in between cannot bypass it:
+--    it either predates the snapshot (and is validated) or fails the block's commit with a write-write
+--    conflict (docs /aws/en/transactions/ "Conflict detection and concurrency"). SIGNAL rolls the
+--    block back, so the DML never commits (source: rollback after the fact). Run as two statements
+--    outside a transaction, the check and the DML race: never ship that form.
 -----------------------------------------------------------------------------------------------
 -- Inlined into every writer whose SET list names current_balance (IF UPDATE(current_balance) gate;
 -- fixture: sp_process_monthly_payments and sp_loan_modification, not sp_apply_late_fees / sp_nightly_accrual,
 -- which touch other loans columns) immediately before the UPDATE / MERGE INTO ${catalog}.${schema}.loans
--- (worked instance: examples/proc-cursor-payments/converted.sql, the block before its loans MERGE):
+-- (worked instance: examples/proc-cursor-payments/converted.sql, inside its BEGIN ATOMIC block, before
+-- the loans MERGE):
 --
---   DECLARE negative_balance CONDITION FOR SQLSTATE '45050';  -- source RAISERROR 50050
+--   DECLARE negative_balance CONDITION FOR SQLSTATE '45050';  -- source RAISERROR 50050 (outside the block)
+--   BEGIN ATOMIC
+--   ... the writer's other statements ...
 --   IF EXISTS (
 --        SELECT 1
 --        FROM   ${catalog}.${schema}.loans t
@@ -32,12 +41,17 @@
 --        WHERE  t.current_balance - w.principal_due < 0 AND t.loan_status NOT IN ('CO', 'PO');
 --        SIGNAL negative_balance SET MESSAGE_TEXT = 'Negative balance not allowed for active loans';
 --   END IF;
+--   MERGE INTO ${catalog}.${schema}.loans t USING waterfall w ON ... ;   -- the guarded DML
+--   END;
 --
--- Ordering difference to record in the tolerance record: ASE logged the violation AND rolled back
--- the whole statement (the audit INSERT inside the trigger is rolled back too unless the caller
--- committed it separately; in the fixture it is inside the caller's transaction, so it is lost).
--- The converted pre-check commits the audit row. Recon on audit_trail therefore expects
--- >= source rows for BALANCE_VIOLATION; this is a documented, approved-by-tolerance difference.
+-- Audit-row outcome to record in the tolerance record: ASE logged the violation AND rolled back the
+-- whole statement (the audit INSERT inside the trigger is rolled back too unless the caller committed
+-- it separately; in the fixture it is inside the caller's transaction, so it is lost). Inside the
+-- atomic block the SIGNAL rolls the converted audit row back as well, so BALANCE_VIOLATION counts
+-- match the source (0 for a rolled-back attempt). Only a writer that runs the pre-check outside a
+-- transaction commits the row; that writer's tolerance record must then allow >= source rows for
+-- BALANCE_VIOLATION, and it must also accept the check/DML race described above, so the atomic form
+-- is the one to ship.
 
 --    Shape B, SDP track (loans maintained as a streaming table / materialized view):
 CREATE OR REFRESH MATERIALIZED VIEW ${catalog}.${schema}.loans_validated (
