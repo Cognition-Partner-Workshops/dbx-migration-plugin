@@ -115,7 +115,18 @@ commas only (`start_date => TO_TIMESTAMP_TZ('...', '...')` is one value). `CREAT
 `GLOBAL|PRIVATE TEMPORARY TABLE`, `[NON]EDITIONABLE`, `[NO] FORCE VIEW` and `PUBLIC` modifiers do not change the census
 class. SQL*Plus directives may be indented. A file that mixes DDL with top-level `INSERT`/`MERGE`/`UPDATE`/`DELETE`/
 `TRUNCATE` (outside every PL/SQL unit) gets one extra `DML SCRIPT` row named after the file that owns those writes;
-`ON DELETE CASCADE` and `GRANT ... DELETE ON` are not DML. `DELETE FROM t` is a write only: the `FROM` after `DELETE`
+`ON DELETE CASCADE` and `GRANT ... DELETE ON` are not DML. A remainder without DML that still queries or calls
+something is a script too: standalone `SELECT ... FROM` / `CALL` statements make a `SQL SCRIPT` row, an anonymous
+block whose statements call a routine (`poladm.pkg.run(...)`, `log_run(l_n)`, `run_all;`) or query a table makes a
+`PLSQL SCRIPT` row, and both are scanned for reads/calls like a procedure. A block that only drives the ruled or pure
+Oracle packages (`DBMS_SCHEDULER`, `DBMS_RLS`, `DBMS_REDACT`, `DBMS_OUTPUT`), `NULL;`, `COMMIT;` and grants makes no
+row: the scheduler/VPD/redaction rows already own that text. A package is analysed member by member: each top-level
+`PROCEDURE`/`FUNCTION` of the spec and body (declaration to its `;`, implementation to its `END name;`, nested local
+subprograms included in their parent) is its own lineage unit `OWNER.PKG.MEMBER`, so a caller's `calls` edge lands on
+the node that carries the reads, writes, sequence draws and trigger fan-out of that member and nothing of its siblings;
+package-level declarations (constants, cursors, state) and the initialization block stay on the `OWNER.PKG` node. An
+unqualified name inside a member resolves to a sibling member first, then to a same-schema routine; a call statement
+without an argument list (`run_all;`) is a `calls` edge when it resolves in the census. `DELETE FROM t` is a write only: the `FROM` after `DELETE`
 is never a read, while `FROM`/`IN (SELECT ... FROM u)` subqueries inside the same `DELETE` remain reads of `u`.
 A `FROM` list is walked item by item across top-level commas (parentheses balanced, literals opaque, `PARTITION (p)` /
 `SAMPLE (n)` modifiers and aliases skipped, `ON`/`USING` join conditions crossed): `FROM a, b c, (SELECT ...) s, d`
@@ -127,21 +138,25 @@ a silent omission.
 Round-trip on the fixture (`python3 examples/round_trip.py`, static text only, writes `examples/round_trip_report.md`):
 15 files, 48 census rows (6 tables, 5 indexes, 2 sequences, 3 views, 1 MV + 2 MV logs, package + 4 members,
 procedure, function, trigger, scheduler job + program, 2 synonyms, db link, 8 grants, 2 roles, 2 role memberships,
-VPD + redaction policy, 1 SQL*Plus script, 1 DML script), 54 edges = 51 FACT, 3 INFERRED, 0 UNVERIFIABLE. The
-INFERRED three are exactly the constructs built to be dynamic: `PKG_POLICY_RENEWAL` `EXECUTE IMMEDIATE l_sql`
+VPD + redaction policy, 1 SQL*Plus script, 1 DML script), 56 edges = 53 FACT, 3 INFERRED, 0 UNVERIFIABLE. The
+INFERRED three are exactly the constructs built to be dynamic: `PKG_POLICY_RENEWAL.ARCHIVE_TO` `EXECUTE IMMEDIATE l_sql`
 (literal prefix `INSERT INTO poladm.` recorded), `V_CLAIMS_REMOTE` over `claims.claim@claims_link`, and
 `FN_BROKER_PREDICATE`'s VPD predicate string naming `ods.v_broker_hierarchy`. `RPT_POLICY_PAGE`'s `&as_of` sits in a
 literal position (`TO_DATE('&as_of', ...)`), so its three reads stay FACT. Five of the FACT edges are transitive
-trigger fan-out: `MRG_POLICY_FROM_STG` and `PKG_POLICY_RENEWAL` write `POLICY`, `TRG_POLICY_BIU` calls
+trigger fan-out: `MRG_POLICY_FROM_STG` and `PKG_POLICY_RENEWAL.RENEW_EXPIRING` write `POLICY`, `TRG_POLICY_BIU` calls
 `PRC_LOG_EVENT`, so both inherit `writes POLICY_AUDIT_LOG` and `consumes-sequence AUDIT_SEQ` (`MRG_POLICY_FROM_STG`
-writes with `DELETE|INSERT|UPDATE(ANNUAL_PREMIUM,BROKER_ID,COVER_NOTE_REF,EXPIRY_DT,POLICY_STATUS)`, `PKG_POLICY_RENEWAL`
+writes with `DELETE|INSERT|UPDATE(ANNUAL_PREMIUM,BROKER_ID,COVER_NOTE_REF,EXPIRY_DT,POLICY_STATUS)`, `RENEW_EXPIRING`
 with `UPDATE(ANNUAL_PREMIUM,EXPIRY_DT,POLICY_STATUS)`; both overlap the trigger's `INSERT|UPDATE`, which names no
-`OF` columns).
+`OF` columns). The package's other members carry only their own effects (`BROKER_UPLIFT` reads `BROKER`,
+`EXPIRING_CURSOR` reads `POLICY`, `ARCHIVE_TO` the dynamic write), `RENEW_EXPIRING` calls `BROKER_UPLIFT` and
+`PRC_LOG_EVENT`, and `PRG_NIGHTLY_RENEWAL`'s side-effect closure reaches `POLICY`, `PREMIUM_TXN`, `POLICY_SEQ` and the
+fan-out through its `calls PKG_POLICY_RENEWAL.RENEW_EXPIRING` edge; the `PKG_POLICY_RENEWAL` node itself has no
+write.
 Five FACT edges are index `defines-on` (`POLICY_PARTY_IX -> POLICY`, ...) and two are synonym `alias-of`
 (`PUBLIC.BROKER -> POLADM.BROKER`, `ODS.POLICY -> POLADM.POLICY`).
 `python3 examples/round_trip.py --selftest` runs 17 negative cases (one unsupported construct each, must produce the
 named `UNVERIFIABLE` risk, including a quoted index target and a quoted / not-enumerated-function second member of a
-comma join), 22 positive cases (look-alike supported syntax `FOR UPDATE OF`, `EXTRACT(... FROM)`,
+comma join), 26 positive cases (look-alike supported syntax `FOR UPDATE OF`, `EXTRACT(... FROM)`,
 `WHEN MATCHED THEN UPDATE ... DELETE WHERE`, `coll.DELETE`, `DELETE t` without `FROM`, must produce none; multiple and
 recursive CTEs keep their base-table edges and create no alias nodes; a CTE name reused as a real table in the next
 statement is an edge; a qualified `claims.broker` bypasses the `PUBLIC` synonym while unqualified `broker` uses it;
@@ -162,12 +177,21 @@ two-, three- and nested comma joins, mixed with an ANSI `JOIN ... ON` and a `@db
 create no alias nodes while `EXTRACT(YEAR FROM d), col`, `GROUP BY g1, g2`, `ORDER BY 1, 2` and `IN (1, 2)` add none;
 an `UPDATE OF status, id` trigger fans out to `UPDATE ... SET t.status =`, to `SET premium = ..., id = id` and to a
 `MERGE ... UPDATE SET t.status =` but not to `SET premium = (subquery) RETURNING premium, id INTO` nor to a `MERGE ...
-UPDATE SET t.premium =`, and `SET ROW = rec` fans out as INFERRED `update-columns-unknown`), and the fixture
-invariants (zero `UNVERIFIABLE`, the transitive fan-out edges present, the scheduler `start_date` captured as the full
-`TO_TIMESTAMP_TZ(...)` expression, no CTE alias node, no Albion-only nodes without the Albion input). Albion
+UPDATE SET t.premium =`, and `SET ROW = rec` fans out as INFERRED `update-columns-unknown`; a `SELECT`-only report
+file is a `SQL SCRIPT` reading its three tables; a `DECLARE ... BEGIN poladm.run_all; log_run(l_n); ... END;` block
+plus a `CALL` is a `PLSQL SCRIPT` with a `calls` edge per routine and none of the callees' writes; a
+`DBMS_SCHEDULER.CREATE_JOB` block, a `BEGIN NULL; END;` block and a `GRANT` make no script row while the job's
+`calls` edge stays; a two-member package whose members write different tables, read through a sibling function and
+call a forward-declared helper with a nested local subprogram keeps every effect on the called member, the
+`SELECT` cursor and initialization `INSERT` on the package node, the trigger fan-out of `t_a` on `write_a` only, and
+no node for the nested subprogram), and the fixture invariants (zero `UNVERIFIABLE`, the transitive fan-out edges
+present on `RENEW_EXPIRING`, no write attributed to the `PKG_POLICY_RENEWAL` node, the scheduler program's closure
+reaching the fan-out, no script row for the scheduler/VPD/redaction files, the scheduler `start_date` captured as the
+full `TO_TIMESTAMP_TZ(...)` expression, no CTE alias node, no Albion-only nodes without the Albion input). Albion
 `pkg_policy_inquiry.sql`: 3 census
-rows (body + 2 members), 2 FACT reads (`ods_policy_360`, `ods_claims`; both `OPEN ... FOR` static, both nodes
-`not-in-census` because their DDL is not in the repo), 1 INFERRED `replication` edge
+rows (body + 2 members), 2 FACT reads (`GET_POLICY_SUMMARY` reads `ods_policy_360`, `GET_PARTY_CLAIMS` reads
+`ods_claims`; both `OPEN ... FOR` static, both nodes `not-in-census` because their DDL is not in the repo), 1 INFERRED
+`replication` edge
 `TERADATA.STG_POLICY_360 -> ODS_POLICY_360` (`risk=freshness`, from the package header and
 `docs/architecture_overview.md`), 0 UNVERIFIABLE.
 
@@ -178,7 +202,7 @@ sequence it depends on, plus every package/procedure whose FACT write edges touc
 fan-out writes. Application-facing contracts (`SYS_REFCURSOR` functions, `OUT` parameters, `RAISE_APPLICATION_ERROR`
 codes the app parses) are part of the unit because Postgres function signatures must match the SOAP/JDBC caller.
 Fixture: `POLICY` unit = `POLICY` + 7 constraints + 2 indexes + `TRG_POLICY_BIU` + `POLICY_SEQ` + `AUDIT_SEQ` +
-`PRC_LOG_EVENT` + `POLICY_AUDIT_LOG` (trigger fan-out) + `PKG_POLICY_RENEWAL` (writes `POLICY`, `PREMIUM_TXN`) +
+`PRC_LOG_EVENT` + `POLICY_AUDIT_LOG` (trigger fan-out) + `PKG_POLICY_RENEWAL.RENEW_EXPIRING` (writes `POLICY`, `PREMIUM_TXN`) +
 `MRG_POLICY_FROM_STG` + `STG_POLICY_FEED`. Cut the unit when two write sets share a table and both are needed:
 mark it `shared` and migrate the table with the first, the second procedure alone.
 

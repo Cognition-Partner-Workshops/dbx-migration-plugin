@@ -24,6 +24,7 @@ import tempfile
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 FIXTURE = HERE / "fixture"
@@ -325,6 +326,7 @@ PROCEDURAL_CREATE = {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TRIGGE
 PUBLIC_SYN_RE = re.compile(rf"CREATE\s+(?:OR\s+REPLACE\s+)?PUBLIC\s+SYNONYM\s+({IDENT})\s+FOR\s+({QNAME}(?:@{IDENT})?)", re.I)
 PRIV_SYN_RE = re.compile(rf"CREATE\s+(?:OR\s+REPLACE\s+)?SYNONYM\s+({QNAME})\s+FOR\s+({QNAME}(?:@{IDENT})?)", re.I)
 MEMBER_RE = re.compile(rf"^\s*(PROCEDURE|FUNCTION)\s+({IDENT})", re.I | re.M)
+MEMBER_HEAD_STOP_RE = re.compile(r";|\b(?:IS|AS)\b", re.I)
 # call heads only: the argument list runs to the balanced ')' (call_args), never to the first ');' in the text
 SCHED_RE = re.compile(r"DBMS_SCHEDULER\.CREATE_(JOB|PROGRAM)\s*\(", re.I)
 RLS_RE = re.compile(r"DBMS_RLS\.ADD_POLICY\s*\(", re.I)
@@ -334,6 +336,16 @@ REDACT_RE = re.compile(r"DBMS_REDACT\.ADD_POLICY\s*\(", re.I)
 LOOSE_DML_RE = re.compile(
     rf"\b(?:INSERT\s+INTO|MERGE\s+INTO|TRUNCATE\s+TABLE)\s+{QNAME}|\bUPDATE\s+{QNAME}\s+SET\b|\bDELETE\s+(?:FROM\s+)?{QNAME}\s*(?:WHERE\b|;)",
     re.I)
+# a non-DML remainder is still a script unit when it queries or calls something: a standalone query / CALL, or a
+# statement of an anonymous block that is a routine call (`poladm.pkg.run(...)`, `prc_log_event(...)`, `run_all;`)
+LOOSE_QUERY_RE = re.compile(rf"\bSELECT\b[\s\S]*?\bFROM\b|\bCALL\s+{QNAME}", re.I)
+CALL_STMT_RE = re.compile(rf"(?:;|\bBEGIN\b|\bTHEN\b|\bELSE\b|\bLOOP\b)\s*({IDENT}(?:\.{IDENT}){{0,2}})\s*(?:\(|;)", re.I)
+# `poladm.run_all;` / `run_all;`: a procedure call statement without an argument list
+PARENLESS_CALL_RE = re.compile(rf"(?:;|\bBEGIN\b|\bTHEN\b|\bELSE\b|\bLOOP\b)\s*({IDENT}(?:\.{IDENT}){{0,2}})\s*;", re.I)
+STATEMENT_WORDS = KEYWORDS | {
+    "COMMIT", "ROLLBACK", "RETURN", "EXIT", "RAISE", "CONTINUE", "GOTO", "BEGIN", "DECLARE", "EXCEPTION", "IF", "ELSIF",
+    "WHILE", "FOR", "FORALL", "OPEN", "CLOSE", "FETCH", "EXECUTE", "SAVEPOINT", "LOCK", "PIPE", "RAISE_APPLICATION_ERROR",
+}
 CTAS_RE = re.compile(r"\bAS\s*\(?\s*(?:SELECT|WITH)\b", re.I)
 INDEX_ON_RE = re.compile(rf"\s+ON\s+({QNAME})\s*\(", re.I)
 GRANT_RE = re.compile(rf"GRANT\s+([A-Z ,()_]+?)\s+ON\s+({QNAME})\s+TO\s+({IDENT})", re.I)
@@ -359,6 +371,43 @@ def uncovered(text: str, covered: list[tuple[int, int]]) -> str:
         pos = max(pos, e)
     out.append(text[pos:])
     return "".join(out)
+
+
+def package_members(unit_text: str) -> list[tuple[str, str, int, int]]:
+    """(NAME, PROCEDURE|FUNCTION, start, end) of the top-level members of a package spec or body. A declaration
+    (`PROCEDURE p(...);`: spec entries, body forward declarations) ends at its ';'; an implementation (`... IS|AS ...`)
+    ends at its `END p;` and owns its nested local subprograms. An implementation closed by a bare `END;` ends at the
+    next member header (or the unit end) instead."""
+    out: list[tuple[str, str, int, int]] = []
+    pos = 0
+    for mm in MEMBER_RE.finditer(unit_text):
+        if mm.start() < pos:
+            continue
+        name = mm.group(2)
+        after = mm.end() + len(top_level_cut(unit_text[mm.end():], MEMBER_HEAD_STOP_RE))
+        if after >= len(unit_text) or unit_text[after] == ";":
+            end = after + 1
+        else:
+            em = re.compile(rf"\bEND\s+{re.escape(name)}\s*;", re.I).search(unit_text, after)
+            nxt = MEMBER_RE.search(unit_text, after)
+            end = em.end() if em else (nxt.start() if nxt else len(unit_text))
+        out.append((name.upper(), mm.group(1).upper(), mm.start(), end))
+        pos = end
+    return out
+
+
+def loose_unit_class(loose_static: str) -> str:
+    """Census class of a file's non-procedural remainder (literals blanked), '' when it carries no lineage: DML SCRIPT
+    for top-level DML, PLSQL SCRIPT for an anonymous block that queries or calls a routine, SQL SCRIPT for standalone
+    queries / CALL statements. Calls into the pure and ruled Oracle packages (DBMS_OUTPUT, DBMS_SCHEDULER, ...) and
+    control statements (NULL; COMMIT; RETURN;) do not make a unit."""
+    if LOOSE_DML_RE.search(loose_static):
+        return "DML SCRIPT"
+    calls = [m.group(1).upper() for m in CALL_STMT_RE.finditer(loose_static)]
+    calls = [c for c in calls if c.split(".")[0] not in PURE_PACKAGES | RULED_PACKAGES and c not in STATEMENT_WORDS]
+    if not calls and not any(LOOSE_QUERY_RE.search(stmt) for stmt in loose_static.split(";")):
+        return ""
+    return "PLSQL SCRIPT" if re.search(r"\bBEGIN\b", loose_static, re.I) else "SQL SCRIPT"
 
 
 def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list, proc_units: list, deferred: list) -> None:
@@ -433,10 +482,16 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
             unit_text = text[m.start():end]
             covered.append((m.start(), end))
             node.signals["lines"] = unit_text.count("\n")
-            proc_units.append((key, cls, unit_text))
             if cls in ("PACKAGE", "PACKAGE BODY"):
-                for mm in MEMBER_RE.finditer(unit_text):
-                    est.add(f"{key}.{mm.group(2).upper()}", f"PACKAGE {mm.group(1).upper()}", fname)
+                # each member's body is its own lineage unit (callers resolve to OWNER.PKG.MEMBER); package-level
+                # declarations (constants, cursors, state) and the initialization block stay on the package node
+                members = package_members(unit_text)
+                for mname, mcls, s, e in members:
+                    est.add(f"{key}.{mname}", f"PACKAGE {mcls}", fname)
+                    proc_units.append((f"{key}.{mname}", f"PACKAGE {mcls}", unit_text[s:e]))
+                proc_units.append((key, cls, uncovered(unit_text, [(s, e) for _, _, s, e in members])))
+            else:
+                proc_units.append((key, cls, unit_text))
         if cls in ("VIEW", "MATERIALIZED VIEW"):
             unit_text = text[m.start():stmt_end]         # lexical end: a ';' inside a projected literal is text
             proc_units.append((key, cls, unit_text))
@@ -444,6 +499,7 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
                 node.signals["refresh"] = " ".join(re.findall(r"REFRESH\s+(\w+)\s+ON\s+(\w+)", unit_text, re.I)[0]) if re.search(
                     r"REFRESH\s+\w+\s+ON", unit_text, re.I) else "?"
     for m in SCHED_RE.finditer(text):
+        covered.append((m.start(), statement_end(text, skip_balanced(text, m.end() - 1))))
         args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
         name = args.get("job_name") or args.get("program_name")
         cls = "SCHEDULER " + m.group(1).upper()
@@ -455,12 +511,14 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
         if action:
             proc_units.append((key, cls, action))
     for m in RLS_RE.finditer(text):
+        covered.append((m.start(), statement_end(text, skip_balanced(text, m.end() - 1))))
         args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
         key = f"{args['object_schema']}.{args['policy_name']}".upper()
         est.add(key, "VPD POLICY", fname)
         est.edges.append(Edge(key, f"{args['object_schema']}.{args['object_name']}".upper(), "defines-on", "FACT"))
         est.edges.append(Edge(key, f"{args['function_schema']}.{args['policy_function']}".upper(), "calls", "FACT"))
     for m in REDACT_RE.finditer(text):
+        covered.append((m.start(), statement_end(text, skip_balanced(text, m.end() - 1))))
         args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
         key = f"{args['object_schema']}.{args['policy_name']}".upper()
         est.add(key, "REDACTION POLICY", fname, column=args.get("column_name"))
@@ -472,13 +530,15 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
         deferred.append((key, obj, "defines-on", default_owner))
     for m in ROLE_GRANT_RE.finditer(blanked):
         est.add(f"ROLEGRANT.{m.group(2).upper()}.{m.group(1).upper()}", "ROLE MEMBERSHIP", fname)
-    # top-level DML outside every procedural unit / DDL statement (loose MERGE files, anonymous blocks, seed rows
-    # after a CREATE TABLE) is one DML SCRIPT unit named after the file; a SQL*Plus script already scans its whole text
+    # the remainder outside every procedural unit / DDL statement / ruled DBMS_* call (loose MERGE files, anonymous
+    # blocks, seed rows after a CREATE TABLE, report queries, call-only orchestration scripts) is one script unit named
+    # after the file; a SQL*Plus script already scans its whole text
     loose = uncovered(text, covered)
-    if not is_sqlplus and LOOSE_DML_RE.search(STRING_LIT_RE.sub("''", loose)):
+    loose_cls = "" if is_sqlplus else loose_unit_class(STRING_LIT_RE.sub("''", loose))
+    if loose_cls:
         key = f"{default_owner}.{path.stem.upper()}"
-        est.add(key, "DML SCRIPT", fname)
-        proc_units.append((key, "DML SCRIPT", loose))
+        est.add(key, loose_cls, fname)
+        proc_units.append((key, loose_cls, loose))
 
 
 # --------------------------------------------------------------------------- lineage (section 2)
@@ -803,7 +863,7 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
     if SUBST_IDENT_RE.search(text):
         est.edges.append(Edge(key, f"{owner}.<&var>", "reads", "INFERRED", "substitution-in-identifier"))
     # VPD predicate functions build SQL text from SYS_CONTEXT: the tables inside the string are INFERRED reads
-    if cls == "FUNCTION" and re.search(r"RETURN\s+'", text, re.I) and re.search(r"SYS_CONTEXT", text, re.I):
+    if cls.endswith("FUNCTION") and re.search(r"RETURN\s+'", text, re.I) and re.search(r"SYS_CONTEXT", text, re.I):
         for lit in STRING_LIT_RE.findall(text):
             for rm in READ_RE.finditer(lit):
                 dst, _, _ = est.resolve(rm.group(1), owner)
@@ -883,10 +943,26 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
         if cand != key and not cand.startswith(key + ".") and \
                 est.nodes[cand.rsplit(".", 1)[0] if cand not in est.nodes else cand].cls not in ("TABLE", "VIEW", "SEQUENCE", "MATERIALIZED VIEW"):
             est.edges.append(Edge(key, cand, "calls", "FACT"))
+    # an unqualified name resolves to a member of the enclosing package first (a sibling from inside a member, an own
+    # member from the package-level code), then to a same-schema routine
+    pkg = ""
+    if key.count(".") == 2:
+        pkg = key.rsplit(".", 1)[0]
+    elif est.nodes.get(key) and est.nodes[key].cls in ("PACKAGE", "PACKAGE BODY"):
+        pkg = key
     for m in UNQUAL_CALL_RE.finditer(static):
-        cand = f"{owner}.{m.group(1).upper()}"
-        if cand in est.nodes and est.nodes[cand].cls in PROCEDURAL_CLASSES and cand != key and not key.startswith(cand + "."):
+        cands = ([f"{pkg}.{m.group(1).upper()}"] if pkg else []) + [f"{owner}.{m.group(1).upper()}"]
+        cand = next((c for c in cands if c in est.nodes and est.nodes[c].cls in PROCEDURAL_CLASSES), None)
+        if cand and cand != key and not key.startswith(cand + "."):
             est.edges.append(Edge(key, cand, "calls", "FACT", "", "unqualified call resolved against the census"))
+    for m in PARENLESS_CALL_RE.finditer(static):
+        callee = m.group(1).upper()
+        if callee in STATEMENT_WORDS or callee.split(".")[0] in PURE_PACKAGES | RULED_PACKAGES:
+            continue
+        cands = [callee, f"{owner}.{callee}"] + ([f"{pkg}.{callee}"] if pkg else [])
+        cand = next((c for c in cands if c in est.nodes and est.nodes[c].cls in PROCEDURAL_CLASSES), None)
+        if cand and cand != key and not key.startswith(cand + "."):
+            est.edges.append(Edge(key, cand, "calls", "FACT", "", "call statement without argument list"))
     completeness_pass(est, key, owner, static)
 
 
@@ -1293,6 +1369,74 @@ POSITIVE_CASES.update({
               ("POLADM.P_CN", "POLADM.T_Y", "reads"), ("POLADM.P_CN", "POLADM.T_DEL", "writes")},
         forbid={"POLADM.S", "POLADM.O", "POLADM.OTHER_COL", "POLADM.G1", "POLADM.G2", "POLADM.D", "POLADM.I", "POLADM.J"},
     ),
+    "select_only_report_file_is_a_script": Case(
+        "SELECT p.policy_no, b.broker_name\n  FROM poladm.policy p JOIN poladm.broker b ON b.broker_id = p.broker_id\n"
+        " WHERE p.expiry_dt < SYSDATE;\n"
+        "SELECT count(*) FROM poladm.party;",
+        want={("POLADM.SELECT_ONLY_REPORT_FILE_IS_A_SCRIPT", "POLADM.POLICY", "reads"),
+              ("POLADM.SELECT_ONLY_REPORT_FILE_IS_A_SCRIPT", "POLADM.BROKER", "reads"),
+              ("POLADM.SELECT_ONLY_REPORT_FILE_IS_A_SCRIPT", "POLADM.PARTY", "reads")},
+        want_nodes={("POLADM.SELECT_ONLY_REPORT_FILE_IS_A_SCRIPT", "SQL SCRIPT")},
+    ),
+    "call_only_anonymous_block_is_a_script": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.run_all IS BEGIN INSERT INTO poladm.t_run VALUES (1); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.log_run (p IN NUMBER) IS BEGIN INSERT INTO poladm.t_log VALUES (p); END;\n/\n"
+        "DECLARE\n  l_n NUMBER(10);\nBEGIN\n  poladm.run_all;\n  log_run(l_n);\n  DBMS_OUTPUT.PUT_LINE('done');\n  COMMIT;\nEND;\n/\n"
+        "CALL poladm.log_run(2);",
+        want={("POLADM.CALL_ONLY_ANONYMOUS_BLOCK_IS_A_SCRIPT", "POLADM.RUN_ALL", "calls"),
+              ("POLADM.CALL_ONLY_ANONYMOUS_BLOCK_IS_A_SCRIPT", "POLADM.LOG_RUN", "calls"),
+              ("POLADM.RUN_ALL", "POLADM.T_RUN", "writes")},
+        want_nodes={("POLADM.CALL_ONLY_ANONYMOUS_BLOCK_IS_A_SCRIPT", "PLSQL SCRIPT")},
+        forbid_edges={("POLADM.CALL_ONLY_ANONYMOUS_BLOCK_IS_A_SCRIPT", "POLADM.T_RUN", "writes"),
+                      ("POLADM.CALL_ONLY_ANONYMOUS_BLOCK_IS_A_SCRIPT", "POLADM.T_LOG", "writes")},
+    ),
+    "ruled_package_block_and_control_statements_are_not_a_script": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.prc_r IS BEGIN NULL; END;\n/\n"
+        "BEGIN\n  DBMS_SCHEDULER.CREATE_JOB(job_name => 'POLADM.JOB_R', job_type => 'PLSQL_BLOCK',\n"
+        "    job_action => 'BEGIN poladm.prc_r; END;', enabled => FALSE);\n  DBMS_OUTPUT.PUT_LINE('created');\n  COMMIT;\nEND;\n/\n"
+        "BEGIN\n  NULL;\nEND;\n/\n"
+        "GRANT SELECT ON poladm.t_r TO ods_reader;",
+        want={("POLADM.JOB_R", "POLADM.PRC_R", "calls")},
+        forbid={"POLADM.RULED_PACKAGE_BLOCK_AND_CONTROL_STATEMENTS_ARE_NOT_A_SCRIPT"},
+        want_nodes={("POLADM.JOB_R", "SCHEDULER JOB")},
+    ),
+    "package_members_own_their_effects": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.log_a IS BEGIN INSERT INTO poladm.log_a_t VALUES (1); END;\n/\n"
+        "CREATE OR REPLACE PACKAGE poladm.pkg_two AS\n"
+        "  c_limit CONSTANT NUMBER := 100;\n"
+        "  PROCEDURE write_a(p IN NUMBER);\n"
+        "  PROCEDURE write_b(p IN NUMBER);\n"
+        "  FUNCTION rate RETURN NUMBER;\n"
+        "END pkg_two;\n/\n"
+        "CREATE OR REPLACE PACKAGE BODY poladm.pkg_two AS\n"
+        "  CURSOR c_cfg IS SELECT v FROM poladm.pkg_cfg;\n"
+        "  PROCEDURE helper(p IN NUMBER);\n"
+        "  FUNCTION rate RETURN NUMBER IS l NUMBER; BEGIN SELECT r INTO l FROM poladm.rates; RETURN l; END rate;\n"
+        "  PROCEDURE helper(p IN NUMBER) IS\n"
+        "    PROCEDURE inner_h IS BEGIN INSERT INTO poladm.t_inner VALUES (p); END inner_h;\n"
+        "  BEGIN inner_h; END helper;\n"
+        "  PROCEDURE write_a(p IN NUMBER) IS BEGIN INSERT INTO poladm.t_a VALUES (p * rate()); helper(p); END write_a;\n"
+        "  PROCEDURE write_b(p IN NUMBER) IS BEGIN UPDATE poladm.t_b SET v = p WHERE id = c_limit; END write_b;\n"
+        "BEGIN\n  INSERT INTO poladm.pkg_init_log VALUES (SYSDATE);\n"
+        "END pkg_two;\n/\n"
+        "CREATE OR REPLACE TRIGGER poladm.trg_a AFTER INSERT ON poladm.t_a FOR EACH ROW BEGIN poladm.log_a(); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.caller_a IS BEGIN poladm.pkg_two.write_a(1); END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.caller_b IS BEGIN pkg_two.write_b(2); END;",
+        want={("POLADM.PKG_TWO.WRITE_A", "POLADM.T_A", "writes"), ("POLADM.PKG_TWO.WRITE_B", "POLADM.T_B", "writes"),
+              ("POLADM.PKG_TWO.RATE", "POLADM.RATES", "reads"), ("POLADM.PKG_TWO.HELPER", "POLADM.T_INNER", "writes"),
+              ("POLADM.PKG_TWO.WRITE_A", "POLADM.PKG_TWO.RATE", "calls"), ("POLADM.PKG_TWO.WRITE_A", "POLADM.PKG_TWO.HELPER", "calls"),
+              ("POLADM.PKG_TWO", "POLADM.PKG_CFG", "reads"), ("POLADM.PKG_TWO", "POLADM.PKG_INIT_LOG", "writes"),
+              ("POLADM.CALLER_A", "POLADM.PKG_TWO.WRITE_A", "calls"), ("POLADM.CALLER_B", "POLADM.PKG_TWO.WRITE_B", "calls"),
+              ("POLADM.PKG_TWO.WRITE_A", "POLADM.LOG_A_T", "writes")},
+        forbid={"POLADM.PKG_TWO.INNER_H"},
+        forbid_edges={("POLADM.PKG_TWO", "POLADM.T_A", "writes"), ("POLADM.PKG_TWO", "POLADM.T_B", "writes"),
+                      ("POLADM.PKG_TWO", "POLADM.RATES", "reads"), ("POLADM.PKG_TWO", "POLADM.LOG_A_T", "writes"),
+                      ("POLADM.PKG_TWO.WRITE_B", "POLADM.T_A", "writes"), ("POLADM.PKG_TWO.WRITE_B", "POLADM.LOG_A_T", "writes"),
+                      ("POLADM.PKG_TWO.WRITE_A", "POLADM.T_B", "writes"), ("POLADM.PKG_TWO.RATE", "POLADM.T_A", "writes")},
+        want_nodes={("POLADM.PKG_TWO", "PACKAGE"), ("POLADM.PKG_TWO.WRITE_A", "PACKAGE PROCEDURE"),
+                    ("POLADM.PKG_TWO.WRITE_B", "PACKAGE PROCEDURE"), ("POLADM.PKG_TWO.RATE", "PACKAGE FUNCTION"),
+                    ("POLADM.PKG_TWO.HELPER", "PACKAGE PROCEDURE")},
+    ),
     "trigger_update_of_columns": Case(
         "CREATE TABLE poladm.t_c (id NUMBER, status VARCHAR2(10), premium NUMBER);\n"
         "CREATE OR REPLACE PROCEDURE poladm.log_s IS BEGIN INSERT INTO poladm.log_status VALUES (1); END;\n/\n"
@@ -1370,10 +1514,18 @@ def selftest() -> int:
         failures.append("fixture-only run contains the Albion TERADATA replication node")
     want = {("POLADM.09_MRG_POLICY_FROM_STG", "POLADM.POLICY_AUDIT_LOG", "writes"),
             ("POLADM.09_MRG_POLICY_FROM_STG", "POLADM.AUDIT_SEQ", "consumes-sequence"),
-            ("POLADM.PKG_POLICY_RENEWAL", "POLADM.POLICY_AUDIT_LOG", "writes")}
+            ("POLADM.PKG_POLICY_RENEWAL.RENEW_EXPIRING", "POLADM.POLICY_AUDIT_LOG", "writes")}
     have = {(e.src, e.dst, e.kind) for e in res["edges"]}
     for w in sorted(want - have):
         failures.append(f"fixture: missing transitive trigger fan-out edge {w}")
+    # member effects live on the member the scheduler program calls, not on the package node
+    for w in sorted({e for e in have if e[0] == "POLADM.PKG_POLICY_RENEWAL" and e[2] in ("writes", "consumes-sequence")}):
+        failures.append(f"fixture: package-level attribution of a member effect {w}")
+    if not any(e.src == "POLADM.PKG_POLICY_RENEWAL.RENEW_EXPIRING" and e.dst == "POLADM.POLICY_AUDIT_LOG"
+               for e in side_effect_closure(SimpleNamespace(nodes=res["nodes"], edges=res["edges"]), "POLADM.PRG_NIGHTLY_RENEWAL")):
+        failures.append("fixture: PRG_NIGHTLY_RENEWAL's closure does not reach RENEW_EXPIRING's trigger fan-out")
+    if any(k.startswith("POLADM.13_JOB") or k.startswith("POLADM.15_SYN") for k in res["nodes"]):
+        failures.append("fixture: a DBMS_SCHEDULER / DBMS_RLS / DBMS_REDACT-only anonymous block became a script row")
     job = res["nodes"].get("POLADM.JOB_NIGHTLY_RENEWAL")
     want_start = "TO_TIMESTAMP_TZ('2019-04-01 02:40:00 Europe/London', 'YYYY-MM-DD HH24:MI:SS TZR')"
     if not job or job.signals.get("start_date") != want_start:
