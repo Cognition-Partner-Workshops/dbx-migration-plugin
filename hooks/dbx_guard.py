@@ -327,30 +327,64 @@ def _shell_tokens(cmd: str) -> list[str]:
         return [t.strip("'\"") for t in re.split(r"\s+|(?<!<)(<)(?!<)", cmd) if t]
 
 
-def _commands(toks: list[str]) -> list[list[str]]:
+# redirection operators stay inside their simple command; every other punctuation run ends it
+_REDIRECT_OP = re.compile(r"<{1,3}|<>|<&|>{1,2}|>&|>\||&>{1,2}")
+
+
+def _commands(toks: list[str]) -> list[tuple[list[str], list[str]]]:
     """The token list split into simple commands at `;`, `&&`, `||`, `|`, `&`, parentheses and
-    line breaks; `<` stays inside its command because it names that command's input."""
-    out: list[list[str]] = [[]]
-    for tok in toks:
-        if tok != "<" and re.fullmatch(r"[();<>|&\n]+", tok):
-            out.append([])
+    line breaks, each as (words, heredoc body words). Redirections (`< f`, `>log`, `2>&1`) are
+    part of the command they sit in, and the body of a `<<TAG` heredoc belongs to the command
+    that opened it, up to the line holding TAG alone."""
+    punct = re.compile(r"[();<>|&\n]+")
+    out: list[tuple[list[str], list[str]]] = [([], [])]
+    pending: list[str] = []   # heredoc delimiters announced on the current line, in order
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if tok in ("<<", "<<-") and i + 1 < len(toks) and not punct.fullmatch(toks[i + 1]):
+            pending.append(toks[i + 1].lstrip("-"))
+            out[-1][0].extend(toks[i:i + 2])
+            i += 2
+        elif punct.fullmatch(tok) and not _REDIRECT_OP.fullmatch(tok):
+            if "\n" in tok:
+                while pending:  # body words up to the line holding the delimiter alone
+                    tag = pending.pop(0)
+                    i += 1
+                    while i < len(toks):
+                        if toks[i] == tag and "\n" in toks[i - 1] and (i + 1 >= len(toks) or "\n" in toks[i + 1]):
+                            break
+                        if not punct.fullmatch(toks[i]):
+                            out[-1][1].append(toks[i])
+                        i += 1
+            out.append(([], []))
+            i += 1
         else:
-            out[-1].append(tok)
-    return [c for c in out if c]
+            out[-1][0].append(tok)
+            i += 1
+    return [c for c in out if c[0] or c[1]]
 
 
 def _script_inputs(cmd: str, cfg: GuardConfig | None = None) -> list[str]:
-    """Files a client is told to execute: `< f`, `@f`, `-f f`, `--file f`, `-i f`, `--input f`.
-    Given a config, read only from the simple commands that name a Databricks or legacy client
-    or a legacy source: the `-f` of `rm -f x && databricks jobs list` belongs to `rm`."""
+    """Files a client is told to execute: `< f`, `@f`, `-f f`, `--file f`, `-i f`, `--input f`,
+    and `@f` on a line of the client's heredoc (SQL*Plus / BTEQ `.RUN`). Given a config, read
+    only from the simple commands that name a Databricks or legacy client or a legacy source:
+    the `-f` of `rm -f x && databricks jobs list` belongs to `rm`."""
     files = []
-    for toks in _commands(_shell_tokens(cmd)):
-        if cfg is not None and not _has_context(" ".join(toks), cfg):
+    for words, body in _commands(_shell_tokens(cmd)):
+        if cfg is not None and not _has_context(" ".join(words + body), cfg):
             continue
-        for i, tok in enumerate(toks):
-            nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        skip = False
+        for i, tok in enumerate(words):
+            if skip:  # operand of a redirection other than `<`: a log file, a descriptor, a here-string
+                skip = False
+                continue
+            nxt = words[i + 1] if i + 1 < len(words) else ""
             if tok == "<" or tok in _SCRIPT_FLAGS:
                 f = nxt
+            elif _REDIRECT_OP.fullmatch(tok):
+                skip = True
+                continue
             elif tok.startswith("@"):
                 f = tok[1:]
             elif tok.startswith(tuple(fl + "=" for fl in _SCRIPT_FLAGS)):
@@ -359,6 +393,7 @@ def _script_inputs(cmd: str, cfg: GuardConfig | None = None) -> list[str]:
                 continue
             if f and not f.startswith("-") and not re.fullmatch(r"[<>|;&()]+", f):
                 files.append(f)
+        files.extend(tok[1:] for tok in body if tok.startswith("@") and len(tok) > 1)
     return files
 
 
