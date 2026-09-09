@@ -46,8 +46,9 @@ SELECT
 FROM ${catalog}.${schema}.loans l
 JOIN ${catalog}.${schema}.borrowers b
   ON l.borrower_id = b.borrower_id
--- `l.loan_id *= m.loan_id AND (m.status = 'A' OR m.status IS NULL)`: the inner-side predicate
--- goes INTO the ON clause; in WHERE it turns the outer join back into an inner join.
+-- `l.loan_id *= m.loan_id AND (m.status = 'A' OR m.status IS NULL)`: ASE applies an inner-table
+-- qualification as part of the outer join, so a loan whose modifications are all non-'A' is kept
+-- with NULL m.* (not dropped). ON reproduces that; WHERE would drop it and the no-modification loans.
 LEFT JOIN ${catalog}.${schema}.loan_modifications m
   ON l.loan_id = m.loan_id
  AND (m.status = 'A' OR m.status IS NULL)

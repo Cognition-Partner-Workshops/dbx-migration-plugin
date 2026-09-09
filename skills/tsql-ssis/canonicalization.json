@@ -1,10 +1,10 @@
 [
-  {"rule": "datetime_grid_333", "applies_to": "DATETIME->TIMESTAMP_NTZ", "params": {}},
-  {"rule": "datetime_utc_truncate_ms", "applies_to": "DATETIME2,DATETIMEOFFSET,SMALLDATETIME,BIGDATETIME->TIMESTAMP_NTZ,TIMESTAMP", "params": {}},
+  {"rule": "datetime_grid_333", "applies_to": "DATETIME->TIMESTAMP_NTZ, only columns the target recomputes (DATEADD/arithmetic) at ms or us precision", "params": {"grid_note": "rounds to a 10 ms grid, so distinct source values .000/.003 and .007/.010/.013 compare equal; record in the tolerance record. Loaded DATETIME columns use identity (1/300 s values are exact in TIMESTAMP_NTZ). Exact fit is GAP datetime_tolerance_ms (|delta| <= 2 ms)"}},
+  {"rule": "datetime_utc_truncate_ms", "applies_to": "DATETIMEOFFSET(p<=3)->TIMESTAMP (UTC-normalise; ms truncation is lossless at p<=3)", "params": {"precision_note": "never for DATETIME2/BIGDATETIME/TIME or DATETIMEOFFSET(p>3): truncating to ms hides valid us differences; those use identity, with DATETIME2(7)/DATETIMEOFFSET(7) extracted at us in the source query (GAP datetime_truncate_us)"}},
   {"rule": "collation_casefold", "applies_to": "STRING", "params": {"enabled_if": "census reports a *_CI_* database/column collation (sys.databases.collation_name, sys.columns.collation_name) or an SSIS no-cache Lookup on a CI database; disabled for Sybase ASE binary sort order (sp_helpsort)"}},
   {"rule": "rstrip_spaces", "applies_to": "CHAR->STRING", "params": {}},
   {"rule": "decimal_round", "applies_to": "MONEY,SMALLMONEY,DECIMAL,NUMERIC->DECIMAL", "params": {"mode": "half_up", "places": 4, "places_note": "one params set per rule name (recon.canon.Canonicalizer indexes by rule); places = max(4, largest DECIMAL/NUMERIC scale in the census), raised through the tolerance record"}},
   {"rule": "uuid_normalize", "applies_to": "UNIQUEIDENTIFIER->STRING", "params": {}},
   {"rule": "null_missing_equiv", "applies_to": "*", "params": {}},
-  {"rule": "identity", "applies_to": "*", "params": {}}
+  {"rule": "identity", "applies_to": "*; loaded DATETIME, SMALLDATETIME, DATETIME2(p<=6), BIGDATETIME, TIME(p<=6) -> TIMESTAMP_NTZ/TIME compare exactly", "params": {}}
 ]
