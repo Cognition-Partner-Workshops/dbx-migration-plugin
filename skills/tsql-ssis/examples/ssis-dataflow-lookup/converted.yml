@@ -18,9 +18,16 @@
 # the parameter must select the row set on every run, which only a bounded batch does.
 #
 # Mapping from source.dtsx:
-#   DFT Load fact_payment (Data Flow Task)          -> sql_task load_payment_fact (converted.sql: two idempotent
+#   DFT Load fact_payment (Data Flow Task)          -> sql_task load_payment_fact (converted.sql: the window and its
+#                                                      lookup verdict read once into a temp table, then two idempotent
 #                                                      MERGE statements, fact + error output), one run a day like
 #                                                      the SQL Agent schedule that ran the package.
+#   OLTP_LoanServicing connection manager            -> job parameters src_catalog / src_schema (the migrated copy of
+#     (LOANSQL01, Initial Catalog=loan_servicing)      loan_servicing.dbo; read only). Every payments/loans reference.
+#   DW_LoanMart connection manager                   -> job parameters tgt_catalog / tgt_schema (loan_mart.dw). Every
+#     (LOANDW01, Initial Catalog=loan_mart)            MERGE target and the OnError etl_log write. Two connection
+#                                                      managers are two namespaces; one catalog/schema pair for both
+#                                                      would point the source reads at the fact's own schema.
 #   User::LoadDate (bound to the two ? of the source  -> job parameter load_date. Default {{job.start_time.iso_date}}
 #     query)                                           stands in for what the Agent step set the variable to
 #                                                      (INFERRED: the census reads the step's /Set or the package
@@ -48,16 +55,21 @@ resources:
     load_payment_fact_job:
       name: load_payment_fact_job
       description: "Converted from LoadPaymentFact.dtsx (SQL Agent daily schedule)"
-      max_concurrent_runs: 1             # SSIS packages are not re-entrant; also keeps two runs off the same window
+      max_concurrent_runs: 1             # SSIS packages are not re-entrant; serialises runs of THIS job only (it does
+                                         #   not fence outside writers: converted.sql reads one snapshot for that)
       trigger:
         periodic:
           interval: 1
           unit: DAYS
       parameters:
-        - name: catalog
-          default: ${var.catalog}
-        - name: schema
-          default: ${var.schema}         # dw schema of the loan_mart target catalog
+        - name: src_catalog              # OLTP_LoanServicing -> migrated loan_servicing (read only)
+          default: ${var.src_catalog}
+        - name: src_schema
+          default: ${var.src_schema}     # dbo
+        - name: tgt_catalog              # DW_LoanMart -> loan_mart
+          default: ${var.tgt_catalog}
+        - name: tgt_schema
+          default: ${var.tgt_schema}     # dw
         - name: load_date                # User::LoadDate; the window [load_date, load_date + 1 day)
           default: "{{job.start_time.iso_date}}"
         - name: servicer_id              # $Package::ServicerId; override per run exactly as dtexec /Par did
@@ -68,16 +80,18 @@ resources:
           - ${var.ops_email}
       tasks:
         - task_key: load_payment_fact
-          max_retries: 2                 # commit conflicts with an outside writer (converted.sql header): the
-          min_retry_interval_millis: 60000   # MERGEs are idempotent, so a retry re-evaluates the window safely
+          max_retries: 2                 # commit conflicts with an outside writer to the dw tables (converted.sql
+          min_retry_interval_millis: 60000   # header): the task rebuilds the temp table and re-runs both idempotent MERGEs
           sql_task:
             file:
               path: ../sql/load_payment_fact.sql   # converted.sql
               source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
-            parameters:                  # read as :catalog / :schema / :load_date / :servicer_id in converted.sql
-              catalog: "{{job.parameters.catalog}}"
-              schema: "{{job.parameters.schema}}"
+            parameters:                  # read as :src_catalog / :src_schema / :tgt_catalog / :tgt_schema /
+              src_catalog: "{{job.parameters.src_catalog}}"   # :load_date / :servicer_id in converted.sql
+              src_schema: "{{job.parameters.src_schema}}"
+              tgt_catalog: "{{job.parameters.tgt_catalog}}"
+              tgt_schema: "{{job.parameters.tgt_schema}}"
               load_date: "{{job.parameters.load_date}}"
               servicer_id: "{{job.parameters.servicer_id}}"
 
@@ -93,7 +107,7 @@ resources:
           sql_task:
             file:
               path: ../sql/log_onerror_etl_log.sql
-              # INSERT INTO IDENTIFIER(:catalog||'.'||:schema||'.etl_log')
+              # INSERT INTO IDENTIFIER(:tgt_catalog||'.'||:tgt_schema||'.etl_log')   -- DW_LoanMart, as in the package
               #   (package_name, event, message, logged_at)
               # VALUES ('LoadPaymentFact', 'OnError',
               #         'load_payment_fact ' || :result_state || ' ' || :error_code || ' run ' || :run_id,
@@ -101,8 +115,8 @@ resources:
               source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
             parameters:
-              catalog: "{{job.parameters.catalog}}"
-              schema: "{{job.parameters.schema}}"
+              tgt_catalog: "{{job.parameters.tgt_catalog}}"
+              tgt_schema: "{{job.parameters.tgt_schema}}"
               run_id: "{{job.run_id}}"
               result_state: "{{tasks.load_payment_fact.result_state}}"
               error_code: "{{tasks.load_payment_fact.error_code}}"
