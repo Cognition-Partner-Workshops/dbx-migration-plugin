@@ -331,25 +331,45 @@ def _shell_tokens(cmd: str) -> list[str]:
 _REDIRECT_OP = re.compile(r"<{1,3}|<>|<&|>{1,2}|>&|>\||&>{1,2}")
 
 
+_PIPE_OPS = ("|", "|&")
+
+
 @dataclass
 class _Simple:
     """One simple command of a shell line: its words, the words of the heredoc bodies it opened,
-    and the operator that separated it from the command before it (`|` means that command's
-    output is this one's stdin)."""
+    the operator that separated it from the command before it (`|` / `|&`: the left side's output
+    is this one's stdin), and how many `(`/`{` groups opened right before it and how many `)`/`}`
+    closed between it and the command before it."""
     words: list[str] = field(default_factory=list)
     body: list[str] = field(default_factory=list)
     sep: str = ""
+    opened: int = 0
+    closed: int = 0
+
+    def empty(self) -> bool:
+        return not self.words and not self.body
 
 
 def _commands(toks: list[str]) -> list[_Simple]:
-    """The token list split into simple commands at `;`, `&&`, `||`, `|`, `&`, parentheses and
-    line breaks. Redirections (`< f`, `>log`, `2>&1`) are part of the command they sit in, and
-    the body of a `<<TAG` heredoc (read from the next line, up to the line holding TAG alone)
-    belongs to the command that opened it, even when that command is followed by `| tee` or
-    `&& echo` on the opening line."""
+    """The token list split into simple commands at `;`, `&&`, `||`, `|`, `|&`, `&`, group
+    delimiters and line breaks. Redirections (`< f`, `>log`, `2>&1`) are part of the command
+    they sit in, and the body of a `<<TAG` heredoc (read from the next line, up to the line
+    holding TAG alone) belongs to the command that opened it, even when that command is followed
+    by `| tee` or `&& echo` on the opening line. Punctuation between two commands folds into one
+    separator: `) |`, `|` + newline and `| (` all leave the right-hand command fed by a pipe."""
     punct = re.compile(r"[();<>|&\n]+")
     out: list[_Simple] = [_Simple()]
     pending: list[tuple[str, list[str]]] = []   # (delimiter, body of the opening command), in order
+
+    def separate(tok: str) -> None:
+        op = re.sub(r"[()\n]", "", tok)
+        if not out[-1].empty():
+            out.append(_Simple())
+        cur = out[-1]
+        cur.sep = op or cur.sep or ("\n" if "\n" in tok else "")
+        cur.opened += tok.count("(")
+        cur.closed += tok.count(")")
+
     i = 0
     while i < len(toks):
         tok = toks[i]
@@ -368,12 +388,18 @@ def _commands(toks: list[str]) -> list[_Simple]:
                         if not punct.fullmatch(toks[i]):
                             body.append(toks[i])
                         i += 1
-            out.append(_Simple(sep=tok))
+            separate(tok)
+            i += 1
+        elif tok == "{" and out[-1].empty():
+            out[-1].opened += 1
+            i += 1
+        elif tok == "}" and out[-1].empty():
+            out[-1].closed += 1
             i += 1
         else:
             out[-1].words.append(tok)
             i += 1
-    return [c for c in out if c.words or c.body]
+    return [c for c in out if not c.empty()]
 
 
 # producers whose stdout the guard can read as text: the files `cat` names, the words `echo` /
@@ -381,12 +407,46 @@ def _commands(toks: list[str]) -> list[_Simple]:
 _TEXT_PRODUCERS = ("cat", "echo", "printf", "tee")
 
 
+def _pipe_into(cmds: list[_Simple], k: int) -> int:
+    """Index of the command whose separator is the pipe that feeds cmds[k]'s stdin: k itself, or
+    the command opening the group that k runs in (`ls | (cd x; bteq)`: bteq reads what `ls`
+    wrote); -1 when nothing is piped in."""
+    # depth each command runs at: groups opened before it minus groups closed before it
+    depth, at = 0, []
+    for c in cmds[:k + 1]:
+        depth += c.opened - c.closed
+        at.append(depth)
+    j, level = k, at[k]
+    while j >= 0:
+        if cmds[j].sep in _PIPE_OPS:
+            return j
+        if level <= 0:
+            return -1
+        # cmds[j] runs inside a group: its stdin is the group's, decided at the command that
+        # opened it (the one that entered `level`), which in turn may sit in an outer group
+        while j >= 0 and not (cmds[j].opened and at[j] - cmds[j].opened < level <= at[j]):
+            j -= 1
+        if j >= 0:
+            level = at[j] - cmds[j].opened if cmds[j].sep not in _PIPE_OPS else level
+    return -1
+
+
 def _producers(cmds: list[_Simple], k: int) -> list[_Simple]:
-    """The commands whose output reaches cmds[k]'s stdin through the pipeline."""
+    """The commands whose output reaches cmds[k]'s stdin through the pipeline: the command on the
+    left of each `|`, or every command of the `( ... )` / `{ ...; }` group on its left."""
     out = []
-    while k > 0 and cmds[k].sep == "|":
+    k = _pipe_into(cmds, k)
+    while k > 0 and cmds[k].sep in _PIPE_OPS:
+        unwind = cmds[k].closed  # groups the left operand closes right before the pipe
         k -= 1
         out.append(cmds[k])
+        while unwind > 0 and k > 0:
+            unwind -= cmds[k].opened
+            if unwind <= 0:
+                break
+            unwind += cmds[k].closed
+            k -= 1
+            out.append(cmds[k])
     return out
 
 
@@ -397,11 +457,15 @@ def _piped_scripts(producer: _Simple) -> list[str]:
     base = producer.words[0].rsplit("/", 1)[-1] if producer.words else ""
     if base == "cat":
         skip = False
-        for w in producer.words[1:]:
+        words = producer.words
+        for i, w in enumerate(words[1:], 1):
+            nxt = words[i + 1] if i + 1 < len(words) else ""
             if skip or w.startswith("-") or w == "<":
                 skip = False
             elif _REDIRECT_OP.fullmatch(w) or w in ("<<", "<<-"):
                 skip = True  # the operand is a log, descriptor or heredoc delimiter, not a script
+            elif w.isdigit() and _REDIRECT_OP.fullmatch(nxt) and nxt != "<":
+                continue  # the descriptor of `2>/dev/null` / `2>&1`
             else:
                 files.append(w)
     elif base in ("echo", "printf"):
