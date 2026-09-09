@@ -643,6 +643,21 @@ def test_descriptor_of_a_redirection_is_not_a_cat_operand(tmp_path: Path):
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
     # a descriptor is the whole word before the operator: `foo2>x` is the argument foo2
     assert g._script_inputs("cat read.sql foo2>/dev/null | bteq", CFG) == ["read.sql", "foo2"]
+    # ... and only unquoted digits are one: quoted or escaped, `2` is a filename written against `>`
+    for cmd in ("cat '2'>/dev/null | bteq", 'cat "2">/dev/null | bteq', "cat \\2>/dev/null | bteq",
+                "cat '2'>&1 | bteq", "cat ''2>/dev/null | bteq", "cat '2'>/dev/null 2>&1 | bteq",
+                "(echo 'SELECT 1;'; cat '2') 2>&1 | bteq"):
+        assert "2" in g._script_inputs(cmd, CFG), cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    # `"2"0<f` is the word 20 with f on its stdin, which cat ignores in favour of its operand
+    assert g._script_inputs('cat "2"0<read.sql | bteq', CFG) == ["20"]
+    for cmd in ("cat '2'>/dev/null | bteq", 'cat "2">/dev/null | bteq', "cat \\2>/dev/null | bteq"):
+        assert g._shell_tokens(cmd) == ["cat", "2", ">", "/dev/null", "|", "bteq"], cmd
+    # the bare forms keep their meaning
+    assert g._shell_tokens("cat 2>/dev/null 0<read.sql | bteq") == ["cat", "2>", "/dev/null", "0<", "read.sql", "|", "bteq"]
+    assert g._script_inputs("cat 2>/dev/null 0<read.sql | bteq", CFG) == ["read.sql"]
+    # escaped whitespace shifts the words between the lexers: fuse nothing rather than guess
+    assert g._script_inputs("cat a\\ b 2 >/dev/null | bteq", CFG) == ["a b", "2"]
 
 
 def test_an_input_descriptor_written_against_its_operator_is_not_a_cat_operand(tmp_path: Path):
@@ -655,10 +670,13 @@ def test_an_input_descriptor_written_against_its_operator_is_not_a_cat_operand(t
     for cmd in ("cat 0<write.sql | bteq", "bteq 0<write.sql"):
         assert g._script_inputs(cmd, CFG) == ["write.sql"], cmd
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    # `0 < f` with a space is the file named 0 plus a stdin redirect: both are cat's text
+    # `0 < f` with a space is the file named 0 plus a stdin redirect: cat prints its operand and
+    # leaves the stdin alone
     (tmp_path / "0").write_text("UPDATE sales.orders SET status = 'X';\n")
-    assert g._script_inputs("cat 0 < read.sql | bteq", CFG) == ["0", "read.sql"]
+    assert g._script_inputs("cat 0 < read.sql | bteq", CFG) == ["0"]
     assert g.evaluate("cat 0 < read.sql | bteq", CFG, root=tmp_path).decision == "block"
+    assert g._script_inputs("cat read.sql < 0 | bteq", CFG) == ["read.sql"]
+    assert g._script_inputs("cat - read.sql < 0 | bteq", CFG) == ["read.sql", "0"]
 
 
 def test_a_redirection_after_a_group_belongs_to_the_group(tmp_path: Path):
@@ -696,8 +714,49 @@ def test_a_group_input_redirection_reaches_every_command_in_the_group(tmp_path: 
         assert g._script_inputs(cmd, CFG) == ["read.sql"], cmd
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
     # a command's own redirection stays with it as well
-    assert g._script_inputs("(bteq < write.sql; echo) < read.sql", CFG) == ["write.sql", "read.sql"]
+    assert g._script_inputs("(bteq < write.sql; echo) < read.sql", CFG) == ["write.sql"]
     assert g.evaluate("(bteq < write.sql; echo) < read.sql", CFG, root=tmp_path).decision == "block"
+
+
+def test_a_group_input_skips_members_whose_stdin_is_already_taken(tmp_path: Path):
+    (tmp_path / "read.sql").write_text("SELECT 1;\n")
+    (tmp_path / "write.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    # a member's own `<`, heredoc or here-string, or a pipe feeding it (or the group it runs in),
+    # replaces the group's stdin: the group file never reaches that member
+    for cmd in ("(bteq < read.sql; echo) < write.sql", "(bteq 0<read.sql) < write.sql",
+                "((bteq) < read.sql; echo) < write.sql", "(cat read.sql | bteq) < write.sql",
+                "(cat read.sql | (echo; bteq)) < write.sql", "(cat read.sql | { echo; bteq; }) < write.sql",
+                "(bteq <<< 'SELECT 1') < write.sql", "(bteq <<EOF\nSELECT 1;\nEOF\n) < write.sql",
+                "(echo x | bteq; cat write.sql) < read.sql"):
+        assert "write.sql" not in g._script_inputs(cmd, CFG), cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+    # `cat` with a file operand does not read the stdin the group hands it; without one, or with
+    # `-`, it does, and what it pipes on is the client's script
+    assert g._script_inputs("(cat read.sql | bteq) < write.sql", CFG) == ["read.sql"]
+    for cmd in ("(cat | bteq) < write.sql", "(cat - | bteq) < write.sql", "(cat read.sql - | bteq) < write.sql",
+                "cat < write.sql | bteq", "(cat read.sql | bteq; sqlplus svc@tdprod.corp.example) < write.sql",
+                "(bteq < read.sql; bteq) < write.sql", "(cat read.sql | (bteq); bteq) < write.sql"):
+        assert "write.sql" in g._script_inputs(cmd, CFG), cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    # `<&0` duplicates stdin onto itself: the group's file still reaches the client. `<&-` closes
+    # it and `<&3` takes another descriptor: those do replace it
+    for cmd in ("(bteq <&0) < write.sql", "(bteq 0<&0) < write.sql", "(cat <&0 | bteq) < write.sql"):
+        assert g._script_inputs(cmd, CFG) == ["write.sql"], cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    for cmd in ("(bteq <&-) < write.sql", "(bteq <&3) < write.sql"):
+        assert g._script_inputs(cmd, CFG) == [], cmd
+    # successive group redirections are all opened, in shell order: a redirection this group
+    # already handed down is not the member's own, so the later file reaches it too
+    for cmd in ("(bteq) < read.sql < write.sql", "(bteq) < write.sql < read.sql",
+                "{ bteq; } 0<read.sql < write.sql", "(cat | bteq) < read.sql < write.sql"):
+        assert "write.sql" in g._script_inputs(cmd, CFG), cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    # an inner group's redirection is the member's own relative to the outer group
+    assert g._script_inputs("((bteq) < read.sql) < write.sql", CFG) == ["read.sql"]
+    # nobody inherits it: the operand is consumed, not read as a command of its own
+    assert g._commands(g._shell_tokens("(bteq < read.sql) < write.sql; echo"))[-1].words == ["echo"]
+    # output redirections after the group still land on every member
+    assert g._script_inputs("(cat write.sql | bteq) 2>&1 > /dev/null", CFG) == ["write.sql"]
 
 
 def test_a_heredoc_body_naming_a_client_is_data_not_context(tmp_path: Path):
