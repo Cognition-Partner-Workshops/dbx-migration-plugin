@@ -75,6 +75,23 @@ Delta appended with `skills/tsql-ssis/SKILL.md` (SEEDED 2026-09-08 against the S
 
 A row moves from SEEDED to CONFIRMED (or is corrected) when a unit's error log or recon result shows it; record the unit id next to the row. A systematic mangle goes into SKILL FEEDBACK for the dialect skill so the wave learns it once.
 
+### `oracle` delta (SEEDED, 2026-09-08, from `skills/oracle-plsql`; no engagement unit yet)
+Additions to the `oracle` row above for `--source-dialect oracle`; the base row is unchanged. Signatures name the trap number in the `oracle-plsql` SKILL.md traps table.
+
+| Class | Construct | Expectation and recon signature |
+|---|---|---|
+| Converts | `LISTAGG ... WITHIN GROUP`, `NVL2`, `TO_CHAR(d, fmt)` with `YYYY/MM/DD/HH24/MI/SS` only, `ADD_MONTHS`/`LAST_DAY`, `MERGE ... WHEN MATCHED ... DELETE WHERE` | trust after a read; `DELETE WHERE` must come out as a separate `WHEN MATCHED AND <cond> THEN DELETE` ordered before the `UPDATE` (trap 8; `oracle-plsql` example 01) |
+| Mangles silently | `CHAR(n)` compares against `VARCHAR2` | blank-padded semantics lost; Tier 3 mismatches on `CHAR` keys, Tier 1 undercount on joins; canonicalize `rstrip_spaces` and `rtrim()` the converted predicate (trap 5) |
+| Mangles silently | `ROWNUM` sandwich pagination | rewritten to `LIMIT` without the inner `ORDER BY` preserved as the total key; Tier 4 page contents differ, Tier 1 per-page count is right (trap 7) |
+| Mangles silently | `TO_CHAR(n, 'FM...')`, `TO_CHAR(d, 'DD-MON-YYYY')`, `TRUNC(d, 'IW'/'Q')` | `FM` dropped, `MON` lower-cased (Tier 4 byte diffs); `'IW'`/`'Q'` become day truncation or fail typing (Tier 1 group counts) |
+| Mangles silently | `a || b` with a nullable operand | `concat()` returns NULL where Oracle returns the non-null side; Tier 3 null-vs-value diffs on derived strings (trap 23) |
+| Mangles silently | `CONNECT BY NOCYCLE ... CONNECT_BY_ISCYCLE` | recursive CTE without a cycle guard loops to the recursion limit or drops the cycle row Oracle emits; Tier 1 row count on hierarchy views (trap 6) |
+| Mangles silently | `SUM(NUMBER)` over an all-NULL group in an MV | Oracle NULL vs pipeline MV 0; Tier 2 with `null_missing_equiv` **off** on the aggregate columns (traps 15, 25) |
+| Rejects / hand-convert | `CREATE MATERIALIZED VIEW LOG`, `REFRESH FAST`, `ENABLE QUERY REWRITE`, `DBMS_MVIEW.REFRESH`; `DBMS_SCHEDULER.*`, calendar strings | Lakeflow Pipelines MV / Lakeflow Jobs by hand; calendar string to quartz cron + `timezone_id`; `max_failures` is a GAP (traps 15, 16) |
+| Rejects / hand-convert | SQL*Plus directives (`SET`, `DEFINE`/`&n`, `WHENEVER`, `SPOOL`, `EXIT`) | strip and re-express as job parameters / task outcome (trap 17); a transpiler run on a `.sql` with these produces parse errors for the whole file, so split the SQL body out first |
+| Rejects / hand-convert | PL/SQL bodies: packages, `BULK COLLECT`/`FORALL`, exception blocks, `CREATE OR REPLACE TRIGGER` with `:NEW`/`:OLD`, `PRAGMA AUTONOMOUS_TRANSACTION`, `FOR UPDATE SKIP LOCKED`, `SAVEPOINT`/`ROLLBACK TO` | OLTP-profile units go to Lakebase/Postgres by hand (`oracle-plsql` example 02); analytical units become set-based DBSQL procedures with trigger logic folded into the writer (example 03; traps 10, 13, 14) |
+| Rejects / hand-convert | `CREATE SYNONYM`, `@dblink` references, `CREATE DATABASE LINK`, VPD (`DBMS_RLS`) / `DBMS_REDACT` policies, `GRANT ... TO PUBLIC` | inventory only; resolve synonyms in lineage, external links stay `INFERRED` edges, policies map through `databricks-unity-catalog` or `GAP` (traps 18, 19) |
+
 ## Reconciler [docs]
 Lakebridge ships its own reconcile module. It may run as a second opinion on a unit; it never replaces the kit's `dbx-recon` gate and never self-certifies (rule 4 of the guardrails). If both disagree, the kit's harness result stands and the disagreement is a finding.
 

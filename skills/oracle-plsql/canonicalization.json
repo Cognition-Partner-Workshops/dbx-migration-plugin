@@ -1,0 +1,10 @@
+[
+  {"rule": "empty_string_is_null", "applies_to": "VARCHAR2,NVARCHAR2,CHAR,NCHAR,CLOB->STRING", "params": {"policy": "SET_AT_STOP_A", "default": "treat_empty_as_null"}},
+  {"rule": "decimal_round", "applies_to": "NUMBER (no scale),NUMBER(*),FLOAT(b)->DECIMAL(38,10) only; NUMBER(p,s)->DECIMAL(p,s) and BINARY_FLOAT/BINARY_DOUBLE->FLOAT/DOUBLE use identity", "params": {"mode": "half_even", "places": 10}},
+  {"rule": "datetime_utc_truncate_ms", "applies_to": "DATE,TIMESTAMP(n<=3)->TIMESTAMP_NTZ only; TIMESTAMP(n>3) uses identity; TIMESTAMP WITH [LOCAL] TIME ZONE uses identity on SYS_EXTRACT_UTC()/to_utc_timestamp() in the recon query", "params": {"assume_source_tz_for_DATE": "DBTIMEZONE"}},
+  {"rule": "rstrip_spaces", "applies_to": "CHAR,NCHAR->STRING", "params": {}},
+  {"rule": "null_missing_equiv", "applies_to": "*", "params": {}},
+  {"rule": "collation_casefold", "applies_to": "STRING (unconditional on any field that names it: name it only where NLS_COMP=LINGUISTIC or UPPER()/NLS_UPPER() compares are found in census)", "params": {}},
+  {"rule": "uuid_normalize", "applies_to": "RAW(16)->STRING (unconditional on any field that names it: name it only where a SYS_GUID() default or RAWTOHEX consumers are found in census)", "params": {}},
+  {"rule": "identity", "applies_to": "*", "params": {}}
+]
