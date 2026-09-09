@@ -12,7 +12,12 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import BatchAggregates, KeyExcludingAggregates, StratifiedKeys
+from .adapters import (
+    BatchAggregates,
+    ColumnTypes,
+    KeyExcludingAggregates,
+    StratifiedKeys,
+)
 from .canon import MISSING, Canonicalizer
 from .config import MappingSpec, ObjectMapping, Tolerances
 from .paths import get_path
@@ -135,13 +140,23 @@ def _object_aggregates(c: ObjectMapping, source, target, source_where: str | Non
                        exclude_keys: list[tuple] | None = None) -> tuple[dict[str, dict], dict[str, dict]]:
     """All field aggregates for one object: one statement per side when the adapter batches,
     one per field otherwise. SUM is requested only for fields declared numeric; undeclared
-    fields get the per-column probe (SUM may error on strings). In transactional mode the
-    source is bounded to its applied rows (`source_where`) and the target excludes the same
-    keys (`exclude_keys`), so both aggregates describe one set."""
+    fields are typed from the catalog when the source exposes it (`ColumnTypes`), else they
+    get the per-column probe (SUM may error on strings, and the probe's rollback would release
+    a pinned window). In transactional mode the source is bounded to its applied rows
+    (`source_where`) and the target excludes the same keys (`exclude_keys`), so both aggregates
+    describe one set."""
     s_where = source_where if source_where is not None else c.root_where
     cols = [f.source for f in c.fields]
     numeric_src = [f.source for f in c.fields if _declared_numeric(f)]
     undeclared = [f for f in c.fields if _declared_numeric(f) is None]
+    if undeclared and isinstance(source, ColumnTypes):
+        try:
+            typed = source.numeric_columns(c.root_table)
+        except NotImplementedError:  # an engine whose catalog the adapter does not read yet
+            typed = None
+        if typed is not None:
+            numeric_src += [f.source for f in undeclared if f.source in typed]
+            undeclared = []
     if isinstance(source, BatchAggregates):
         s_all = source.table_aggregates(c.root_table, cols, numeric_src, s_where)
         for f in undeclared:

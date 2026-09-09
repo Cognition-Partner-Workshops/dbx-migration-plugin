@@ -1342,3 +1342,170 @@ def test_transactional_predicates_use_the_source_engine_literal(monkeypatch):
     ctx = open_window(_spec(), source, target)
     assert "modified_date >= <SRC>" in wheres
     assert ctx.applied_where(_spec().objects[0]) == "(modified_date < <SRC> OR modified_date IS NULL)"
+
+
+# ---- round 7: null watermarks, descending identities, probe rollback, unordered uniques ----
+
+EPOCH = dt.datetime(1970, 1, 1)
+
+
+def test_a_watermark_that_turns_null_on_the_target_changes_the_fingerprint():
+    # SUM skips NULL, so a NULL watermark used to fold into the same digest as the epoch: the
+    # target lost row 6's watermark, no row is the max, tier 3 is sampled and may not fetch it
+    loans, borrowers = _rows(40)
+    for r in loans:
+        r["modified_date"] = EPOCH if r["loan_id"] == 6 else r["modified_date"]
+    tgt = [dict(r) for r in loans]
+    tgt[5]["modified_date"] = None
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, sample_size=2), depth="sampled")
+    assert result["verdict"] == "FAIL"
+    pk = _tier(result, "pk_set_diff")["stats"]["loans"]
+    assert pk["fingerprint"].startswith("count+key_sum") and 0 < pk["mismatched_ranges"] < pk["ranges"]
+    codes = {f["check"]: f["detail"] for f in _tier(result, "cdc_lag_ordering")["findings"]}
+    assert "(6,)" in codes["row_behind_applied_watermark"]
+
+
+def test_a_null_source_watermark_applied_as_the_epoch_is_caught_too():
+    loans, borrowers = _rows(40)
+    loans[5]["modified_date"] = None
+    tgt = [dict(r) for r in loans]
+    tgt[5]["modified_date"] = EPOCH
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, sample_size=2), depth="sampled")
+    assert result["verdict"] == "FAIL"
+    codes = {f["check"]: f["detail"] for f in _tier(result, "cdc_lag_ordering")["findings"]}
+    assert "(6,)" in codes["row_ahead_of_source"]
+
+
+def test_range_fingerprints_carry_the_watermark_null_count():
+    loans, borrowers = _rows(4)
+    loans[1]["modified_date"] = None
+    source, _ = _sides(loans, [dict(r) for r in loans], borrowers)
+    (n, keys, wm), = source.range_fingerprints("dbo.loans", ["loan_id"], ["integer"], "modified_date",
+                                              "datetime", [(None, None)])
+    assert n == 4 and keys[0][0] == 10 and len(wm) == 3 and wm[2] == 1
+
+
+def test_a_descending_target_identity_below_the_source_max_is_not_a_collision():
+    # both identities count down from 1000: the source has handed out 1000..995, the target
+    # sequence's next value 994 is below every source key, which is exactly the safe state
+    _, borrowers = _rows()
+    loans = [_loan(1000 - i, changed=i, borrower_id=1 + i % 3) for i in range(6)]
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
+                            src_seq=(994, -1), tgt_seq=(994, -1))
+    result = _run(source, target)
+    assert result["verdict"] == "PASS", result
+    identity = _tier(result, "schema_parity")["stats"]["loans"]["identity"]
+    assert identity == {"source_next": 994, "source_max": 1000, "target_next": 994,
+                        "source_min": 995, "increment": -1}
+
+
+def test_a_descending_target_identity_at_or_above_the_source_min_collides():
+    _, borrowers = _rows()
+    loans = [_loan(1000 - i, changed=i, borrower_id=1 + i % 3) for i in range(6)]
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
+                            src_seq=(994, -1), tgt_seq=(997, -1))
+    result = _run(source, target)
+    assert result["verdict"] == "FAIL"
+    assert _codes(result, "schema_parity") == ["sequence_behind_source"]
+    (finding,) = _tier(result, "schema_parity")["findings"]
+    assert "997 >= source min loan_id=995" in finding["detail"] and "descending" in finding["detail"]
+
+
+def test_identities_stepping_in_opposite_directions_are_a_finding_even_with_headroom():
+    _, borrowers = _rows()
+    loans = [_loan(i, changed=i, borrower_id=1 + i % 3) for i in range(1, 7)]
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
+                            src_seq=(7, 1), tgt_seq=(0, -1))
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == ["sequence_direction_mismatch"]
+
+
+def test_an_ascending_identity_behind_the_source_max_is_still_a_collision():
+    _, borrowers = _rows()
+    loans = [_loan(i, changed=i, borrower_id=1 + i % 3) for i in range(1, 7)]
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_seq=(4, 5))
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == ["sequence_behind_source"]
+
+
+def test_a_composite_unique_declared_in_another_column_order_is_the_same_constraint():
+    loans, borrowers = _rows(6)
+    src = _facts(LOANS_FACTS, unique={("loan_number",), ("borrower_id", "loan_number")})
+    tgt = _facts(TARGET_LOANS_FACTS, unique={("loan_number",), ("loan_number", "borrower_id")})
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target)
+    assert result["verdict"] == "PASS", result
+    stats = _tier(result, "schema_parity")["stats"]
+    (note,) = stats["unique_reordered"]
+    assert "('borrower_id', 'loan_number')" in note and "('loan_number', 'borrower_id')" in note
+
+
+def test_a_genuinely_extra_or_missing_composite_unique_is_still_graded():
+    loans, borrowers = _rows(6)
+    src = _facts(LOANS_FACTS, unique={("loan_number",), ("borrower_id", "loan_number")})
+    tgt = _facts(TARGET_LOANS_FACTS, unique={("loan_number",), ("borrower_id", "current_balance")})
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == ["unique_extra", "unique_missing"]
+
+
+def test_a_source_index_leading_with_the_other_column_is_still_uncovered():
+    # the access path keeps its order: an index on (loan_number, borrower_id) does not serve
+    # a lookup that leads with borrower_id
+    loans, borrowers = _rows(6)
+    src = _facts(LOANS_FACTS, indexes={("borrower_id", "loan_number")})
+    tgt = _facts(TARGET_LOANS_FACTS, indexes={("loan_number", "borrower_id")})
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == ["index_missing"]
+
+
+def _undeclared_spec() -> MappingSpec:
+    # a field with no declared target type: tier 2 has to find out whether it takes a SUM
+    loans = _spec().objects[0]
+    fields = [*loans.fields, FieldMapping("loan_status", "loan_status", "", "")]
+    return MappingSpec("m1", [dataclasses.replace(loans, fields=fields), _spec().objects[1]])
+
+
+def test_a_typed_source_is_never_probed_for_undeclared_fields():
+    from tests.fakes import FakeTypedSource
+    loans, borrowers = _rows(12)
+    for r in loans:
+        r["loan_status"] = "ACTIVE"
+    tgt = [dict(r) for r in loans]
+    source = FakeTypedSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                             schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                             sequences={("dbo.loans", "loan_id"): 13})
+    _, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_undeclared_spec())
+    assert result["verdict"] == "PASS", result
+    # the one typing read replaces the per-field probe; the identity bounds read stays
+    assert source.calls["numeric_columns"] == 1
+    assert source.calls["field_aggregates"] == 1
+    assert _tier(result, "consistency_window")["stats"]["strength"]["source"] == "snapshot"
+
+
+def test_a_probe_that_releases_the_source_snapshot_fails_the_window():
+    # a source with no column typing falls back to the probe; if that probe rolls the pinned
+    # transaction back, the window is lost and the run says so instead of reporting a snapshot
+    loans, borrowers = _rows(12)
+    for r in loans:
+        r["loan_status"] = "ACTIVE"
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    original = source.field_aggregates
+
+    def probing(table, column, where=None):
+        if column == "loan_status":
+            source.isolation = "none"   # what a libpq rollback does to a REPEATABLE READ window
+        return original(table, column, where)
+    source.field_aggregates = probing
+    result = _run(source, target, spec=_undeclared_spec())
+    window = _tier(result, "consistency_window")
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    assert [f["check"] for f in window["findings"]] == ["window_lost", "window_unproven"]
+    assert "rolled the transaction back" in window["findings"][0]["detail"]

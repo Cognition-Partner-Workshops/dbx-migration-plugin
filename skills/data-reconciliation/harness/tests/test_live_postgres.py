@@ -4,6 +4,7 @@ names a throwaway database (the rehearsal stand-in); the test owns one temporary
 import datetime as dt
 import os
 import uuid
+from decimal import Decimal
 
 import pytest
 
@@ -134,3 +135,32 @@ def test_watermark_predicates_hold_for_timestamptz_in_a_non_utc_session(schema, 
         assert source.row_count(f"{schema}.w", bare) == 0
     finally:
         source._conn.close()   # release the table lock before the schema is dropped
+
+
+def test_catalog_typing_spares_the_repeatable_read_window_that_a_sum_probe_ends(schema, monkeypatch):
+    dsn = os.environ[DSN_VAR]
+    table = f"{schema}.a"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY, amount NUMERIC(12,2), status TEXT, "
+                     "modified_at TIMESTAMPTZ)")
+        conn.execute(f"INSERT INTO {table} VALUES (1, 10, 'A', '2026-09-08 12:00:00+00'), "
+                     "(2, 20, 'A', '2026-09-08 13:00:00+00'), (3, 30, 'A', '2026-09-08 14:00:00+00')")
+    monkeypatch.setenv("RECON_TEST_SOURCE", dsn)
+    source = PostgresSourceAdapter("RECON_TEST_SOURCE")
+    try:
+        assert source.open_window() == "repeatable_read"
+        assert source.row_count(table) == 3                    # the first read pins the snapshot
+        with psycopg.connect(dsn, autocommit=True) as writer:   # a below-max write: count and max unchanged
+            writer.execute(f"UPDATE {table} SET amount = 1000 WHERE id = 1")
+        # tier 2 reads the catalog instead of probing, so the string column is never summed
+        assert source.numeric_columns(table) == {"id", "amount"}
+        assert source.field_aggregates(table, "amount")["sum"] == Decimal("60.00")
+        assert source.window_strength() == "snapshot" and source.window_released is None
+        # the probe an untyped source falls back to: SUM(text) aborts the transaction, the rollback
+        # ends the snapshot, and the adapter must stop claiming it
+        assert source.field_aggregates(table, "status")["sum"] is None
+        assert source.window_strength() != "snapshot"
+        assert source.window_released == f"SUM(status) on {table} failed and rolled back"
+        assert source.field_aggregates(table, "amount")["sum"] == Decimal("1050.00")  # the write shows
+    finally:
+        source._conn.close()

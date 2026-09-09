@@ -81,6 +81,8 @@ class TransactionalContext:
     key_diffs: dict[str, KeyDiff] = field(default_factory=dict)
     # renders a watermark bound the way the source engine reads it (the predicates run there)
     render: Callable[[Any], str] = literal
+    # each side's window strength once the opening markers are read; close_window compares
+    strength_open: dict[str, str] = field(default_factory=dict)
 
     def in_flight(self, c: ObjectMapping) -> int:
         return self.windows.get(c.object, ObjectWindow()).in_flight
@@ -141,6 +143,7 @@ def open_window(spec: MappingSpec, source, target) -> TransactionalContext:
                 where = f"({c.root_where}) AND {newer}" if c.root_where else newer
                 win.in_flight = source.row_count(c.root_table, where)
         ctx.windows[c.object] = win
+    ctx.strength_open = {"source": source.window_strength(), "target": target.window_strength()}
     return ctx
 
 
@@ -185,6 +188,15 @@ def close_window(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                                            "target": target.isolation if hasattr(target, "isolation") else "none"},
                              "strength": strength, "markers": {}}
     for side, how in strength.items():
+        if ctx.strength_open.get(side) == "snapshot" and how != "snapshot":
+            # a rollback inside the run ended the transaction that carried the snapshot: the
+            # tiers after it read a different snapshot than the ones before, whatever the
+            # markers say, and the run cannot be trusted
+            checks += 1
+            findings.append(Finding("*", "window_lost",
+                                    f"{side} pinned a snapshot at open but no longer holds it at "
+                                    "close: a statement rolled the transaction back mid-run, so "
+                                    "the tiers did not all read one snapshot; rerun"))
         if how == "markers" and not tol.accept_marker_only_window:
             checks += 1
             findings.append(Finding("*", "window_unproven",
@@ -523,12 +535,24 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
             findings.append(Finding(c.object, "primary_key_mismatch",
                                     f"source {s.primary_key} -> expected {pk}, target {t.primary_key}",
                                     s.primary_key, t.primary_key))
-        expected_unique = {_map_cols(u, colmap) for u in s.unique}
+        # a unique constraint rejects the same duplicates whatever order its columns are
+        # declared in, so parity is by column set; the declared order is an access path and
+        # is kept for the coverage check (`_covered`) and noted when only the order differs
+        expected_unique = {frozenset(_map_cols(u, colmap)) for u in s.unique}
+        target_unique = {frozenset(u) for u in t_lower.unique}
         for u in sorted(s.unique):
-            if _map_cols(u, colmap) not in t_lower.unique:
+            want = _map_cols(u, colmap)
+            if frozenset(want) not in target_unique:
                 findings.append(Finding(c.object, "unique_missing",
-                                        f"source unique {u} has no target unique {_map_cols(u, colmap)}"))
-        for u in sorted(t_lower.unique - expected_unique - {t_lower.primary_key}):
+                                        f"source unique {u} has no target unique {want}"))
+            elif want not in t_lower.unique:
+                have = next(t for t in sorted(t_lower.unique) if frozenset(t) == frozenset(want))
+                stats.setdefault("unique_reordered", []).append(
+                    f"{c.object}: source unique {u} is enforced on the target as {have}, not "
+                    f"{want}; same constraint, different access path")
+        for u in sorted(t_lower.unique):
+            if frozenset(u) in expected_unique or frozenset(u) == frozenset(t_lower.primary_key):
+                continue
             if set(u) <= mapped_targets:
                 tightened(Finding(c.object, "unique_extra",
                                   f"target unique {u} has no source counterpart: legacy-valid "
@@ -608,28 +632,49 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
         if c.identity_source and c.identity_target:
             checks += 1
             try:
-                t_next = target.identity_next(c.object, c.identity_target)
-                s_next = source.identity_next(c.root_table, c.identity_source)
+                t_state = target.identity_state(c.object, c.identity_target)
+                s_state = source.identity_state(c.root_table, c.identity_source)
             except NotImplementedError as exc:
                 stats.setdefault("unverified", []).append(f"{c.object} identity: {exc}")
-                t_next = s_next = None
             else:
-                (s_max,) = _max_key(source, c.root_table, c.identity_source, c.root_where)
-                seq_note = {"source_next": s_next, "source_max": s_max, "target_next": t_next}
-                if t_next is None:
+                s_min, s_max = _key_bounds(source, c.root_table, c.identity_source, c.root_where)
+                seq_note = {"source_next": None if s_state is None else s_state.next,
+                            "source_max": s_max,
+                            "target_next": None if t_state is None else t_state.next}
+                if t_state is None:
                     findings.append(Finding(c.object, "sequence_missing",
                                             f"target column {c.identity_target} owns no sequence/identity"))
-                elif s_max is not None and t_next <= int(s_max):
+                elif t_state.descending:
+                    # a countdown identity hands out ever smaller values: it collides with the
+                    # rows the source already holds when its next value is not below their minimum
+                    seq_note.update(source_min=s_min, increment=t_state.increment)
+                    if s_min is not None and t_state.next >= int(s_min):
+                        findings.append(Finding(c.object, "sequence_behind_source",
+                                                f"target next value {t_state.next} >= source min "
+                                                f"{c.identity_source}={s_min} on a descending identity "
+                                                f"(increment {t_state.increment}): new inserts would collide",
+                                                s_min, t_state.next))
+                elif s_max is not None and t_state.next <= int(s_max):
                     findings.append(Finding(c.object, "sequence_behind_source",
-                                            f"target next value {t_next} <= source max "
+                                            f"target next value {t_state.next} <= source max "
                                             f"{c.identity_source}={s_max}: new inserts would collide",
-                                            s_max, t_next))
+                                            s_max, t_state.next))
+                if (t_state is not None and s_state is not None
+                        and t_state.descending != s_state.descending):
+                    findings.append(Finding(c.object, "sequence_direction_mismatch",
+                                            f"source identity {c.identity_source} steps by "
+                                            f"{s_state.increment}, target {c.identity_target} by "
+                                            f"{t_state.increment}: the two sides hand out keys from "
+                                            "opposite ends and will meet",
+                                            s_state.increment, t_state.increment))
         stats[c.object] = {"source": _facts_dict(s_raw), "target": _facts_dict(t_raw), "identity": seq_note}
     return TierResult(7, "schema_parity", not findings, checks, findings, stats)
 
 
-def _max_key(source, table: str, column: str, where: str | None) -> tuple:
-    return (source.field_aggregates(table, column, where)["max"],)
+def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any, Any]:
+    """(MIN, MAX) of the source identity column: the bounds a target sequence must clear."""
+    agg = source.field_aggregates(table, column, where)
+    return agg["min"], agg["max"]
 
 
 def _facts_dict(f: SchemaFacts) -> dict:

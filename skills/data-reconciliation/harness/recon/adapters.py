@@ -84,6 +84,19 @@ class SchemaFacts:
     expression_indexes: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class IdentityState:
+    """Where a sequence/identity stands: the value its next insert takes and the signed step it
+    moves by. A negative step counts down, so its headroom is checked against the other side's
+    minimum key rather than its maximum."""
+    next: int
+    increment: int
+
+    @property
+    def descending(self) -> bool:
+        return self.increment < 0
+
+
 class SourceAdapter(Protocol):
     def row_count(self, table: str, where: str | None = None) -> int: ...
     def field_aggregates(self, table: str, column: str, where: str | None = None) -> dict[str, Any]: ...
@@ -115,6 +128,15 @@ class KeyExcludingAggregates(Protocol):
     def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
                                    key_cols: list[str], exclude_keys: list[tuple],
                                    where: str | None = None) -> dict[str, dict[str, Any]]: ...
+
+
+@runtime_checkable
+class ColumnTypes(Protocol):
+    """Catalog-backed column typing, so Tier 2 learns which undeclared fields take a SUM from
+    metadata instead of probing with a statement that errors on strings. The probe's error
+    handling rolls the connection back, which on a pinned transactional window silently ends
+    the snapshot every later tier believes it is still reading."""
+    def numeric_columns(self, table: str) -> set[str]: ...
 
 
 @runtime_checkable
@@ -157,7 +179,7 @@ class TransactionalSide(Protocol):
     def max_watermark(self, table: str, watermark: str, where: str | None = None) -> Any: ...
     def watermark_literal(self, value: Any) -> str: ...
     def schema_facts(self, table: str) -> SchemaFacts: ...
-    def identity_next(self, table: str, column: str) -> int | None: ...
+    def identity_state(self, table: str, column: str) -> IdentityState | None: ...
 
 
 @runtime_checkable
@@ -221,6 +243,8 @@ class _SqlAdapterBase:
         self.rows_fetched = 0
         self.isolation = "none"
         self._token_ok: bool | None = None
+        # set when a statement rolled the pinned window back mid-run (see field_aggregates)
+        self.window_released: str | None = None
 
     def _execute(self, sql: str, params=()):
         cur = self._conn.cursor()
@@ -273,7 +297,18 @@ class _SqlAdapterBase:
             out["sum"] = None
             if hasattr(self._conn, "rollback"):
                 self._conn.rollback()  # libpq leaves the transaction aborted otherwise
+                self._release_window(f"SUM({column}) on {table} failed and rolled back")
         return out
+
+    def _release_window(self, reason: str) -> None:
+        """A rollback ends the transaction that carried the pinned snapshot; say so rather than
+        keep reporting an isolation the later reads no longer have."""
+        if self.isolation != "none":
+            self.isolation = "none"
+            self.window_released = reason
+
+    def numeric_columns(self, table: str) -> set[str]:
+        raise NotImplementedError(f"{type(self).__name__} cannot read column types")
 
     def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
@@ -430,6 +465,7 @@ class _SqlAdapterBase:
     def open_window(self) -> str:
         """Best effort: pin a snapshot for the run. Engines that refuse (SQL Server without
         ALLOW_SNAPSHOT_ISOLATION, Sybase) fall back to plain reads; the markers still decide."""
+        self.window_released = None
         if hasattr(self._conn, "rollback"):
             try:
                 self._conn.rollback()
@@ -531,11 +567,13 @@ class _SqlAdapterBase:
                            ranges: list[tuple[tuple | None, tuple | None]],
                            where: str | None = None) -> list[tuple[int, tuple | None, Any]]:
         """Per key range: (row count, per-key-column (sum, sum of squares), watermark (sum, sum
-        of squares)) in one statement (SUM over CASE). Sums are exact decimals and the squares
-        are taken modulo DIGEST_MODULUS, so a key swapped for another, two keys traded for two
-        others with the same total, or a row's watermark moved inside a range all change the
-        fingerprint even when the count does not. A digest is None when the column kind has no
-        exact portable sum (strings, uuids, fractional numbers)."""
+        of squares, null count)) in one statement (SUM over CASE). Sums are exact decimals and
+        the squares are taken modulo DIGEST_MODULUS, so a key swapped for another, two keys
+        traded for two others with the same total, or a row's watermark moved inside a range all
+        change the fingerprint even when the count does not. SUM skips NULL, which would make a
+        NULL watermark indistinguishable from zero / the epoch; the null count keeps them apart.
+        A digest is None when the column kind has no exact portable sum (strings, uuids,
+        fractional numbers)."""
         if not ranges:
             return []
         key_digests = [self._digest_sql(k, kind) for k, kind in zip(key_cols, key_kinds)]
@@ -548,7 +586,7 @@ class _SqlAdapterBase:
             if key_digestible:
                 terms += [t for pair in key_digests for t in pair]
             if wm_digest:
-                terms += list(wm_digest)
+                terms += [*wm_digest, f"CASE WHEN {watermark} IS NULL THEN 1 ELSE 0 END"]
             for term in terms:
                 pred, vals = self._range_predicate(key_cols, lo, hi, len(values))
                 values += vals
@@ -562,7 +600,7 @@ class _SqlAdapterBase:
         for _ in ranges:
             n = int(row.pop(0) or 0)
             keys = tuple(moments() for _ in key_cols) if key_digestible else None
-            wm = moments() if wm_digest else None
+            wm = (*moments(), int(row.pop(0) or 0)) if wm_digest else None
             out.append((n, keys, wm))
         return out
 
@@ -583,7 +621,7 @@ class _SqlAdapterBase:
     def schema_facts(self, table: str) -> SchemaFacts:
         raise NotImplementedError(f"{type(self).__name__} cannot read constraint metadata")
 
-    def identity_next(self, table: str, column: str) -> int | None:
+    def identity_state(self, table: str, column: str) -> IdentityState | None:
         raise NotImplementedError(f"{type(self).__name__} cannot read identity state")
 
 
@@ -738,7 +776,19 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
         facts.check_count = int(n)
         return facts
 
-    def identity_next(self, table: str, column: str) -> int | None:
+    def numeric_columns(self, table: str) -> set[str]:
+        schema, name = _split_table(table, "dbo")
+        rows = self._rows(
+            "SELECT c.name FROM sys.columns c "
+            "JOIN sys.types t ON t.user_type_id = c.system_type_id "  # the base type, not an alias
+            "JOIN sys.objects o ON o.object_id = c.object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "WHERE s.name = ? AND o.name = ? AND t.name IN ('tinyint', 'smallint', 'int', "
+            "'bigint', 'decimal', 'numeric', 'money', 'smallmoney', 'float', 'real')",
+            (schema, name))
+        return {col for (col,) in rows}
+
+    def identity_state(self, table: str, column: str) -> IdentityState | None:
         schema, name = _split_table(table, "dbo")
         rows = self._rows(
             "SELECT CAST(ic.last_value AS BIGINT), CAST(ic.increment_value AS BIGINT), "
@@ -749,9 +799,10 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
         if not rows:
             return None
         last, inc, seed = rows[0]
+        step = int(inc or 1)
         if last is None:  # identity never used: the next value is the seed
-            return int(seed) if seed is not None else None
-        return int(last) + int(inc or 1)
+            return IdentityState(int(seed), step) if seed is not None else None
+        return IdentityState(int(last) + step, step)
 
 
 class DatabricksSourceAdapter(_SqlAdapterBase):
@@ -962,7 +1013,17 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.identity_columns.add(col)
         return facts
 
-    def identity_next(self, table: str, column: str) -> int | None:
+    def numeric_columns(self, table: str) -> set[str]:
+        schema, name = _split_table(table, "public")
+        rows = self._rows(
+            "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid "
+            "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped "
+            "AND t.typname IN ('int2', 'int4', 'int8', 'numeric', 'float4', 'float8', 'money')",
+            (schema, name))
+        return {col for (col,) in rows}
+
+    def identity_state(self, table: str, column: str) -> IdentityState | None:
         schema, name = _split_table(table, "public")
         (seq,) = self._rows("SELECT pg_get_serial_sequence(%s, %s)",
                             (f'"{schema}"."{name}"', column))[0]
@@ -971,7 +1032,8 @@ class _PostgresBase(_SqlAdapterBase):
         (last, is_called, inc) = self._rows(
             f"SELECT s.last_value, s.is_called, p.seqincrement FROM {seq} s, "
             "pg_sequence p WHERE p.seqrelid = %s::regclass", (seq,))[0]
-        return int(last) + int(inc) if is_called else int(last)
+        step = int(inc)
+        return IdentityState(int(last) + step if is_called else int(last), step)
 
 
 class PostgresSourceAdapter(_PostgresBase):
@@ -1061,5 +1123,8 @@ class LakebaseTargetAdapter(_PostgresBase):
     def schema_facts(self, object: str) -> SchemaFacts:
         return super().schema_facts(self._q(object))
 
-    def identity_next(self, object: str, column: str) -> int | None:
-        return super().identity_next(self._q(object), column)
+    def numeric_columns(self, object: str) -> set[str]:
+        return super().numeric_columns(self._q(object))
+
+    def identity_state(self, object: str, column: str) -> IdentityState | None:
+        return super().identity_state(self._q(object), column)

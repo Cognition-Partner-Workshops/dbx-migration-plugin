@@ -10,7 +10,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from collections import Counter
 from typing import Any, Iterable
 
-from recon.adapters import DIGEST_MODULUS, SchemaFacts, Stratum
+from recon.adapters import DIGEST_MODULUS, IdentityState, SchemaFacts, Stratum
 from recon.paths import get_path
 from recon.canon import MISSING
 from recon.watermarks import literal
@@ -84,7 +84,8 @@ def _matches(row: dict, where: str | None) -> bool:
 
 class _TransactionalMixin:
     """TransactionalSide for the in-memory fakes; `schema` maps table -> SchemaFacts and
-    `sequences` maps (table, column) -> next value, both optional."""
+    `sequences` maps (table, column) -> next value (or a (next, increment) pair for a stepped
+    or descending identity), both optional."""
     tables: dict
     calls: Counter
     statements: int
@@ -191,7 +192,9 @@ class _TransactionalMixin:
             keys = None
             if digestible_keys:
                 keys = tuple(self._moments(k[i] for k, _ in hit) for i in range(len(key_cols)))
-            wm = self._moments(wm for _, wm in hit) if digest_wm else None
+            wm = None
+            if digest_wm:
+                wm = (*self._moments(wm for _, wm in hit), sum(1 for _, wm in hit if wm is None))
             out.append((len(hit), keys, wm))
         return out
 
@@ -222,12 +225,17 @@ class _TransactionalMixin:
             raise NotImplementedError(f"fake has no schema facts for {table}")
         return self.schema[table]
 
-    def identity_next(self, table, column) -> int | None:
-        self.calls["identity_next"] += 1
+    def identity_state(self, table, column) -> IdentityState | None:
+        self.calls["identity_state"] += 1
         self.statements += 1
         if (table, column) not in self.sequences:
             raise NotImplementedError(f"fake has no identity state for {table}.{column}")
-        return self.sequences[(table, column)]
+        state = self.sequences[(table, column)]
+        if state is None or isinstance(state, IdentityState):
+            return state
+        if isinstance(state, tuple):
+            return IdentityState(*state)
+        return IdentityState(state, 1)
 
 class FakeSource(_TransactionalMixin):
     """Implements SourceAdapter plus the optional BatchAggregates / StratifiedKeys /
@@ -336,6 +344,21 @@ class FakeSource(_TransactionalMixin):
         self.statements += 1
         counts = Counter(self._key(r, key_cols) for r in self.tables[table] if _matches(r, where))
         return sum(1 for n in counts.values() if n > 1)
+
+
+class FakeTypedSource(FakeSource):
+    """A source whose catalog says which columns are numeric (the `ColumnTypes` protocol), as
+    the SQL Server and Postgres adapters do; typed from the fixture rows' Python values."""
+
+    def numeric_columns(self, table: str) -> set[str]:
+        self.calls["numeric_columns"] += 1
+        self.statements += 1
+        out: set[str] = set()
+        for r in self.tables[table]:
+            for col, v in r.items():
+                if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool):
+                    out.add(col)
+        return out
 
 
 def _get_path(doc: dict, path: str):
