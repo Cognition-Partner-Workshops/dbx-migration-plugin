@@ -55,15 +55,11 @@ AS BEGIN
                    || ' AS SELECT * FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE 1 = 0';
     archive_loop: FOR acct AS
         SELECT ACCOUNT_KEY, ACCOUNT_TYPE FROM ${catalog}.${schema}.DIM_ACCOUNT
-        WHERE ACCOUNT_STATUS = 'CLOSED' AND CLOSE_DATE < p_closed_before AND CURRENT_FLAG = 'Y'
-        ORDER BY ACCOUNT_KEY
+        WHERE ACCOUNT_STATUS = 'CLOSED' AND CLOSE_DATE < p_closed_before AND CURRENT_FLAG = 'Y' ORDER BY ACCOUNT_KEY
     DO
-        IF p_accounts_done >= p_max_batch THEN
-            LEAVE archive_loop;                                             -- WHILE ... p_accounts_done < p_max_batch
-        END IF;
+        IF p_accounts_done >= p_max_batch THEN LEAVE archive_loop; END IF;   -- WHILE ... p_accounts_done < p_max_batch
         CASE acct.ACCOUNT_TYPE
-            WHEN 'LOAN' THEN
-                SET v_txn_count = 0;
+            WHEN 'LOAN' THEN SET v_txn_count = 0;
             ELSE
                 EXECUTE IMMEDIATE 'INSERT INTO ' || v_arch_table              -- value via USING, not string-spliced
                                || ' SELECT ft.* FROM ${catalog}.${schema}.FACT_TRANSACTION ft WHERE ft.ACCOUNT_KEY = ?'
