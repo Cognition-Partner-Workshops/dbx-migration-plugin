@@ -132,6 +132,10 @@ class Tolerances:
     # source does not: such a target rejects writes the legacy application makes today. True
     # records the decision that the tightening is intended and demotes those findings to stats.
     accept_target_only_constraints: bool = False
+    # Tier 7 fails when a source CHECK predicate and a target CHECK predicate are both unmatched
+    # after canonicalisation (dialect functions, different shapes): the harness can prove neither
+    # equivalence nor difference. True records that a human compared the listed pairs by hand.
+    accept_unverified_check_constraints: bool = False
 
 
 @dataclass(frozen=True)
@@ -301,6 +305,7 @@ def load_tolerances(path: Path) -> Tolerances:
         pk_set_stream_every_range=_flag(data, "pk_set_stream_every_range", path),
         accept_marker_only_window=_flag(data, "accept_marker_only_window", path),
         accept_target_only_constraints=_flag(data, "accept_target_only_constraints", path),
+        accept_unverified_check_constraints=_flag(data, "accept_unverified_check_constraints", path),
     )
 
 

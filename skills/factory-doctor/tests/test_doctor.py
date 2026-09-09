@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -108,6 +109,17 @@ def test_driver_probe_requires_full_module(monkeypatch):
     c = doctor.check_drivers()
     assert c.data["drivers"]["databricks"] is False and c.status == "warn"
     assert "databricks-sql-connector missing" in c.detail
+
+
+def test_driver_probe_names_match_adapter_imports():
+    """Each probe module is the one the harness adapter actually imports (Lakebase is psycopg 3,
+    Redshift is psycopg2); a wrong name would report a working environment as missing a driver."""
+    adapters = (PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness" / "recon" / "adapters.py").read_text()
+    imported = set(re.findall(r"^\s+import ([A-Za-z_][\w.]*)  # lazy", adapters, re.MULTILINE))
+    imported |= {f"{a}.{b}" for a, b in re.findall(r"^\s+from ([\w.]+) import (\w+)  # lazy", adapters, re.MULTILINE)}
+    for engine, module in doctor.DRIVERS.items():
+        assert module in imported, f"{engine}: doctor probes {module}, adapters never import it"
+    assert doctor.DRIVERS["postgres"] == "psycopg" and doctor.DRIVERS["redshift"] == "psycopg2"
 
 
 def test_not_blocked_probe_fails(tmp_path):

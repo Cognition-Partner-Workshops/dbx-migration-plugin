@@ -100,6 +100,10 @@ class SchemaFacts:
     not_null: set[str] = field(default_factory=set)
     indexes: set[tuple[str, ...]] = field(default_factory=set)
     check_count: int = 0
+    # enforced CHECK predicates as the catalog renders them (sys.check_constraints.definition,
+    # pg_get_constraintdef); tier 7 canonicalises them across dialects. A reader that can only
+    # count leaves this empty and check_count is then all the parity there is.
+    checks: set[str] = field(default_factory=set)
     identity_columns: set[str] = field(default_factory=set)
     partial: set[tuple[str, ...]] = field(default_factory=set)
     # indexes keyed on expressions rather than columns, as their normalised definition text
@@ -912,13 +916,14 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
                 facts.not_null.add(col)
             if is_identity:
                 facts.identity_columns.add(col)
-        (n,) = self._rows(
-            "SELECT COUNT(*) FROM sys.check_constraints cc "
+        rows = self._rows(
+            "SELECT cc.definition FROM sys.check_constraints cc "
             "JOIN sys.objects o ON o.object_id = cc.parent_object_id "
             "JOIN sys.schemas s ON s.schema_id = o.schema_id "
             "WHERE s.name = ? AND o.name = ? AND cc.is_disabled = 0",
-            (schema, name))[0]
-        facts.check_count = int(n)
+            (schema, name))
+        facts.check_count = len(rows)
+        facts.checks = {definition for (definition,) in rows}
         return facts
 
     def numeric_columns(self, table: str) -> set[str]:
@@ -1102,7 +1107,8 @@ class _PostgresBase(_SqlAdapterBase):
         rows = self._rows(
             "SELECT con.contype, con.conname, a.attname, "
             "       CASE WHEN con.contype = 'f' THEN rn.nspname || '.' || rc.relname END, "
-            "       ra.attname, k.ord, con.confupdtype, con.confdeltype "
+            "       ra.attname, k.ord, con.confupdtype, con.confdeltype, "
+            "       CASE WHEN con.contype = 'c' THEN pg_get_constraintdef(con.oid) END "
             "FROM pg_constraint con "
             "JOIN pg_class c ON c.oid = con.conrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -1118,13 +1124,13 @@ class _PostgresBase(_SqlAdapterBase):
         # a CHECK that names no column (a constant, or only functions) has an empty conkey and
         # arrives as one row with a NULL column; it still counts
         by_con: dict[str, list] = {}
-        for ctype, cname, col, ref_table, ref_col, _ord, on_update, on_delete in rows:
-            entry = by_con.setdefault(cname, [ctype, [], ref_table, [], (on_update, on_delete)])
+        for ctype, cname, col, ref_table, ref_col, _ord, on_update, on_delete, definition in rows:
+            entry = by_con.setdefault(cname, [ctype, [], ref_table, [], (on_update, on_delete), definition])
             if col is not None:
                 entry[1].append(col)
             if ref_col is not None:
                 entry[3].append(ref_col)
-        for ctype, cols, ref_table, ref_cols, actions in by_con.values():
+        for ctype, cols, ref_table, ref_cols, actions, definition in by_con.values():
             if ctype == "p":
                 facts.primary_key = tuple(cols)
             elif ctype == "u":
@@ -1135,6 +1141,7 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.foreign_key_actions[fk] = tuple(_fk_action(a) for a in actions)
             elif ctype == "c":
                 facts.check_count += 1
+                facts.checks.add(definition)
         # attnum 0 in indkey marks an expression key; a LEFT JOIN keeps those indexes visible
         nulls_equal = "ix.indnullsnotdistinct" if self._server_version() >= 150000 else "FALSE"
         rows = self._rows(

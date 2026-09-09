@@ -85,7 +85,7 @@ Each row is a way a migration goes wrong and the one thing in the kit that catch
 | A child keeps retrying a red recon | Hard cap of 3 full runs, then it reports FAIL with a one-word failure class. |
 | Children hammer the live source | Fixture first. Each child reads the real source once, inside the cap agreed at the first stop. |
 | A child grades its own homework | A separate session that wrote none of the code re-runs the harness. Only its PASS merges. |
-| Fixture PASS gets mistaken for done | The report says so in the verdict line. Only live or snapshot PASS can merge. |
+| Fixture PASS gets mistaken for done | The report says so in the verdict line. Only a live, snapshot or transactional PASS can merge. |
 | The source moved during the check | Live comparisons are timestamped and re-run on the source side to separate drift from a real defect. |
 | Someone loosens a tolerance to go green | Tolerance changes need a dated approval in the decisions file. Grading-only fixes are the one exception. |
 | A secret ends up in a PR or log | Everything takes secret names; values are read from the environment at run time and never printed. |

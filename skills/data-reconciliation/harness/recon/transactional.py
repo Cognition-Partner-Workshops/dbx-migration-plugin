@@ -575,7 +575,8 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         foreign_key_actions={_lower_fk(fk): a for fk, a in f.foreign_key_actions.items()},
         not_null={x.lower() for x in f.not_null},
         indexes={tuple(x.lower() for x in i) for i in f.indexes},
-        check_count=f.check_count, identity_columns={x.lower() for x in f.identity_columns},
+        check_count=f.check_count, checks=set(f.checks),
+        identity_columns={x.lower() for x in f.identity_columns},
         partial={tuple(x.lower() for x in p) for p in f.partial},
         expression_unique={normalize_sql_text(x) for x in f.expression_unique},
         expression_indexes={normalize_sql_text(x) for x in f.expression_indexes})
@@ -608,6 +609,397 @@ def _map_expression(text: str, colmap: dict[str, str]) -> str:
             return '"' + mapped.replace('"', '""') + '"' if mapped else m.group("quoted")
         return m.group(0)
     return _EXPR_TOKEN.sub(swap, text)
+
+
+# CHECK predicates as the two catalogs render them differ in everything but meaning:
+# SQL Server  ([Loan_Status]='FC' OR [Loan_Status]='AC')      ([Balance]>=(0))      (len([Code])<=(10))
+# Postgres    CHECK ((loan_status = ANY (ARRAY['AC'::text, 'FC'::text])))
+#             CHECK ((balance >= (0)::numeric))                 CHECK ((length((code)::text) <= 10))
+# `_check_key_text` folds both to one form: quoting and casts dropped, identifiers lower-cased and
+# mapped to the target's column names, numbers normalised, parentheses kept only where they bind
+# (function arguments, IN lists, arithmetic), an OR-chain of equalities on one column and an
+# `= ANY (ARRAY[...])` both written as a sorted IN list, dialect spellings of a few functions
+# unified. Anything it cannot vouch for (a function outside the portable set, CASE, a subquery,
+# LIKE, COLLATE, regex operators) marks the predicate non-portable: a match still counts, a
+# mismatch is unverified rather than a difference.
+_CHECK_TOKEN = re.compile(
+    r"(?P<ws>\s+)"
+    r"|(?P<string>'(?:[^']|'')*')"
+    r"|(?P<quoted>\"(?:[^\"]|\"\")*\")"
+    r"|(?P<cast>::\s*[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\s+(?:varying|precision|with(?:out)?\s+time\s+zone))?"
+    r"(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?(?:\s*\[\s*\])*)"
+    r"|(?P<number>\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+)"
+    r"|(?P<ident>[A-Za-z_][A-Za-z0-9_$#]*)"
+    r"|(?P<op><>|!=|>=|<=|!~~|~~|\|\||[=<>+\-*/%(),\[\]])"
+    r"|(?P<other>\S)")
+_NUMERIC_CAST = re.compile(r"::\s*(?:integer|int|int2|int4|int8|bigint|smallint|numeric|decimal|real|"
+                           r"double precision|float\d*)\b", re.IGNORECASE)
+_BRACKET_IDENT = re.compile(r"\[([^\]]+)\]")
+_ARRAY_BRACKET = re.compile(r"\barray\s*\[", re.IGNORECASE)
+_FUNC_ALIASES = {"len": "length", "char_length": "length", "character_length": "length",
+                 "ceil": "ceiling", "isnull": "coalesce", "getdate": "current_timestamp",
+                 "getutcdate": "current_timestamp", "now": "current_timestamp",
+                 "sysdatetime": "current_timestamp"}
+_PORTABLE_FUNCS = {"length", "upper", "lower", "trim", "ltrim", "rtrim", "abs", "coalesce", "nullif",
+                   "round", "floor", "ceiling", "substring", "current_timestamp", "current_date"}
+_KEYWORDS = {"and", "or", "not", "in", "is", "null", "like", "between", "any", "all", "some", "array",
+             "true", "false", "case", "when", "then", "else", "end", "exists", "select", "collate",
+             "similar", "to", "escape", "current_timestamp", "current_date"}
+_NON_PORTABLE_KEYWORDS = {"case", "exists", "select", "collate", "like", "similar", "escape"}
+_COMPARISONS = {"=", "<>", "<", ">", "<=", ">=", "in", "like", "is", "between"}
+_LITERAL_KINDS = {"string", "number", "ident"}  # ident covers true/false/null
+
+
+def _check_tokens(text: str, colmap: dict[str, str]) -> tuple[list[tuple[str, str]], bool]:
+    """(kind, value) tokens of a CHECK definition with quoting, casts and the leading CHECK
+    removed; identifiers lower-cased and source columns renamed. `portable` is False when a
+    construct outside the canonical subset was seen."""
+    text = re.sub(r"^\s*check\s*", "", text, flags=re.IGNORECASE)
+    if not _ARRAY_BRACKET.search(text):  # SQL Server quotes identifiers in brackets
+        text = _BRACKET_IDENT.sub(lambda m: '"' + m.group(1).replace('"', '""') + '"', text)
+    tokens: list[tuple[str, str]] = []
+    portable = True
+    for m in _CHECK_TOKEN.finditer(text):
+        kind = m.lastgroup
+        value = m.group(0)
+        if kind == "ws":
+            continue
+        if kind == "cast":
+            # Postgres prints a negative or typed numeric literal as a quoted string with a cast
+            if tokens and tokens[-1][0] == "string" and _NUMERIC_CAST.match(value):
+                try:
+                    num = decimal.Decimal(tokens[-1][1][1:-1].replace("''", "'"))
+                    tokens[-1] = ("number", format(num.normalize(), "f") if num.is_finite() else tokens[-1][1])
+                except decimal.InvalidOperation:
+                    pass
+            continue
+        if kind == "quoted":
+            name = value[1:-1].replace('""', '"').lower()
+            tokens.append(("ident", colmap.get(name, name)))
+        elif kind == "ident":
+            name = value.lower()
+            if name in _KEYWORDS:
+                if name in _NON_PORTABLE_KEYWORDS:
+                    portable = False
+                tokens.append(("kw", name))
+            else:
+                tokens.append(("ident", colmap.get(name, name)))
+        elif kind == "number":
+            try:
+                num = decimal.Decimal(value)
+                value = format(num.normalize(), "f") if num.is_finite() else value
+            except decimal.InvalidOperation:
+                pass
+            tokens.append(("number", value))
+        elif kind == "op":
+            if value in ("~~", "!~~"):  # Postgres spells LIKE as an operator in pg_get_constraintdef
+                portable = False
+                if value == "!~~":
+                    tokens.append(("kw", "not"))
+                tokens.append(("kw", "like"))
+            else:
+                tokens.append(("op", "<>" if value == "!=" else value))
+        elif kind == "string":
+            tokens.append(("string", value))
+        else:
+            portable = False
+            tokens.append(("other", value))
+    # a name followed by `(` is a function: alias dialect spellings, vet the rest
+    for i, (kind, value) in enumerate(tokens):
+        if kind == "ident" and i + 1 < len(tokens) and tokens[i + 1] == ("op", "("):
+            name = _FUNC_ALIASES.get(value, value)
+            if name not in _PORTABLE_FUNCS:
+                portable = False
+            tokens[i] = ("func", name)
+    return tokens, portable
+
+
+class _Unparsable(Exception):
+    pass
+
+
+class _Parser:
+    """Precedence-climbing parser for the token subset of `_check_tokens`, producing a small AST
+    that `_render` prints with the minimum parentheses; the catalogs' own bracketing conventions
+    (Postgres wraps every node, SQL Server every literal) therefore never reach the comparison.
+    Nodes: ("or", [..]) ("and", [..]) ("not", x) ("cmp", op, l, r) ("is", x, "null"|"not null")
+    ("in", x, [lits], negated) ("bin", op, l, r) ("neg", x) ("call", name, [args])
+    ("atom", kind, text)."""
+
+    def __init__(self, tokens: list[tuple[str, str]]) -> None:
+        self.toks = tokens
+        self.i = 0
+
+    def peek(self, k: int = 0):
+        j = self.i + k
+        return self.toks[j] if j < len(self.toks) else None
+
+    def take(self, expect=None):
+        tok = self.peek()
+        if tok is None or (expect is not None and tok != expect):
+            raise _Unparsable(f"expected {expect}, got {tok}")
+        self.i += 1
+        return tok
+
+    def at(self, *values: str) -> bool:
+        tok = self.peek()
+        return tok is not None and tok[0] in ("kw", "op") and tok[1] in values
+
+    def parse(self):
+        node = self.expr()
+        if self.peek() is not None:
+            raise _Unparsable(f"trailing {self.peek()}")
+        return node
+
+    def expr(self):
+        return self.chain("or", self.and_expr)
+
+    def and_expr(self):
+        return self.chain("and", self.not_expr)
+
+    def chain(self, kw: str, sub):
+        items = [sub()]
+        while self.at(kw):
+            self.take()
+            items.append(sub())
+        return items[0] if len(items) == 1 else (kw, items)
+
+    def not_expr(self):
+        if self.at("not"):
+            self.take()
+            return ("not", self.not_expr())
+        return self.pred()
+
+    def pred(self):
+        left = self.arith()
+        if self.at("is"):
+            self.take()
+            neg = self.at("not") and self.take()
+            what = self.take()
+            if what[0] != "kw" or what[1] not in ("null", "true", "false"):
+                raise _Unparsable("IS needs NULL/TRUE/FALSE")
+            return ("is", left, ("not " if neg else "") + what[1])
+        neg = False
+        if self.at("not") and self.peek(1) is not None and self.peek(1)[1] in ("in", "like", "between"):
+            self.take()
+            neg = True
+        if self.at("in"):
+            self.take()
+            self.take(("op", "("))
+            lits = self.literal_list(("op", ")"))
+            return ("in", left, lits, neg)
+        if self.at("between"):
+            self.take()
+            lo = self.arith()
+            self.take(("kw", "and"))
+            hi = self.arith()
+            node = ("and", [("cmp", ">=", left, lo), ("cmp", "<=", left, hi)])
+            return ("not", node) if neg else node
+        if self.at("like"):
+            self.take()
+            pattern = self.arith()
+            if self.at("escape"):
+                self.take()
+                pattern = ("bin", "escape", pattern, self.arith())
+            node = ("cmp", "like", left, pattern)
+            return ("not", node) if neg else node
+        if self.at("=", "<>", "<", ">", "<=", ">="):
+            op = self.take()[1]
+            if self.at("any", "all", "some"):
+                quant = self.take()[1]
+                self.take(("op", "("))
+                lits = self.array_literal()
+                self.take(("op", ")"))
+                if op == "=" and quant in ("any", "some"):
+                    return ("in", left, lits, False)
+                if op == "<>" and quant == "all":
+                    return ("in", left, lits, True)
+                raise _Unparsable("quantified comparison")
+            right = self.arith()
+            if _is_literal(left) and not _is_literal(right):  # `0 <= x` reads as `x >= 0`
+                op = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}.get(op, op)
+                left, right = right, left
+            return ("cmp", op, left, right)
+        return left
+
+    def array_literal(self):
+        depth = 0
+        while self.at("("):
+            self.take()
+            depth += 1
+        self.take(("kw", "array"))
+        self.take(("op", "["))
+        lits = self.literal_list(("op", "]"))
+        for _ in range(depth):
+            self.take(("op", ")"))
+        return lits
+
+    def literal_list(self, close):
+        lits = []
+        while True:
+            lits.append(self.arith())
+            if self.at(","):
+                self.take()
+                continue
+            self.take(close)
+            return lits
+
+    def arith(self):
+        node = self.term()
+        while self.at("+", "-", "||"):
+            op = self.take()[1]
+            node = ("bin", op, node, self.term())
+        return node
+
+    def term(self):
+        node = self.factor()
+        while self.at("*", "/", "%"):
+            op = self.take()[1]
+            node = ("bin", op, node, self.factor())
+        return node
+
+    def factor(self):
+        if self.at("-"):
+            self.take()
+            inner = self.factor()
+            if inner[0] == "atom" and inner[1] == "number":
+                return ("atom", "number", "-" + inner[2])
+            return ("neg", inner)
+        if self.at("+"):
+            self.take()
+            return self.factor()
+        return self.primary()
+
+    def primary(self):
+        tok = self.take()
+        kind, value = tok
+        if kind == "op" and value == "(":
+            node = self.expr()
+            self.take(("op", ")"))
+            return node
+        if kind == "func":
+            self.take(("op", "("))
+            args = []
+            if not self.at(")"):
+                args = self.literal_list(("op", ")"))
+            else:
+                self.take()
+            return ("call", value, args)
+        if kind in ("number", "string", "ident"):
+            return ("atom", kind, value)
+        if kind == "kw" and value in ("null", "true", "false", "current_timestamp", "current_date"):
+            return ("atom", "kw", value)
+        raise _Unparsable(f"unexpected {tok}")
+
+
+def _is_literal(node) -> bool:
+    return node[0] == "atom" and node[1] in ("number", "string", "kw")
+
+
+def _fold(node):
+    """Semantic normalisation: flatten nested OR/AND, fold `c = a OR c = b` into `c IN (a, b)`
+    and `c <> a AND c <> b` into `c NOT IN (a, b)`, sort IN lists and the operands of the
+    commutative AND/OR."""
+    kind = node[0]
+    if kind in ("or", "and"):
+        items = []
+        for x in node[1]:
+            x = _fold(x)
+            items.extend(x[1] if x[0] == kind else [x])
+        want_op, negated = ("=", False) if kind == "or" else ("<>", True)
+        by_col: dict = {}
+        rest = []
+        for x in items:
+            if x[0] == "cmp" and x[1] == want_op and x[2][0] == "atom" and x[2][1] == "ident" \
+                    and _is_literal(x[3]):
+                by_col.setdefault(x[2], []).append(x[3])
+            else:
+                rest.append(x)
+        for col, lits in by_col.items():
+            if len(lits) == 1:
+                rest.append(("cmp", want_op, col, lits[0]))
+            else:
+                rest.append(("in", col, lits, negated))
+        rest = [_fold(x) if x[0] == "in" else x for x in rest]
+        rest.sort(key=_render)
+        return rest[0] if len(rest) == 1 else (kind, rest)
+    if kind == "in":
+        lits = sorted((_fold(x) for x in node[2]), key=_render)
+        return ("in", _fold(node[1]), lits, node[3])
+    if kind == "not":
+        return ("not", _fold(node[1]))
+    if kind == "cmp":
+        return ("cmp", node[1], _fold(node[2]), _fold(node[3]))
+    if kind == "is":
+        return ("is", _fold(node[1]), node[2])
+    if kind == "bin":
+        return ("bin", node[1], _fold(node[2]), _fold(node[3]))
+    if kind == "neg":
+        return ("neg", _fold(node[1]))
+    if kind == "call":
+        return ("call", node[1], [_fold(a) for a in node[2]])
+    return node
+
+
+_PREC = {"or": 1, "and": 2, "not": 3, "cmp": 4, "is": 4, "in": 4, "+": 5, "-": 5, "||": 5,
+         "*": 6, "/": 6, "%": 6, "neg": 7, "escape": 8}
+
+
+def _prec(node) -> int:
+    kind = node[0]
+    if kind == "bin":
+        return _PREC[node[1]]
+    return _PREC.get(kind, 9)
+
+
+def _render(node, parent: int = 0, right: bool = False) -> str:
+    kind = node[0]
+    if kind == "atom":
+        return node[2]
+    if kind == "call":
+        return f"{node[1]}({', '.join(_render(a) for a in node[2])})"
+    if kind in ("or", "and"):
+        text = f" {kind} ".join(_render(x, _PREC[kind]) for x in node[1])
+    elif kind == "not":
+        text = "not " + _render(node[1], _PREC["not"])
+    elif kind == "cmp":
+        text = f"{_render(node[2], 4)} {node[1]} {_render(node[3], 4, True)}"
+    elif kind == "is":
+        text = f"{_render(node[1], 4)} is {node[2]}"
+    elif kind == "in":
+        text = (f"{_render(node[1], 4)} {'not in' if node[3] else 'in'} "
+                f"({', '.join(_render(x) for x in node[2])})")
+    elif kind == "bin":
+        p = _PREC[node[1]]
+        text = f"{_render(node[2], p)} {node[1]} {_render(node[3], p, True)}"
+    elif kind == "neg":
+        text = "-" + _render(node[1], _PREC["neg"])
+    else:
+        raise _Unparsable(kind)
+    own = _prec(node)
+    if own < parent or (right and own == parent and kind == "bin"):
+        return f"({text})"
+    return text
+
+
+def _check_key_text(definition: str, colmap: dict[str, str]) -> tuple[str, bool]:
+    """(canonical text, portable) of one CHECK definition; see the note above `_CHECK_TOKEN`."""
+    tokens, portable = _check_tokens(definition, colmap)
+    try:
+        return _render(_fold(_Parser(tokens).parse())), portable
+    except (_Unparsable, IndexError):
+        # outside the grammar: the tokens as they came, comparable only to an identical spelling
+        return " ".join(v for _, v in tokens), False
+
+
+def _check_keys(defs: set[str], colmap: dict[str, str]) -> dict[str, tuple[str, bool]]:
+    """canonical text -> (original definition, portable) for one side's CHECK constraints."""
+    out: dict[str, tuple[str, bool]] = {}
+    for d in sorted(defs):
+        key, portable = _check_key_text(d, colmap)
+        out[key] = (d, portable and out.get(key, (d, True))[1])
+    return out
 
 
 def _covered(leading: tuple, facts: SchemaFacts) -> bool:
@@ -768,7 +1160,38 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
             if not _covered(_map_cols(idx, colmap), t_lower):
                 findings.append(Finding(c.object, "index_missing",
                                         f"no target index leads with {_map_cols(idx, colmap)} (source {idx})"))
-        if t.check_count < s.check_count:
+        # CHECK predicates: matched on canonical text, never on count alone, as long as both
+        # readers delivered every definition; a reader that only counts falls back to the counts
+        if len(s.checks) == s.check_count and len(t.checks) == t.check_count:
+            s_keys, t_keys = _check_keys(s.checks, colmap), _check_keys(t.checks, {})
+            s_only, t_only = sorted(set(s_keys) - set(t_keys)), sorted(set(t_keys) - set(s_keys))
+            if s_only and not t_only:
+                for key in s_only:
+                    findings.append(Finding(c.object, "check_constraint_missing",
+                                            f"source CHECK {s_keys[key][0]} (canonical: {key}) has no "
+                                            "target counterpart: the target admits rows the source rejects"))
+            elif s_only:
+                # a source predicate and a target predicate both unmatched: the same rule spelled
+                # in a way the canonicaliser cannot fold, or genuinely different rules
+                detail = (f"{len(s_only)} source CHECK(s) match no target CHECK and {len(t_only)} target "
+                          f"CHECK(s) match no source CHECK; source: "
+                          + "; ".join(f"{s_keys[k][0]} (canonical: {k})" for k in s_only)
+                          + "; target: " + "; ".join(f"{t_keys[k][0]} (canonical: {k})" for k in t_only)
+                          + ("" if all(s_keys[k][1] for k in s_only) and all(t_keys[k][1] for k in t_only)
+                             else "; a predicate uses a dialect-specific construct"))
+                if tol.accept_unverified_check_constraints:
+                    stats.setdefault("accepted_unverified_check_constraints", []).append(
+                        f"{c.object}: {detail}")
+                else:
+                    findings.append(Finding(c.object, "check_constraint_unverified",
+                                            detail + "; compare them by hand and record "
+                                            "accept_unverified_check_constraints"))
+            else:
+                for key in t_only:
+                    tightened(Finding(c.object, "check_constraint_extra",
+                                      f"target CHECK {t_keys[key][0]} (canonical: {key}) has no source "
+                                      "counterpart: it rejects writes the source accepts"))
+        elif t.check_count < s.check_count:
             findings.append(Finding(c.object, "check_constraint_count_lower",
                                     f"source {s.check_count} CHECK constraints, target {t.check_count}",
                                     s.check_count, t.check_count))
@@ -777,6 +1200,10 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                               f"source {s.check_count} CHECK constraints, target {t.check_count}: "
                               "the extra checks reject writes the source accepts",
                               s.check_count, t.check_count))
+        else:
+            stats.setdefault("check_predicates_unverified", []).append(
+                f"{c.object}: {s.check_count} CHECK constraints on each side, but a catalog reader "
+                "delivered counts only; the predicates were not compared")
         for idx in sorted(s.partial):
             stats.setdefault("partial_indexes_unverified", []).append(
                 f"{c.object}: source filtered index {idx} carries a predicate the harness cannot "
@@ -884,7 +1311,8 @@ def _facts_dict(f: SchemaFacts) -> dict:
             "foreign_keys": sorted([list(c), r, list(rc), *f.foreign_key_actions.get((c, r, rc), ())]
                                    for c, r, rc in f.foreign_keys),
             "not_null": sorted(f.not_null), "indexes": sorted(map(list, f.indexes)),
-            "check_count": f.check_count, "identity_columns": sorted(f.identity_columns),
+            "check_count": f.check_count, "checks": sorted(f.checks),
+            "identity_columns": sorted(f.identity_columns),
             "partial": sorted(map(list, f.partial)),
             "expression_unique": sorted(f.expression_unique),
             "expression_indexes": sorted(f.expression_indexes)}

@@ -27,7 +27,9 @@ def _batch_runtime():
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
-                or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")]
+                or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
+                or (isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "MERGE_EVIDENCE_MODES" for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
         "Counter": Counter,
@@ -137,10 +139,7 @@ def test_validate_manifest_accepts_capability_contract():
 
 
 def test_child_prompt_embeds_capability_contract():
-    tree = ast.parse(WORKFLOW.read_text())
-    selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"child_prompt", "capability_block"}]
-    ns = {"json": __import__("json"), "WAVE": 1, "REPO": "repo", "MANIFEST": _manifest()}
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
+    ns = _prompt_ns(_manifest())
     text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
     assert "--expect-identity sp-1" in text
     assert '"catalogs": ["mig"]' in text
@@ -175,7 +174,8 @@ def _prompt_ns(manifest):
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "COST_KEYS" for t in node.targets))]
+                    isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES"}
+                    for t in node.targets))]
     ns = {"json": __import__("json"), "WAVE": 1, "REPO": "repo", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled")}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
@@ -264,6 +264,43 @@ def test_pass_without_pr_is_downgraded():
     output = asyncio.run(exercise())
     assert output["status"] == "FAIL"
     assert output["failure_class"] == "missing_pr"
+
+
+def _run_one(namespace, report):
+    async def agent(prompt, **kwargs):
+        return dict(report)
+
+    namespace["agent"] = agent
+
+    async def exercise():
+        return await namespace["run_batch"](
+            {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "b"},
+            asyncio.Semaphore(1), namespace["Breaker"](3))
+
+    return asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("mode", ["live", "snapshot", "transactional"])
+def test_pass_with_merge_evidence_mode_is_kept(mode):
+    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode,
+                                      "pr_url": "https://example/pr/1", "branch": "f", "one_line_summary": "ok"})
+    assert out["status"] == "PASS" and "failure_class" not in out
+
+
+@pytest.mark.parametrize("mode", ["fixture", "continuous", None])
+def test_pass_without_merge_evidence_is_downgraded(mode):
+    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode,
+                                      "pr_url": "https://example/pr/1", "branch": "f", "one_line_summary": "ok"})
+    assert out["status"] == "FAIL" and out["failure_class"] == "non_merge_evidence"
+
+
+def test_prompts_name_every_merge_evidence_mode():
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"](_manifest()["batches"][0])
+    verify = ns["verify_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1"}], False)
+    for mode in ("live", "snapshot", "transactional"):
+        assert mode in child and mode in verify
+    assert "Fixture evidence is never PASS" in child
 
 
 def test_first_run_requires_wave_run_id():

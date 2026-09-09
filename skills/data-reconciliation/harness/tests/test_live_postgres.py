@@ -69,6 +69,7 @@ def test_partial_and_invalid_indexes_never_count_as_parity(schema, monkeypatch):
     assert facts.partial == {("region",), ("active",)}       # reported for a manual check
     assert facts.not_null == {"id", "code", "active"}
     assert facts.check_count == 2                            # a column-free CHECK still counts
+    assert facts.checks == {"CHECK ((dup > 0))", "CHECK ((1 < 2))"}
     # expression keys (attnum 0) stay visible as the key text of pg_get_indexdef
     assert facts.expression_unique == {"lower(code)"}           # partial unique is not uniqueness
     assert facts.expression_indexes == {"upper(region), id", "lower(region)"}  # INCLUDE dropped

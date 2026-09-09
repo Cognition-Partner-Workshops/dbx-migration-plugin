@@ -54,6 +54,7 @@ def test_disabled_constraints_never_count_as_enforced(schema, monkeypatch):
     assert facts.foreign_keys == {fk}
     assert facts.foreign_key_actions == {fk: ("cascade", "no action")}
     assert facts.check_count == 1
+    assert facts.checks == {"([Amount]>=(0))"}                 # the NOCHECK one is not enforced
     assert facts.not_null == {"Child_ID", "Parent_ID"}
 
 

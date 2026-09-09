@@ -34,6 +34,7 @@ from recon.engine import MODES, PLANNED_MODES, run_recon
 from recon.report import render_summary
 from recon.transactional import (
     _applied_predicate,
+    _check_key_text,
     _common_kind,
     _digest_kind,
 
@@ -75,6 +76,7 @@ LOANS_FACTS = SchemaFacts(
     foreign_keys={(("borrower_id",), "dbo.borrowers", ("borrower_id",))},
     not_null={"loan_id", "loan_number", "current_balance", "modified_date", "borrower_id"},
     indexes={("borrower_id",), ("loan_status", "days_past_due")}, check_count=2,
+    checks={"([Current_Balance]>=(0))", "([Loan_Status]='FC' OR [Loan_Status]='DL' OR [Loan_Status]='AC')"},
     identity_columns={"loan_id"})
 
 TARGET_LOANS_FACTS = SchemaFacts(
@@ -82,6 +84,9 @@ TARGET_LOANS_FACTS = SchemaFacts(
     foreign_keys={(("borrower_id",), "loan_servicing.borrowers", ("borrower_id",))},
     not_null={"loan_id", "loan_number", "current_balance", "modified_date", "borrower_id"},
     indexes={("borrower_id",), ("loan_status", "days_past_due", "loan_id")}, check_count=2,
+    checks={"CHECK ((current_balance >= (0)::numeric))",
+            "CHECK (((loan_status)::text = ANY ((ARRAY['AC'::character varying, 'DL'::character varying, "
+            "'FC'::character varying])::text[])))"},
     identity_columns={"loan_id"})
 
 BORROWER_FACTS = SchemaFacts(primary_key=("borrower_id",), not_null={"borrower_id"},
@@ -836,7 +841,7 @@ def test_schema_parity_findings_map_through_the_spec():
     assert _codes(result, "schema_parity") == sorted([
         "unique_missing", "foreign_key_missing", "not_null_missing", "not_null_missing",
         "not_null_missing", "not_null_missing", "index_missing", "index_missing",
-        "check_constraint_count_lower"])
+        "check_constraint_missing", "check_constraint_missing"])
     fk = next(f for f in _tier(result, "schema_parity")["findings"] if f["check"] == "foreign_key_missing")
     assert "borrowers" in fk["detail"]
 
@@ -900,6 +905,136 @@ def test_a_target_only_constraint_fails_parity_because_it_rejects_legacy_valid_w
     assert accepted["verdict"] == "PASS" and accepted["merge_eligible"] is True
     note = _tier(accepted, "schema_parity")["stats"]["accepted_target_only_constraints"]
     assert len(note) == 1 and note[0].startswith(f"loans: {code}: ")
+
+
+@pytest.mark.parametrize("sqlserver, postgres, canonical", [
+    ("([Balance]>=(0))", "CHECK ((balance >= (0)::numeric))", "balance >= 0"),
+    ("([Balance]>=(0))", "CHECK (((0)::numeric <= balance))", "balance >= 0"),
+    ("([Loan_Status]='FC' OR [Loan_Status]='AC')",
+     "CHECK (((loan_status)::text = ANY ((ARRAY['AC'::character varying, 'FC'::character varying])::text[])))",
+     "loan_status in ('AC', 'FC')"),
+    ("([status]<>'X' AND [status]<>'Y')", "CHECK ((status <> ALL (ARRAY['X'::text, 'Y'::text])))",
+     "status not in ('X', 'Y')"),
+    ("(len([Code])<=(10))", "CHECK ((length((code)::text) <= 10))", "length(code) <= 10"),
+    ("(([a]+[b])*(2)>(0))", "CHECK ((((a + b) * 2) > 0))", "(a + b) * 2 > 0"),
+    ("([rate]>=(0.00) AND [rate]<=(1))", "CHECK (((rate <= (1)::numeric) AND (rate >= (0)::numeric)))",
+     "rate <= 1 and rate >= 0"),
+    ("([x] BETWEEN (1) AND (5))", "CHECK (((x >= 1) AND (x <= 5)))", "x <= 5 and x >= 1"),
+    ("([n]>(-(1)))", "CHECK ((n > '-1'::integer))", "n > -1"),
+    ("([x] IS NOT NULL OR [y] IS NOT NULL)", "CHECK (((y IS NOT NULL) OR (x IS NOT NULL)))",
+     "x is not null or y is not null"),
+])
+def test_check_predicates_canonicalise_the_same_across_sql_server_and_postgres(sqlserver, postgres, canonical):
+    assert _check_key_text(sqlserver, {}) == (canonical, True)
+    assert _check_key_text(postgres, {}) == (canonical, True)
+
+
+def test_check_predicate_canonical_form_keeps_what_distinguishes_rules():
+    assert _check_key_text("(upper([x])='A')", {})[0] != _check_key_text("(upper([x])='a')", {})[0]
+    assert _check_key_text("([a]-([b]-[c])>(0))", {})[0] == "a - (b - c) > 0"
+    assert _check_key_text("(([a]-[b])-[c]>(0))", {})[0] == "a - b - c > 0"
+    assert _check_key_text("CHECK ((a + (b * 2) > 0))", {})[0] == "a + b * 2 > 0"
+    # source columns are renamed through the mapping; literals and function names are not
+    assert _check_key_text("([Cust_ID]>(0) AND upper([memo])<>'cust_id')",
+                           {"cust_id": "customer_id", "memo": "note"})[0] == \
+        "customer_id > 0 and upper(note) <> 'cust_id'"
+
+
+@pytest.mark.parametrize("definition", [
+    "(datalength([Blob])<(100))",                       # engine-specific function
+    "CHECK ((CASE WHEN a THEN 1 ELSE 0 END = 1))",      # outside the grammar
+    "CHECK ((e ~~ '%@%'::text))",                       # LIKE: pattern/collation semantics differ
+    "([e] like '%@%')",
+])
+def test_dialect_specific_check_predicates_are_not_portable(definition):
+    assert _check_key_text(definition, {})[1] is False
+
+
+def _checks_run(src_checks, tgt_checks, tol=None):
+    loans, borrowers = _rows(6)
+    tgt = _tightened(check_count=len(tgt_checks), checks=set(tgt_checks))
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = _facts(LOANS_FACTS, check_count=len(src_checks), checks=set(src_checks))
+    return _run(source, target, tol=tol) if tol else _run(source, target)
+
+
+def test_equal_check_counts_with_a_predicate_absent_from_the_target_fail_as_missing():
+    # two on each side, but the target dropped the status rule and added a rule the source lacks
+    # spelled on a column the source rule does not mention: nothing on the target can be it
+    result = _checks_run(
+        ["([Current_Balance]>=(0))", "([Loan_Status]='AC' OR [Loan_Status]='FC')"],
+        ["CHECK ((current_balance >= (0)::numeric))", "CHECK ((current_balance >= (0)::numeric)) "])
+    # the second target text canonicalises to the same rule, so the target has one predicate
+    assert _codes(result, "schema_parity") == ["check_constraint_missing"]
+    f = _tier(result, "schema_parity")["findings"][0]
+    assert "([Loan_Status]='AC' OR [Loan_Status]='FC')" in f["detail"]
+    assert "canonical: loan_status in ('AC', 'FC')" in f["detail"]
+    assert result["merge_eligible"] is False
+
+
+def test_equal_check_counts_with_different_predicates_are_unverified_and_block_merge():
+    result = _checks_run(["([Current_Balance]>=(0))"], ["CHECK ((current_balance <= (0)::numeric))"])
+    assert _codes(result, "schema_parity") == ["check_constraint_unverified"]
+    detail = _tier(result, "schema_parity")["findings"][0]["detail"]
+    assert "canonical: current_balance >= 0" in detail and "canonical: current_balance <= 0" in detail
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    # accept_target_only_constraints is about extra rules, not about unproven equivalence
+    still = _checks_run(["([Current_Balance]>=(0))"], ["CHECK ((current_balance <= (0)::numeric))"],
+                        tol=Tolerances("t1", accept_target_only_constraints=True))
+    assert _codes(still, "schema_parity") == ["check_constraint_unverified"]
+    # the recorded hand comparison demotes the pair to a stat
+    accepted = _checks_run(["([Current_Balance]>=(0))"], ["CHECK ((current_balance <= (0)::numeric))"],
+                           tol=Tolerances("t1", accept_unverified_check_constraints=True))
+    assert accepted["verdict"] == "PASS" and accepted["merge_eligible"] is True
+    note = _tier(accepted, "schema_parity")["stats"]["accepted_unverified_check_constraints"]
+    assert len(note) == 1 and note[0].startswith("loans: 1 source CHECK(s) match no target CHECK")
+
+
+def test_dialect_specific_check_predicate_with_no_textual_match_is_unverified_not_passed():
+    result = _checks_run(["(datalength([Memo])<(100))"], ["CHECK ((octet_length(memo) < 100))"])
+    assert _codes(result, "schema_parity") == ["check_constraint_unverified"]
+    assert "dialect-specific construct" in _tier(result, "schema_parity")["findings"][0]["detail"]
+    # the same dialect spelling on both sides is a match, not a guess
+    same = _checks_run(["(datalength([Memo])<(100))"], ["CHECK ((datalength(memo) < 100))"])
+    assert _codes(same, "schema_parity") == []
+
+
+def test_check_predicates_are_compared_through_the_column_mapping():
+    loans, borrowers = _rows(6)
+    renamed_not_null = (TARGET_LOANS_FACTS.not_null - {"current_balance"}) | {"balance_current"}
+    tgt = _tightened(not_null=renamed_not_null,
+                     checks={"CHECK ((balance_current >= (0)::numeric))",
+                             "CHECK ((loan_status = ANY (ARRAY['AC'::text, 'DL'::text, 'FC'::text])))"})
+    source, target = _sides(loans, _renamed_rows(loans), borrowers, tgt_facts=tgt)
+    result = _run(source, target, spec=_renamed_spec())
+    assert _codes(result, "schema_parity") == []
+    # a target rule still written against the old column name is not the mapped source rule
+    stale = _tightened(not_null=renamed_not_null)
+    unmapped = _run(*_sides(loans, _renamed_rows(loans), borrowers, tgt_facts=stale)[:2], spec=_renamed_spec())
+    assert _codes(unmapped, "schema_parity") == ["check_constraint_unverified"]
+
+
+def test_target_only_check_predicate_is_a_tightening_with_the_existing_decision_knob():
+    result = _checks_run(["([Current_Balance]>=(0))"],
+                         ["CHECK ((current_balance >= (0)::numeric))", "CHECK ((days_past_due >= 0))"])
+    assert _codes(result, "schema_parity") == ["check_constraint_extra"]
+    assert "days_past_due >= 0" in _tier(result, "schema_parity")["findings"][0]["detail"]
+    accepted = _checks_run(["([Current_Balance]>=(0))"],
+                           ["CHECK ((current_balance >= (0)::numeric))", "CHECK ((days_past_due >= 0))"],
+                           tol=Tolerances("t1", accept_target_only_constraints=True))
+    assert accepted["verdict"] == "PASS" and accepted["merge_eligible"] is True
+
+
+def test_a_reader_that_only_counts_checks_falls_back_to_counts_and_says_so():
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
+                            tgt_facts=_tightened(checks=set()))
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == []
+    assert _tier(result, "schema_parity")["stats"]["check_predicates_unverified"] == [
+        "loans: 2 CHECK constraints on each side, but a catalog reader delivered counts only; "
+        "the predicates were not compared"]
+    assert _tier(result, "schema_parity")["stats"]["loans"]["source"]["checks"] == sorted(LOANS_FACTS.checks)
 
 
 def test_target_only_constraints_on_unmapped_columns_or_out_of_scope_tables_are_noted_not_graded():
@@ -1011,7 +1146,8 @@ def _sqlserver_cased(f: SchemaFacts) -> SchemaFacts:
         foreign_keys={(tuple(up(x) for x in c), "dbo.Borrowers", tuple(up(x) for x in rc))
                       for c, _r, rc in f.foreign_keys},
         not_null={up(x) for x in f.not_null}, indexes={tuple(up(x) for x in i) for i in f.indexes},
-        check_count=f.check_count, identity_columns={up(x) for x in f.identity_columns})
+        check_count=f.check_count, checks=set(f.checks),
+        identity_columns={up(x) for x in f.identity_columns})
 
 
 def _renamed_spec() -> MappingSpec:
@@ -1031,7 +1167,8 @@ def test_catalog_casing_never_changes_parity_on_a_renamed_target_column(renamed_
     cased = _sqlserver_cased(LOANS_FACTS)
     assert cased.primary_key == ("Loan_ID",) and "Current_Balance" in cased.not_null
     loans, borrowers = _rows(6)
-    tgt = _tightened(not_null=(TARGET_LOANS_FACTS.not_null - {"current_balance"}) | renamed_not_null)
+    tgt = _tightened(not_null=(TARGET_LOANS_FACTS.not_null - {"current_balance"}) | renamed_not_null,
+                     checks={c.replace("current_balance", "balance_current") for c in TARGET_LOANS_FACTS.checks})
     source, target = _sides(loans, _renamed_rows(loans), borrowers, tgt_facts=tgt)
     source.schema["dbo.loans"] = cased
     source.schema["dbo.borrowers"] = _sqlserver_cased(BORROWER_FACTS)

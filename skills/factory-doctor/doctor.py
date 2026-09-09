@@ -50,7 +50,7 @@ OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines"
 M2M_VARS = ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET")
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
 DRIVERS = {"databricks": "databricks.sql", "redshift": "psycopg2", "snowflake": "snowflake.connector",
-           "teradata": "teradatasql", "oracle": "oracledb", "sqlserver": "pyodbc", "postgres": "psycopg2"}
+           "teradata": "teradatasql", "oracle": "oracledb", "sqlserver": "pyodbc", "postgres": "psycopg"}
 
 # Safe live probe: if the platform loads hooks.json, the guard blocks this before it runs; if it
 # does not, `echo` prints a line and nothing else happens. Either way no Databricks call is made.

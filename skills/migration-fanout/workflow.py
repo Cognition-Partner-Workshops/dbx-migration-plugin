@@ -114,6 +114,9 @@ REPLAYED = {
 # for units the plan flags cutover-critical (D4 external feed, finance). Never "threshold":
 # the verifier's depth is a plan decision, not a tolerance-file side effect.
 VERIFY_DEPTHS = ("sampled", "full")
+# Recon modes whose PASS is merge evidence (recon/report.py merge_eligible): both sides real.
+# fixture never is; transactional is the operational (Lakebase) track's live run.
+MERGE_EVIDENCE_MODES = ("live", "snapshot", "transactional")
 # Values the child doctor compares its own findings against (hooks/dbx_guard.py, 00_context.md).
 GUARD_MODES = ("block", "warn")
 STOP_MODES = ("hard", "soft")
@@ -248,12 +251,12 @@ CHILD_SCHEMA = {
         "pr_url": {"type": "string"},
         "branch": {"type": "string"},
         "recon_verdict": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]},
-        "recon_mode": {"type": "string"},
+        "recon_mode": {"type": "string", "description": "recon --mode of the evidence run (fixture never merges)"},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
         "skill_feedback": {"type": "array", "items": {"type": "string"}},
         "recon_cost": {"type": "object",
-                       "description": "result.json['cost'] of the final live/snapshot run"},
+                       "description": "result.json['cost'] of the final live/snapshot/transactional run"},
         "one_line_summary": {"type": "string"},
     },
     "required": ["status", "recon_verdict", "recon_mode", "write_targets", "one_line_summary"],
@@ -300,12 +303,13 @@ def child_prompt(batch):
         + "Rules that override anything else:\n"
         "- Do not edit files under .migration/. The workflow writes the ledger from your report.\n"
         "- Do not merge your own PR.\n"
-        "- status=PASS requires a live or snapshot recon PASS (result.json merge_eligible=true). "
-        "Fixture evidence is never PASS.\n"
+        f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
+        "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
+        "evidence is never PASS.\n"
         "- If the recon harness fails 3 full runs, stop and report status=FAIL with a short "
         "failure_class (for example 'timestamp_precision', 'decimal_rounding', 'missing_rule').\n"
         "- Report every rule you had to derive yourself in skill_feedback.\n"
-        "- Copy result.json['cost'] of your final live/snapshot run into recon_cost; the wave brief "
+        "- Copy result.json['cost'] of your final merge-evidence run into recon_cost; the wave brief "
         "compares it with the STOP C estimate.\n"
         "- one_line_summary is for a human skimming 20 of these: what landed, or why not."
     )
@@ -340,8 +344,9 @@ def verify_prompt(passed, auto_merge):
         f"any of this code.\nRun the playbook {MANIFEST['verify_macro']} exactly as written over "
         f"these batches:\n{json.dumps(passed, sort_keys=True, indent=1)}\n\n"
         "Re-run the recon harness yourself. Do not trust the PR's pasted evidence. "
-        "Mark a unit PASS only if you re-ran the harness in live or snapshot mode and result.json says "
-        "merge_eligible=true. "
+        f"Mark a unit PASS only if you re-ran the harness in one of {list(MERGE_EVIDENCE_MODES)} "
+        "(the same mode the child used: transactional for Lakebase/operational units) and result.json "
+        "says merge_eligible=true. "
         f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
         "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
         "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. "
@@ -383,7 +388,7 @@ async def run_batch(batch, sem, breaker):
                    "one_line_summary": f"child session died: {e}"}
         if (out["status"] == "PASS"
                 and (out["recon_verdict"] != "PASS"
-                     or out.get("recon_mode") not in ("live", "snapshot"))):
+                     or out.get("recon_mode") not in MERGE_EVIDENCE_MODES)):
             out["status"] = "FAIL"
             out["failure_class"] = "non_merge_evidence"
             out["one_line_summary"] = (
