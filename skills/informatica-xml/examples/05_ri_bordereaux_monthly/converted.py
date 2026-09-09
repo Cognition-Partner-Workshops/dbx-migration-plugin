@@ -95,7 +95,10 @@ def lkp_sii_lob():
 
 @dp.materialized_view(name="ri_claims_bdx_std", comment="m_RI_BORDEREAUX_MONTHLY converted; grain = BROKER_ID, CLAIM_REF")
 @dp.expect("amount_parsable", "NOT amt_unparsable")            # legacy silently produced 0: warn, do not drop
-@dp.expect_or_drop("policy_rekeyed", "POLICY_NO RLIKE '^ALB-[A-Z]{3}-[0-9]{7}$'")   # INFERRED POLARIS key shape
+# INFERRED POLARIS key shape. Warn only: the legacy mapping has no Filter after EXP_REKEY_POLICY, so every input
+# row reached the target; and because REPLACESTR ran case-insensitively, 'al/mot/0000001' legitimately lands as
+# 'ALB-mot-0000001' (lower-case suffix preserved) - the check must be (?i) or those rows fail it.
+@dp.expect("policy_rekeyed", "POLICY_NO RLIKE '(?i)^ALB-[A-Z]{3}-[0-9]{7}$'")
 def ri_claims_bdx_std():
     # Informatica Expression transformations are row-preserving: every output row IS an input row plus derived
     # ports. The conversion keeps that shape: both Expressions are applied to the same raw row (withColumn), never

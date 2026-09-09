@@ -62,4 +62,6 @@ Fixture: `informatica/XML/wf_PARTY_MDM_SYNC.xml` (`source.xml`), `informatica/ma
 - Oracle hub's actual `''`-to-NULL behaviour for each string column (it is per-column type, `VARCHAR2` folds).
 - Informatica `INITCAP` treatment of digits adjacent to letters (`4th`) - the rule used is the documented one, not
   observed.
-- `SOUNDEX` of non-ASCII surnames under the `Latin1` codepage.
+- `SOUNDEX` of non-ASCII surnames under the `Latin1` codepage, and of surnames whose first character is not a
+  letter (`'Brien`): the conversion returns NULL for no-letter values (documented) and skips leading non-letters
+  (INFERRED) on both sides of the fuzzy join.

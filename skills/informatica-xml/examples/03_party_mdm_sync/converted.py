@@ -67,15 +67,25 @@ def exp_nino_mask():
     return party.select("PARTY_ID", masked.alias("out_NINO_MASKED"))
 
 
+def infa_soundex(col):
+    # SOUNDEX(UPPER(x)) -> soundex(upper(x)) (row 47) with the Informatica edge cases restored: Informatica returns
+    # NULL when the string has no English letter, whereas Spark's soundex() hands back the input unchanged when the
+    # first character is not a letter - so two punctuation-only surnames ('-', '???') would equal-match. The guard
+    # yields NULL for no-letter values (and NULL never joins), and drops leading non-letters so a letter-bearing
+    # value always produces a 4-char code rather than its raw text (leading-non-letter handling is INFERRED, not
+    # verified live). Used on BOTH sides of the NAME_DOB fuzzy join so the keys agree.
+    letters_only_start = F.regexp_replace(F.upper(col), r"^[^A-Z]+", "")
+    return F.when(col.rlike(r"[A-Za-z]"), F.soundex(letters_only_start))
+
+
 @dp.temporary_view()
 def exp_xmatch_apf():
-    # SOUNDEX(UPPER(x)) -> soundex(upper(x)) (row 47); TO_DATE(x,'DD/MM/YYYY') -> to_timestamp(x,'dd/MM/yyyy') (row 9),
-    # the date/time port (precision 29 scale 9) lands as TIMESTAMP_NTZ; unparsable text is a row error, so try_ +
-    # expectation (row 61).
+    # TO_DATE(x,'DD/MM/YYYY') -> to_timestamp(x,'dd/MM/yyyy') (row 9), the date/time port (precision 29 scale 9)
+    # lands as TIMESTAMP_NTZ; unparsable text is a row error, so try_ + expectation (row 61).
     party = spark.read.table(PARTY_TABLE)
     return party.select(
         "PARTY_ID",
-        F.soundex(F.upper(F.col("LAST_NAME"))).alias("out_SURNAME_SOUNDEX"),
+        infa_soundex(F.col("LAST_NAME")).alias("out_SURNAME_SOUNDEX"),
         F.expr("try_to_timestamp(BIRTH_DT_TXT, 'dd/MM/yyyy')").cast("timestamp_ntz").alias("out_BIRTH_DT"),
         F.col("BIRTH_DT_TXT").isNotNull().alias("birth_dt_present"),
     )
@@ -90,7 +100,7 @@ def mdm_party_golden():
     xm = spark.read.table("exp_xmatch_apf")
     cust = spark.read.table(CUSTOMERS_TABLE).select(
         F.col("CUSTOMER_ID").alias("LEGACY_CUSTOMER_ID"), "NINO",
-        F.soundex(F.upper(F.col("LAST_NAME"))).alias("cust_soundex"), F.col("DOB").alias("cust_dob"),
+        infa_soundex(F.col("LAST_NAME")).alias("cust_soundex"), F.col("DOB").alias("cust_dob"),
         F.col("LAST_UPDATED_TS").alias("cust_updated_ts"))                       # INFERRED column name
 
     # Survivorship and the NINO-exact / NAME_DOB-fuzzy match order are described only in the MAPPING DESCRIPTION
