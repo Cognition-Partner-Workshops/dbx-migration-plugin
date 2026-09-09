@@ -78,6 +78,13 @@ class StratifiedKeys(Protocol):
 
 
 @runtime_checkable
+class NullKeyCounting(Protocol):
+    """Rows whose comparison key has a NULL component. Such rows cannot be matched, bounded by
+    MIN/MAX or reached by a keyed fetch, so Tier 3 reports them instead of silently skipping them."""
+    def null_key_count(self, table: str, key_cols: list[str], where: str | None = None) -> int: ...
+
+
+@runtime_checkable
 class StatementCounting(Protocol):
     """Adapters that count what they cost: statements issued and rows pulled across the wire."""
     statements: int
@@ -299,6 +306,12 @@ class _SqlAdapterBase:
                           f"GROUP BY {order} HAVING COUNT(*) > 1) d")[0]
         return int(n)
 
+    def null_key_count(self, table: str, key_cols: list[str], where: str | None = None) -> int:
+        nulls = " OR ".join(f"{k} IS NULL" for k in key_cols)
+        w = f" AND ({where})" if where else ""
+        (n,) = self._rows(f"SELECT COUNT(*) FROM {table} WHERE ({nulls}){w}")[0]
+        return int(n)
+
 
 # ---- Source warehouses ------------------------------------------------------------------
 
@@ -416,6 +429,9 @@ class DatabricksTargetAdapter:
 
     def sum_probe(self, object: str, field_path: str, where: str | None = None) -> Any:
         return self._sql.sum_probe(self._q(object), field_path, where)
+
+    def null_key_count(self, object: str, key_fields: list[str], where: str | None = None) -> int:
+        return self._sql.null_key_count(self._q(object), key_fields, where)
 
     def fetch_keyed(self, object: str, key_fields: list[str], fields: list[str],
                     where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]:

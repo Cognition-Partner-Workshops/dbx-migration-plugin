@@ -15,6 +15,16 @@ Config file shape (`.migration/allowed_targets.json`, written at setup, committe
       "forbidden_bundle_targets": ["prod", "production"]  # optional override
     }
 
+The guard reads text: the command, the scripts it names (SQL files handed to a client, shell
+scripts handed to an interpreter or `source`) and heredoc bodies. Text it cannot read is a
+violation, not a pass: an unreadable script, and any construct that would only produce the
+statement at run time where a Databricks or legacy client is involved (command substitution,
+`eval`, an interpreter fed a `$`-built string or decoded bytes, an expansion inside the SQL
+argument or an unquoted heredoc). Programs the guard cannot read into (a Python or JDBC client
+opening its own connection) are covered by the read-only source roles the doctor verifies, not
+by this hook. A command that changes directory is judged against the allowlist of every
+workspace it enters as well as the one it starts in.
+
 Outside a migration workspace (no `.migration/allowed_targets.json` up the tree) the guard
 approves everything. Malformed input approves (plugin hooks fail open by platform design; the
 factory-doctor reports whether the hook is loaded).
@@ -109,6 +119,17 @@ _DATABRICKS_CONTEXT = re.compile(_CLIENT_PREFIX + r"(?:databricks|dbx-recon|spar
 _LEGACY_ONLY_CLIENTS = re.compile(
     _CLIENT_PREFIX + r"(?:bteq|sqlplus|sqlldr|snowsql|mload|fastload|fastexport|tbuild|tdload)\b", re.IGNORECASE
 )
+
+_SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
+_SEPARATORS = (";", "&&", "||", "|", "&", "(", ")", "{", "}", "\n")
+_PREFIX_WORDS = ("sudo", "env", "nohup", "time", "exec", "command", "nice", "xargs")
+# flags whose value is the SQL text itself (psql -c, sqlcmd/isql/snowsql -Q/-q, spark-sql/dbsqlcli -e ...)
+_SQL_VALUE_FLAGS = ("-c", "-Q", "-q", "-e", "--query", "--sql", "--statement", "--execute", "--command")
+# producers whose output is opaque to a text scan
+_OPAQUE_PRODUCER = re.compile(
+    r"(?:^|[\s;&|(])(?:base64\s+(?:-[A-Za-z]*d[A-Za-z]*|--decode)|xxd\s+-r|openssl\s+enc\b|gunzip|gzip\s+-d|zcat|"
+    r"uudecode|curl|wget|python[0-9.]*|perl|ruby|node)\b", re.IGNORECASE)
+_HEREDOC = re.compile(r"<<-?\s*(['\"\\]?)([A-Za-z_][\w-]*)\1?[^\n]*\n")
 
 
 @dataclass
@@ -275,28 +296,192 @@ def _script_inputs(cmd: str) -> list[str]:
     return files
 
 
-def _inline_scripts(cmd: str, root: Path, cfg: GuardConfig) -> tuple[str, list[str]]:
-    """Command text plus the contents of every referenced script. Scripts the guard cannot inspect in
-    full (unreadable, or larger than `_MAX_SCRIPT_BYTES`) are returned as unreadable."""
-    unreadable: list[str] = []
-    if not (_DATABRICKS_CONTEXT.search(cmd) or _LEGACY_ONLY_CLIENTS.search(cmd) or _mentions_legacy(cmd, cfg)):
-        return cmd, unreadable
+def _raw_tokens(cmd: str) -> list[str]:
+    """Shell words with their quotes kept, so `'$x'` (literal) and `"$x"` (expanded) stay distinct."""
+    lex = shlex.shlex(cmd, posix=False, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        return list(lex)
+    except ValueError:
+        return [t for t in re.split(r"\s+", cmd) if t]
+
+
+def _live(text: str) -> str:
+    """The text with single-quoted spans and backslash-escaped characters blanked: what remains of
+    `$` and backticks is what the shell would actually expand."""
+    out, i, n = list(text), 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            out[i] = out[i + 1] = " "
+            i += 2
+        elif c == "'":
+            j = text.find("'", i + 1)
+            j = n if j < 0 else j
+            for k in range(i, min(j + 1, n)):
+                out[k] = " "
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+_SUBSTITUTION = re.compile(r"\$\(|(?<![\w])[<>]\(")
+_BACKTICK = re.compile(r"`([^`]*)`")
+
+
+def _command_backticks(live: str) -> bool:
+    """A backtick span that is not a plain SQL identifier (`mig_cat`) runs a command."""
+    return any(not re.fullmatch(r"[\w$-]+", m.group(1)) for m in _BACKTICK.finditer(live))
+
+
+def _expands(text: str) -> bool:
+    live = _live(text)
+    return "$" in live or _command_backticks(live)
+
+
+def _substitutes(text: str) -> bool:
+    """Command or process substitution, or a command in backticks."""
+    live = _live(text)
+    return bool(_SUBSTITUTION.search(live)) or _command_backticks(live)
+
+
+def _strip_quotes(tok: str) -> str:
+    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "'\"":
+        return tok[1:-1]
+    return tok
+
+
+def _shell_script_inputs(cmd: str) -> list[str]:
+    """Scripts run by a shell interpreter or sourced: `bash x.sh`, `sh -x x.sh`, `bash < x.sh`,
+    `source x`, `. x`. `-c` forms carry their text in the command and are not files."""
+    toks = _raw_tokens(cmd)
+    files: list[str] = []
+    for i, tok in enumerate(toks):
+        base = tok.rsplit("/", 1)[-1]
+        if not (base in _SHELLS or tok in ("source", ".")):
+            continue
+        if i > 0 and toks[i - 1] not in _SEPARATORS and toks[i - 1] not in _PREFIX_WORDS:
+            continue
+        j = i + 1
+        while j < len(toks) and toks[j].startswith("-") and toks[j] not in _SEPARATORS:
+            if toks[j] == "-c":
+                j = len(toks)
+            j += 1
+        if j < len(toks) and toks[j] == "<":
+            j += 1
+        if j < len(toks) and toks[j] not in _SEPARATORS and not toks[j].startswith("<"):
+            files.append(_strip_quotes(toks[j]))
+    return files
+
+
+def _read_script(f: str, root: Path) -> str | None:
+    p = Path(os.path.expandvars(os.path.expanduser(f)))
+    if not p.is_absolute():
+        p = root / p
+    try:
+        with p.open(errors="replace") as fh:
+            body = fh.read(_MAX_SCRIPT_BYTES + 1)
+    except OSError:
+        return None
+    return None if len(body) > _MAX_SCRIPT_BYTES else body
+
+
+def _has_context(text: str, cfg: GuardConfig) -> bool:
+    return bool(_DATABRICKS_CONTEXT.search(text) or _LEGACY_ONLY_CLIENTS.search(text) or _mentions_legacy(text, cfg))
+
+
+def _inline_scripts(cmd: str, root: Path, cfg: GuardConfig) -> tuple[str, list[str], list[str]]:
+    """Command text plus the contents of every referenced script: shell scripts the command runs
+    (always), then SQL scripts handed to a client (when a client or legacy source is involved).
+    Scripts the guard cannot inspect in full (unreadable, or larger than `_MAX_SCRIPT_BYTES`) are
+    returned as unreadable, shell and SQL separately."""
+    unreadable_shell: list[str] = []
     parts = [cmd]
-    for f in _script_inputs(cmd):
-        p = Path(os.path.expandvars(os.path.expanduser(f)))
-        if not p.is_absolute():
-            p = root / p
-        try:
-            with p.open(errors="replace") as fh:
-                body = fh.read(_MAX_SCRIPT_BYTES + 1)
-        except OSError:
+    for f in _shell_script_inputs(cmd):
+        body = _read_script(f, root)
+        if body is None:
+            unreadable_shell.append(f)
+        else:
+            parts.append("\n;\n" + _join_continuations(body))
+    text = "\n".join(parts)
+    unreadable: list[str] = []
+    if not _has_context(text, cfg):
+        return text, unreadable, unreadable_shell
+    for f in _script_inputs(text):
+        body = _read_script(f, root)
+        if body is None:
             unreadable.append(f)
-            continue
-        if len(body) > _MAX_SCRIPT_BYTES:
-            unreadable.append(f)
-            continue
-        parts.append("\n;\n" + _sql_view(body, sql_only=True))
-    return "\n".join(parts), unreadable
+        else:
+            parts.append("\n;\n" + _sql_view(body, sql_only=True))
+    return "\n".join(parts), unreadable, unreadable_shell
+
+
+def _sql_bearing(toks: list[str], i: int) -> bool:
+    """Whether token i is where a client reads its SQL from: the value of a SQL flag, the positional
+    after `tools query`, or a composite string (whitespace or `;` inside) rather than a bare value."""
+    prev = toks[i - 1] if i > 0 else ""
+    if prev in _SQL_VALUE_FLAGS or toks[i].split("=", 1)[0] in _SQL_VALUE_FLAGS:
+        return True
+    if i >= 2 and toks[i - 2] == "tools" and prev == "query":
+        return True
+    return bool(re.search(r"[\s;]", _strip_quotes(toks[i])))
+
+
+def _check_opaque_execution(cmd: str, cfg: GuardConfig) -> list[str]:
+    """Constructs that would only produce the statement at run time, so the text scan cannot
+    clear them. Always: `eval`/`sh -c` on a `$`-built string, opaque bytes piped into a shell,
+    a shell fed by process substitution. In a Databricks/legacy context: any command or process
+    substitution, an expansion inside the SQL argument, an unquoted heredoc that expands."""
+    violations: list[str] = []
+    toks = _raw_tokens(cmd)
+    ctx = _has_context(cmd, cfg)
+
+    def seg_start(i: int) -> bool:
+        return i == 0 or toks[i - 1] in _SEPARATORS or toks[i - 1] in _PREFIX_WORDS
+
+    for i, tok in enumerate(toks):
+        base = tok.rsplit("/", 1)[-1]
+        if tok == "eval" and seg_start(i):
+            rest = " ".join(toks[i + 1:])
+            if _expands(rest.split(";", 1)[0]):
+                violations.append("`eval` of a runtime-built string; the guard cannot read what it would run")
+        elif base in _SHELLS and seg_start(i):
+            if i > 0 and toks[i - 1] == "|":
+                producer = " ".join(toks[:i - 1])
+                if _OPAQUE_PRODUCER.search(producer) or _expands(producer):
+                    violations.append(f"text piped into `{base}` comes from a decoder, download, program or expansion the "
+                                      "guard cannot read")
+            j = i + 1
+            while j < len(toks) and toks[j].startswith("-") and toks[j] not in _SEPARATORS:
+                if toks[j] == "-c" and j + 1 < len(toks) and _expands(toks[j + 1]):
+                    violations.append(f"`{base} -c` on a runtime-built string; the guard cannot read what it would run")
+                j += 1
+            if j < len(toks) and toks[j].startswith("<("):
+                violations.append(f"`{base}` fed by process substitution; the guard cannot read what it would run")
+        elif tok == "xargs" and ctx:
+            violations.append("`xargs` builds a client invocation from stdin; the guard cannot read the statement it would run")
+
+    if ctx:
+        if _substitutes(cmd):
+            violations.append("command/process substitution in a Databricks or legacy command; the statement is built at "
+                              "run time, so inline it as text")
+        for i, tok in enumerate(toks):
+            if _expands(tok) and _sql_bearing(toks, i):
+                violations.append(f"shell expansion inside the SQL argument `{tok[:60]}`; expand it in the command text so "
+                                  "the guard can read the statement")
+                break
+        for m in _HEREDOC.finditer(cmd):
+            if m.group(1):
+                continue  # quoted delimiter: the body is literal
+            end = re.search(rf"^\s*{re.escape(m.group(2))}\s*$", cmd[m.end():], re.MULTILINE)
+            body = cmd[m.end(): m.end() + end.start()] if end else cmd[m.end():]
+            if _expands(body):
+                violations.append(f"unquoted heredoc <<{m.group(2)} expands `$`/backticks in its body; quote the delimiter "
+                                  f"(<<'{m.group(2)}') or inline the values")
+                break
+    return violations
 
 
 def _catalogs_in_segment(seg: str) -> set[str]:
@@ -378,18 +563,23 @@ def _mentions_legacy(cmd: str, cfg: GuardConfig) -> list[str]:
     return hits
 
 
-def _check_uninspectable_scripts(cmd: str, cfg: GuardConfig, unreadable: list[str]) -> list[str]:
+def _check_uninspectable_scripts(cmd: str, cfg: GuardConfig, unreadable: list[str],
+                                 unreadable_shell: list[str] = ()) -> list[str]:
     """A script the guard cannot read in full is a script it cannot clear: fail closed."""
+    out = []
+    if unreadable_shell:
+        out.append(f"shell script(s) {list(unreadable_shell)} the command would run cannot be read in full (missing, "
+                   f"unreadable or over {_MAX_SCRIPT_BYTES // (1024 * 1024)} MiB); the guard cannot clear what it cannot read")
     if not unreadable:
-        return []
+        return out
     if _mentions_legacy(cmd, cfg) or _LEGACY_ONLY_CLIENTS.search(cmd):
-        return [f"legacy client fed script(s) {unreadable} that the guard cannot read in full (missing, unreadable or over "
-                f"{_MAX_SCRIPT_BYTES // (1024 * 1024)} MiB); inline the SQL or split it so it can be inspected "
-                "(legacy is read-only in every phase)"]
-    if _DATABRICKS_CONTEXT.search(cmd):
-        return [f"Databricks client fed script(s) {unreadable} that the guard cannot read in full (missing, unreadable or over "
-                f"{_MAX_SCRIPT_BYTES // (1024 * 1024)} MiB); inline the SQL or split it so its write targets can be checked"]
-    return []
+        out.append(f"legacy client fed script(s) {unreadable} that the guard cannot read in full (missing, unreadable or over "
+                   f"{_MAX_SCRIPT_BYTES // (1024 * 1024)} MiB); inline the SQL or split it so it can be inspected "
+                   "(legacy is read-only in every phase)")
+    elif _DATABRICKS_CONTEXT.search(cmd):
+        out.append(f"Databricks client fed script(s) {unreadable} that the guard cannot read in full (missing, unreadable or over "
+                   f"{_MAX_SCRIPT_BYTES // (1024 * 1024)} MiB); inline the SQL or split it so its write targets can be checked")
+    return out
 
 
 def _check_legacy_writes(cmd: str, cfg: GuardConfig) -> list[str]:
@@ -409,9 +599,14 @@ def _check_legacy_writes(cmd: str, cfg: GuardConfig) -> list[str]:
 
 def evaluate(command: str, cfg: GuardConfig, root: Path | None = None) -> Verdict:
     command = _join_continuations(command)
-    full, unreadable = _inline_scripts(command, root or _project_root(), cfg)
-    violations = (_check_uninspectable_scripts(full, cfg, unreadable) + _check_databricks_writes(full, cfg)
+    full, unreadable, unreadable_shell = _inline_scripts(command, root or _project_root(), cfg)
+    violations = (_check_uninspectable_scripts(full, cfg, unreadable, unreadable_shell)
+                  + _check_opaque_execution(full, cfg) + _check_databricks_writes(full, cfg)
                   + _check_legacy_writes(full, cfg))
+    return _verdict(violations, cfg)
+
+
+def _verdict(violations: list[str], cfg: GuardConfig) -> Verdict:
     if not violations:
         return Verdict("approve")
     reason = (
@@ -423,6 +618,58 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None) -> Verdic
     if cfg.mode == "warn":
         return Verdict("approve", "WARN (guard_mode=warn): " + reason, violations)
     return Verdict("block", reason, violations)
+
+
+def _cd_targets(cmd: str) -> list[str | None]:
+    """Directories the command changes into (`cd d`, `pushd d`), in order; None for one the guard
+    cannot resolve (`cd -`, an unexpanded variable, a substitution)."""
+    toks = _raw_tokens(cmd)
+    out: list[str | None] = []
+    for i, tok in enumerate(toks):
+        if tok not in ("cd", "pushd") or (i > 0 and toks[i - 1] not in _SEPARATORS):
+            continue
+        j = i + 1
+        while j < len(toks) and toks[j].startswith("-") and len(toks[j]) > 1 and toks[j] not in _SEPARATORS:
+            j += 1
+        if j >= len(toks) or toks[j] in _SEPARATORS:
+            out.append(os.path.expanduser("~"))
+            continue
+        target = _strip_quotes(toks[j])
+        if target == "-" or _expands(target):
+            expanded = os.path.expandvars(target)
+            out.append(None if target == "-" or _expands(expanded) else expanded)
+        else:
+            out.append(target)
+    return out
+
+
+def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path) -> Verdict:
+    """`evaluate` against the starting workspace and against every workspace the command `cd`s
+    into: a write must be allowed by each allowlist involved, and a Databricks/legacy command that
+    moves to a directory the guard cannot resolve is not clearable."""
+    violations: list[str] = []
+    first = evaluate(command, cfg, root)
+    violations += first.violations or ([first.reason] if first.decision == "block" else [])
+    seen = {cfg.path}
+    cwd = root
+    for target in _cd_targets(command):
+        if target is None:
+            if _has_context(command, cfg):
+                violations.append("command changes to a directory the guard cannot resolve before running a Databricks or "
+                                  "legacy client; the allowlist in force there is unknown")
+            break
+        cwd = (cwd / os.path.expanduser(target)).resolve()
+        try:
+            other = load_config(cwd)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            violations.append(f"cannot read {CONFIG_REL} for {cwd}: {exc}")
+            continue
+        if other is None or other.path in seen:
+            continue
+        seen.add(other.path)
+        v = evaluate(command, other, cwd)
+        violations += [f"[{other.path}] {x}" for x in v.violations]
+    return _verdict(list(dict.fromkeys(violations)), cfg)
 
 
 def _project_root() -> Path:
@@ -454,7 +701,7 @@ def main(stdin_text: str | None = None) -> int:
         return 2
     if cfg is None:
         return 0
-    verdict = evaluate(command, cfg)
+    verdict = evaluate_with_workdirs(command, cfg, _project_root())
     if verdict.decision == "block":
         print(json.dumps({"decision": "block", "reason": verdict.reason}))
         print(verdict.reason, file=sys.stderr)

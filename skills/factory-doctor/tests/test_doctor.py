@@ -41,11 +41,13 @@ def test_probe_command_is_blocked_by_guard_and_harmless_otherwise():
     assert doctor.HOOK_PROBE_COMMAND.startswith("echo ")
 
 
-def test_ready_offline_with_probe_blocked(tmp_path):
+def test_offline_run_passes_every_local_check_but_is_never_ready(tmp_path):
     ws = make_workspace(tmp_path)
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, no_databricks=True)
     c = by_id(report)
-    assert report["ready"], [x for x in report["checks"] if x["status"] == "fail"]
+    assert not [x for x in report["checks"] if x["status"] == "fail"]
+    # an unverified identity can never certify a wave, however the check was skipped
+    assert not report["ready"] and report["blocking"] == ["databricks_identity=skipped"]
     assert c["workspace"]["status"] == "ok"
     assert c["stop_mode"]["data"]["stop_mode"] == "hard"
     assert c["allowed_targets"]["status"] == "ok" and c["allowed_targets"]["data"]["catalogs"] == ["mig_cat"]
@@ -62,7 +64,8 @@ def test_unknown_probe_is_unverified_and_carries_command(tmp_path):
     c = by_id(report)
     assert c["hook_platform_loaded"]["status"] == "unverified"
     assert c["hook_platform_loaded"]["data"]["probe_command"] == doctor.HOOK_PROBE_COMMAND
-    assert not report["ready"] and report["blocking"] == ["hook_platform_loaded=unverified"]
+    assert not report["ready"]
+    assert report["blocking"] == ["hook_platform_loaded=unverified", "databricks_identity=skipped"]
 
 
 def test_human_identity_is_not_ready(tmp_path, monkeypatch):
@@ -160,10 +163,11 @@ def test_cli_writes_capabilities_json_and_exit_codes(tmp_path):
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
                         "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--hook-probe-result", "blocked"],
                        capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.returncode == 1, r.stdout + r.stderr  # offline: identity unverified, so not ready
     cap = json.loads((ws / ".migration" / "09_capabilities.json").read_text())
-    assert cap["schema"] == "dbx-migration-factory/capabilities/1" and cap["ready"] is True
-    assert "ready=True" in r.stdout
+    assert cap["schema"] == "dbx-migration-factory/capabilities/1" and cap["ready"] is False
+    assert cap["blocking"] == ["databricks_identity=skipped"]
+    assert "ready=False" in r.stdout and "databricks_identity=skipped" in r.stdout
 
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
                         "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--hook-probe-result", "not-blocked"],

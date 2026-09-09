@@ -12,7 +12,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import BatchAggregates, StratifiedKeys, SumProbe
+from .adapters import BatchAggregates, NullKeyCounting, StratifiedKeys, SumProbe
 from .canon import MISSING, Canonicalizer
 from .config import MappingSpec, ObjectMapping, Tolerances
 from .paths import get_path
@@ -301,6 +301,18 @@ def _stratified_keys(c: ObjectMapping, source: StratifiedKeys, n: int, sample_si
     return sorted(chosen), len(strata)
 
 
+def _null_key_rows(c: ObjectMapping, source, target) -> dict[str, int]:
+    """Rows per side whose comparison key has a NULL component, one statement per side that can
+    count them. Every keyed path (MIN/MAX strata, IN-list fetches, dict lookups) skips such rows,
+    so a nonzero count means the key does not identify the table and Tier 3 cannot clear it."""
+    out: dict[str, int] = {}
+    if isinstance(source, NullKeyCounting):
+        out["source"] = source.null_key_count(c.root_table, c.key_source, c.root_where)
+    if isinstance(target, NullKeyCounting):
+        out["target"] = target.null_key_count(c.object, c.key_target, c.target_where)
+    return out
+
+
 def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                 source, target, seed: int = 0, depth: str = "threshold") -> TierResult:
     """Full keyed diff below the tolerance row threshold; keyed stratified sampling above.
@@ -312,6 +324,14 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
     rng = random.Random(seed)
     for c in spec.objects:
         n = source.row_count(c.root_table, c.root_where)
+        null_keys = _null_key_rows(c, source, target)
+        for side, count in null_keys.items():
+            if count:
+                checks += 1
+                findings.append(Finding(c.object, "null_comparison_key",
+                                        f"{side}: {count} row(s) with a NULL component in the comparison key "
+                                        f"{c.key_source if side == 'source' else c.key_target}; such rows can be "
+                                        "neither matched nor sampled, so the key does not identify every row"))
         if depth == "full":
             sampled = False
         elif depth == "sampled":
@@ -377,6 +397,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                 record_source_key(key)
                 src_rows[key] = r
             stats[c.object] = {"mode": "full_diff", "population": n}
+        stats[c.object]["null_key_rows"] = null_keys
         if source_run_count > 1:
             duplicate_source_runs.append((previous_source_key, source_run_count))
         stats[c.object]["duplicate_source_key_count"] = len(duplicate_source_runs)

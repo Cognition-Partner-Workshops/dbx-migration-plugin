@@ -125,6 +125,9 @@ def test_one_source_field_mapped_to_numeric_and_nonnumeric_targets_keeps_both_su
     assert s_all["code"]["sum"] == 55 and s_all["code"]["count"] == 10   # batched metrics kept
     assert t_all["code_n"]["sum"] == 56 and t_all["code"].get("sum") is None
     assert len(t_conn.statements) == 1                                    # code_n batched, code never summed
+    est = estimate_cost(spec, TOL)  # the STOP C estimate plans per physical column like the run
+    assert est["source_statements"]["tier2"] == len(s_conn.statements) == 2
+    assert est["target_statements"]["tier2"] == len(t_conn.statements) == 1
     result = _tier2(spec, source, target)
     assert ("aggregate_sum", "field code->code_n") in {(f.check, f.detail) for f in result.findings}
     assert not [f for f in result.findings if f.detail == "field code->code"]
@@ -155,6 +158,25 @@ def test_many_source_fields_mapped_to_one_target_field_keep_the_probe_the_conver
                                       [(i, str(i)) for i in range(1, 11)])
     _object_aggregates(spec.objects[0], source2, target2)
     assert len(s_conn2.statements) == 1 and len(t_conn2.statements) == 2
+    est = estimate_cost(spec, TOL)
+    assert est["source_statements"]["tier2"] == 1 and est["target_statements"]["tier2"] == 2
+
+
+def test_estimate_counts_a_shared_column_once_under_its_strongest_plan():
+    # `amt` is declared numeric on the source in one mapping (batch) and undeclared in another
+    # (probe): the run reads it once in the batched statement, so the estimate must not add a probe.
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="t", root_table="t", key_source=["id"], key_target="id",
+        fields=[FieldMapping("amt", "amt", "", "decimal(10,2)"),
+                FieldMapping("amt", "amt_copy", "REAL", "double")])])
+    source, s_conn = _typed_adapter("CREATE TABLE t (id INTEGER, amt REAL)",
+                                    [(i, float(i)) for i in range(1, 11)])
+    target, t_conn = _typed_adapter("CREATE TABLE t (id INTEGER, amt REAL, amt_copy REAL)",
+                                    [(i, float(i), float(i)) for i in range(1, 11)])
+    _object_aggregates(spec.objects[0], source, target)
+    est = estimate_cost(spec, TOL)
+    assert est["source_statements"]["tier2"] == len(s_conn.statements) == 1
+    assert est["target_statements"]["tier2"] == len(t_conn.statements) == 1
 
 
 def test_table_aggregates_honours_where():
@@ -273,6 +295,46 @@ def test_tier3_stratified_catches_a_seeded_diff_in_every_stratum_edge():
     result = run_recon("u", "live", SPEC, tol, RULES, source, target)
     assert result["verdict"] == "FAIL"
     assert any(f["check"] == "field_diff" and "199" in f["detail"] for f in result["tiers"][2]["findings"])
+
+
+def test_null_key_count_is_one_statement_and_honours_where():
+    adapter, conn = sqlite_adapter(ROWS + [(None, 1, 1.0, "x"), (None, 2, 2.0, "y")])
+    assert adapter.null_key_count("t", ["id"]) == 2
+    assert adapter.null_key_count("t", ["id"], "grp = 1") == 1
+    assert adapter.null_key_count("t", ["id", "amt"]) == 2 + sum(1 for r in ROWS if r[2] is None)
+    assert len(conn.statements) == 3 and all("IS NULL" in s for s in conn.statements)
+
+
+def test_tier3_reports_null_comparison_keys_that_sampling_cannot_reach():
+    # Tier 1 counts and tier 2 aggregates are identical on both sides; the only difference is a
+    # NULL-key row whose name differs. A keyed sample can never fetch that row, so tier 3 has
+    # to name the null key instead of passing.
+    source, target = big_estate()
+    source.tables["ORDERS"].append({"ORDER_ID": None, "CUST_NAME": "5x", "TOTAL": 5.0})
+    target.objects["orders"].append({"order_id": None, "customer": {"name": "5y"},
+                                     "total": 5.0, "items": []})
+    tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=12)
+    result = run_recon("u", "live", SPEC, tol, RULES, source, target, seed=3)
+    assert result["tiers"][0]["passed"] and result["tiers"][1]["passed"]
+    t3 = result["tiers"][2]
+    assert result["verdict"] == "FAIL" and not t3["passed"]
+    checks = [f["check"] for f in t3["findings"]]
+    assert checks == ["null_comparison_key", "null_comparison_key"]
+    assert {f["detail"].split(":")[0] for f in t3["findings"]} == {"source", "target"}
+    assert t3["stats"]["orders"]["null_key_rows"] == {"source": 1, "target": 1}
+    assert source.calls["null_key_count"] == target.calls["null_key_count"] == 1
+    assert None not in {k[0] for k in source.last_fetch_keyed["keys"]}
+
+
+def test_null_key_rows_are_reported_in_full_diff_mode_too():
+    source, target = big_estate(n=20)
+    source.tables["ORDERS"].append({"ORDER_ID": None, "CUST_NAME": "5", "TOTAL": 5.0})
+    target.objects["orders"].append({"order_id": None, "customer": {"name": "5"}, "total": 5.0, "items": []})
+    result = run_recon("u", "live", SPEC, Tolerances(version="t"), RULES, source, target, seed=3)
+    t3 = result["tiers"][2]
+    assert t3["stats"]["orders"]["mode"] == "full_diff"
+    assert [f["check"] for f in t3["findings"]] == ["null_comparison_key", "null_comparison_key"]
+    assert t3["stats"]["orders"]["null_key_rows"] == {"source": 1, "target": 1}
 
 
 def test_tier3_stratified_counts_source_duplicates_without_streaming():
