@@ -250,10 +250,13 @@ class FakeSource(_TransactionalMixin):
     def _sorted(self, table: str, key_cols: list[str], where: str | None,
                 natural: bool = False) -> list[dict]:
         # repr order tolerates mixed-type keys (the historical fake behaviour); strata need the
-        # engine's natural key order so lo <= key <= hi range checks hold.
-        sort_key = ((lambda r: self._key(r, key_cols)) if natural
-                    else (lambda r: tuple(repr(v) for v in self._key(r, key_cols))))
-        return sorted(self._tx_rows(table, where), key=sort_key)
+        # engine's natural key order so lo <= key <= hi range checks hold, and a NULL key is never
+        # inside a MIN/MAX-bounded range (null_key_count reports those rows).
+        rows = self._tx_rows(table, where)
+        if natural:
+            return sorted((r for r in rows if not any(v is None for v in self._key(r, key_cols))),
+                          key=lambda r: self._key(r, key_cols))
+        return sorted(rows, key=lambda r: tuple(repr(v) for v in self._key(r, key_cols)))
 
     def row_count(self, table: str, where: str | None = None) -> int:
         self.calls["row_count"] += 1
@@ -301,6 +304,12 @@ class FakeSource(_TransactionalMixin):
         for r in self._sorted(table, key_cols, where):
             self.rows_fetched += 1
             yield self._key(r, key_cols)
+
+    def null_key_count(self, table, key_cols, where=None) -> int:
+        self.calls["null_key_count"] += 1
+        self.statements += 1
+        return sum(1 for r in self._tx_rows(table, where)
+                   if any(v is None for v in self._key(r, key_cols)))
 
     def key_strata(self, table, key_cols, n_strata, where=None) -> list[Stratum]:
         self.calls["key_strata"] += 1
@@ -386,6 +395,12 @@ class FakeTarget(_TransactionalMixin):
         self.calls["nested_count"] += 1
         self.statements += 1
         return sum(len(get_path(d, array_path) or []) for d in self._rows(object, where))
+
+    def null_key_count(self, object: str, key_fields: list[str], where=None) -> int:
+        self.calls["null_key_count"] += 1
+        self.statements += 1
+        return sum(1 for d in self._rows(object, where)
+                   if any(get_path(d, k) is None for k in key_fields))
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where=None) -> dict[str, dict[str, Any]]:

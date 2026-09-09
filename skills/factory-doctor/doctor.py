@@ -11,10 +11,11 @@ Usage:
                       [--hook-probe-result blocked|not-blocked|unknown] [--expect-identity NAME]
                       [--no-databricks] [--out PATH]
 
-Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and the security
-controls (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`,
-or `skipped` by an explicit flag; an `unverified` hook probe or a human identity is not ready.
-Other `warn`/`unverified` checks are advisory and listed in the JSON for the playbook to decide.
+Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and every security
+control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`;
+an `unverified` hook probe, a human identity, or an identity check `skipped` by `--no-databricks`
+is not ready (an offline report can never authorize a wave). Other `warn`/`unverified` checks are
+advisory and listed in the JSON for the playbook to decide.
 """
 from __future__ import annotations
 
@@ -337,7 +338,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
     blocking = [f"{c.id}={c.status}" for c in checks
-                if c.status == "fail" or (c.id in SECURITY_CONTROLS and c.status not in ("ok", "skipped"))]
+                if c.status == "fail" or (c.id in SECURITY_CONTROLS and c.status != "ok")]
     return {
         "schema": "dbx-migration-factory/capabilities/1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -358,7 +359,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--role", choices=("orchestrator", "child"), default="orchestrator")
     p.add_argument("--hook-probe-result", choices=("blocked", "not-blocked", "unknown"), default="unknown")
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
-    p.add_argument("--no-databricks", action="store_true", help="skip CLI/identity checks (offline)")
+    p.add_argument("--no-databricks", action="store_true",
+                   help="skip CLI/identity checks (offline; the report is never ready)")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
 

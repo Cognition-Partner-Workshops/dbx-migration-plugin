@@ -84,6 +84,10 @@ def _manifest(**extra):
     {"identity": "", "catalogs": ["mig"]},    # empty identity
     {"identity": "sp-1", "catalogs": []},     # no catalogs
     {"identity": "sp-1", "catalogs": ["mig"], "ready": False},
+    {"identity": "sp-1", "catalogs": ["mig"]},                      # ready missing
+    {"identity": "sp-1", "catalogs": ["mig"], "ready": None},
+    {"identity": "sp-1", "catalogs": ["mig"], "ready": "true"},
+    {"identity": "sp-1", "catalogs": ["mig"], "ready": 1},
 ])
 def test_validate_manifest_rejects_bad_capability_contract(caps):
     validate_manifest = _functions()["validate_manifest"]

@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 
 from .config import MappingSpec, Tolerances
-from .tiers import MAX_STRATA, sum_plan
+from .tiers import MAX_STRATA, _column_plans, sum_plan
 
 
 def _tier3_mode(depth: str, n: int | None, tol: Tolerances) -> str:
@@ -44,13 +44,18 @@ def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
         n = (row_counts or {}).get(c.root_table)
         src["tier1"] += 1 + len(c.embeds)
         tgt["tier1"] += 1 + len(c.embeds)
-        # Tier 2: one batched statement per table per side, plus one isolated probe per field
-        # whose SUM that side cannot declare safe (SUM may error on strings, so it is not batched).
-        src["tier2"] += 1 + sum(1 for f in c.fields if sum_plan(f.source_type, f.target_type) == "probe")
-        tgt["tier2"] += 1 + sum(1 for f in c.fields if sum_plan(f.target_type, f.source_type) == "probe")
+        # Tier 2: one batched statement per table per side, plus one isolated probe per physical
+        # column whose SUM that side cannot declare safe (SUM may error on strings, so it is not
+        # batched). Planned per column exactly as the run does: a column several mappings share
+        # is read once, under the strongest plan.
+        s_plan = _column_plans([(f.source, sum_plan(f.source_type, f.target_type)) for f in c.fields])
+        t_plan = _column_plans([(f.target, sum_plan(f.target_type, f.source_type)) for f in c.fields])
+        src["tier2"] += 1 + sum(1 for p in s_plan.values() if p == "probe")
+        tgt["tier2"] += 1 + sum(1 for p in t_plan.values() if p == "probe")
         t3 = _tier3_mode(depth, n, tol)
         modes[c.root_table] = t3
-        src["tier3"] += 1  # row_count
+        src["tier3"] += 2  # row_count, null-key rows
+        tgt["tier3"] += 1  # null-key rows
         if t3 == "unknown":
             # threshold depth with no row count: the tier could go either way; statements are
             # estimated as sampled (the cheaper floor), rows cannot be estimated.
