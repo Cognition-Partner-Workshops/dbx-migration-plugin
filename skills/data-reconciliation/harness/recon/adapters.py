@@ -769,23 +769,57 @@ def _split_table(table: str, default_schema: str | None) -> tuple[str | None, st
 _INDEX_KEYS_START_RE = re.compile(r"\bUSING\s+\w+\s*\(", re.IGNORECASE)
 
 
+def normalize_sql_text(text: str) -> str:
+    """Lower-case and collapse whitespace outside quotes; a single-quoted literal or a
+    double-quoted identifier keeps its exact contents, so `lower(x) = 'A'` and `= 'a'` differ."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "'\"":
+            j = i + 1
+            while j < n:
+                if text[j] == ch:
+                    if j + 1 < n and text[j + 1] == ch:  # doubled quote escapes itself
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        else:
+            j = i
+            while j < n and text[j] not in "'\"":
+                j += 1
+            out.append(re.sub(r"\s+", " ", text[i:j]).lower())
+            i = j
+    return "".join(out).strip()
+
+
 def _index_key_text(indexdef: str) -> str:
-    """The key list of a `CREATE INDEX` definition ("lower(email), tenant_id"), lower-cased with
-    whitespace collapsed: the balanced parenthesis after `USING <method>`, so nested calls stay
-    whole and the INCLUDE/WHERE/WITH suffixes never enter."""
+    """The key list of a `CREATE INDEX` definition ("lower(email), tenant_id"), normalized with
+    `normalize_sql_text`: the balanced parenthesis after `USING <method>`, walked outside quotes
+    so nested calls and literals containing parentheses stay whole and the INCLUDE/WHERE/WITH
+    suffixes never enter."""
     m = _INDEX_KEYS_START_RE.search(indexdef)
     if m is None:
-        return re.sub(r"\s+", " ", indexdef.strip()).lower()
-    depth, start = 1, m.end()
+        return normalize_sql_text(indexdef)
+    depth, start, quote = 1, m.end(), ""
     for i in range(start, len(indexdef)):
         ch = indexdef[i]
-        if ch == "(":
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                return re.sub(r"\s+", " ", indexdef[start:i].strip()).lower()
-    return re.sub(r"\s+", " ", indexdef[start:].strip()).lower()
+                return normalize_sql_text(indexdef[start:i])
+    return normalize_sql_text(indexdef[start:])
 
 
 class SqlServerSourceAdapter(_SqlAdapterBase):

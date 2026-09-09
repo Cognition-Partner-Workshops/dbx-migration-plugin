@@ -39,7 +39,13 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import SchemaFacts, StratifiedKeys, TransactionalSide, WholeNumberColumns
+from .adapters import (
+    SchemaFacts,
+    StratifiedKeys,
+    TransactionalSide,
+    WholeNumberColumns,
+    normalize_sql_text,
+)
 from .config import ConfigError, MappingSpec, ObjectMapping, Tolerances
 from .tiers import Finding, TierResult
 from .watermarks import (
@@ -563,8 +569,8 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         indexes={tuple(x.lower() for x in i) for i in f.indexes},
         check_count=f.check_count, identity_columns={x.lower() for x in f.identity_columns},
         partial={tuple(x.lower() for x in p) for p in f.partial},
-        expression_unique={x.lower() for x in f.expression_unique},
-        expression_indexes={x.lower() for x in f.expression_indexes})
+        expression_unique={normalize_sql_text(x) for x in f.expression_unique},
+        expression_indexes={normalize_sql_text(x) for x in f.expression_indexes})
 
 
 # Lexer for index expression text as the catalogs render it (pg_get_indexdef): a string literal

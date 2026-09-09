@@ -1474,6 +1474,33 @@ def test_index_key_text_keeps_nested_calls_whole_and_drops_suffixes():
         "to_tsvector('english'::regconfig, coalesce(body, ''::text))"
 
 
+def test_index_key_text_keeps_literal_and_quoted_identifier_case():
+    upper = _index_key_text("CREATE UNIQUE INDEX u ON s.t USING btree (((status = 'A'::text)), tenant_id)")
+    lower = _index_key_text("CREATE UNIQUE INDEX u ON s.t USING btree (((status = 'a'::text)), tenant_id)")
+    assert upper == "((status = 'A'::text)), tenant_id" and upper != lower
+    assert _index_key_text('CREATE INDEX i ON s.t USING btree (lower("Email"), UPPER("email"))') == \
+        'lower("Email"), upper("email")'
+    # parentheses and doubled quotes inside a literal never close the key list
+    assert _index_key_text("CREATE INDEX i ON s.t USING btree (COALESCE(note, 'n/a (''X'')'::text)) WHERE x") == \
+        "coalesce(note, 'n/a (''X'')'::text)"
+
+
+def test_expression_unique_literal_case_is_a_parity_finding():
+    loans, borrowers = _rows(12)
+    src = dataclasses.replace(LOANS_FACTS, expression_unique={_index_key_text(
+        "CREATE UNIQUE INDEX u ON dbo.loans USING btree (((status = 'A'::text)), loan_number)")})
+    tgt = dataclasses.replace(TARGET_LOANS_FACTS, expression_unique={_index_key_text(
+        "CREATE UNIQUE INDEX u ON public.loans USING btree (((status = 'a'::text)), loan_number)")})
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))
+    assert result["verdict"] == "FAIL"
+    assert _codes(result, "schema_parity") == ["expression_unique_missing"]
+    assert "'A'" in _tier(result, "schema_parity")["findings"][0]["detail"]
+    target.schema["loans"] = dataclasses.replace(TARGET_LOANS_FACTS, expression_unique=set(src.expression_unique))
+    assert _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))["verdict"] == "PASS"
+
+
 @pytest.mark.parametrize("expr_src, expr_tgt", [
     ("lower(loan_number)", "lower(loan_no)"),
     # a column name inside a string literal is not a column reference
