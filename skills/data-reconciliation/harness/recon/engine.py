@@ -91,7 +91,10 @@ def _report_release_failure(exc: BaseException, note: str) -> None:
     stderr as it happens (3.10 never renders notes and the CLI does not catch the run's error),
     and on the run's exception (`add_note` on 3.11+, the same `__notes__` list by hand on 3.10)
     for embedded callers."""
-    print(f"dbx-recon: {note}", file=sys.stderr, flush=True)
+    try:
+        print(f"dbx-recon: {note}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001  reporting must never replace the run's error
+        pass
     if sys.version_info >= (3, 11):
         exc.add_note(note)
     else:

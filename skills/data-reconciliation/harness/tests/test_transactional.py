@@ -1447,6 +1447,19 @@ def test_release_failures_reach_stderr_and_the_exception_on_every_runtime(monkey
         "dbx-recon: source close_window failed", "dbx-recon: source connection could not be dropped"]
 
 
+def test_a_broken_stderr_never_replaces_the_run_error(monkeypatch):
+    import io
+    import recon.engine as engine
+
+    class _Closed(io.StringIO):
+        def write(self, s):
+            raise OSError("stderr closed")
+    monkeypatch.setattr(engine.sys, "stderr", _Closed())
+    exc = RuntimeError("tier failure")
+    engine._report_release_failure(exc, "source close_window failed")
+    assert exc.__notes__ == ["source close_window failed"]
+
+
 def test_a_failed_run_prints_release_failures_before_the_error_propagates(capsys):
     loans, borrowers = _rows(6)
     source, target = _sides(loans, [dict(r) for r in loans], borrowers)
