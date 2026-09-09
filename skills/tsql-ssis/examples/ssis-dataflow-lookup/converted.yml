@@ -1,122 +1,48 @@
-# Job wrapper for converted.sql (LoadPaymentFact.dtsx), under skills/tsql-ssis/SKILL.md §6 "SSIS Data Flow
-# Task" (per-execution parameter -> bounded batch), "SSIS Variables" and "SSIS event handlers" rows.
-# Shapes per databricks-jobs SKILL.md "Multi-Task Workflows" (depends_on / run_if / job parameters),
-# references/task-types.md ("SQL Task": sql_task.file + source: WORKSPACE + warehouse_id),
-# references/notifications-monitoring.md (on_failure, max_retries, max_concurrent_runs),
-# https://docs.databricks.com/aws/en/jobs/sql ("The file can contain multiple SQL statements separated by
-# semicolons"; task Parameters as key-value pairs referenced in the SQL asset), /aws/en/jobs/parameter-use
-# ("SQL: You can use dynamic value references in your task configuration. Use named parameters to retrieve
-# parameter values"), /aws/en/jobs/dynamic-value-references ({{job.parameters.<name>}}, {{job.run_id}},
-# {{job.start_time.<argument>}} usable as a job-parameter default, {{tasks.<task_name>.result_state}},
-# {{tasks.<task_name>.error_code}}: "For successful tasks, this evaluates to an empty string"),
-# /aws/en/jobs/conditional-tasks (run_if AT_LEAST_ONE_FAILED; Excluded when unmet).
-#
-# Execution model (converted.sql header): one job run == one package execution == one (LoadDate, ServicerId)
-# bounded batch, re-evaluating the whole window against that servicer's loans. Not a pipeline: a streaming
-# table's checkpoint is global, so a per-run filter parameter cannot re-evaluate rows a previous run consumed,
-# and a pipeline `configuration` key is frozen at deploy time. Both defects are the same bug from two sides:
-# the parameter must select the row set on every run, which only a bounded batch does.
-#
-# Mapping from source.dtsx:
-#   DFT Load fact_payment (Data Flow Task)          -> sql_task load_payment_fact (converted.sql: the window and its
-#                                                      lookup verdict read once into a temp table, then two idempotent
-#                                                      MERGE statements, fact + error output), one run a day like
-#                                                      the SQL Agent schedule that ran the package.
-#   OLTP_LoanServicing connection manager            -> job parameters src_catalog / src_schema (the migrated copy of
-#     (LOANSQL01, Initial Catalog=loan_servicing)      loan_servicing.dbo; read only). Every payments/loans reference.
-#   DW_LoanMart connection manager                   -> job parameters tgt_catalog / tgt_schema (loan_mart.dw). Every
-#     (LOANDW01, Initial Catalog=loan_mart)            MERGE target and the OnError etl_log write. Two connection
-#                                                      managers are two namespaces; one catalog/schema pair for both
-#                                                      would point the source reads at the fact's own schema.
-#   User::LoadDate (bound to the two ? of the source  -> job parameter load_date. Default {{job.start_time.iso_date}}
-#     query)                                           stands in for what the Agent step set the variable to
-#                                                      (INFERRED: the census reads the step's /Set or the package
-#                                                      expression; the design value 2026-09-01 is not a default
-#                                                      anyone wants). Overridden per run to re-load a day.
-#   $Package::ServicerId (Required="True", value 7)  -> job parameter servicer_id (default "7", the package's
-#                                                      design value, what the Agent step passed). Required=True
-#                                                      means the executor supplied the value per execution
-#                                                      (dtexec /Par); the Jobs equivalent is a per-run override
-#                                                      ("Run now with different parameters" / API job_parameters).
-#                                                      Two servicers a day == two runs (or two run_job_task calls),
-#                                                      each re-reading the same window under its own value.
-#   OnError handler "SQL Log OnError" -> dw.etl_log -> sql_task log_onerror, run_if AT_LEAST_ONE_FAILED after
-#                                                      the load task. Same table, same columns, same event
-#                                                      literal 'OnError'; the customer's ops queries over
-#                                                      etl_log keep working. The on_failure notification is
-#                                                      an ADDITIONAL signal, not a replacement for the row.
-#   System::ErrorDescription (message column)       -> {{tasks.load_payment_fact.error_code}} plus the job run
-#                                                      id; the full error text lives in the query history,
-#                                                      which the run id keys into.
-#   Package name (package_name column)              -> the literal 'LoadPaymentFact' (System::PackageName).
-#   User::RowsRead                                  -> dropped (no consumer in the package).
+# Job wrapper for converted.sql (LoadPaymentFact.dtsx). One run = one package execution =
+# one (LoadDate, ServicerId) bounded batch. Shapes: databricks-jobs (sql_task, job parameters,
+# run_if, max_retries); docs /jobs/parameter-use (:name in SQL), /jobs/dynamic-value-references.
 resources:
   jobs:
     load_payment_fact_job:
       name: load_payment_fact_job
-      description: "Converted from LoadPaymentFact.dtsx (SQL Agent daily schedule)"
-      max_concurrent_runs: 1             # SSIS packages are not re-entrant; serialises runs of THIS job only (it does
-                                         #   not fence outside writers: converted.sql reads one snapshot for that)
+      max_concurrent_runs: 1                 # a package is not re-entrant (this job only)
       trigger:
-        periodic:
-          interval: 1
-          unit: DAYS
+        periodic: { interval: 1, unit: DAYS }
       parameters:
-        - name: src_catalog              # OLTP_LoanServicing -> migrated loan_servicing (read only)
-          default: ${var.src_catalog}
-        - name: src_schema
-          default: ${var.src_schema}     # dbo
-        - name: tgt_catalog              # DW_LoanMart -> loan_mart
-          default: ${var.tgt_catalog}
-        - name: tgt_schema
-          default: ${var.tgt_schema}     # dw
-        - name: load_date                # User::LoadDate; the window [load_date, load_date + 1 day)
-          default: "{{job.start_time.iso_date}}"
-        - name: servicer_id              # $Package::ServicerId; override per run exactly as dtexec /Par did
-          default: "7"                   #   (the package's ParameterValue). Scheduled runs use the default,
-                                         #   which is what the SQL Agent step passed.
+        - { name: src_catalog, default: "${var.src_catalog}" }   # OLTP_LoanServicing (read only)
+        - { name: src_schema,  default: "${var.src_schema}" }    #   loan_servicing.dbo
+        - { name: tgt_catalog, default: "${var.tgt_catalog}" }   # DW_LoanMart
+        - { name: tgt_schema,  default: "${var.tgt_schema}" }    #   loan_mart.dw
+        - { name: load_date,   default: "{{job.start_time.iso_date}}" }  # User::LoadDate (INFERRED default)
+        - { name: servicer_id, default: "7" }  # $Package::ServicerId (Required): override per run, as dtexec /Par did
       email_notifications:
-        on_failure:
-          - ${var.ops_email}
+        on_failure: ["${var.ops_email}"]
       tasks:
-        - task_key: load_payment_fact
-          max_retries: 2                 # commit conflicts with an outside writer to the dw tables (converted.sql
-          min_retry_interval_millis: 60000   # header): the task rebuilds the temp table and re-runs both idempotent MERGEs
+        - task_key: load_payment_fact          # DFT Load fact_payment
+          max_retries: 2                       # commit conflict with an outside dw writer: MERGEs are idempotent
+          min_retry_interval_millis: 60000
           sql_task:
-            file:
-              path: ../sql/load_payment_fact.sql   # converted.sql
-              source: WORKSPACE
-            warehouse_id: ${var.warehouse_id}
-            parameters:                  # read as :src_catalog / :src_schema / :tgt_catalog / :tgt_schema /
-              src_catalog: "{{job.parameters.src_catalog}}"   # :load_date / :servicer_id in converted.sql
-              src_schema: "{{job.parameters.src_schema}}"
-              tgt_catalog: "{{job.parameters.tgt_catalog}}"
-              tgt_schema: "{{job.parameters.tgt_schema}}"
-              load_date: "{{job.parameters.load_date}}"
-              servicer_id: "{{job.parameters.servicer_id}}"
-
-        # OnError event handler: INSERT INTO dw.etl_log (package_name, event, message, logged_at)
-        # VALUES (?, 'OnError', ?, GETDATE()). Runs only when the load task failed (Excluded on a clean
-        # run: docs /jobs/conditional-tasks), so clean-run semantics are unchanged.
-        # SSIS fires the handler once per error event (several rows per failed run are possible); the
-        # conversion writes exactly one row per failed run (recorded delta, NOTE.md).
-        - task_key: log_onerror
-          depends_on:
-            - task_key: load_payment_fact
-          run_if: AT_LEAST_ONE_FAILED
-          sql_task:
-            file:
-              path: ../sql/log_onerror_etl_log.sql
-              # INSERT INTO IDENTIFIER(:tgt_catalog||'.'||:tgt_schema||'.etl_log')   -- DW_LoanMart, as in the package
-              #   (package_name, event, message, logged_at)
-              # VALUES ('LoadPaymentFact', 'OnError',
-              #         'load_payment_fact ' || :result_state || ' ' || :error_code || ' run ' || :run_id,
-              #         current_timestamp());
-              source: WORKSPACE
+            file: { path: ../sql/load_payment_fact.sql, source: WORKSPACE }   # converted.sql
             warehouse_id: ${var.warehouse_id}
             parameters:
+              src_catalog: "{{job.parameters.src_catalog}}"
+              src_schema:  "{{job.parameters.src_schema}}"
               tgt_catalog: "{{job.parameters.tgt_catalog}}"
-              tgt_schema: "{{job.parameters.tgt_schema}}"
-              run_id: "{{job.run_id}}"
+              tgt_schema:  "{{job.parameters.tgt_schema}}"
+              load_date:   "{{job.parameters.load_date}}"
+              servicer_id: "{{job.parameters.servicer_id}}"
+        - task_key: log_onerror                # OnError handler: INSERT INTO dw.etl_log (...) VALUES (?, 'OnError', ?, GETDATE())
+          depends_on: [{ task_key: load_payment_fact }]
+          run_if: AT_LEAST_ONE_FAILED          # excluded on a clean run; one row per failed run (SSIS: one per error event)
+          sql_task:
+            file: { path: ../sql/log_onerror_etl_log.sql, source: WORKSPACE }
+            # INSERT INTO IDENTIFIER(:tgt_catalog||'.'||:tgt_schema||'.etl_log') (package_name, event, message, logged_at)
+            # VALUES ('LoadPaymentFact', 'OnError', 'load_payment_fact ' || :result_state || ' ' || :error_code
+            #         || ' run ' || :run_id, current_timestamp());
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              tgt_catalog:  "{{job.parameters.tgt_catalog}}"
+              tgt_schema:   "{{job.parameters.tgt_schema}}"
+              run_id:       "{{job.run_id}}"
               result_state: "{{tasks.load_payment_fact.result_state}}"
-              error_code: "{{tasks.load_payment_fact.error_code}}"
+              error_code:   "{{tasks.load_payment_fact.error_code}}"

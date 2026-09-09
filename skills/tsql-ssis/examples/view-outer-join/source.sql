@@ -1,25 +1,5 @@
-/*=====================================================================
-  vw_active_loan_portfolio — Active/delinquent loan portfolio view
-  Sybase ASE 16
-
-  ** CRITICAL SYBASE-ISM: *= outer join syntax **
-
-  This view uses the Sybase proprietary *= operator for LEFT OUTER JOIN.
-  The *= means "keep all rows from the LEFT table even when no match
-  exists on the RIGHT."
-
-  - l.loan_id *= m.loan_id  → LEFT JOIN to loan_modifications
-  - l.loan_id *= p.loan_id  → LEFT JOIN to last-payment subquery
-
-  A naive conversion that simply removes the *= and leaves a comma join
-  produces an INNER JOIN, silently dropping:
-    - Loans with no modification history
-    - Loans with no payment history (new originations)
-
-  This is the primary "planted bug" — the reconciliation completeness
-  control catches the row-count discrepancy.
-=====================================================================*/
-
+/* vw_active_loan_portfolio (Sybase ASE 16), trimmed from fixture schema/views/.
+   *= is the ASE LEFT OUTER JOIN; the WHERE predicate on the inner table m belongs to the join. */
 CREATE VIEW dbo.vw_active_loan_portfolio
 AS
 SELECT
@@ -27,30 +7,12 @@ SELECT
     l.loan_number,
     l.loan_type,
     dbo.fn_format_loan_type(l.loan_type) AS loan_type_desc,
-    l.original_balance,
     l.current_balance,
-    l.interest_rate,
-    l.term_months,
-    l.origination_date,
-    l.maturity_date,
     l.loan_status,
     l.days_past_due,
-    l.past_due_amount,
-    l.escrow_balance,
-    l.servicer_id,
-    l.investor_code,
-    l.property_state,
-    l.property_value,
-    l.ltv,
     b.borrower_id,
-    b.first_name,
     b.last_name,
-    b.credit_score,
-    b.borrower_type,
-    b.state_code,
     m.modification_id,
-    m.modification_type,
-    m.effective_date    AS mod_effective_date,
     m.status            AS mod_status,
     p.last_payment_date,
     p.last_payment_amt,
