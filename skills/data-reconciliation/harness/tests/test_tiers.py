@@ -148,6 +148,27 @@ def test_continuous_mode_records_the_depth_it_ran_at_not_the_one_requested():
     assert result["depth"] == "sampled"
 
 
+def test_cli_reports_the_effective_depth_not_the_requested_one(tmp_path: Path, monkeypatch, capsys):
+    from recon import adapters, cli
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig"]}))
+    source, target = make_green()
+    monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "oracle", lambda secret: source)
+    monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: target)
+    monkeypatch.setattr(cli, "load_mapping_spec", lambda path, params: SPEC)
+    monkeypatch.setattr(cli, "load_tolerances", lambda path: TOL)
+    monkeypatch.setattr(cli, "load_canon_rules", lambda path: RULES)
+    rc = cli.main(["run", "--unit", "u", "--family", "oracle", "--mode", "continuous", "--depth", "full",
+                   "--mapping", "m", "--tolerances", "t", "--canonicalization", "c",
+                   "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+                   "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out")])
+    assert rc == 0
+    line = capsys.readouterr().out
+    assert "depth=sampled" in line and "depth=full" not in line
+    assert json.loads((tmp_path / "out" / "result.json").read_text())["depth"] == "sampled"
+
+
 def test_determinism():
     r1 = run(*make_green())
     r2 = run(*make_green())

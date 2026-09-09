@@ -254,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
                        source_family=args.family, depth=args.depth)
-    print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={args.depth} "
+    print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")
     return 0 if result["verdict"] == "PASS" else 1

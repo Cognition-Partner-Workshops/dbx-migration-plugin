@@ -321,20 +321,35 @@ def test_shell_wrapper_on_literal_write_is_read_through():
 
 
 @pytest.mark.parametrize("cmd", [
-    # a long option is a shell word, not the start of a SQL comment
+    # unquoted shell text has no comments: a long option or a bare `--` is a word
     "databricks --profile demo experimental aitools tools query \"DROP TABLE prod_cat.s.t\"",
     "databricks experimental aitools tools query --warehouse-id abc \"DROP TABLE prod_cat.s.t\"",
     "sqlcmd -S legacy-prod --foo -Q \"DELETE FROM dbo.rates\"",
-    # a bare `--` (end of options) is not a comment that swallows the quoted statement after it
     "databricks experimental aitools tools query -- 'DROP TABLE prod_cat.s.t'",
-    # a glob is not the start of a block comment
+    "databricks experimental aitools tools query -- \"DROP TABLE prod_cat.s.t\"",
+    # ... and a `/*` glob is a word, whatever `*/` follows it
     "cat /tmp/*.sql; databricks experimental aitools tools query \"DROP TABLE prod_cat.s.t\"",
+    "cat /tmp/*.sql */ ; databricks experimental aitools tools query \"DROP TABLE prod_cat.s.t\"",
     "bash -c \"ls /*.sql; databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'; ls */\"",
-    # the double-quoted body of `sh -c` is shell text: its single-quoted argument is the statement
+    # the body of `sh -c` is shell text whichever way it is quoted and whatever options precede -c:
+    # the quoted argument inside it is the statement, not a literal
     "bash -c \"databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
     "bash -c \"databricks --profile demo experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "bash -c 'databricks --profile demo experimental aitools tools query \"DROP TABLE prod_cat.s.t\"'",
     "sudo bash -x -c \"databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "bash --norc -c \"databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "bash -o pipefail -c \"databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "bash -lc \"databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "bash -c -- \"databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "bash --norc -c 'databricks experimental aitools tools query \"DROP TABLE prod_cat.s.t\"'",
     "/bin/sh -c \"databricks experimental aitools tools query \\\"DROP TABLE prod_cat.s.t\\\"\"",
+    ("bash -c \"databricks experimental aitools tools query 'SELECT 1'; "
+     "databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\""),
+    # a comment ends where SQL says it ends, and the statement after it is read
+    "databricks experimental aitools tools query \"SELECT 1 -- x\nDROP TABLE prod_cat.s.t\"",
+    "databricks experimental aitools tools query \"SELECT 1 /* x */ ; DROP TABLE prod_cat.s.t\"",
+    "databricks experimental aitools tools query <<EOF\nSELECT 1 -- x\nDROP TABLE prod_cat.s.t\nEOF",
+    "sqlcmd -S legacy-prod -Q 'SELECT 1 /*x*/; DELETE FROM dbo.rates'",
 ])
 def test_shell_words_are_not_sql_comments(cmd):
     v = block(cmd)
@@ -342,13 +357,26 @@ def test_shell_words_are_not_sql_comments(cmd):
 
 
 @pytest.mark.parametrize("cmd", [
-    # real SQL comments inside the statement argument are still comments
+    # inside a SQL argument a comment is a comment in every shape SQL allows: compact, with an
+    # apostrophe or quotes in it, in a single- or double-quoted argument, in a heredoc body
     "databricks --profile demo experimental aitools tools query \"SELECT 1 -- DROP TABLE prod_cat.s.t\"",
-    "databricks experimental aitools tools query \"SELECT 1 /* DROP TABLE prod_cat.s.t */\"",
+    "databricks experimental aitools tools query \"SELECT 1 --DROP TABLE prod_cat.s.t\"",
+    "databricks experimental aitools tools query \"SELECT 1 -- don't DROP TABLE prod_cat.s.t\"",
+    "databricks experimental aitools tools query \"SELECT 1 /* it's fine: DROP TABLE prod_cat.s.t */\"",
+    "databricks experimental aitools tools query \"SELECT 1 /*DROP TABLE prod_cat.s.t*/\"",
     "databricks experimental aitools tools query \"SELECT 1 /*+ DROP TABLE prod_cat.s.t */\"",
     "databricks experimental aitools tools query \"SELECT 1\n-- DROP TABLE prod_cat.s.t\n\"",
+    "databricks experimental aitools tools query 'SELECT 1 -- DROP TABLE prod_cat.s.t'",
+    "databricks experimental aitools tools query 'SELECT 1 --DROP TABLE prod_cat.s.t'",
     "databricks experimental aitools tools query <<'SQL'\nSELECT 1 -- DROP TABLE prod_cat.s.t\n/* DROP TABLE prod_cat.s.t */\nSQL",
+    "databricks experimental aitools tools query <<EOF\nSELECT 1 -- DROP TABLE prod_cat.s.t\nEOF",
+    "databricks experimental aitools tools query <<-EOF\n\tSELECT 1 -- DROP TABLE prod_cat.s.t\n\tEOF",
+    # the same inside the body of `sh -c`
+    "bash -c \"databricks experimental aitools tools query 'SELECT 1 -- DROP TABLE prod_cat.s.t'\"",
+    "bash -c 'databricks experimental aitools tools query \"SELECT 1 -- DROP TABLE prod_cat.s.t\"'",
     "bash -c \"databricks --profile demo experimental aitools tools query 'INSERT INTO mig_cat.s.t SELECT 1'\"",
+    # a literal is still a literal
+    "databricks experimental aitools tools query \"SELECT * FROM mig_cat.s.t WHERE note = 'DROP TABLE prod_cat.s.t'\"",
 ])
 def test_sql_comments_and_options_together_stay_readable(cmd):
     approve(cmd)
