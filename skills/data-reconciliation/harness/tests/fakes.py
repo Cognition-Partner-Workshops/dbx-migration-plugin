@@ -18,12 +18,43 @@ from recon.canon import MISSING
 _EPOCH = dt.datetime(1970, 1, 1)  # noqa: DTZ001  fixtures use naive datetimes throughout
 
 
+def _instant(value):
+    """Naive-UTC form of a datetime, mirroring recon.watermarks.instant for literal predicates."""
+    if isinstance(value, datetime.datetime) and value.tzinfo is not None:
+        return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _agg_of(vals: list) -> dict[str, Any]:
+    nn = [v for v in vals if v is not None]
+    nums = [v for v in nn if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool)]
+    return {"count": len(vals),
+            "null_rate": (len(vals) - len(nn)) / len(vals) if vals else 0.0,
+            "min": min(nn) if nn else None, "max": max(nn) if nn else None,
+            "sum": sum(nums) if nums else None, "distinct_count": len(set(map(repr, nn)))}
+
+
 def _matches(row: dict, where: str | None) -> bool:
     if not where:
         return True
     if where.lstrip().startswith("{"):
         parsed = json.loads(where)
         return all(row.get(k) == v for k, v in parsed.items())
+    if " IS NULL)" in where:
+        # the applied predicate: [(scope) AND ](col < lit OR col IS NULL) | (col <= lit OR ...)
+        scope, _, applied = where.rpartition(" AND (") if " AND (" in where else (None, None, where)
+        bound, _, _ = applied.strip("() ").partition(" OR ")
+        op = " <= " if " <= " in bound else " < "
+        col, _, lit = bound.partition(op)
+        value = row.get(col.strip())
+        if value is None:
+            applied_ok = True
+        else:
+            lit = lit.strip().strip("'")
+            bound_v = (datetime.datetime.fromisoformat(lit) if isinstance(value, datetime.datetime)
+                       else type(value)(lit))
+            applied_ok = _instant(value) <= bound_v if op == " <= " else _instant(value) < bound_v
+        return applied_ok and _matches(row, scope.strip("() ") if scope else None)
     if " > " in where or " >= " in where:
         # the in-flight predicate the transactional window issues:
         # [(scope) AND ]col > literal  |  [(scope) AND ]col >= datetime_literal
@@ -36,6 +67,7 @@ def _matches(row: dict, where: str | None) -> bool:
         lit = lit.strip().strip("'")
         if isinstance(value, datetime.datetime):
             bound = datetime.datetime.fromisoformat(lit)
+            value = _instant(value)
         else:
             bound = type(value)(lit)
         newer_ok = value >= bound if op == " >= " else value > bound
@@ -123,7 +155,7 @@ class _TransactionalMixin:
         if isinstance(value, (int, float, Decimal)):
             return Decimal(str(value))
         if isinstance(value, dt.datetime):
-            return Decimal(int((value.replace(tzinfo=None) - _EPOCH).total_seconds() * 1_000_000))
+            return Decimal(int((_instant(value) - _EPOCH).total_seconds() * 1_000_000))
         if isinstance(value, dt.date):
             return Decimal((value - dt.date(1970, 1, 1)).days * 86_400_000_000)
         return None
@@ -245,12 +277,7 @@ class FakeSource(_TransactionalMixin):
     def _aggregates(self, table: str, column: str, where: str | None) -> dict[str, Any]:
         vals = [(r[column] if column in r else get_path(r, column))
                 for r in self.tables[table] if _matches(r, where)]
-        nn = [v for v in vals if v is not None]
-        nums = [v for v in nn if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool)]
-        return {"count": len(vals),
-                "null_rate": (len(vals) - len(nn)) / len(vals) if vals else 0.0,
-                "min": min(nn) if nn else None, "max": max(nn) if nn else None,
-                "sum": sum(nums) if nums else None, "distinct_count": len(set(map(repr, nn)))}
+        return _agg_of(vals)
 
     def fetch_keyed(self, table, key_cols, columns, where=None, keys=None) -> Iterable[dict]:
         self.calls["fetch_keyed"] += 1
@@ -360,15 +387,26 @@ class FakeTarget(_TransactionalMixin):
             out[col] = agg
         return out
 
+    def table_aggregates_excluding(self, object: str, columns: list[str], numeric: list[str],
+                                   key_cols: list[str], exclude_keys: list[tuple],
+                                   where=None) -> dict[str, dict[str, Any]]:
+        self.calls["table_aggregates_excluding"] += 1
+        self.statements += 1
+        self.last_excluded_keys = list(exclude_keys)
+        excluded = {tuple(k) for k in exclude_keys}
+        rows = [d for d in self._rows(object, where)
+                if tuple(get_path(d, k) for k in key_cols) not in excluded]
+        out = {}
+        for col in columns:
+            agg = _agg_of([None if (v := get_path(d, col)) is MISSING else v for d in rows])
+            if col not in numeric:
+                agg["sum"] = None
+            out[col] = agg
+        return out
+
     def field_aggregates(self, object: str, field_path: str, where=None) -> dict[str, Any]:
         vals = [get_path(d, field_path) for d in self._rows(object, where)]
-        vals = [None if v is MISSING else v for v in vals]
-        nn = [v for v in vals if v is not None]
-        nums = [v for v in nn if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool)]
-        return {"count": len(vals),
-                "null_rate": (len(vals) - len(nn)) / len(vals) if vals else 0.0,
-                "min": min(nn) if nn else None, "max": max(nn) if nn else None,
-                "sum": sum(nums) if nums else None, "distinct_count": len(set(map(repr, nn)))}
+        return _agg_of([None if v is MISSING else v for v in vals])
 
     def fetch_keyed(self, object, key_fields, fields, where=None, keys=None) -> Iterable[dict]:
         if isinstance(key_fields, str):

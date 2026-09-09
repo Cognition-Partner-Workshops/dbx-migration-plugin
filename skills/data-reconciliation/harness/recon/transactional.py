@@ -34,12 +34,14 @@ from __future__ import annotations
 
 import datetime as dt
 import decimal
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from .adapters import SchemaFacts, StratifiedKeys, TransactionalSide
 from .config import ConfigError, MappingSpec, ObjectMapping, Tolerances
 from .tiers import Finding, TierResult
+from .watermarks import check_comparable, family, instant, lag_seconds, later, same
 
 # Keys listed per finding before the rest is summarised as a count.
 MAX_KEYS_IN_FINDING = 20
@@ -82,27 +84,26 @@ class TransactionalContext:
         if hwm is None or not c.watermark_source:
             return False
         wm = source_row.get(c.watermark_source)
-        return wm is not None and _later(wm, hwm)
+        return wm is not None and later(wm, hwm)
 
+    def applied_where(self, c: ObjectMapping) -> str | None:
+        """Source predicate selecting the rows the target is expected to hold already (watermark at
+        or before the applied high-watermark, or no watermark), scoped by root_where."""
+        hwm = self.hwm(c)
+        if hwm is None or not c.watermark_source:
+            return c.root_where
+        applied = _applied_predicate(c.watermark_source, hwm)
+        return f"({c.root_where}) AND {applied}" if c.root_where else applied
 
-def _later(a: Any, b: Any) -> bool:
-    try:
-        return a > b
-    except TypeError:
-        return str(a) > str(b)
-
-
-def _lag_seconds(src: Any, tgt: Any) -> float | None:
-    if src is None or tgt is None:
-        return None
-    if isinstance(src, dt.datetime) and isinstance(tgt, dt.datetime):
-        if (src.tzinfo is None) != (tgt.tzinfo is None):
-            src = src.replace(tzinfo=None)
-            tgt = tgt.replace(tzinfo=None)
-        return (src - tgt).total_seconds()
-    if isinstance(src, (int, float, decimal.Decimal)) and isinstance(tgt, (int, float, decimal.Decimal)):
-        return float(decimal.Decimal(str(src)) - decimal.Decimal(str(tgt)))
-    return None
+    def in_flight_keys(self, c: ObjectMapping, source) -> list[tuple]:
+        """Keys of the source rows changed after the applied high-watermark (one statement)."""
+        hwm = self.hwm(c)
+        if hwm is None or not c.watermark_source:
+            return []
+        newer = _newer_predicate(c.watermark_source, hwm)
+        where = f"({c.root_where}) AND {newer}" if c.root_where else newer
+        return [tuple(r[k] for k in c.key_source)
+                for r in source.fetch_keyed(c.root_table, c.key_source, [], where=where)]
 
 
 def require_transactional(source, target) -> None:
@@ -122,6 +123,8 @@ def open_window(spec: MappingSpec, source, target) -> TransactionalContext:
         t_mark = target.window_marker(c.object, c.key_target, c.watermark_target, c.target_where)
         ctx.open_markers[c.object] = (s_mark, t_mark)
         if c.watermark_source and c.watermark_target:
+            check_comparable(s_mark[1], t_mark[1],
+                             f"{c.object}: {c.watermark_source} vs {c.watermark_target}")
             win.hwm_target = t_mark[1]
             if win.hwm_target is not None:
                 newer = _newer_predicate(c.watermark_source, win.hwm_target)
@@ -135,17 +138,27 @@ def _newer_predicate(column: str, hwm: Any) -> str:
     """Rows changed after the target's applied watermark. Drivers deliver datetimes at microsecond
     precision while the engine may store more (SQL Server datetime2(7)), so a strict `>` against
     the truncated literal would count every row that shares the applied microsecond; compare from
-    the next microsecond instead, matching what `_later` can see on fetched rows."""
+    the next microsecond instead, matching what `later` can see on fetched rows."""
     if isinstance(hwm, dt.datetime):
         return f"{column} >= {_literal(hwm + dt.timedelta(microseconds=1))}"
     return f"{column} > {_literal(hwm)}"
 
 
+def _applied_predicate(column: str, hwm: Any) -> str:
+    """The complement of `_newer_predicate` that also keeps rows with no watermark: those are
+    applied as far as the harness can tell, exactly as `row_in_flight` treats them."""
+    if isinstance(hwm, dt.datetime):
+        bound = f"{column} < {_literal(hwm + dt.timedelta(microseconds=1))}"
+    else:
+        bound = f"{column} <= {_literal(hwm)}"
+    return f"({bound} OR {column} IS NULL)"
+
+
 def _literal(value: Any) -> str:
-    """Watermark literal for a predicate. Only datetimes and numbers are accepted as watermarks;
-    anything else cannot be compared across engines safely."""
+    """Watermark literal for a predicate, as a UTC instant (see recon.watermarks). Only datetimes
+    and numbers are accepted as watermarks; anything else cannot be compared across engines."""
     if isinstance(value, dt.datetime):
-        return "'" + value.replace(tzinfo=None).isoformat(sep=" ", timespec="microseconds") + "'"
+        return "'" + instant(value).isoformat(sep=" ", timespec="microseconds") + "'"
     if isinstance(value, dt.date):
         return f"'{value.isoformat()}'"
     if isinstance(value, bool) or not isinstance(value, (int, float, decimal.Decimal)):
@@ -221,13 +234,7 @@ def _ranges(source: StratifiedKeys, c: ObjectMapping, n: int, tol: Tolerances) -
 
 def _kind(value: Any) -> str:
     """Digest family of a key/watermark value: what portable sum the adapters can compute."""
-    if isinstance(value, bool):
-        return "other"
-    if isinstance(value, (int, float, decimal.Decimal)):
-        return "number"
-    if isinstance(value, (dt.datetime, dt.date)):
-        return "datetime"
-    return "other"
+    return family(value)
 
 
 def _fingerprint_complete(fps: list[tuple], nk: int, watermark: bool) -> bool:
@@ -308,7 +315,7 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
             t_index = {tuple(k[:nk]): k[nk:] for k in t_keys}
             for key, rest in s_index.items():
                 s_wm = rest[0] if has_wm and rest else None
-                unapplied = has_wm and hwm is not None and s_wm is not None and _later(s_wm, hwm)
+                unapplied = has_wm and hwm is not None and s_wm is not None and later(s_wm, hwm)
                 if key not in t_index:
                     if unapplied:
                         in_flight_missing.add(key)
@@ -318,9 +325,9 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                 if not has_wm:
                     continue
                 t_wm = t_index[key][0] if t_index[key] else None
-                if s_wm == t_wm or (s_wm is None and t_wm is None):
+                if same(s_wm, t_wm):
                     continue
-                if t_wm is not None and (s_wm is None or _later(t_wm, s_wm)):
+                if t_wm is not None and (s_wm is None or later(t_wm, s_wm)):
                     ahead.add(key)
                 elif unapplied:
                     in_flight_updates.add(key)
@@ -364,7 +371,7 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         checks += 1
         s_open, t_open = ctx.open_markers[c.object]
         s_wm, t_wm = s_open[1], t_open[1]
-        lag = _lag_seconds(s_wm, t_wm)
+        lag = lag_seconds(s_wm, t_wm)
         diff = ctx.key_diffs.get(c.object, KeyDiff())
         stats[c.object] = {"watermark": f"{c.watermark_source}->{c.watermark_target}",
                            "source_max": s_wm, "target_max": t_wm, "lag_s": lag,
@@ -430,7 +437,16 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         not_null={x.lower() for x in f.not_null},
         indexes={tuple(x.lower() for x in i) for i in f.indexes},
         check_count=f.check_count, identity_columns={x.lower() for x in f.identity_columns},
-        partial={tuple(x.lower() for x in p) for p in f.partial})
+        partial={tuple(x.lower() for x in p) for p in f.partial},
+        expression_unique={x.lower() for x in f.expression_unique},
+        expression_indexes={x.lower() for x in f.expression_indexes})
+
+
+def _map_expression(text: str, colmap: dict[str, str]) -> str:
+    """Rewrite the source column names inside an index expression to their target names, so
+    `lower(email)` on the source is expected as `lower(email_addr)` when the field is renamed."""
+    return re.sub(r"[A-Za-z_][A-Za-z0-9_]*",
+                  lambda m: colmap.get(m.group(0).lower(), m.group(0)), text)
 
 
 def _covered(leading: tuple, facts: SchemaFacts) -> bool:
@@ -530,6 +546,26 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
             stats.setdefault("partial_indexes_unverified", []).append(
                 f"{c.object}: source filtered index {idx} carries a predicate the harness cannot "
                 f"translate; confirm its target counterpart by hand")
+        # expression indexes: matched on their rewritten definition text, never dropped. A unique
+        # one is a constraint (unique_missing/unique_extra semantics); a plain one is coverage the
+        # harness cannot judge column-wise, so it is listed for a hand check
+        expected_expr_unique = {_map_expression(e, colmap) for e in s.expression_unique}
+        for expr in sorted(s.expression_unique):
+            want = _map_expression(expr, colmap)
+            if want not in t_lower.expression_unique:
+                findings.append(Finding(c.object, "expression_unique_missing",
+                                        f"source unique index on ({expr}) has no target unique index "
+                                        f"on ({want})"))
+        for expr in sorted(t_lower.expression_unique - expected_expr_unique):
+            tightened(Finding(c.object, "expression_unique_extra",
+                              f"target unique index on ({expr}) has no source counterpart: "
+                              "legacy-valid rows that collide under the expression would be rejected"))
+        for expr in sorted(s.expression_indexes):
+            want = _map_expression(expr, colmap)
+            if want not in t_lower.expression_indexes:
+                stats.setdefault("expression_indexes_unverified", []).append(
+                    f"{c.object}: source index on ({expr}) has no target index on ({want}); "
+                    "confirm the access path by hand")
         seq_note = None
         if c.identity_source and c.identity_target:
             checks += 1
@@ -563,4 +599,6 @@ def _facts_dict(f: SchemaFacts) -> dict:
             "foreign_keys": sorted([list(c), r, list(rc)] for c, r, rc in f.foreign_keys),
             "not_null": sorted(f.not_null), "indexes": sorted(map(list, f.indexes)),
             "check_count": f.check_count, "identity_columns": sorted(f.identity_columns),
-            "partial": sorted(map(list, f.partial))}
+            "partial": sorted(map(list, f.partial)),
+            "expression_unique": sorted(f.expression_unique),
+            "expression_indexes": sorted(f.expression_indexes)}

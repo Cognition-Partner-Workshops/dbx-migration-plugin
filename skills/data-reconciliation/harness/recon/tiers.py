@@ -12,14 +12,20 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import BatchAggregates, StratifiedKeys
+from .adapters import BatchAggregates, KeyExcludingAggregates, StratifiedKeys
 from .canon import MISSING, Canonicalizer
 from .config import MappingSpec, ObjectMapping, Tolerances
 from .paths import get_path
+from .watermarks import family, instant, later
 
 # Tier 3 sampling: at most this many strata per table; each stratum contributes
 # ceil(sample_size / strata) keys plus the range edges (first/last keys are always graded).
 MAX_STRATA = 32
+
+# Tier 2 in transactional mode excludes the in-flight source keys from the target's aggregates
+# by listing them in one statement; above this many keys the object is graded ungraded instead
+# of shipping an oversized predicate (a feed that far behind fails tier 6 on lag anyway).
+IN_FLIGHT_EXCLUSION_CAP = 10_000
 
 
 @dataclass
@@ -92,6 +98,8 @@ def _agg_close(a: Any, b: Any, rel_tol: float) -> bool:
         da, db = decimal.Decimal(str(a)), decimal.Decimal(str(b))
         denom = max(abs(da), abs(db), decimal.Decimal("1e-12"))
         return abs(da - db) <= decimal.Decimal(str(rel_tol)) * denom
+    if family(a) == family(b) == "datetime":
+        return instant(a) == instant(b)
     return a == b
 
 
@@ -123,23 +131,30 @@ def _declared_numeric(f) -> bool | None:
     return None
 
 
-def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict], dict[str, dict]]:
+def _object_aggregates(c: ObjectMapping, source, target, source_where: str | None = None,
+                       exclude_keys: list[tuple] | None = None) -> tuple[dict[str, dict], dict[str, dict]]:
     """All field aggregates for one object: one statement per side when the adapter batches,
     one per field otherwise. SUM is requested only for fields declared numeric; undeclared
-    fields get the per-column probe (SUM may error on strings)."""
+    fields get the per-column probe (SUM may error on strings). In transactional mode the
+    source is bounded to its applied rows (`source_where`) and the target excludes the same
+    keys (`exclude_keys`), so both aggregates describe one set."""
+    s_where = source_where if source_where is not None else c.root_where
     cols = [f.source for f in c.fields]
     numeric_src = [f.source for f in c.fields if _declared_numeric(f)]
     undeclared = [f for f in c.fields if _declared_numeric(f) is None]
     if isinstance(source, BatchAggregates):
-        s_all = source.table_aggregates(c.root_table, cols, numeric_src, c.root_where)
+        s_all = source.table_aggregates(c.root_table, cols, numeric_src, s_where)
         for f in undeclared:
-            s_all[f.source] = source.field_aggregates(c.root_table, f.source, c.root_where)
+            s_all[f.source] = source.field_aggregates(c.root_table, f.source, s_where)
     else:
-        s_all = {f.source: source.field_aggregates(c.root_table, f.source, c.root_where) for f in c.fields}
+        s_all = {f.source: source.field_aggregates(c.root_table, f.source, s_where) for f in c.fields}
     tcols = [f.target for f in c.fields]
     numeric_tgt = [f.target for f in c.fields
                    if _is_numeric_field(f, s_all[f.source].get("sum"))]
-    if isinstance(target, BatchAggregates):
+    if exclude_keys is not None:
+        t_all = target.table_aggregates_excluding(c.object, tcols, numeric_tgt, list(c.key_target),
+                                                  exclude_keys, c.target_where)
+    elif isinstance(target, BatchAggregates):
         t_all = target.table_aggregates(c.object, tcols, numeric_tgt, c.target_where)
     else:
         t_all = {f.target: (target.field_aggregates(c.object, f.target, c.target_where)
@@ -152,13 +167,32 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                      source, target, ctx=None) -> TierResult:
     findings, checks = [], 0
     deferred: list[str] = []
-    skipped_in_flight: list[str] = []
+    applied_subset: dict[str, dict[str, Any]] = {}
     for c in spec.objects:
-        if ctx is not None and ctx.in_flight(c):
-            # aggregates over a moving table cannot be exact; tiers 3 and 5 grade it per key
-            skipped_in_flight.append(c.object)
-            continue
-        s_all, t_all = _object_aggregates(c, source, target)
+        in_flight = ctx.in_flight(c) if ctx is not None else 0
+        if in_flight:
+            # aggregate the applied set on both sides: the source bounded by the target's applied
+            # watermark, the target minus the very keys that are in flight (their target values
+            # are the pre-change ones). Every applied row stays in the comparison, so drift in a
+            # row tier 3's sample never visits is still caught
+            if not isinstance(target, KeyExcludingAggregates):
+                checks += 1
+                findings.append(Finding(c.object, "aggregates_ungraded_in_flight",
+                                        f"{in_flight} source rows in flight and the target adapter "
+                                        "cannot exclude keys from its aggregates"))
+                continue
+            if in_flight > IN_FLIGHT_EXCLUSION_CAP:
+                checks += 1
+                findings.append(Finding(c.object, "aggregates_ungraded_in_flight",
+                                        f"{in_flight} source rows in flight exceeds the "
+                                        f"{IN_FLIGHT_EXCLUSION_CAP}-key exclusion cap; let the feed "
+                                        "catch up before grading aggregates"))
+                continue
+            keys = ctx.in_flight_keys(c, source)
+            applied_subset[c.object] = {"in_flight": in_flight, "excluded_keys": len(keys)}
+            s_all, t_all = _object_aggregates(c, source, target, ctx.applied_where(c), keys)
+        else:
+            s_all, t_all = _object_aggregates(c, source, target)
         for f in c.fields:
             checks += 1
             s, t = s_all[f.source], t_all[f.target]
@@ -186,8 +220,8 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                     findings.append(Finding(c.object, f"aggregate_{stat}",
                                             f"field {f.source}->{f.target}", sv, tv, f.rules))
     stats: dict[str, Any] = {"deferred_to_tier3": deferred} if deferred else {}
-    if skipped_in_flight:
-        stats["skipped_in_flight"] = skipped_in_flight
+    if applied_subset:
+        stats["applied_subset"] = applied_subset
     return TierResult(2, "per_field_aggregates", not findings, checks, findings, stats)
 
 
@@ -375,7 +409,7 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                 continue
             if wm:
                 s_wm, t_wm = row.get(c.watermark_source), _get_path(doc, c.watermark_target)
-                if s_wm is not None and t_wm is not None and t_wm > s_wm:
+                if s_wm is not None and t_wm is not None and later(t_wm, s_wm):
                     findings.append(Finding(c.object, "row_ahead_of_source",
                                             f"key={k} target {c.watermark_target} newer than source "
                                             f"{c.watermark_source}", s_wm, t_wm))

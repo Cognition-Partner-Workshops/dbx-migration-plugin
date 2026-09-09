@@ -26,6 +26,9 @@ def schema():
     conn.execute(f"CREATE UNIQUE INDEX t_region_partial_u ON {name}.t (region) WHERE active")
     conn.execute(f"CREATE INDEX t_region_ix ON {name}.t (region, code)")
     conn.execute(f"CREATE INDEX t_active_partial_ix ON {name}.t (active) WHERE region = 'eu'")
+    conn.execute(f"CREATE UNIQUE INDEX t_code_lower_u ON {name}.t (lower(code))")
+    conn.execute(f"CREATE INDEX t_region_expr_ix ON {name}.t (upper(region), id) INCLUDE (code)")
+    conn.execute(f"CREATE UNIQUE INDEX t_expr_partial_u ON {name}.t (lower(region)) WHERE active")
     # a concurrent unique build over duplicate values fails and leaves the index INVALID
     with pytest.raises(psycopg.errors.UniqueViolation):
         conn.execute(f"CREATE UNIQUE INDEX CONCURRENTLY t_dup_invalid_u ON {name}.t (dup)")
@@ -53,6 +56,9 @@ def test_partial_and_invalid_indexes_never_count_as_parity(schema, monkeypatch):
     assert facts.indexes == {("region", "code")}             # invalid and partial indexes excluded
     assert facts.partial == {("region",), ("active",)}       # reported for a manual check
     assert facts.not_null == {"id", "code", "active"}
+    # expression keys (attnum 0) stay visible as the key text of pg_get_indexdef
+    assert facts.expression_unique == {"lower(code)"}           # partial unique is not uniqueness
+    assert facts.expression_indexes == {"upper(region), id", "lower(region)"}  # INCLUDE dropped
 
 
 def test_range_fingerprints_bind_through_psycopg(schema, monkeypatch):

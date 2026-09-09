@@ -16,6 +16,7 @@ Postgres database standing in for a Lakebase migration branch (same wire protoco
 | `inject_target_defects.sql` | Negative rehearsal A: missing keys, stray row, out-of-order apply, dropped NOT NULL, sequence behind |
 | `inject_target_drift.sql` | Negative rehearsal B: CDC lag beyond tolerance plus one applied-row value drift |
 | `inject_target_equal_count.sql` | Negative rehearsal C: a key swapped for a stray and one row applied ahead of its source, with every count and max watermark unchanged |
+| `inject_target_applied_drift.sql` | Negative rehearsal D: ten loans in flight with stale values, one applied loan drifted on a field tier 3's sample never visits |
 | `repair_target.sql` | Restores the schema-level defect; `load_target.py` restores the data |
 
 ## Run
@@ -75,6 +76,15 @@ the tier 6 lag check pass (every count and max watermark unchanged). Tier 5 `pk_
 [(500,)]` and `pk_extra_on_target [(2989,)]` on `payments` from 2 mismatched ranges (376 keys
 streamed of 2988); tier 6 `row_ahead_of_source [(7,)]` on `loans` from 1 mismatched range while
 `lag_s = 0.0`.
+
+Rehearsal D (`inject_target_applied_drift.sql`, `--depth sampled` with `sample_size` 50): `FAIL`.
+Tier 0 reports 10 `loans` rows in flight; tier 2 aggregates the source bounded by the target's
+applied watermark against the target minus those 10 keys (`applied_subset.loans = {in_flight: 10,
+excluded_keys: 10}`) and fails `aggregate_sum`/`aggregate_max`/`aggregate_distinct_count` on
+`term_months`, with no finding for the stale `current_balance` of the in-flight rows. Tier 3
+sampled 125 of 880 rows, did not visit loan 5 and passed, so tier 2 is the only tier that names
+the drift. Fields under `decimal_round` (`MONEY -> decimal(19,4)`) still have `sum` and
+`distinct_count` deferred to tier 3, as in every mode.
 
 Every `pk_extra_on_target` above is graded as a defect: the harness has no tombstone or
 CDC-position evidence, so an undrained source delete and a stray target write look the same

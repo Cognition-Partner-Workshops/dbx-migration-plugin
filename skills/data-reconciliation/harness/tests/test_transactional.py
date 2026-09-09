@@ -11,6 +11,7 @@ from recon.adapters import (
     LakebaseTargetAdapter,
     SchemaFacts,
     TargetIdentityError,
+    _index_key_text,
     _SqlAdapterBase,
 )
 from recon.cli import main
@@ -27,7 +28,8 @@ from recon.config import (
 from recon.cost import estimate_cost
 from recon.engine import MODES, PLANNED_MODES, run_recon
 from recon.report import render_summary
-from recon.transactional import _newer_predicate
+from recon.transactional import _applied_predicate, _newer_predicate
+from recon.watermarks import instant, lag_seconds, later, same
 from tests.fakes import FakeSource, FakeTarget
 
 T0 = dt.datetime(2026, 9, 1, 12, 0, 0)
@@ -274,7 +276,9 @@ def test_in_flight_rows_are_not_defects_when_lag_is_tolerated():
     assert result["verdict"] == "PASS", result
     t1 = _tier(result, "counts_through_mapping")
     assert t1["stats"]["count_gap_within_in_flight"]["loans"] == {"gap": 2, "in_flight": 2}
-    assert _tier(result, "per_field_aggregates")["stats"]["skipped_in_flight"] == ["loans"]
+    t2 = _tier(result, "per_field_aggregates")
+    assert t2["passed"] and t2["stats"]["applied_subset"]["loans"] == {"in_flight": 2, "excluded_keys": 2}
+    assert target.last_excluded_keys == [(11,), (12,)]
     assert _tier(result, "keyed_diffs")["stats"]["loans"]["in_flight_rows"] == 2
     assert _tier(result, "pk_set_diff")["stats"]["loans"]["in_flight_missing"] == 2
     cdc = _tier(result, "cdc_lag_ordering")["stats"]["loans"]
@@ -1002,3 +1006,230 @@ def test_cli_estimate_accepts_mode(tmp_path, monkeypatch, capsys):
                  "--mode", "transactional"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["mode"] == "transactional" and "tier5" in out["source_statements"]
+
+
+# ---- round 5: tier 2 over the applied set, one watermark comparator, expression indexes ----
+
+
+def test_drift_in_an_applied_row_fails_aggregates_while_other_rows_are_in_flight():
+    # loans 39 and 40 are in flight; loan 7 was applied long ago but its target balance drifted.
+    # Tier 3 is sampled (2 keys + range edges) and never visits key 7; tier 2 must still see it.
+    loans, borrowers = _rows(40)
+    tgt = [dict(r) for r in loans if r["loan_id"] <= 38]
+    tgt[6]["current_balance"] = 999_999
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=5, sample_size=2),
+                  depth="sampled", seed=3)
+    assert (7,) not in source.last_fetch_keyed["keys"], "pick a seed whose sample misses key 7"
+    assert _codes(result, "keyed_diffs") == []
+    t2 = _tier(result, "per_field_aggregates")
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    assert {f["check"] for f in t2["findings"]} >= {"aggregate_sum", "aggregate_max"}
+    assert all(f["object"] == "loans" and "current_balance" in f["detail"] for f in t2["findings"])
+    assert t2["stats"]["applied_subset"]["loans"] == {"in_flight": 2, "excluded_keys": 2}
+    assert target.last_excluded_keys == [(39,), (40,)]
+    # the applied rows agree on every other field: no false findings from the in-flight rows
+    assert not any("loan_number" in f["detail"] or "borrower_id" in f["detail"] for f in t2["findings"])
+
+
+def test_in_flight_rows_with_stale_target_values_do_not_fail_aggregates():
+    # the target still holds the pre-change values of two rows the source has since updated:
+    # exactly the case that used to force tier 2 to skip the whole object
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    for r in loans[10:]:
+        r["current_balance"] += 500
+        r["modified_date"] = _ts(20)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=15))
+    assert result["verdict"] == "PASS", result
+    t2 = _tier(result, "per_field_aggregates")
+    assert t2["checks_run"] == 4 and t2["stats"]["applied_subset"]["loans"]["excluded_keys"] == 2
+    assert source.calls["table_aggregates"] == 2 and target.calls["table_aggregates_excluding"] == 1
+
+
+def test_a_target_that_cannot_exclude_keys_leaves_aggregates_ungraded_not_green():
+    class NoExclusion(FakeTarget):
+        table_aggregates_excluding = None
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans if r["loan_id"] <= 10]
+    source, _ = _sides(loans, tgt, borrowers)
+    target = NoExclusion({"loans": tgt, "borrowers": [dict(b) for b in borrowers]},
+                         schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS},
+                         sequences={("loans", "loan_id"): 13})
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=5))
+    assert result["verdict"] == "FAIL"
+    assert _codes(result, "per_field_aggregates") == ["aggregates_ungraded_in_flight"]
+
+
+def test_applied_predicate_is_the_complement_of_the_in_flight_predicate_plus_nulls():
+    hwm = dt.datetime(2026, 9, 8, 18, 43, 52, 164112)  # noqa: DTZ001  naive = UTC by contract
+    assert _applied_predicate("modified_date", hwm) == \
+        "(modified_date < '2026-09-08 18:43:52.164113' OR modified_date IS NULL)"
+    assert _applied_predicate("version_no", 41) == "(version_no <= 41 OR version_no IS NULL)"
+
+
+class _RecordingConn:
+    def __init__(self):
+        self.executed: list[tuple[str, tuple]] = []
+
+    def cursor(self):
+        conn = self
+
+        class Cur:
+            def execute(self, sql, params=()):
+                conn.executed.append((sql, params))
+
+            def fetchall(self):
+                return [(3, 3, 1, 9, 3, 12)]
+        return Cur()
+
+
+def test_sql_adapter_excludes_in_flight_keys_in_one_bound_statement():
+    conn = _RecordingConn()
+    adapter = _NoSnapshotAdapter(conn)
+    out = adapter.table_aggregates_excluding("dbo.loans", ["current_balance"], ["current_balance"],
+                                             ["loan_id"], [(11,), (12,)], where="status = 'A'")
+    sql, params = conn.executed[-1]
+    assert sql.endswith("FROM dbo.loans WHERE (status = 'A') AND NOT (loan_id IN (?, ?))")
+    assert params == (11, 12)
+    assert out["current_balance"]["sum"] == 12 and out["current_balance"]["count"] == 3
+    adapter.table_aggregates_excluding("dbo.x", ["v"], [], ["a", "b"], [(1, "p"), (2, "q")])
+    sql, params = conn.executed[-1]
+    assert sql.endswith("FROM dbo.x WHERE NOT ((a = ? AND b = ?) OR (a = ? AND b = ?))")
+    assert params == (1, "p", 2, "q")
+
+
+UTC = dt.timezone.utc
+PLUS2 = dt.timezone(dt.timedelta(hours=2))
+
+
+def test_watermark_comparator_treats_naive_as_utc_and_never_compares_lexically():
+    naive = dt.datetime(2026, 9, 1, 12, 0, 0)  # noqa: DTZ001  the SQL Server datetime shape
+    aware_same = dt.datetime(2026, 9, 1, 14, 0, 0, tzinfo=PLUS2)   # same instant, +02:00
+    aware_utc = dt.datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+    assert instant(aware_same) == instant(aware_utc) == naive
+    assert same(naive, aware_same) and same(aware_same, aware_utc)
+    assert not later(naive, aware_same) and not later(aware_same, naive)
+    assert later(aware_same + dt.timedelta(microseconds=1), naive)
+    assert later(naive + dt.timedelta(microseconds=1), aware_same)
+    assert lag_seconds(naive, aware_same) == 0.0
+    assert lag_seconds(naive + dt.timedelta(seconds=3), aware_same) == 3.0
+    # 9 > 10 lexically is not a thing: numbers compare as numbers
+    assert not later(9, 10) and later(10, 9)
+    # a datetime against a number is a mapping error, not a string comparison
+    with pytest.raises(ConfigError, match="not comparable"):
+        later(naive, 10)
+
+
+def _aware_target(loans, shift=PLUS2):
+    return [dict(r, modified_date=r["modified_date"].replace(tzinfo=UTC).astimezone(shift))
+            for r in loans]
+
+
+def test_equivalent_naive_and_aware_watermarks_pass_every_tier():
+    # source: SQL Server datetime (naive, UTC by contract); target: timestamptz rendered +02:00
+    loans, borrowers = _rows(12)
+    source, target = _sides(loans, _aware_target(loans), borrowers)
+    result = _run(source, target)
+    assert result["verdict"] == "PASS", result
+    assert result["merge_eligible"] is True
+    cdc = _tier(result, "cdc_lag_ordering")["stats"]["loans"]
+    assert cdc["lag_s"] == 0.0 and cdc["in_flight"] == 0
+    assert _tier(result, "pk_set_diff")["stats"]["loans"]["mismatched_ranges"] == 0
+
+
+def test_mixed_tz_in_flight_rows_and_lag_are_measured_as_instants():
+    # target applied up to loan 10, stored aware; loans 11 and 12 (naive) are in flight
+    loans, borrowers = _rows(12)
+    tgt = _aware_target([r for r in loans if r["loan_id"] <= 10])
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=5))
+    assert result["verdict"] == "PASS", result
+    assert _tier(result, "counts_through_mapping")["stats"]["count_gap_within_in_flight"]["loans"] == \
+        {"gap": 2, "in_flight": 2}
+    assert _tier(result, "pk_set_diff")["stats"]["loans"]["in_flight_missing"] == 2
+    assert _tier(result, "cdc_lag_ordering")["stats"]["loans"]["lag_s"] == 2.0
+
+
+def test_tier3_and_tier5_ordering_use_instants_across_tz_representations():
+    # loan 4's target row is one second NEWER than the source (as instants) though its +02:00
+    # wall clock reads two hours ahead of every naive value; loan 6 is one second OLDER
+    loans, borrowers = _rows(12)
+    tgt = _aware_target(loans)
+    tgt[3]["modified_date"] += dt.timedelta(seconds=1)
+    tgt[5]["modified_date"] -= dt.timedelta(seconds=1)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, depth="full")
+    assert result["verdict"] == "FAIL"
+    t3 = {f["check"]: f["detail"] for f in _tier(result, "keyed_diffs")["findings"]}
+    assert "key=(4,)" in t3["row_ahead_of_source"] and "(6,)" not in t3["row_ahead_of_source"]
+    cdc = {f["check"]: f["detail"] for f in _tier(result, "cdc_lag_ordering")["findings"]}
+    assert "(4,)" in cdc["row_ahead_of_source"] and "(6,)" in cdc["row_behind_applied_watermark"]
+    assert "(6,)" not in cdc["row_ahead_of_source"] and "(4,)" not in cdc["row_behind_applied_watermark"]
+
+
+def test_a_datetime_watermark_against_a_numeric_one_is_refused_before_any_tier_runs():
+    loans, borrowers = _rows(12)
+    tgt = [dict(r, modified_date=i) for i, r in enumerate(loans, 1)]
+    source, target = _sides(loans, tgt, borrowers)
+    with pytest.raises(ConfigError, match="loans: modified_date vs modified_date.*not comparable"):
+        _run(source, target)
+    assert source.calls["range_fingerprints"] == 0
+    assert source.window_open is False and target.window_open is False
+
+
+def test_expression_indexes_are_graded_not_dropped():
+    src = dataclasses.replace(LOANS_FACTS, expression_unique={"lower(loan_number)"},
+                              expression_indexes={"upper(loan_number)"})
+    # target: same unique expression, plus a unique expression the source never had
+    tgt = dataclasses.replace(TARGET_LOANS_FACTS, expression_unique={"lower(loan_number)", "lower(name)"})
+    loans, borrowers = _rows(12)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target)
+    assert result["verdict"] == "FAIL"
+    t7 = _tier(result, "schema_parity")
+    assert _codes(result, "schema_parity") == ["expression_unique_extra"]
+    assert "lower(name)" in t7["findings"][0]["detail"]
+    assert t7["stats"]["expression_indexes_unverified"] == [
+        ("loans: source index on (upper(loan_number)) has no target index on (upper(loan_number)); "
+         "confirm the access path by hand")]
+    assert t7["stats"]["loans"]["source"]["expression_unique"] == ["lower(loan_number)"]
+    assert t7["stats"]["loans"]["target"]["expression_unique"] == ["lower(loan_number)", "lower(name)"]
+    # the recorded decision for target-only constraints covers a target-only unique expression
+    result = _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))
+    assert result["verdict"] == "PASS", result
+    # a source unique expression the target lacks is always a defect
+    target.schema["loans"] = dataclasses.replace(TARGET_LOANS_FACTS, expression_unique=set())
+    result = _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))
+    assert _codes(result, "schema_parity") == ["expression_unique_missing"]
+
+
+def test_index_key_text_keeps_nested_calls_whole_and_drops_suffixes():
+    assert _index_key_text("CREATE UNIQUE INDEX u ON s.t USING btree (lower(email))") == "lower(email)"
+    assert _index_key_text("CREATE UNIQUE INDEX u ON s.t USING btree (lower(region)) WHERE active") == \
+        "lower(region)"
+    assert _index_key_text("CREATE INDEX i ON s.t USING btree (upper(region), id) INCLUDE (code)") == \
+        "upper(region), id"
+    assert _index_key_text("CREATE INDEX i ON s.t USING gin (to_tsvector('english'::regconfig, "
+                           "COALESCE(body, ''::text))) WITH (fastupdate=off)") == \
+        "to_tsvector('english'::regconfig, coalesce(body, ''::text))"
+
+
+def test_expression_index_columns_follow_the_field_mapping():
+    spec = _spec()
+    loans = dataclasses.replace(spec.objects[0], fields=[
+        FieldMapping("loan_number", "loan_no", "varchar", "string"),
+        FieldMapping("current_balance", "current_balance", "money", "decimal(19,4)"),
+        FieldMapping("borrower_id", "borrower_id", "int", "int")])
+    spec = MappingSpec("m1", [loans, spec.objects[1]])
+    src = dataclasses.replace(LOANS_FACTS, unique={("loan_number",)}, expression_unique={"lower(loan_number)"})
+    tgt = dataclasses.replace(TARGET_LOANS_FACTS, unique={("loan_no",)}, expression_unique={"lower(loan_no)"},
+                              not_null={"loan_id", "loan_no", "current_balance", "modified_date", "borrower_id"})
+    rows, borrowers = _rows(12)
+    tgt_rows = [{**{k: v for k, v in r.items() if k != "loan_number"}, "loan_no": r["loan_number"]} for r in rows]
+    source, target = _sides(rows, tgt_rows, borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target, spec=spec)
+    assert _codes(result, "schema_parity") == [], _tier(result, "schema_parity")["findings"]

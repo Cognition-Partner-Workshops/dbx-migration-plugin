@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -76,6 +77,10 @@ class SchemaFacts:
     check_count: int = 0
     identity_columns: set[str] = field(default_factory=set)
     partial: set[tuple[str, ...]] = field(default_factory=set)
+    # indexes keyed on expressions rather than columns, as their normalised definition text
+    # (e.g. "lower(email)"); a unique one is a constraint the column-wise facts cannot see
+    expression_unique: set[str] = field(default_factory=set)
+    expression_indexes: set[str] = field(default_factory=set)
 
 
 class SourceAdapter(Protocol):
@@ -100,6 +105,15 @@ class BatchAggregates(Protocol):
     metric). `numeric` names the columns that also get a SUM."""
     def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]: ...
+
+
+@runtime_checkable
+class KeyExcludingAggregates(Protocol):
+    """Tier 2 in transactional mode: the same one-statement aggregates over every row except the
+    listed keys (the source rows still in flight), so both sides describe one applied set."""
+    def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
+                                   key_cols: list[str], exclude_keys: list[tuple],
+                                   where: str | None = None) -> dict[str, dict[str, Any]]: ...
 
 
 @runtime_checkable
@@ -257,12 +271,27 @@ class _SqlAdapterBase:
     def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
         w = f" WHERE {where}" if where else ""
+        return self._table_aggregates(table, columns, numeric, w, [])
+
+    def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
+                                   key_cols: list[str], exclude_keys: list[tuple],
+                                   where: str | None = None) -> dict[str, dict[str, Any]]:
+        clauses, values = [], []
+        if where:
+            clauses.append(f"({where})")
+        if exclude_keys:
+            clauses.append("NOT " + self._keys_clause(key_cols, exclude_keys, values))
+        w = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return self._table_aggregates(table, columns, numeric, w, values)
+
+    def _table_aggregates(self, table: str, columns: list[str], numeric: list[str],
+                          w: str, values: list[Any]) -> dict[str, dict[str, Any]]:
         exprs = ["COUNT(*)"]
         for col in columns:
             exprs += [f"COUNT({col})", f"MIN({col})", f"MAX({col})", f"COUNT(DISTINCT {col})"]
             if col in numeric:
                 exprs.append(f"SUM({col})")
-        row = list(self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}")[0])
+        row = list(self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}", self._params(values))[0])
         n = int(row.pop(0))
         out: dict[str, dict[str, Any]] = {}
         for col in columns:
@@ -286,17 +315,7 @@ class _SqlAdapterBase:
             if where:
                 clauses.append(f"({where})")
             if chunk is not None:
-                if len(key_cols) == 1:
-                    clauses.append(f"{key_cols[0]} IN ({', '.join(self._placeholders(len(chunk)))})")
-                    values.extend(k[0] if isinstance(k, tuple) else k for k in chunk)
-                else:
-                    for key in chunk:
-                        parts = []
-                        for col, value in zip(key_cols, key):
-                            parts.append(f"{col} = {self._placeholders(1, len(values))[0]}")
-                            values.append(value)
-                        clauses.append("(" + " AND ".join(parts) + ")")
-                    clauses[-len(chunk):] = ["(" + " OR ".join(clauses[-len(chunk):]) + ")"]
+                clauses.append(self._keys_clause(key_cols, chunk, values))
             w = " WHERE " + " AND ".join(clauses) if clauses else ""
             cur = self._execute(f"SELECT {cols} FROM {table}{w} ORDER BY {', '.join(key_cols)}",
                                 self._params(values))
@@ -304,6 +323,21 @@ class _SqlAdapterBase:
             for row in cur:
                 self.rows_fetched += 1
                 yield dict(zip(names, row))
+
+    def _keys_clause(self, key_cols: list[str], keys: list, values: list[Any]) -> str:
+        """A parenthesised membership test for `keys`, appending its bind values to `values`."""
+        if len(key_cols) == 1:
+            offset = len(values)
+            values.extend(k[0] if isinstance(k, tuple) else k for k in keys)
+            return f"({key_cols[0]} IN ({', '.join(self._placeholders(len(keys), offset))}))"
+        alternatives = []
+        for key in keys:
+            parts = []
+            for col, value in zip(key_cols, key):
+                parts.append(f"{col} = {self._placeholders(1, len(values))[0]}")
+                values.append(value)
+            alternatives.append("(" + " AND ".join(parts) + ")")
+        return "(" + " OR ".join(alternatives) + ")"
 
     def iter_keys(self, table: str, key_cols: list[str], where: str | None = None) -> Iterable[tuple]:
         w = f" WHERE {where}" if where else ""
@@ -589,6 +623,28 @@ def _split_table(table: str, default_schema: str | None) -> tuple[str | None, st
     return (parts[-2] if len(parts) > 1 else default_schema), parts[-1]
 
 
+_INDEX_KEYS_START_RE = re.compile(r"\bUSING\s+\w+\s*\(", re.IGNORECASE)
+
+
+def _index_key_text(indexdef: str) -> str:
+    """The key list of a `CREATE INDEX` definition ("lower(email), tenant_id"), lower-cased with
+    whitespace collapsed: the balanced parenthesis after `USING <method>`, so nested calls stay
+    whole and the INCLUDE/WHERE/WITH suffixes never enter."""
+    m = _INDEX_KEYS_START_RE.search(indexdef)
+    if m is None:
+        return re.sub(r"\s+", " ", indexdef.strip()).lower()
+    depth, start = 1, m.end()
+    for i in range(start, len(indexdef)):
+        ch = indexdef[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return re.sub(r"\s+", " ", indexdef[start:i].strip()).lower()
+    return re.sub(r"\s+", " ", indexdef[start:].strip()).lower()
+
+
 class SqlServerSourceAdapter(_SqlAdapterBase):
     """Secret value: an ODBC connection string. Also the Sybase ASE stand-in for the OLTP track
     (same T-SQL catalog shape through sys.* views on SQL Server; ASE itself has no snapshot
@@ -845,31 +901,36 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.foreign_keys.add((tuple(cols), ref_table, tuple(ref_cols)))
             elif ctype == "c":
                 facts.check_count += 1
+        # attnum 0 in indkey marks an expression key; a LEFT JOIN keeps those indexes visible
         rows = self._rows(
-            "SELECT ix.indisunique, ix.indpred IS NOT NULL, a.attname, k.ord "
+            "SELECT ix.indexrelid, ix.indisunique, ix.indpred IS NOT NULL, ix.indexprs IS NOT NULL, "
+            "a.attname, k.ord, pg_get_indexdef(ix.indexrelid) "
             "FROM pg_index ix JOIN pg_class c ON c.oid = ix.indrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON k.ord <= ix.indnkeyatts "
-            "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum "
+            "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum AND k.attnum > 0 "
             "WHERE n.nspname = %s AND c.relname = %s AND NOT ix.indisprimary "
             "AND ix.indisvalid AND ix.indisready AND ix.indislive "
             "ORDER BY ix.indexrelid, k.ord", (schema, name))
-        # indexes are grouped by their order of appearance (indexrelid), so a change in the
-        # ordinal back to 1 starts a new index
-        current: list[str] = []
-        current_unique = current_partial = False
-
-        def flush() -> None:
-            bucket = facts.partial if current_partial else facts.unique if current_unique else facts.indexes
-            bucket.add(tuple(current))
-        for is_unique, is_partial, col, ord_ in rows:
-            if int(ord_) == 1 and current:
-                flush()
-                current = []
-            current.append(col)
-            current_unique, current_partial = bool(is_unique), bool(is_partial)
-        if current:
-            flush()
+        by_index: dict[Any, dict[str, Any]] = {}
+        for indexrelid, is_unique, is_partial, has_exprs, col, _ord, indexdef in rows:
+            entry = by_index.setdefault(indexrelid, {
+                "cols": [], "unique": bool(is_unique), "partial": bool(is_partial),
+                "expr": bool(has_exprs), "def": indexdef})
+            entry["cols"].append(col)
+        for entry in by_index.values():
+            if entry["expr"]:
+                text = _index_key_text(entry["def"])
+                if entry["unique"] and not entry["partial"]:
+                    facts.expression_unique.add(text)
+                else:  # a partial unique expression is an access path, not full uniqueness
+                    facts.expression_indexes.add(text)
+            elif entry["partial"]:
+                facts.partial.add(tuple(entry["cols"]))
+            elif entry["unique"]:
+                facts.unique.add(tuple(entry["cols"]))
+            else:
+                facts.indexes.add(tuple(entry["cols"]))
         rows = self._rows(
             "SELECT a.attname, a.attnotnull, a.attidentity <> '' OR "
             "       pg_get_serial_sequence(%s, a.attname) IS NOT NULL "
@@ -952,6 +1013,12 @@ class LakebaseTargetAdapter(_PostgresBase):
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
         return super().table_aggregates(self._q(object), columns, numeric, where)
+
+    def table_aggregates_excluding(self, object: str, columns: list[str], numeric: list[str],
+                                   key_cols: list[str], exclude_keys: list[tuple],
+                                   where: str | None = None) -> dict[str, dict[str, Any]]:
+        return super().table_aggregates_excluding(self._q(object), columns, numeric, key_cols,
+                                                  exclude_keys, where)
 
     def fetch_keyed(self, object: str, key_fields: list[str], fields: list[str],
                     where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]:
