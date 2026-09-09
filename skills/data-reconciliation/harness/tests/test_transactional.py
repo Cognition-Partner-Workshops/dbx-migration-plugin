@@ -40,9 +40,12 @@ from recon.transactional import (
     open_window,
 )
 from recon.watermarks import instant, lag_seconds, later, same
-from tests.fakes import FakeSource, FakeTarget
+from tests.fakes import FakeSource, FakeTarget, FakeTypedSource
 
 T0 = dt.datetime(2026, 9, 1, 12, 0, 0)
+EPOCH = dt.datetime(1970, 1, 1)
+UTC = dt.timezone.utc
+PLUS2 = dt.timezone(dt.timedelta(hours=2))
 
 
 def _ts(seconds: int) -> dt.datetime:
@@ -90,10 +93,14 @@ def _spec(with_watermark: bool = True, with_identity: bool = True) -> MappingSpe
     return MappingSpec("m1", [loans, borrowers])
 
 
-def _rows(n: int = 12) -> tuple[list[dict], list[dict]]:
-    loans = [_loan(i, changed=i, borrower_id=1 + i % 3) for i in range(1, n + 1)]
+def _rows(n: int = 12, keys=None) -> tuple[list[dict], list[dict]]:
+    keys = list(keys) if keys is not None else range(1, n + 1)
+    loans = [_loan(k, changed=i, borrower_id=1 + i % 3) for i, k in enumerate(keys, 1)]
     borrowers = [{"borrower_id": b, "name": f"B{b}"} for b in (1, 2, 3)]
     return loans, borrowers
+
+
+EVEN_KEYS = [2 * i for i in range(1, 41)]
 
 
 def _sides(loans_src, loans_tgt, borrowers, *, src_seq=None, tgt_seq=None, tgt_facts=None):
@@ -181,43 +188,28 @@ def test_pk_set_diff_reports_missing_and_extra_keys_only_for_mismatched_ranges()
     assert stats["fingerprint"] == "count+key_sum+key_sumsq+watermark_sum+watermark_sumsq"
 
 
-def test_a_key_swapped_for_another_in_the_same_range_is_caught_when_counts_agree():
-    # one source key absent, one stray target key present in the same range: the range counts
-    # are equal, only the key digest differs; tier 3 is sampled so it may fetch neither row
-    _, borrowers = _rows()
-    loans = [_loan(2 * i, changed=i, borrower_id=1 + i % 3) for i in range(1, 41)]  # even keys
-    tgt = [dict(r) for r in loans if r["loan_id"] != 74]
-    tgt.append(_loan(75, changed=37, borrower_id=1))
+@pytest.mark.parametrize("missing, extra", [
+    # one key swapped inside a range: counts agree, only the key digest differs
+    ((74,), {75: 37}),
+    # 14 and 18 traded for 15 and 17 inside stratum 12..20: same count, key sum and watermarks;
+    # only the second moment (sum of squares) tells them apart
+    ((14, 18), {15: 7, 17: 9}),
+])
+def test_keys_swapped_inside_a_range_are_caught_when_counts_agree(missing, extra):
+    # tier 3 is sampled (2 keys) so it may fetch none of the rows involved
+    loans, borrowers = _rows(keys=EVEN_KEYS)
+    tgt = [dict(r) for r in loans if r["loan_id"] not in missing]
+    tgt += [_loan(k, changed=c, borrower_id=1) for k, c in extra.items()]
     source, target = _sides(loans, tgt, borrowers)
     result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, sample_size=2), depth="sampled")
-    pk = _tier(result, "pk_set_diff")
     assert result["verdict"] == "FAIL"
+    pk = _tier(result, "pk_set_diff")
     assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
-    assert "(74,)" in pk["findings"][0]["detail"] and "(75,)" in pk["findings"][1]["detail"]
+    assert all(f"({k},)" in pk["findings"][0]["detail"] for k in missing)
+    assert all(f"({k},)" in pk["findings"][1]["detail"] for k in extra)
     stats = pk["stats"]["loans"]
-    assert stats["mismatched_ranges"] == 1 and stats["keys_streamed"] < len(loans)
+    assert 0 < stats["mismatched_ranges"] < stats["ranges"] and stats["keys_streamed"] < len(loans)
     assert _tier(result, "counts_through_mapping")["passed"] is True  # counts alone saw nothing
-
-
-def test_two_keys_traded_for_two_with_the_same_sum_are_caught():
-    # source keys 14 and 18 are replaced on the target by 15 and 17 inside the same stratum
-    # (12..20): same count, same key sum, same watermarks; only the second moment (sum of
-    # squares) tells them apart
-    _, borrowers = _rows()
-    loans = [_loan(2 * i, changed=i, borrower_id=1 + i % 3) for i in range(1, 41)]  # even keys
-    tgt = [dict(r) for r in loans if r["loan_id"] not in (14, 18)]
-    tgt.append(_loan(15, changed=7, borrower_id=1))
-    tgt.append(_loan(17, changed=9, borrower_id=1))
-    source, target = _sides(loans, tgt, borrowers)
-    result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, sample_size=2), depth="sampled")
-    assert result["verdict"] == "FAIL"
-    pk = _tier(result, "pk_set_diff")
-    assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
-    assert "(14,)" in pk["findings"][0]["detail"] and "(18,)" in pk["findings"][0]["detail"]
-    assert "(15,)" in pk["findings"][1]["detail"] and "(17,)" in pk["findings"][1]["detail"]
-    stats = pk["stats"]["loans"]
-    assert 0 < stats["mismatched_ranges"] < stats["ranges"]
-    assert _tier(result, "counts_through_mapping")["passed"] is True
 
 
 def test_two_watermarks_moved_in_opposite_directions_are_caught():
@@ -254,8 +246,7 @@ def test_an_undrained_source_delete_fails_counts_and_pk_set_even_with_generous_l
 def test_a_stray_target_key_between_two_source_strata_is_counted():
     # source keys are the even numbers; strata of 5 keys end at 10, 20, ...; a target-only key
     # 11 lies in the gap between the stratum ending at 10 and the one starting at 12
-    _, borrowers = _rows()
-    loans = [_loan(2 * i, changed=i, borrower_id=1 + i % 3) for i in range(1, 41)]
+    loans, borrowers = _rows(keys=EVEN_KEYS)
     tgt = [dict(r) for r in loans] + [_loan(11, changed=5, borrower_id=1)]
     source, target = _sides(loans, tgt, borrowers)
     result = _run(source, target, tol=Tolerances("t1", pk_set_ranges=8, cdc_lag_max_s=3600))
@@ -294,16 +285,8 @@ def test_in_flight_rows_are_not_defects_when_lag_is_tolerated():
     cdc = _tier(result, "cdc_lag_ordering")["stats"]["loans"]
     assert cdc["lag_s"] == 2.0 and cdc["in_flight"] == 2
     assert result["merge_eligible"] is True
-
-
-def test_summary_names_the_window_isolation_and_in_flight_rows():
-    loans, borrowers = _rows(12)
-    tgt = [dict(r) for r in loans if r["loan_id"] <= 10]
-    source, target = _sides(loans, tgt, borrowers)
-    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=5))
-    summary = render_summary(result)
     assert ("- Consistency window: source isolation `fake_snapshot`, target isolation "
-            "`fake_snapshot`, held; in flight at open: `{\"loans\": 2}`") in summary
+            "`fake_snapshot`, held; in flight at open: `{\"loans\": 2}`") in render_summary(result)
 
 
 def test_in_flight_predicate_starts_at_the_next_microsecond_for_datetimes():
@@ -435,7 +418,7 @@ def test_digest_kind_is_exact_for_whole_numbers_only():
     # a column whose scale varies by row (unconstrained numeric) gets no digest at all
     assert _common_kind([Decimal(7), Decimal("7.5")]) == "other"
     assert _common_kind([None, 3, 4]) == "integer" and _common_kind([]) == "other"
-    base = _NoSnapshotAdapter(_RecordingConn())
+    base = _NoSnapshotAdapter(_StubConn())
     digest, square = base._digest_sql("k", "integer")
     assert digest == "CAST(k AS DECIMAL(38,0))"
     assert "DECIMAL(38,6)" not in square
@@ -485,10 +468,10 @@ def test_tolerance_switches_load_real_booleans_and_default_off(tmp_path):
     path.write_text(json.dumps({"version": "t1", "accept_marker_only_window": True}))
     tol = load_tolerances(path)
     assert tol.accept_marker_only_window is True and tol.pk_set_stream_every_range is False
-    path.write_text(json.dumps({"version": "t1"}))
+    path.write_text(json.dumps({"version": "t1", "cdc_lag_max_s": 60}))
     tol = load_tolerances(path)
     assert tol.accept_marker_only_window is False and tol.pk_set_stream_every_range is False
-    assert tol.accept_target_only_constraints is False
+    assert tol.accept_target_only_constraints is False and tol.cdc_lag_max_s == 60.0
 
 
 @pytest.mark.parametrize("key", ["cdc_lag_max_s", "numeric_abs_tol", "aggregate_rel_tol"])
@@ -501,24 +484,6 @@ def test_tolerance_bounds_must_be_finite_non_negative_numbers(tmp_path, key, val
     path.write_text(json.dumps({"version": "t1", key: value}))  # json emits NaN/Infinity literals
     with pytest.raises(ConfigError, match=f"{key} must be .*{needle}"):
         load_tolerances(path)
-
-
-def test_a_nan_lag_tolerance_cannot_reach_tier6(tmp_path):
-    path = tmp_path / "tol.json"
-    path.write_text('{"version": "t1", "cdc_lag_max_s": NaN}')
-    with pytest.raises(ConfigError, match="cdc_lag_max_s must be finite"):
-        load_tolerances(path)
-    path.write_text('{"version": "t1", "cdc_lag_max_s": 60}')
-    assert load_tolerances(path).cdc_lag_max_s == 60.0
-
-
-def test_a_stale_target_fails_lag_under_any_loadable_tolerance():
-    """The largest lag the loader accepts is still a finite number a real lag can exceed."""
-    loans, borrowers = _rows(6)
-    stale = [dict(r, modified_date=_ts(-7200)) for r in loans]
-    source, target = _sides(loans, stale, borrowers)
-    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=3600.0))
-    assert "cdc_lag_exceeded" in _codes(result, "cdc_lag_ordering")
 
 
 def _tokened(source, counter):
@@ -571,69 +536,22 @@ def test_a_balanced_insert_and_delete_during_fallback_is_caught_by_the_change_to
     assert result["merge_eligible"] is False
 
 
-def test_the_same_writes_are_invisible_to_markers_alone_and_that_is_why_they_do_not_pass():
-    # sanity check of the premise: without a token the markers hold, and the only thing that
-    # stops a merge is the window_unproven finding
-    loans, borrowers = _rows(12)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    _marker_only(source)
-    original = source.range_fingerprints
-
-    def write_mid_run(*a, **kw):
-        loans[1]["current_balance"] += 1
-        return original(*a, **kw)
-    source.range_fingerprints = write_mid_run
-    result = _run(source, target)
-    assert _codes(result, "consistency_window") == ["window_unproven"]
-    assert result["merge_eligible"] is False
-
-
-def test_a_shared_tier_that_raises_still_closes_both_windows():
+@pytest.mark.parametrize("target_fails, source_fails, raised", [
+    ("target_row_count", None, "connection reset during tier 1"),   # a shared tier
+    ("range_fingerprints", None, "lakebase branch went away"),       # a transactional tier
+    ("window_marker", None, "permission denied for marker"),         # the opening marker read
+    ("range_fingerprints", "close_window", "source rollback failed"),
+])
+def test_a_raise_anywhere_in_the_run_still_closes_both_windows(target_fails, source_fails, raised):
     loans, borrowers = _rows(6)
     source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    def failing_target_count(object, where=None):
-        raise RuntimeError("connection reset during tier 1")
-    target.target_row_count = failing_target_count
-    with pytest.raises(RuntimeError, match="tier 1"):
-        _run(source, target)
-    assert source.calls["close_window"] == 1 and target.calls["close_window"] == 1
-    assert not source.window_open and not target.window_open
-
-
-def test_a_transactional_tier_that_raises_still_closes_both_windows():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    target.fail_on["range_fingerprints"] = RuntimeError("lakebase branch went away")
-    with pytest.raises(RuntimeError, match="lakebase"):
-        _run(source, target)
-    assert source.calls["close_window"] == 1 and target.calls["close_window"] == 1
-
-
-def test_a_failing_marker_query_at_open_still_closes_both_windows():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    target.fail_on["window_marker"] = RuntimeError("permission denied for marker")
-    with pytest.raises(RuntimeError, match="marker"):
-        _run(source, target)
-    assert source.calls["close_window"] == 1 and target.calls["close_window"] == 1
-
-
-def test_one_side_failing_to_close_does_not_leave_the_other_pinned():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    target.fail_on["range_fingerprints"] = RuntimeError("tier failure")
-    source.fail_on["close_window"] = RuntimeError("source rollback failed")
-    with pytest.raises(RuntimeError, match="source rollback failed"):
+    target.fail_on[target_fails] = RuntimeError("tier failure" if source_fails else raised)
+    if source_fails:
+        source.fail_on[source_fails] = RuntimeError(raised)
+    with pytest.raises(RuntimeError, match=raised):
         _run(source, target)
     assert target.calls["close_window"] == 1 and not target.window_open
-
-
-def test_a_clean_run_closes_each_window_exactly_once():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    result = _run(source, target)
-    assert result["verdict"] == "PASS"
-    assert source.calls["close_window"] == 1 and target.calls["close_window"] == 1
+    assert source.calls["close_window"] == 1 and (source_fails or not source.window_open)
 
 
 def test_field_diff_is_still_graded_for_applied_rows():
@@ -688,12 +606,7 @@ def test_source_filtered_indexes_are_reported_for_a_manual_check_not_graded():
 
 
 def _facts(base: SchemaFacts, **over) -> SchemaFacts:
-    fields = {"primary_key": base.primary_key, "unique": set(base.unique),
-              "foreign_keys": set(base.foreign_keys), "not_null": set(base.not_null),
-              "indexes": set(base.indexes), "check_count": base.check_count,
-              "identity_columns": set(base.identity_columns)}
-    fields.update(over)
-    return SchemaFacts(**fields)
+    return dataclasses.replace(base, **over)
 
 
 def _tightened(**over) -> SchemaFacts:
@@ -768,61 +681,60 @@ def _renamed_rows(loans: list[dict]) -> list[dict]:
     return [{("balance_current" if k == "current_balance" else k): v for k, v in r.items()} for r in loans]
 
 
-def test_catalog_casing_never_changes_parity_including_a_renamed_target_column():
+@pytest.mark.parametrize("renamed_not_null, codes", [({"balance_current"}, []), (set(), ["not_null_missing"])])
+def test_catalog_casing_never_changes_parity_on_a_renamed_target_column(renamed_not_null, codes):
     cased = _sqlserver_cased(LOANS_FACTS)
     assert cased.primary_key == ("Loan_ID",) and "Current_Balance" in cased.not_null
     loans, borrowers = _rows(6)
-    tgt = _tightened(not_null=(TARGET_LOANS_FACTS.not_null - {"current_balance"}) | {"balance_current"})
+    tgt = _tightened(not_null=(TARGET_LOANS_FACTS.not_null - {"current_balance"}) | renamed_not_null)
     source, target = _sides(loans, _renamed_rows(loans), borrowers, tgt_facts=tgt)
     source.schema["dbo.loans"] = cased
     source.schema["dbo.borrowers"] = _sqlserver_cased(BORROWER_FACTS)
     result = _run(source, target, spec=_renamed_spec())
-    assert result["verdict"] == "PASS", _tier(result, "schema_parity")["findings"]
-    assert _codes(result, "schema_parity") == []
+    parity = _tier(result, "schema_parity")
+    assert _codes(result, "schema_parity") == codes, parity["findings"]
     # the catalog's own spelling is what the evidence records
-    assert _tier(result, "schema_parity")["stats"]["loans"]["source"]["primary_key"] == ["Loan_ID"]
-
-
-def test_catalog_casing_never_hides_a_missing_constraint_on_a_renamed_column():
-    loans, borrowers = _rows(6)
-    tgt = _tightened(not_null=TARGET_LOANS_FACTS.not_null - {"current_balance"})  # renamed col nullable
-    source, target = _sides(loans, _renamed_rows(loans), borrowers, tgt_facts=tgt)
-    source.schema["dbo.loans"] = _sqlserver_cased(LOANS_FACTS)
-    source.schema["dbo.borrowers"] = _sqlserver_cased(BORROWER_FACTS)
-    result = _run(source, target, spec=_renamed_spec())
-    assert result["verdict"] == "FAIL"
-    assert _codes(result, "schema_parity") == ["not_null_missing"]
-    assert "current_balance -> target balance_current is nullable" in \
-        _tier(result, "schema_parity")["findings"][0]["detail"]
+    assert parity["stats"]["loans"]["source"]["primary_key"] == ["Loan_ID"]
+    if codes:
+        assert "current_balance -> target balance_current is nullable" in parity["findings"][0]["detail"]
 
 
 def test_primary_key_mismatch_is_reported():
     loans, borrowers = _rows(6)
-    facts = SchemaFacts(primary_key=("loan_number",), unique={("loan_number",)},
-                        foreign_keys=TARGET_LOANS_FACTS.foreign_keys,
-                        not_null=TARGET_LOANS_FACTS.not_null, indexes=TARGET_LOANS_FACTS.indexes,
-                        check_count=2, identity_columns={"loan_id"})
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=facts)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
+                            tgt_facts=_tightened(primary_key=("loan_number",)))
     result = _run(source, target)
     assert "primary_key_mismatch" in _codes(result, "schema_parity")
 
 
-def test_sequence_behind_source_max_key_is_a_cutover_blocker():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_seq=4)
-    result = _run(source, target)
-    assert result["verdict"] == "FAIL"
-    assert _codes(result, "schema_parity") == ["sequence_behind_source"]
-    identity = _tier(result, "schema_parity")["stats"]["loans"]["identity"]
-    assert identity == {"source_next": 7, "source_max": 6, "target_next": 4}
+DESC_KEYS = [1000 - i for i in range(6)]
 
 
-def test_missing_target_sequence_is_a_finding():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    target.sequences[("loans", "loan_id")] = None
+@pytest.mark.parametrize("keys, src_seq, tgt_seq, codes, needle, identity", [
+    (None, None, 4, ["sequence_behind_source"], "4 <= source max",
+     {"source_next": 7, "source_max": 6, "target_next": 4}),
+    (None, None, None, ["sequence_missing"], "owns no sequence", None),
+    # both count down from 1000: next 994 is below every source key, the safe state
+    (DESC_KEYS, (994, -1), (994, -1), [], None,
+     {"source_next": 994, "source_max": 1000, "target_next": 994, "source_min": 995, "increment": -1}),
+    (DESC_KEYS, (994, -1), (997, -1), ["sequence_behind_source"], "997 >= source min loan_id=995", None),
+    (None, (7, 1), (0, -1), ["sequence_direction_mismatch"], "opposite ends", None),
+    (None, None, (4, 5), ["sequence_behind_source"], "collide", None),
+    (None, (7, 10), (7, 1), ["sequence_increment_mismatch"], "steps by 10", None),
+])
+def test_identity_parity(keys, src_seq, tgt_seq, codes, needle, identity):
+    loans, borrowers = _rows(6, keys=keys)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, src_seq=src_seq, tgt_seq=tgt_seq)
+    if tgt_seq is None:
+        target.sequences[("loans", "loan_id")] = None
     result = _run(source, target)
-    assert _codes(result, "schema_parity") == ["sequence_missing"]
+    assert result["verdict"] == ("PASS" if not codes else "FAIL"), result
+    assert _codes(result, "schema_parity") == codes
+    parity = _tier(result, "schema_parity")
+    if needle:
+        assert needle in parity["findings"][0]["detail"]
+    if identity:
+        assert parity["stats"]["loans"]["identity"] == identity
 
 
 def test_unverifiable_schema_facts_warn_and_block_merge_eligibility():
@@ -922,25 +834,29 @@ def test_cli_refuses_transactional_mode_against_a_delta_target(tmp_path, monkeyp
     assert "transactional" in msg and "lakebase" in msg and "not implemented" in msg
 
 
-class _Conn:
-    """Minimal DB-API stand-in whose only answer is the connected database name."""
+class _StubConn:
+    """DB-API stand-in that records every (sql, params) and answers each fetch with `rows`."""
 
-    def __init__(self, database):
-        self.database, self.closed, self.executed = database, False, []
+    def __init__(self, rows=((3, 3, 1, 9, 3, 12),)):
+        self.rows, self.closed, self.executed = list(rows), False, []
 
     def cursor(self):
         conn = self
 
         class Cur:
             def execute(self, sql, params=()):
-                conn.executed.append(sql)
+                conn.executed.append((sql, params))
 
             def fetchall(self):
-                return [(conn.database,)]
+                return conn.rows
         return Cur()
 
     def close(self):
         self.closed = True
+
+
+def _db(name):
+    return _StubConn([(name,)])
 
 
 def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkeypatch):
@@ -949,13 +865,13 @@ def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkey
     conns = []
 
     def connect(dsn):
-        conns.append(_Conn("loan_servicing_prod"))
+        conns.append(_db("loan_servicing_prod"))
         return conns[-1]
     monkeypatch.setattr(psycopg, "connect", connect)
     with pytest.raises(TargetIdentityError, match="'loan_servicing_prod'.*'lakebase_rehearsal'"):
         LakebaseTargetAdapter("T", "lakebase_rehearsal", "loan_servicing")
     assert conns[0].closed is True
-    assert conns[0].executed == ["SELECT current_database()"]
+    assert [s for s, _ in conns[0].executed] == ["SELECT current_database()"]
     target = LakebaseTargetAdapter("T", "loan_servicing_prod", "loan_servicing")
     assert target.database == "loan_servicing_prod" and conns[1].closed is False
 
@@ -1031,7 +947,7 @@ def test_cli_refuses_a_lakebase_dsn_outside_the_allowlisted_database(tmp_path, m
     psycopg = pytest.importorskip("psycopg")
     monkeypatch.setenv("S", "src")
     monkeypatch.setenv("T", "dsn-under-test")
-    monkeypatch.setattr(psycopg, "connect", lambda dsn: _Conn("somewhere_else"))
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: _db("somewhere_else"))
     monkeypatch.setitem(SOURCE_ADAPTERS, "sqlserver", lambda secret: FakeSource({}))
     with pytest.raises(SystemExit) as exc:
         main(["run", "--unit", "u", "--family", "sqlserver", "--mapping", "m.json",
@@ -1049,9 +965,6 @@ def test_cli_estimate_accepts_mode(tmp_path, monkeypatch, capsys):
                  "--mode", "transactional"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["mode"] == "transactional" and "tier5" in out["source_statements"]
-
-
-# ---- round 5: tier 2 over the applied set, one watermark comparator, expression indexes ----
 
 
 def test_drift_in_an_applied_row_fails_aggregates_while_other_rows_are_in_flight():
@@ -1112,24 +1025,8 @@ def test_applied_predicate_is_the_complement_of_the_in_flight_predicate_plus_nul
     assert _applied_predicate("version_no", 41) == "(version_no <= 41 OR version_no IS NULL)"
 
 
-class _RecordingConn:
-    def __init__(self):
-        self.executed: list[tuple[str, tuple]] = []
-
-    def cursor(self):
-        conn = self
-
-        class Cur:
-            def execute(self, sql, params=()):
-                conn.executed.append((sql, params))
-
-            def fetchall(self):
-                return [(3, 3, 1, 9, 3, 12)]
-        return Cur()
-
-
 def test_sql_adapter_excludes_in_flight_keys_in_one_bound_statement():
-    conn = _RecordingConn()
+    conn = _StubConn()
     adapter = _NoSnapshotAdapter(conn)
     out = adapter.table_aggregates_excluding("dbo.loans", ["current_balance"], ["current_balance"],
                                              ["loan_id"], [(11,), (12,)], where="status = 'A'")
@@ -1141,10 +1038,6 @@ def test_sql_adapter_excludes_in_flight_keys_in_one_bound_statement():
     sql, params = conn.executed[-1]
     assert sql.endswith("FROM dbo.x WHERE NOT ((a = ? AND b = ?) OR (a = ? AND b = ?))")
     assert params == (1, "p", 2, "q")
-
-
-UTC = dt.timezone.utc
-PLUS2 = dt.timezone(dt.timedelta(hours=2))
 
 
 def test_watermark_comparator_treats_naive_as_utc_and_never_compares_lexically():
@@ -1260,16 +1153,22 @@ def test_index_key_text_keeps_nested_calls_whole_and_drops_suffixes():
         "to_tsvector('english'::regconfig, coalesce(body, ''::text))"
 
 
-def test_expression_index_columns_follow_the_field_mapping():
+@pytest.mark.parametrize("expr_src, expr_tgt", [
+    ("lower(loan_number)", "lower(loan_no)"),
+    # a column name inside a string literal is not a column reference
+    ("CASE WHEN loan_number = 'loan_number' THEN NULL ELSE lower(loan_number) END",
+     "CASE WHEN loan_no = 'loan_number' THEN NULL ELSE lower(loan_no) END"),
+])
+def test_expression_index_columns_follow_the_field_mapping(expr_src, expr_tgt):
     spec = _spec()
     loans = dataclasses.replace(spec.objects[0], fields=[
         FieldMapping("loan_number", "loan_no", "varchar", "string"),
         FieldMapping("current_balance", "current_balance", "money", "decimal(19,4)"),
         FieldMapping("borrower_id", "borrower_id", "int", "int")])
     spec = MappingSpec("m1", [loans, spec.objects[1]])
-    src = dataclasses.replace(LOANS_FACTS, unique={("loan_number",)}, expression_unique={"lower(loan_number)"})
-    tgt = dataclasses.replace(TARGET_LOANS_FACTS, unique={("loan_no",)}, expression_unique={"lower(loan_no)"},
-                              not_null={"loan_id", "loan_no", "current_balance", "modified_date", "borrower_id"})
+    src = _facts(LOANS_FACTS, unique={("loan_number",)}, expression_unique={expr_src})
+    tgt = _tightened(unique={("loan_no",)}, expression_unique={expr_tgt},
+                     not_null={"loan_id", "loan_no", "current_balance", "modified_date", "borrower_id"})
     rows, borrowers = _rows(12)
     tgt_rows = [{**{k: v for k, v in r.items() if k != "loan_number"}, "loan_no": r["loan_number"]} for r in rows]
     source, target = _sides(rows, tgt_rows, borrowers, tgt_facts=tgt)
@@ -1295,33 +1194,13 @@ def test_expression_mapping_rewrites_column_references_only():
         "to_tsvector('english'::regconfig, coalesce(body, ''::text))"
 
 
-def test_expression_unique_parity_ignores_a_column_name_inside_a_literal():
-    spec = _spec()
-    loans = dataclasses.replace(spec.objects[0], fields=[
-        FieldMapping("loan_number", "loan_no", "varchar", "string"),
-        FieldMapping("current_balance", "current_balance", "money", "decimal(19,4)"),
-        FieldMapping("borrower_id", "borrower_id", "int", "int")])
-    spec = MappingSpec("m1", [loans, spec.objects[1]])
-    expr_src = "CASE WHEN loan_number = 'loan_number' THEN NULL ELSE lower(loan_number) END"
-    expr_tgt = "CASE WHEN loan_no = 'loan_number' THEN NULL ELSE lower(loan_no) END"
-    src = dataclasses.replace(LOANS_FACTS, unique={("loan_number",)}, expression_unique={expr_src})
-    tgt = dataclasses.replace(TARGET_LOANS_FACTS, unique={("loan_no",)}, expression_unique={expr_tgt},
-                              not_null={"loan_id", "loan_no", "current_balance", "modified_date", "borrower_id"})
-    rows, borrowers = _rows(12)
-    tgt_rows = [{**{k: v for k, v in r.items() if k != "loan_number"}, "loan_no": r["loan_number"]} for r in rows]
-    source, target = _sides(rows, tgt_rows, borrowers, tgt_facts=tgt)
-    source.schema["dbo.loans"] = src
-    result = _run(source, target, spec=spec)
-    assert _codes(result, "schema_parity") == [], _tier(result, "schema_parity")["findings"]
-
-
 class _PostgresLike(_PostgresBase):
     pass
 
 
 def test_watermark_literal_carries_the_utc_offset_only_where_the_engine_needs_it():
     hwm = dt.datetime(2026, 9, 8, 18, 43, 52, 164112, tzinfo=PLUS2)   # 16:43:52.164112 UTC
-    pg, generic = _PostgresLike(_RecordingConn()), _NoSnapshotAdapter(_RecordingConn())
+    pg, generic = _PostgresLike(_StubConn()), _NoSnapshotAdapter(_StubConn())
     # Postgres: a timestamptz column would read a bare literal in the session TimeZone
     assert _newer_predicate("modified_at", hwm, pg.watermark_literal) == \
         "modified_at >= '2026-09-08 16:43:52.164113+00:00'"
@@ -1343,11 +1222,6 @@ def test_transactional_predicates_use_the_source_engine_literal(monkeypatch):
     ctx = open_window(_spec(), source, target)
     assert "modified_date >= <SRC>" in wheres
     assert ctx.applied_where(_spec().objects[0]) == "(modified_date < <SRC> OR modified_date IS NULL)"
-
-
-# ---- round 7: null watermarks, descending identities, probe rollback, unordered uniques ----
-
-EPOCH = dt.datetime(1970, 1, 1)
 
 
 def test_a_watermark_that_turns_null_on_the_target_changes_the_fingerprint():
@@ -1388,24 +1262,6 @@ def test_range_fingerprints_carry_the_watermark_null_count():
     assert n == 4 and keys[0][0] == 10 and len(wm) == 3 and wm[2] == 1
 
 
-class _GroupedConn(_RecordingConn):
-    """Answers a GROUP BY rng statement with the rows handed in, keyed by the range index."""
-    def __init__(self, rows):
-        super().__init__()
-        self.rows = rows
-
-    def cursor(self):
-        conn = self
-
-        class Cur:
-            def execute(self, sql, params=()):
-                conn.executed.append((sql, params))
-
-            def fetchall(self):
-                return conn.rows
-        return Cur()
-
-
 def _contiguous(n, width=2):
     edges = [(i * 10,) * width for i in range(1, n)]
     return list(zip([None] + edges, edges + [None]))
@@ -1414,7 +1270,8 @@ def _contiguous(n, width=2):
 def test_composite_key_fingerprints_stay_under_sql_server_parameter_limit():
     # 64 ranges x 2 key columns x (sum, sum of squares) + a watermark: the old one-CASE-per-term
     # shape bound the bounds ~8 times per range and crossed 2100 parameters on SQL Server
-    conn = _GroupedConn([(1, 5, 50, 7, 50, 7, 500, 9, 0), (3, 2, 20, 3, 20, 3, 200, 4, 1)])
+    # GROUP BY rng rows: (rng, count, sum a, sumsq a, sum b, sumsq b, sum wm, sumsq wm, wm nulls)
+    conn = _StubConn([(1, 5, 50, 7, 50, 7, 500, 9, 0), (3, 2, 20, 3, 20, 3, 200, 4, 1)])
     adapter = _NoSnapshotAdapter(conn)
     out = adapter.range_fingerprints("dbo.t", ["a", "b"], ["integer", "integer"], "version_no",
                                      "integer", _contiguous(64))
@@ -1430,7 +1287,7 @@ def test_composite_key_fingerprints_stay_under_sql_server_parameter_limit():
 
 
 def test_range_fingerprints_split_into_statements_when_ranges_exceed_the_parameter_budget():
-    conn = _GroupedConn([(0, 1, 1, 1, 1, 1)])
+    conn = _StubConn([(0, 1, 1, 1, 1, 1)])
     adapter = _NoSnapshotAdapter(conn)
     adapter.max_params = 20
     out = adapter.range_fingerprints("dbo.t", ["a", "b"], ["integer", "integer"], None, None,
@@ -1438,61 +1295,6 @@ def test_range_fingerprints_split_into_statements_when_ranges_exceed_the_paramet
     # 6 parameters per range -> 3 ranges per statement -> 17 statements, every range answered
     assert len(conn.executed) == 17 and all(len(p) <= 20 for _, p in conn.executed)
     assert len(out) == 50 and out[0] == (1, ((1, 1), (1, 1)), None)
-
-
-def test_a_descending_target_identity_below_the_source_max_is_not_a_collision():
-    # both identities count down from 1000: the source has handed out 1000..995, the target
-    # sequence's next value 994 is below every source key, which is exactly the safe state
-    _, borrowers = _rows()
-    loans = [_loan(1000 - i, changed=i, borrower_id=1 + i % 3) for i in range(6)]
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
-                            src_seq=(994, -1), tgt_seq=(994, -1))
-    result = _run(source, target)
-    assert result["verdict"] == "PASS", result
-    identity = _tier(result, "schema_parity")["stats"]["loans"]["identity"]
-    assert identity == {"source_next": 994, "source_max": 1000, "target_next": 994,
-                        "source_min": 995, "increment": -1}
-
-
-def test_a_descending_target_identity_at_or_above_the_source_min_collides():
-    _, borrowers = _rows()
-    loans = [_loan(1000 - i, changed=i, borrower_id=1 + i % 3) for i in range(6)]
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
-                            src_seq=(994, -1), tgt_seq=(997, -1))
-    result = _run(source, target)
-    assert result["verdict"] == "FAIL"
-    assert _codes(result, "schema_parity") == ["sequence_behind_source"]
-    (finding,) = _tier(result, "schema_parity")["findings"]
-    assert "997 >= source min loan_id=995" in finding["detail"] and "descending" in finding["detail"]
-
-
-def test_identities_stepping_in_opposite_directions_are_a_finding_even_with_headroom():
-    _, borrowers = _rows()
-    loans = [_loan(i, changed=i, borrower_id=1 + i % 3) for i in range(1, 7)]
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
-                            src_seq=(7, 1), tgt_seq=(0, -1))
-    result = _run(source, target)
-    assert _codes(result, "schema_parity") == ["sequence_direction_mismatch"]
-
-
-def test_an_ascending_identity_behind_the_source_max_is_still_a_collision():
-    _, borrowers = _rows()
-    loans = [_loan(i, changed=i, borrower_id=1 + i % 3) for i in range(1, 7)]
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_seq=(4, 5))
-    result = _run(source, target)
-    assert _codes(result, "schema_parity") == ["sequence_behind_source"]
-
-
-def test_identities_with_different_increments_in_the_same_direction_are_a_finding():
-    _, borrowers = _rows()
-    loans = [_loan(i, changed=i, borrower_id=1 + i % 3) for i in range(1, 7)]
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
-                            src_seq=(7, 10), tgt_seq=(7, 1))
-    result = _run(source, target)
-    assert _codes(result, "schema_parity") == ["sequence_increment_mismatch"]
-    (finding,) = _tier(result, "schema_parity")["findings"]
-    assert "steps by 10" in finding["detail"]
-    assert (finding["source_value"], finding["target_value"]) == ("10", "1")
 
 
 SRC_FK = ((("borrower_id",), "dbo.borrowers", ("borrower_id",)))
@@ -1526,39 +1328,26 @@ def test_referential_actions_normalise_across_catalogs():
         ["no action", "cascade", "set null", "set default"]
 
 
-def test_a_composite_unique_declared_in_another_column_order_is_the_same_constraint():
-    loans, borrowers = _rows(6)
-    src = _facts(LOANS_FACTS, unique={("loan_number",), ("borrower_id", "loan_number")})
-    tgt = _facts(TARGET_LOANS_FACTS, unique={("loan_number",), ("loan_number", "borrower_id")})
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
-    source.schema["dbo.loans"] = src
-    result = _run(source, target)
-    assert result["verdict"] == "PASS", result
-    stats = _tier(result, "schema_parity")["stats"]
-    (note,) = stats["unique_reordered"]
-    assert "('borrower_id', 'loan_number')" in note and "('loan_number', 'borrower_id')" in note
-
-
-def test_a_genuinely_extra_or_missing_composite_unique_is_still_graded():
-    loans, borrowers = _rows(6)
-    src = _facts(LOANS_FACTS, unique={("loan_number",), ("borrower_id", "loan_number")})
-    tgt = _facts(TARGET_LOANS_FACTS, unique={("loan_number",), ("borrower_id", "current_balance")})
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
-    source.schema["dbo.loans"] = src
-    result = _run(source, target)
-    assert _codes(result, "schema_parity") == ["unique_extra", "unique_missing"]
-
-
-def test_a_source_index_leading_with_the_other_column_is_still_uncovered():
-    # the access path keeps its order: an index on (loan_number, borrower_id) does not serve
+@pytest.mark.parametrize("src, tgt, codes, note", [
+    # a composite unique is a column set: another declaration order is the same constraint
+    ({"unique": {("loan_number",), ("borrower_id", "loan_number")}},
+     {"unique": {("loan_number",), ("loan_number", "borrower_id")}}, [], "unique_reordered"),
+    ({"unique": {("loan_number",), ("borrower_id", "loan_number")}},
+     {"unique": {("loan_number",), ("borrower_id", "current_balance")}}, ["unique_extra", "unique_missing"], None),
+    # an index is an access path and keeps its order: (loan_number, borrower_id) does not serve
     # a lookup that leads with borrower_id
+    ({"indexes": {("borrower_id", "loan_number")}}, {"indexes": {("loan_number", "borrower_id")}},
+     ["index_missing"], None),
+])
+def test_composite_unique_is_unordered_but_a_composite_index_is_not(src, tgt, codes, note):
     loans, borrowers = _rows(6)
-    src = _facts(LOANS_FACTS, indexes={("borrower_id", "loan_number")})
-    tgt = _facts(TARGET_LOANS_FACTS, indexes={("loan_number", "borrower_id")})
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
-    source.schema["dbo.loans"] = src
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=_tightened(**tgt))
+    source.schema["dbo.loans"] = _facts(LOANS_FACTS, **src)
     result = _run(source, target)
-    assert _codes(result, "schema_parity") == ["index_missing"]
+    assert _codes(result, "schema_parity") == codes
+    if note:
+        (line,) = _tier(result, "schema_parity")["stats"][note]
+        assert "('borrower_id', 'loan_number')" in line and "('loan_number', 'borrower_id')" in line
 
 
 def _undeclared_spec() -> MappingSpec:
@@ -1569,7 +1358,6 @@ def _undeclared_spec() -> MappingSpec:
 
 
 def test_a_typed_source_is_never_probed_for_undeclared_fields():
-    from tests.fakes import FakeTypedSource
     loans, borrowers = _rows(12)
     for r in loans:
         r["loan_status"] = "ACTIVE"

@@ -2,33 +2,35 @@
 
 from __future__ import annotations
 
-import datetime
 import datetime as dt
-import json
 import decimal
-from decimal import ROUND_HALF_UP, Decimal
+import json
+import operator
 from collections import Counter
-from typing import Any, Iterable
+from collections.abc import Iterable
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 
 from recon.adapters import DIGEST_MODULUS, IdentityState, SchemaFacts, Stratum
-from recon.paths import get_path
 from recon.canon import MISSING
+from recon.paths import get_path
 from recon.watermarks import literal
 
-
 _EPOCH = dt.datetime(1970, 1, 1)  # noqa: DTZ001  fixtures use naive datetimes throughout
+_NUMERIC = (int, float, decimal.Decimal)
+_OPS = {" >= ": operator.ge, " > ": operator.gt, " <= ": operator.le, " < ": operator.lt}
 
 
 def _instant(value):
     """Naive-UTC form of a datetime, mirroring recon.watermarks.instant for literal predicates."""
-    if isinstance(value, datetime.datetime) and value.tzinfo is not None:
-        return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    if isinstance(value, dt.datetime) and value.tzinfo is not None:
+        return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
     return value
 
 
 def _agg_of(vals: list) -> dict[str, Any]:
     nn = [v for v in vals if v is not None]
-    nums = [v for v in nn if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool)]
+    nums = [v for v in nn if isinstance(v, _NUMERIC) and not isinstance(v, bool)]
     return {"count": len(vals),
             "null_rate": (len(vals) - len(nn)) / len(vals) if vals else 0.0,
             "min": min(nn) if nn else None, "max": max(nn) if nn else None,
@@ -36,50 +38,29 @@ def _agg_of(vals: list) -> dict[str, Any]:
 
 
 def _matches(row: dict, where: str | None) -> bool:
+    """Evaluates the predicates the tiers issue: a JSON scope, `col = literal`, or the
+    transactional window's `[(scope) AND ]col OP literal[ OR col IS NULL]`."""
     if not where:
         return True
     if where.lstrip().startswith("{"):
-        parsed = json.loads(where)
-        return all(row.get(k) == v for k, v in parsed.items())
-    if " IS NULL)" in where:
-        # the applied predicate: [(scope) AND ](col < lit OR col IS NULL) | (col <= lit OR ...)
-        scope, _, applied = where.rpartition(" AND (") if " AND (" in where else (None, None, where)
-        bound, _, _ = applied.strip("() ").partition(" OR ")
-        op = " <= " if " <= " in bound else " < "
+        return all(row.get(k) == v for k, v in json.loads(where).items())
+    scope, _, pred = where.rpartition(" AND ") if " AND " in where else ("", "", where)
+    bound, _, null_ok = pred.strip("() ").partition(" OR ")
+    op = next((o for o in _OPS if o in bound), None)
+    if op:
         col, _, lit = bound.partition(op)
         value = row.get(col.strip())
         if value is None:
-            applied_ok = True
-        else:
-            lit = lit.strip().strip("'")
-            bound_v = (datetime.datetime.fromisoformat(lit) if isinstance(value, datetime.datetime)
-                       else type(value)(lit))
-            applied_ok = _instant(value) <= bound_v if op == " <= " else _instant(value) < bound_v
-        return applied_ok and _matches(row, scope.strip("() ") if scope else None)
-    if " > " in where or " >= " in where:
-        # the in-flight predicate the transactional window issues:
-        # [(scope) AND ]col > literal  |  [(scope) AND ]col >= datetime_literal
-        scope, _, newer = where.rpartition(" AND ") if " AND " in where else (None, None, where)
-        op = " >= " if " >= " in newer else " > "
-        col, _, lit = newer.partition(op)
-        value = row.get(col.strip())
-        if value is None:
-            return False
+            return bool(null_ok) and _matches(row, scope.strip("() "))
         lit = lit.strip().strip("'")
-        if isinstance(value, datetime.datetime):
-            bound = datetime.datetime.fromisoformat(lit)
-            value = _instant(value)
-        else:
-            bound = type(value)(lit)
-        newer_ok = value >= bound if op == " >= " else value > bound
-        return newer_ok and _matches(row, scope.strip("() ") if scope else None)
+        edge = dt.datetime.fromisoformat(lit) if isinstance(value, dt.datetime) else type(value)(lit)
+        return _OPS[op](_instant(value), edge) and _matches(row, scope.strip("() "))
     left, sep, right = where.partition("=")
     if not sep:
         return True
-    right = right.strip().strip("'\"")
     key = left.strip()
     value = row[key] if key in row else get_path(row, key)
-    return str(value) == right
+    return str(value) == right.strip().strip("'\"")
 
 
 class _TransactionalMixin:
@@ -96,14 +77,12 @@ class _TransactionalMixin:
         self.sequences = sequences or {}
         self.isolation = "none"
         self.window_open = False
-        # called between open and close by tests that simulate a side moving mid-run
-        self.on_open = None
-        # what open_window pins: "fake_snapshot" (default) or "none" for a side whose engine
-        # refused a snapshot; with "none", `change_token` (a callable) feeds the markers
+        self.on_open = None  # runs inside open_window, for tests that move a side mid-run
+        # "fake_snapshot" (default) or "none" for an engine that refused a snapshot; with "none"
+        # a callable `change_token` feeds the markers
         self.pin = "fake_snapshot"
         self.change_token = None
-        # optional per-method failure injection: {"method": Exception}
-        self.fail_on: dict = {}
+        self.fail_on: dict = {}  # {"method": Exception} failure injection
 
     def _maybe_fail(self, method):
         exc = self.fail_on.get(method)
@@ -113,8 +92,8 @@ class _TransactionalMixin:
     def _tx_rows(self, table, where):
         return [r for r in self._all_rows(table) if _matches(r, where)]
 
-    def _tx_key(self, r, key_cols):
-        return tuple(get_path(r, k) if k not in r else r[k] for k in key_cols)
+    def _key(self, r: dict, key_cols: list[str]) -> tuple:
+        return tuple(r[k] if k in r else get_path(r, k) for k in key_cols)
 
     def open_window(self) -> str:
         self.calls["open_window"] += 1
@@ -146,7 +125,7 @@ class _TransactionalMixin:
             vals = [r.get(watermark) for r in rows if r.get(watermark) is not None]
             marker = (len(rows), max(vals) if vals else None)
         else:
-            keys = [self._tx_key(r, key_cols) for r in rows]
+            keys = [self._key(r, key_cols) for r in rows]
             marker = (len(rows),) + tuple(max(k[i] for k in keys) if keys else None
                                          for i in range(len(key_cols)))
         if self.isolation != "fake_snapshot" and self.change_token:
@@ -157,7 +136,7 @@ class _TransactionalMixin:
     def _digest(value):
         if isinstance(value, bool) or value is None:
             return None
-        if isinstance(value, (int, float, Decimal)):
+        if isinstance(value, _NUMERIC):
             return Decimal(str(value))
         if isinstance(value, dt.datetime):
             return Decimal(int((_instant(value) - _EPOCH).total_seconds() * 1_000_000))
@@ -170,38 +149,40 @@ class _TransactionalMixin:
         digests = [cls._digest(v) or Decimal(0) for v in values]
         squares = 0
         for d in digests:
-            whole = int(d.to_integral_value(rounding=ROUND_HALF_UP))
-            residue = abs(whole) % DIGEST_MODULUS  # sign vanishes in the square anyway
+            residue = abs(int(d.to_integral_value(rounding=ROUND_HALF_UP))) % DIGEST_MODULUS
             squares += residue * residue
         return sum(digests, Decimal(0)), squares
+
+    @staticmethod
+    def _bounds(lo, hi):
+        return (lo if lo is None or isinstance(lo, tuple) else (lo,),
+                hi if hi is None or isinstance(hi, tuple) else (hi,))
+
+    @staticmethod
+    def _within(k, lo, hi):
+        return (lo is None or k >= lo) and (hi is None or k <= hi)
 
     def range_fingerprints(self, table, key_cols, key_kinds, watermark, wm_kind, ranges,
                            where=None) -> list[tuple]:
         self.calls["range_fingerprints"] += 1
         self.statements += 1
         self._maybe_fail("range_fingerprints")
-        rows = self._tx_rows(table, where)
-        keyed = [(self._tx_key(r, key_cols), r.get(watermark) if watermark else None) for r in rows]
-        digestible_keys = all(kind in ("integer", "datetime") for kind in key_kinds)
+        digest_keys = all(kind in ("integer", "datetime") for kind in key_kinds)
         digest_wm = bool(watermark and wm_kind in ("integer", "datetime"))
-        # one CASE classifies each row: the first range whose bounds hold wins it, like the SQL
-        norm = [(lo if lo is None or isinstance(lo, tuple) else (lo,),
-                 hi if hi is None or isinstance(hi, tuple) else (hi,)) for lo, hi in ranges]
-        by_range: dict[int, list] = {i: [] for i in range(len(norm))}
-        for k, wm in keyed:
-            i = next((i for i, (lo, hi) in enumerate(norm)
-                      if (lo is None or k >= lo) and (hi is None or k <= hi)), None)
+        norm = [self._bounds(lo, hi) for lo, hi in ranges]
+        # like the SQL CASE, the first range whose bounds hold wins the row
+        hits: list[list] = [[] for _ in norm]
+        for r in self._tx_rows(table, where):
+            k, wm = self._key(r, key_cols), r.get(watermark) if watermark else None
+            i = next((i for i, (lo, hi) in enumerate(norm) if self._within(k, lo, hi)), None)
             if i is not None:
-                by_range[i].append((k, wm))
+                hits[i].append((k, wm))
         out = []
-        for i in range(len(norm)):
-            hit = by_range[i]
-            keys = None
-            if digestible_keys:
-                keys = tuple(self._moments(k[j] for k, _ in hit) for j in range(len(key_cols)))
-            wm = None
-            if digest_wm:
-                wm = (*self._moments(wm for _, wm in hit), sum(1 for _, wm in hit if wm is None))
+        for hit in hits:
+            keys = (tuple(self._moments(k[j] for k, _ in hit) for j in range(len(key_cols)))
+                    if digest_keys else None)
+            wm = ((*self._moments(wm for _, wm in hit), sum(1 for _, wm in hit if wm is None))
+                  if digest_wm else None)
             out.append((len(hit), keys, wm))
         return out
 
@@ -209,13 +190,9 @@ class _TransactionalMixin:
         self.calls["keys_in_range"] += 1
         self.statements += 1
         self._maybe_fail("keys_in_range")
-        lo = lo if lo is None or isinstance(lo, tuple) else (lo,)
-        hi = hi if hi is None or isinstance(hi, tuple) else (hi,)
-        out = []
-        for r in self._tx_rows(table, where):
-            k = self._tx_key(r, key_cols)
-            if (lo is None or k >= lo) and (hi is None or k <= hi):
-                out.append(k + tuple(r.get(c) for c in (extra_cols or [])))
+        lo, hi = self._bounds(lo, hi)
+        out = [self._key(r, key_cols) + tuple(r.get(c) for c in (extra_cols or []))
+               for r in self._tx_rows(table, where) if self._within(self._key(r, key_cols), lo, hi)]
         self.rows_fetched += len(out)
         return sorted(out, key=lambda k: k[:len(key_cols)])
 
@@ -240,9 +217,8 @@ class _TransactionalMixin:
         state = self.sequences[(table, column)]
         if state is None or isinstance(state, IdentityState):
             return state
-        if isinstance(state, tuple):
-            return IdentityState(*state)
-        return IdentityState(state, 1)
+        return IdentityState(*state) if isinstance(state, tuple) else IdentityState(state, 1)
+
 
 class FakeSource(_TransactionalMixin):
     """Implements SourceAdapter plus the optional BatchAggregates / StratifiedKeys /
@@ -260,32 +236,26 @@ class FakeSource(_TransactionalMixin):
     def _all_rows(self, table):
         return self.tables[table]
 
-    def _key(self, r: dict, key_cols: list[str]) -> tuple:
-        return tuple(r[k] if k in r else get_path(r, k) for k in key_cols)
-
     def _sorted(self, table: str, key_cols: list[str], where: str | None,
                 natural: bool = False) -> list[dict]:
         # repr order tolerates mixed-type keys (the historical fake behaviour); strata need the
         # engine's natural key order so lo <= key <= hi range checks hold.
         sort_key = ((lambda r: self._key(r, key_cols)) if natural
                     else (lambda r: tuple(repr(v) for v in self._key(r, key_cols))))
-        return sorted((r for r in self.tables[table] if _matches(r, where)), key=sort_key)
+        return sorted(self._tx_rows(table, where), key=sort_key)
 
     def row_count(self, table: str, where: str | None = None) -> int:
         self.calls["row_count"] += 1
         self.statements += 1
-        return sum(_matches(r, where) for r in self.tables[table])
+        return len(self._tx_rows(table, where))
 
     def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
         self.calls["table_aggregates"] += 1
         self.statements += 1
-        out = {}
-        for col in columns:
-            agg = self._aggregates(table, col, where)
-            if col not in numeric:
-                agg["sum"] = None
-            out[col] = agg
+        out = {col: self._aggregates(table, col, where) for col in columns}
+        for col in set(columns) - set(numeric):
+            out[col]["sum"] = None
         return out
 
     def field_aggregates(self, table: str, column: str, where: str | None = None) -> dict[str, Any]:
@@ -294,9 +264,8 @@ class FakeSource(_TransactionalMixin):
         return self._aggregates(table, column, where)
 
     def _aggregates(self, table: str, column: str, where: str | None) -> dict[str, Any]:
-        vals = [(r[column] if column in r else get_path(r, column))
-                for r in self.tables[table] if _matches(r, where)]
-        return _agg_of(vals)
+        return _agg_of([(r[column] if column in r else get_path(r, column))
+                        for r in self._tx_rows(table, where)])
 
     def fetch_keyed(self, table, key_cols, columns, where=None, keys=None) -> Iterable[dict]:
         self.calls["fetch_keyed"] += 1
@@ -337,8 +306,7 @@ class FakeSource(_TransactionalMixin):
     def sample_keys(self, table, key_cols, lo, hi, row_numbers, where=None) -> list[tuple]:
         self.calls["sample_keys"] += 1
         self.statements += 1
-        lo = lo if isinstance(lo, tuple) else (lo,)
-        hi = hi if isinstance(hi, tuple) else (hi,)
+        lo, hi = self._bounds(lo, hi)
         in_range = [r for r in self._sorted(table, key_cols, where, natural=True)
                     if lo <= self._key(r, key_cols) <= hi]
         wanted = set(row_numbers)
@@ -349,7 +317,7 @@ class FakeSource(_TransactionalMixin):
     def duplicate_key_count(self, table, key_cols, where=None) -> int:
         self.calls["duplicate_key_count"] += 1
         self.statements += 1
-        counts = Counter(self._key(r, key_cols) for r in self.tables[table] if _matches(r, where))
+        counts = Counter(self._key(r, key_cols) for r in self._tx_rows(table, where))
         return sum(1 for n in counts.values() if n > 1)
 
 
@@ -360,21 +328,8 @@ class FakeTypedSource(FakeSource):
     def numeric_columns(self, table: str) -> set[str]:
         self.calls["numeric_columns"] += 1
         self.statements += 1
-        out: set[str] = set()
-        for r in self.tables[table]:
-            for col, v in r.items():
-                if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool):
-                    out.add(col)
-        return out
-
-
-def _get_path(doc: dict, path: str):
-    cur: Any = doc
-    for part in path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return None
-        cur = cur[part]
-    return cur
+        return {col for r in self.tables[table] for col, v in r.items()
+                if isinstance(v, _NUMERIC) and not isinstance(v, bool)}
 
 
 class FakeTarget(_TransactionalMixin):
@@ -396,9 +351,18 @@ class FakeTarget(_TransactionalMixin):
         return [d for d in self.objects[object]
                 if (scope(d) if scope else _matches(d, where))]
 
+    @staticmethod
+    def _aggs(rows, columns, numeric):
+        out = {col: _agg_of([None if (v := get_path(d, col)) is MISSING else v for d in rows])
+               for col in columns}
+        for col in set(columns) - set(numeric):
+            out[col]["sum"] = None
+        return out
+
     def target_row_count(self, object: str, where=None) -> int:
         self.calls["target_row_count"] += 1
         self.statements += 1
+        self._maybe_fail("target_row_count")
         return len(self._rows(object, where))
 
     def nested_count(self, object: str, array_path: str, where=None) -> int:
@@ -430,17 +394,10 @@ class FakeTarget(_TransactionalMixin):
         excluded = {tuple(k) for k in exclude_keys}
         rows = [d for d in self._rows(object, where)
                 if tuple(get_path(d, k) for k in key_cols) not in excluded]
-        out = {}
-        for col in columns:
-            agg = _agg_of([None if (v := get_path(d, col)) is MISSING else v for d in rows])
-            if col not in numeric:
-                agg["sum"] = None
-            out[col] = agg
-        return out
+        return self._aggs(rows, columns, numeric)
 
     def field_aggregates(self, object: str, field_path: str, where=None) -> dict[str, Any]:
-        vals = [get_path(d, field_path) for d in self._rows(object, where)]
-        return _agg_of([None if v is MISSING else v for v in vals])
+        return self._aggs(self._rows(object, where), [field_path], [field_path])[field_path]
 
     def fetch_keyed(self, object, key_fields, fields, where=None, keys=None) -> Iterable[dict]:
         if isinstance(key_fields, str):
