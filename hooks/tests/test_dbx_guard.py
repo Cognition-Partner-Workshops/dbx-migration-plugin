@@ -635,9 +635,14 @@ def test_descriptor_of_a_redirection_is_not_a_cat_operand(tmp_path: Path):
     (tmp_path / "2").write_text("UPDATE sales.orders SET status = 'X';\n")
     assert g._script_inputs("cat 2 | bteq", CFG) == ["2"]
     assert g.evaluate("cat 2 | bteq", CFG, root=tmp_path).decision == "block"
-    # ... also when a redirection follows it with a space: `2` is the operand, not a descriptor
-    assert g._script_inputs("cat 2 >/dev/null | bteq", CFG) == ["2"]
-    assert g.evaluate("cat 2 >/dev/null | bteq", CFG, root=tmp_path).decision == "block"
+    # ... also when a redirection follows it with a space: `2` is the operand, not a descriptor,
+    # however often the same digit sits against an operator elsewhere on the line
+    for cmd in ("cat 2 >/dev/null | bteq", "true 2>/dev/null; cat 2 >log | bteq",
+                "cat 2 > /dev/null 2>&1 | bteq", "echo '2>&1' > /dev/null; cat 2 >&2 | bteq"):
+        assert g._script_inputs(cmd, CFG) == ["2"], cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    # a descriptor is the whole word before the operator: `foo2>x` is the argument foo2
+    assert g._script_inputs("cat read.sql foo2>/dev/null | bteq", CFG) == ["read.sql", "foo2"]
 
 
 def test_an_input_descriptor_written_against_its_operator_is_not_a_cat_operand(tmp_path: Path):
@@ -674,6 +679,25 @@ def test_a_redirection_after_a_group_belongs_to_the_group(tmp_path: Path):
     # the redirection does not make an opaque producer readable
     assert g.evaluate("(python3 gen.py) 2>&1 | bteq", CFG, root=tmp_path).decision == "block"
     assert g.evaluate("{ cat read.sql; python3 gen.py; } 2>&1 | bteq", CFG, root=tmp_path).decision == "block"
+
+
+def test_a_group_input_redirection_reaches_every_command_in_the_group(tmp_path: Path):
+    (tmp_path / "read.sql").write_text("SELECT 1;\n")
+    (tmp_path / "write.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    for cmd in ("(bteq; echo done) < write.sql", "{ bteq; echo done; } < write.sql",
+                "{ echo start; bteq; echo done; } < write.sql", "(echo start; bteq) 0<write.sql",
+                "((bteq); echo done) < write.sql", "(true; (bteq; echo); echo) < write.sql",
+                "(bteq; echo done) < write.sql > /dev/null 2>&1",
+                "(bteq < read.sql; sqlplus svc@tdprod.corp.example) < write.sql"):
+        assert "write.sql" in g._script_inputs(cmd, CFG), cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    for cmd in ("(bteq; echo done) < read.sql", "{ echo start; bteq; echo done; } < read.sql",
+                "(bteq; cat write.sql) < read.sql"):
+        assert g._script_inputs(cmd, CFG) == ["read.sql"], cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+    # a command's own redirection stays with it as well
+    assert g._script_inputs("(bteq < write.sql; echo) < read.sql", CFG) == ["write.sql", "read.sql"]
+    assert g.evaluate("(bteq < write.sql; echo) < read.sql", CFG, root=tmp_path).decision == "block"
 
 
 def test_a_heredoc_body_naming_a_client_is_data_not_context(tmp_path: Path):
