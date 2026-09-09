@@ -1,15 +1,15 @@
 [
   {
     "rule": "decimal_round",
-    "applies_to": "decimal(p,s)->DECIMAL(p,s)",
+    "applies_to": "decimal(p,s) with s <= 10 -> DECIMAL(p,s), and any decimal port computed under 'Enable high precision = NO'; bind per field in the mapping spec, never to a port with s > 10",
     "params": {"mode": "half_up", "places": 10},
-    "why": "Informatica ROUND rounds half away from zero and sessions with 'Enable high precision = NO' compute decimals in double (15 significant digits); places 10 neutralises sub-1e-10 double noise while last-digit errors at the port scale still fail Tier 3. Tighten per unit only under a recorded decision."
+    "why": "Informatica ROUND rounds half away from zero and high-precision-off sessions compute decimals in double (15 significant digits); places 10 neutralises sub-1e-10 double noise while last-digit errors at any scale <= 10 still fail Tier 3. The harness holds one params set per rule name, so a port with s > 10 gets `identity` (raw compare) until per-field `places` exists (harness gap). Tighten per unit only under a recorded decision."
   },
   {
     "rule": "datetime_utc_truncate_ms",
-    "applies_to": "date/time(29,9),TIMESTAMP(6)->TIMESTAMP_NTZ,TIMESTAMP",
+    "applies_to": "date/time ports fed by SYSDATE / SESSSTARTTIME / SYSTIMESTAMP('NS'), ports written under 'Pre 85 Timestamp Compatibility', and zoned timestamps -> TIMESTAMP_NTZ, TIMESTAMP; bind per field, never to a pass-through TIMESTAMP(6) column",
     "params": {},
-    "why": "date/time ports carry nanoseconds, Teradata/Oracle sources microseconds, Delta microseconds; SYSDATE/SESSSTARTTIME audit columns and 'Pre 85 Timestamp Compatibility' sessions differ below the millisecond. Zoned values are normalised to UTC first."
+    "why": "Only those columns legitimately differ below the millisecond (nanosecond clock reads, pre-8.5 second precision, zone normalisation to UTC). Teradata/Oracle TIMESTAMP(6) values are carried at microseconds by both engines and Delta, so they compare with `identity` and a sub-millisecond mismatch stays a Tier 3 failure."
   },
   {
     "rule": "rstrip_spaces",

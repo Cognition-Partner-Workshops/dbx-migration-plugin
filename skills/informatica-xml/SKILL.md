@@ -20,11 +20,25 @@ Everything Databricks-side goes through `skills/target-routing/SKILL.md` to the 
 | OLTP front-door units only | Lakebase type column below | `databricks-lakebase` `references/synced-tables.md` "Data Type Mapping" |
 | Analyzer inventory of the export (no transpiler flag exists) | embedded SQL overrides transpile under `teradata` / `oracle` | `skills/lakebridge/SKILL.md` Informatica row |
 
-## 2. Type map
+## 2. Enumeration and lineage
+
+Parse the `POWERMART` export namespace-free with the DTD disabled (`powrmart.dtd` is never shipped); unescape `&apos; &lt; &gt; &#xD;&#xA;` before handing any override to the connection dialect's SQL parser. The export alone suffices; read-only `pmrep listobjects` / `objectexport` or `REP_*` views only widen it. Coverage arithmetic: every `MAPPING` under `FOLDER` is a unit, every `SESSION` and `TASKINSTANCE` attaches to one, every `.par` section (`[repo.folder.workflow.session]`) matches a session, every Control-M `CMDLINE` / crontab `pmcmd startworkflow -f <folder> <workflow>` matches a workflow; a leftover on either side is a finding.
+
+| Census | XML path (`POWERMART/REPOSITORY/FOLDER/...`) | Size / complexity signals | Lineage edge (FACT when cited from the path; INFERRED as noted) |
+|---|---|---|---|
+| Source / target | `SOURCE@NAME,@DATABASETYPE,@DBDNAME` + `FLATFILE`, `SOURCEFIELD`; `TARGET` + `TARGETFIELD@KEYTYPE` | field count; `FLATFILE@DELIMITED="NO"` = fixed width, `OCCURS`/`LEVEL` = COBOL, `@CODEPAGE`, `@NULL_CHARACTER`, `@STRIPTRAILINGBLANKS`; `KEYTYPE="PRIMARY KEY"` = MERGE candidate | read / write per `INSTANCE@TYPE="SOURCE"`/`"TARGET"`; the physical database comes from `SESSIONEXTENSION` `READER`/`WRITER` `CONNECTIONREFERENCE@CNXREFNAME` and is INFERRED until the connection export is in the bundle |
+| Mapping (unit) | `MAPPING@NAME,@ISVALID`; `TRANSFORMATION`, `INSTANCE`, `CONNECTOR`, `MAPPINGVARIABLE`, `TARGETLOADORDER` | element counts; low = SQ / Expression / Filter / Sorter / Union, medium = Aggregator / Joiner / Router / Lookup / Update Strategy / Rank / mapplet, high = Normalizer / Java / SQL / Stored Procedure / Transaction Control / dynamic Lookup; `ISVALID="NO"` = dead | SQ `TABLEATTRIBUTE` `Sql Query` / `Source Filter` / `User Defined Join`: parse the SQL, every `FROM`/`JOIN` table is a read; Lookup `Lookup table name` / `Lookup Sql Override` is a read (the most often missed); Stored Procedure / SQL transformation reads INFERRED; `MAPPINGVARIABLE` + `SETVARIABLE` = watermark self-edge |
+| Session | `SESSION@MAPPINGNAME`; `SESSTRANSFORMATIONINST/ATTRIBUTE`, `SESSIONEXTENSION`, `SESSIONCOMPONENT`, `PARTITION`, `CONFIGREFERENCE` | partitions; `Commit Interval`, `Recovery Strategy`, `Treat source rows as`, `Target load type`, `Enable high precision`, `Truncate target table option`, `Pushdown Optimization` | session-level `Sql Query` / `Pre SQL` / `Post SQL` / `Lookup Sql Override` (per partition too) replace the mapping's; `Target Table Name` / `Table Name Prefix` rename the write; `Reject filename` (`$BadFileName`), `Output filename` are file writes; Post SQL `UPDATE`s are writes |
+| Reusable transformation / mapplet | `TRANSFORMATION@REUSABLE="YES"`, `MAPPLET`, consumed via `INSTANCE@TRANSFORMATION_NAME` / `@TRANSFORMATION_TYPE="Mapplet"`; `FOLDER@SHARED` | consumer count | two or more consuming mappings = shared object (wave 0); a table written by two mappings or by a mapping and another engine is shared too |
+| Workflow / worklet | `WORKFLOW@ISENABLED,@SCHEDULERNAME`; `SCHEDULER/SCHEDULEINFO@SCHEDULETYPE`, `TASK@TYPE`, `TASKINSTANCE`, `WORKFLOWLINK@FROMTASK,@TOTASK,@CONDITION`, `WORKFLOWVARIABLE`; `WORKLET` nests the same | task types other than `Start`/`Session`, non-empty link conditions | link = intra-workflow edge; Event Wait `File Watch Name` = inbound file edge; Command / pre-post-session `Command` text = script edge (read it for `pmcmd`, `sftp`, `-paramfile`, other engines' jobs) |
+| Parameters | `*.par` `[section]` lines `$$name=value`, `$name=value` (`$DBConnection_*`, `$InputFile_*`, `$OutputFile_*`, `$BadFileName`, `$PMSourceFileDir`) | nested `$$` inside values | resolution order: session section > workflow section > `pmcmd -paramfile` > `DEFAULTVALUE` > repository value (INFERRED); an unresolved name stays INFERRED, never guessed |
+| External schedulers | Control-M `JOB@CMDLINE`, `INCOND`/`OUTCOND`, `CYCLIC`, `TIMEFROM`, `MONTHDAYS`; crontab lines invoking wrapper scripts | - | `SCHEDULETYPE="ONDEMAND"` = externally started, find the owner; `INCOND` = inbound job edge; two owners = D5 finding (trap 24); an `INCOND` the descriptions imply but the export lacks is a finding, not an edge |
+
+## 3. Type map
 
 | Informatica port type | Delta | Lakebase | Handling |
 |---|---|---|---|
-| `decimal(p,s)`, `Enable high precision = YES` | `DECIMAL(p,s)` (p <= 38) | `NUMERIC` | `decimal_round` at port scale |
+| `decimal(p,s)`, `Enable high precision = YES` | `DECIMAL(p,s)` (p <= 38) | `NUMERIC` | s <= 10: `decimal_round` (places 10); s > 10: `identity`, raw compare (trap 3) |
 | `decimal(p,s)`, `Enable high precision = NO` (default) | `DECIMAL(p,s)`; legacy computed in double (15 digits) | `NUMERIC` | `decimal_round`; last-digit drift expected (trap 3) |
 | `decimal` p > 38, Oracle `NUMBER` without scale | `DECIMAL(38,s)` or `DOUBLE` per STOP A | `NUMERIC` / `DOUBLE PRECISION` | Tier 2 sum drift is the signature |
 | `integer`, `small integer`, `bigint` | `INT`, `SMALLINT`, `BIGINT` | `INTEGER`, `SMALLINT`, `BIGINT` | double->integer port assignment rounds (row 14) |
@@ -33,15 +47,14 @@ Everything Databricks-side goes through `skills/target-routing/SKILL.md` to the 
 | `string(n)` from `CHAR(n)` / fixed-width with `STRIPTRAILINGBLANKS="NO"` | `STRING` | `TEXT` | `rstrip_spaces`; `IS_SPACES`/`LENGTH` see the padding (trap 4) |
 | `nstring`, `ntext`, `text` | `STRING` | `TEXT` | codepage `Latin1`/`MS1252` -> UTF-8 on read (trap 18); `text` excluded from Tier 3, hash-compare |
 | `binary` | `BINARY` | `BYTEA` | `uuid_normalize` only for 16-byte GUIDs |
-| `date/time` (29,9) from `TIMESTAMP(6)`, Oracle `DATE` | `TIMESTAMP_NTZ` (zone-less legacy); `TIMESTAMP` only if STOP A says UTC | `TIMESTAMP [WITHOUT TIME ZONE]` | `datetime_utc_truncate_ms` (traps 7, 8) |
-| `date/time` into a `DATE` target column | `DATE` | `DATE` | `CAST(ts AS DATE)` only after confirming the legacy target truncated |
-| `timestamp with time zone` | `TIMESTAMP` (UTC) | `TIMESTAMP WITH TIME ZONE` | `datetime_utc_truncate_ms` |
+| `date/time` (29,9) from `TIMESTAMP(6)`, Oracle `DATE` | `TIMESTAMP_NTZ` (zone-less legacy); `TIMESTAMP` only if STOP A says UTC | `TIMESTAMP [WITHOUT TIME ZONE]` | pass-through: `identity` at us; `datetime_utc_truncate_ms` only on `SYSDATE`/`SESSSTARTTIME`-fed and Pre-85 columns (traps 7, 8); into a `DATE` target: `CAST(ts AS DATE)` only after confirming the legacy truncated |
+| `timestamp with time zone` | `TIMESTAMP` (UTC) | `TIMESTAMP WITH TIME ZONE` | `datetime_utc_truncate_ms` (UTC normalisation) |
 | Flat-file `PICTURETEXT="9(09)V99"` (implied decimals) | `DECIMAL(11,2)` via `CAST(substr AS DECIMAL(11,0)) / 100` | `NUMERIC` | Tier 2 sum 100x off if missed (trap 21) |
 | Flat-file `9(05)` Julian `YYDDD`, `X(n)` codes | `STRING` + derived `DATE` | `TEXT`, `DATE` | pivot year lives in converted code (trap 22) |
 | Packed / `COMP-3` (Normalizer input) | `DECIMAL(p,s)` after unpacking | `NUMERIC` | hand conversion |
 | Sequence Generator `NEXTVAL` | `BIGINT GENERATED ALWAYS AS IDENTITY` | `BIGINT` | never compared by value (trap 19) |
 
-## 3. Function and construct map
+## 4. Function and construct map
 
 Databricks expressions are SQL, usable verbatim via `F.expr(...)` or in DBSQL. Keep legacy port names as column aliases so Tier 3 field mapping is 1:1.
 
@@ -137,18 +150,18 @@ Databricks expressions are SQL, usable verbatim via `F.expr(...)` or in DBSQL. K
 | 88 | Scheduler `RECURRING`, Control-M `CYCLIC`/`TIMEFROM`, cron | Quartz cron + `timezone_id`, `PAUSED`; 30-min cadence -> `0 0/30 7-20 * * ?` | `MONTHDAYS="WD1"` = daily cron + business-day check task |
 | 89 | Control-M `INCOND/OUTCOND`, duplicate cron owners | `depends_on` / `run_job_task`; one owner under D5 | missing legacy dependencies are findings, not edges |
 
-## 4. Traps (recon signature)
+## 5. Traps (recon signature)
 
 | # | Trap | Legacy | Databricks | Signature | Fix / canon |
 |---|---|---|---|---|---|
 | 1 | Session / partition SQL overrides | replace mapping SQL silently | mapping SQL converted | Tier 1 count, Tier 3 missing columns | extract effective SQL per session **and** partition |
 | 2 | Implicit port conversions | round / 0-on-failure | error or NULL | Tier 3 off-by-one, Tier 2 null rate | explicit `try_cast`/`round` per port; gap `zero_null_equiv` |
-| 3 | `Enable high precision = NO` | double arithmetic | exact `DECIMAL` | Tier 3 last digit, Tier 2 sum drift | `decimal_round half_up`; never widen tolerance without a decision |
+| 3 | `Enable high precision = NO` | double arithmetic | exact `DECIMAL` | Tier 3 last digit, Tier 2 sum drift | `decimal_round half_up` (places 10) on ports with s <= 10 or computed in double; s > 10 ports `identity` (per-field `places` is a harness gap); never widen without a decision |
 | 4 | CHAR padding, `IS_SPACES`, `LENGTH` | padded | unbounded `STRING` | Tier 3 strings, Tier 2 distinct | `rstrip_spaces`; test on the untrimmed value |
 | 5 | `''` vs NULL (`NULL_CHARACTER`, Oracle targets) | engine-specific | distinct | Tier 2 null rate | `empty_string_is_null` (STOP A); `nullif(x, '')` at Oracle boundaries |
 | 6 | `TO_DATE` format on transposed data | day <= 12 transposes, else row error | same, or NULL | Tier 3 dates, Tier 2 null rate | reproduce like-for-like, file the defect; rejects -> quarantine |
 | 7 | Timezone | zone-less local time | UTC `TIMESTAMP` | Tier 3 constant offset | `TIMESTAMP_NTZ`; gap `timestamp_offset_shift` |
-| 8 | Datetime precision | ns / `TIMESTAMP(6)` / seconds | us | Tier 3 sub-ms | `datetime_utc_truncate_ms` |
+| 8 | Datetime precision | ns clock reads (`SYSDATE`, `SYSTIMESTAMP('NS')`), Pre-85 seconds | us | Tier 3 sub-ms on those columns only | `datetime_utc_truncate_ms` bound to them; `TIMESTAMP(6)` pass-through stays `identity` so a us mismatch still fails |
 | 9 | Lookup multiple match | first/last by cache order | all matches | Tier 1 excess, Tier 3 looked-up cols | `row_number()` over an explicit INFERRED order |
 | 10 | Lookup cache staleness | stale persistent / per-row snapshots | one snapshot | Tier 3 on rows changed mid-run | frozen recon snapshot; document |
 | 11 | Router | every matching group | `CASE` first-match | Tier 1 per-target lower | one filter per group |
@@ -168,14 +181,14 @@ Databricks expressions are SQL, usable verbatim via `F.expr(...)` or in DBSQL. K
 | 25 | Commit-interval visibility | partial loads mid-run | atomic | Tier 1 after legacy mid-run failure | recon completed runs only |
 | 26 | Bulk loaders | duplicates diverted to error tables | all rows written | Tier 1 excess | dedupe per legacy unique index under a decision |
 
-## 5. Canonical target shape
+## 6. Canonical target shape
 
 - Mapping -> one SDP file: `@dp.table` Auto Loader read for file sources (`_metadata.file_path` supplies `$$RUNDATE`-style values), `@dp.temporary_view` per lookup deduplicated to one row per key, row-preserving Expressions as `withColumn` on the same row, `@dp.materialized_view` target named after the legacy target with port names as aliases, `@dp.expect*` for every legacy row-error/reject condition plus a quarantine MV built from the negated conditions.
 - Workflow -> one Lakeflow Job: task key = session name, `pipeline_task` per SDP unit, `depends_on` + `run_if` per link, `trigger.file_arrival` for Event Wait, `email_notifications.on_failure` for the failure Email task, cron `schedule` with `timezone_id`, deployed `PAUSED` via `databricks-dabs`.
 - Pre/Post SQL and SQL-only tasks -> `CREATE PROCEDURE <unit>_pre()` / `<unit>_post()` (statements transpiled by the connection's dialect skill, `Continue` -> `DECLARE CONTINUE HANDLER`), `CALL`ed from `sql_task`s before/after the pipeline task; a Pre SQL `TRUNCATE`/`DELETE` on the target makes the unit a truncate-load.
-- `canonicalization.json` (list form, `recon.config.load_canon_rules`): `decimal_round` (trap 3), `datetime_utc_truncate_ms` (7, 8), `rstrip_spaces` (4), `empty_string_is_null` (5, 16), `null_missing_equiv`, `collation_casefold` (17, flagged columns only), `identity`. Harness gaps, never faked: `zero_null_equiv`, `timestamp_offset_shift`, `codepage_transcode`, per-field rule parameters.
+- `canonicalization.json` (list form, `recon.config.load_canon_rules`): `decimal_round` (trap 3; scale <= 10 or double-computed ports only), `datetime_utc_truncate_ms` (7, 8; clock-read / Pre-85 / zoned columns only), `rstrip_spaces` (4), `empty_string_is_null` (5, 16), `null_missing_equiv`, `collation_casefold` (17, flagged columns only), `identity`. Harness gaps, never faked: `zero_null_equiv`, `timestamp_offset_shift`, `codepage_transcode`, per-field rule parameters.
 
-## 6. Examples
+## 7. Examples
 
 | Example | Fixture object | Exercises |
 |---|---|---|
