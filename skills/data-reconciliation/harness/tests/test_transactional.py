@@ -1434,14 +1434,27 @@ def test_databricks_target_validates_catalog_and_schema_before_it_connects(monke
     assert connects == []
 
 
-def test_cleanup_notes_are_attached_without_add_note(monkeypatch):
+@pytest.mark.parametrize("version", [(3, 10, 0), (3, 12, 0)])
+def test_release_failures_reach_stderr_and_the_exception_on_every_runtime(monkeypatch, capsys, version):
     import recon.engine as engine
-    monkeypatch.setattr(engine.sys, "version_info", (3, 10, 0))
+    monkeypatch.setattr(engine.sys, "version_info", version)
     exc = RuntimeError("tier failure")
-    engine._add_note(exc, "source close_window failed")
-    engine._add_note(exc, "source connection could not be dropped")
+    engine._report_release_failure(exc, "source close_window failed")
+    engine._report_release_failure(exc, "source connection could not be dropped")
     assert exc.__notes__ == ["source close_window failed", "source connection could not be dropped"]
     assert str(exc) == "tier failure"
+    assert capsys.readouterr().err.splitlines() == [
+        "dbx-recon: source close_window failed", "dbx-recon: source connection could not be dropped"]
+
+
+def test_a_failed_run_prints_release_failures_before_the_error_propagates(capsys):
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    target.fail_on["range_fingerprints"] = RuntimeError("tier failure")
+    source.fail_on["close_window"] = RuntimeError("rollback failed")
+    with pytest.raises(RuntimeError):
+        _run(source, target)
+    assert capsys.readouterr().err == "dbx-recon: source close_window failed: RuntimeError('rollback failed')\n"
 
 
 def test_lakebase_target_qualifies_objects_with_escaped_identifiers(monkeypatch):

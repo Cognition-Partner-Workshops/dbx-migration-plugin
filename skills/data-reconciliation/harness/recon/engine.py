@@ -86,9 +86,12 @@ def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source,
     return tiers
 
 
-def _add_note(exc: BaseException, note: str) -> None:
-    """`BaseException.add_note` on 3.11+; the same `__notes__` list by hand on 3.10, where the
-    traceback will not print it but callers and tests still see the release failures."""
+def _report_release_failure(exc: BaseException, note: str) -> None:
+    """A window that could not be released is reported twice so no runtime can lose it: on
+    stderr as it happens (3.10 never renders notes and the CLI does not catch the run's error),
+    and on the run's exception (`add_note` on 3.11+, the same `__notes__` list by hand on 3.10)
+    for embedded callers."""
+    print(f"dbx-recon: {note}", file=sys.stderr, flush=True)
     if sys.version_info >= (3, 11):
         exc.add_note(note)
     else:
@@ -135,7 +138,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         # run's error is what propagates, with any release failure attached to it
         if mode == "transactional":
             for err in abandon_window(source, target):
-                _add_note(exc, str(err))
+                _report_release_failure(exc, str(err))
         raise
     provenance_warnings = _snapshot_provenance_warnings(
         snapshot, source_family, spec, next(t for t in tiers if t.tier == 1))
