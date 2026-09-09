@@ -13,6 +13,7 @@ from typing import Any, Iterable
 from recon.adapters import DIGEST_MODULUS, SchemaFacts, Stratum
 from recon.paths import get_path
 from recon.canon import MISSING
+from recon.watermarks import literal
 
 
 _EPOCH = dt.datetime(1970, 1, 1)  # noqa: DTZ001  fixtures use naive datetimes throughout
@@ -132,6 +133,9 @@ class _TransactionalMixin:
             return "snapshot"
         return "change_token" if self.change_token else "markers"
 
+    def watermark_literal(self, value) -> str:
+        return literal(value)
+
     def window_marker(self, table, key_cols, watermark, where=None) -> tuple:
         self.calls["window_marker"] += 1
         self.statements += 1
@@ -177,8 +181,8 @@ class _TransactionalMixin:
         self._maybe_fail("range_fingerprints")
         rows = self._tx_rows(table, where)
         keyed = [(self._tx_key(r, key_cols), r.get(watermark) if watermark else None) for r in rows]
-        digestible_keys = all(kind in ("number", "datetime") for kind in key_kinds)
-        digest_wm = bool(watermark and wm_kind in ("number", "datetime"))
+        digestible_keys = all(kind in ("integer", "datetime") for kind in key_kinds)
+        digest_wm = bool(watermark and wm_kind in ("integer", "datetime"))
         out = []
         for lo, hi in ranges:
             lo = lo if lo is None or isinstance(lo, tuple) else (lo,)

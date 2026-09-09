@@ -1,12 +1,19 @@
 """Catalog reads that only a real Postgres can exercise. Skipped unless RECON_TEST_POSTGRES_DSN
 names a throwaway database (the rehearsal stand-in); the test owns one temporary schema."""
 
+import datetime as dt
 import os
 import uuid
 
 import pytest
 
-from recon.adapters import LakebaseTargetAdapter, TargetIdentityError
+from recon.adapters import (
+    LakebaseTargetAdapter,
+    PostgresSourceAdapter,
+    TargetIdentityError,
+)
+from recon.transactional import _applied_predicate, _newer_predicate
+from recon.watermarks import literal
 
 psycopg = pytest.importorskip("psycopg")
 
@@ -29,6 +36,8 @@ def schema():
     conn.execute(f"CREATE UNIQUE INDEX t_code_lower_u ON {name}.t (lower(code))")
     conn.execute(f"CREATE INDEX t_region_expr_ix ON {name}.t (upper(region), id) INCLUDE (code)")
     conn.execute(f"CREATE UNIQUE INDEX t_expr_partial_u ON {name}.t (lower(region)) WHERE active")
+    conn.execute(f"ALTER TABLE {name}.t ADD CONSTRAINT t_dup_chk CHECK (dup > 0)")
+    conn.execute(f"ALTER TABLE {name}.t ADD CONSTRAINT t_const_chk CHECK (1 < 2)")   # names no column
     # a concurrent unique build over duplicate values fails and leaves the index INVALID
     with pytest.raises(psycopg.errors.UniqueViolation):
         conn.execute(f"CREATE UNIQUE INDEX CONCURRENTLY t_dup_invalid_u ON {name}.t (dup)")
@@ -56,6 +65,7 @@ def test_partial_and_invalid_indexes_never_count_as_parity(schema, monkeypatch):
     assert facts.indexes == {("region", "code")}             # invalid and partial indexes excluded
     assert facts.partial == {("region",), ("active",)}       # reported for a manual check
     assert facts.not_null == {"id", "code", "active"}
+    assert facts.check_count == 2                            # a column-free CHECK still counts
     # expression keys (attnum 0) stay visible as the key text of pg_get_indexdef
     assert facts.expression_unique == {"lower(code)"}           # partial unique is not uniqueness
     assert facts.expression_indexes == {"upper(region), id", "lower(region)"}  # INCLUDE dropped
@@ -65,9 +75,29 @@ def test_range_fingerprints_bind_through_psycopg(schema, monkeypatch):
     # the modular square must render as MOD(), not `%`, or psycopg reads it as a placeholder
     monkeypatch.setenv("RECON_TEST_TARGET", os.environ[DSN_VAR])
     target = LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), schema)
-    fps = target.range_fingerprints("t", ["id"], ["number"], None, None, [(None, (1,)), ((1,), None)])
+    fps = target.range_fingerprints("t", ["id"], ["integer"], None, None, [(None, (1,)), ((1,), None)])
     assert [(n, k[0][0]) for n, k, _ in fps] == [(1, 1), (2, 3)]
     assert [k[0][1] for _, k, _ in fps] == [1, 5]        # 1^2 and 1^2 + 2^2
+
+
+def test_numeric_keys_beyond_six_decimals_are_never_collapsed_into_one_digest(schema, monkeypatch):
+    dsn = os.environ[DSN_VAR]
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE TABLE {schema}.n (k NUMERIC(20,8) PRIMARY KEY, big BIGINT)")
+        conn.execute(f"INSERT INTO {schema}.n VALUES (1.0000001, 4611686018427387904), "
+                     "(1.0000002, 4611686018427387905)")
+    monkeypatch.setenv("RECON_TEST_TARGET", dsn)
+    target = LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), schema)
+    whole = [(None, None)]
+    # a fractional key gets no digest, so tier 5 streams it instead of trusting a rounded sum
+    (n, keys, _), = target.range_fingerprints("n", ["k"], ["number"], None, None, whole)
+    assert (n, keys) == (2, None)
+    # whole numbers digest exactly up to bigint range: neighbours near 2^62 stay distinct
+    (_, keys, _), = target.range_fingerprints("n", ["big"], ["integer"], None, None, whole)
+    (_, keys_lo, _), = target.range_fingerprints("n", ["big"], ["integer"], None, None,
+                                                 [(None, (4611686018427387904,))])
+    assert keys[0][0] == 2 * 4611686018427387904 + 1
+    assert keys_lo[0][0] == 4611686018427387904 and keys[0][1] != keys_lo[0][1]
 
 
 def test_target_identity_is_checked_against_the_live_database(monkeypatch):
@@ -75,3 +105,32 @@ def test_target_identity_is_checked_against_the_live_database(monkeypatch):
     with pytest.raises(TargetIdentityError, match="allowlisted target is 'not_this_database'"):
         LakebaseTargetAdapter("RECON_TEST_TARGET", "not_this_database", "public")
     assert LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), "public").database == _database()
+
+
+def test_watermark_predicates_hold_for_timestamptz_in_a_non_utc_session(schema, monkeypatch):
+    dsn = os.environ[DSN_VAR]
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE TABLE {schema}.w (id INT PRIMARY KEY, at_tz TIMESTAMPTZ, at_naive TIMESTAMP)")
+        conn.execute(f"INSERT INTO {schema}.w VALUES "
+                     "(1, '2026-09-08 12:00:00+00', '2026-09-08 12:00:00'), "
+                     "(2, '2026-09-08 13:00:00+00', '2026-09-08 13:00:00'), "
+                     "(3, '2026-09-08 14:00:00+00', '2026-09-08 14:00:00'), "
+                     "(4, NULL, NULL)")
+    monkeypatch.setenv("RECON_TEST_SOURCE",
+                       psycopg.conninfo.make_conninfo(dsn, options="-c TimeZone=America/New_York"))
+    source = PostgresSourceAdapter("RECON_TEST_SOURCE")
+    try:
+        (tz,) = source._rows("SHOW TimeZone")[0]
+        assert tz == "America/New_York"
+        hwm = dt.datetime(2026, 9, 8, 15, 0, 0, tzinfo=dt.timezone(dt.timedelta(hours=2)))  # 13:00 UTC
+        for col in ("at_tz", "at_naive"):
+            newer = _newer_predicate(col, hwm, source.watermark_literal)
+            applied = _applied_predicate(col, hwm, source.watermark_literal)
+            assert source.row_count(f"{schema}.w", newer) == 1, (col, newer)       # row 3 only
+            assert source.row_count(f"{schema}.w", applied) == 3, (col, applied)   # rows 1, 2 and the NULL
+        # the bare form the zone-less engines use is read as 13:00 New York (17:00 UTC) here, so
+        # the in-flight row 3 would be misfiled as applied
+        bare = _newer_predicate("at_tz", hwm, literal)
+        assert source.row_count(f"{schema}.w", bare) == 0
+    finally:
+        source._conn.close()   # release the table lock before the schema is dropped

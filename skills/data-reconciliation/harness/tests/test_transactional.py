@@ -3,6 +3,7 @@
 import dataclasses
 import datetime as dt
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -12,6 +13,7 @@ from recon.adapters import (
     SchemaFacts,
     TargetIdentityError,
     _index_key_text,
+    _PostgresBase,
     _SqlAdapterBase,
 )
 from recon.cli import main
@@ -28,7 +30,14 @@ from recon.config import (
 from recon.cost import estimate_cost
 from recon.engine import MODES, PLANNED_MODES, run_recon
 from recon.report import render_summary
-from recon.transactional import _applied_predicate, _newer_predicate
+from recon.transactional import (
+    _applied_predicate,
+    _common_kind,
+    _kind,
+    _map_expression,
+    _newer_predicate,
+    open_window,
+)
 from recon.watermarks import instant, lag_seconds, later, same
 from tests.fakes import FakeSource, FakeTarget
 
@@ -397,6 +406,39 @@ def test_string_keys_stream_every_range_rather_than_trusting_counts():
     assert pk["stats"]["loans"]["fingerprint"] == "unavailable: every range streamed"
     assert pk["stats"]["loans"]["mismatched_ranges"] == pk["stats"]["loans"]["ranges"]
     assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
+
+
+def test_fractional_numeric_keys_stream_every_range_rather_than_trusting_a_rounded_digest():
+    # two keys that differ beyond the sixth decimal must never collapse into one digest
+    loans, borrowers = _rows(12)
+    for r in loans:
+        r["current_balance"] = Decimal("1000.0000000") + Decimal(r["loan_id"]) * Decimal("0.0000001")
+    spec = _spec()
+    spec.objects[0].key_source[:] = ["current_balance"]
+    spec.objects[0].key_target[:] = ["current_balance"]
+    tgt = [dict(r) for r in loans]
+    tgt[6]["current_balance"] = Decimal("1000.0000099")
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=spec, tol=Tolerances("t1", pk_set_ranges=4))
+    pk = _tier(result, "pk_set_diff")
+    assert pk["stats"]["loans"]["fingerprint"] == "unavailable: every range streamed"
+    assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
+    assert "1000.0000007" in pk["findings"][0]["detail"] and "1000.0000099" in pk["findings"][1]["detail"]
+
+
+def test_digest_kind_is_exact_for_whole_numbers_only():
+    assert _kind(7) == _kind(Decimal(7)) == _kind(Decimal("7E+2")) == "integer"
+    assert _kind(Decimal("7.00")) == _kind(Decimal("1.0000001")) == _kind(7.5) == "number"
+    assert _kind(True) == _kind("7") == "other"
+    assert _kind(T0) == "datetime"
+    # a column whose scale varies by row (unconstrained numeric) gets no digest at all
+    assert _common_kind([Decimal(7), Decimal("7.5")]) == "other"
+    assert _common_kind([None, 3, 4]) == "integer" and _common_kind([]) == "other"
+    base = _NoSnapshotAdapter(_RecordingConn())
+    digest, square = base._digest_sql("k", "integer")
+    assert digest == "CAST(k AS DECIMAL(38,0))"
+    assert "DECIMAL(38,6)" not in square
+    assert base._digest_sql("k", "number") is None is base._digest_sql("k", "other")
 
 
 def _marker_only(source):
@@ -1233,3 +1275,70 @@ def test_expression_index_columns_follow_the_field_mapping():
     source.schema["dbo.loans"] = src
     result = _run(source, target, spec=spec)
     assert _codes(result, "schema_parity") == [], _tier(result, "schema_parity")["findings"]
+
+
+def test_expression_mapping_rewrites_column_references_only():
+    colmap = {"status": "loan_status", "email": "email_addr", "text": "body", "lower": "lc"}
+    # the mapped name inside a string literal, a cast type and a function name stays put
+    assert _map_expression("CASE WHEN status = 'status' THEN 'email' ELSE email END", colmap) == \
+        "CASE WHEN loan_status = 'status' THEN 'email' ELSE email_addr END"
+    assert _map_expression("lower(email::text)", colmap) == "lower(email_addr::text)"
+    assert _map_expression("lower((email)::character varying)", colmap) == \
+        "lower((email_addr)::character varying)"
+    assert _map_expression("COALESCE(status, 'it''s status')", colmap) == \
+        "COALESCE(loan_status, 'it''s status')"
+    # quoted identifiers are column references too, and keep their quoting
+    assert _map_expression('lower("Email"), "text"', colmap) == 'lower("email_addr"), "body"'
+    # unchanged when nothing is mapped
+    assert _map_expression("to_tsvector('english'::regconfig, coalesce(body, ''::text))", {}) == \
+        "to_tsvector('english'::regconfig, coalesce(body, ''::text))"
+
+
+def test_expression_unique_parity_ignores_a_column_name_inside_a_literal():
+    spec = _spec()
+    loans = dataclasses.replace(spec.objects[0], fields=[
+        FieldMapping("loan_number", "loan_no", "varchar", "string"),
+        FieldMapping("current_balance", "current_balance", "money", "decimal(19,4)"),
+        FieldMapping("borrower_id", "borrower_id", "int", "int")])
+    spec = MappingSpec("m1", [loans, spec.objects[1]])
+    expr_src = "CASE WHEN loan_number = 'loan_number' THEN NULL ELSE lower(loan_number) END"
+    expr_tgt = "CASE WHEN loan_no = 'loan_number' THEN NULL ELSE lower(loan_no) END"
+    src = dataclasses.replace(LOANS_FACTS, unique={("loan_number",)}, expression_unique={expr_src})
+    tgt = dataclasses.replace(TARGET_LOANS_FACTS, unique={("loan_no",)}, expression_unique={expr_tgt},
+                              not_null={"loan_id", "loan_no", "current_balance", "modified_date", "borrower_id"})
+    rows, borrowers = _rows(12)
+    tgt_rows = [{**{k: v for k, v in r.items() if k != "loan_number"}, "loan_no": r["loan_number"]} for r in rows]
+    source, target = _sides(rows, tgt_rows, borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target, spec=spec)
+    assert _codes(result, "schema_parity") == [], _tier(result, "schema_parity")["findings"]
+
+
+class _PostgresLike(_PostgresBase):
+    pass
+
+
+def test_watermark_literal_carries_the_utc_offset_only_where_the_engine_needs_it():
+    hwm = dt.datetime(2026, 9, 8, 18, 43, 52, 164112, tzinfo=PLUS2)   # 16:43:52.164112 UTC
+    pg, generic = _PostgresLike(_RecordingConn()), _NoSnapshotAdapter(_RecordingConn())
+    # Postgres: a timestamptz column would read a bare literal in the session TimeZone
+    assert _newer_predicate("modified_at", hwm, pg.watermark_literal) == \
+        "modified_at >= '2026-09-08 16:43:52.164113+00:00'"
+    assert _applied_predicate("modified_at", hwm, pg.watermark_literal) == \
+        "(modified_at < '2026-09-08 16:43:52.164113+00:00' OR modified_at IS NULL)"
+    # SQL Server datetime rejects an offset, so the zone-less engines keep the bare UTC form
+    assert _newer_predicate("modified_date", hwm, generic.watermark_literal) == \
+        "modified_date >= '2026-09-08 16:43:52.164113'"
+    assert pg.watermark_literal(41) == generic.watermark_literal(41) == "41"
+
+
+def test_transactional_predicates_use_the_source_engine_literal(monkeypatch):
+    # the in-flight and applied predicates are evaluated by the source, so its rendering wins
+    rows, borrowers = _rows(12)
+    source, target = _sides(rows, [dict(r) for r in rows], borrowers)
+    wheres: list[str] = []
+    monkeypatch.setattr(source, "watermark_literal", lambda value: "<SRC>")
+    monkeypatch.setattr(source, "row_count", lambda table, where=None: wheres.append(where) or 0)
+    ctx = open_window(_spec(), source, target)
+    assert "modified_date >= <SRC>" in wheres
+    assert ctx.applied_where(_spec().objects[0]) == "(modified_date < <SRC> OR modified_date IS NULL)"

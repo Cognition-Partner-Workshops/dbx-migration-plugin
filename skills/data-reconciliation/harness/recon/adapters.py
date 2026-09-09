@@ -20,6 +20,7 @@ from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
 from .paths import get_path
+from .watermarks import literal as watermark_literal
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ class TransactionalSide(Protocol):
     def keys_in_range(self, table: str, key_cols: list[str], lo: tuple | None, hi: tuple | None,
                       where: str | None = None, extra_cols: list[str] | None = None) -> list[tuple]: ...
     def max_watermark(self, table: str, watermark: str, where: str | None = None) -> Any: ...
+    def watermark_literal(self, value: Any) -> str: ...
     def schema_facts(self, table: str) -> SchemaFacts: ...
     def identity_next(self, table: str, column: str) -> int | None: ...
 
@@ -198,7 +200,10 @@ class _SqlAdapterBase:
     # ({table} is formatted in); None when the engine exposes none.
     change_token_sql: str | None = None
     # Portable digests for range fingerprints: exact decimal sums compare equal across engines.
-    number_digest_sql = "CAST({col} AS DECIMAL(38,6))"
+    # Only whole-number keys digest; a fractional decimal or float has no scale the harness can
+    # cast to without rounding two distinct keys together, so those kinds return no digest and
+    # the caller streams every range.
+    integer_digest_sql = "CAST({col} AS DECIMAL(38,0))"
     datetime_digest_sql: str | None = None  # whole microseconds since the epoch
     # Remainder of {x} divided by {m}, sign of the dividend (the square below removes it). The
     # function form is the default because a literal `%` is a placeholder to pyformat drivers
@@ -207,6 +212,8 @@ class _SqlAdapterBase:
     # Second moment of a digest {d}: the residue is rounded to a whole number first so engines
     # that shorten the scale of a decimal product still agree with those that keep it.
     square_digest_sql = "CAST({r} * {r} AS DECIMAL(38,0))"
+    # Whether datetime watermark literals carry an explicit +00:00 (see watermarks.literal).
+    watermark_literal_utc_offset = False
 
     def __init__(self, conn):
         self._conn = conn
@@ -447,6 +454,10 @@ class _SqlAdapterBase:
             return "snapshot"
         return "change_token" if self._token_ok else "markers"
 
+    def watermark_literal(self, value: Any) -> str:
+        """How this engine wants a watermark bound in a predicate against its own column."""
+        return watermark_literal(value, utc_offset=self.watermark_literal_utc_offset)
+
     def _change_token(self, table: str) -> Any:
         """Engine write counter for the table, or None when the engine has none or the login
         cannot read it; both cases leave the window on markers alone."""
@@ -504,10 +515,10 @@ class _SqlAdapterBase:
         return (" AND ".join(parts) if parts else "1 = 1"), values
 
     def _digest_sql(self, col: str, kind: str) -> tuple[str, str] | None:
-        """(sum term, sum-of-squares term) for one column, or None when the kind has no portable
-        digest (strings, uuids)."""
-        if kind == "number":
-            digest = self.number_digest_sql.format(col=col)
+        """(sum term, sum-of-squares term) for one column, or None when the kind has no exact
+        portable digest (strings, uuids, fractional numbers)."""
+        if kind == "integer":
+            digest = self.integer_digest_sql.format(col=col)
         elif kind == "datetime" and self.datetime_digest_sql:
             digest = self.datetime_digest_sql.format(col=col)
         else:
@@ -524,7 +535,7 @@ class _SqlAdapterBase:
         are taken modulo DIGEST_MODULUS, so a key swapped for another, two keys traded for two
         others with the same total, or a row's watermark moved inside a range all change the
         fingerprint even when the count does not. A digest is None when the column kind has no
-        portable sum (strings, uuids)."""
+        exact portable sum (strings, uuids, fractional numbers)."""
         if not ranges:
             return []
         key_digests = [self._digest_sql(k, kind) for k, kind in zip(key_cols, key_kinds)]
@@ -854,6 +865,9 @@ class _PostgresBase(_SqlAdapterBase):
     paramstyle = "format"
     # EXTRACT returns an exact numeric on Postgres 14+ (Lakebase is 16), so no float rounding
     datetime_digest_sql = "TRUNC(EXTRACT(EPOCH FROM {col}) * 1000000)"
+    # A timestamptz column reads an offset-less literal in the session TimeZone; a timestamp
+    # column ignores the offset, so the explicit +00:00 is right for both under the UTC contract.
+    watermark_literal_utc_offset = True
 
     def open_window(self) -> str:
         """Every statement until close_window reads one REPEATABLE READ snapshot."""
@@ -877,8 +891,8 @@ class _PostgresBase(_SqlAdapterBase):
             "FROM pg_constraint con "
             "JOIN pg_class c ON c.oid = con.conrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
-            "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum "
+            "LEFT JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+            "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum "
             "LEFT JOIN pg_class rc ON rc.oid = con.confrelid "
             "LEFT JOIN pg_namespace rn ON rn.oid = rc.relnamespace "
             "LEFT JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) "
@@ -886,10 +900,13 @@ class _PostgresBase(_SqlAdapterBase):
             "LEFT JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = fk.attnum "
             "WHERE n.nspname = %s AND c.relname = %s AND con.contype IN ('p', 'u', 'f', 'c') "
             "ORDER BY con.conname, k.ord", (schema, name))
+        # a CHECK that names no column (a constant, or only functions) has an empty conkey and
+        # arrives as one row with a NULL column; it still counts
         by_con: dict[str, list] = {}
         for ctype, cname, col, ref_table, ref_col, _ord in rows:
             entry = by_con.setdefault(cname, [ctype, [], ref_table, []])
-            entry[1].append(col)
+            if col is not None:
+                entry[1].append(col)
             if ref_col is not None:
                 entry[3].append(ref_col)
         for ctype, cols, ref_table, ref_cols in by_con.values():

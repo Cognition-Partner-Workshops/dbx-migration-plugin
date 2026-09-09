@@ -68,6 +68,22 @@ def same(a: Any, b: Any) -> bool:
     return instant(a) == instant(b)
 
 
+def literal(value: Any, utc_offset: bool = False) -> str:
+    """SQL literal of a watermark as a UTC instant. `utc_offset` appends an explicit `+00:00`
+    for engines that read an offset-less literal in the session time zone when the column is
+    zone-aware (Postgres timestamptz); engines whose zone-less types reject an offset (SQL
+    Server datetime) keep the bare form. Only datetimes and numbers are accepted; anything
+    else cannot be compared across engines."""
+    if isinstance(value, dt.datetime):
+        text = instant(value).isoformat(sep=" ", timespec="microseconds")
+        return f"'{text}+00:00'" if utc_offset else f"'{text}'"
+    if isinstance(value, dt.date):
+        return f"'{value.isoformat()}'"
+    if isinstance(value, bool) or not isinstance(value, _NUMBER):
+        raise ConfigError(f"watermark values must be datetimes or numbers, got {type(value).__name__}")
+    return str(value)
+
+
 def lag_seconds(src: Any, tgt: Any) -> float | None:
     """src - tgt in seconds, or None when either is null or the two are not comparable."""
     if src is None or tgt is None:

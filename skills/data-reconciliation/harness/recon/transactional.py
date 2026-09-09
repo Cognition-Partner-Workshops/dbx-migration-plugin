@@ -35,13 +35,21 @@ from __future__ import annotations
 import datetime as dt
 import decimal
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 from .adapters import SchemaFacts, StratifiedKeys, TransactionalSide
 from .config import ConfigError, MappingSpec, ObjectMapping, Tolerances
 from .tiers import Finding, TierResult
-from .watermarks import check_comparable, family, instant, lag_seconds, later, same
+from .watermarks import (
+    check_comparable,
+    family,
+    lag_seconds,
+    later,
+    literal,
+    same,
+)
 
 # Keys listed per finding before the rest is summarised as a count.
 MAX_KEYS_IN_FINDING = 20
@@ -71,6 +79,8 @@ class TransactionalContext:
     windows: dict[str, ObjectWindow] = field(default_factory=dict)
     open_markers: dict[str, tuple[tuple, tuple]] = field(default_factory=dict)
     key_diffs: dict[str, KeyDiff] = field(default_factory=dict)
+    # renders a watermark bound the way the source engine reads it (the predicates run there)
+    render: Callable[[Any], str] = literal
 
     def in_flight(self, c: ObjectMapping) -> int:
         return self.windows.get(c.object, ObjectWindow()).in_flight
@@ -92,7 +102,7 @@ class TransactionalContext:
         hwm = self.hwm(c)
         if hwm is None or not c.watermark_source:
             return c.root_where
-        applied = _applied_predicate(c.watermark_source, hwm)
+        applied = _applied_predicate(c.watermark_source, hwm, self.render)
         return f"({c.root_where}) AND {applied}" if c.root_where else applied
 
     def in_flight_keys(self, c: ObjectMapping, source) -> list[tuple]:
@@ -100,7 +110,7 @@ class TransactionalContext:
         hwm = self.hwm(c)
         if hwm is None or not c.watermark_source:
             return []
-        newer = _newer_predicate(c.watermark_source, hwm)
+        newer = _newer_predicate(c.watermark_source, hwm, self.render)
         where = f"({c.root_where}) AND {newer}" if c.root_where else newer
         return [tuple(r[k] for k in c.key_source)
                 for r in source.fetch_keyed(c.root_table, c.key_source, [], where=where)]
@@ -115,7 +125,7 @@ def require_transactional(source, target) -> None:
 
 def open_window(spec: MappingSpec, source, target) -> TransactionalContext:
     """Pin both sides, read the opening markers, and measure the in-flight set per object."""
-    ctx = TransactionalContext()
+    ctx = TransactionalContext(render=source.watermark_literal)
     iso = (source.open_window(), target.open_window())
     for c in spec.objects:
         win = ObjectWindow(isolation=iso)
@@ -127,43 +137,32 @@ def open_window(spec: MappingSpec, source, target) -> TransactionalContext:
                              f"{c.object}: {c.watermark_source} vs {c.watermark_target}")
             win.hwm_target = t_mark[1]
             if win.hwm_target is not None:
-                newer = _newer_predicate(c.watermark_source, win.hwm_target)
+                newer = _newer_predicate(c.watermark_source, win.hwm_target, ctx.render)
                 where = f"({c.root_where}) AND {newer}" if c.root_where else newer
                 win.in_flight = source.row_count(c.root_table, where)
         ctx.windows[c.object] = win
     return ctx
 
 
-def _newer_predicate(column: str, hwm: Any) -> str:
+def _newer_predicate(column: str, hwm: Any, render: Callable[[Any], str] = literal) -> str:
     """Rows changed after the target's applied watermark. Drivers deliver datetimes at microsecond
     precision while the engine may store more (SQL Server datetime2(7)), so a strict `>` against
     the truncated literal would count every row that shares the applied microsecond; compare from
-    the next microsecond instead, matching what `later` can see on fetched rows."""
+    the next microsecond instead, matching what `later` can see on fetched rows. `render` is the
+    source adapter's `watermark_literal`: the predicate is evaluated by that engine."""
     if isinstance(hwm, dt.datetime):
-        return f"{column} >= {_literal(hwm + dt.timedelta(microseconds=1))}"
-    return f"{column} > {_literal(hwm)}"
+        return f"{column} >= {render(hwm + dt.timedelta(microseconds=1))}"
+    return f"{column} > {render(hwm)}"
 
 
-def _applied_predicate(column: str, hwm: Any) -> str:
+def _applied_predicate(column: str, hwm: Any, render: Callable[[Any], str] = literal) -> str:
     """The complement of `_newer_predicate` that also keeps rows with no watermark: those are
     applied as far as the harness can tell, exactly as `row_in_flight` treats them."""
     if isinstance(hwm, dt.datetime):
-        bound = f"{column} < {_literal(hwm + dt.timedelta(microseconds=1))}"
+        bound = f"{column} < {render(hwm + dt.timedelta(microseconds=1))}"
     else:
-        bound = f"{column} <= {_literal(hwm)}"
+        bound = f"{column} <= {render(hwm)}"
     return f"({bound} OR {column} IS NULL)"
-
-
-def _literal(value: Any) -> str:
-    """Watermark literal for a predicate, as a UTC instant (see recon.watermarks). Only datetimes
-    and numbers are accepted as watermarks; anything else cannot be compared across engines."""
-    if isinstance(value, dt.datetime):
-        return "'" + instant(value).isoformat(sep=" ", timespec="microseconds") + "'"
-    if isinstance(value, dt.date):
-        return f"'{value.isoformat()}'"
-    if isinstance(value, bool) or not isinstance(value, (int, float, decimal.Decimal)):
-        raise ConfigError(f"watermark values must be datetimes or numbers, got {type(value).__name__}")
-    return str(value)
 
 
 def abandon_window(source, target) -> None:
@@ -233,8 +232,24 @@ def _ranges(source: StratifiedKeys, c: ObjectMapping, n: int, tol: Tolerances) -
 
 
 def _kind(value: Any) -> str:
-    """Digest family of a key/watermark value: what portable sum the adapters can compute."""
+    """Digest family of a key/watermark value: what portable sum the adapters can compute.
+    Whole numbers (an int, or a Decimal the driver returned with no fractional scale) are
+    `integer` and digest exactly; a fractional decimal or a float is `number`, which has no
+    exact portable digest, so such keys stream every range instead of being fingerprinted."""
+    if isinstance(value, bool):
+        return family(value)
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, decimal.Decimal) and value.is_finite() and value.as_tuple().exponent >= 0:
+        return "integer"
     return family(value)
+
+
+def _common_kind(values: Iterable[Any]) -> str:
+    """The one digest kind shared by every non-null value, or `other` when they disagree (a
+    numeric column whose scale varies per row) or none is known."""
+    kinds = {_kind(v) for v in values if v is not None}
+    return kinds.pop() if len(kinds) == 1 else "other"
 
 
 def _fingerprint_complete(fps: list[tuple], nk: int, watermark: bool) -> bool:
@@ -274,10 +289,11 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         ranges = _ranges(source, c, n, tol)
         nk = len(c.key_source)
         has_wm = bool(c.watermark_source and c.watermark_target)
-        first = next((r[0] for r in ranges if r[0] is not None), ())
-        key_kinds = [_kind(v) for v in first] if len(first) == nk else ["other"] * nk
-        s_open_wm = ctx.open_markers[c.object][0][1] if has_wm else None
-        wm_kind = _kind(s_open_wm) if has_wm and s_open_wm is not None else None
+        bounds = [b for r in ranges for b in r if b is not None and len(b) == nk]
+        key_kinds = [_common_kind(b[i] for b in bounds) for i in range(nk)]
+        wm_kind = None
+        if has_wm:
+            wm_kind = _common_kind(m[1] for m in ctx.open_markers[c.object] if len(m) > 1)
         complete = False
         if tol.pk_set_stream_every_range:
             fingerprint = "not used: every range streamed (pk_set_stream_every_range)"
@@ -442,11 +458,33 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         expression_indexes={x.lower() for x in f.expression_indexes})
 
 
+# Lexer for index expression text as the catalogs render it (pg_get_indexdef): a string literal
+# with '' escapes, a quoted identifier with "" escapes, a cast target (`::` and a type name, with
+# the multi-word forms Postgres prints), a function name (identifier followed by a parenthesis),
+# and a bare identifier; everything else is passed through.
+_EXPR_TOKEN = re.compile(
+    r"(?P<string>'(?:[^']|'')*')"
+    r"|(?P<quoted>\"(?:[^\"]|\"\")*\")"
+    r"|(?P<cast>::\s*[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\s+(?:varying|precision|with(?:out)?\s+time\s+zone))?(?:\s*\([^)]*\))?)"
+    r"|(?P<func>[A-Za-z_][A-Za-z0-9_]*)(?=\s*\()"
+    r"|(?P<ident>[A-Za-z_][A-Za-z0-9_]*)")
+
+
 def _map_expression(text: str, colmap: dict[str, str]) -> str:
-    """Rewrite the source column names inside an index expression to their target names, so
-    `lower(email)` on the source is expected as `lower(email_addr)` when the field is renamed."""
-    return re.sub(r"[A-Za-z_][A-Za-z0-9_]*",
-                  lambda m: colmap.get(m.group(0).lower(), m.group(0)), text)
+    """Rewrite the source column references inside an index expression to their target names, so
+    `lower(email)` on the source is expected as `lower(email_addr)` when the field is renamed.
+    Only column references move: a string literal, a type name and a function name that happen
+    to spell a mapped column stay as they are."""
+    def swap(m: re.Match) -> str:
+        if m.group("ident"):
+            return colmap.get(m.group("ident").lower(), m.group("ident"))
+        if m.group("quoted"):
+            name = m.group("quoted")[1:-1].replace('""', '"')
+            mapped = colmap.get(name.lower())
+            return '"' + mapped.replace('"', '""') + '"' if mapped else m.group("quoted")
+        return m.group(0)
+    return _EXPR_TOKEN.sub(swap, text)
 
 
 def _covered(leading: tuple, facts: SchemaFacts) -> bool:
