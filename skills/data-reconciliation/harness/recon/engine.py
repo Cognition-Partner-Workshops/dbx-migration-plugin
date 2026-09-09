@@ -120,10 +120,12 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
             ctx = open_window(spec, source, target)
         tiers = _run_tiers(spec, tol, canon, source, target, seed, depth, mode, ops,
                            run_source, run_target, ctx)
-    except BaseException:
-        # a marker or tier query that raises must not leave either side's window pinned
+    except BaseException as exc:
+        # a marker or tier query that raises must not leave either side's window pinned; the
+        # run's error is what propagates, with any release failure attached to it
         if mode == "transactional":
-            abandon_window(source, target)
+            for err in abandon_window(source, target):
+                exc.add_note(str(err))
         raise
     provenance_warnings = _snapshot_provenance_warnings(
         snapshot, source_family, spec, next(t for t in tiers if t.tier == 1))

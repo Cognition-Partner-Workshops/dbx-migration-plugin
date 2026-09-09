@@ -289,19 +289,28 @@ def _count(data: dict, key: str, default: int, path: Path) -> int:
     return value
 
 
+def _positive_count(data: dict, key: str, default: int, path: Path) -> int:
+    """A tolerance count that sizes a plan (ranges, samples, concurrency) must be >= 1: zero
+    would silently collapse the plan and a coerced string or boolean would hide a typo."""
+    value = _count(data, key, default, path)
+    if value < 1:
+        raise ConfigError(f"{path}: {key} must be a positive JSON integer, got {value!r}")
+    return value
+
+
 def load_tolerances(path: Path) -> Tolerances:
     data = json.loads(path.read_text())
     version = _require_version(data, path)
     return Tolerances(
         version=version,
-        full_diff_row_threshold=int(data.get("full_diff_row_threshold", 100_000)),
-        sample_size=int(data.get("sample_size", 1_000)),
+        full_diff_row_threshold=_count(data, "full_diff_row_threshold", 100_000, path),
+        sample_size=_positive_count(data, "sample_size", 1_000, path),
         numeric_abs_tol=_bound(data, "numeric_abs_tol", 0.0, path),
         aggregate_rel_tol=_bound(data, "aggregate_rel_tol", 0.0, path),
-        source_concurrency=int(data.get("source_concurrency", 1)),
+        source_concurrency=_positive_count(data, "source_concurrency", 1, path),
         cdc_lag_max_s=_bound(data, "cdc_lag_max_s", 0.0, path),
         cdc_in_flight_max_rows=_count(data, "cdc_in_flight_max_rows", 0, path),
-        pk_set_ranges=int(data.get("pk_set_ranges", 64)),
+        pk_set_ranges=_positive_count(data, "pk_set_ranges", 64, path),
         pk_set_stream_every_range=_flag(data, "pk_set_stream_every_range", path),
         accept_marker_only_window=_flag(data, "accept_marker_only_window", path),
         accept_target_only_constraints=_flag(data, "accept_target_only_constraints", path),

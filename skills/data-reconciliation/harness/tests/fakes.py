@@ -117,6 +117,11 @@ class _TransactionalMixin:
         self._maybe_fail("close_window")
         self.window_open = False
 
+    def discard(self) -> None:
+        self.calls["discard"] += 1
+        self._maybe_fail("discard")
+        self.window_open = False
+
     def window_strength(self) -> str:
         if self.isolation == "fake_snapshot":
             return "snapshot"

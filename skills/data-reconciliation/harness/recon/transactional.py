@@ -179,16 +179,21 @@ def _applied_predicate(column: str, hwm: Any, render: Callable[[Any], str] = lit
     return f"({bound} OR {column} IS NULL)"
 
 
-def abandon_window(source, target) -> None:
-    """Release both sides after a failed run; one side's failure never keeps the other pinned."""
-    errors = []
-    for side in (source, target):
+def abandon_window(source, target) -> list[Exception]:
+    """Release both sides after a failed run and report what went wrong doing so, never raise:
+    the run's own error is the finding. A side whose rollback fails has its connection dropped
+    so no snapshot stays pinned; one side's failure never keeps the other pinned."""
+    errors: list[Exception] = []
+    for name, side in (("source", source), ("target", target)):
         try:
             side.close_window()
         except Exception as exc:  # noqa: BLE001  driver-specific error type
-            errors.append(exc)
-    if errors:
-        raise errors[0]
+            errors.append(RuntimeError(f"{name} close_window failed: {exc!r}"))
+            try:
+                side.discard()
+            except Exception as exc2:  # noqa: BLE001
+                errors.append(RuntimeError(f"{name} connection could not be dropped: {exc2!r}"))
+    return errors
 
 
 def close_window(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,

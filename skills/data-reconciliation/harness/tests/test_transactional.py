@@ -14,6 +14,7 @@ from recon.adapters import (
     TargetIdentityError,
     _fk_action,
     _index_key_text,
+    quote_ident,
     _PostgresBase,
     _SqlAdapterBase,
     SqlServerSourceAdapter,
@@ -753,6 +754,29 @@ def test_tolerance_bounds_must_be_finite_non_negative_numbers(tmp_path, key, val
         load_tolerances(path)
 
 
+@pytest.mark.parametrize("key", ["pk_set_ranges", "sample_size", "source_concurrency"])
+@pytest.mark.parametrize("value, needle", [
+    (0, "positive JSON integer"), (-4, "non-negative JSON integer"), (True, "non-negative JSON integer"),
+    ("64", "non-negative JSON integer"), (2.5, "non-negative JSON integer"), (None, "non-negative JSON integer"),
+])
+def test_tolerance_plan_counts_must_be_positive_integers(tmp_path, key, value, needle):
+    path = tmp_path / "tol.json"
+    path.write_text(json.dumps({"version": "t1", key: value}))
+    with pytest.raises(ConfigError, match=f"{key} must be .*{needle}"):
+        load_tolerances(path)
+
+
+def test_tolerance_counts_load_integers_and_keep_defaults(tmp_path):
+    path = tmp_path / "tol.json"
+    path.write_text(json.dumps({"version": "t1", "pk_set_ranges": 16, "full_diff_row_threshold": 0}))
+    tol = load_tolerances(path)
+    assert tol.pk_set_ranges == 16 and tol.full_diff_row_threshold == 0  # 0 rows: always sample
+    assert tol.sample_size == 1_000 and tol.source_concurrency == 1
+    path.write_text(json.dumps({"version": "t1", "full_diff_row_threshold": -1}))
+    with pytest.raises(ConfigError, match="full_diff_row_threshold must be a non-negative JSON integer"):
+        load_tolerances(path)
+
+
 def _tokened(source, counter):
     """A marker-fallback source whose engine exposes a per-table write counter."""
     source.pin = "none"
@@ -815,10 +839,32 @@ def test_a_raise_anywhere_in_the_run_still_closes_both_windows(target_fails, sou
     target.fail_on[target_fails] = RuntimeError("tier failure" if source_fails else raised)
     if source_fails:
         source.fail_on[source_fails] = RuntimeError(raised)
-    with pytest.raises(RuntimeError, match=raised):
+    with pytest.raises(RuntimeError) as info:
         _run(source, target)
+    # the run's own error propagates; a failed release is attached to it, never in its place
+    assert str(info.value) == ("tier failure" if source_fails else raised)
     assert target.calls["close_window"] == 1 and not target.window_open
-    assert source.calls["close_window"] == 1 and (source_fails or not source.window_open)
+    assert source.calls["close_window"] == 1
+    if source_fails:
+        assert info.value.__notes__ == [f"source close_window failed: RuntimeError({raised!r})"]
+        assert source.calls["discard"] == 1 and not source.window_open  # the connection is dropped
+    else:
+        assert not hasattr(info.value, "__notes__") and source.calls["discard"] == 0
+        assert not source.window_open
+
+
+def test_a_side_that_cannot_be_released_at_all_is_reported_on_the_original_error():
+    loans, borrowers = _rows(6)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    target.fail_on["range_fingerprints"] = RuntimeError("tier failure")
+    source.fail_on["close_window"] = RuntimeError("rollback failed")
+    source.fail_on["discard"] = RuntimeError("socket gone")
+    with pytest.raises(RuntimeError) as info:
+        _run(source, target)
+    assert str(info.value) == "tier failure" and info.value.__notes__ == [
+        "source close_window failed: RuntimeError('rollback failed')",
+        "source connection could not be dropped: RuntimeError('socket gone')"]
+    assert target.calls["close_window"] == 1 and not target.window_open
 
 
 def test_field_diff_is_still_graded_for_applied_rows():
@@ -1351,6 +1397,32 @@ class _StubConn:
 
 def _db(name):
     return _StubConn([(name,)])
+
+
+@pytest.mark.parametrize("name, quote, expected", [
+    ("loans", '"', '"loans"'),
+    ('lo"ans"; DROP TABLE x; --', '"', '"lo""ans""; DROP TABLE x; --"'),
+    ("loan`s", "`", "`loan``s`"),
+    ("Mixed Case", "`", "`Mixed Case`"),
+])
+def test_identifiers_are_delimited_with_the_delimiter_doubled(name, quote, expected):
+    assert quote_ident(name, quote) == expected
+
+
+@pytest.mark.parametrize("name", ["", "a.b", "x\x00y"])
+def test_identifiers_that_are_not_one_name_are_refused(name):
+    with pytest.raises(ConfigError, match="invalid SQL identifier"):
+        quote_ident(name, '"')
+
+
+def test_lakebase_target_qualifies_objects_with_escaped_identifiers(monkeypatch):
+    psycopg = pytest.importorskip("psycopg")
+    monkeypatch.setenv("T", "dsn-under-test")
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: _db("db"))
+    target = LakebaseTargetAdapter("T", "db", 'loan"servicing')
+    assert target._q('lo"ans') == '"loan""servicing"."lo""ans"'
+    with pytest.raises(ConfigError, match="invalid SQL identifier"):
+        target._q("public.loans")
 
 
 def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkeypatch):

@@ -215,6 +215,7 @@ class TransactionalSide(Protocol):
     `window_strength` says how much that proof is worth (see WINDOW_STRENGTHS)."""
     def open_window(self) -> str: ...
     def close_window(self) -> None: ...
+    def discard(self) -> None: ...
     def window_strength(self) -> str: ...
     def window_marker(self, table: str, key_cols: list[str], watermark: str | None,
                       where: str | None = None) -> tuple: ...
@@ -562,6 +563,12 @@ class _SqlAdapterBase:
         if hasattr(self._conn, "rollback"):
             self._conn.rollback()
 
+    def discard(self) -> None:
+        """Drop the connection outright: the last resort when a rollback fails, so a snapshot
+        never outlives the run on the engine side."""
+        self.isolation = "none"
+        self._conn.close()
+
     def window_strength(self) -> str:
         if self.isolation in ("snapshot", "repeatable_read"):
             return "snapshot"
@@ -771,6 +778,16 @@ def _key_text(value: Any) -> str | None:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return "\\x" + bytes(value).hex()
     return str(value)
+
+
+def quote_ident(name: str, quote: str) -> str:
+    """One SQL identifier, delimited and with the delimiter doubled inside, so a name from a
+    mapping spec or a CLI flag can only ever name an object, never end the identifier and start
+    a statement. Empty names and dotted paths are refused: a qualified name is quoted per part."""
+    if not name or "." in name or "\x00" in name:
+        from .config import ConfigError
+        raise ConfigError(f"invalid SQL identifier {name!r}")
+    return quote + name.replace(quote, quote * 2) + quote
 
 
 def _split_table(table: str, default_schema: str | None) -> tuple[str | None, str]:
@@ -1005,7 +1022,7 @@ class DatabricksTargetAdapter:
         self._conn = _databricks_connect(secret_name)
         self._sql = _SqlAdapterBase(self._conn)
         self._sql.paramstyle = "pyformat"
-        self._prefix = f"`{catalog}`.`{schema}`."
+        self._prefix = f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
 
     @property
     def statements(self) -> int:
@@ -1016,7 +1033,7 @@ class DatabricksTargetAdapter:
         return self._sql.rows_fetched
 
     def _q(self, object: str) -> str:
-        return self._prefix + f"`{object}`"
+        return self._prefix + quote_ident(object, "`")
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
@@ -1316,6 +1333,7 @@ class LakebaseTargetAdapter(_PostgresBase):
         import psycopg  # lazy: optional extra
         super().__init__(psycopg.connect(_secret(secret_name)))
         self._schema = schema
+        self._schema_q = quote_ident(schema, '"')
         self.database = self._bind_database(database)
 
     def _bind_database(self, expected: str) -> str:
@@ -1328,7 +1346,7 @@ class LakebaseTargetAdapter(_PostgresBase):
         return actual
 
     def _q(self, object: str) -> str:
-        return f'"{self._schema}"."{object}"'
+        return f'{self._schema_q}.{quote_ident(object, chr(34))}'
 
     def target_row_count(self, object: str, where: str | None = None) -> int:
         return self.row_count(self._q(object), where)
