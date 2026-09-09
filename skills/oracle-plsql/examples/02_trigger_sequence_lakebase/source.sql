@@ -1,23 +1,8 @@
--- Fixture: POLADM (policy administration, OLTP profile). Synthetic; no customer data.
--- Object class: SEQUENCE. Census key: POLADM.POLICY_SEQ, POLADM.AUDIT_SEQ
+-- Oracle OLTP schema: sequences, a BEFORE INSERT OR UPDATE row trigger (:NEW/:OLD, INSERTING/UPDATING,
+-- NEXTVAL, SYS_CONTEXT, a '' = NULL dead branch) and the autonomous-transaction logger it calls.
 
-CREATE SEQUENCE poladm.policy_seq
-  START WITH 1000000
-  INCREMENT BY 1
-  CACHE 200          -- cached values are lost on instance restart: gaps are normal
-  NOCYCLE
-  NOORDER;           -- RAC: values are not monotonic across nodes
-
-CREATE SEQUENCE poladm.audit_seq
-  START WITH 1
-  INCREMENT BY 1
-  CACHE 1000
-  NOCYCLE;
-
--- Object class: TRIGGER. Census key: POLADM.TRG_POLICY_BIU (on POLADM.POLICY)
--- BEFORE INSERT OR UPDATE, row-level. Assigns the surrogate key from policy_seq, maintains
--- audit columns and row_version, derives active_policy_flag, and logs status/premium changes
--- through the autonomous logger. :NEW / :OLD correlation names throughout.
+CREATE SEQUENCE poladm.policy_seq START WITH 1000000 INCREMENT BY 1 CACHE 200 NOCYCLE NOORDER;
+CREATE SEQUENCE poladm.audit_seq  START WITH 1       INCREMENT BY 1 CACHE 1000 NOCYCLE;
 
 CREATE OR REPLACE TRIGGER poladm.trg_policy_biu
   BEFORE INSERT OR UPDATE ON poladm.policy
@@ -29,8 +14,8 @@ BEGIN
     IF :NEW.policy_id IS NULL THEN
       :NEW.policy_id := poladm.policy_seq.NEXTVAL;
     END IF;
-    :NEW.created_dt := SYSDATE;
-    :NEW.created_by := SYS_CONTEXT('USERENV','SESSION_USER');
+    :NEW.created_dt  := SYSDATE;
+    :NEW.created_by  := SYS_CONTEXT('USERENV','SESSION_USER');
     :NEW.row_version := 1;
     l_event := 'INSERT';
   ELSIF UPDATING THEN
@@ -40,10 +25,8 @@ BEGIN
     l_event := 'UPDATE';
   END IF;
 
-  -- Normalise identifiers the way pkg_policy_inquiry expects to find them
   :NEW.policy_no := REPLACE(UPPER(TRIM(:NEW.policy_no)), 'AL/', 'ALB-');
 
-  -- '' arriving from the SOAP layer is already NULL by the time it reaches :NEW
   IF :NEW.cover_note_ref = '' THEN            -- never true in Oracle: '' IS NULL
     :NEW.cover_note_ref := NULL;
   END IF;
@@ -67,10 +50,6 @@ BEGIN
 END trg_policy_biu;
 /
 
--- Object class: PROCEDURE. Census key: POLADM.PRC_LOG_EVENT
--- Autonomous-transaction logger: its INSERT + COMMIT survive a ROLLBACK of the caller.
--- Writes: POLADM.POLICY_AUDIT_LOG (and consumes POLADM.AUDIT_SEQ).
-
 CREATE OR REPLACE PROCEDURE poladm.prc_log_event (
   p_policy_id   IN NUMBER,
   p_event_cd    IN VARCHAR2,
@@ -90,6 +69,6 @@ BEGIN
   COMMIT;                                  -- commits ONLY the autonomous transaction
 EXCEPTION
   WHEN OTHERS THEN
-    ROLLBACK;                              -- never let logging break the business transaction
+    ROLLBACK;                              -- logging never breaks the business transaction
 END prc_log_event;
 /

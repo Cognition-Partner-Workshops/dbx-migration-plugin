@@ -1,7 +1,5 @@
--- Object class: TABLE (global temporary) + MERGE statement (script unit).
--- Census keys: POLADM.STG_POLICY_FEED, POLADM.MRG_POLICY_FROM_STG (statement, keyed by file)
--- Nightly POLARIS feed upsert. Trap carriers: NEXTVAL inside MERGE INSERT, DELETE WHERE branch,
--- TRIM/'' handling on the feed, duplicate source keys raising ORA-30926, and TRUNC(dt) compares.
+-- Oracle: nightly feed upsert. GTT staging, MERGE with UPDATE ... DELETE WHERE, NEXTVAL in the
+-- INSERT branch, TRIM/'' handling, TRUNC(DATE); duplicate source keys raise ORA-30926.
 
 CREATE GLOBAL TEMPORARY TABLE poladm.stg_policy_feed (
   policy_no        VARCHAR2(20),
