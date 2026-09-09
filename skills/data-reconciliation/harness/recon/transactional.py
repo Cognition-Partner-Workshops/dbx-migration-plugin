@@ -449,8 +449,42 @@ def _column_map(spec: MappingSpec, c: ObjectMapping) -> dict[str, str]:
     return m
 
 
-def _table_map(spec: MappingSpec) -> dict[str, str]:
-    return {o.root_table.split(".")[-1].lower(): o.object.lower() for o in spec.objects}
+def _norm_table(name: str) -> str:
+    return name.replace("[", "").replace("]", "").replace('"', "").lower()
+
+
+class _TableIndex:
+    """Resolves the table a foreign key references to the mapped object that owns it.
+
+    A reference matches on its full spelling first: the spec's `root_table`/`object`, or the
+    qualified name the catalog reports for the object's own facts. A bare reference resolves only
+    when exactly one mapped object carries that table name (`schema_a.customer` and
+    `schema_b.customer` mapped side by side leave it unresolved, never silently picked). A
+    qualified reference never resolves to a same-named object the catalog places elsewhere."""
+
+    def __init__(self) -> None:
+        self._exact: dict[str, str] = {}
+        self._placed: set[str] = set()  # objects whose catalog identity is in _exact
+
+    def add(self, spelling: str, obj: str, catalog: bool = False) -> None:
+        self._exact[_norm_table(spelling)] = obj
+        if catalog:
+            self._placed.add(obj)
+
+    def resolve(self, ref: str) -> list[str]:
+        """The candidate objects: one when resolved, none when out of scope, several when the
+        reference is too bare to tell them apart."""
+        name = _norm_table(ref)
+        if name in self._exact:
+            return [self._exact[name]]
+        bare = name.rsplit(".", 1)[-1]
+        if "." in name:
+            # a qualified reference to a table the spec spelled bare, unless the catalog has
+            # already placed that object in another schema
+            found = {o for s, o in self._exact.items() if s == bare and o not in self._placed}
+        else:
+            found = {o for s, o in self._exact.items() if s.rsplit(".", 1)[-1] == bare}
+        return sorted(found)
 
 
 def _map_cols(cols: tuple, colmap: dict[str, str]) -> tuple:
@@ -459,12 +493,12 @@ def _map_cols(cols: tuple, colmap: dict[str, str]) -> tuple:
 
 def _lower_fk(fk: tuple) -> tuple:
     cols, ref, rcols = fk
-    return (tuple(x.lower() for x in cols), ref.split(".")[-1].lower(),
-            tuple(x.lower() for x in rcols))
+    return (tuple(x.lower() for x in cols), _norm_table(ref), tuple(x.lower() for x in rcols))
 
 
 def _lower_facts(f: SchemaFacts) -> SchemaFacts:
     return SchemaFacts(
+        table=_norm_table(f.table),
         primary_key=tuple(x.lower() for x in f.primary_key),
         unique={tuple(x.lower() for x in u) for u in f.unique},
         foreign_keys={_lower_fk(fk) for fk in f.foreign_keys},
@@ -517,7 +551,25 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
     Indexes stay one-directional (an extra target index changes cost, not acceptance)."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
-    tables = _table_map(spec)
+    # both catalogs are read first so every foreign key resolves against the qualified identity
+    # of every mapped table, not just the ones graded before it
+    tables, targets = _TableIndex(), _TableIndex()
+    facts: dict[str, tuple[SchemaFacts, SchemaFacts]] = {}
+    for c in spec.objects:
+        obj = c.object.lower()
+        tables.add(c.root_table, obj)
+        targets.add(c.object, obj)
+        try:
+            s_raw = source.schema_facts(c.root_table)
+            t_raw = target.schema_facts(c.object)
+        except NotImplementedError as exc:
+            stats.setdefault("unverified", []).append(f"{c.object}: {exc}")
+            continue
+        if s_raw.table:
+            tables.add(s_raw.table, obj, catalog=True)
+        if t_raw.table:
+            targets.add(t_raw.table, obj, catalog=True)
+        facts[c.object] = (s_raw, t_raw)
 
     def tightened(finding: Finding) -> None:
         if tol.accept_target_only_constraints:
@@ -527,14 +579,11 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
             findings.append(finding)
 
     for c in spec.objects:
+        if c.object not in facts:
+            continue
         colmap = _column_map(spec, c)
         mapped_targets = set(colmap.values())
-        try:
-            s_raw = source.schema_facts(c.root_table)
-            t_raw = target.schema_facts(c.object)
-        except NotImplementedError as exc:
-            stats.setdefault("unverified", []).append(f"{c.object}: {exc}")
-            continue
+        s_raw, t_raw = facts[c.object]
         checks += 1
         s, t, t_lower = _lower_facts(s_raw), t_raw, _lower_facts(t_raw)
         pk = _map_cols(s.primary_key, colmap)
@@ -567,27 +616,44 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
             else:
                 stats.setdefault("target_only_columns_unverified", []).append(
                     f"{c.object}: unique {u} covers a column outside the mapping")
+        # target foreign keys keyed by the mapped object they reference; one the index cannot
+        # place keeps the catalog's qualified reference and so never matches an expectation
+        t_fks: dict[tuple, tuple] = {}
+        for cols, ref, rcols in t_lower.foreign_keys:
+            found = targets.resolve(ref)
+            t_fks[(cols, found[0] if len(found) == 1 else ref, rcols)] = (cols, ref, rcols)
         expected_fks: set[tuple] = set()
         for cols, ref, rcols in sorted(s.foreign_keys):
-            ref_obj = tables.get(ref.split(".")[-1].lower())
-            if ref_obj is None:
+            found = tables.resolve(ref)
+            if len(found) > 1:
+                # too bare to grade: neither passed nor failed, and the target FKs it could
+                # correspond to are not judged target-only either; the warning blocks merge
+                stats.setdefault("unverified", []).append(
+                    f"{c.object}: FK {cols} -> {ref} could reference any of {found}; qualify the "
+                    "reference (root_table schema) or confirm its target counterpart by hand")
+                for cand in found:
+                    ref_map = next((_column_map(spec, o) for o in spec.objects if o.object.lower() == cand), {})
+                    expected_fks.add((_map_cols(cols, colmap), cand, _map_cols(rcols, ref_map)))
+                continue
+            if not found:
                 stats.setdefault("foreign_keys_out_of_scope", []).append(f"{c.object}: {cols} -> {ref}")
                 continue
+            ref_obj = found[0]
             ref_map = next((_column_map(spec, o) for o in spec.objects if o.object.lower() == ref_obj), {})
             want = (_map_cols(cols, colmap), ref_obj, _map_cols(rcols, ref_map))
             expected_fks.add(want)
-            if want not in t_lower.foreign_keys:
+            if want not in t_fks:
                 findings.append(Finding(c.object, "foreign_key_missing",
                                         f"source FK {cols} -> {ref}{rcols} expected on target as {want}"))
                 continue
             s_act = s.foreign_key_actions.get((cols, ref, rcols))
-            t_act = t_lower.foreign_key_actions.get(want)
+            t_act = t_lower.foreign_key_actions.get(t_fks[want])
             if s_act and t_act and s_act != t_act:
                 findings.append(Finding(c.object, "foreign_key_action_mismatch",
                                         f"FK {want}: source acts (update, delete) = {s_act}, target "
                                         f"{t_act}: parent changes propagate differently", s_act, t_act))
         in_scope = {o.object.lower() for o in spec.objects}
-        for cols, ref, rcols in sorted(t_lower.foreign_keys - expected_fks):
+        for cols, ref, rcols in sorted(set(t_fks) - expected_fks):
             if ref not in in_scope:
                 stats.setdefault("foreign_keys_out_of_scope", []).append(
                     f"{c.object}: target FK {cols} -> {ref}")
@@ -656,12 +722,18 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                             "source_max": s_max,
                             "target_next": None if t_state is None else t_state.next}
                 collides = False
+                # the source identity frontier (its own next value) is compared only when both
+                # sides step the same way; opposite directions are a finding of their own
+                s_next = (s_state.next if s_state is not None and t_state is not None
+                          and s_state.descending == t_state.descending else None)
                 if t_state is None:
                     findings.append(Finding(c.object, "sequence_missing",
                                             f"target column {c.identity_target} owns no sequence/identity"))
                 elif t_state.descending:
                     # a countdown identity hands out ever smaller values: it collides with the
-                    # rows the source already holds when its next value is not below their minimum
+                    # rows the source already holds when its next value is not below their
+                    # minimum, and reissues identifiers the source already handed out (rows
+                    # since deleted or rolled back) when it sits above the source's own next value
                     seq_note.update(source_min=s_min, increment=t_state.increment)
                     if s_min is not None and t_state.next >= int(s_min):
                         collides = True
@@ -670,12 +742,26 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                                                 f"{c.identity_source}={s_min} on a descending identity "
                                                 f"(increment {t_state.increment}): new inserts would collide",
                                                 s_min, t_state.next))
+                    elif s_next is not None and t_state.next > s_next:
+                        collides = True
+                        findings.append(Finding(c.object, "sequence_behind_source",
+                                                f"target next value {t_state.next} > source identity next "
+                                                f"{s_next} on a descending identity (source min "
+                                                f"{c.identity_source}={s_min}): identifiers the source "
+                                                "already issued would be reissued", s_next, t_state.next))
                 elif s_max is not None and t_state.next <= int(s_max):
                     collides = True
                     findings.append(Finding(c.object, "sequence_behind_source",
                                             f"target next value {t_state.next} <= source max "
                                             f"{c.identity_source}={s_max}: new inserts would collide",
                                             s_max, t_state.next))
+                elif s_next is not None and t_state.next < s_next:
+                    collides = True
+                    findings.append(Finding(c.object, "sequence_behind_source",
+                                            f"target next value {t_state.next} < source identity next "
+                                            f"{s_next} (source max {c.identity_source}={s_max}): identifiers "
+                                            "the source already issued would be reissued",
+                                            s_next, t_state.next))
                 if t_state is not None and s_state is not None and t_state.increment != s_state.increment:
                     step = (f"source identity {c.identity_source} steps by {s_state.increment}, "
                             f"target {c.identity_target} by {t_state.increment}: ")

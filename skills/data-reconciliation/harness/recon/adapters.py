@@ -80,7 +80,10 @@ class SchemaFacts:
     Column tuples are ordered; unique/index sets hold leading-column tuples. Only indexes the
     engine enforces over the whole table belong in `unique`/`indexes`: disabled, invalid or
     still-building ones are left out, and filtered/partial ones (a row predicate) go to
-    `partial`, which is reported but not graded because the predicate is dialect-bound."""
+    `partial`, which is reported but not graded because the predicate is dialect-bound.
+    `table` is the schema-qualified name the catalog knows the table by, so a foreign key that
+    references it can be resolved even when the mapping spec spells the table bare."""
+    table: str = ""
     primary_key: tuple[str, ...] = ()
     unique: set[tuple[str, ...]] = field(default_factory=set)
     foreign_keys: set[tuple[tuple[str, ...], str, tuple[str, ...]]] = field(default_factory=set)
@@ -742,7 +745,7 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
 
     def schema_facts(self, table: str) -> SchemaFacts:
         schema, name = _split_table(table, "dbo")
-        facts = SchemaFacts()
+        facts = SchemaFacts(table=f"{schema}.{name}")
         rows = self._rows(
             "SELECT i.is_primary_key, i.is_unique, i.has_filter, i.name, ic.key_ordinal, c.name "
             "FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id "
@@ -963,7 +966,7 @@ class _PostgresBase(_SqlAdapterBase):
 
     def schema_facts(self, table: str) -> SchemaFacts:
         schema, name = _split_table(table, "public")
-        facts = SchemaFacts()
+        facts = SchemaFacts(table=f"{schema}.{name}")
         rows = self._rows(
             "SELECT con.contype, con.conname, a.attname, "
             "       CASE WHEN con.contype = 'f' THEN rn.nspname || '.' || rc.relname END, "

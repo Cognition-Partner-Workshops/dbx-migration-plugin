@@ -653,7 +653,84 @@ def test_target_only_constraints_on_unmapped_columns_or_out_of_scope_tables_are_
     stats = _tier(result, "schema_parity")["stats"]
     assert stats["target_only_columns_unverified"] == [
         "loans: unique ('servicer_ref',) covers a column outside the mapping"]
-    assert stats["foreign_keys_out_of_scope"] == ["loans: target FK ('servicer_id',) -> servicers"]
+    assert stats["foreign_keys_out_of_scope"] == [
+        "loans: target FK ('servicer_id',) -> loan_servicing.servicers"]
+
+
+def _customer_facts(schema: str, fk_to: str | None = None) -> SchemaFacts:
+    facts = SchemaFacts(table=f"{schema}.customer", primary_key=("id",), not_null={"id"})
+    if fk_to:
+        facts.foreign_keys.add((("parent_id",), fk_to, ("id",)))
+    return facts
+
+
+def _two_schema_sides(source_fk: str, target_fk: str, target_placed: bool = True):
+    """`billing.customer` and `crm.customer` are both mapped (to customer_billing / customer_crm);
+    `crm.customer.parent_id` references `source_fk`, its target references `target_fk`."""
+    rows = [{"id": 1, "parent_id": 1}]
+    spec = MappingSpec("m1", [
+        ObjectMapping(object="customer_billing", root_table="billing.customer", key_source=["id"],
+                      key_target=["id"], fields=[]),
+        ObjectMapping(object="customer_crm", root_table="crm.customer", key_source=["id"],
+                      key_target=["id"], fields=[FieldMapping("parent_id", "parent_id", "int", "int")]),
+    ])
+    tschema = "lakebase" if target_placed else ""
+    source = FakeSource({"billing.customer": rows, "crm.customer": rows},
+                        schema={"billing.customer": _customer_facts("billing"),
+                                "crm.customer": _customer_facts("crm", source_fk)})
+    target = FakeTarget({"customer_billing": rows, "customer_crm": rows},
+                        schema={"customer_billing": _facts(_customer_facts(tschema),
+                                                           table=f"{tschema}.customer_billing" if tschema else ""),
+                                "customer_crm": _facts(_customer_facts(tschema, target_fk),
+                                                       table=f"{tschema}.customer_crm" if tschema else "")})
+    return spec, source, target
+
+
+@pytest.mark.parametrize("source_fk, target_fk, codes", [
+    # the same-named table in the other mapped schema is a different parent
+    ("billing.customer", "lakebase.customer_billing", []),
+    ("crm.customer", "lakebase.customer_crm", []),
+    ("billing.customer", "lakebase.customer_crm", ["foreign_key_extra", "foreign_key_missing"]),
+    ("crm.customer", "lakebase.customer_billing", ["foreign_key_extra", "foreign_key_missing"]),
+    # bracketed catalog spelling is the same table
+    ("[billing].[customer]", "lakebase.customer_billing", []),
+])
+def test_foreign_keys_resolve_on_the_qualified_source_table_not_its_bare_name(source_fk, target_fk, codes):
+    spec, source, target = _two_schema_sides(source_fk, target_fk)
+    result = run_recon("u1", "transactional", spec, Tolerances("t1"), [], source, target)
+    assert _codes(result, "schema_parity") == codes, _tier(result, "schema_parity")["findings"]
+    assert result["verdict"] == ("PASS" if not codes else "FAIL")
+
+
+def test_a_bare_foreign_key_reference_shared_by_two_mapped_schemas_is_unverified_not_passed():
+    spec, source, target = _two_schema_sides("customer", "lakebase.customer_billing")
+    result = run_recon("u1", "transactional", spec, Tolerances("t1"), [], source, target)
+    parity = _tier(result, "schema_parity")
+    # neither graded as parity nor as a target-only FK: the run stays PASS but cannot merge
+    assert _codes(result, "schema_parity") == []
+    assert parity["stats"]["unverified"] == [(
+        "customer_crm: FK ('parent_id',) -> customer could reference any of ['customer_billing', "
+        "'customer_crm']; qualify the reference (root_table schema) or confirm its target "
+        "counterpart by hand")]
+    assert result["verdict"] == "PASS" and result["merge_eligible"] is False
+    assert any(w.startswith("UNVERIFIED schema_parity") for w in result["warnings"])
+
+
+@pytest.mark.parametrize("placed, codes", [
+    # the target catalog places customer_billing in `lakebase`; a same-named table in another
+    # schema is not the mapped object
+    (True, ["foreign_key_missing"]),
+    # a fake that reports no catalog identity falls back to the bare object name
+    (False, []),
+])
+def test_a_target_foreign_key_into_another_schema_is_not_the_mapped_object(placed, codes):
+    spec, source, target = _two_schema_sides("billing.customer", "archive.customer_billing", target_placed=placed)
+    result = run_recon("u1", "transactional", spec, Tolerances("t1"), [], source, target)
+    parity = _tier(result, "schema_parity")
+    assert _codes(result, "schema_parity") == codes, parity["findings"]
+    if placed:
+        assert parity["stats"]["foreign_keys_out_of_scope"] == [
+            "customer_crm: target FK ('parent_id',) -> archive.customer_billing"]
 
 
 def _sqlserver_cased(f: SchemaFacts) -> SchemaFacts:
@@ -721,6 +798,18 @@ DESC_KEYS = [1000 - i for i in range(6)]
     (None, (7, 1), (0, -1), ["sequence_direction_mismatch"], "opposite ends", None),
     (None, None, (4, 5), ["sequence_behind_source"], "collide", None),
     (None, (7, 10), (7, 1), ["sequence_increment_mismatch"], "steps by 10", None),
+    # rows 7..999 were issued and deleted (or rolled back): the surviving max is 6 but the source
+    # identity stands at 1000, so a target seeded from the surviving rows reissues 7..999
+    (None, 1000, 7, ["sequence_behind_source"], "7 < source identity next 1000 (source max loan_id=6)",
+     {"source_next": 1000, "source_max": 6, "target_next": 7}),
+    (None, 1000, 1000, [], None, {"source_next": 1000, "source_max": 6, "target_next": 1000}),
+    (None, 1000, 1500, [], None, None),
+    # the same on a countdown identity: the source issued 994..100 and deleted them
+    (DESC_KEYS, (99, -1), (994, -1), ["sequence_behind_source"],
+     "994 > source identity next 99 on a descending identity (source min loan_id=995)", None),
+    (DESC_KEYS, (99, -1), (99, -1), [], None, None),
+    # a source that steps the other way has no comparable frontier; only the direction is graded
+    (None, (-50, -1), (7, 1), ["sequence_direction_mismatch"], "opposite ends", None),
 ])
 def test_identity_parity(keys, src_seq, tgt_seq, codes, needle, identity):
     loans, borrowers = _rows(6, keys=keys)
