@@ -193,9 +193,17 @@ AS BEGIN
 END;
 
 -- Positional consumers of result set N read these instead of EXEC output. The macro's :screening_date parameter
--- becomes the consumer's predicate: EXEC AML_SCREENING(DATE '2024-03-31') -> CALL ...(DATE '2024-03-31') followed by
--- SELECT ... FROM VW_AML_<n> WHERE SCREENING_DATE = DATE '2024-03-31'; the defaulted EXEC AML_SCREENING() ->
--- WHERE SCREENING_DATE = current_date(). No view picks "the latest date": a backdated run would otherwise be
+-- becomes the consumer's predicate, and the result set's ORDER BY becomes the consumer's ORDER BY SORT_ORDER:
+--   EXEC AML_SCREENING(DATE '2024-03-31')  ->  CALL ${catalog}.${schema}.AML_SCREENING(DATE '2024-03-31');
+--                                             SELECT ... FROM VW_AML_<n> WHERE SCREENING_DATE = DATE '2024-03-31'
+--                                             ORDER BY SORT_ORDER;
+-- and the defaulted EXEC AML_SCREENING() -> WHERE SCREENING_DATE = current_date() ORDER BY SORT_ORDER. The ORDER BY
+-- is the consumer's, not the view's: a view (like a table) has no row order, so an ORDER BY inside the view would
+-- promise nothing to a SELECT over it. SORT_ORDER is the source ORDER BY materialised as ROW_NUMBER() at run time,
+-- so a consumer that orders by it gets the rows in the order the macro's spool had them (ties in the source key,
+-- e.g. equal TOTAL_AMOUNT, are arbitrary on both engines: Tier 4 compares ordered output only up to ties). A
+-- positional consumer that does not add ORDER BY SORT_ORDER is a conversion defect, not a target property.
+-- No view picks "the latest date": a backdated run would otherwise be
 -- invisible behind a newer one, and two runs for different dates never see each other's rows. For one date the views
 -- resolve exactly one run -- the latest *published* one (QUALIFY: databricks-dbsql references/best-practices.md
 -- "Query Optimization Tips") -- so a consumer reading after its own CALL returned sees that CALL's rows or a later

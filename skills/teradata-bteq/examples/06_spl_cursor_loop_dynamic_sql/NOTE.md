@@ -44,6 +44,24 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   `l.CLOSED_BEFORE = <campaign date>` (an account interrupted in one call and finished by the retry has a ledger row
   under each `RUN_ID`). The ledger is the second unit-owned table this example adds (the archive table is the first);
   `CREATE TABLE IF NOT EXISTS` ships in the converted file ahead of the procedure, as example 05 does.
+- `BT; ... ET;` *lock scope* -> `ARCHIVE_CAMPAIGN_LOCK`, the third unit-owned table (one seeded row). On the source the
+  loop's UPDATEs and DELETEs held write locks until `ET`, so a second overlapping call blocked and never saw the same
+  `CLOSED` account; without BT/ET two calls whose cursors overlap would each run the triple for the shared accounts,
+  each write a ledger row and each charge them, and the campaign would end short by that many (the per-call ledger
+  makes the count *exact per call*, it does not stop two calls from claiming one account). The procedure therefore
+  takes the lock before its first read: `UPDATE ... SET OWNER_RUN_ID = v_run_id WHERE OWNER_RUN_ID IS NULL`, reads
+  the row back, and `SIGNAL`s `75003` unless the owner is `v_run_id`. Two calls racing for the row either serialise
+  (the second finds the first's id) or conflict at commit -- Delta `UPDATE + UPDATE` on the same row "can conflict"
+  (docs.databricks.com/aws/en/optimizations/isolation/row-level-concurrency, opened), the loser's `UPDATE` raises and
+  its handler runs -- so exactly one call owns the row and its cursor is the only one selecting `CLOSED` accounts:
+  every account it archives is claimed by it alone. The handler and the normal exit release the lock with
+  `WHERE OWNER_RUN_ID = v_run_id`, so a call that failed *on* the lock never frees the owner's. A call refused the lock
+  has archived and charged nothing; the caller retries with an unchanged budget once the owner finishes (on the source
+  it would have waited on the lock instead of returning). Session death while holding the lock leaves
+  `OWNER_RUN_ID` set: the next call is refused with that id in its message; the operator confirms the run is dead
+  (no active job run, no `ETL_LOG` row for the id) and frees it with `UPDATE ... SET OWNER_RUN_ID = NULL WHERE
+  OWNER_RUN_ID = '<id>'`. Freeing it automatically after a timeout needs the campaign's maximum runtime, which is an
+  engagement decision (`.migration/06_decisions.md`), not a default this example can pick.
 - `SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT` -> same syntax.
 - `INOUT` parameter -> `INOUT` (same).
 - `EXTRACT(YEAR FROM d) (FORMAT '9999')`, `TRIM(n (FORMAT '-(18)9'))` -> `CAST(year(d) AS STRING)` / parameter marker.
@@ -79,6 +97,18 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   `p_max_batch`). The shadow-run therefore needs one run with two overlapping calls (different `p_closed_before`),
   one of them with the injected failure. Ledger row missing or written *after* the `UPDATE` (failure between the two
   leaves an `ARCHIVED` account with no ledger row): one *past* the cap, same signature as the mirror bug above.
+- No campaign lock (two overlapping calls both admitted): both cursors select the same `CLOSED` accounts, both run the
+  triple, both write a ledger row and both charge each shared account, so the two calls together archive `s` fewer
+  accounts than their budgets add up to -> **Tier 1** on `DIM_ACCOUNT WHERE ACCOUNT_STATUS = 'ARCHIVED'` for the two
+  campaigns (`b1 + b2 - s` vs `b1 + b2`), and `count(*) > count(distinct ACCOUNT_KEY)` on `ARCHIVE_RUN_LEDGER` with
+  *both* rows paired to `ARCHIVED` (a retry after an interrupted triple also leaves two rows, but only the later one
+  pairs with a status its call set -- the recon distinguishes them by `LEDGER_TS < DIM_ACCOUNT.ETL_UPDATE_TS` on both
+  rows). The shadow-run's overlapping-call scenario above exercises it; the expected outcome with the lock is that
+  the second call returns `75003` and archives nothing.
+- Lock released in the handler without the `OWNER_RUN_ID = v_run_id` predicate: a call refused the lock frees the
+  owner's lock on its way out, and a third call is admitted alongside the owner -> same double-claim signature as
+  above, only visible when the shadow-run issues *three* overlapping calls. Lock never released on success: the second
+  scheduled campaign is refused forever -> **Tier 1** zero archived rows for every later campaign.
 
 ## Citations
 - `FOR ... AS query DO`, `WHILE`, `LEAVE`, `CASE` statement: `databricks-dbsql` `references/sql-scripting.md`
@@ -92,6 +122,9 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   functions/uuid.
 - Transactions: same file, "Multi-Statement Transactions" (status and SQL scripting atomic blocks); routed through
   `target-routing`, not restated here.
+- Concurrent `UPDATE + UPDATE` on the same row "can conflict" under both isolation levels; writers "see a consistent
+  snapshot view of the table and writes occur in a serial order": https://docs.databricks.com/aws/en/optimizations/
+  isolation/row-level-concurrency and https://docs.databricks.com/aws/en/optimizations/isolation-level (opened).
 
 ## Not verified live
 - Whether an atomic block (`BEGIN ATOMIC ... END`, per the "Multi-Statement Transactions" section's preview status)
@@ -105,3 +138,8 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   `IN` parameter instead.
 - That the second-pass INFO summary (`ARCHIVED AND CAST(ETL_UPDATE_TS AS DATE) = current_date()`, kept as on the
   source) is acceptable when two calls run on the same day; it is a log line, not a budget input.
+- That a Delta write-conflict raised by the lock `UPDATE` surfaces inside the procedure as a `SQLEXCEPTION` the EXIT
+  handler catches (the cited page documents the conflict, not how SQL scripting reports it), and that a `SET v =
+  (SELECT ...)` issued right after this call's own committed `UPDATE` reads that commit (Delta snapshot per statement is
+  the assumption). If either fails live, the lock still serialises correctly -- the loser stops either way -- but its
+  error path would differ from the `75003` message.

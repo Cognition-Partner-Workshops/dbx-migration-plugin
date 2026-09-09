@@ -20,6 +20,30 @@ CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ARCHIVE_RUN_LEDGER (
 )
 COMMENT 'SP_ARCHIVE_CLOSED_ACCOUNTS: accounts each call took through the archive triple; joined to DIM_ACCOUNT to charge the budget';
 
+-- Mutual exclusion between calls. On the source the whole loop ran inside BT ... ET, so the row-hash write locks of
+-- the first call's UPDATEs (and the table write lock of its non-PI DELETEs) blocked a second call until ET: two
+-- overlapping calls were serialised by the engine, and an account was archived, and charged, by exactly one of them.
+-- Without BT/ET nothing serialises them here: two calls whose cursors both read the same CLOSED account would both
+-- run its triple, both write a ledger row for it and both charge it, and the campaign would end short by the number
+-- of shared accounts. The lock row restores the source's exclusion explicitly: one row per procedure; a call takes it
+-- with a single-row UPDATE ... WHERE OWNER_RUN_ID IS NULL and then reads the row back. Two calls racing for it
+-- either serialise (the second sees the first's RUN_ID and stops) or conflict at commit ("Row-level concurrency",
+-- docs.databricks.com/aws/en/optimizations/isolation/row-level-concurrency: UPDATE + UPDATE "can conflict when
+-- modifying the same row"; the loser's UPDATE raises, its EXIT handler runs, its release is a no-op); in both
+-- outcomes exactly one RUN_ID owns the row, so the cursor of the running call is the only cursor, and every account
+-- it selects is claimed by it alone. The DDL seeds the single row, so the procedure only ever UPDATEs it.
+CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK (
+  LOCK_NAME     STRING    NOT NULL,   -- procedure name; one row
+  OWNER_RUN_ID  STRING,               -- v_run_id of the call holding it; NULL = free
+  LOCKED_TS     TIMESTAMP
+)
+COMMENT 'SP_ARCHIVE_CLOSED_ACCOUNTS: one row; OWNER_RUN_ID IS NULL = no call running; stands in for the BT/ET lock scope of the source';
+
+INSERT INTO ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK (LOCK_NAME, OWNER_RUN_ID, LOCKED_TS)
+SELECT 'SP_ARCHIVE_CLOSED_ACCOUNTS', NULL, NULL
+WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
+                  WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS');
+
 CREATE OR REPLACE PROCEDURE ${catalog}.${schema}.SP_ARCHIVE_CLOSED_ACCOUNTS(
     IN    p_closed_before   DATE,
     IN    p_archive_schema  STRING,          -- was p_archive_db (Teradata database == UC schema)
@@ -35,6 +59,7 @@ AS BEGIN
     DECLARE v_arch_table STRING;
     DECLARE v_year       STRING;
     DECLARE v_run_id     STRING;
+    DECLARE v_lock_owner STRING;
 
     -- CONTINUE HANDLER FOR NOT FOUND + FETCH loop: not needed; FOR ... DO iterates the cursor and ends on exhaustion.
     -- EXIT HANDLER: ROLLBACK has no cited equivalent for a multi-statement compound (no BT/ET); the handler records
@@ -51,8 +76,14 @@ AS BEGIN
     -- A caller whose session died without OUT values recovers the campaign's consumption from the same join on
     -- CLOSED_BEFORE with COUNT(DISTINCT ACCOUNT_KEY) (an account interrupted in one call and finished by the retry has
     -- a ledger row under each RUN_ID). Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
+    -- The handler also frees the campaign lock, but only if this call holds it (OWNER_RUN_ID = v_run_id): when the
+    -- failure *is* the lock (another call owns it, or this call's UPDATE lost the commit race) the release is a no-op
+    -- and the owner keeps running.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
+        UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
+        SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
+        WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;
         SET p_return_code = -1;
         SET p_accounts_done = (SELECT COUNT(*)
                                FROM ${catalog}.${schema}.ARCHIVE_RUN_LEDGER l
@@ -83,6 +114,21 @@ AS BEGIN
         SIGNAL SQLSTATE '75002' SET MESSAGE_TEXT = 'p_archive_schema is not a declared archive target for this unit';
     END IF;
 
+    -- Take the campaign lock (header): single-row UPDATE guarded by OWNER_RUN_ID IS NULL, then read the row back. If
+    -- the owner is not this call, another call is inside its loop (or died holding the lock, see NOTE.md) and this
+    -- call stops before reading a single account, exactly where the source call would have blocked on BT/ET locks.
+    -- Nothing has been archived or charged, so the caller retries with an unchanged budget once the owner releases.
+    UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
+    SET OWNER_RUN_ID = v_run_id, LOCKED_TS = current_timestamp()
+    WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID IS NULL;
+    SET v_lock_owner = (SELECT OWNER_RUN_ID FROM ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
+                        WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS');
+    IF v_lock_owner IS NULL OR v_lock_owner <> v_run_id THEN
+        SIGNAL SQLSTATE '75003' SET MESSAGE_TEXT = 'SP_ARCHIVE_CLOSED_ACCOUNTS is already running as run '
+                                                   || COALESCE(v_lock_owner, '<unknown>')
+                                                   || '; retry after it releases ARCHIVE_CAMPAIGN_LOCK';
+    END IF;
+
     -- Dynamic DDL via EXECUTE IMMEDIATE. ${catalog} is a literal, so the catalog cannot move either; the factory's
     -- write-scope hook (.migration/allowed_targets.json) is the outer gate on the catalog.
     SET v_year = CAST(year(p_closed_before) AS STRING);                     -- EXTRACT(YEAR ...) (FORMAT '9999')
@@ -90,7 +136,9 @@ AS BEGIN
     EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS ' || v_arch_table
                    || ' AS SELECT * FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE 1 = 0';   -- ... WITH NO DATA
 
-    -- BT; ... ET;  -> no multi-statement transaction around the loop (see header). Each DML statement is its own
+    -- BT; ... ET;  -> no multi-statement transaction around the loop (see header). Its lock scope is replaced by the
+    -- campaign lock above (so the cursor below is the only one reading CLOSED accounts while this call runs, and each
+    -- account it selects is claimed by this call alone); its atomicity is not replaced. Each DML statement is its own
     -- atomic Delta commit; the (archive, delete, mark) triple per account is made idempotent instead: the archive
     -- INSERT skips TRANSACTION_IDs already present in the archive table, so a re-run after a failure between the
     -- INSERT and the DELETE copies nothing twice, and the DELETE/UPDATE that follow are naturally repeatable.
@@ -156,6 +204,11 @@ AS BEGIN
                 'Archived ' || CAST(typ.N AS STRING) || ' accounts of type ' || typ.ACCOUNT_TYPE,
                 current_timestamp());
     END FOR;
+
+    -- Release the lock last: the budget write-back below is on the OUT/INOUT side only and needs no exclusion.
+    UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
+    SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
+    WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;
 
     SET p_max_batch = p_max_batch - p_accounts_done;
 END;

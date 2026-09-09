@@ -23,7 +23,11 @@ client's spool), a UC procedure that writes and publishes one run, and one view 
   the failed run's rows and `RESIGNAL`s, so `CALL` fails the way `EXEC` did and leaves nothing behind; a run killed
   with its session (no handler) stays unpublished and invisible -- housekeeping is `DELETE ... WHERE COMPLETED_TS IS
   NULL AND STARTED_TS < <cutoff>` in the unit's maintenance task, not in the consumer path.
-- `ORDER BY` on a result set -> `SORT_ORDER` column (`ROW_NUMBER() OVER (ORDER BY ...)`); the view consumer sorts.
+- `ORDER BY` on a result set -> `SORT_ORDER` column (`ROW_NUMBER() OVER (ORDER BY ...)` at run time) plus a consumer
+  contract: every positional read is `SELECT ... FROM VW_AML_<n> WHERE SCREENING_DATE = <d> ORDER BY SORT_ORDER`. The
+  order lives in the consumer's statement, not in the view: a view has no row order, so an `ORDER BY` inside it would
+  guarantee nothing to the `SELECT` over it. `SORT_ORDER` materialises the source key order (ties arbitrary on both
+  engines, as in the source spool). Converting the `EXEC` call site without adding the `ORDER BY` is a defect.
 - `DATE - INTEGER` -> `date_add(d, -n)`; `DATE + 3` -> `date_add(d, 3)`; `DATE - DATE` -> `datediff` (skill §5).
 - `x (FORMAT 'ZZZ,ZZZ,ZZ9.99')`, `(FORMAT 'YYYY-MM-DD')` -> dropped; values stay typed.
 - `BETWEEN (:t * 0.8) AND :t` DECIMAL(15,2) * literal -> both engines produce a DECIMAL; boundary rows are the recon
@@ -41,6 +45,10 @@ client's spool), a UC procedure that writes and publishes one run, and one view 
 - `CUSTOMER_NAME` built from `NOT CASESPECIFIC` columns: joins are on keys here so no drift, but **Tier 3** would flag
   a case-differing `KYC_STATUS` grouping if the target column lost `UTF8_LCASE` (example 01).
 - Result sets merged into one table without `RESULT_SET_NO`: **Tier 1** on each per-set view (counts collapse).
+- Consumer read without `ORDER BY SORT_ORDER` (or `SORT_ORDER` computed over the wrong key): **Tier 4** ordered
+  compare of the consumer's output against the macro's spool for the same date, first differing position reported;
+  the Tier 3 keyed diff on `(CUSTOMER_ID, ACCOUNT_ID)` stays green, so Tier 4 is the only signature and the shadow-run
+  must capture the consumer's statement, not the view.
 - A "latest run" view (`SCREENING_DATE = (SELECT MAX(...))`) instead of the date-keyed contract: a backdated
   `EXEC AML_SCREENING(DATE '2024-03-31')` shadow-run compares the source result set against rows for a *newer* date
   -> **Tier 1** count mismatch and **Tier 3** keyed diff on `(CUSTOMER_ID, ACCOUNT_ID)` for that date's consumer read.
