@@ -20,10 +20,12 @@ CREATE TEMPORARY TABLE stg_policy_src AS
     FROM stg_policy_feed s
     LEFT JOIN ${catalog}.poladm.broker b ON b.broker_ref = s.broker_ref;
 
--- ORA-30926 parity: Oracle fails the whole MERGE on any duplicate source key; Delta fails only when the
--- duplicates hit a target row and inserts unmatched duplicates twice. Fail first; never QUALIFY-dedupe silently.
-SELECT assert_true(count(*) = 0, concat('duplicate policy_no keys: ', count(*)))
-  FROM (SELECT policy_no FROM stg_policy_src GROUP BY 1 HAVING count(*) > 1);
+-- Duplicate-key parity: Oracle raises ORA-30926 when >1 source row hits one target row and ORA-00001 when unmatched
+-- duplicates both INSERT (unique policy_no); unmatched duplicate 'D' rows reach no clause and succeed. Delta has no
+-- unique constraint, so fail on exactly the first two cases; never QUALIFY-dedupe silently.
+SELECT assert_true(count(*) = 0, concat('policy_no keys Oracle would reject: ', count(*)))
+  FROM (SELECT s.policy_no FROM stg_policy_src s LEFT JOIN ${catalog}.poladm.policy t ON t.policy_no = s.policy_no
+         WHERE t.policy_no IS NOT NULL OR s.feed_action <> 'D' GROUP BY s.policy_no HAVING count(*) > 1);
 
 -- :OLD image for the trigger's "status or premium changed" audit condition (rows the D branch deletes included).
 DROP TABLE IF EXISTS policy_pre_image;
@@ -32,8 +34,7 @@ CREATE TEMPORARY TABLE policy_pre_image AS
     FROM ${catalog}.poladm.policy t
    WHERE t.policy_no IN (SELECT policy_no FROM stg_policy_src);
 
--- Oracle runs UPDATE then DELETE WHERE on the updated row; Delta takes the first matching WHEN clause on the
--- pre-update row, so DELETE goes first with a source-side predicate.
+-- Oracle runs UPDATE then DELETE WHERE on the updated row; Delta takes the first WHEN on the pre-update row: DELETE first.
 MERGE INTO ${catalog}.poladm.policy AS tgt
 USING stg_policy_src AS src
 ON tgt.policy_no = src.policy_no
@@ -75,6 +76,5 @@ SELECT coalesce(pre.policy_id, p.policy_id),
     OR (pre.row_version >= 1 AND (coalesce(pre.policy_status, '~') <> src.policy_status
                                   OR coalesce(pre.annual_premium, -1) <> src.annual_premium));
 
--- Lakebase (OLTP) variant: CREATE TEMP TABLE ... ON COMMIT PRESERVE ROWS; same MERGE with DELETE first and
--- VALUES (nextval('poladm.policy_seq'), ...); keep the duplicate pre-check (RAISE EXCEPTION). The example 02 trigger
--- fires there, so the folded trigger columns, pre-image and audit INSERT are not repeated.
+-- Lakebase (OLTP) variant: CREATE TEMP TABLE ... ON COMMIT PRESERVE ROWS; same MERGE with DELETE first, VALUES
+-- (nextval('poladm.policy_seq'), ...), pre-check via RAISE EXCEPTION; the example 02 trigger fires there (no fold-in).
