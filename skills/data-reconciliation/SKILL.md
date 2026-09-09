@@ -109,9 +109,10 @@ Tolerance bounds (`cdc_lag_max_s`, `numeric_abs_tol`, `aggregate_rel_tol`) must 
 non-negative JSON numbers: `NaN` would make every lag comparison false and silently pass tier 6,
 so it, `Infinity`, negatives, booleans and numeric strings are refused at load.
 
-`harness/examples/lakebase_rehearsal/` is the rehearsed SQL Server -> Postgres run (mapping,
-tolerances, DDL, loader, and three defect scripts with the findings each one must produce; the
-third plants defects that keep every count and every max watermark unchanged).
+`harness/examples/lakebase_rehearsal/` records the rehearsed SQL Server -> Postgres run (OLTP
+tolerance record plus the findings each of four defect scripts must produce; the third plants
+defects that keep every count and every max watermark unchanged). The fixture itself (mapping,
+DDL, loader, defect scripts) lives in `ts-tsql-sybase-legacy-db/rehearsals/lakebase/`.
 
 A tier or marker query that raises releases both windows before the error propagates; one
 side failing to close never leaves the other pinned.
@@ -160,8 +161,7 @@ fixture and continuous evidence never merges.
 ## Example inputs
 
 `harness/examples/` has a mapping spec, a tolerance record, Redshift canonicalization rules,
-and the `lakebase_rehearsal/` operational set (mapping with watermark/identity, OLTP
-tolerances, target DDL, loader, defect scripts). Copy and edit; do not start from a blank file.
+and the `lakebase_rehearsal/` OLTP tolerance record. Copy and edit; do not start from a blank file.
 
 ## Known traps (append per engagement)
 - AVG on integers truncates on some legacy engines and returns decimal on Databricks. Use
