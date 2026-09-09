@@ -193,6 +193,6 @@ The `.migration/` workspace created in step 1 of the chain is the engagement's d
 
 ## What is deliberately not here
 
-No transactional reconciliation mode yet: operational-track units reconcile with the set-based harness at a stated consistency point (`--mode snapshot`/`live` against a quiesced window or CDC watermark); a `--mode transactional` (consistency-window snapshots, PK-set diff, CDC lag and ordering, constraint/index/sequence parity) is the next harness increment, and until it lands the OLTP front door refuses to promise it.
+No transactional reconciliation against a Delta target: `--mode transactional` (consistency window, in-flight CDC allowance, PK-set diff, CDC lag and ordering, constraint/index/sequence parity) exists for the Lakebase operational track only, and the CLI refuses it for `--target-kind databricks`; analytical-track units reconcile with the set-based harness at a stated consistency point (`--mode snapshot`/`live`).
 
 No bespoke parity scoreboard app and no assumption of production data access. Correctness rests on the reconciliation harness (dual-run diffs against the live legacy system via federation or exported snapshots), captured evidence in every PR, a CI regression gate, an event-driven parallel-run window, and a skeptical independent audit run by a session that did not perform the migration. Where production access is denied (a common pattern), phase 0 falls back to metadata-only assessment plus masked or representative sample data, recorded as a D10 dependency with an explicit recon-scope caveat.
