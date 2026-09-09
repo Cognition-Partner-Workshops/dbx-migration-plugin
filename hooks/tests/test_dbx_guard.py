@@ -537,6 +537,33 @@ def test_scripts_of_the_client_command_are_still_read(tmp_path: Path):
     assert v.decision == "block" and "read-only" in v.reason and "cannot read" not in v.reason
 
 
+@pytest.mark.parametrize("cmd", [
+    "bteq >log -i fix.sql",
+    "bteq 2>&1 -i fix.sql",
+    "bteq >>log 2>/dev/null -i fix.sql",
+    "bteq &>log < fix.sql",
+    "bteq -i fix.sql > log 2>&1",
+    "sqlplus svc@tdprod.corp.example <<EOF\n@fix.sql\nEOF",
+    "sqlplus svc@tdprod.corp.example <<EOF\nSET ECHO ON;\n@fix.sql\nEOF\necho done",
+    "bteq <<-EOF\n\t.LOGON tdprod.corp.example/svc;\n\t.RUN FILE @fix.sql\n\tEOF",
+    "cat <<A <<B\n@x\nA\n@y\nB\nbteq -i fix.sql",
+])
+def test_redirections_and_heredoc_lines_keep_the_client_context(cmd, tmp_path: Path):
+    (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    assert g._script_inputs(cmd, CFG) == ["fix.sql"], cmd
+    v = g.evaluate(cmd, CFG, root=tmp_path)
+    assert v.decision == "block" and "read-only" in v.reason, cmd
+    v = g.evaluate("spark-sql >log 2>&1 -f fix.sql", CFG, root=tmp_path)
+    assert v.decision == "block" and "unresolvable catalog" in v.reason
+
+
+def test_redirection_operands_and_here_strings_are_not_scripts(tmp_path: Path):
+    for cmd in ("bteq >/nonexistent/log 2>&1 <<< 'SELECT 1'", "databricks jobs list 2>/nonexistent/err | tee /nonexistent/out",
+                "rm -f /nonexistent/x >/nonexistent/log && databricks jobs list 2>&1"):
+        assert g._script_inputs(cmd, CFG) == [], cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+
+
 # ---------------------------------------------------------------- denied shapes: legacy writes
 
 @pytest.mark.parametrize("cmd", [
