@@ -41,7 +41,7 @@ from recon.transactional import (
     _newer_predicate,
     open_window,
 )
-from recon.watermarks import instant, lag_seconds, later, same
+from recon.watermarks import instant, lag_seconds, lag_units, later, same
 from tests.fakes import FakeSource, FakeTarget, FakeTypedSource
 
 T0 = dt.datetime(2026, 9, 1, 12, 0, 0)
@@ -309,6 +309,121 @@ def test_lag_beyond_tolerance_is_a_finding():
     assert _codes(result, "cdc_lag_ordering") == ["cdc_lag_exceeded"]
     # the in-flight rows are still not double-reported as missing keys
     assert _codes(result, "pk_set_diff") == []
+
+
+def _counter_spec(unit: str | None) -> MappingSpec:
+    """The loans mapping keyed on a numeric change column (rowversion / version_no)."""
+    spec = _spec()
+    loans = dataclasses.replace(spec.objects[0], watermark_source="version_no",
+                                watermark_target="version_no", watermark_unit=unit)
+    return MappingSpec("m1", [loans, spec.objects[1]])
+
+
+def _counter_rows(behind: int, step: int = 1):
+    """12 source rows versioned 1*step..12*step; the target lacks the last `behind` of them."""
+    loans, borrowers = _rows(12)
+    for i, r in enumerate(loans, 1):
+        r["version_no"] = i * step
+    tgt = [dict(r) for r in loans[:12 - behind]]
+    return loans, tgt, borrowers
+
+
+@pytest.mark.parametrize("lag_max_s", [1, 1000])
+def test_a_numeric_watermark_without_a_unit_is_never_graded_as_seconds(lag_max_s):
+    # two rows in flight, counter behind by 2: below the 1000s bound and above the 1s bound,
+    # neither of which means anything for a counter
+    loans, tgt, borrowers = _counter_rows(behind=2)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_counter_spec(None),
+                  tol=Tolerances("t1", cdc_lag_max_s=lag_max_s))
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    assert _codes(result, "cdc_lag_ordering") == ["cdc_lag_ungraded"]
+    stats = _tier(result, "cdc_lag_ordering")["stats"]["loans"]
+    assert stats["lag_s"] is None and stats["lag_units"] == 2 and stats["unit"] is None
+    assert _codes(result, "pk_set_diff") == []
+
+
+def test_a_counter_watermark_is_graded_by_unapplied_rows_not_seconds():
+    loans, tgt, borrowers = _counter_rows(behind=2, step=1000)  # 2000 units behind
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_counter_spec("counter"),
+                  tol=Tolerances("t1", cdc_lag_max_s=0, cdc_in_flight_max_rows=2))
+    assert result["verdict"] == "PASS", result
+    assert _tier(result, "cdc_lag_ordering")["stats"]["loans"]["lag_units"] == 2000
+    source, target = _sides(loans, [dict(r) for r in tgt], borrowers)
+    result = _run(source, target, spec=_counter_spec("counter"),
+                  tol=Tolerances("t1", cdc_lag_max_s=10_000, cdc_in_flight_max_rows=1))
+    assert result["verdict"] == "FAIL"
+    assert _codes(result, "cdc_lag_ordering") == ["cdc_in_flight_exceeded"]
+
+
+def test_a_counter_ahead_on_the_target_is_still_an_ordering_violation():
+    loans, tgt, borrowers = _counter_rows(behind=0)
+    tgt[-1]["version_no"] = 50
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_counter_spec("counter"),
+                  tol=Tolerances("t1", cdc_in_flight_max_rows=100))
+    assert result["verdict"] == "FAIL"
+    assert _codes(result, "cdc_lag_ordering") == ["row_ahead_of_source", "target_ahead_of_source"]
+
+
+@pytest.mark.parametrize("unit, step, verdict", [
+    ("epoch_ms", 1000, "PASS"),   # 2 rows behind = 2000 ms = 2 s, within 5 s
+    ("epoch_s", 1000, "FAIL"),    # the same numbers read as seconds: 2000 s
+    ("epoch_us", 1000, "PASS"),
+])
+def test_an_epoch_watermark_scales_to_seconds_by_its_declared_unit(unit, step, verdict):
+    loans, tgt, borrowers = _counter_rows(behind=2, step=step)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_counter_spec(unit), tol=Tolerances("t1", cdc_lag_max_s=5))
+    assert result["verdict"] == verdict, result
+    codes = _codes(result, "cdc_lag_ordering")
+    assert codes == ([] if verdict == "PASS" else ["cdc_lag_exceeded"])
+    lag = _tier(result, "cdc_lag_ordering")["stats"]["loans"]["lag_s"]
+    assert lag == {"epoch_ms": 2.0, "epoch_s": 2000.0, "epoch_us": 0.002}[unit]
+
+
+@pytest.mark.parametrize("spec, unit", [(_spec(), "counter"), (_counter_spec("datetime"), "datetime")])
+def test_a_declared_unit_that_does_not_fit_the_values_is_incomparable(spec, unit):
+    loans, tgt, borrowers = _counter_rows(behind=0)
+    loans_obj = dataclasses.replace(spec.objects[0], watermark_unit=unit)
+    spec = MappingSpec("m1", [loans_obj, spec.objects[1]])
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=spec, tol=Tolerances("t1", cdc_lag_max_s=1000))
+    assert result["verdict"] == "FAIL"
+    assert _codes(result, "cdc_lag_ordering") == ["cdc_watermark_incomparable"]
+
+
+def test_lag_seconds_only_reads_a_number_under_an_epoch_unit():
+    assert lag_seconds(10, 9) is None and lag_seconds(10, 9, "counter") is None
+    assert lag_seconds(2000, 500, "epoch_ms") == 1.5
+    assert lag_seconds(2000, 500, "epoch_s") == 1500.0
+    assert lag_seconds(Decimal(3_000_000), 0, "epoch_us") == 3.0
+    assert lag_units(10, 9) == 1 and lag_units(9, 10) == -1 and lag_units(None, 9) is None
+    assert lag_units(_ts(3), _ts(0)) is None
+
+
+def test_mapping_watermark_unit_is_validated_and_loaded(tmp_path):
+    base = {"version": "m1", "objects": [{
+        "object": "loans", "root_table": "dbo.loans", "key": {"source": ["id"], "target": ["id"]},
+        "fields": [], "watermark": {"source": "rv", "target": "rv", "unit": "counter"}}]}
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps(base))
+    assert load_mapping_spec(path).objects[0].watermark_unit == "counter"
+    base["objects"][0]["watermark"]["unit"] = "seconds"
+    path.write_text(json.dumps(base))
+    with pytest.raises(ConfigError, match="watermark unit must be one of"):
+        load_mapping_spec(path)
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5, "2", None])
+def test_cdc_in_flight_max_rows_must_be_a_non_negative_integer(tmp_path, value):
+    path = tmp_path / "tol.json"
+    path.write_text(json.dumps({"version": "t1", "cdc_in_flight_max_rows": value}))
+    with pytest.raises(ConfigError, match="cdc_in_flight_max_rows must be a non-negative JSON integer"):
+        load_tolerances(path)
+    path.write_text(json.dumps({"version": "t1", "cdc_in_flight_max_rows": 3}))
+    assert load_tolerances(path).cdc_in_flight_max_rows == 3
 
 
 def test_a_missing_key_older_than_the_applied_watermark_is_a_defect_even_with_lag():
@@ -1193,6 +1308,57 @@ def test_sql_adapter_excludes_in_flight_keys_in_one_bound_statement():
     sql, params = conn.executed[-1]
     assert sql.endswith("FROM dbo.x WHERE NOT ((a = ? AND b = ?) OR (a = ? AND b = ?))")
     assert params == (1, "p", 2, "q")
+
+
+def test_sql_adapter_exclusion_capacity_counts_every_key_component():
+    conn = _StubConn()
+    adapter = _NoSnapshotAdapter(conn)
+    width = 7
+    cap = adapter.exclusion_capacity(width)
+    assert cap == 2000 // width == 285
+    keys = [tuple(range(i, i + width)) for i in range(cap)]
+    adapter.table_aggregates_excluding("dbo.wide", ["v"], [], [f"k{j}" for j in range(width)], keys)
+    sql, params = conn.executed[-1]
+    assert sql.count("?") == len(params) == cap * width <= adapter.max_params
+    statements = len(conn.executed)
+    with pytest.raises(ValueError, match="exceed"):
+        adapter.table_aggregates_excluding("dbo.wide", ["v"], [], [f"k{j}" for j in range(width)],
+                                           keys + [tuple(range(cap, cap + width))])
+    assert len(conn.executed) == statements   # never split into several statements
+
+
+def _wide_key_estate(in_flight: int, width: int = 7):
+    cols = [f"k{j}" for j in range(width)]
+    rows = [{**{c: (i if j == 0 else 1) for j, c in enumerate(cols)}, "v": i, "modified_date": _ts(i)}
+            for i in range(1, 400 + 1)]
+    tgt = [dict(r) for r in rows[:len(rows) - in_flight]]
+    facts = SchemaFacts(primary_key=tuple(cols), not_null=set(cols))
+    spec = MappingSpec("m1", [ObjectMapping(
+        object="wide", root_table="dbo.wide", key_source=cols, key_target=cols,
+        fields=[FieldMapping("v", "v", "int", "int")],
+        watermark_source="modified_date", watermark_target="modified_date")])
+    source = FakeSource({"dbo.wide": rows}, schema={"dbo.wide": facts})
+    target = FakeTarget({"wide": tgt}, schema={"wide": facts})
+    return spec, source, target
+
+
+@pytest.mark.parametrize("in_flight, graded", [(285, True), (300, False)])
+def test_wide_key_exclusion_is_capped_by_bound_parameters_not_row_count(in_flight, graded):
+    # 300 seven-column keys are far under IN_FLIGHT_EXCLUSION_CAP but need 2100 parameters,
+    # more than one statement carries; the object is graded ungraded, never split or aborted
+    spec, source, target = _wide_key_estate(in_flight)
+    result = run_recon("u1", "transactional", spec, Tolerances("t1", cdc_lag_max_s=1000), [],
+                       source, target)
+    t2 = _tier(result, "per_field_aggregates")
+    if graded:
+        assert result["verdict"] == "PASS", result
+        assert target.calls["table_aggregates_excluding"] == 1
+        assert t2["stats"]["applied_subset"]["wide"]["excluded_keys"] == in_flight
+    else:
+        assert result["verdict"] == "FAIL"
+        assert _codes(result, "per_field_aggregates") == ["aggregates_ungraded_in_flight"]
+        assert "285-key exclusion cap for a 7-column key" in t2["findings"][0]["detail"]
+        assert target.calls["table_aggregates_excluding"] == 0
 
 
 def test_watermark_comparator_treats_naive_as_utc_and_never_compares_lexically():

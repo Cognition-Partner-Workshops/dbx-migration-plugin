@@ -43,9 +43,11 @@ from .adapters import SchemaFacts, StratifiedKeys, TransactionalSide, WholeNumbe
 from .config import ConfigError, MappingSpec, ObjectMapping, Tolerances
 from .tiers import Finding, TierResult
 from .watermarks import (
+    EPOCH_SCALE,
     check_comparable,
     family,
     lag_seconds,
+    lag_units,
     later,
     literal,
     same,
@@ -429,11 +431,15 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         checks += 1
         s_open, t_open = ctx.open_markers[c.object]
         s_wm, t_wm = s_open[1], t_open[1]
-        lag = lag_seconds(s_wm, t_wm)
+        fam = family(s_wm if s_wm is not None else t_wm)
+        unit = c.watermark_unit or ("datetime" if fam == "datetime" else None)
+        lag = lag_seconds(s_wm, t_wm, unit)
+        units = lag_units(s_wm, t_wm)
+        in_flight = ctx.in_flight(c)
         diff = ctx.key_diffs.get(c.object, KeyDiff())
         stats[c.object] = {"watermark": f"{c.watermark_source}->{c.watermark_target}",
-                           "source_max": s_wm, "target_max": t_wm, "lag_s": lag,
-                           "in_flight": ctx.in_flight(c),
+                           "unit": unit, "source_max": s_wm, "target_max": t_wm, "lag_s": lag,
+                           "lag_units": units, "in_flight": in_flight,
                            "rows_ahead_on_target": len(diff.ahead),
                            "rows_behind_on_target": len(diff.behind)}
         if diff.ahead:
@@ -450,10 +456,30 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                                     f"{diff.behind[:MAX_KEYS_IN_FINDING]}"))
         if s_wm is None and t_wm is None:
             continue
-        if lag is None:
+        if s_wm is None or t_wm is None or (fam == "datetime") != (unit == "datetime"):
+            # one side null, or a declared unit that does not fit the values: nothing to order
             findings.append(Finding(c.object, "cdc_watermark_incomparable",
-                                    f"max({c.watermark_source})={s_wm!r} vs max({c.watermark_target})={t_wm!r}",
+                                    f"max({c.watermark_source})={s_wm!r} vs max({c.watermark_target})={t_wm!r}"
+                                    + (f" under watermark unit {unit!r}" if c.watermark_unit else ""),
                                     s_wm, t_wm))
+            continue
+        if fam == "number" and unit not in EPOCH_SCALE and unit != "counter":
+            findings.append(Finding(c.object, "cdc_lag_ungraded",
+                                    f"{c.watermark_source} is a number with no declared watermark unit: "
+                                    f"its difference {units} is not a duration, so cdc_lag_max_s cannot "
+                                    "grade it; declare watermark.unit epoch_s|epoch_ms|epoch_us (graded "
+                                    "in seconds) or counter (graded by cdc_in_flight_max_rows)",
+                                    s_wm, t_wm))
+        elif unit == "counter":
+            if units < 0:
+                findings.append(Finding(c.object, "target_ahead_of_source",
+                                        f"target watermark is {-units} units past the source: replay "
+                                        "or out-of-order apply", s_wm, t_wm))
+            elif in_flight > tol.cdc_in_flight_max_rows:
+                findings.append(Finding(c.object, "cdc_in_flight_exceeded",
+                                        f"{in_flight} source rows unapplied > cdc_in_flight_max_rows="
+                                        f"{tol.cdc_in_flight_max_rows} (counter behind by {units} units)",
+                                        s_wm, t_wm))
         elif lag < 0:
             findings.append(Finding(c.object, "target_ahead_of_source",
                                     f"target watermark is {-lag:.3f}s newer than the source: replay "
@@ -461,7 +487,7 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         elif lag > tol.cdc_lag_max_s:
             findings.append(Finding(c.object, "cdc_lag_exceeded",
                                     f"lag {lag:.3f}s > cdc_lag_max_s={tol.cdc_lag_max_s}s "
-                                    f"({ctx.in_flight(c)} source rows in flight)", s_wm, t_wm))
+                                    f"({in_flight} source rows in flight)", s_wm, t_wm))
     return TierResult(6, "cdc_lag_ordering", not findings, checks, findings, stats)
 
 

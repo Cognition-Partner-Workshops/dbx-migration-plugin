@@ -172,6 +172,37 @@ def test_catalog_typing_spares_the_repeatable_read_window_that_a_sum_probe_ends(
         source._conn.close()
 
 
+def test_wide_composite_keys_are_excluded_in_one_typed_array_statement(schema, monkeypatch):
+    # 3000 seven-column keys would need 21000 bind parameters as a VALUES list; as one text[]
+    # per key column they travel as 7 parameters and are cast back to the declared types
+    dsn = os.environ[DSN_VAR]
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE TABLE {schema}."wide" (k0 INT, k1 BIGINT, k2 TEXT, k3 DATE, '
+                     "k4 TIMESTAMPTZ, k5 NUMERIC(9,3), k6 UUID, v INT, "
+                     "PRIMARY KEY (k0, k1, k2, k3, k4, k5, k6))")
+        conn.execute(f'INSERT INTO {schema}."wide" SELECT i, i * 10, \'c\' || i, DATE \'2026-01-01\' + i, '
+                     "TIMESTAMPTZ '2026-09-08 12:00:00+00' + i * INTERVAL '1 second', i + 0.5, "
+                     "gen_random_uuid(), i FROM generate_series(1, 3200) AS g(i)")
+        keys = conn.execute(f'SELECT k0, k1, k2, k3, k4, k5, k6 FROM {schema}."wide" '
+                            "WHERE k0 > 200 ORDER BY k0").fetchall()
+    monkeypatch.setenv("RECON_TEST_TARGET", dsn)
+    target = LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), schema)
+    try:
+        cols = ["k0", "k1", "k2", "k3", "k4", "k5", "k6"]
+        assert len(keys) == 3000 and target.exclusion_capacity(7) >= 3000
+        before = target.statements
+        out = target.table_aggregates_excluding("wide", ["v"], ["v"], cols, keys)
+        assert target.statements - before == 2          # one catalog read + one aggregate
+        assert out["v"]["count"] == 200 and out["v"]["sum"] == 200 * 201 // 2
+        # a predicate and the exclusion compose; a datetime key given as a naive UTC instant matches
+        naive = [(k[0], k[1], k[2], k[3], k[4].astimezone(dt.timezone.utc).replace(tzinfo=None),
+                  k[5], k[6]) for k in keys[:100]]
+        out = target.table_aggregates_excluding("wide", ["v"], ["v"], cols, naive, where="k0 <= 300")
+        assert out["v"]["count"] == 200 and out["v"]["max"] == 200
+    finally:
+        target._conn.close()
+
+
 def test_unique_null_semantics_follow_the_index_declaration(schema, monkeypatch):
     dsn = os.environ[DSN_VAR]
     table = f"{schema}.u"

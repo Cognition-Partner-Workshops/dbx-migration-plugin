@@ -420,9 +420,18 @@ class FakeTarget(_TransactionalMixin):
         self.calls["field_aggregates"] = probes  # only direct probes count as statements
         return out
 
+    # bound-parameter budget of the SQL adapters: one parameter per key component
+    max_params = 2000
+
+    def exclusion_capacity(self, key_width: int) -> int:
+        return max(1, self.max_params // max(1, key_width))
+
     def table_aggregates_excluding(self, object: str, columns: list[str], numeric: list[str],
                                    key_cols: list[str], exclude_keys: list[tuple],
                                    where=None) -> dict[str, dict[str, Any]]:
+        if len(exclude_keys) > self.exclusion_capacity(len(key_cols)):
+            raise ValueError(f"{len(exclude_keys)} keys x {len(key_cols)} columns exceed the "
+                             f"{self.max_params}-parameter budget of one statement")
         self.calls["table_aggregates_excluding"] += 1
         self.statements += 1
         self.last_excluded_keys = list(exclude_keys)

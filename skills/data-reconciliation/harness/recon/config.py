@@ -67,6 +67,12 @@ class EmbedMapping:
     fields: list[FieldMapping] = field(default_factory=list)
 
 
+# Numeric watermarks carry no time by themselves. epoch_* scale the difference to seconds so
+# tier 6 grades it against cdc_lag_max_s; counter (rowversion, a version column) has no time
+# meaning, so lag is graded as the number of unapplied source rows against cdc_in_flight_max_rows.
+WATERMARK_UNITS = ("datetime", "epoch_s", "epoch_ms", "epoch_us", "counter")
+
+
 @dataclass(frozen=True)
 class ObjectMapping:
     object: str
@@ -79,10 +85,12 @@ class ObjectMapping:
     target_where: str | None = None
     # Transactional mode (operational track). watermark: the change column on each side; rows
     # whose source watermark is newer than the target's applied high-watermark are in flight,
-    # not defects. identity: the source identity/sequence column and its target column, whose
+    # not defects. unit: what a numeric watermark measures (WATERMARK_UNITS); a datetime column
+    # needs none. identity: the source identity/sequence column and its target column, whose
     # owned sequence must be ahead of every migrated key.
     watermark_source: str | None = None
     watermark_target: str | None = None
+    watermark_unit: str | None = None
     identity_source: str | None = None
     identity_target: str | None = None
 
@@ -108,6 +116,8 @@ class Tolerances:
     # Transactional mode: tolerated CDC lag between max(source watermark) and max(target
     # watermark), and the number of key ranges the PK-set diff counts before streaming keys.
     cdc_lag_max_s: float = 0.0
+    # Unapplied source rows tolerated when the watermark is a counter (no time unit to grade).
+    cdc_in_flight_max_rows: int = 0
     pk_set_ranges: int = 64
     # Tier 5 streams every key range instead of trusting equal range fingerprints (count, sum,
     # sum of squares): the complete comparison for units where a three-or-more-key substitution
@@ -183,6 +193,9 @@ def _validate_mapping_identifiers(c: dict) -> None:
             raise ConfigError(f"{block} must be an object with source and target column names")
         validate_identifier(pair["source"])
         validate_identifier(pair["target"])
+        if block == "watermark" and pair.get("unit") is not None and pair["unit"] not in WATERMARK_UNITS:
+            raise ConfigError(f"watermark unit must be one of {', '.join(WATERMARK_UNITS)}, "
+                              f"got {pair['unit']!r}")
     for e in c.get("embeds", []):
         validate_identifier(e["array_path"])
         validate_identifier(e["child_table"])
@@ -234,6 +247,7 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             target_where=_validate_predicate(substitute_params(c.get("target_where"), params, path)),
             watermark_source=(c.get("watermark") or {}).get("source"),
             watermark_target=(c.get("watermark") or {}).get("target"),
+            watermark_unit=(c.get("watermark") or {}).get("unit"),
             identity_source=(c.get("identity") or {}).get("source"),
             identity_target=(c.get("identity") or {}).get("target"),
         ))
@@ -263,6 +277,14 @@ def _bound(data: dict, key: str, default: float, path: Path) -> float:
     return float(value)
 
 
+def _count(data: dict, key: str, default: int, path: Path) -> int:
+    """A tolerance count is a non-negative JSON integer; booleans and fractions are refused."""
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"{path}: {key} must be a non-negative JSON integer, got {value!r}")
+    return value
+
+
 def load_tolerances(path: Path) -> Tolerances:
     data = json.loads(path.read_text())
     version = _require_version(data, path)
@@ -274,6 +296,7 @@ def load_tolerances(path: Path) -> Tolerances:
         aggregate_rel_tol=_bound(data, "aggregate_rel_tol", 0.0, path),
         source_concurrency=int(data.get("source_concurrency", 1)),
         cdc_lag_max_s=_bound(data, "cdc_lag_max_s", 0.0, path),
+        cdc_in_flight_max_rows=_count(data, "cdc_in_flight_max_rows", 0, path),
         pk_set_ranges=int(data.get("pk_set_ranges", 64)),
         pk_set_stream_every_range=_flag(data, "pk_set_stream_every_range", path),
         accept_marker_only_window=_flag(data, "accept_marker_only_window", path),

@@ -261,12 +261,15 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                         f"{in_flight} source rows in flight and the target adapter "
                                         "cannot exclude keys from its aggregates"))
                 continue
-            if in_flight > IN_FLIGHT_EXCLUSION_CAP:
+            # the exclusion is one statement on the target: its capacity is the smaller of the
+            # tier's own cap and what the adapter can bind for a key this wide
+            cap = min(IN_FLIGHT_EXCLUSION_CAP, target.exclusion_capacity(len(c.key_target)))
+            if in_flight > cap:
                 checks += 1
                 findings.append(Finding(c.object, "aggregates_ungraded_in_flight",
-                                        f"{in_flight} source rows in flight exceeds the "
-                                        f"{IN_FLIGHT_EXCLUSION_CAP}-key exclusion cap; let the feed "
-                                        "catch up before grading aggregates"))
+                                        f"{in_flight} source rows in flight exceeds the {cap}-key "
+                                        f"exclusion cap for a {len(c.key_target)}-column key; let "
+                                        "the feed catch up before grading aggregates"))
                 continue
             keys = ctx.in_flight_keys(c, source)
             applied_subset[c.object] = {"in_flight": in_flight, "excluded_keys": len(keys)}

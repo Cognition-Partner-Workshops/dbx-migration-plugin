@@ -84,12 +84,27 @@ def literal(value: Any, utc_offset: bool = False) -> str:
     return str(value)
 
 
-def lag_seconds(src: Any, tgt: Any) -> float | None:
-    """src - tgt in seconds, or None when either is null or the two are not comparable."""
+# seconds per unit of a numeric watermark that encodes an epoch instant
+EPOCH_SCALE = {"epoch_s": decimal.Decimal(1), "epoch_ms": decimal.Decimal("0.001"),
+               "epoch_us": decimal.Decimal("0.000001")}
+
+
+def lag_units(src: Any, tgt: Any) -> decimal.Decimal | None:
+    """src - tgt in the watermark's own units (whatever a numeric counter counts), or None when
+    either is null or the two are not comparable."""
+    if src is None or tgt is None or not (family(src) == family(tgt) == "number"):
+        return None
+    return decimal.Decimal(str(src)) - decimal.Decimal(str(tgt))
+
+
+def lag_seconds(src: Any, tgt: Any, unit: str | None = None) -> float | None:
+    """src - tgt in seconds. Datetimes carry their own unit; a number is only seconds when the
+    mapping declares which epoch unit it encodes (EPOCH_SCALE). A counter's difference is not a
+    duration, so it is None here and graded by lag_units and the unapplied row count instead."""
     if src is None or tgt is None:
         return None
     if family(src) == family(tgt) == "datetime":
         return (instant(src) - instant(tgt)).total_seconds()
-    if family(src) == family(tgt) == "number":
-        return float(decimal.Decimal(str(src)) - decimal.Decimal(str(tgt)))
+    if family(src) == family(tgt) == "number" and unit in EPOCH_SCALE:
+        return float(lag_units(src, tgt) * EPOCH_SCALE[unit])
     return None

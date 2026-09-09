@@ -11,6 +11,7 @@ a literal connection string or token on the CLI.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
 from .paths import get_path
+from .watermarks import instant
 from .watermarks import literal as watermark_literal
 
 
@@ -146,10 +148,13 @@ class BatchAggregates(Protocol):
 @runtime_checkable
 class KeyExcludingAggregates(Protocol):
     """Tier 2 in transactional mode: the same one-statement aggregates over every row except the
-    listed keys (the source rows still in flight), so both sides describe one applied set."""
+    listed keys (the source rows still in flight), so both sides describe one applied set.
+    `exclusion_capacity` is how many keys of the given width one such statement can carry; the
+    caller grades nothing rather than split the aggregate across statements."""
     def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
                                    key_cols: list[str], exclude_keys: list[tuple],
                                    where: str | None = None) -> dict[str, dict[str, Any]]: ...
+    def exclusion_capacity(self, key_width: int) -> int: ...
 
 
 @runtime_checkable
@@ -370,9 +375,16 @@ class _SqlAdapterBase:
         w = f" WHERE {where}" if where else ""
         return self._table_aggregates(table, columns, numeric, w, [])
 
+    def exclusion_capacity(self, key_width: int) -> int:
+        """The membership test binds one parameter per key component."""
+        return max(1, self.max_params // max(1, key_width))
+
     def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
                                    key_cols: list[str], exclude_keys: list[tuple],
                                    where: str | None = None) -> dict[str, dict[str, Any]]:
+        if len(exclude_keys) > self.exclusion_capacity(len(key_cols)):
+            raise ValueError(f"{len(exclude_keys)} keys x {len(key_cols)} columns exceed the "
+                             f"{self.max_params}-parameter budget of one statement")
         clauses, values = [], []
         if where:
             clauses.append(f"({where})")
@@ -735,6 +747,18 @@ class OracleSourceAdapter(_SqlAdapterBase):
         import oracledb  # lazy: optional extra
         user, password, dsn = _secret(dsn_secret).split("/", 2)
         super().__init__(oracledb.connect(user=user, password=password, dsn=dsn))
+
+
+def _key_text(value: Any) -> str | None:
+    """A key component as the text the target engine casts back to the column type; datetimes as
+    UTC instants with an explicit offset, matching the watermark literal contract."""
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return instant(value).isoformat(sep=" ", timespec="microseconds") + "+00:00"
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "\\x" + bytes(value).hex()
+    return str(value)
 
 
 def _split_table(table: str, default_schema: str | None) -> tuple[str | None, str]:
@@ -1109,6 +1133,50 @@ class _PostgresBase(_SqlAdapterBase):
             if has_seq:
                 facts.identity_columns.add(col)
         return facts
+
+    # In-flight keys travel as one text[] per key column and are cast to the column's declared
+    # type server-side, so one statement excludes any number of keys of any width: the row cap
+    # is the caller's (IN_FLIGHT_EXCLUSION_CAP), never the bind-parameter limit.
+    ARRAY_EXCLUSION_CAPACITY = 1_000_000
+
+    def exclusion_capacity(self, key_width: int) -> int:
+        return self.ARRAY_EXCLUSION_CAPACITY
+
+    def _column_types(self, table: str) -> dict[str, str]:
+        schema, name = _split_table(table, "public")
+        rows = self._rows(
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped",
+            (schema, name))
+        return {col.lower(): typ for col, typ in rows}
+
+    def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
+                                   key_cols: list[str], exclude_keys: list[tuple],
+                                   where: str | None = None) -> dict[str, dict[str, Any]]:
+        if not exclude_keys:
+            return super().table_aggregates_excluding(table, columns, numeric, key_cols, [], where)
+        if len(exclude_keys) > self.exclusion_capacity(len(key_cols)):
+            raise ValueError(f"{len(exclude_keys)} keys exceed the "
+                             f"{self.ARRAY_EXCLUSION_CAPACITY}-key exclusion budget")
+        types = self._column_types(table)
+        casts = []
+        for col in key_cols:
+            typ = types.get(col.strip('"').lower())
+            if typ is None:
+                raise ValueError(f"{table}: key column {col} is not in the catalog")
+            casts.append(typ)
+        values: list[Any] = [[_key_text(k[i]) for k in exclude_keys] for i in range(len(key_cols))]
+        arrays = [f"{p}::text[]" for p in self._placeholders(len(key_cols))]
+        names = ", ".join(f"_k{i}" for i in range(len(key_cols)))
+        match = " AND ".join(f"_x._k{i}::{typ} = {col}"
+                             for i, (col, typ) in enumerate(zip(key_cols, casts)))
+        clauses = [f"({where})"] if where else []
+        clauses.append(f"NOT EXISTS (SELECT 1 FROM unnest({', '.join(arrays)}) AS _x({names}) "
+                       f"WHERE {match})")
+        return self._table_aggregates(table, columns, numeric, " WHERE " + " AND ".join(clauses),
+                                      values)
 
     def _server_version(self) -> int:
         if not hasattr(self, "_server_version_num"):
