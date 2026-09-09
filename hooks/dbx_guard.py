@@ -407,13 +407,15 @@ _PIPE_OPS = ("|", "|&")
 class _Simple:
     """One simple command of a shell line: its words, the words of the heredoc bodies it opened,
     the operator that separated it from the command before it (`|` / `|&`: the left side's output
-    is this one's stdin), and how many `(`/`{` groups opened right before it and how many `)`/`}`
-    closed between it and the command before it."""
+    is this one's stdin), how many `(`/`{` groups opened right before it and how many `)`/`}`
+    closed between it and the command before it, and how many of its words it wrote itself
+    (`own`): the rest were handed down by the redirections of a group it sits in."""
     words: list[str] = field(default_factory=list)
     body: list[str] = field(default_factory=list)
     sep: str = ""
     opened: int = 0
     closed: int = 0
+    own: int | None = None
 
     def empty(self) -> bool:
         return not self.words and not self.body
@@ -424,11 +426,15 @@ _LOCAL_STDIN = re.compile(r"0?(?:<|<<<|<<-?|<&)")
 
 
 def _stdin_replaced(cmds: list[_Simple], c: _Simple) -> bool:
-    """Whether cmds member `c` reads something other than the stdin its enclosing group is given:
-    a stdin redirection or heredoc of its own, or a pipe feeding it (directly or the group it
-    runs in)."""
-    if any(_LOCAL_STDIN.fullmatch(w) for w in c.words):
-        return True
+    """Whether cmds member `c` reads something other than the stdin the group closing now is
+    given: a stdin redirection or heredoc of its own (or of an inner group it sits in), or a
+    pipe feeding it (directly or the group it runs in). Redirections this same group handed
+    down already do not count: `(bteq) < a < b` opens both, and `<&0` duplicates stdin onto
+    itself, which replaces nothing."""
+    words = c.words if c.own is None else c.words[:c.own]
+    for w, operand in zip(words, [*words[1:], ""]):
+        if _LOCAL_STDIN.fullmatch(w) and not (w.endswith("<&") and operand == "0"):
+            return True
     return _pipe_into(cmds, next(k for k, x in enumerate(cmds) if x is c)) >= 0
 
 
@@ -458,6 +464,8 @@ def _commands(toks: list[str]) -> list[_Simple]:
         nonlocal closed_group
         start = open_groups.pop() if open_groups else 0
         closed_group = out[start:-1]
+        for c in closed_group:
+            c.own = len(c.words)
 
     def separate(tok: str) -> None:
         operand_of.clear()

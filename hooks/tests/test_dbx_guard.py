@@ -738,6 +738,21 @@ def test_a_group_input_skips_members_whose_stdin_is_already_taken(tmp_path: Path
                 "(bteq < read.sql; bteq) < write.sql", "(cat read.sql | (bteq); bteq) < write.sql"):
         assert "write.sql" in g._script_inputs(cmd, CFG), cmd
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    # `<&0` duplicates stdin onto itself: the group's file still reaches the client. `<&-` closes
+    # it and `<&3` takes another descriptor: those do replace it
+    for cmd in ("(bteq <&0) < write.sql", "(bteq 0<&0) < write.sql", "(cat <&0 | bteq) < write.sql"):
+        assert g._script_inputs(cmd, CFG) == ["write.sql"], cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    for cmd in ("(bteq <&-) < write.sql", "(bteq <&3) < write.sql"):
+        assert g._script_inputs(cmd, CFG) == [], cmd
+    # successive group redirections are all opened, in shell order: a redirection this group
+    # already handed down is not the member's own, so the later file reaches it too
+    for cmd in ("(bteq) < read.sql < write.sql", "(bteq) < write.sql < read.sql",
+                "{ bteq; } 0<read.sql < write.sql", "(cat | bteq) < read.sql < write.sql"):
+        assert "write.sql" in g._script_inputs(cmd, CFG), cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    # an inner group's redirection is the member's own relative to the outer group
+    assert g._script_inputs("((bteq) < read.sql) < write.sql", CFG) == ["read.sql"]
     # nobody inherits it: the operand is consumed, not read as a command of its own
     assert g._commands(g._shell_tokens("(bteq < read.sql) < write.sql; echo"))[-1].words == ["echo"]
     # output redirections after the group still land on every member
