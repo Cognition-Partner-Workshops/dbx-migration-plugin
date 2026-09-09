@@ -59,6 +59,14 @@ class BatchAggregates(Protocol):
 
 
 @runtime_checkable
+class SumProbe(Protocol):
+    """One isolated `SELECT SUM(col)` for a field whose numeric type is undeclared on this side;
+    None when the engine rejects it. Pairs with `BatchAggregates` so a probed field costs one
+    extra statement, not a second full metrics pass."""
+    def sum_probe(self, table: str, column: str, where: str | None = None) -> Any: ...
+
+
+@runtime_checkable
 class StratifiedKeys(Protocol):
     """Server-side key stratification for Tier 3 sampling: the source computes n key ranges and
     returns chosen keys per range, so the harness never streams the whole key column."""
@@ -148,14 +156,18 @@ class _SqlAdapterBase:
         n, nonnull, mn, mx, dc = self._rows(AGG_SQL.format(col=column, table=table, where=w))[0]
         out = {"count": int(n), "null_rate": (int(n) - int(nonnull)) / int(n) if n else 0.0,
                "min": mn, "max": mx, "distinct_count": int(dc)}
+        out["sum"] = self.sum_probe(table, column, where)
+        return out
+
+    def sum_probe(self, table: str, column: str, where: str | None = None) -> Any:
+        w = f" WHERE {where}" if where else ""
         try:
             (s,) = self._rows(f"SELECT SUM({column}) FROM {table}{w}")[0]
-            out["sum"] = s
+            return s
         except Exception:  # noqa: BLE001  driver-specific error type: SUM on a non-numeric column
-            out["sum"] = None
             if hasattr(self._conn, "rollback"):
                 self._conn.rollback()  # libpq leaves the transaction aborted otherwise
-        return out
+            return None
 
     def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
@@ -401,6 +413,9 @@ class DatabricksTargetAdapter:
 
     def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
         return self._sql.field_aggregates(self._q(object), field_path, where)
+
+    def sum_probe(self, object: str, field_path: str, where: str | None = None) -> Any:
+        return self._sql.sum_probe(self._q(object), field_path, where)
 
     def fetch_keyed(self, object: str, key_fields: list[str], fields: list[str],
                     where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]:

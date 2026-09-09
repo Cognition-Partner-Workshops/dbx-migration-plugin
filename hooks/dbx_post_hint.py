@@ -65,8 +65,8 @@ def main(stdin_text: str | None = None) -> int:
     if not isinstance(event, dict):
         return 0
     resp = event.get("tool_response") or {}
-    if not isinstance(resp, dict):
-        return 0
+    if not isinstance(resp, dict) or resp.get("success") is True:
+        return 0  # a command that succeeded only mentions the error text (log greps, docs); a missing flag is inspected
     text = " ".join(str(resp.get(k) or "") for k in ("output", "error"))
     if not text.strip():
         return 0

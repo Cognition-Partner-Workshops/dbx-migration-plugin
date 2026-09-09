@@ -12,7 +12,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import BatchAggregates, StratifiedKeys
+from .adapters import BatchAggregates, StratifiedKeys, SumProbe
 from .canon import MISSING, Canonicalizer
 from .config import MappingSpec, ObjectMapping, Tolerances
 from .paths import get_path
@@ -143,8 +143,9 @@ def _is_numeric_field(f, s: dict, t: dict) -> bool:
 
 def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict], dict[str, dict]]:
     """All field aggregates for one object: one statement per side when the adapter batches,
-    one per field otherwise. Each side requests SUM per its own `sum_plan`; probed fields get
-    the isolated per-column statement so a SUM that errors never aborts the batched one."""
+    one per field otherwise. Each side requests SUM per its own `sum_plan`; a probed field keeps
+    the batched metrics and adds one isolated SUM statement (`SumProbe`) so a SUM that errors
+    never aborts the batched one; adapters without `SumProbe` fall back to the per-column statement."""
     s_plan = {f.source: sum_plan(f.source_type, f.target_type) for f in c.fields}
     cols = list(s_plan)
     if isinstance(source, BatchAggregates):
@@ -152,7 +153,10 @@ def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict
                                         c.root_where)
         for col, p in s_plan.items():
             if p == "probe":
-                s_all[col] = source.field_aggregates(c.root_table, col, c.root_where)
+                if isinstance(source, SumProbe):
+                    s_all[col]["sum"] = source.sum_probe(c.root_table, col, c.root_where)
+                else:
+                    s_all[col] = source.field_aggregates(c.root_table, col, c.root_where)
     else:
         s_all = {col: source.field_aggregates(c.root_table, col, c.root_where) for col in cols}
     t_plan = {f.target: sum_plan(f.target_type, f.source_type) for f in c.fields}
@@ -166,7 +170,10 @@ def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict
                                         c.target_where)
         for col, p in t_plan.items():
             if p == "probe":
-                t_all[col] = t_probe(col)
+                if isinstance(target, SumProbe):
+                    t_all[col]["sum"] = target.sum_probe(c.object, col, c.target_where)
+                else:
+                    t_all[col] = t_probe(col)
     else:
         t_all = {col: t_probe(col) for col in t_plan}
     return s_all, t_all

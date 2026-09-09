@@ -23,6 +23,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,7 +34,9 @@ from pathlib import Path
 REQUIRED_FILES = (
     "00_context.md",
     "01_conventions.md",
+    "02_glossary.md",
     "03_recon_tolerances.md",
+    "03_recon_tolerances.json",
     "04_dependency_register.md",
     "05_progress.md",
     "06_decisions.md",
@@ -250,6 +253,23 @@ def check_drivers() -> Check:
 
 # ------------------------------------------------------------------ databricks identity
 
+_APPLICATION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+_SP_SCHEMA = "servicePrincipal"
+
+
+def classify_identity(who: dict) -> tuple[str, bool]:
+    """(userName, is_service_principal) from a SCIM `current-user me` document.
+
+    A service principal is recognised by positive evidence only: `applicationId`, a ServicePrincipal
+    SCIM schema, or a `userName` that is the application id (a UUID). Anything else, including a
+    username without an '@', is treated as a human identity, so the doctor fails closed."""
+    name = str(who.get("userName") or who.get("displayName") or "?")
+    schemas = [str(s) for s in who.get("schemas") or []]
+    is_sp = bool(who.get("applicationId")) or any(_SP_SCHEMA.lower() in s.lower() for s in schemas) \
+        or bool(_APPLICATION_ID.fullmatch(name))
+    return name, is_sp
+
+
 def check_databricks(expect_identity: str | None) -> list[Check]:
     out: list[Check] = []
     cli = shutil.which("databricks")
@@ -282,8 +302,7 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
     except json.JSONDecodeError:
         out.append(Check("databricks_identity", "fail", "current-user me returned non-JSON"))
         return out
-    name = who.get("userName") or who.get("displayName") or "?"
-    is_sp = "@" not in str(name)
+    name, is_sp = classify_identity(who)
     data = {"userName": name, "service_principal": is_sp}
     status = "ok"
     detail = f"authenticated as {name} ({'service principal' if is_sp else 'user'})"

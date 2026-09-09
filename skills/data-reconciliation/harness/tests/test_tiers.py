@@ -239,8 +239,8 @@ def test_tier2_source_sum_follows_source_type_not_target_type():
     rows = [{"ID": 1, "CODE": "7", "AMT": 1.5}, {"ID": 2, "CODE": "8", "AMT": 2.5}]
 
     class Source(FakeSource):
-        def field_aggregates(self, table, column, where=None):
-            out = super().field_aggregates(table, column, where)
+        def sum_probe(self, table, column, where=None):
+            out = super().sum_probe(table, column, where)
             if column == "CODE":
                 raise RuntimeError("ORA-01722: invalid number")  # the probe fails in isolation
             return out
@@ -257,8 +257,8 @@ def test_tier2_source_sum_follows_source_type_not_target_type():
     source = FakeSource({"T": rows})
     result = run_recon("u", "live", spec, TOL, RULES, source, target)
     assert result["verdict"] == "PASS"
-    assert source.calls["field_aggregates"] == 1  # CODE probed alone
-    assert target.calls["field_aggregates"] == 1  # AMT (undeclared target type) probed alone
+    assert source.calls["sum_probe"] == 1 and source.calls["field_aggregates"] == 0  # CODE: one SUM alone
+    assert target.calls["sum_probe"] == 1 and target.calls["field_aggregates"] == 0  # AMT undeclared: one SUM
     assert target.last_table_aggregates_numeric == ["id", "code"]
     from recon.cost import estimate_cost
     est = estimate_cost(spec, TOL)

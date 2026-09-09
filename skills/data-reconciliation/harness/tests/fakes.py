@@ -71,6 +71,11 @@ class FakeSource:
         self.statements += 1
         return self._aggregates(table, column, where)
 
+    def sum_probe(self, table: str, column: str, where: str | None = None) -> Any:
+        self.calls["sum_probe"] += 1
+        self.statements += 1
+        return self._aggregates(table, column, where)["sum"]
+
     def _aggregates(self, table: str, column: str, where: str | None) -> dict[str, Any]:
         vals = [(r[column] if column in r else get_path(r, column))
                 for r in self.tables[table] if _matches(r, where)]
@@ -186,6 +191,13 @@ class FakeTarget:
             out[col] = agg
         self.calls["field_aggregates"] = probes  # only direct probes count as statements
         return out
+
+    def sum_probe(self, object: str, field_path: str, where=None) -> Any:
+        self.calls["sum_probe"] += 1
+        self.statements += 1
+        vals = [get_path(d, field_path) for d in self._rows(object, where)]
+        nums = [v for v in vals if isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool)]
+        return sum(nums) if nums else None
 
     def field_aggregates(self, object: str, field_path: str, where=None) -> dict[str, Any]:
         self.calls["field_aggregates"] += 1

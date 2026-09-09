@@ -169,6 +169,44 @@ def test_databricks_script_file_is_inspected(tmp_path: Path):
     assert g.evaluate("spark-sql -f ok.sql", CFG, root=tmp_path).decision == "approve"
 
 
+def test_script_file_over_size_cap_is_not_partially_cleared(tmp_path: Path, monkeypatch):
+    # a write after the read boundary must not slip through because the guard only saw the prefix
+    monkeypatch.setattr(g, "_MAX_SCRIPT_BYTES", 64)
+    big = tmp_path / "big.sql"
+    big.write_text("SELECT 1;\n" * 10 + "UPDATE sales.orders SET status = 'X';\n")
+    v = g.evaluate(f"bteq < {big}", CFG, root=tmp_path)
+    assert v.decision == "block" and "cannot read in full" in v.reason and "read-only" in v.reason
+    v = g.evaluate(f"spark-sql -f {big}", CFG, root=tmp_path)
+    assert v.decision == "block" and "cannot read in full" in v.reason
+    small = tmp_path / "small.sql"
+    small.write_text("SELECT 1;\n")
+    assert g.evaluate(f"spark-sql -f {small}", CFG, root=tmp_path).decision == "approve"
+
+
+def test_databricks_script_file_unreadable_is_blocked(tmp_path: Path):
+    v = g.evaluate("spark-sql -f /nonexistent/load.sql", CFG, root=tmp_path)
+    assert v.decision == "block" and "cannot read" in v.reason
+
+
+@pytest.mark.parametrize("client", ["/opt/teradata/bin/bteq", "./tools/bteq", "$HOME/td/sqlplus", "~/bin/snowsql"])
+def test_legacy_client_by_absolute_path_is_recognised(client: str):
+    v = block(f"{client} <<'EOF'\nUPDATE sales.orders SET status='X' WHERE 1=1;\nEOF")
+    assert "legacy-only client" in v.reason
+    approve(f"{client} <<'EOF'\nSELECT COUNT(*) FROM sales.orders;\nEOF")
+
+
+@pytest.mark.parametrize("client", ["/usr/local/bin/databricks", "./.venv/bin/databricks", "/opt/spark/bin/spark-sql"])
+def test_databricks_client_by_absolute_path_is_recognised(client: str):
+    v = block(f"{client} -e \"CREATE TABLE orders_v2 (id INT)\"")
+    assert "unresolvable catalog" in v.reason
+    approve(f"{client} -e \"CREATE TABLE mig_cat.wave1.orders_v2 (id INT)\"")
+
+
+def test_path_prefix_does_not_make_unrelated_binaries_a_client():
+    approve("/opt/mybteq/run --sql \"UPDATE sales.orders SET status='X'\"")  # basename is `run`, not a client
+    approve("cat /etc/databricks/config && echo done")  # a directory named databricks is not the CLI
+
+
 def test_non_client_commands_do_not_read_files(tmp_path: Path):
     approve("rm -f /nonexistent/thing && docker run -i img < /nonexistent/in.txt")
 
@@ -311,6 +349,16 @@ def test_post_hint_silent_on_success(tmp_path: Path):
     ev = {"tool_name": "exec", "tool_input": {"command": "ls"}, "tool_response": {"success": True, "output": "a b c", "error": None}}
     r = _run(ev, tmp_path, script="dbx_post_hint.py")
     assert r.returncode == 0 and r.stdout.strip() == ""
+
+
+def test_post_hint_silent_when_a_successful_command_merely_mentions_an_error(tmp_path: Path):
+    ev = {"tool_name": "exec", "tool_input": {"command": "grep PERMISSION_DENIED run.log"},
+          "tool_response": {"success": True, "output": "run.log:12 PERMISSION_DENIED: User does not have USE CATALOG", "error": ""}}
+    r = _run(ev, tmp_path, script="dbx_post_hint.py")
+    assert r.returncode == 0 and r.stdout.strip() == ""
+    ev["tool_response"].pop("success")  # no success flag: the text decides
+    r = _run(ev, tmp_path, script="dbx_post_hint.py")
+    assert "D10" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_hooks_json_registers_both_scripts():
