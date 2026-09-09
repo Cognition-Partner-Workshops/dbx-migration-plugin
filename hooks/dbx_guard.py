@@ -313,22 +313,52 @@ def _write_segments(text: str) -> list[tuple[int, str]]:
     return out
 
 
+# redirection operators stay inside their simple command; every other punctuation run ends it. A
+# descriptor attached to the operator (`2>&1`, `0<f`) is part of it; separated by a space it is
+# an operand (`cat 2 >log` prints the file named 2)
+_REDIRECT_OP = re.compile(r"\d*(?:<{1,3}|<>|<&|>{1,2}|>&|>\||&>{1,2})")
+_STDIN_OP = re.compile(r"0?<")
+
+
 def _shell_tokens(cmd: str) -> list[str]:
     """Shell words with redirection operators, separators and newlines as their own tokens; a
     quoted argument (usually the SQL itself) is one word, so a `<` comparison or a line break
-    inside it is never an operator."""
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
-    lex.whitespace = " \t\r"
-    lex.whitespace_split = True
-    lex.commenters = ""
+    inside it is never an operator. A descriptor written against its operator is one token with
+    it (`2>&`, `0<`): the digit and the operator came from the same whitespace-delimited word,
+    which is what makes the digit a descriptor rather than an operand."""
+    def lexer(punctuation: str | bool) -> shlex.shlex:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=punctuation)
+        lex.whitespace = " \t\r"
+        lex.whitespace_split = True
+        lex.commenters = ""
+        return lex
+
     try:
-        return list(lex)
+        toks = list(lexer("();<>|&\n"))
     except ValueError:  # unbalanced quote: fall back to whitespace words, quotes stripped
         return [t.strip("'\"") for t in re.split(r"\s+|(?<!<)(<)(?!<)", cmd) if t]
-
-
-# redirection operators stay inside their simple command; every other punctuation run ends it
-_REDIRECT_OP = re.compile(r"<{1,3}|<>|<&|>{1,2}|>&|>\||&>{1,2}")
+    words = list(lexer(False))   # the same text, split at whitespace only
+    out: list[str] = []
+    i = 0
+    for word in words:
+        j, acc = i, ""
+        while j < len(toks) and len(acc) < len(word):
+            acc += toks[j]
+            j += 1
+        if acc != word:   # the two splits disagree: fuse nothing, a digit stays an operand
+            return toks
+        k = i
+        while k < j:
+            nxt = toks[k + 1] if k + 1 < j else ""
+            if toks[k].isdigit() and _REDIRECT_OP.fullmatch(nxt) and not nxt[0].isdigit():
+                out.append(toks[k] + nxt)
+                k += 2
+            else:
+                out.append(toks[k])
+                k += 1
+        i = j
+    out.extend(toks[i:])
+    return out
 
 
 _PIPE_OPS = ("|", "|&")
@@ -356,19 +386,39 @@ def _commands(toks: list[str]) -> list[_Simple]:
     they sit in, and the body of a `<<TAG` heredoc (read from the next line, up to the line
     holding TAG alone) belongs to the command that opened it, even when that command is followed
     by `| tee` or `&& echo` on the opening line. Punctuation between two commands folds into one
-    separator: `) |`, `|` + newline and `| (` all leave the right-hand command fed by a pipe."""
+    separator: `) |`, `|` + newline and `| (` all leave the right-hand command fed by a pipe. A
+    redirection written after `)` / `}` belongs to the group (`(cat f) 2>&1 | bteq`,
+    `(bteq; echo done) < f`): it is repeated on every command inside the group, which all inherit
+    that stdin, rather than becoming a command of its own."""
     punct = re.compile(r"[();<>|&\n]+")
     out: list[_Simple] = [_Simple()]
     pending: list[tuple[str, list[str]]] = []   # (delimiter, body of the opening command), in order
+    open_groups: list[int] = []          # index in `out` of each unclosed group's first command
+    closed_group: list[_Simple] = []     # members of the group closed last
+    operand_of: list[_Simple] = []       # commands owning the redirection whose operand comes next
+
+    def open_group() -> None:
+        open_groups.append(len(out) - 1)
+
+    def close_group() -> None:
+        nonlocal closed_group
+        start = open_groups.pop() if open_groups else 0
+        closed_group = out[start:-1]
 
     def separate(tok: str) -> None:
+        operand_of.clear()
         op = re.sub(r"[()\n]", "", tok)
         if not out[-1].empty():
             out.append(_Simple())
         cur = out[-1]
         cur.sep = op or cur.sep or ("\n" if "\n" in tok else "")
-        cur.opened += tok.count("(")
-        cur.closed += tok.count(")")
+        for ch in tok:
+            if ch == "(":
+                cur.opened += 1
+                open_group()
+            elif ch == ")":
+                cur.closed += 1
+                close_group()
 
     i = 0
     while i < len(toks):
@@ -392,9 +442,21 @@ def _commands(toks: list[str]) -> list[_Simple]:
             i += 1
         elif tok == "{" and out[-1].empty():
             out[-1].opened += 1
+            open_group()
             i += 1
         elif tok == "}" and out[-1].empty():
             out[-1].closed += 1
+            close_group()
+            i += 1
+        elif operand_of:
+            for c in operand_of:
+                c.words.append(tok)
+            operand_of.clear()
+            i += 1
+        elif _REDIRECT_OP.fullmatch(tok) and out[-1].empty() and out[-1].closed and closed_group:
+            for c in closed_group:
+                c.words.append(tok)
+            operand_of = list(closed_group)
             i += 1
         else:
             out[-1].words.append(tok)
@@ -458,14 +520,11 @@ def _piped_scripts(producer: _Simple) -> list[str]:
     if base == "cat":
         skip = False
         words = producer.words
-        for i, w in enumerate(words[1:], 1):
-            nxt = words[i + 1] if i + 1 < len(words) else ""
-            if skip or w.startswith("-") or w == "<":
+        for w in words[1:]:
+            if skip or w.startswith("-") or _STDIN_OP.fullmatch(w):
                 skip = False
             elif _REDIRECT_OP.fullmatch(w) or w in ("<<", "<<-"):
                 skip = True  # the operand is a log, descriptor or heredoc delimiter, not a script
-            elif w.isdigit() and _REDIRECT_OP.fullmatch(nxt) and nxt != "<":
-                continue  # the descriptor of `2>/dev/null` / `2>&1`
             else:
                 files.append(w)
     elif base in ("echo", "printf"):
@@ -495,7 +554,7 @@ def _script_inputs(cmd: str, cfg: GuardConfig | None = None) -> list[str]:
                 skip = False
                 continue
             nxt = words[i + 1] if i + 1 < len(words) else ""
-            if tok == "<" or tok in _SCRIPT_FLAGS:
+            if _STDIN_OP.fullmatch(tok) or tok in _SCRIPT_FLAGS:
                 f = nxt
             elif _REDIRECT_OP.fullmatch(tok):
                 skip = True
