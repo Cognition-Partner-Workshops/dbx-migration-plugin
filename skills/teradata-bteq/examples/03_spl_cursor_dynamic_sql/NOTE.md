@@ -10,10 +10,12 @@ Source: skill-authored (fixture schema `DIM_ACCOUNT`, `FACT_TRANSACTION`, `ETL_L
 - `ACTIVITY_COUNT` -> explicit `SELECT COUNT(*)` (`INTO`); `SQLCODE`/`SQLSTATE` in the handler -> fixed return code.
 - `BT`/`ET` + `ROLLBACK` -> no drop-in. Per-statement Delta commits; the archive `INSERT` is idempotent
   (`NOT EXISTS` on `TRANSACTION_ID`); an account interrupted mid-triple stays `CLOSED` and is finished by the re-run.
-  The `INOUT` budget is never taken from the in-memory counter (which only caps the loop): the status `UPDATE` also
-  stamps `ETL_BATCH_ID = v_run_id` (`unix_micros(current_timestamp())`, docs.databricks.com `functions/unix_micros`),
-  and both exits derive `p_accounts_done` as `count(ACCOUNT_STATUS = 'ARCHIVED' AND ETL_BATCH_ID = v_run_id)`, so
-  that one committed row is the progress record and rows archived by any other writer (other id) are never charged.
+  The `INOUT` budget is never taken from the in-memory counter (which only caps the loop): each account writes an
+  `ARCHIVE_RUN_LEDGER (RUN_ID, ACCOUNT_KEY)` row (DDL ships in the converted file) just before its status `UPDATE`,
+  and both exits derive `p_accounts_done` as `count(ledger rows of v_run_id whose account is ARCHIVED)`: an account
+  interrupted between the two is not charged (the re-run does), other writers' archives are never charged, and
+  `ETL_BATCH_ID` keeps its load lineage as on the source. `v_run_id` is `uuid()` (random, docs.databricks.com
+  `functions/uuid`), never clock-derived, so two callers cannot share an id.
   `BEGIN ATOMIC` (preview, `catalogManaged` tables) is the alternative where the target profile allows it.
 - BT/ET also serialised overlapping callers (write locks held to `ET`). Replaced by a one-row
   `ARCHIVE_CAMPAIGN_LOCK (LOCK_NAME, OWNER_RUN_ID, LOCKED_TS)` whose DDL + idempotent `MERGE` seed ship in the
@@ -31,5 +33,5 @@ Source: skill-authored (fixture schema `DIM_ACCOUNT`, `FACT_TRANSACTION`, `ETL_L
 - **Tier 3** keyed diff on rows present in both fact and archive (should be empty after a completed run).
 
 ## Not verified live
-`FOR` with a labelled `LEAVE`; `EXECUTE IMMEDIATE ... INTO ... USING`; `INOUT` write-back from inside an `EXIT`
-handler; `BEGIN ATOMIC` as a BT/ET replacement; write-conflict behaviour of two `UPDATE`s on the same lock row.
+`FOR` with a labelled `LEAVE`; `EXECUTE IMMEDIATE ... INTO ... USING`; `INOUT` write-back and a join subquery in
+`SET` inside an `EXIT` handler; `BEGIN ATOMIC` as BT/ET replacement; write conflicts of two `UPDATE`s on the lock row.

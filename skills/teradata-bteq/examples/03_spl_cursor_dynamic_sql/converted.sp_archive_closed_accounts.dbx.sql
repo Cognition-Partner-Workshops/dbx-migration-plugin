@@ -1,11 +1,11 @@
 -- Target: UC stored procedure (databricks-dbsql references/sql-scripting.md: "FOR Loop", "LEAVE and ITERATE",
 -- "CASE Statement", "Handler Declaration" (EXIT only), "SIGNAL and RESIGNAL", "EXECUTE IMMEDIATE", "CREATE PROCEDURE").
--- BT/ET has no drop-in (NOTE.md). Deployed with the procedure: one-row campaign lock, seeded idempotently by MERGE.
-CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
-    (LOCK_NAME STRING NOT NULL, OWNER_RUN_ID BIGINT, LOCKED_TS TIMESTAMP);
+-- BT/ET has no drop-in (NOTE.md). Deployed with the procedure: one-row campaign lock (seeded idempotently by MERGE)
+-- and a run ledger (which run archived which account) so ETL_BATCH_ID keeps its load lineage, as on the source.
+CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK (LOCK_NAME STRING NOT NULL, OWNER_RUN_ID STRING, LOCKED_TS TIMESTAMP);
 MERGE INTO ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK l USING (SELECT 'SP_ARCHIVE_CLOSED_ACCOUNTS' AS LOCK_NAME) s
-    ON l.LOCK_NAME = s.LOCK_NAME
-    WHEN NOT MATCHED THEN INSERT (LOCK_NAME, OWNER_RUN_ID, LOCKED_TS) VALUES (s.LOCK_NAME, NULL, NULL);
+    ON l.LOCK_NAME = s.LOCK_NAME WHEN NOT MATCHED THEN INSERT (LOCK_NAME, OWNER_RUN_ID, LOCKED_TS) VALUES (s.LOCK_NAME, NULL, NULL);
+CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ARCHIVE_RUN_LEDGER (RUN_ID STRING NOT NULL, ACCOUNT_KEY BIGINT NOT NULL);
 CREATE OR REPLACE PROCEDURE ${catalog}.${schema}.SP_ARCHIVE_CLOSED_ACCOUNTS(
     IN    p_closed_before   DATE,
     IN    p_archive_schema  STRING,          -- was p_archive_db (Teradata database == UC schema)
@@ -15,21 +15,21 @@ CREATE OR REPLACE PROCEDURE ${catalog}.${schema}.SP_ARCHIVE_CLOSED_ACCOUNTS(
 )
 LANGUAGE SQL SQL SECURITY INVOKER MODIFIES SQL DATA
 AS BEGIN
-    DECLARE v_run_id     BIGINT DEFAULT unix_micros(current_timestamp());   -- lock owner + ETL_BATCH_ID stamp
+    DECLARE v_run_id     STRING DEFAULT uuid();   -- lock owner + ledger key; random, so never shared by two callers
     DECLARE v_txn_count  INT;  DECLARE v_arch_table STRING;
     -- ROLLBACK has no equivalent: partial work is kept, the re-run is idempotent, and the budget is derived from committed
-    -- state: each status UPDATE stamps ETL_BATCH_ID = v_run_id, so the count of rows carrying this run's id is exactly
-    -- what it archived (other writers' rows carry other ids). Fixed return code: no cited SQLSTATE read in a handler.
+    -- state: this run's ledger rows whose account is ARCHIVED (a row without the status is an interrupted account: the
+    -- re-run finishes and charges it). Fixed return code: no cited SQLSTATE read in a handler.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         SET p_return_code = -1;
-        SET p_accounts_done = (SELECT COUNT(*) FROM ${catalog}.${schema}.DIM_ACCOUNT
-                               WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_BATCH_ID = v_run_id);
+        SET p_accounts_done = (SELECT COUNT(*) FROM ${catalog}.${schema}.ARCHIVE_RUN_LEDGER l JOIN ${catalog}.${schema}.DIM_ACCOUNT a
+            ON a.ACCOUNT_KEY = l.ACCOUNT_KEY WHERE l.RUN_ID = v_run_id AND a.ACCOUNT_STATUS = 'ARCHIVED');
         SET p_max_batch = p_max_batch - p_accounts_done;
         UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
         WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;
         INSERT INTO ${catalog}.${schema}.ETL_LOG (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
-        VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR', 'run ' || CAST(v_run_id AS STRING) || ' failed after '
+        VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR', 'run ' || v_run_id || ' failed after '
                 || CAST(p_accounts_done AS STRING) || ' accounts; re-run with the returned budget', current_timestamp());
     END;
     SET p_return_code = 0; SET p_accounts_done = 0;
@@ -44,8 +44,7 @@ AS BEGIN
     -- -> NULL); a loser may instead hit a write conflict. Every path lands in the handler; release is owner-checked.
     UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK SET OWNER_RUN_ID = v_run_id, LOCKED_TS = current_timestamp()
     WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID IS NULL;
-    IF (SELECT OWNER_RUN_ID FROM ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
-        WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS') IS DISTINCT FROM v_run_id THEN
+    IF (SELECT OWNER_RUN_ID FROM ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS') IS DISTINCT FROM v_run_id THEN
         SIGNAL SQLSTATE '75003' SET MESSAGE_TEXT = 'SP_ARCHIVE_CLOSED_ACCOUNTS campaign lock missing or held by another run';
     END IF;
     SET v_arch_table = '${catalog}.' || p_archive_schema || '.FACT_TRANSACTION_ARCH_' || CAST(year(p_closed_before) AS STRING);
@@ -68,12 +67,13 @@ AS BEGIN
                     INTO v_txn_count USING acct.ACCOUNT_KEY;                -- ACTIVITY_COUNT: no row-count register
                 DELETE FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;
         END CASE;
-        UPDATE ${catalog}.${schema}.DIM_ACCOUNT SET ACCOUNT_STATUS = 'ARCHIVED', ETL_BATCH_ID = v_run_id,
-            ETL_UPDATE_TS = current_timestamp() WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;   -- the durable progress record
-        SET p_accounts_done = p_accounts_done + 1;                          -- loop cap only; budget comes from the table
+        INSERT INTO ${catalog}.${schema}.ARCHIVE_RUN_LEDGER VALUES (v_run_id, acct.ACCOUNT_KEY);   -- ledger row, then status:
+        UPDATE ${catalog}.${schema}.DIM_ACCOUNT SET ACCOUNT_STATUS = 'ARCHIVED', ETL_UPDATE_TS = current_timestamp()
+        WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;                               -- together they are the durable progress record
+        SET p_accounts_done = p_accounts_done + 1;                          -- loop cap only; budget comes from the tables
     END FOR archive_loop;
-    SET p_accounts_done = (SELECT COUNT(*) FROM ${catalog}.${schema}.DIM_ACCOUNT
-                           WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_BATCH_ID = v_run_id);
+    SET p_accounts_done = (SELECT COUNT(*) FROM ${catalog}.${schema}.ARCHIVE_RUN_LEDGER l JOIN ${catalog}.${schema}.DIM_ACCOUNT a
+        ON a.ACCOUNT_KEY = l.ACCOUNT_KEY WHERE l.RUN_ID = v_run_id AND a.ACCOUNT_STATUS = 'ARCHIVED');
     SET p_max_batch = p_max_batch - p_accounts_done;
     UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
     WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;
