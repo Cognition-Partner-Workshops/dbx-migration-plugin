@@ -187,9 +187,10 @@ def _sum_plans(pairs: list[tuple[str, str, str]], adapter, table: str) -> dict[s
         except NotImplementedError:  # an engine whose catalog the adapter does not read yet
             typed = None
         if typed is not None:
+            typed_names = {name.lower() for name in typed}
             for col, p in plan.items():
                 if p == "probe":
-                    plan[col] = "batch" if col in typed else "skip"
+                    plan[col] = "batch" if col.lower() in typed_names else "skip"
     return plan
 
 

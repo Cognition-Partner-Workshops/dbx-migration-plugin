@@ -1749,3 +1749,24 @@ def test_a_probe_that_releases_the_source_snapshot_fails_the_window():
     assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
     assert [f["check"] for f in window["findings"]] == ["window_lost", "window_unproven"]
     assert "rolled the transaction back" in window["findings"][0]["detail"]
+
+
+def test_catalog_case_does_not_decide_whether_an_undeclared_field_is_summed():
+    # SQL Server's catalog reports the declared column case; the mapping may spell it differently
+    class ShoutingCatalog(FakeTypedSource):
+        def numeric_columns(self, table: str) -> set[str]:
+            return {c.upper() for c in super().numeric_columns(table)}
+
+    loans, borrowers = _rows(12)
+    for r in loans:
+        r["loan_status"] = 3
+    tgt = [dict(r) for r in loans]
+    tgt[0]["loan_status"] = 4  # applied-row numeric drift only a SUM can see (min/max/nulls agree)
+    source = ShoutingCatalog({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                             schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                             sequences={("dbo.loans", "loan_id"): 13})
+    _, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_undeclared_spec())
+    assert result["verdict"] == "FAIL"
+    assert any(f["check"] == "aggregate_sum" and "loan_status" in f["detail"]
+               for f in _tier(result, "per_field_aggregates")["findings"]), result
