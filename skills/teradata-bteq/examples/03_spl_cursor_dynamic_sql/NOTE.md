@@ -9,14 +9,16 @@ Source: skill-authored (fixture schema `DIM_ACCOUNT`, `FACT_TRANSACTION`, `ETL_L
   build-time allowlist (`${schema}`, `${archive_schema}`), never the caller's string.
 - `ACTIVITY_COUNT` -> explicit `SELECT COUNT(*)` (`INTO`); `SQLCODE`/`SQLSTATE` in the handler -> fixed return code.
 - `BT`/`ET` + `ROLLBACK` -> no drop-in. Per-statement Delta commits; the archive `INSERT` is idempotent
-  (`NOT EXISTS` on `TRANSACTION_ID`), the counter increments before the status `UPDATE` so the `INOUT` budget the
-  handler returns is conservative (an interrupted account is charged once and redone by the re-run, never archived
-  twice). `BEGIN ATOMIC` (preview, `catalogManaged` tables) is the alternative where the target profile allows it.
-- BT/ET also serialised overlapping callers (write locks held to `ET`). Replaced by a seeded one-row
-  `ARCHIVE_CAMPAIGN_LOCK (LOCK_NAME STRING, OWNER_RUN_ID STRING, LOCKED_TS TIMESTAMP)`: claim with
-  `UPDATE ... WHERE OWNER_RUN_ID IS NULL`, read back, `SIGNAL 75003` if not the owner; released (owner-checked) on
-  both exits. Decision items: stale-lock timeout after a session dies mid-run; `max_concurrent_runs: 1` on the calling
-  job (`databricks-jobs` `references/triggers-schedules.md`) as belt-and-braces.
+  (`NOT EXISTS` on `TRANSACTION_ID`), and the counter increments after the status `UPDATE` (source order), so the
+  `INOUT` budget the handler returns charges exactly the accounts that are `ARCHIVED`; an account interrupted
+  mid-triple stays `CLOSED`, is not charged, and is finished by the re-run. `BEGIN ATOMIC` (preview,
+  `catalogManaged` tables) is the alternative where the target profile allows it.
+- BT/ET also serialised overlapping callers (write locks held to `ET`). Replaced by a one-row
+  `ARCHIVE_CAMPAIGN_LOCK (LOCK_NAME, OWNER_RUN_ID, LOCKED_TS)` whose DDL + idempotent `MERGE` seed ship in the
+  converted file ahead of the procedure: claim with `UPDATE ... WHERE OWNER_RUN_ID IS NULL`, read back,
+  `SIGNAL 75003` if not the owner (covers a missing row: read-back is NULL); released (owner-checked) on both exits.
+  Decision items: stale-lock timeout after a session dies mid-run; `max_concurrent_runs: 1` on the calling job
+  (`databricks-jobs` `references/triggers-schedules.md`) as belt-and-braces.
 
 ## Recon tier that catches a wrong conversion
 - **Tier 2** conservation: `sum(AMOUNT)` over `FACT_TRANSACTION` + archive must equal the source total; a
