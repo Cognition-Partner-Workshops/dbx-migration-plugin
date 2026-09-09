@@ -141,12 +141,26 @@ def _is_numeric_field(f, s: dict, t: dict) -> bool:
             and _side_numeric(sum_plan(f.target_type, f.source_type), t))
 
 
+_PLAN_RANK = {"skip": 0, "probe": 1, "batch": 2}
+
+
+def _column_plans(plans: list[tuple[str, str]]) -> dict[str, str]:
+    """One SUM plan per physical column from the plans of every mapping that touches it: a
+    column read once serves all of them, so the strongest request wins (batch > probe > skip)
+    and no mapping's requirement is dropped when a column name repeats."""
+    out: dict[str, str] = {}
+    for col, p in plans:
+        if col not in out or _PLAN_RANK[p] > _PLAN_RANK[out[col]]:
+            out[col] = p
+    return out
+
+
 def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict], dict[str, dict]]:
     """All field aggregates for one object: one statement per side when the adapter batches,
     one per field otherwise. Each side requests SUM per its own `sum_plan`; a probed field keeps
     the batched metrics and adds one isolated SUM statement (`SumProbe`) so a SUM that errors
     never aborts the batched one; adapters without `SumProbe` fall back to the per-column statement."""
-    s_plan = {f.source: sum_plan(f.source_type, f.target_type) for f in c.fields}
+    s_plan = _column_plans([(f.source, sum_plan(f.source_type, f.target_type)) for f in c.fields])
     cols = list(s_plan)
     if isinstance(source, BatchAggregates):
         s_all = source.table_aggregates(c.root_table, cols, [k for k, p in s_plan.items() if p == "batch"],
@@ -159,7 +173,7 @@ def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict
                     s_all[col] = source.field_aggregates(c.root_table, col, c.root_where)
     else:
         s_all = {col: source.field_aggregates(c.root_table, col, c.root_where) for col in cols}
-    t_plan = {f.target: sum_plan(f.target_type, f.source_type) for f in c.fields}
+    t_plan = _column_plans([(f.target, sum_plan(f.target_type, f.source_type)) for f in c.fields])
 
     def t_probe(col: str) -> dict:
         return (target.field_aggregates(c.object, col, c.target_where)
