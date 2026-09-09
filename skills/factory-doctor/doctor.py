@@ -78,8 +78,24 @@ def _run(cmd: list[str], timeout: int = 60, cwd: Path | None = None) -> tuple[in
         return 124, "", f"{' '.join(cmd[:3])}: timed out after {timeout}s"
 
 
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(password|passwd|pwd|pass|token|access[_-]?token|secret|api[_-]?key|client[_-]?secret|"
+    r"private[_-]?key|sas|signature|sig|authorization)\b\s*[:=]\s*(?:bearer\s+|basic\s+)?"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;,&]+)"
+)
+_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
+_URL_USERINFO = re.compile(r"(://[^/\s:@]+):([^@\s]+)@")
+_TOKEN_SHAPED = re.compile(r"\b(?:dapi|dsapi|ghp_|gho_|xox[abp]-|sk-|AKIA|eyJ)[A-Za-z0-9._-]{8,}")
+
+
 def _redact(text: str) -> str:
-    """Drop anything that looks like a token or secret value from CLI stderr."""
+    """Drop anything that looks like a token or secret value from CLI/driver stderr: named
+    assignments (password=, PWD=, token:, Authorization: Bearer ...), DSN/URL userinfo, known
+    token prefixes, and long digit-bearing words."""
+    text = _SECRET_ASSIGNMENT.sub(r"\1=<redacted>", text)
+    text = _BEARER.sub(r"\1 <redacted>", text)
+    text = _URL_USERINFO.sub(r"\1:<redacted>@", text)
+    text = _TOKEN_SHAPED.sub("<redacted>", text)
     out = []
     for tok in text.split():
         if len(tok) > 24 and any(c.isdigit() for c in tok) and "/" not in tok and "." not in tok:

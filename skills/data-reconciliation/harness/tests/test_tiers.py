@@ -393,6 +393,19 @@ def test_cli_rejects_unsafe_param_before_adapter(tmp_path: Path):
                   "--param", "x=bad'"])
 
 
+@pytest.mark.parametrize("value", ["bad'", "1 OR 1 IS NOT NULL", "1 -- x", "1 /* x */", "x; drop", "", "a b"])
+def test_param_value_must_be_one_literal(value):
+    from recon.cli import _parse_params
+    with pytest.raises(SystemExit, match="invalid --param value"):
+        _parse_params([f"x={value}"])
+
+
+@pytest.mark.parametrize("value", ["42", "wave_07", "2026-09-08", "2026-09-08 12:30:00.5", "2026-09-08T12:30:00", "a/b"])
+def test_param_value_literals_pass(value):
+    from recon.cli import _parse_params
+    assert _parse_params([f"x={value}"]) == {"x": value}
+
+
 def test_cli_rejects_target_outside_allowlist_before_adapter(tmp_path: Path, monkeypatch):
     from recon import cli
     monkeypatch.chdir(tmp_path)

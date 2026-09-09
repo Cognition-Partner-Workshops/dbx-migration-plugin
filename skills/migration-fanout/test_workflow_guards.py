@@ -16,7 +16,8 @@ def _functions():
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "VERIFY_DEPTHS" for t in node.targets))]
+                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES"}
+                    for t in node.targets))]
     namespace = {"Counter": Counter}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
@@ -71,8 +72,16 @@ def test_validate_manifest_rejects_invalid_positive_integer(value):
         validate_manifest(manifest)
 
 
+CAPS = {"identity": "sp-1", "catalogs": ["mig"], "ready": True, "guard_mode": "block", "stop_mode": "soft"}
+
+
+def _caps(**changes):
+    return {**CAPS, **changes}
+
+
 def _manifest(**extra):
     m = {"wave": 1, "repo": "repo", "child_macro": "child", "verify_macro": "verify",
+         "capabilities": CAPS,
          "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
     m.update(extra)
     return m
@@ -80,14 +89,20 @@ def _manifest(**extra):
 
 @pytest.mark.parametrize("caps", [
     "sp@x",                                   # not a dict
-    {"catalogs": ["mig"]},                    # no identity
-    {"identity": "", "catalogs": ["mig"]},    # empty identity
-    {"identity": "sp-1", "catalogs": []},     # no catalogs
-    {"identity": "sp-1", "catalogs": ["mig"], "ready": False},
-    {"identity": "sp-1", "catalogs": ["mig"]},                      # ready missing
-    {"identity": "sp-1", "catalogs": ["mig"], "ready": None},
-    {"identity": "sp-1", "catalogs": ["mig"], "ready": "true"},
-    {"identity": "sp-1", "catalogs": ["mig"], "ready": 1},
+    {k: v for k, v in CAPS.items() if k != "identity"},
+    _caps(identity=""),
+    _caps(catalogs=[]),
+    _caps(catalogs="mig"),
+    _caps(catalogs=["mig", ""]),
+    _caps(ready=False),
+    {k: v for k, v in CAPS.items() if k != "ready"},
+    _caps(ready=None),
+    _caps(ready="true"),
+    _caps(ready=1),
+    {k: v for k, v in CAPS.items() if k != "guard_mode"},
+    _caps(guard_mode="off"),
+    {k: v for k, v in CAPS.items() if k != "stop_mode"},
+    _caps(stop_mode="medium"),
 ])
 def test_validate_manifest_rejects_bad_capability_contract(caps):
     validate_manifest = _functions()["validate_manifest"]
@@ -95,26 +110,42 @@ def test_validate_manifest_rejects_bad_capability_contract(caps):
         validate_manifest(_manifest(capabilities=caps))
 
 
-def test_validate_manifest_accepts_capability_contract_and_absence():
+def test_validate_manifest_rejects_missing_capabilities():
+    validate_manifest = _functions()["validate_manifest"]
+    m = _manifest()
+    del m["capabilities"]
+    with pytest.raises(SystemExit, match="capabilities"):
+        validate_manifest(m)
+
+
+@pytest.mark.parametrize("manifest", [
+    _manifest(capabilities=_caps(stop_mode="hard")),                    # auto_merge defaults to true
+    _manifest(capabilities=_caps(stop_mode="hard"), auto_merge=True),
+    _manifest(auto_merge="false"),
+])
+def test_validate_manifest_hard_stop_mode_forbids_auto_merge(manifest):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="auto_merge"):
+        validate_manifest(manifest)
+
+
+def test_validate_manifest_accepts_capability_contract():
     validate_manifest = _functions()["validate_manifest"]
     validate_manifest(_manifest())
-    validate_manifest(_manifest(capabilities={"identity": "sp-1", "catalogs": ["mig"], "ready": True,
-                                              "guard_mode": "block", "stop_mode": "hard"}))
+    validate_manifest(_manifest(auto_merge=True))
+    validate_manifest(_manifest(capabilities=_caps(stop_mode="hard", guard_mode="warn"), auto_merge=False))
 
 
 def test_child_prompt_embeds_capability_contract():
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"child_prompt", "capability_block"}]
-    ns = {"json": __import__("json"), "WAVE": 1, "REPO": "repo",
-          "MANIFEST": _manifest(capabilities={"identity": "sp-1", "catalogs": ["mig"], "ready": True,
-                                             "guard_mode": "block", "stop_mode": "hard"})}
+    ns = {"json": __import__("json"), "WAVE": 1, "REPO": "repo", "MANIFEST": _manifest()}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
     assert "--expect-identity sp-1" in text
     assert '"catalogs": ["mig"]' in text
+    assert '"guard_mode": "block"' in text and '"stop_mode": "soft"' in text
     assert "BLOCKED" in text
-    ns["MANIFEST"] = _manifest()
-    assert "expect-identity" not in ns["child_prompt"](ns["MANIFEST"]["batches"][0])
 
 
 @pytest.mark.parametrize("manifest", [

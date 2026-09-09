@@ -13,7 +13,7 @@ What this script guarantees, so the orchestrator does not have to:
   - Children never edit shared ledger files. This script is the single writer of
     <manifest>.result.json and the ledger rows the orchestrator appends from it.
   - The verifier is a different session from every child. Only PRs the verifier marks
-    PASS are merged, and only if the manifest says auto_merge (true by default; soft stop_mode keeps it true).
+    PASS are merged, and only if the manifest says auto_merge (true by default; hard stop_mode requires false).
   - Re-running with the same run_id (also passed as WAVE_RUN_ID) replays finished children and only
     launches the rest.
 
@@ -34,11 +34,11 @@ Manifest shape (written by the plan playbook, read here):
     "source_statements": 240, "target_statements": 96,   # summed over the wave; actuals from
     "source_rows_fetched": 180000, "warehouse_hours": 1.5  # result.json["cost"] land in the brief
   },
-  "capabilities": {                           # optional; copied from .migration/09_capabilities.json
-    "identity": "<migration SP userName>",   # (factory-doctor). Children run the doctor with
-    "catalogs": ["mig"],                       # --expect-identity and report BLOCKED on mismatch.
-    "guard_mode": "block", "stop_mode": "hard", "ready": true
-  },
+  "capabilities": {                           # required; copied from .migration/09_capabilities.json
+    "identity": "<migration SP userName>",   # (factory-doctor, ready=true). Children run the doctor
+    "catalogs": ["mig"],                       # with --expect-identity and report BLOCKED on any
+    "guard_mode": "block", "stop_mode": "hard", "ready": true   # mismatch. hard stop_mode
+  },                                          # requires auto_merge=false (humans merge).
   "batches": [
     {"id": "w2-b01", "units": ["orders_load", "orders_dim"],
      "write_targets": ["mig.orders", "mig.orders_dim"],
@@ -114,6 +114,9 @@ REPLAYED = {
 # for units the plan flags cutover-critical (D4 external feed, finance). Never "threshold":
 # the verifier's depth is a plan decision, not a tolerance-file side effect.
 VERIFY_DEPTHS = ("sampled", "full")
+# Values the child doctor compares its own findings against (hooks/dbx_guard.py, 00_context.md).
+GUARD_MODES = ("block", "warn")
+STOP_MODES = ("hard", "soft")
 
 
 def validate_manifest(m):
@@ -143,16 +146,26 @@ def validate_manifest(m):
     if "cost_estimate" in m and not isinstance(m["cost_estimate"], dict):
         raise SystemExit("manifest 'cost_estimate' must be an object (output of `dbx-recon estimate`, "
                          "summed over the wave)")
-    if "capabilities" in m:
-        caps = m["capabilities"]
-        if not isinstance(caps, dict) or not isinstance(caps.get("identity"), str) or not caps["identity"]:
-            raise SystemExit("manifest 'capabilities' must be an object with a non-empty 'identity' "
-                             "(the migration principal's userName from 09_capabilities.json)")
-        if not isinstance(caps.get("catalogs"), list) or not caps["catalogs"]:
-            raise SystemExit("manifest 'capabilities.catalogs' must be the non-empty allowlist")
-        if caps.get("ready") is not True:
-            raise SystemExit("manifest 'capabilities.ready' must be true: the factory-doctor preflight "
-                             "did not pass; fix the D10 and re-run the doctor before launching a wave")
+    caps = m.get("capabilities")
+    if not isinstance(caps, dict) or not isinstance(caps.get("identity"), str) or not caps["identity"]:
+        raise SystemExit("manifest 'capabilities' must be an object with a non-empty 'identity' "
+                         "(the migration principal's userName from 09_capabilities.json); no wave "
+                         "launches without the factory-doctor contract the children compare against")
+    if (not isinstance(caps.get("catalogs"), list) or not caps["catalogs"]
+            or not all(isinstance(c, str) and c for c in caps["catalogs"])):
+        raise SystemExit("manifest 'capabilities.catalogs' must be the non-empty allowlist of catalog names")
+    if caps.get("guard_mode") not in GUARD_MODES:
+        raise SystemExit(f"manifest 'capabilities.guard_mode' must be one of {GUARD_MODES}")
+    if caps.get("stop_mode") not in STOP_MODES:
+        raise SystemExit(f"manifest 'capabilities.stop_mode' must be one of {STOP_MODES}")
+    if caps.get("ready") is not True:
+        raise SystemExit("manifest 'capabilities.ready' must be true: the factory-doctor preflight "
+                         "did not pass; fix the D10 and re-run the doctor before launching a wave")
+    if "auto_merge" in m and not isinstance(m["auto_merge"], bool):
+        raise SystemExit("manifest 'auto_merge' must be a boolean")
+    if caps["stop_mode"] == "hard" and m.get("auto_merge", True):
+        raise SystemExit("manifest 'auto_merge' must be false under capabilities.stop_mode 'hard': "
+                         "merge authority stays with a human")
 
 
 validate_manifest(MANIFEST)
@@ -299,9 +312,7 @@ def child_prompt(batch):
 
 
 def capability_block():
-    caps = MANIFEST.get("capabilities")
-    if not caps:
-        return ""
+    caps = MANIFEST["capabilities"]
     return (
         "CAPABILITY CONTRACT (from the orchestrator's factory-doctor run): "
         f"{json.dumps(caps, sort_keys=True)}\n"

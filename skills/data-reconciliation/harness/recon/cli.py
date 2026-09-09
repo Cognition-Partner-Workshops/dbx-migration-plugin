@@ -33,7 +33,8 @@ TARGET_KINDS = ("databricks", "lakebase")
 # --mode transactional grades two live sides; a Delta target is loaded, not replicated, so
 # only the operational target accepts it.
 TRANSACTIONAL_TARGET_KINDS = ("lakebase",)
-PARAM_RE = re.compile(r"^[A-Za-z0-9_\-:.T /]*$")
+# a --param value is one literal: a number, identifier, date or date + time; never an expression
+PARAM_RE = re.compile(r"^[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?$")
 
 
 def _single_identifier(value: str, option: str) -> str:

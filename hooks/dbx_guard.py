@@ -125,6 +125,10 @@ _DATABRICKS_CONTEXT = re.compile(_CLIENT_PREFIX + r"(?:databricks|dbx-recon|spar
 _LEGACY_ONLY_CLIENTS = re.compile(
     _CLIENT_PREFIX + r"(?:bteq|sqlplus|sqlldr|snowsql|mload|fastload|fastexport|tbuild|tdload)\b", re.IGNORECASE
 )
+# Engine-neutral clients: whichever engine they reach, the statement they carry is executed.
+_GENERIC_SQL_CLIENTS = re.compile(
+    _CLIENT_PREFIX + r"(?:psql|pgcli|sqlcmd|osql|isql|tsql|mysql|mariadb|sqlite3|bcp|beeline|trino|presto)\b", re.IGNORECASE
+)
 
 _SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
 _SEPARATORS = (";", "&&", "||", "|", "&", "(", ")", "{", "}", "\n")
@@ -208,10 +212,19 @@ def load_config(start: Path) -> GuardConfig | None:
 
 
 # a literal handed to a dynamic-SQL executor is a statement, not data
-_DYNAMIC_SQL_CALLER = re.compile(
-    r"(?:\bEXEC(?:UTE)?\s+IMMEDIATE|\bsp_executesql|\bEXEC(?:UTE)?\s*\(|\.(?:execute|executemany|sql|run_query)\s*\()\s*N?\s*$",
-    re.IGNORECASE,
-)
+_DYNAMIC_SQL_EXECUTOR = r"(?:\bEXEC(?:UTE)?\s+IMMEDIATE|\bsp_executesql|\bEXEC(?:UTE)?\s*\(|\.(?:execute|executemany|sql|run_query)\s*\()"
+_DYNAMIC_SQL_CALLER = re.compile(_DYNAMIC_SQL_EXECUTOR + r"\s*N?\s*$", re.IGNORECASE)
+_DYNAMIC_SQL_ANYWHERE = re.compile(_DYNAMIC_SQL_EXECUTOR, re.IGNORECASE)
+
+
+def _executes_sql(cmd: str) -> bool:
+    """Whether any statement in the text reaches an engine: a Databricks, legacy or generic SQL
+    client is invoked (directly, through a pipe, a wrapper or an inlined script), or a program in
+    the text hands a literal to a dynamic-SQL executor. SQL-shaped text anywhere else (a commit
+    message, an `echo` into notes, a grep pattern) is prose."""
+    words = re.sub(r"""["']""", " ", cmd)  # a client quoted into `sh -c "..."` is still a client
+    return bool(_DATABRICKS_CONTEXT.search(words) or _LEGACY_ONLY_CLIENTS.search(words)
+                or _GENERIC_SQL_CLIENTS.search(words) or _DYNAMIC_SQL_ANYWHERE.search(words))
 
 
 def _sql_view(text: str, sql_only: bool = False) -> str:
@@ -876,7 +889,7 @@ def _check_databricks_writes(cmd: str, cfg: GuardConfig) -> list[str]:
 
     use_cats = [(m.start(), _norm(m.group(1))) for m in _USE_CATALOG.finditer(text)]
 
-    for offset, seg in _write_segments(text):
+    for offset, seg in (_write_segments(text) if _executes_sql(cmd) else []):
         # the catalog in force is the last USE CATALOG *before* this statement, not the first in the command
         use_cat = next((c for pos, c in reversed(use_cats) if pos < offset), None)
         cats = _catalogs_in_segment(seg)

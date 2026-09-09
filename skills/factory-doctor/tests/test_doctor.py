@@ -188,3 +188,21 @@ def test_no_workspace_does_not_write(tmp_path):
 ])
 def test_redact(secretish, expected):
     assert expected in doctor._redact(secretish)
+
+
+@pytest.mark.parametrize("secretish,leak", [
+    ("DRIVER={ODBC Driver 18};SERVER=h;UID=sa;PWD=Sup3r$ecret!;Encrypt=no", "Sup3r$ecret!"),
+    ("password=hunter2 rejected", "hunter2"),
+    ("token: 'abc' invalid", "abc"),
+    ("HTTP 401 for Authorization: Bearer eyJhbGciOi.payload on host", "eyJhbGciOi"),
+    ("connection to postgres://mig:hunter2@db.host:5432/lake failed", "hunter2"),
+    ("client_secret=\"sh0rt\" expired", "sh0rt"),
+])
+def test_redact_named_secrets_and_dsn_userinfo(secretish, leak):
+    red = doctor._redact(secretish)
+    assert leak not in red and "<redacted>" in red
+
+
+def test_redact_keeps_plain_error_text():
+    msg = "login failed for user 'sa' (password mismatch); token_count=3"
+    assert doctor._redact(msg) == msg

@@ -75,6 +75,35 @@ def test_allowed(cmd):
     approve(cmd)
 
 
+# SQL-shaped text that no client executes is prose: it must not trip the catalog allowlist
+@pytest.mark.parametrize("cmd", [
+    "git commit -m 'unit u12: INSERT INTO prod_cat.sales.orders SELECT ... is the legacy load, converted'",
+    "git commit -am \"MERGE INTO prod_cat.s.t rewritten as MERGE INTO mig_cat.s.t\"",
+    "echo 'CREATE TABLE prod_cat.sales.orders_v2 (id INT)' >> .migration/05_findings.md",
+    "echo \"-- legacy: UPDATE other_cat.s.t SET a = 1\" > notes.sql",
+    "printf '%s\\n' 'DROP TABLE prod_cat.s.t' 'INSERT INTO prod_cat.s.t SELECT 1' > converted/todo.txt",
+    "cat > analysis.md <<'EOF'\nThe legacy job runs INSERT INTO prod_cat.sales.orders nightly.\nEOF",
+    "grep -rn 'INSERT INTO prod_cat' converted/ | wc -l",
+    "sed -i 's/INSERT INTO prod_cat.s.t/INSERT INTO mig_cat.s.t/' converted/load.sql",
+])
+def test_sql_text_outside_any_client_is_prose(cmd):
+    approve(cmd)
+
+
+# ...and the same statement handed to a client is still a write
+@pytest.mark.parametrize("cmd", [
+    "echo 'DROP TABLE prod_cat.s.t' | databricks experimental aitools tools query",
+    "printf '%s' 'INSERT INTO prod_cat.s.t SELECT 1' | dbsqlcli",
+    "echo 'CREATE TABLE prod_cat.s.t (id INT)' > /tmp/x.sql && databricks experimental aitools tools query \"$(cat /tmp/x.sql)\"",
+    "psql -h lakebase -d other_db -c 'INSERT INTO other_db.s.t SELECT 1'",
+    "python3 -c \"spark.sql('DROP TABLE prod_cat.s.t')\"",
+    "python3 - <<'EOF'\ncur.execute('INSERT INTO prod_cat.s.t SELECT 1')\nEOF",
+])
+def test_sql_text_reaching_a_client_is_still_enforced(cmd):
+    v = block(cmd)
+    assert "prod_cat" in v.reason or "other_db" in v.reason or "substitution" in v.reason
+
+
 # ---------------------------------------------------------------- denied shapes: Databricks scope
 
 @pytest.mark.parametrize("cmd,needle", [
