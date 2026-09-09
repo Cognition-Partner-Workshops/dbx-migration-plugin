@@ -1,0 +1,8 @@
+[
+  {"rule": "collation_casefold", "applies_to": "CHAR,VARCHAR->STRING", "params": {"enabled_if": "column is NOT CASESPECIFIC on the source (Teradata default in ANSI-off sessions); disable per column where the DDL says CASESPECIFIC and the target column stays UTF8_BINARY"}},
+  {"rule": "decimal_round", "applies_to": "DECIMAL,NUMBER->DECIMAL", "params": {"mode": "half_even", "places": 8, "places_policy": "finest source scale in the estate (DECIMAL(18,8) EXCHANGE_RATE); the harness applies one params set per rule name, so never lower this to a monetary scale -- scale-widening on AVG/derived columns is absorbed by the tolerance record's numeric_abs_tol, not by rounding every decimal"}},
+  {"rule": "rstrip_spaces", "applies_to": "CHAR,VARCHAR->STRING", "params": {"enabled_if": "Teradata blank-pads both operands of every character comparison, so VARCHAR keys with trailing blanks match on the source; apply to CHAR always and to VARCHAR columns where profiling finds trailing blanks (target column gets the _RTRIM collation)"}},
+  {"rule": "datetime_utc_truncate_ms", "applies_to": "TIMESTAMP(6),TIMESTAMP(6) WITH TIME ZONE->TIMESTAMP", "params": {}},
+  {"rule": "null_missing_equiv", "applies_to": "*", "params": {}},
+  {"rule": "identity", "applies_to": "*", "params": {}}
+]

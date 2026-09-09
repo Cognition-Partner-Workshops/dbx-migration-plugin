@@ -17,6 +17,8 @@ MAX_FINDINGS_IN_REPORT = 50
 MODE_NOTES = {
     "snapshot": " (PASS scoped to the snapshot watermark)",
     "fixture": " (fixture data: NOT a merge verdict, run live once before merging)",
+    "transactional": " (both sides live: PASS scoped to the consistency window that held and the "
+                     "target's applied CDC watermark)",
 }
 
 
@@ -35,9 +37,11 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         for path in t.stats.get("embeds_ungraded", []):
             warnings.append(f"UNGRADED embedded values: {path} (cardinality checked only; "
                             "declare embed key/fields in the mapping spec to grade values)")
+        for note in t.stats.get("unverified", []):
+            warnings.append(f"UNVERIFIED {t.name}: {note}")
     warnings.extend(provenance_warnings or [])
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
-    merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot")
+    merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and (mode != "snapshot" or snapshot is not None))
     return {
         "unit": unit,
@@ -129,6 +133,20 @@ def render_summary(result: dict) -> str:
                      f"statements / {cost['target_rows_fetched']} rows; {cost['elapsed_s']}s")
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
+    window = next((t for t in result["tiers"] if t["name"] == "consistency_window"), None)
+    if window is not None:
+        iso = window["stats"].get("isolation", {})
+        in_flight = {o: m["in_flight_at_open"] for o, m in window["stats"].get("markers", {}).items()
+                     if m.get("in_flight_at_open")}
+        strength = window["stats"].get("strength", {})
+        def side(name):
+            how = strength.get(name)
+            return f"`{iso.get(name)}`" + (f" ({how})" if how and how != "snapshot" else "")
+        codes = {f["check"] for f in window["findings"]}
+        state = "held" if window["passed"] else ("MOVED" if "window_unstable" in codes else "UNPROVEN")
+        lines.append(f"- Consistency window: source isolation {side('source')}, target isolation "
+                     f"{side('target')}, {state}"
+                     + (f"; in flight at open: `{json.dumps(in_flight)}`" if in_flight else ""))
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [

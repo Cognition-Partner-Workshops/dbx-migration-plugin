@@ -20,7 +20,8 @@ Writes `.migration/09_capabilities.json` and prints one line per check. Exit 0 =
 `ready` needs no `fail` anywhere *and* the three security controls (`hook_guard_functional`,
 `hook_platform_loaded`, `databricks_identity`) at `ok`: an `unverified` probe or a human identity
 leaves `ready: false` with the offending ids in `blocking`. Other `warn`/`unverified` rows are
-advisory. `--no-databricks` skips CLI/identity checks for offline use (never in an engagement session).
+advisory. `--no-databricks` skips CLI/identity checks for offline use; the report it writes is
+never `ready` (identity `skipped` stays in `blocking`), so it cannot authorize a wave.
 
 ## The hook probe (the one manual step)
 

@@ -66,8 +66,9 @@ the two things a plugin cannot carry itself.
 Then start an engagement with one front door: `!dbx_migrate_etl`, `!dbx_migrate_warehouse`,
 `!dbx_migrate_code`, or `!dbx_migrate_oltp` (operational databases; splits the estate into a
 Lakebase operational track and a Delta analytical track). Operational-track units reconcile with
-`dbx-recon --mode snapshot|live` at a stated consistency point; `--mode transactional` is accepted
-by the CLI only so that it can refuse by name until that harness increment lands.
+`dbx-recon --mode transactional --target-kind lakebase`: both sides under a consistency window,
+in-flight CDC rows tolerated up to `cdc_lag_max_s`, PK-set diff, lag/ordering, and
+constraint/index/sequence parity on top of the set-based tiers.
 
 The official `databricks` plugin is installed automatically as a dependency (tracking its default
 branch). To pin it, add `"ref"` or `"sha"` to the `requiredPlugins` entry in

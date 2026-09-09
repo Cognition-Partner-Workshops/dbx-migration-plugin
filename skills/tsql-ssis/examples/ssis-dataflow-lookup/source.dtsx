@@ -1,0 +1,84 @@
+<?xml version="1.0"?>
+<!-- Hand-written .dtsx-shaped fixture (not a Visual Studio export). LoadPaymentFact.dtsx:
+     OLE DB Source (payments window) -> Lookup (loans, Full cache, no-match redirected)
+     -> Derived Column -> OLE DB Destination dw.fact_payment; no-match -> dw.err_payment_no_loan.
+     Source and destination are different servers/databases. -->
+<DTS:Executable xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+  DTS:ExecutableType="Microsoft.Package" DTS:ObjectName="LoadPaymentFact">
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager DTS:ObjectName="OLTP_LoanServicing" DTS:CreationName="OLEDB"><DTS:ObjectData><DTS:ConnectionManager
+      DTS:ConnectionString="Data Source=LOANSQL01;Initial Catalog=loan_servicing;Provider=SQLNCLI11;Integrated Security=SSPI;" /></DTS:ObjectData></DTS:ConnectionManager>
+    <DTS:ConnectionManager DTS:ObjectName="DW_LoanMart" DTS:CreationName="OLEDB"><DTS:ObjectData><DTS:ConnectionManager
+      DTS:ConnectionString="Data Source=LOANDW01;Initial Catalog=loan_mart;Provider=SQLNCLI11;Integrated Security=SSPI;" /></DTS:ObjectData></DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+  <DTS:Variables>
+    <DTS:Variable DTS:Namespace="User" DTS:ObjectName="LoadDate" DTS:DataType="7"><DTS:VariableValue DTS:DataType="7">2026-09-01</DTS:VariableValue></DTS:Variable>
+  </DTS:Variables>
+  <DTS:PackageParameters>
+    <DTS:PackageParameter DTS:ObjectName="ServicerId" DTS:DataType="3" DTS:Required="True"><DTS:Property DTS:Name="ParameterValue">7</DTS:Property></DTS:PackageParameter>
+  </DTS:PackageParameters>
+  <DTS:Executables>
+    <DTS:Executable DTS:ObjectName="DFT Load fact_payment" DTS:ExecutableType="Microsoft.Pipeline">
+      <DTS:ObjectData><pipeline version="1"><components>
+        <component componentClassID="Microsoft.OLEDBSource" name="SRC payments">
+          <properties>
+            <property name="AccessMode">2</property> <!-- SQL command -->
+            <property name="SqlCommand">SELECT p.payment_id, p.loan_id, p.payment_date, p.principal_amt, p.interest_amt, p.escrow_amt,
+              p.late_fee_amt, p.total_amt, p.reversal_flag, p.batch_id FROM dbo.payments p
+              WHERE p.payment_date &gt;= ? AND p.payment_date &lt; DATEADD(dd, 1, ?)</property>
+            <property name="ParameterMapping">"Parameter0:Input",{User::LoadDate};"Parameter1:Input",{User::LoadDate};</property>
+          </properties>
+          <connections><connection connectionManagerRefId="Package.ConnectionManagers[OLTP_LoanServicing]" /></connections>
+        </component>
+        <component componentClassID="Microsoft.Lookup" name="LKP loans">
+          <properties>
+            <property name="CacheType">0</property>       <!-- Full cache: one snapshot of loans -->
+            <property name="NoMatchBehavior">1</property> <!-- redirect to no-match output -->
+            <property name="SqlCommand">SELECT loan_id, loan_type, investor_code, property_state FROM dbo.loans WHERE servicer_id = ?</property>
+            <property name="ParameterMap">~{Package::ServicerId}</property>
+          </properties>
+          <connections><connection connectionManagerRefId="Package.ConnectionManagers[OLTP_LoanServicing]" /></connections>
+          <inputs><input name="Lookup Input"><inputColumns><inputColumn cachedName="loan_id" /></inputColumns></input></inputs>
+          <outputs>
+            <output name="Lookup Match Output"><outputColumns>
+              <outputColumn name="loan_type" dataType="str" length="4" codePage="1252" />
+              <outputColumn name="investor_code" dataType="str" length="10" codePage="1252" />
+              <outputColumn name="property_state" dataType="str" length="2" codePage="1252" /></outputColumns></output>
+            <output name="Lookup No Match Output" />
+          </outputs>
+        </component>
+        <component componentClassID="Microsoft.DerivedColumn" name="DER payment attrs">
+          <outputs><output name="Derived Column Output"><outputColumns>
+            <outputColumn name="payment_month" dataType="i4"><properties><property name="Expression">YEAR(payment_date) * 100 + MONTH(payment_date)</property></properties></outputColumn>
+            <outputColumn name="is_reversal" dataType="bool"><properties><property name="Expression">reversal_flag == "Y" ? TRUE : FALSE</property></properties></outputColumn>
+            <outputColumn name="amt_bucket" dataType="wstr" length="10"><properties><property name="Expression">total_amt &lt; 500 ? "LT500" : (total_amt &lt; 2000 ? "500-2K" : "GT2K")</property></properties></outputColumn>
+            <outputColumn name="loan_type_trim" dataType="wstr" length="4"><properties><property name="Expression">(DT_WSTR,4)TRIM(loan_type)</property></properties></outputColumn>
+          </outputColumns></output></outputs>
+        </component>
+        <component componentClassID="Microsoft.OLEDBDestination" name="DST fact_payment">
+          <properties>
+            <property name="AccessMode">3</property> <!-- fast load -->  <property name="OpenRowset">[dw].[fact_payment]</property>
+            <property name="FastLoadOptions">TABLOCK,CHECK_CONSTRAINTS,ROWS_PER_BATCH = 10000</property>
+            <property name="FastLoadKeepNulls">false</property> <!-- NULLs take column DEFAULTs -->
+          </properties>
+          <connections><connection connectionManagerRefId="Package.ConnectionManagers[DW_LoanMart]" /></connections>
+        </component>
+        <component componentClassID="Microsoft.OLEDBDestination" name="DST err_payment_no_loan">
+          <properties><property name="OpenRowset">[dw].[err_payment_no_loan]</property></properties>
+          <connections><connection connectionManagerRefId="Package.ConnectionManagers[DW_LoanMart]" /></connections>
+        </component>
+      </components><paths>
+        <path startId="SRC payments.Outputs[OLE DB Source Output]"       endId="LKP loans.Inputs[Lookup Input]" />
+        <path startId="LKP loans.Outputs[Lookup Match Output]"           endId="DER payment attrs.Inputs[Derived Column Input]" />
+        <path startId="DER payment attrs.Outputs[Derived Column Output]" endId="DST fact_payment.Inputs[OLE DB Destination Input]" />
+        <path startId="LKP loans.Outputs[Lookup No Match Output]"        endId="DST err_payment_no_loan.Inputs[OLE DB Destination Input]" />
+      </paths></pipeline></DTS:ObjectData>
+    </DTS:Executable>
+  </DTS:Executables>
+  <DTS:EventHandlers><DTS:EventHandler DTS:EventName="OnError"><DTS:Executables>
+    <DTS:Executable DTS:ObjectName="SQL Log OnError" DTS:ExecutableType="Microsoft.ExecuteSQLTask"><DTS:ObjectData>
+      <SQLTask:SqlTaskData xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask" SQLTask:Connection="Package.ConnectionManagers[DW_LoanMart]"
+        SQLTask:SqlStatementSource="INSERT INTO dw.etl_log (package_name, event, message, logged_at) VALUES (?, 'OnError', ?, GETDATE())" />
+    </DTS:ObjectData></DTS:Executable>
+  </DTS:Executables></DTS:EventHandler></DTS:EventHandlers>
+</DTS:Executable>

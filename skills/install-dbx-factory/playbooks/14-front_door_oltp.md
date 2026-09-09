@@ -20,7 +20,7 @@ The customer says "we're moving our loan-servicing database off Sybase." A wareh
 ## Specifications
 - Deliverable: configured hand-off: engine pinned, access probed, track split recorded with provenance, dialect skill attached, LAKEBASE profile requested from setup, family defaults recorded.
 - Validation: `!dbx_migrate_pipeline` was invoked in this session and the orchestrator can start ingest without re-asking anything this intake covered; every in-scope table carries a track tag.
-- Reconciliation for operational-track units runs the harness in `--mode snapshot` or `live` against a consistency point (a legacy backup restore, a CDC watermark, or a quiesced window the user grants): the harness's Tier 1-4 are set-based and assume both sides are still. A `--mode transactional` (consistency-window snapshots, PK-set diff, CDC lag and ordering, constraint/index/sequence parity) is not yet implemented; until it lands, the plan must state the consistency point per unit explicitly, and a unit with no attainable consistency point is DEGRADED recon, not a lower tolerance.
+- Reconciliation for operational-track units runs the harness in `--mode transactional --target-kind lakebase` against the migration branch: both sides are pinned for a consistency window (source `SNAPSHOT` where the engine allows it, otherwise open/close markers and `isolation: none` on the record), rows newer than the target's applied CDC watermark are in flight rather than defects up to `cdc_lag_max_s`, and tiers 5-7 add PK-set diff, lag/ordering, and constraint/index/sequence parity. Every unit's mapping must name a `watermark` column and, for identity tables, `identity`; a table with no watermark is graded strictly and the tolerance record's `cdc_lag_max_s` is a STOP A row, not a child default. A unit whose source cannot be pinned and has no watermark is DEGRADED recon, not a lower tolerance.
 
 ## Advice and Pointers
 - The OLTP estate's difficulty is procedural and transactional, not volumetric: a 40 GB Sybase database with 900 procedures is a harder migration than a 40 TB warehouse. Weight the complexity ranking by procedure count, trigger count, and cross-table constraint depth.
@@ -33,4 +33,4 @@ The customer says "we're moving our loan-servicing database off Sybase." A wareh
 - Do NOT begin inventory, analysis, or conversion here; hand off to the chain.
 - Do NOT enable CDC, change tracking, replication, or logical decoding on the legacy engine; register the D10 and name the owner.
 - Do NOT put operational-track tables into Delta because it is the path the warehouse front door knows; the track split is a STOP A fact.
-- Do NOT run or promise `--mode transactional` recon; state the consistency point instead.
+- Do NOT run `--mode transactional` against a Delta target or without a per-table watermark in the mapping; the CLI refuses the former and the harness grades the latter strictly.

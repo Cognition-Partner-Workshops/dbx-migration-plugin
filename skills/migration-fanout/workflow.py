@@ -150,9 +150,9 @@ def validate_manifest(m):
                              "(the migration principal's userName from 09_capabilities.json)")
         if not isinstance(caps.get("catalogs"), list) or not caps["catalogs"]:
             raise SystemExit("manifest 'capabilities.catalogs' must be the non-empty allowlist")
-        if caps.get("ready") is False:
-            raise SystemExit("manifest 'capabilities.ready' is false: the factory-doctor preflight failed; "
-                             "fix the D10 and re-run the doctor before launching a wave")
+        if caps.get("ready") is not True:
+            raise SystemExit("manifest 'capabilities.ready' must be true: the factory-doctor preflight "
+                             "did not pass; fix the D10 and re-run the doctor before launching a wave")
 
 
 validate_manifest(MANIFEST)
@@ -314,7 +314,8 @@ def capability_block():
 
 
 def verify_prompt(passed, auto_merge):
-    depths = {b["id"]: batch_verify_depth(b) for b in passed}
+    by_id = {b["id"]: b for b in BATCHES}
+    depths = {p["batch"]: batch_verify_depth(by_id[p["batch"]]) for p in passed}
     merge_line = (
         "Merge every PR you mark PASS and list it in merged_prs, even if another unit in the wave failed; "
         "failed units are reopened next launch."

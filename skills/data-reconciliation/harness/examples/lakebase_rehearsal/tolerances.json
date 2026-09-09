@@ -1,0 +1,11 @@
+{
+  "version": "tol-oltp-v1",
+  "full_diff_row_threshold": 100000,
+  "sample_size": 1000,
+  "numeric_abs_tol": 0.0,
+  "aggregate_rel_tol": 0.0,
+  "source_concurrency": 1,
+  "cdc_lag_max_s": 60,
+  "pk_set_ranges": 16,
+  "accept_target_only_constraints": true
+}
