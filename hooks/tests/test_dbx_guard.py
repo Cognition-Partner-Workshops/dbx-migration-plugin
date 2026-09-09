@@ -547,6 +547,9 @@ def test_scripts_of_the_client_command_are_still_read(tmp_path: Path):
     "sqlplus svc@tdprod.corp.example <<EOF\nSET ECHO ON;\n@fix.sql\nEOF\necho done",
     "bteq <<-EOF\n\t.LOGON tdprod.corp.example/svc;\n\t.RUN FILE @fix.sql\n\tEOF",
     "cat <<A <<B\n@x\nA\n@y\nB\nbteq -i fix.sql",
+    "bteq <<EOF | tee /nonexistent/log\n@fix.sql\nEOF",
+    "sqlplus svc@tdprod.corp.example <<EOF && echo ok\n@fix.sql\nEOF",
+    "bteq <<EOF 2>&1 | grep -v Warning; echo done\n.RUN FILE @fix.sql\nEOF",
 ])
 def test_redirections_and_heredoc_lines_keep_the_client_context(cmd, tmp_path: Path):
     (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
@@ -560,6 +563,14 @@ def test_redirections_and_heredoc_lines_keep_the_client_context(cmd, tmp_path: P
 def test_redirection_operands_and_here_strings_are_not_scripts(tmp_path: Path):
     for cmd in ("bteq >/nonexistent/log 2>&1 <<< 'SELECT 1'", "databricks jobs list 2>/nonexistent/err | tee /nonexistent/out",
                 "rm -f /nonexistent/x >/nonexistent/log && databricks jobs list 2>&1"):
+        assert g._script_inputs(cmd, CFG) == [], cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+
+
+def test_a_heredoc_body_naming_a_client_is_data_not_context(tmp_path: Path):
+    (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    for cmd in ("cat <<'EOF' > run_later.sh\nbteq @fix.sql\nEOF", "cat <<EOF\nsqlplus svc@tdprod.corp.example @fix.sql\nEOF",
+                "tee notes.md <<'EOF'\nrun: databricks -f fix.sql\nEOF"):
         assert g._script_inputs(cmd, CFG) == [], cmd
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
 

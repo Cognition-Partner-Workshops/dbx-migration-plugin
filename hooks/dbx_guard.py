@@ -334,28 +334,29 @@ _REDIRECT_OP = re.compile(r"<{1,3}|<>|<&|>{1,2}|>&|>\||&>{1,2}")
 def _commands(toks: list[str]) -> list[tuple[list[str], list[str]]]:
     """The token list split into simple commands at `;`, `&&`, `||`, `|`, `&`, parentheses and
     line breaks, each as (words, heredoc body words). Redirections (`< f`, `>log`, `2>&1`) are
-    part of the command they sit in, and the body of a `<<TAG` heredoc belongs to the command
-    that opened it, up to the line holding TAG alone."""
+    part of the command they sit in, and the body of a `<<TAG` heredoc (read from the next line,
+    up to the line holding TAG alone) belongs to the command that opened it, even when that
+    command is followed by `| tee` or `&& echo` on the opening line."""
     punct = re.compile(r"[();<>|&\n]+")
     out: list[tuple[list[str], list[str]]] = [([], [])]
-    pending: list[str] = []   # heredoc delimiters announced on the current line, in order
+    pending: list[tuple[str, list[str]]] = []   # (delimiter, body of the opening command), in order
     i = 0
     while i < len(toks):
         tok = toks[i]
         if tok in ("<<", "<<-") and i + 1 < len(toks) and not punct.fullmatch(toks[i + 1]):
-            pending.append(toks[i + 1].lstrip("-"))
+            pending.append((toks[i + 1].lstrip("-"), out[-1][1]))
             out[-1][0].extend(toks[i:i + 2])
             i += 2
         elif punct.fullmatch(tok) and not _REDIRECT_OP.fullmatch(tok):
             if "\n" in tok:
-                while pending:  # body words up to the line holding the delimiter alone
-                    tag = pending.pop(0)
+                while pending:
+                    tag, body = pending.pop(0)
                     i += 1
                     while i < len(toks):
                         if toks[i] == tag and "\n" in toks[i - 1] and (i + 1 >= len(toks) or "\n" in toks[i + 1]):
                             break
                         if not punct.fullmatch(toks[i]):
-                            out[-1][1].append(toks[i])
+                            body.append(toks[i])
                         i += 1
             out.append(([], []))
             i += 1
@@ -368,11 +369,12 @@ def _commands(toks: list[str]) -> list[tuple[list[str], list[str]]]:
 def _script_inputs(cmd: str, cfg: GuardConfig | None = None) -> list[str]:
     """Files a client is told to execute: `< f`, `@f`, `-f f`, `--file f`, `-i f`, `--input f`,
     and `@f` on a line of the client's heredoc (SQL*Plus / BTEQ `.RUN`). Given a config, read
-    only from the simple commands that name a Databricks or legacy client or a legacy source:
-    the `-f` of `rm -f x && databricks jobs list` belongs to `rm`."""
+    only from the simple commands whose own words name a Databricks or legacy client or a legacy
+    source: the `-f` of `rm -f x && databricks jobs list` belongs to `rm`, and a heredoc body
+    that merely mentions a client (`cat <<EOF` writing a script) is data, not context."""
     files = []
     for words, body in _commands(_shell_tokens(cmd)):
-        if cfg is not None and not _has_context(" ".join(words + body), cfg):
+        if cfg is not None and not _has_context(" ".join(words), cfg):
             continue
         skip = False
         for i, tok in enumerate(words):
