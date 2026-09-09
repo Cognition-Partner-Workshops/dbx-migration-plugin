@@ -1093,6 +1093,26 @@ def test_in_flight_rows_with_stale_target_values_do_not_fail_aggregates():
     assert source.calls["table_aggregates"] == 2 and target.calls["table_aggregates_excluding"] == 1
 
 
+def test_an_undeclared_target_field_is_probed_with_the_in_flight_keys_excluded():
+    # the target side of an undeclared field is probed in isolation; under in-flight exclusion
+    # that probe must run over the same applied set as the batched statement, not the whole table
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    for r in loans[10:]:
+        r["current_balance"] += 500
+        r["modified_date"] = _ts(20)
+    spec = _spec()
+    fields = [dataclasses.replace(f, target_type="") if f.target == "current_balance" else f
+              for f in spec.objects[0].fields]
+    spec = MappingSpec("m1", [dataclasses.replace(spec.objects[0], fields=fields), spec.objects[1]])
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=15), spec=spec)
+    assert result["verdict"] == "PASS", result
+    t2 = _tier(result, "per_field_aggregates")
+    assert t2["checks_run"] == 4 and _codes(result, "per_field_aggregates") == []
+    assert target.calls["table_aggregates_excluding"] == 2 and target.calls["field_aggregates"] == 0
+
+
 def test_a_target_that_cannot_exclude_keys_leaves_aggregates_ungraded_not_green():
     class NoExclusion(FakeTarget):
         table_aggregates_excluding = None

@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 
 from .config import MappingSpec, Tolerances
-from .tiers import MAX_STRATA
+from .tiers import MAX_STRATA, sum_plan
 
 
 def _tier3_mode(depth: str, n: int | None, tol: Tolerances) -> str:
@@ -44,10 +44,10 @@ def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
         n = (row_counts or {}).get(c.root_table)
         src["tier1"] += 1 + len(c.embeds)
         tgt["tier1"] += 1 + len(c.embeds)
-        # Tier 2: one batched statement per table per side, plus one probe per field whose
-        # numericness is undeclared (SUM may error on strings, so it is not batched).
-        src["tier2"] += 1 + sum(1 for f in c.fields if not f.target_type)
-        tgt["tier2"] += 1
+        # Tier 2: one batched statement per table per side, plus one isolated probe per field
+        # whose SUM that side cannot declare safe (SUM may error on strings, so it is not batched).
+        src["tier2"] += 1 + sum(1 for f in c.fields if sum_plan(f.source_type, f.target_type) == "probe")
+        tgt["tier2"] += 1 + sum(1 for f in c.fields if sum_plan(f.target_type, f.source_type) == "probe")
         t3 = _tier3_mode(depth, n, tol)
         modes[c.root_table] = t3
         src["tier3"] += 1  # row_count

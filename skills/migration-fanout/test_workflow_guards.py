@@ -152,11 +152,13 @@ def test_verifier_prompt_carries_per_batch_depth_defaulting_to_sampled():
         {"id": "b1", "units": ["u"], "write_targets": ["t1"], "brief": "x"},
         {"id": "b2", "units": ["v"], "write_targets": ["t2"], "brief": "y", "verify_depth": "full"}])
     ns = _prompt_ns(m)
-    text = ns["verify_prompt"](m["batches"], True)
+    # the shape main() hands the verifier: {"batch": id, ...}, no verify_depth on the record
+    passed = [{"batch": b["id"], "units": b["units"], "pr_url": "", "branch": ""} for b in m["batches"]]
+    text = ns["verify_prompt"](passed, True)
     assert '"b1": "sampled"' in text and '"b2": "full"' in text
     assert "--depth" in text and "Never lower" in text and "recon_cost" in text
     ns2 = _prompt_ns(_manifest(verify_depth="full"))
-    assert '"b": "full"' in ns2["verify_prompt"](ns2["MANIFEST"]["batches"], True)
+    assert '"b": "full"' in ns2["verify_prompt"]([{"batch": "b", "units": ["u"]}], True)
 
 
 def test_child_prompt_asks_for_recon_cost():

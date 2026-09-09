@@ -253,6 +253,7 @@ class FakeSource(_TransactionalMixin):
                          where: str | None = None) -> dict[str, dict[str, Any]]:
         self.calls["table_aggregates"] += 1
         self.statements += 1
+        self.last_table_aggregates_numeric = list(numeric)
         out = {col: self._aggregates(table, col, where) for col in columns}
         for col in set(columns) - set(numeric):
             out[col]["sum"] = None
@@ -376,6 +377,8 @@ class FakeTarget(_TransactionalMixin):
         # counted as one statement, as a SQL target would issue.
         self.calls["table_aggregates"] += 1
         self.statements += 1
+        self.last_table_aggregates_numeric = list(numeric)
+        probes = self.calls["field_aggregates"]
         out = {}
         for col in columns:
             agg = (self.field_aggregates(object, col, where) if where is not None
@@ -383,6 +386,7 @@ class FakeTarget(_TransactionalMixin):
             if col not in numeric:
                 agg["sum"] = None
             out[col] = agg
+        self.calls["field_aggregates"] = probes  # only direct probes count as statements
         return out
 
     def table_aggregates_excluding(self, object: str, columns: list[str], numeric: list[str],
@@ -397,6 +401,7 @@ class FakeTarget(_TransactionalMixin):
         return self._aggs(rows, columns, numeric)
 
     def field_aggregates(self, object: str, field_path: str, where=None) -> dict[str, Any]:
+        self.calls["field_aggregates"] += 1
         return self._aggs(self._rows(object, where), [field_path], [field_path])[field_path]
 
     def fetch_keyed(self, object, key_fields, fields, where=None, keys=None) -> Iterable[dict]:

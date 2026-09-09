@@ -38,7 +38,7 @@ _THREE_PART = re.compile(rf"(?<![\w`.])({_SEG})\.({_SEG})\.({_SEG})(?![\w`.])")
 _WRITE_STMT = re.compile(
     r"""(?:\b(?:
         INSERT\s+(?:INTO|OVERWRITE)\b
-      | UPDATE\s+(?!SET\b)\S+\s+SET\b
+      | UPDATE\s+(?:TOP\s*\([^)]*\)\s+)?(?!SET\b)\S+(?:\s+(?:AS\s+)?(?!SET\b|WITH\b)[\w`\[\]$]+)?(?:\s+WITH\s*\([^)]*\))?\s+SET\b
       | DELETE\s+FROM\b
       | MERGE\s+INTO\b
       | TRUNCATE\s+TABLE\b
@@ -67,7 +67,8 @@ _SCHEMA_TWO_PART = re.compile(
 _ON_CATALOG = re.compile(rf"\bON\s+CATALOG\s+({_SEG})", re.IGNORECASE)
 _ON_SCHEMA = re.compile(rf"\bON\s+(?:SCHEMA|DATABASE)\s+({_SEG})\.({_SEG})(?![\w`.])", re.IGNORECASE)
 
-_BUNDLE_DEPLOY = re.compile(r"\bdatabricks\s+bundle\s+(?:deploy|run|destroy)\b(.*)", re.IGNORECASE)
+# one match per bundle invocation, bounded by the shell separators so chained commands are each checked
+_BUNDLE_DEPLOY = re.compile(r"\bdatabricks\s+bundle\b([^;&|\n]*?\b(?:deploy|run|destroy)\b[^;&|\n]*)", re.IGNORECASE)
 _BUNDLE_TARGET = re.compile(r"(?:^|\s)(?:-t|--target)(?:=|\s+)(\S+)")
 _TARGET_CATALOG_FLAG = re.compile(r"--target-catalog(?:=|\s+)(\S+)")
 _SCRIPT_INPUT = re.compile(r"(?<![<>])<\s*(?!<)([^\s<>|;&]+)|(?:^|\s)@([^\s;&|]+)|(?:^|\s)(?:-f|-i|--file|--input)(?:=|\s+)([^\s;&|]+)")
@@ -144,9 +145,64 @@ def load_config(start: Path) -> GuardConfig | None:
     return GuardConfig.from_dict(data, path)
 
 
-def _strip_comments(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    return re.sub(r"(?m)--[^\n]*$", " ", text)
+# a literal handed to a dynamic-SQL executor is a statement, not data
+_DYNAMIC_SQL_CALLER = re.compile(
+    r"(?:\bEXEC(?:UTE)?\s+IMMEDIATE|\bsp_executesql|\bEXEC(?:UTE)?\s*\(|\.(?:execute|executemany|sql|run_query)\s*\()\s*N?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _sql_view(text: str, sql_only: bool = False) -> str:
+    """The text as the write detector reads it, offsets preserved: comments blanked, and the
+    contents of single-quoted SQL literals blanked so `WHERE note = 'DROP TABLE x'` is a read.
+
+    Shell quoting is respected: a top-level '...' is an argument (usually the SQL itself) and is
+    kept whole; literals are masked inside a double-quoted argument, or everywhere when the text
+    is a script file (`sql_only`). A literal that feeds a dynamic-SQL executor stays visible."""
+    out = list(text)
+    i, n, dq = 0, len(text), False
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = text[i]
+        if c == "\\" and not sql_only:
+            i += 2
+        elif text.startswith("--", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif c == '"' and not sql_only:
+            dq = not dq
+            i += 1
+        elif c == "'":
+            if dq or sql_only:
+                j = i + 1
+                while j < n:
+                    if text[j] == "'":
+                        if text.startswith("''", j):
+                            j += 2
+                            continue
+                        break
+                    j += 1
+                if not _DYNAMIC_SQL_CALLER.search(text, max(0, i - 40), i):
+                    blank(i + 1, j)
+                i = j + 1
+            else:
+                j = text.find("'", i + 1)
+                i = n if j < 0 else j + 1
+        else:
+            i += 1
+    return "".join(out)
 
 
 def _join_continuations(cmd: str) -> str:
@@ -184,7 +240,7 @@ def _inline_scripts(cmd: str, root: Path, cfg: GuardConfig) -> tuple[str, list[s
             p = root / p
         try:
             with p.open(errors="replace") as fh:
-                parts.append("\n;\n" + fh.read(_MAX_SCRIPT_BYTES))
+                parts.append("\n;\n" + _sql_view(fh.read(_MAX_SCRIPT_BYTES), sql_only=True))
         except OSError:
             unreadable.append(f)
     return "\n".join(parts), unreadable
@@ -207,7 +263,7 @@ def _catalogs_in_segment(seg: str) -> set[str]:
 def _check_databricks_writes(cmd: str, cfg: GuardConfig) -> list[str]:
     violations: list[str] = []
     allowed = set(cfg.catalogs)
-    text = _strip_comments(cmd)
+    text = _sql_view(cmd)
     in_dbx = bool(_DATABRICKS_CONTEXT.search(cmd))
 
     use_cats = [(m.start(), _norm(m.group(1))) for m in _USE_CATALOG.finditer(text)]
@@ -245,8 +301,7 @@ def _check_databricks_writes(cmd: str, cfg: GuardConfig) -> list[str]:
         if re.fullmatch(r"[a-z_][a-z0-9_$-]*", first) and first not in allowed:
             violations.append(f"CLI mutation of securable {name!r} outside allowlist {sorted(allowed)}")
 
-    m = _BUNDLE_DEPLOY.search(cmd)
-    if m:
+    for m in _BUNDLE_DEPLOY.finditer(cmd):
         tm = _BUNDLE_TARGET.search(m.group(1))
         if tm and tm.group(1).strip("'\"").lower() in cfg.forbidden_bundle_targets:
             violations.append(f"bundle deploy/run to forbidden target {tm.group(1)!r}; production deploys happen only at STOP E under the cutover principal")
@@ -267,7 +322,7 @@ def _check_legacy_writes(cmd: str, cfg: GuardConfig, unreadable: list[str]) -> l
     if (hits or legacy_client) and unreadable:
         return [f"legacy client fed script(s) {unreadable} that the guard cannot read; inline the SQL or use a "
                 "path under the project so it can be inspected (legacy is read-only in every phase)"]
-    text = _strip_comments(cmd)
+    text = _sql_view(cmd)
     segs = _write_segments(text)
     if not segs:
         return []

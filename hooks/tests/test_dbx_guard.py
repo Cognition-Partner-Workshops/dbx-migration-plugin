@@ -45,6 +45,9 @@ def block(cmd: str, cfg=CFG):
     "databricks experimental aitools tools query \"MERGE INTO mig_cat.s.t USING mig_cat.s.stg ON t.id = stg.id WHEN MATCHED THEN UPDATE SET *\"",
     "databricks experimental aitools tools query \"CALL mig_cat.wave1.usp_load_orders()\"",
     "databricks experimental aitools tools query \"SELECT * FROM legacy_fed.dbo.orders WHERE op_type = 'DELETE' AND last_update > '2024-01-01'\"",
+    "databricks experimental aitools tools query \"SELECT * FROM prod_cat.audit.log WHERE stmt = 'DROP TABLE prod_cat.s.t' OR stmt = 'UPDATE prod_cat.s.t SET a = 1'\"",
+    "sqlcmd -S legacy-prod -Q \"SELECT * FROM dbo.audit WHERE action = 'INSERT INTO loans' AND note = 'it''s an UPDATE dbo.loans SET x'\"",
+    "sqlcmd -S legacy-prod -Q \"SELECT 1 -- INSERT INTO dbo.loans SELECT 1\"",
     "dbx-recon run --unit u12 --family teradata --mode live --source-dsn-secret LEGACY_TD_DSN --target-secret DATABRICKS_MIGRATION_SQL --target-catalog mig_cat --allowed-targets-file .migration/allowed_targets.json --target-schema wave1_u12 --out .migration/recon/u12/",
     "databricks bundle validate -t migration",
     "databricks bundle deploy -t migration",
@@ -73,6 +76,9 @@ def test_allowed(cmd):
     ("databricks experimental aitools tools query \"INSERT INTO prod_cat.sales.orders SELECT * FROM mig_cat.s.orders\"", "prod_cat"),
     ("databricks experimental aitools tools query \"DROP TABLE IF EXISTS `prod_cat`.sales.orders\"", "prod_cat"),
     ("databricks experimental aitools tools query \"MERGE INTO prod_cat.sales.orders t USING mig_cat.s.orders s ON t.id=s.id WHEN MATCHED THEN UPDATE SET *\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"UPDATE prod_cat.sales.orders AS o SET o.status = 'x'\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"UPDATE prod_cat.sales.orders o SET status = 'x' WHERE note = 'harmless'\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"SELECT 1; DROP TABLE prod_cat.s.t\"", "prod_cat"),
     ("databricks experimental aitools tools query \"USE CATALOG prod_cat; CREATE TABLE orders_v2 (id INT)\"", "prod_cat"),
     ("databricks experimental aitools tools query \"CREATE SCHEMA prod_cat.migration_tmp\"", "prod_cat"),
     ("databricks experimental aitools tools query \"GRANT ALL PRIVILEGES ON CATALOG prod_cat TO `migration-sp`\"", "prod_cat"),
@@ -99,6 +105,9 @@ def test_allowed(cmd):
     ("cd repo && databricks bundle validate && databricks bundle deploy -t prod", "prod"),
     ("databricks bundle deploy \\\n  --target prod \\\n  --var env=live", "prod"),
     ("databricks bundle run \\\n\t-t production nightly_orders", "production"),
+    ("databricks bundle deploy -t migration && databricks bundle deploy -t prod", "prod"),
+    ("databricks bundle deploy -t migration; databricks bundle run --target production nightly_orders", "production"),
+    ("databricks bundle -t prod deploy", "prod"),
     ("databricks experimental aitools tools query \"USE CATALOG mig_cat; CREATE TABLE a (id INT); USE CATALOG prod_cat; CREATE TABLE orders_v2 (id INT)\"", "prod_cat"),
     ("databricks experimental aitools tools query \"USE CATALOG mig_cat; USE CATALOG prod_cat; INSERT INTO orders SELECT 1\"", "prod_cat"),
 ])
@@ -132,6 +141,16 @@ def test_legacy_script_file_with_write_is_blocked(tmp_path: Path, invocation: st
     v = g.evaluate(invocation.format(f=f), CFG, root=tmp_path)
     assert v.decision == "block"
     assert "read-only" in v.reason
+
+
+def test_script_file_literals_are_data_unless_executed(tmp_path: Path):
+    f = tmp_path / "audit.sql"
+    f.write_text("SELECT * FROM sales.audit WHERE stmt = 'DROP TABLE sales.orders' -- it's history\n"
+                 "  OR stmt = 'UPDATE sales.orders SET status = 1';\n")
+    assert g.evaluate(f"bteq < {f}", CFG, root=tmp_path).decision == "approve"
+    f.write_text("BEGIN EXECUTE IMMEDIATE 'DROP TABLE sales.orders_bak'; END;\n")
+    v = g.evaluate(f"sqlplus svc@LEGACY_TD_DSN @{f}", CFG, root=tmp_path)
+    assert v.decision == "block" and "read-only" in v.reason
 
 
 def test_legacy_script_file_unreadable_is_blocked(tmp_path: Path):
@@ -168,6 +187,12 @@ def test_non_client_commands_do_not_read_files(tmp_path: Path):
     "sqlplus ro_user/x@ORCL <<EOF\nDROP INDEX sales.ix_orders;\nEOF",
     "snowsql -q \"CREATE OR REPLACE VIEW sales.v_orders AS SELECT 1\"",
     "docker exec -i legacy-prod isql -Usa -Q 'UPDATE dbo.loans SET status = 1 WHERE 1=1'",
+    "sqlcmd -S legacy-prod -Q \"UPDATE dbo.loans AS l SET l.status = 1\"",
+    "sqlcmd -S legacy-prod -Q \"UPDATE dbo.loans l SET status = 1\"",
+    "sqlcmd -S legacy-prod -Q \"UPDATE dbo.loans WITH (TABLOCK) SET status = 1\"",
+    "sqlcmd -S legacy-prod -Q \"UPDATE TOP (10) dbo.loans SET status = 1\"",
+    "sqlcmd -S legacy-prod -Q \"EXEC sp_executesql N'UPDATE dbo.loans SET status = 1'\"",
+    "sqlplus svc@tdprod.corp.example <<EOF\nBEGIN EXECUTE IMMEDIATE 'DROP TABLE sales.orders_bak'; END;\n/\nEOF",
     "python3 - <<'EOF'\nimport pyodbc\nc = pyodbc.connect(os.environ['LEGACY_TD_DSN'])\nc.execute('GRANT SELECT ON sales.orders TO devin')\nEOF",
 ])
 def test_blocked_legacy(cmd):
