@@ -8,10 +8,11 @@ import sqlite3
 import pytest
 
 from recon.adapters import _SqlAdapterBase
+from recon.canon import Canonicalizer, CanonRule
 from recon.config import ConfigError, FieldMapping, MappingSpec, ObjectMapping, Tolerances
 from recon.cost import estimate_cost
 from recon.engine import run_recon
-from recon.tiers import _object_aggregates, _stratified_keys
+from recon.tiers import _object_aggregates, _stratified_keys, tier2_aggregates
 from tests.fakes import FakeSource, FakeTarget
 from tests.test_tiers import RULES, SPEC, TOL
 
@@ -94,6 +95,66 @@ def test_probed_field_costs_one_statement_on_top_of_the_batched_one():
     est = estimate_cost(spec, TOL)
     assert est["source_statements"]["tier2"] == source.statements == 2
     assert est["target_statements"]["tier2"] == target.statements == 2
+
+
+def _typed_adapter(ddl: str, rows):
+    conn = CountingConn()
+    conn._c.execute(ddl)
+    conn._c.executemany(f"INSERT INTO t VALUES ({', '.join('?' * len(rows[0]))})", rows)
+    return _SqlAdapterBase(conn), conn
+
+
+def _tier2(spec, source, target):
+    return tier2_aggregates(spec, TOL, Canonicalizer([CanonRule("identity", "*")]), source, target)
+
+
+def test_one_source_field_mapped_to_numeric_and_nonnumeric_targets_keeps_both_sum_plans():
+    # `code` is TEXT holding digits; it maps to a TEXT column (no SUM) and to an INT column
+    # (conversion mapping: SUM must be probed on the source). Listing the skip mapping last
+    # must not erase the probe the first mapping needs, or the drift in `code_n` goes ungraded.
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="t", root_table="t", key_source=["id"], key_target="id",
+        fields=[FieldMapping("code", "code_n", "TEXT", "int"),
+                FieldMapping("code", "code", "TEXT", "TEXT")])])
+    source, s_conn = _typed_adapter("CREATE TABLE t (id INTEGER, code TEXT)",
+                                    [(i, str(i)) for i in range(1, 11)])
+    target, t_conn = _typed_adapter("CREATE TABLE t (id INTEGER, code TEXT, code_n INTEGER)",
+                                    [(i, str(i), i + (1 if i == 5 else 0)) for i in range(1, 11)])
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
+    assert [s.split(" FROM")[0] for s in s_conn.statements[1:]] == ["SELECT SUM(code)"]
+    assert s_all["code"]["sum"] == 55 and s_all["code"]["count"] == 10   # batched metrics kept
+    assert t_all["code_n"]["sum"] == 56 and t_all["code"].get("sum") is None
+    assert len(t_conn.statements) == 1                                    # code_n batched, code never summed
+    result = _tier2(spec, source, target)
+    assert ("aggregate_sum", "field code->code_n") in {(f.check, f.detail) for f in result.findings}
+    assert not [f for f in result.findings if f.detail == "field code->code"]
+
+
+def test_many_source_fields_mapped_to_one_target_field_keep_the_probe_the_conversion_needs():
+    # two source columns land in one TEXT target column: INT->TEXT needs a SUM probe on the target,
+    # TEXT->TEXT does not. Order of the mappings must not decide whether the probe happens.
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="t", root_table="t", key_source=["id"], key_target="id",
+        fields=[FieldMapping("qty", "label", "INTEGER", "TEXT"),
+                FieldMapping("label", "label", "TEXT", "TEXT")])])
+    source, s_conn = _typed_adapter("CREATE TABLE t (id INTEGER, qty INTEGER, label TEXT)",
+                                    [(i, i, str(i)) for i in range(1, 11)])
+    target, t_conn = _typed_adapter("CREATE TABLE t (id INTEGER, label TEXT)",
+                                    [(i, str(i + (1 if i == 5 else 0))) for i in range(1, 11)])
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
+    assert len(s_conn.statements) == 1 and s_all["qty"]["sum"] == 55      # qty batched, label skipped
+    assert [s.split(" FROM")[0] for s in t_conn.statements[1:]] == ["SELECT SUM(label)"]
+    assert t_all["label"]["sum"] == 56 and t_all["label"]["count"] == 10  # one probe, metrics kept
+    result = _tier2(spec, source, target)
+    assert ("aggregate_sum", "field qty->label") in {(f.check, f.detail) for f in result.findings}
+    # the reverse order requests exactly the same statements
+    spec.objects[0].fields.reverse()
+    source2, s_conn2 = _typed_adapter("CREATE TABLE t (id INTEGER, qty INTEGER, label TEXT)",
+                                      [(i, i, str(i)) for i in range(1, 11)])
+    target2, t_conn2 = _typed_adapter("CREATE TABLE t (id INTEGER, label TEXT)",
+                                      [(i, str(i)) for i in range(1, 11)])
+    _object_aggregates(spec.objects[0], source2, target2)
+    assert len(s_conn2.statements) == 1 and len(t_conn2.statements) == 2
 
 
 def test_table_aggregates_honours_where():

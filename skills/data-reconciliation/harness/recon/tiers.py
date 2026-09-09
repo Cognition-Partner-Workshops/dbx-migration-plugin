@@ -161,11 +161,25 @@ def _is_numeric_field(f, s: dict, t: dict, s_plan: str | None = None, t_plan: st
             and _side_numeric(t_plan or sum_plan(f.target_type, f.source_type), t))
 
 
+_PLAN_RANK = {"skip": 0, "probe": 1, "batch": 2}
+
+
+def _column_plans(plans: list[tuple[str, str]]) -> dict[str, str]:
+    """One SUM plan per physical column from the plans of every mapping that touches it: a
+    column read once serves all of them, so the strongest request wins (batch > probe > skip)
+    and no mapping's requirement is dropped when a column name repeats."""
+    out: dict[str, str] = {}
+    for col, p in plans:
+        if col not in out or _PLAN_RANK[p] > _PLAN_RANK[out[col]]:
+            out[col] = p
+    return out
+
+
 def _sum_plans(pairs: list[tuple[str, str, str]], adapter, table: str) -> dict[str, str]:
     """col -> `sum_plan` for one side. A field that would be probed is typed from the catalog
     instead when the adapter exposes it (`ColumnTypes`): the probe's error handling rolls the
     connection back, which on a pinned transactional window silently ends the snapshot."""
-    plan = {col: sum_plan(own, other) for col, own, other in pairs}
+    plan = _column_plans([(col, sum_plan(own, other)) for col, own, other in pairs])
     if "probe" in plan.values() and isinstance(adapter, ColumnTypes):
         try:
             typed = adapter.numeric_columns(table)

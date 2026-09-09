@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,7 +72,28 @@ _ON_SCHEMA = re.compile(rf"\bON\s+(?:SCHEMA|DATABASE)\s+({_SEG})\.({_SEG})(?![\w
 _BUNDLE_DEPLOY = re.compile(r"\bdatabricks\s+bundle\b([^;&|\n]*?\b(?:deploy|run|destroy)\b[^;&|\n]*)", re.IGNORECASE)
 _BUNDLE_TARGET = re.compile(r"(?:^|\s)(?:-t|--target)(?:=|\s+)(\S+)")
 _TARGET_CATALOG_FLAG = re.compile(r"--target-catalog(?:=|\s+)(\S+)")
-_SCRIPT_INPUT = re.compile(r"(?<![<>])<\s*(?!<)([^\s<>|;&]+)|(?:^|\s)@([^\s;&|]+)|(?:^|\s)(?:-f|-i|--file|--input)(?:=|\s+)([^\s;&|]+)")
+_SCRIPT_FLAGS = ("-f", "-i", "--file", "--input")
+# the securable a write statement acts on sits right after its verb phrase; anything qualified
+# later in the statement (CTAS `AS SELECT FROM`, MERGE `USING`, INSERT ... SELECT) is a source
+_WRITE_TARGET_HEAD = re.compile(
+    r"""(?:
+        INSERT\s+(?:INTO|OVERWRITE)(?:\s+TABLE)?
+      | UPDATE(?:\s+TOP\s*\([^)]*\))?
+      | DELETE\s+FROM
+      | MERGE\s+(?:WITH\s+SCHEMA\s+EVOLUTION\s+)?INTO
+      | TRUNCATE\s+TABLE
+      | COPY\s+INTO
+      | (?:OPTIMIZE|VACUUM|RESTORE|REFRESH)\s+TABLE
+      | REPLACE\s+TABLE
+      | CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+|EXTERNAL\s+|STREAMING\s+|MATERIALIZED\s+|LIVE\s+)*
+        (?:TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE)(?:\s+IF\s+NOT\s+EXISTS)?
+      | DROP\s+(?:TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE)(?:\s+IF\s+EXISTS)?
+      | ALTER\s+(?:TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME)(?:\s+IF\s+EXISTS)?
+      | (?:GRANT|REVOKE)\s+.+?\bON\s+(?:(?:TABLE|VIEW|MATERIALIZED\s+VIEW|FUNCTION|PROCEDURE|VOLUME)\s+)?
+      | (?:EXEC(?:UTE)?|CALL)
+    )\s*""",
+    re.IGNORECASE | re.VERBOSE,
+)
 _CLI_SECURABLE = re.compile(
     r"\bdatabricks\s+(grants\s+(?:update|delete)|schemas\s+(?:create|delete|update)|tables\s+delete|volumes\s+(?:create|delete)|catalogs\s+(?:create|delete|update))\s+(.*)",
     re.IGNORECASE,
@@ -222,12 +244,33 @@ def _write_segments(text: str) -> list[tuple[int, str]]:
     return out
 
 
+def _shell_tokens(cmd: str) -> list[str]:
+    """Shell words with redirection operators as their own tokens; a quoted argument (usually
+    the SQL itself) is one word, so a `<` comparison inside it is never an operator."""
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        return list(lex)
+    except ValueError:  # unbalanced quote: fall back to whitespace words, quotes stripped
+        return [t.strip("'\"") for t in re.split(r"\s+|(?<!<)(<)(?!<)", cmd) if t]
+
+
 def _script_inputs(cmd: str) -> list[str]:
     """Files a client is told to execute: `< f`, `@f`, `-f f`, `--file f`, `-i f`, `--input f`."""
     files = []
-    for m in _SCRIPT_INPUT.finditer(cmd):
-        f = next(g for g in m.groups() if g).strip("'\"")
-        if f and not f.startswith("-") and f != "<":
+    toks = _shell_tokens(cmd)
+    for i, tok in enumerate(toks):
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if tok == "<" or tok in _SCRIPT_FLAGS:
+            f = nxt
+        elif tok.startswith("@"):
+            f = tok[1:]
+        elif tok.startswith(tuple(fl + "=" for fl in _SCRIPT_FLAGS)):
+            f = tok.split("=", 1)[1]
+        else:
+            continue
+        if f and not f.startswith("-") and not re.fullmatch(r"[<>|;&()]+", f):
             files.append(f)
     return files
 
@@ -257,17 +300,26 @@ def _inline_scripts(cmd: str, root: Path, cfg: GuardConfig) -> tuple[str, list[s
 
 
 def _catalogs_in_segment(seg: str) -> set[str]:
-    """Catalog of the statement's *write target*: the first qualified securable after the verb.
-
-    Later identifiers in the same statement are sources (CTAS `AS SELECT FROM prod...`, MERGE
-    `USING`), and reading from outside the allowlist is legitimate.
-    """
-    earliest: tuple[int, str] | None = None
-    for rx in (_THREE_PART, _SCHEMA_TWO_PART, _ON_SCHEMA, _CREATE_CATALOG, _ON_CATALOG):
+    """Catalog of the statement's *write target*: the securable named directly after the verb
+    phrase, when it is qualified. An unqualified target resolves to nothing here (the caller
+    falls back to `USE CATALOG`), never to a qualified identifier further along, which is a
+    source (CTAS `AS SELECT FROM prod...`, MERGE `USING`, INSERT ... SELECT) and may legitimately
+    sit outside the allowlist."""
+    start = len(seg) - len(seg.lstrip())
+    for rx in (_SCHEMA_TWO_PART, _CREATE_CATALOG):
+        m = rx.match(seg, start)
+        if m:
+            return {_norm(m.group(1))}
+    for rx in (_ON_SCHEMA, _ON_CATALOG):  # GRANT/REVOKE name their securable after ON
         m = rx.search(seg)
-        if m and (earliest is None or m.start() < earliest[0]):
-            earliest = (m.start(), _norm(m.group(1)))
-    return {earliest[1]} if earliest else set()
+        if m:
+            return {_norm(m.group(1))}
+    head = _WRITE_TARGET_HEAD.match(seg, start)
+    if head:
+        m = _THREE_PART.match(seg, head.end())
+        if m:
+            return {_norm(m.group(1))}
+    return set()
 
 
 def _check_databricks_writes(cmd: str, cfg: GuardConfig) -> list[str]:

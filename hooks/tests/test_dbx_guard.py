@@ -120,6 +120,74 @@ def test_use_catalog_switch_back_to_allowed_is_fine():
     approve("databricks experimental aitools tools query \"USE CATALOG prod_cat; SELECT 1; USE CATALOG mig_cat; CREATE TABLE t (id INT)\"")
 
 
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO current_table SELECT * FROM mig_cat.schema.source",
+    "CREATE TABLE orders AS SELECT * FROM mig_cat.sales.orders",
+    "MERGE INTO orders t USING mig_cat.s.stg s ON t.id = s.id WHEN MATCHED THEN UPDATE SET *",
+    "INSERT OVERWRITE TABLE staging.orders SELECT * FROM mig_cat.s.orders",
+    "DELETE FROM orders WHERE id IN (SELECT id FROM mig_cat.s.gone)",
+    "COPY INTO landing FROM (SELECT * FROM mig_cat.s.files)",
+])
+def test_unqualified_destination_does_not_inherit_the_catalog_of_a_qualified_source(sql):
+    # the write lands wherever the session's current catalog points; an allowlisted catalog read
+    # later in the same statement says nothing about that
+    v = block(f"databricks experimental aitools tools query \"{sql}\"")
+    assert "unresolvable catalog" in v.reason
+    approve(f"databricks experimental aitools tools query \"USE CATALOG mig_cat; {sql}\"")
+    v = block(f"databricks experimental aitools tools query \"USE CATALOG prod_cat; {sql}\"")
+    assert "USE CATALOG 'prod_cat'" in v.reason
+
+
+def test_qualified_destination_is_read_from_the_statement_head_not_the_source():
+    v = block("databricks experimental aitools tools query \"INSERT INTO prod_cat.s.t SELECT * FROM mig_cat.s.src\"")
+    assert "['prod_cat']" in v.reason
+    approve("databricks experimental aitools tools query \"INSERT INTO mig_cat.s.t SELECT * FROM prod_cat.s.src\"")
+    approve("databricks experimental aitools tools query \"GRANT SELECT ON TABLE mig_cat.s.t TO `x`\"")
+    approve("databricks experimental aitools tools query \"GRANT SELECT ON mig_cat.s.t TO `x`\"")
+    v = block("databricks experimental aitools tools query \"GRANT MODIFY ON TABLE prod_cat.s.t TO `x`\"")
+    assert "['prod_cat']" in v.reason
+
+
+# ---------------------------------------------------------------- `<` inside SQL is a comparison
+
+@pytest.mark.parametrize("cmd", [
+    "databricks experimental aitools tools query \"SELECT * FROM mig_cat.s.orders WHERE amount < 5\"",
+    "databricks experimental aitools tools query 'SELECT * FROM mig_cat.s.orders WHERE amount < 5 AND qty <10'",
+    "databricks experimental aitools tools query \"SELECT count(*) FROM mig_cat.s.t WHERE a < b\"",
+    "spark-sql -e 'SELECT * FROM mig_cat.s.t WHERE ts < current_timestamp()'",
+    "dbsqlcli -e \"SELECT 1 WHERE 1 < 2\"",
+    "sqlcmd -S legacy-prod -Q \"SELECT * FROM dbo.loans WHERE balance < 100\"",
+])
+def test_less_than_inside_quoted_sql_is_not_a_script_redirect(cmd):
+    assert g._script_inputs(cmd) == []
+    approve(cmd)
+
+
+def test_quoted_less_than_does_not_hide_a_write(tmp_path: Path):
+    v = block("databricks experimental aitools tools query \"DELETE FROM mig_cat.s.t WHERE amount < 5; DROP TABLE prod_cat.s.t\"")
+    assert "prod_cat" in v.reason
+
+
+@pytest.mark.parametrize("cmd,files", [
+    ("bteq < extract.bteq", ["extract.bteq"]),
+    ("bteq <extract.bteq", ["extract.bteq"]),
+    ("bteq < 'my script.bteq'", ["my script.bteq"]),
+    ("sqlplus -S svc_ro@LEGACY_TD_DSN @fix.sql", ["fix.sql"]),
+    ("snowsql -f run.sql", ["run.sql"]),
+    ("spark-sql -i init.sql -f load.sql", ["init.sql", "load.sql"]),
+    ("psql --file=load.sql -h tdprod.corp.example", ["load.sql"]),
+    ("psql --input load.sql", ["load.sql"]),
+    ("spark-sql -f \"/tmp/a b.sql\"", ["/tmp/a b.sql"]),
+    ("bteq <<'EOF'\nSELECT 1;\nEOF", []),
+    ("bteq <<< 'SELECT 1'", []),
+    ("spark-sql -f", []),
+    ("spark-sql -f -v", []),
+    ("psql -c \"SELECT 1\" -f 'load.sql", ["load.sql"]),  # unbalanced quote still finds the script
+])
+def test_script_inputs_follow_shell_tokens(cmd, files):
+    assert g._script_inputs(cmd) == files
+
+
 # ---------------------------------------------------------------- script files fed to clients
 
 def test_legacy_script_file_readonly_is_approved(tmp_path: Path):
