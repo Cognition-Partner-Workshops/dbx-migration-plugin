@@ -320,12 +320,47 @@ _REDIRECT_OP = re.compile(r"\d*(?:<{1,3}|<>|<&|>{1,2}|>&|>\||&>{1,2})")
 _STDIN_OP = re.compile(r"0?<")
 
 
+def _raw_words(cmd: str) -> list[str]:
+    """The command split at unquoted, unescaped blanks, each word kept as written (quotes and
+    backslashes included)."""
+    words: list[str] = []
+    cur, quote, i = "", "", 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(cmd):
+                cur += cmd[i:i + 2]
+                i += 2
+                continue
+            cur += ch
+            if ch == quote:
+                quote = ""
+        elif ch == "\\" and i + 1 < len(cmd):
+            cur += cmd[i:i + 2]
+            i += 2
+            continue
+        elif ch in "'\"":
+            quote = ch
+            cur += ch
+        elif ch in " \t\r":
+            if cur:
+                words.append(cur)
+            cur = ""
+        else:
+            cur += ch
+        i += 1
+    if cur:
+        words.append(cur)
+    return words
+
+
 def _shell_tokens(cmd: str) -> list[str]:
     """Shell words with redirection operators, separators and newlines as their own tokens; a
     quoted argument (usually the SQL itself) is one word, so a `<` comparison or a line break
     inside it is never an operator. A descriptor written against its operator is one token with
-    it (`2>&`, `0<`): the digit and the operator came from the same whitespace-delimited word,
-    which is what makes the digit a descriptor rather than an operand."""
+    it (`2>&`, `0<`): unquoted digits opening a whitespace-delimited word, with the operator
+    right behind them in the source text, is what makes the digits a descriptor; quoted or
+    escaped (`'2'>log`, `\\2>log`) they are a filename, whatever follows them."""
     def lexer(punctuation: str | bool) -> shlex.shlex:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=punctuation)
         lex.whitespace = " \t\r"
@@ -338,9 +373,12 @@ def _shell_tokens(cmd: str) -> list[str]:
     except ValueError:  # unbalanced quote: fall back to whitespace words, quotes stripped
         return [t.strip("'\"") for t in re.split(r"\s+|(?<!<)(<)(?!<)", cmd) if t]
     words = list(lexer(False))   # the same text, split at whitespace only
+    raw = _raw_words(cmd)        # the same words with their quotes and escapes kept
+    if len(raw) != len(words):   # the splits disagree: nothing can be fused
+        raw = [""] * len(words)
     out: list[str] = []
     i = 0
-    for word in words:
+    for word, source in zip(words, raw):
         j, acc = i, ""
         while j < len(toks) and len(acc) < len(word):
             acc += toks[j]
@@ -350,7 +388,8 @@ def _shell_tokens(cmd: str) -> list[str]:
         k = i
         while k < j:
             nxt = toks[k + 1] if k + 1 < j else ""
-            if toks[k].isdigit() and _REDIRECT_OP.fullmatch(nxt) and not nxt[0].isdigit():
+            if k == i and toks[k].isdigit() and _REDIRECT_OP.fullmatch(nxt) and not nxt[0].isdigit() \
+                    and source.startswith(toks[k] + nxt):
                 out.append(toks[k] + nxt)
                 k += 2
             else:
@@ -380,6 +419,19 @@ class _Simple:
         return not self.words and not self.body
 
 
+_GROUP_STDIN = re.compile(r"0?(?:<|<<<|<&)")
+_LOCAL_STDIN = re.compile(r"0?(?:<|<<<|<<-?|<&)")
+
+
+def _stdin_replaced(cmds: list[_Simple], c: _Simple) -> bool:
+    """Whether cmds member `c` reads something other than the stdin its enclosing group is given:
+    a stdin redirection or heredoc of its own, or a pipe feeding it (directly or the group it
+    runs in)."""
+    if any(_LOCAL_STDIN.fullmatch(w) for w in c.words):
+        return True
+    return _pipe_into(cmds, next(k for k, x in enumerate(cmds) if x is c)) >= 0
+
+
 def _commands(toks: list[str]) -> list[_Simple]:
     """The token list split into simple commands at `;`, `&&`, `||`, `|`, `|&`, `&`, group
     delimiters and line breaks. Redirections (`< f`, `>log`, `2>&1`) are part of the command
@@ -388,8 +440,10 @@ def _commands(toks: list[str]) -> list[_Simple]:
     by `| tee` or `&& echo` on the opening line. Punctuation between two commands folds into one
     separator: `) |`, `|` + newline and `| (` all leave the right-hand command fed by a pipe. A
     redirection written after `)` / `}` belongs to the group (`(cat f) 2>&1 | bteq`,
-    `(bteq; echo done) < f`): it is repeated on every command inside the group, which all inherit
-    that stdin, rather than becoming a command of its own."""
+    `(bteq; echo done) < f`): it is repeated on every command inside the group rather than
+    becoming a command of its own. The group's stdin only reaches the members that did not
+    replace it themselves, with a `<` of their own or by sitting behind a pipe
+    (`(bteq < r; echo) < w` and `(cat r | bteq) < w` never hand `w` to bteq)."""
     punct = re.compile(r"[();<>|&\n]+")
     out: list[_Simple] = [_Simple()]
     pending: list[tuple[str, list[str]]] = []   # (delimiter, body of the opening command), in order
@@ -454,9 +508,11 @@ def _commands(toks: list[str]) -> list[_Simple]:
             operand_of.clear()
             i += 1
         elif _REDIRECT_OP.fullmatch(tok) and out[-1].empty() and out[-1].closed and closed_group:
-            for c in closed_group:
+            owners = [c for c in closed_group
+                      if not (_GROUP_STDIN.fullmatch(tok) and _stdin_replaced(out, c))]
+            for c in owners:
                 c.words.append(tok)
-            operand_of = list(closed_group)
+            operand_of = owners or [_Simple()]   # nobody inherits it: the operand is still consumed
             i += 1
         else:
             out[-1].words.append(tok)
@@ -518,15 +574,26 @@ def _piped_scripts(producer: _Simple) -> list[str]:
     files = [tok[1:] for tok in producer.body if tok.startswith("@") and len(tok) > 1]
     base = producer.words[0].rsplit("/", 1)[-1] if producer.words else ""
     if base == "cat":
-        skip = False
+        # `cat` reads its stdin (`cat < f`, or the stdin of the group it runs in) only when it
+        # names no file, or names `-`
+        operands: list[str] = []
+        stdin: list[str] = []
         words = producer.words
-        for w in words[1:]:
-            if skip or w.startswith("-") or _STDIN_OP.fullmatch(w):
-                skip = False
+        i = 1
+        while i < len(words):
+            w = words[i]
+            if _STDIN_OP.fullmatch(w):
+                stdin.extend(words[i + 1:i + 2])
+                i += 2
             elif _REDIRECT_OP.fullmatch(w) or w in ("<<", "<<-"):
-                skip = True  # the operand is a log, descriptor or heredoc delimiter, not a script
+                i += 2  # the operand is a log, descriptor or heredoc delimiter, not a script
             else:
-                files.append(w)
+                if w == "-" or not w.startswith("-"):
+                    operands.append(w)
+                i += 1
+        files.extend(w for w in operands if w != "-")
+        if not operands or "-" in operands:
+            files.extend(stdin)
     elif base in ("echo", "printf"):
         files.extend(w[1:] for w in producer.words[1:] if w.startswith("@") and len(w) > 1)
     return files
