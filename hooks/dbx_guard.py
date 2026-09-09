@@ -130,6 +130,9 @@ _OPAQUE_PRODUCER = re.compile(
     r"(?:^|[\s;&|(])(?:base64\s+(?:-[A-Za-z]*d[A-Za-z]*|--decode)|xxd\s+-r|openssl\s+enc\b|gunzip|gzip\s+-d|zcat|"
     r"uudecode|curl|wget|python[0-9.]*|perl|ruby|node)\b", re.IGNORECASE)
 _HEREDOC = re.compile(r"<<-?\s*(['\"\\]?)([A-Za-z_][\w-]*)\1?[^\n]*\n")
+_SHELL_COMMENT_END = re.compile(r"[\n'\"]")
+# text ending right before the argument of `sh -c` / `bash -x -c`: that argument is a shell command
+_SHELL_C_ARG = re.compile(r"(?:^|[\s;&|(])(?:[^\s;&|()<>'\"]*/)?(?:sh|bash|zsh|dash|ksh)(?:\s+-[A-Za-z]+)*\s+-c\s+$")
 
 
 @dataclass
@@ -205,7 +208,15 @@ def _sql_view(text: str, sql_only: bool = False) -> str:
 
     Shell quoting is respected: a top-level '...' is an argument (usually the SQL itself) and is
     kept whole; literals are masked inside a double-quoted argument, or everywhere when the text
-    is a script file (`sql_only`). A literal that feeds a dynamic-SQL executor stays visible."""
+    is a script file (`sql_only`). A literal that feeds a dynamic-SQL executor stays visible.
+
+    In shell text a `--` or `/*` is a comment only in the shapes SQL comments take and shell
+    words do not: `--` followed by whitespace (a long option `--profile` is a word, and a
+    comment stops at a quote so `-- -e '<sql>'` keeps the argument visible), `/*` followed by
+    whitespace, `*`, `+` or `!` and closed by `*/` (`/tmp/*.sql` is a glob). A comment the guard
+    does not recognise stays visible, which can only add a finding, never hide one. The
+    double-quoted argument of `sh -c` is a shell command, read with these same rules, so a
+    single-quoted SQL argument inside it is a statement and not a literal."""
     out = list(text)
     i, n, dq = 0, len(text), False
 
@@ -214,20 +225,43 @@ def _sql_view(text: str, sql_only: bool = False) -> str:
             if out[k] != "\n":
                 out[k] = " "
 
+    def line_comment_end(start: int) -> int | None:
+        if sql_only:
+            j = text.find("\n", start)
+            return n if j < 0 else j
+        if start + 2 < n and text[start + 2] not in " \t\r\n":
+            return None
+        m = _SHELL_COMMENT_END.search(text, start + 2)
+        return n if m is None else m.start()
+
+    def block_comment_end(start: int) -> int | None:
+        j = text.find("*/", start + 2)
+        if sql_only:
+            return n if j < 0 else j + 2
+        if j < 0 or start + 2 >= n or text[start + 2] not in " \t\r\n*+!":
+            return None
+        return j + 2
+
+    def comment_end(start: int) -> int | None:
+        if text.startswith("--", start):
+            return line_comment_end(start)
+        if text.startswith("/*", start):
+            return block_comment_end(start)
+        return None
+
     while i < n:
         c = text[i]
         if c == "\\" and not sql_only:
             i += 2
-        elif text.startswith("--", i):
-            j = text.find("\n", i)
-            j = n if j < 0 else j
+        elif (j := comment_end(i)) is not None:
             blank(i, j)
             i = j
-        elif text.startswith("/*", i):
-            j = text.find("*/", i + 2)
-            j = n if j < 0 else j + 2
-            blank(i, j)
-            i = j
+        elif c == '"' and not sql_only and not dq and _SHELL_C_ARG.search(text, 0, i):
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out[i + 1: j] = _sql_view(text[i + 1: j])
+            i = j + 1
         elif c == '"' and not sql_only:
             dq = not dq
             i += 1

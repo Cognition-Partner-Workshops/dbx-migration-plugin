@@ -320,6 +320,40 @@ def test_shell_wrapper_on_literal_write_is_read_through():
     assert "prod_cat" in v.reason
 
 
+@pytest.mark.parametrize("cmd", [
+    # a long option is a shell word, not the start of a SQL comment
+    "databricks --profile demo experimental aitools tools query \"DROP TABLE prod_cat.s.t\"",
+    "databricks experimental aitools tools query --warehouse-id abc \"DROP TABLE prod_cat.s.t\"",
+    "sqlcmd -S legacy-prod --foo -Q \"DELETE FROM dbo.rates\"",
+    # a bare `--` (end of options) is not a comment that swallows the quoted statement after it
+    "databricks experimental aitools tools query -- 'DROP TABLE prod_cat.s.t'",
+    # a glob is not the start of a block comment
+    "cat /tmp/*.sql; databricks experimental aitools tools query \"DROP TABLE prod_cat.s.t\"",
+    "bash -c \"ls /*.sql; databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'; ls */\"",
+    # the double-quoted body of `sh -c` is shell text: its single-quoted argument is the statement
+    "bash -c \"databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "bash -c \"databricks --profile demo experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "sudo bash -x -c \"databricks experimental aitools tools query 'DROP TABLE prod_cat.s.t'\"",
+    "/bin/sh -c \"databricks experimental aitools tools query \\\"DROP TABLE prod_cat.s.t\\\"\"",
+])
+def test_shell_words_are_not_sql_comments(cmd):
+    v = block(cmd)
+    assert "prod_cat" in v.reason or "legacy" in v.reason
+
+
+@pytest.mark.parametrize("cmd", [
+    # real SQL comments inside the statement argument are still comments
+    "databricks --profile demo experimental aitools tools query \"SELECT 1 -- DROP TABLE prod_cat.s.t\"",
+    "databricks experimental aitools tools query \"SELECT 1 /* DROP TABLE prod_cat.s.t */\"",
+    "databricks experimental aitools tools query \"SELECT 1 /*+ DROP TABLE prod_cat.s.t */\"",
+    "databricks experimental aitools tools query \"SELECT 1\n-- DROP TABLE prod_cat.s.t\n\"",
+    "databricks experimental aitools tools query <<'SQL'\nSELECT 1 -- DROP TABLE prod_cat.s.t\n/* DROP TABLE prod_cat.s.t */\nSQL",
+    "bash -c \"databricks --profile demo experimental aitools tools query 'INSERT INTO mig_cat.s.t SELECT 1'\"",
+])
+def test_sql_comments_and_options_together_stay_readable(cmd):
+    approve(cmd)
+
+
 def test_shell_script_the_command_runs_is_inspected(tmp_path: Path):
     (tmp_path / "deploy.sh").write_text("#!/bin/bash\nset -e\n"
                                         "databricks experimental aitools tools query \"DROP TABLE prod_cat.s.t\"\n")
