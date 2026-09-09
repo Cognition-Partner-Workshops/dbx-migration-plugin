@@ -1,9 +1,6 @@
--- Target: Databricks SQL view (databricks-dbsql references/best-practices.md "Query Optimization Tips": window functions,
--- QUALIFY, CTEs).
--- CSUM/MAVG are Teradata OLAP shorthands; both become standard window functions with an explicit ROWS frame.
--- The frame is partitioned by BRANCH_ID because Teradata evaluates CSUM/MAVG over the whole result set ordered by the
--- sort key: verify that reading against the fixture's verify/ signature before assuming a per-branch frame
--- (the fixture's own harness catches the off-by-one on MAVG; skill §7 trap "OLAP frame").
+-- Target: Databricks SQL view (databricks-dbsql references/best-practices.md "Query Optimization Tips").
+-- CSUM/MAVG become window functions with an explicit ROWS frame; PARTITION BY BRANCH_ID is what the fixture's
+-- verify/ checksums require (see NOTE.md), not what the source text literally says.
 
 CREATE OR REPLACE VIEW ${catalog}.${schema}.VW_BRANCH_PERFORMANCE
 COMMENT 'Monthly branch performance with cumulative sums, moving averages, and regional rankings'

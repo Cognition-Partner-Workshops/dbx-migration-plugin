@@ -1,7 +1,6 @@
-/* Skill-authored minimal fixture (the estate has no cursor / loop / dynamic-SQL procedure). Same schema as the
-   fixture (BANKING_DW.DIM_ACCOUNT, FACT_TRANSACTION, ETL_LOG). Exercises: DECLARE CURSOR / OPEN / FETCH / CLOSE,
-   CONTINUE HANDLER FOR NOT FOUND, WHILE ... END WHILE with LEAVE, FOR ... AS cursor loop, CASE statement,
-   dynamic SQL via CALL DBC.SysExecSQL, BT/ET explicit transaction, SIGNAL SQLSTATE, INOUT parameter. */
+/* Skill-authored minimal fixture (the estate has no cursor / dynamic-SQL procedure); fixture schema
+   BANKING_DW.DIM_ACCOUNT, FACT_TRANSACTION, ETL_LOG. Constructs: DECLARE CURSOR / OPEN / FETCH / CLOSE,
+   CONTINUE HANDLER FOR NOT FOUND, WHILE + LEAVE, CASE statement, DBC.SysExecSQL, BT/ET, SIGNAL, INOUT. */
 
 REPLACE PROCEDURE BANKING_DW.SP_ARCHIVE_CLOSED_ACCOUNTS(
     IN    p_closed_before   DATE,
@@ -43,15 +42,12 @@ BEGIN
     IF p_max_batch IS NULL OR p_max_batch <= 0 THEN
         SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT = 'p_max_batch must be positive';
     END IF;
-
     -- Dynamic DDL: archive table per calendar year, name built at run time
     SET v_sql = 'CREATE MULTISET TABLE ' || TRIM(p_archive_db) || '.FACT_TRANSACTION_ARCH_' ||
                 TRIM(EXTRACT(YEAR FROM p_closed_before) (FORMAT '9999')) ||
                 ' AS BANKING_DW.FACT_TRANSACTION WITH NO DATA;';
     CALL DBC.SysExecSQL(v_sql);
-
-    BT;   -- explicit transaction (Teradata session mode)
-
+    BT;
     OPEN acct_cur;
     fetch_loop:
     WHILE v_done = 0 AND p_accounts_done < p_max_batch DO
@@ -59,7 +55,6 @@ BEGIN
         IF v_done = 1 THEN
             LEAVE fetch_loop;
         END IF;
-
         CASE v_account_type
             WHEN 'LOAN' THEN
                 SET v_txn_count = 0;    -- loans archived by a different process
@@ -70,10 +65,8 @@ BEGIN
                             TRIM(v_account_key (FORMAT '-(18)9')) || ';';
                 CALL DBC.SysExecSQL(v_sql);
                 SET v_txn_count = ACTIVITY_COUNT;
-
                 DELETE FROM BANKING_DW.FACT_TRANSACTION WHERE ACCOUNT_KEY = v_account_key;
         END CASE;
-
         UPDATE BANKING_DW.DIM_ACCOUNT
         SET ACCOUNT_STATUS = 'ARCHIVED', ETL_UPDATE_TS = CURRENT_TIMESTAMP(0)
         WHERE ACCOUNT_KEY = v_account_key;
@@ -81,21 +74,7 @@ BEGIN
         SET p_accounts_done = p_accounts_done + 1;
     END WHILE fetch_loop;
     CLOSE acct_cur;
-
     ET;
-
-    -- Second pass: FOR cursor loop, log one row per archived account type
-    FOR typ AS type_cur CURSOR FOR
-        SEL ACCOUNT_TYPE, COUNT(*) AS N
-        FROM BANKING_DW.DIM_ACCOUNT
-        WHERE ACCOUNT_STATUS = 'ARCHIVED' AND CAST(ETL_UPDATE_TS AS DATE) = CURRENT_DATE
-        GROUP BY ACCOUNT_TYPE
-    DO
-        INSERT INTO BANKING_DW.ETL_LOG (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
-        VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'INFO',
-                'Archived ' || TRIM(typ.N (FORMAT 'Z(9)9')) || ' accounts of type ' || typ.ACCOUNT_TYPE,
-                CURRENT_TIMESTAMP(0));
-    END FOR;
 
     SET p_max_batch = p_max_batch - p_accounts_done;   -- INOUT: remaining budget for the caller
 END;

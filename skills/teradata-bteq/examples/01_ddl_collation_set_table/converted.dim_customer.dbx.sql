@@ -1,13 +1,8 @@
--- Target: Databricks SQL / Delta, like-for-like shape (legacy names kept; see target-routing "Write scope").
--- ${catalog}.${schema} are the unit's declared write target from .migration/allowed_targets.json.
--- Collation syntax: databricks-dbsql references/geospatial-collations.md "Part 2: Collations" (column-level COLLATE);
--- the RTRIM modifier ("Collation Modifiers": `'Hello' == 'Hello '`, UTF8_BINARY_RTRIM / UTF8_LCASE_RTRIM) carries
--- Teradata's trailing-blank-insensitive CHAR(n) comparison into every production join/filter/GROUP BY, so that the
--- semantics do not depend on how a loader happened to pad the value. Recon's rstrip_spaces is the *check*, not the fix.
--- Clustering + identity + ANALYZE: databricks-dbsql references/best-practices.md ("Dimension Table Patterns",
--- "Liquid Clustering vs Traditional Partitioning", "OPTIMIZE, VACUUM, and ANALYZE").
--- Teradata column DEFAULTs are not carried into the DDL: the SCD2 loader (example 04) supplies them explicitly,
--- so the converted table does not depend on Delta column-default table features (verify via target-routing if wanted).
+-- Target: Delta table, like-for-like names; ${catalog}.${schema} from .migration/allowed_targets.json.
+-- Collations: databricks-dbsql references/geospatial-collations.md "Part 2: Collations", "Collation Modifiers"
+-- (RTRIM carries Teradata's trailing-blank-insensitive CHAR(n) comparison; recon's rstrip_spaces is the check).
+-- Clustering / identity: references/best-practices.md "Dimension Table Patterns", "Liquid Clustering vs Traditional Partitioning".
+-- Column DEFAULTs are supplied by the SCD2 loader, not the DDL.
 
 CREATE OR REPLACE TABLE ${catalog}.${schema}.DIM_CUSTOMER (
     CUSTOMER_ID         INT              NOT NULL,
@@ -44,9 +39,5 @@ CLUSTER BY (CUSTOMER_KEY, CUSTOMER_ID, ONBOARDING_DATE);
 -- UNIQUE PRIMARY INDEX uniqueness is not enforced by Delta: covered by a Tier 2 distinct-count check on
 -- CUSTOMER_KEY and a duplicate-key probe in Tier 3.
 
--- Dropped, recorded in the unit mapping (no runtime effect on the target):
---   NO FALLBACK / NO BEFORE|AFTER JOURNAL / CHECKSUM / MERGEBLOCKRATIO (Teradata storage options)
---   COMPRESS (...) value-list compression (Delta columnar encoding replaces it)
---   COLLECT STATISTICS ... (run ANALYZE TABLE ... COMPUTE STATISTICS FOR COLUMNS per the target profile instead)
---   column DEFAULT clauses (moved to the loader, see header)
---   secondary INDEX IDX_CUST_SEGMENT (no secondary indexes on Delta; clustering key or nothing)
+-- Dropped, recorded in the unit mapping: FALLBACK / JOURNAL / CHECKSUM / MERGEBLOCKRATIO, COMPRESS (...),
+-- COLLECT STATISTICS (-> ANALYZE TABLE ... COMPUTE STATISTICS FOR COLUMNS), column DEFAULTs, NUSI IDX_CUST_SEGMENT.
