@@ -20,12 +20,13 @@ CREATE TEMPORARY TABLE stg_policy_src AS
     FROM stg_policy_feed s
     LEFT JOIN ${catalog}.poladm.broker b ON b.broker_ref = s.broker_ref;
 
--- Duplicate-key parity: Oracle raises ORA-30926 when >1 source row hits one target row and ORA-00001 when unmatched
--- duplicates both INSERT (unique policy_no); unmatched duplicate 'D' rows reach no clause and succeed. Delta has no
--- unique constraint, so fail on exactly the first two cases; never QUALIFY-dedupe silently.
+-- Key parity (policy_no is NOT NULL UNIQUE in Oracle): ORA-30926 when >1 source row hits one target row, ORA-00001
+-- when unmatched duplicates both INSERT, ORA-01400 when a NULL key would INSERT; unmatched duplicate or NULL 'D' rows
+-- reach no clause and succeed. Delta has no constraints, so fail on exactly those cases; never QUALIFY-dedupe silently.
 SELECT assert_true(count(*) = 0, concat('policy_no keys Oracle would reject: ', count(*)))
   FROM (SELECT s.policy_no FROM stg_policy_src s LEFT JOIN ${catalog}.poladm.policy t ON t.policy_no = s.policy_no
-         WHERE t.policy_no IS NOT NULL OR s.feed_action <> 'D' GROUP BY s.policy_no HAVING count(*) > 1);
+         WHERE t.policy_no IS NOT NULL OR s.feed_action <> 'D'
+         GROUP BY s.policy_no HAVING count(*) > 1 OR max(s.policy_no) IS NULL);
 
 -- :OLD image for the trigger's "status or premium changed" audit condition (rows the D branch deletes included).
 DROP TABLE IF EXISTS policy_pre_image;
@@ -59,8 +60,7 @@ WHEN NOT MATCHED AND src.feed_action <> 'D' THEN
           src.expiry_dt, src.annual_premium, src.cover_note_ref,
           CASE WHEN src.policy_status = 'LIVE'
                 AND current_date() BETWEEN to_date(src.inception_dt) AND to_date(src.expiry_dt) THEN 'Y' ELSE 'N' END,
-          1, current_timestamp(), current_user());
--- policy_id: policy_seq.NEXTVAL -> BIGINT GENERATED ALWAYS AS IDENTITY on the Delta table; recon keys on policy_no.
+          1, current_timestamp(), current_user());  -- policy_id: NEXTVAL -> IDENTITY column; recon keys on policy_no
 
 -- Trigger's prc_log_event branch (autonomous in Oracle; commits with the MERGE here: accepted difference).
 INSERT INTO ${catalog}.poladm.policy_audit_log

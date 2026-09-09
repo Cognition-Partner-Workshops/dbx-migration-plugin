@@ -1,5 +1,6 @@
 -- Oracle: nightly feed upsert. GTT staging, MERGE with UPDATE ... DELETE WHERE, NEXTVAL in the
--- INSERT branch, TRIM/'' handling, TRUNC(DATE); duplicate matched keys raise ORA-30926 (unmatched: ORA-00001).
+-- INSERT branch, TRIM/'' handling, TRUNC(DATE); poladm.policy.policy_no is NOT NULL UNIQUE: duplicate matched keys
+-- raise ORA-30926, unmatched duplicates ORA-00001, a blank (NULL) key on INSERT ORA-01400.
 
 CREATE GLOBAL TEMPORARY TABLE poladm.stg_policy_feed (
   policy_no        VARCHAR2(20),

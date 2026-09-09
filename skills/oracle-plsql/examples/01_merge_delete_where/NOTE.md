@@ -6,7 +6,7 @@
 |---|---|---|
 | `GLOBAL TEMPORARY TABLE ... ON COMMIT PRESERVE ROWS` | `CREATE TEMPORARY TABLE` (drop-first on re-run) | construct map |
 | `WHEN MATCHED THEN UPDATE ... WHERE ... DELETE WHERE` | `WHEN MATCHED AND action='D' THEN DELETE` **before** the `UPDATE` branch | trap 8 |
-| duplicate source keys: ORA-30926 (matched) / ORA-00001 (unmatched, both insert); unmatched `'D'` duplicates are a no-op | `assert_true` pre-check on the normalised key restricted to matched or insert-eligible duplicates; no `QUALIFY` dedupe | trap 8 |
+| duplicate/NULL source keys: ORA-30926 (matched) / ORA-00001 (unmatched, both insert) / ORA-01400 (NULL key inserts); unmatched `'D'` duplicates or NULLs are a no-op | `assert_true` pre-check on the normalised key restricted to matched or insert-eligible duplicates and NULLs (a NULL key could not be re-identified for the audit fold-in either); no `QUALIFY` dedupe | trap 8 |
 | `policy_seq.NEXTVAL` in `INSERT` | identity column (Delta) / `nextval()` (Lakebase); recon keys on `policy_no` | trap 10 |
 | `NULLIF(TRIM(x), '')`, `TRIM(policy_no)` of blanks (NULL in Oracle), `TRUNC(date)`, `CHAR(1)` | kept explicitly; `nullif(..., '')` on the normalised key so a blank never matches or inserts `''`; `date_trunc('DAY')` on `TIMESTAMP_NTZ`; `rtrim()` | traps 1, 3, 5 |
 | `BEFORE INSERT OR UPDATE` trigger firing on the `MERGE` | `row_version`/`updated_*`/`active_policy_flag` folded into the `MERGE`; audit rows from a pre-`MERGE` `:OLD` image | trap 10, example 02 |
