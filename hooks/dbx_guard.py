@@ -79,10 +79,14 @@ _CLI_SECURABLE = re.compile(
 # Position of the catalog-bearing positional argument per CLI verb (CLI signatures:
 # `grants update SECURABLE_TYPE FULL_NAME`, `schemas create NAME CATALOG_NAME`, `volumes create CATALOG_NAME ...`).
 _CLI_CATALOG_ARG = {"grants update": 1, "grants delete": 1, "schemas create": 1}
-_DATABRICKS_CONTEXT = re.compile(r"(?:^|[\s;&|(])(?:databricks|dbx-recon|spark-sql|dbsqlcli)\b|--target-catalog")
+# a client is recognised by its basename: `databricks`, `./bin/databricks` and `/opt/x/databricks` alike
+_CLIENT_PREFIX = r"(?:^|[\s;&|(])(?:[^\s;&|()<>'\"]*/)?"
+_DATABRICKS_CONTEXT = re.compile(_CLIENT_PREFIX + r"(?:databricks|dbx-recon|spark-sql|dbsqlcli)\b|--target-catalog")
 
 # Clients that only ever talk to legacy engines in a migration; any write through them is a violation.
-_LEGACY_ONLY_CLIENTS = re.compile(r"(?:^|[\s;&|(])(?:bteq|sqlplus|sqlldr|snowsql|mload|fastload|fastexport|tbuild|tdload)\b", re.IGNORECASE)
+_LEGACY_ONLY_CLIENTS = re.compile(
+    _CLIENT_PREFIX + r"(?:bteq|sqlplus|sqlldr|snowsql|mload|fastload|fastexport|tbuild|tdload)\b", re.IGNORECASE
+)
 
 
 @dataclass
@@ -229,7 +233,8 @@ def _script_inputs(cmd: str) -> list[str]:
 
 
 def _inline_scripts(cmd: str, root: Path, cfg: GuardConfig) -> tuple[str, list[str]]:
-    """Command text plus the contents of every referenced script; unreadable scripts are returned."""
+    """Command text plus the contents of every referenced script. Scripts the guard cannot inspect in
+    full (unreadable, or larger than `_MAX_SCRIPT_BYTES`) are returned as unreadable."""
     unreadable: list[str] = []
     if not (_DATABRICKS_CONTEXT.search(cmd) or _LEGACY_ONLY_CLIENTS.search(cmd) or _mentions_legacy(cmd, cfg)):
         return cmd, unreadable
@@ -240,9 +245,14 @@ def _inline_scripts(cmd: str, root: Path, cfg: GuardConfig) -> tuple[str, list[s
             p = root / p
         try:
             with p.open(errors="replace") as fh:
-                parts.append("\n;\n" + _sql_view(fh.read(_MAX_SCRIPT_BYTES), sql_only=True))
+                body = fh.read(_MAX_SCRIPT_BYTES + 1)
         except OSError:
             unreadable.append(f)
+            continue
+        if len(body) > _MAX_SCRIPT_BYTES:
+            unreadable.append(f)
+            continue
+        parts.append("\n;\n" + _sql_view(body, sql_only=True))
     return "\n".join(parts), unreadable
 
 
@@ -316,12 +326,23 @@ def _mentions_legacy(cmd: str, cfg: GuardConfig) -> list[str]:
     return hits
 
 
-def _check_legacy_writes(cmd: str, cfg: GuardConfig, unreadable: list[str]) -> list[str]:
+def _check_uninspectable_scripts(cmd: str, cfg: GuardConfig, unreadable: list[str]) -> list[str]:
+    """A script the guard cannot read in full is a script it cannot clear: fail closed."""
+    if not unreadable:
+        return []
+    if _mentions_legacy(cmd, cfg) or _LEGACY_ONLY_CLIENTS.search(cmd):
+        return [f"legacy client fed script(s) {unreadable} that the guard cannot read in full (missing, unreadable or over "
+                f"{_MAX_SCRIPT_BYTES // (1024 * 1024)} MiB); inline the SQL or split it so it can be inspected "
+                "(legacy is read-only in every phase)"]
+    if _DATABRICKS_CONTEXT.search(cmd):
+        return [f"Databricks client fed script(s) {unreadable} that the guard cannot read in full (missing, unreadable or over "
+                f"{_MAX_SCRIPT_BYTES // (1024 * 1024)} MiB); inline the SQL or split it so its write targets can be checked"]
+    return []
+
+
+def _check_legacy_writes(cmd: str, cfg: GuardConfig) -> list[str]:
     hits = _mentions_legacy(cmd, cfg)
     legacy_client = bool(_LEGACY_ONLY_CLIENTS.search(cmd))
-    if (hits or legacy_client) and unreadable:
-        return [f"legacy client fed script(s) {unreadable} that the guard cannot read; inline the SQL or use a "
-                "path under the project so it can be inspected (legacy is read-only in every phase)"]
     text = _sql_view(cmd)
     segs = _write_segments(text)
     if not segs:
@@ -337,7 +358,8 @@ def _check_legacy_writes(cmd: str, cfg: GuardConfig, unreadable: list[str]) -> l
 def evaluate(command: str, cfg: GuardConfig, root: Path | None = None) -> Verdict:
     command = _join_continuations(command)
     full, unreadable = _inline_scripts(command, root or _project_root(), cfg)
-    violations = _check_databricks_writes(full, cfg) + _check_legacy_writes(full, cfg, unreadable)
+    violations = (_check_uninspectable_scripts(full, cfg, unreadable) + _check_databricks_writes(full, cfg)
+                  + _check_legacy_writes(full, cfg))
     if not violations:
         return Verdict("approve")
     reason = (

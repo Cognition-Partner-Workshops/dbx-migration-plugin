@@ -264,6 +264,11 @@ class FakeSource(_TransactionalMixin):
         self.statements += 1
         return self._aggregates(table, column, where)
 
+    def sum_probe(self, table: str, column: str, where: str | None = None) -> Any:
+        self.calls["sum_probe"] += 1
+        self.statements += 1
+        return self._aggregates(table, column, where)["sum"]
+
     def _aggregates(self, table: str, column: str, where: str | None) -> dict[str, Any]:
         return _agg_of([(r[column] if column in r else get_path(r, column))
                         for r in self._tx_rows(table, where)])
@@ -399,6 +404,11 @@ class FakeTarget(_TransactionalMixin):
         rows = [d for d in self._rows(object, where)
                 if tuple(get_path(d, k) for k in key_cols) not in excluded]
         return self._aggs(rows, columns, numeric)
+
+    def sum_probe(self, object: str, field_path: str, where=None) -> Any:
+        self.calls["sum_probe"] += 1
+        self.statements += 1
+        return self._aggs(self._rows(object, where), [field_path], [field_path])[field_path]["sum"]
 
     def field_aggregates(self, object: str, field_path: str, where=None) -> dict[str, Any]:
         self.calls["field_aggregates"] += 1

@@ -1490,13 +1490,13 @@ def test_a_probe_that_releases_the_source_snapshot_fails_the_window():
     for r in loans:
         r["loan_status"] = "ACTIVE"
     source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    original = source.field_aggregates
+    original = source.sum_probe
 
     def probing(table, column, where=None):
         if column == "loan_status":
             source.isolation = "none"   # what a libpq rollback does to a REPEATABLE READ window
         return original(table, column, where)
-    source.field_aggregates = probing
+    source.sum_probe = probing
     result = _run(source, target, spec=_undeclared_spec())
     window = _tier(result, "consistency_window")
     assert result["verdict"] == "FAIL" and result["merge_eligible"] is False

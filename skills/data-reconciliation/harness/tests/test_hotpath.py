@@ -8,12 +8,12 @@ import sqlite3
 import pytest
 
 from recon.adapters import _SqlAdapterBase
-from recon.config import ConfigError, ObjectMapping, Tolerances
+from recon.config import ConfigError, FieldMapping, MappingSpec, ObjectMapping, Tolerances
 from recon.cost import estimate_cost
 from recon.engine import run_recon
-from recon.tiers import _stratified_keys
+from recon.tiers import _object_aggregates, _stratified_keys
 from tests.fakes import FakeSource, FakeTarget
-from tests.test_tiers import RULES, SPEC
+from tests.test_tiers import RULES, SPEC, TOL
 
 
 class CountingConn:
@@ -73,6 +73,27 @@ def test_table_aggregates_is_one_statement_and_matches_per_column():
     assert batched["name"]["min"] == "n1" and batched["name"]["max"] == "n99"
     assert "sum" not in batched["name"] or batched["name"]["sum"] is None
     assert ad.statements == 7  # 3 x (metrics + SUM probe) per-column, then 1 batched
+
+
+def test_probed_field_costs_one_statement_on_top_of_the_batched_one():
+    # a probed field must not re-run the 5-metric statement: batched metrics + one SUM, so the
+    # cost estimate's "1 + probes" per side is what actually goes over the wire
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="t", root_table="t", key_source=["id"], key_target="id",
+        fields=[FieldMapping("id", "id", "INTEGER", "int"),
+                FieldMapping("amt", "amt", "REAL", ""),        # target side undeclared -> probe
+                FieldMapping("name", "name", "TEXT", "int")])])  # conversion mapping -> probe
+    source, s_conn = sqlite_adapter(ROWS)
+    target, t_conn = sqlite_adapter(ROWS)
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
+    assert len(s_conn.statements) == 2 and len(t_conn.statements) == 2
+    assert s_conn.statements[1].startswith("SELECT SUM(name)")
+    assert t_conn.statements[1].startswith("SELECT SUM(amt)")
+    assert s_all["name"]["count"] == 100 and s_all["name"]["distinct_count"] > 0  # batched metrics kept
+    assert t_all["amt"]["sum"] == pytest.approx(sum(r[2] for r in ROWS if r[2] is not None))
+    est = estimate_cost(spec, TOL)
+    assert est["source_statements"]["tier2"] == source.statements == 2
+    assert est["target_statements"]["tier2"] == target.statements == 2
 
 
 def test_table_aggregates_honours_where():

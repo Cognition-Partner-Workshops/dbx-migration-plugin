@@ -122,6 +122,26 @@ def test_missing_files_and_stop_mode_fail(tmp_path):
     assert c["stop_mode"]["status"] == "fail"
 
 
+def test_setup_outputs_glossary_and_tolerances_json_are_required(tmp_path):
+    ws = make_workspace(tmp_path, omit=("02_glossary.md", "03_recon_tolerances.json"))
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "fail"
+    assert c["workspace"]["data"]["missing"] == ["02_glossary.md", "03_recon_tolerances.json"]
+
+
+@pytest.mark.parametrize("who, expected", [
+    ({"userName": "someone@example.com", "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"]}, False),
+    ({"userName": "svc_migration", "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"]}, False),  # no '@' is not an SP
+    ({"displayName": "Local Admin"}, False),
+    ({"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}, True),  # application id as userName
+    ({"userName": "svc", "applicationId": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}, True),
+    ({"displayName": "mig-sp", "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServicePrincipal"]}, True),
+])
+def test_identity_classification_needs_positive_service_principal_evidence(who, expected):
+    _, is_sp = doctor.classify_identity(who)
+    assert is_sp is expected
+
+
 def test_warn_mode_and_empty_legacy_sources_are_warned(tmp_path):
     ws = make_workspace(tmp_path, allowed={"catalogs": ["mig_cat"], "guard_mode": "warn"})
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))

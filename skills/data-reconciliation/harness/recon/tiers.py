@@ -17,6 +17,7 @@ from .adapters import (
     ColumnTypes,
     KeyExcludingAggregates,
     StratifiedKeys,
+    SumProbe,
 )
 from .canon import MISSING, Canonicalizer
 from .config import MappingSpec, ObjectMapping, Tolerances
@@ -182,8 +183,8 @@ def _object_aggregates(c: ObjectMapping, source, target, source_where: str | Non
                        ) -> tuple[dict[str, dict], dict[str, dict], dict[str, str], dict[str, str]]:
     """All field aggregates for one object plus each side's plan: one statement per side when the
     adapter batches, one per field otherwise. Each side requests SUM per its own `sum_plan` (its
-    declared type, or its catalog); probed fields get an isolated statement so a SUM that errors
-    never aborts the batched one. In transactional mode the source is bounded to its applied
+    declared type, or its catalog); a probed field keeps the batched metrics and adds one isolated
+    SUM statement (`SumProbe`) so a SUM that errors never aborts the batched one. In transactional mode the source is bounded to its applied
     rows (`source_where`) and the target excludes the same keys (`exclude_keys`), so both
     aggregates describe one set."""
     s_where = source_where if source_where is not None else c.root_where
@@ -194,7 +195,10 @@ def _object_aggregates(c: ObjectMapping, source, target, source_where: str | Non
                                         s_where)
         for col, p in s_plan.items():
             if p == "probe":
-                s_all[col] = source.field_aggregates(c.root_table, col, s_where)
+                if isinstance(source, SumProbe):
+                    s_all[col]["sum"] = source.sum_probe(c.root_table, col, s_where)
+                else:
+                    s_all[col] = source.field_aggregates(c.root_table, col, s_where)
     else:
         s_all = {col: source.field_aggregates(c.root_table, col, s_where) for col in cols}
     t_plan = _sum_plans([(f.target, f.target_type, f.source_type) for f in c.fields], target, c.object)
@@ -217,7 +221,10 @@ def _object_aggregates(c: ObjectMapping, source, target, source_where: str | Non
     if exclude_keys is not None or isinstance(target, BatchAggregates):
         for col, p in t_plan.items():
             if p == "probe":
-                t_all[col] = t_probe(col)
+                if exclude_keys is None and isinstance(target, SumProbe):
+                    t_all[col]["sum"] = target.sum_probe(c.object, col, c.target_where)
+                else:
+                    t_all[col] = t_probe(col)
     return s_all, t_all, s_plan, t_plan
 
 
