@@ -331,21 +331,31 @@ def _shell_tokens(cmd: str) -> list[str]:
 _REDIRECT_OP = re.compile(r"<{1,3}|<>|<&|>{1,2}|>&|>\||&>{1,2}")
 
 
-def _commands(toks: list[str]) -> list[tuple[list[str], list[str]]]:
+@dataclass
+class _Simple:
+    """One simple command of a shell line: its words, the words of the heredoc bodies it opened,
+    and the operator that separated it from the command before it (`|` means that command's
+    output is this one's stdin)."""
+    words: list[str] = field(default_factory=list)
+    body: list[str] = field(default_factory=list)
+    sep: str = ""
+
+
+def _commands(toks: list[str]) -> list[_Simple]:
     """The token list split into simple commands at `;`, `&&`, `||`, `|`, `&`, parentheses and
-    line breaks, each as (words, heredoc body words). Redirections (`< f`, `>log`, `2>&1`) are
-    part of the command they sit in, and the body of a `<<TAG` heredoc (read from the next line,
-    up to the line holding TAG alone) belongs to the command that opened it, even when that
-    command is followed by `| tee` or `&& echo` on the opening line."""
+    line breaks. Redirections (`< f`, `>log`, `2>&1`) are part of the command they sit in, and
+    the body of a `<<TAG` heredoc (read from the next line, up to the line holding TAG alone)
+    belongs to the command that opened it, even when that command is followed by `| tee` or
+    `&& echo` on the opening line."""
     punct = re.compile(r"[();<>|&\n]+")
-    out: list[tuple[list[str], list[str]]] = [([], [])]
+    out: list[_Simple] = [_Simple()]
     pending: list[tuple[str, list[str]]] = []   # (delimiter, body of the opening command), in order
     i = 0
     while i < len(toks):
         tok = toks[i]
         if tok in ("<<", "<<-") and i + 1 < len(toks) and not punct.fullmatch(toks[i + 1]):
-            pending.append((toks[i + 1].lstrip("-"), out[-1][1]))
-            out[-1][0].extend(toks[i:i + 2])
+            pending.append((toks[i + 1].lstrip("-"), out[-1].body))
+            out[-1].words.extend(toks[i:i + 2])
             i += 2
         elif punct.fullmatch(tok) and not _REDIRECT_OP.fullmatch(tok):
             if "\n" in tok:
@@ -358,12 +368,45 @@ def _commands(toks: list[str]) -> list[tuple[list[str], list[str]]]:
                         if not punct.fullmatch(toks[i]):
                             body.append(toks[i])
                         i += 1
-            out.append(([], []))
+            out.append(_Simple(sep=tok))
             i += 1
         else:
-            out[-1][0].append(tok)
+            out[-1].words.append(tok)
             i += 1
-    return [c for c in out if c[0] or c[1]]
+    return [c for c in out if c.words or c.body]
+
+
+# producers whose stdout the guard can read as text: the files `cat` names, the words `echo` /
+# `printf` print, the heredoc body either opens; `tee` passes its stdin through
+_TEXT_PRODUCERS = ("cat", "echo", "printf", "tee")
+
+
+def _producers(cmds: list[_Simple], k: int) -> list[_Simple]:
+    """The commands whose output reaches cmds[k]'s stdin through the pipeline."""
+    out = []
+    while k > 0 and cmds[k].sep == "|":
+        k -= 1
+        out.append(cmds[k])
+    return out
+
+
+def _piped_scripts(producer: _Simple) -> list[str]:
+    """Script files a text producer hands the client on its stdin: `cat fix.sql | bteq`, and
+    `@fix.sql` on a line of `cat <<EOF | sqlplus` or in `echo @fix.sql | bteq`."""
+    files = [tok[1:] for tok in producer.body if tok.startswith("@") and len(tok) > 1]
+    base = producer.words[0].rsplit("/", 1)[-1] if producer.words else ""
+    if base == "cat":
+        skip = False
+        for w in producer.words[1:]:
+            if skip or w.startswith("-") or w == "<":
+                skip = False
+            elif _REDIRECT_OP.fullmatch(w) or w in ("<<", "<<-"):
+                skip = True  # the operand is a log, descriptor or heredoc delimiter, not a script
+            else:
+                files.append(w)
+    elif base in ("echo", "printf"):
+        files.extend(w[1:] for w in producer.words[1:] if w.startswith("@") and len(w) > 1)
+    return files
 
 
 def _script_inputs(cmd: str, cfg: GuardConfig | None = None) -> list[str]:
@@ -371,11 +414,17 @@ def _script_inputs(cmd: str, cfg: GuardConfig | None = None) -> list[str]:
     and `@f` on a line of the client's heredoc (SQL*Plus / BTEQ `.RUN`). Given a config, read
     only from the simple commands whose own words name a Databricks or legacy client or a legacy
     source: the `-f` of `rm -f x && databricks jobs list` belongs to `rm`, and a heredoc body
-    that merely mentions a client (`cat <<EOF` writing a script) is data, not context."""
+    that merely mentions a client (`cat <<EOF` writing a script) is data, not context. What a
+    text producer pipes into such a command (`cat fix.sql | bteq`, `cat <<EOF | sqlplus` with
+    `@fix.sql` in the body) is that command's script too."""
     files = []
-    for words, body in _commands(_shell_tokens(cmd)):
+    cmds = _commands(_shell_tokens(cmd))
+    for k, c in enumerate(cmds):
+        words, body = c.words, c.body
         if cfg is not None and not _has_context(" ".join(words), cfg):
             continue
+        for producer in _producers(cmds, k):
+            files.extend(_piped_scripts(producer))
         skip = False
         for i, tok in enumerate(words):
             if skip:  # operand of a redirection other than `<`: a log file, a descriptor, a here-string
@@ -565,6 +614,17 @@ def _check_opaque_execution(cmd: str, cfg: GuardConfig) -> list[str]:
                 violations.append(f"`{base}` fed by process substitution; the guard cannot read what it would run")
         elif tok == "xargs" and ctx:
             violations.append("`xargs` builds a client invocation from stdin; the guard cannot read the statement it would run")
+
+    cmds = _commands(_shell_tokens(cmd))
+    for k, c in enumerate(cmds):  # a legacy client runs whatever reaches its stdin
+        if not _LEGACY_ONLY_CLIENTS.search(" ".join(c.words)):
+            continue
+        for producer in _producers(cmds, k):
+            base = producer.words[0].rsplit("/", 1)[-1] if producer.words else ""
+            if base not in _TEXT_PRODUCERS or _expands(" ".join(producer.words)):
+                violations.append(f"text piped into `{c.words[0]}` comes from `{base or '?'}`, a program or expansion the "
+                                  "guard cannot read; pipe from cat/echo/printf or a heredoc instead")
+                break
 
     if ctx:
         if _substitutes(cmd):

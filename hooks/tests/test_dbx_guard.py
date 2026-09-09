@@ -567,6 +567,31 @@ def test_redirection_operands_and_here_strings_are_not_scripts(tmp_path: Path):
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
 
 
+@pytest.mark.parametrize("cmd", [
+    "cat <<EOF | bteq\n@fix.sql\nEOF",
+    "cat <<EOF | sqlplus svc@tdprod.corp.example\nSET ECHO ON;\n@fix.sql\nEOF",
+    "cat <<EOF | tee /nonexistent/copy | bteq\n@fix.sql\nEOF",
+    "cat fix.sql | bteq",
+    "cat < fix.sql | bteq",
+    "echo @fix.sql | bteq",
+])
+def test_text_piped_into_a_client_is_its_script(cmd, tmp_path: Path):
+    (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    assert g._script_inputs(cmd, CFG) == ["fix.sql"], cmd
+    v = g.evaluate(cmd, CFG, root=tmp_path)
+    assert v.decision == "block" and "read-only" in v.reason, cmd
+
+
+def test_opaque_text_piped_into_a_legacy_client_is_blocked(tmp_path: Path):
+    for cmd in ("sed 's/x/y/' fix.sql | bteq", "python3 gen.py | sqlplus svc@tdprod.corp.example",
+                "cat $F | bteq", "gunzip -c fix.sql.gz | bteq"):
+        v = g.evaluate(cmd, CFG, root=tmp_path)
+        assert v.decision == "block", cmd
+    for cmd in ("cat <<EOF | bteq\nSELECT 1;\nEOF", "printf 'SELECT 1' | bteq",
+                "databricks jobs list | jq .", "jq -n '{}' | databricks api post /api/2.1/jobs/create"):
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+
+
 def test_a_heredoc_body_naming_a_client_is_data_not_context(tmp_path: Path):
     (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
     for cmd in ("cat <<'EOF' > run_later.sh\nbteq @fix.sql\nEOF", "cat <<EOF\nsqlplus svc@tdprod.corp.example @fix.sql\nEOF",
