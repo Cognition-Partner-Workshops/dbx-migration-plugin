@@ -2,7 +2,7 @@
 -- "CASE Statement", "Handler Declaration" (EXIT only), "SIGNAL and RESIGNAL", "EXECUTE IMMEDIATE", "CREATE PROCEDURE").
 -- BT/ET has no drop-in (NOTE.md). Deployed with the procedure: one-row campaign lock, seeded idempotently by MERGE.
 CREATE TABLE IF NOT EXISTS ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
-    (LOCK_NAME STRING NOT NULL, OWNER_RUN_ID STRING, LOCKED_TS TIMESTAMP);
+    (LOCK_NAME STRING NOT NULL, OWNER_RUN_ID BIGINT, LOCKED_TS TIMESTAMP);
 MERGE INTO ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK l USING (SELECT 'SP_ARCHIVE_CLOSED_ACCOUNTS' AS LOCK_NAME) s
     ON l.LOCK_NAME = s.LOCK_NAME
     WHEN NOT MATCHED THEN INSERT (LOCK_NAME, OWNER_RUN_ID, LOCKED_TS) VALUES (s.LOCK_NAME, NULL, NULL);
@@ -15,23 +15,21 @@ CREATE OR REPLACE PROCEDURE ${catalog}.${schema}.SP_ARCHIVE_CLOSED_ACCOUNTS(
 )
 LANGUAGE SQL SQL SECURITY INVOKER MODIFIES SQL DATA
 AS BEGIN
-    DECLARE v_run_id     STRING    DEFAULT uuid();
-    DECLARE v_lock_ts    TIMESTAMP DEFAULT current_timestamp();   -- durable run marker, persisted in the lock row
+    DECLARE v_run_id     BIGINT DEFAULT unix_micros(current_timestamp());   -- lock owner + ETL_BATCH_ID stamp
     DECLARE v_txn_count  INT;  DECLARE v_arch_table STRING;
     -- ROLLBACK has no equivalent: partial work is kept, the re-run is idempotent, and the budget is derived from committed
-    -- state (ARCHIVED rows stamped >= this run's LOCKED_TS while it owns the lock), never from the in-memory counter.
-    -- Fixed return code: no cited SQLSTATE read inside a handler. Lock released only by its owner.
+    -- state: each status UPDATE stamps ETL_BATCH_ID = v_run_id, so the count of rows carrying this run's id is exactly
+    -- what it archived (other writers' rows carry other ids). Fixed return code: no cited SQLSTATE read in a handler.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         SET p_return_code = -1;
         SET p_accounts_done = (SELECT COUNT(*) FROM ${catalog}.${schema}.DIM_ACCOUNT
-            WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= v_lock_ts AND EXISTS (SELECT 1 FROM
-            ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id));
+                               WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_BATCH_ID = v_run_id);
         SET p_max_batch = p_max_batch - p_accounts_done;
         UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
         WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;
         INSERT INTO ${catalog}.${schema}.ETL_LOG (PROCEDURE_NAME, BATCH_ID, LOG_LEVEL, LOG_MESSAGE, LOG_TS)
-        VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR', 'run ' || v_run_id || ' failed after '
+        VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR', 'run ' || CAST(v_run_id AS STRING) || ' failed after '
                 || CAST(p_accounts_done AS STRING) || ' accounts; re-run with the returned budget', current_timestamp());
     END;
     SET p_return_code = 0; SET p_accounts_done = 0;
@@ -43,8 +41,8 @@ AS BEGIN
         SIGNAL SQLSTATE '75002' SET MESSAGE_TEXT = 'p_archive_schema is not a declared archive target for this unit';
     END IF;
     -- BT write locks serialised callers: claim the seeded row, read back, SIGNAL unless owner (other run, or row missing
-    -- -> NULL); a loser may instead hit a write conflict. Every path lands in the handler.
-    UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK SET OWNER_RUN_ID = v_run_id, LOCKED_TS = v_lock_ts
+    -- -> NULL); a loser may instead hit a write conflict. Every path lands in the handler; release is owner-checked.
+    UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK SET OWNER_RUN_ID = v_run_id, LOCKED_TS = current_timestamp()
     WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID IS NULL;
     IF (SELECT OWNER_RUN_ID FROM ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
         WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS') IS DISTINCT FROM v_run_id THEN
@@ -70,12 +68,12 @@ AS BEGIN
                     INTO v_txn_count USING acct.ACCOUNT_KEY;                -- ACTIVITY_COUNT: no row-count register
                 DELETE FROM ${catalog}.${schema}.FACT_TRANSACTION WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;
         END CASE;
-        UPDATE ${catalog}.${schema}.DIM_ACCOUNT SET ACCOUNT_STATUS = 'ARCHIVED', ETL_UPDATE_TS = current_timestamp()
-        WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;
+        UPDATE ${catalog}.${schema}.DIM_ACCOUNT SET ACCOUNT_STATUS = 'ARCHIVED', ETL_BATCH_ID = v_run_id,
+            ETL_UPDATE_TS = current_timestamp() WHERE ACCOUNT_KEY = acct.ACCOUNT_KEY;   -- the durable progress record
         SET p_accounts_done = p_accounts_done + 1;                          -- loop cap only; budget comes from the table
     END FOR archive_loop;
     SET p_accounts_done = (SELECT COUNT(*) FROM ${catalog}.${schema}.DIM_ACCOUNT
-                           WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= v_lock_ts);
+                           WHERE ACCOUNT_STATUS = 'ARCHIVED' AND ETL_BATCH_ID = v_run_id);
     SET p_max_batch = p_max_batch - p_accounts_done;
     UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
     WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;

@@ -10,15 +10,16 @@ Source: skill-authored (fixture schema `DIM_ACCOUNT`, `FACT_TRANSACTION`, `ETL_L
 - `ACTIVITY_COUNT` -> explicit `SELECT COUNT(*)` (`INTO`); `SQLCODE`/`SQLSTATE` in the handler -> fixed return code.
 - `BT`/`ET` + `ROLLBACK` -> no drop-in. Per-statement Delta commits; the archive `INSERT` is idempotent
   (`NOT EXISTS` on `TRANSACTION_ID`); an account interrupted mid-triple stays `CLOSED` and is finished by the re-run.
-  The `INOUT` budget is never taken from the in-memory counter (which only caps the loop): both exits derive
-  `p_accounts_done` from committed state, `count(ACCOUNT_STATUS = 'ARCHIVED' AND ETL_UPDATE_TS >= LOCKED_TS)` while
-  this run owns the lock, so each account's own status `UPDATE` is the durable progress record. `BEGIN ATOMIC`
-  (preview, `catalogManaged` tables) is the alternative where the target profile allows it.
+  The `INOUT` budget is never taken from the in-memory counter (which only caps the loop): the status `UPDATE` also
+  stamps `ETL_BATCH_ID = v_run_id` (`unix_micros(current_timestamp())`, docs.databricks.com `functions/unix_micros`),
+  and both exits derive `p_accounts_done` as `count(ACCOUNT_STATUS = 'ARCHIVED' AND ETL_BATCH_ID = v_run_id)`, so
+  that one committed row is the progress record and rows archived by any other writer (other id) are never charged.
+  `BEGIN ATOMIC` (preview, `catalogManaged` tables) is the alternative where the target profile allows it.
 - BT/ET also serialised overlapping callers (write locks held to `ET`). Replaced by a one-row
   `ARCHIVE_CAMPAIGN_LOCK (LOCK_NAME, OWNER_RUN_ID, LOCKED_TS)` whose DDL + idempotent `MERGE` seed ship in the
   converted file ahead of the procedure: claim with `UPDATE ... WHERE OWNER_RUN_ID IS NULL`, read back,
   `SIGNAL 75003` if not the owner (covers a missing row: read-back is NULL); released (owner-checked) on both exits.
-  A session killed mid-run reaches neither exit: the stale lock row keeps its `LOCKED_TS`, so the operator computes
+  A session killed mid-run reaches neither exit: the stale lock row keeps `OWNER_RUN_ID`, so the operator computes
   the consumed budget with the same count before releasing the row (`max_concurrent_runs: 1` on the calling job,
   `databricks-jobs` `references/triggers-schedules.md`, as belt-and-braces). Decision item: stale-lock timeout.
 
