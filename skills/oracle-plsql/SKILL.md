@@ -93,10 +93,10 @@ contain (Albion's `ods_policy_360`, whose DDL is not in the repo) is still a FAC
 | Table / index | `CREATE TABLE ... AS SELECT` (also `GLOBAL TEMPORARY ... AS (SELECT ...)`, `AS WITH ...`): every source of the subquery is a `reads` edge of the new table; `CREATE [UNIQUE|BITMAP] INDEX ix ON t (...)` is a `defines-on` edge `IX -> T` (function-based columns, `TABLESPACE`/`LOCAL` clauses do not matter) | a plain `CREATE TABLE` owns its text (`REFERENCES ... ON DELETE CASCADE` is not DML) and draws no edge | an index whose target is not a plain `ON name (` (quoted identifier, `ON CLUSTER c`) -> `UNVERIFIABLE risk=unparsed-index-target` rather than a silent omission |
 | Sequence | none | none; edges point *at* it | none. Record `last_number` for Lakebase `setval` parity |
 | Scheduler job / program / chain | `job_action`/`program_action` parsed like an anonymous block: every named subprogram is a `schedules` edge; chain steps -> programs | none directly | `job_type='EXECUTABLE'` or `EXTERNAL_SCRIPT` (`risk=os-script`), `job_action` referencing `&`/bind-like placeholders, `event_condition` jobs (`risk=aq-event`) |
-| SQL*Plus script | tables in embedded SQL; `@file`/`@@file`/`START` edges to other scripts (resolve relative to the script dir then `SQLPATH`) | embedded DML/DDL; `SPOOL` target (edge `SCRIPT -> FILE`) | `&var`/`&&var` inside identifiers (`risk=substitution-in-identifier`); `HOST`/`!` lines (`risk=os-shell`); `@file` not found in repo (`risk=missing-include`) |
+| SQL*Plus script | tables in embedded SQL; `@file`/`@@file`/`START file [args]` edges typed `includes` to the other script (`.sql` appended when the name has no suffix; `@@` resolves against the calling script's directory, `@`/`START` against the working directory then `SQLPATH`, which are unknown statically, so the script's directory stands in for both and the edge records which rule applied); the included script is censused as a `SQL FILE` node when it exists on disk, and when it is itself a SQL*Plus script in the census its own includes/spools chain from it | embedded DML/DDL; `SPOOL file` target (edge `SCRIPT -> FILE.<NAME>` typed `writes`, node class `SPOOL FILE`, status `external`; `SPOOL OFF`/`SPOOL OUT` close and draw nothing) | `&var`/`&&var` inside identifiers or in an include/spool target (`risk=substitution-in-identifier`, `<&include>` / `<&spool>` nodes); `HOST`/`!`/`$` lines (`risk=os-shell`, edge to `OS.<shell>`); `@file` not found in repo (`risk=missing-include`, `not-in-census` target node) |
 | Synonym | resolves to its target *even when the synonym itself is in the census* (a private synonym shares the schema namespace with tables, so an enumerated `ODS.POLICY` synonym row never satisfies a lookup of `ods.policy`; the reader's edge goes to `POLADM.POLICY`); the synonym row stays and draws one `alias-of` edge to its target (FACT, INFERRED over a link, `not-in-census` target node when missing) | n/a | synonym with `db_link` (`risk=external-db-link`); synonym to a missing object (`risk=dangling-synonym`, the edge goes to the `not-in-census` target node) |
 | Database link | node of class `EXTERNAL_DB` with `host` | n/a | always INFERRED beyond the link itself: the remote estate is enumerated separately or listed as out of scope |
-| Dynamic SQL | literal statements are parsed as if static | same | anything with `||` or a bind inside an identifier position |
+| Dynamic SQL | literal statements are parsed as if static: `EXECUTE IMMEDIATE '<literal>'`, and a variable whose every assignment is one whole string literal (`l_sql := 'INSERT INTO ...';`, a declaration default `l_q CLOB := 'SELECT ...'`) used by `EXECUTE IMMEDIATE l_sql [USING ...]` / `OPEN c FOR l_sql [USING ...]`; binds (`:1`) are opaque | same | anything with `\|\|` or a bind inside an identifier position: a variable that is ever concatenated (`l_sql := l_sql \|\| ' WHERE ...'`, `l_sql := 'DELETE FROM ' \|\| t`) stays INFERRED `dynamic-sql` on `<VAR>` with its literal prefix recorded; a variable never assigned a literal (`l_sql := build();`) is UNVERIFIABLE |
 | Temporary objects | GTT rows are census tables with `temporary='Y'`; edges are FACT | same | private temporary tables (`ORA$PTT_`) created in code (`risk=session-temp`); `DBMS_SQL` result sets |
 | GoldenGate / external feeds | `docs/feed_inventory.md`-style manifests, `.prm` files (`MAP src.t, TARGET ods.t`) -> edge `SOURCE_DB.T -> ODS.T` typed `replication` | n/a | replication lag expectations (`risk=freshness`, Albion: 26h-stale ODS behind a "real-time" SOAP API) |
 
@@ -110,8 +110,16 @@ Comment stripping is lexical: `--` and `/* */` inside `'...'` (with `''`), `q'X.
 `[({<` closing with their partner) or `"quoted"` identifiers are text, so a literal such as `'-- not a comment'` never
 hides the `FROM` that follows it. The same lexer bounds statements: a `CREATE [MATERIALIZED] VIEW` ends at the first
 `;` outside a literal (`SELECT 'a;b' ... FROM t` keeps its `FROM`), a `DBMS_SCHEDULER`/`DBMS_RLS`/`DBMS_REDACT` call
-ends at its balanced `)` (a `);` inside a `program_action` block does not), and named arguments are split on top-level
-commas only (`start_date => TO_TIMESTAMP_TZ('...', '...')` is one value). `CREATE UNIQUE|BITMAP INDEX`,
+ends at its balanced `)` (a `);` inside a `program_action` block does not), and arguments are split on top-level
+commas only (`start_date => TO_TIMESTAMP_TZ('...', '...')` is one value). Those ruled calls accept positional as well as
+named actuals: positionals are mapped onto the documented formal order (`CREATE_PROGRAM(program_name, program_type,
+program_action, ...)`, `CREATE_JOB(job_name, job_type, job_action, number_of_arguments, start_date, repeat_interval, ...)`
+or, when the second positional is not a `job_type` keyword, `CREATE_JOB(job_name, program_name, start_date, ...)`;
+`ADD_POLICY(object_schema, object_name, policy_name, function_schema, policy_function, ...)`; `DBMS_REDACT.ADD_POLICY(
+object_schema, object_name, policy_name, policy_description, column_name, ...)`), an omitted `object_schema` /
+`function_schema` defaults to the file's owner, and a naming argument that is missing or not a string literal (a
+variable, an expression, an empty `()` call) yields one UNVERIFIABLE edge (`scheduler-name-not-literal`,
+`scheduler-program-not-literal`, `scheduler-action-not-literal`, `policy-call-not-literal`) instead of a guessed node. `CREATE UNIQUE|BITMAP INDEX`,
 `GLOBAL|PRIVATE TEMPORARY TABLE`, `[NON]EDITIONABLE`, `[NO] FORCE VIEW` and `PUBLIC` modifiers do not change the census
 class. SQL*Plus directives may be indented. A file that mixes DDL with top-level `INSERT`/`MERGE`/`UPDATE`/`DELETE`/
 `TRUNCATE` (outside every PL/SQL unit) gets one extra `DML SCRIPT` row named after the file that owns those writes;
@@ -138,11 +146,12 @@ a silent omission.
 Round-trip on the fixture (`python3 examples/round_trip.py`, static text only, writes `examples/round_trip_report.md`):
 15 files, 48 census rows (6 tables, 5 indexes, 2 sequences, 3 views, 1 MV + 2 MV logs, package + 4 members,
 procedure, function, trigger, scheduler job + program, 2 synonyms, db link, 8 grants, 2 roles, 2 role memberships,
-VPD + redaction policy, 1 SQL*Plus script, 1 DML script), 56 edges = 53 FACT, 3 INFERRED, 0 UNVERIFIABLE. The
-INFERRED three are exactly the constructs built to be dynamic: `PKG_POLICY_RENEWAL.ARCHIVE_TO` `EXECUTE IMMEDIATE l_sql`
-(literal prefix `INSERT INTO poladm.` recorded), `V_CLAIMS_REMOTE` over `claims.claim@claims_link`, and
-`FN_BROKER_PREDICATE`'s VPD predicate string naming `ods.v_broker_hierarchy`. `RPT_POLICY_PAGE`'s `&as_of` sits in a
-literal position (`TO_DATE('&as_of', ...)`), so its three reads stay FACT. Five of the FACT edges are transitive
+VPD + redaction policy, 1 SQL*Plus script, 1 DML script), 57 edges = 53 FACT, 4 INFERRED, 0 UNVERIFIABLE. The
+INFERRED four are exactly the constructs built to be dynamic: `PKG_POLICY_RENEWAL.ARCHIVE_TO` `EXECUTE IMMEDIATE l_sql`
+(literal prefix `INSERT INTO poladm.` recorded), `V_CLAIMS_REMOTE` over `claims.claim@claims_link`,
+`FN_BROKER_PREDICATE`'s VPD predicate string naming `ods.v_broker_hierarchy`, and `RPT_POLICY_PAGE`'s
+`SPOOL &spool_file` (`writes <&spool>`, `substitution-in-identifier`). The same script's `&as_of` sits in a literal
+position (`TO_DATE('&as_of', ...)`), so its three reads stay FACT. Five of the FACT edges are transitive
 trigger fan-out: `MRG_POLICY_FROM_STG` and `PKG_POLICY_RENEWAL.RENEW_EXPIRING` write `POLICY`, `TRG_POLICY_BIU` calls
 `PRC_LOG_EVENT`, so both inherit `writes POLICY_AUDIT_LOG` and `consumes-sequence AUDIT_SEQ` (`MRG_POLICY_FROM_STG`
 writes with `DELETE|INSERT|UPDATE(ANNUAL_PREMIUM,BROKER_ID,COVER_NOTE_REF,EXPIRY_DT,POLICY_STATUS)`, `RENEW_EXPIRING`

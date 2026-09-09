@@ -33,7 +33,12 @@ ALBION_DEFAULT = HERE.parents[3] / "albion-insurance-data-estate" / "api_legacy"
 # a SQL*Plus directive may be indented; `SET col = ...` (UPDATE) and `EXECUTE IMMEDIATE` (PL/SQL) are not directives
 SQLPLUS_DIRECTIVE = re.compile(
     r"^\s*(SET\s+(PAGESIZE|LINESIZE|DEFINE|FEEDBACK|VERIFY|HEADING|ECHO|SERVEROUTPUT|TERMOUT|TRIMSPOOL|TIMING|AUTOCOMMIT|SQLBLANKLINES)"
-    r"\b(?!\s*=)|SPOOL|WHENEVER|DEFINE|COLUMN|EXEC(UTE)?\s+(?!IMMEDIATE\b)|@@?|PROMPT|ACCEPT|TTITLE|BREAK|COMPUTE)\b", re.I)
+    r"\b(?!\s*=)|(?:SPO(?:OL)?|WHENEVER|DEFINE|COLUMN|PROMPT|ACCEPT|TTITLE|BREAK|COMPUTE|HO(?:ST)?)\b|EXEC(?:UTE)?\s+(?!IMMEDIATE\b)"
+    r"|@@?\S|STA(?:RT)?\s+(?!WITH\b)|[!$])", re.I)
+# SQL*Plus lines that are lineage of the script itself (SKILL.md section 2, SQL*Plus row): includes, spool, OS shell
+INCLUDE_RE = re.compile(r"^\s*(@@|@|STA(?:RT)?\s+(?!WITH\b))\s*(\S+)", re.I | re.M)
+SPOOL_RE = re.compile(r"^\s*SPO(?:OL)?\s+(\S+)", re.I | re.M)
+HOST_RE = re.compile(r"^\s*(?:HO(?:ST)?\b|[!$])(.*)$", re.I | re.M)
 IDENT = r"[A-Za-z_][A-Za-z0-9_$#]*"
 QNAME = rf"(?:{IDENT}\.)?{IDENT}"
 KEYWORDS = {
@@ -245,15 +250,24 @@ def split_top_level(text: str) -> list[str]:
     return parts
 
 
-def named_args(text: str) -> list[tuple[str, str]]:
-    """`name => value` pairs of a PL/SQL call, splitting on top-level commas only: a value may be a full expression
-    such as TO_TIMESTAMP_TZ('...', '...') (balanced parentheses, literals opaque)."""
-    out: list[tuple[str, str]] = []
-    for p in split_top_level(text):
+def call_params(text: str, positional: list[str]) -> dict[str, str]:
+    """{lower-case formal: actual text} of a PL/SQL call: positional actuals (PL/SQL requires them first) are mapped
+    onto `positional`, named actuals (`formal => value`) onto their formal; surplus positionals are dropped. Split on
+    top-level commas only: an actual may be a full expression such as TO_TIMESTAMP_TZ('...', '...')."""
+    out: dict[str, str] = {}
+    for i, p in enumerate(split_top_level(text)):
         m = re.match(r"\s*(\w+)\s*=>\s*(.*?)\s*$", p, re.S)
         if m:
-            out.append((m.group(1), m.group(2)))
+            out[m.group(1).lower()] = m.group(2)
+        elif i < len(positional) and p.strip():
+            out[positional[i]] = p.strip()
     return out
+
+
+def literal_param(params: dict[str, str], name: str) -> str | None:
+    """Value of a string-literal actual, None when absent or not a literal (a variable, an expression, NULL)."""
+    v = params.get(name, "").strip()
+    return unquote(v) if len(v) >= 2 and v[0] == "'" and v[-1] == "'" else None
 
 
 def norm(name: str, default_owner: str) -> str:
@@ -331,6 +345,19 @@ MEMBER_HEAD_STOP_RE = re.compile(r";|\b(?:IS|AS)\b", re.I)
 SCHED_RE = re.compile(r"DBMS_SCHEDULER\.CREATE_(JOB|PROGRAM)\s*\(", re.I)
 RLS_RE = re.compile(r"DBMS_RLS\.ADD_POLICY\s*\(", re.I)
 REDACT_RE = re.compile(r"DBMS_REDACT\.ADD_POLICY\s*\(", re.I)
+# formal parameter order of the ruled calls (Oracle PL/SQL Packages and Types Reference), for positional actuals.
+# CREATE_JOB is overloaded on its 2nd formal: an inline job (job_type, job_action, ...) or a program-based one
+# (program_name, ...); the value tells them apart
+SCHED_PROGRAM_FORMALS = ["program_name", "program_type", "program_action", "number_of_arguments", "enabled", "comments"]
+SCHED_JOB_INLINE_FORMALS = ["job_name", "job_type", "job_action", "number_of_arguments", "start_date", "repeat_interval",
+                            "end_date", "job_class", "enabled", "auto_drop", "comments"]
+SCHED_JOB_PROGRAM_FORMALS = ["job_name", "program_name", "start_date", "repeat_interval", "end_date", "job_class", "enabled",
+                             "auto_drop", "comments"]
+SCHED_JOB_TYPES = {"PLSQL_BLOCK", "STORED_PROCEDURE", "EXECUTABLE", "CHAIN", "EXTERNAL_SCRIPT", "SQL_SCRIPT", "BACKUP_SCRIPT"}
+RLS_FORMALS = ["object_schema", "object_name", "policy_name", "function_schema", "policy_function", "statement_types",
+               "update_check", "enable", "static_policy", "policy_type", "long_predicate", "sec_relevant_cols"]
+REDACT_FORMALS = ["object_schema", "object_name", "policy_name", "policy_description", "column_name", "column_description",
+                  "function_type", "function_parameters", "expression", "enable"]
 # top-level DML that makes the non-procedural remainder of a file a DML SCRIPT unit (GRANT ... DELETE ON and
 # ON DELETE CASCADE do not qualify)
 LOOSE_DML_RE = re.compile(
@@ -425,7 +452,7 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
         key = f"{default_owner}.{path.stem.upper()}"
         est.add(key, "SQLPLUS_SCRIPT", fname,
                 lines=len(raw.splitlines()), substitution_vars=len(set(re.findall(r"&&?(\w+)", raw))))
-        sqlplus_units.append((key, text))
+        sqlplus_units.append((key, text, path))
     for m in PUBLIC_SYN_RE.finditer(blanked):
         est.public_synonyms[m.group(1).upper()] = norm(m.group(2).split("@")[0], default_owner) + (
             "@" + m.group(2).split("@")[1].upper() if "@" in m.group(2) else "")
@@ -498,31 +525,70 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
             if cls == "MATERIALIZED VIEW":
                 node.signals["refresh"] = " ".join(re.findall(r"REFRESH\s+(\w+)\s+ON\s+(\w+)", unit_text, re.I)[0]) if re.search(
                     r"REFRESH\s+\w+\s+ON", unit_text, re.I) else "?"
+    script_key = f"{default_owner}.{path.stem.upper()}"
+
+    def unparsed_call(kind: str, risk: str, call_text: str) -> None:
+        # the call is real lineage the static model cannot name: the file becomes the script unit that carries it
+        est.add(script_key, "SQLPLUS_SCRIPT" if is_sqlplus else "PLSQL SCRIPT", fname)
+        unverifiable(est, script_key, default_owner, kind, risk, call_text)
+
     for m in SCHED_RE.finditer(text):
         covered.append((m.start(), statement_end(text, skip_balanced(text, m.end() - 1))))
-        args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
-        name = args.get("job_name") or args.get("program_name")
+        call_text = text[m.start():skip_balanced(text, m.end() - 1)]
+        is_job = m.group(1).upper() == "JOB"
+        if is_job:
+            actuals = split_top_level(call_args(text, m.end() - 1))
+            second = unquote(actuals[1]).upper() if len(actuals) > 1 and "=>" not in actuals[1] else ""
+            formals = SCHED_JOB_INLINE_FORMALS if second in SCHED_JOB_TYPES else SCHED_JOB_PROGRAM_FORMALS
+        else:
+            formals = SCHED_PROGRAM_FORMALS
+        params = call_params(call_args(text, m.end() - 1), formals)
+        name = literal_param(params, "job_name" if is_job else "program_name")
+        if name is None:
+            unparsed_call("schedules", "scheduler-name-not-literal", call_text)
+            continue
         cls = "SCHEDULER " + m.group(1).upper()
         key = norm(name, default_owner)
-        est.add(key, cls, fname, repeat_interval=args.get("repeat_interval", ""), start_date=args.get("start_date", ""))
-        action = args.get("program_action") or args.get("job_action") or ""
-        if args.get("program_name") and m.group(1).upper() == "JOB":
-            est.edges.append(Edge(key, norm(args["program_name"], default_owner), "schedules", "FACT"))
+        est.add(key, cls, fname, repeat_interval=unquote(params.get("repeat_interval", "")),
+                start_date=unquote(params.get("start_date", "")))
+        program = literal_param(params, "program_name") if is_job else None
+        if is_job and program is None and "program_name" in params:
+            unverifiable(est, key, default_owner, "schedules", "scheduler-program-not-literal", call_text)
+        elif program:
+            est.edges.append(Edge(key, norm(program, default_owner), "schedules", "FACT"))
+        action_formal = "job_action" if is_job else "program_action"
+        action = literal_param(params, action_formal)
         if action:
             proc_units.append((key, cls, action))
+        elif action_formal in params:
+            unverifiable(est, key, default_owner, "calls", "scheduler-action-not-literal", call_text)
     for m in RLS_RE.finditer(text):
         covered.append((m.start(), statement_end(text, skip_balanced(text, m.end() - 1))))
-        args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
-        key = f"{args['object_schema']}.{args['policy_name']}".upper()
+        call_text = text[m.start():skip_balanced(text, m.end() - 1)]
+        params = call_params(call_args(text, m.end() - 1), RLS_FORMALS)
+        # object_schema / function_schema default to the current schema when omitted or NULL
+        schema = literal_param(params, "object_schema") or default_owner
+        fschema = literal_param(params, "function_schema") or default_owner
+        obj, pol, fn = (literal_param(params, k) for k in ("object_name", "policy_name", "policy_function"))
+        if obj is None or pol is None or fn is None:
+            unparsed_call("defines-on", "policy-call-not-literal", call_text)
+            continue
+        key = f"{schema}.{pol}".upper()
         est.add(key, "VPD POLICY", fname)
-        est.edges.append(Edge(key, f"{args['object_schema']}.{args['object_name']}".upper(), "defines-on", "FACT"))
-        est.edges.append(Edge(key, f"{args['function_schema']}.{args['policy_function']}".upper(), "calls", "FACT"))
+        est.edges.append(Edge(key, f"{schema}.{obj}".upper(), "defines-on", "FACT"))
+        est.edges.append(Edge(key, f"{fschema}.{fn}".upper(), "calls", "FACT"))
     for m in REDACT_RE.finditer(text):
         covered.append((m.start(), statement_end(text, skip_balanced(text, m.end() - 1))))
-        args = {k.lower(): unquote(v) for k, v in named_args(call_args(text, m.end() - 1))}
-        key = f"{args['object_schema']}.{args['policy_name']}".upper()
-        est.add(key, "REDACTION POLICY", fname, column=args.get("column_name"))
-        est.edges.append(Edge(key, f"{args['object_schema']}.{args['object_name']}".upper(), "defines-on", "FACT"))
+        call_text = text[m.start():skip_balanced(text, m.end() - 1)]
+        params = call_params(call_args(text, m.end() - 1), REDACT_FORMALS)
+        schema = literal_param(params, "object_schema") or default_owner
+        obj, pol = literal_param(params, "object_name"), literal_param(params, "policy_name")
+        if obj is None or pol is None:
+            unparsed_call("defines-on", "policy-call-not-literal", call_text)
+            continue
+        key = f"{schema}.{pol}".upper()
+        est.add(key, "REDACTION POLICY", fname, column=literal_param(params, "column_name"))
+        est.edges.append(Edge(key, f"{schema}.{obj}".upper(), "defines-on", "FACT"))
     for m in GRANT_RE.finditer(blanked):
         priv, obj, grantee = m.groups()
         key = f"GRANT.{grantee.upper()}.{norm(obj, default_owner)}.{re.sub(r'[^A-Z]', '', priv.upper().split('(')[0])}"
@@ -554,9 +620,13 @@ UNQUAL_CALL_RE = re.compile(rf"(?<![.\w])({IDENT})\s*\(", re.I)
 EXEC_IMM_RE = re.compile(r"EXECUTE\s+IMMEDIATE\s+('(?:[^']|'')*'|[A-Za-z_]\w*\b(?!\s*[(.]))(\s*\|\|)?", re.I)
 EXEC_IMM_ANY_RE = re.compile(r"EXECUTE\s+IMMEDIATE\b", re.I)
 OPEN_FOR_RE = re.compile(rf"OPEN\s+{IDENT}\s+FOR\s+(?!SELECT\b|WITH\b)({IDENT}|'|\()", re.I)
-OPEN_FOR_VAR_RE = re.compile(rf"OPEN\s+{IDENT}\s+FOR\s+({IDENT})\s*;", re.I)
+OPEN_FOR_VAR_RE = re.compile(rf"OPEN\s+{IDENT}\s+FOR\s+({IDENT})\s*(?:;|USING\b)", re.I)
 DYN_ASSIGN_RE = re.compile(rf"({IDENT})\s*:=\s*('(?:[^']|'')*')\s*\|\|", re.I)
-ANY_ASSIGN_RE = re.compile(rf"({IDENT})\s*:=", re.I)
+# `v := 'whole literal';` and a declaration default `v VARCHAR2(n) [CHAR|BYTE] := | DEFAULT 'whole literal';`
+STRING_TYPE = r"(?:VARCHAR2|NVARCHAR2|CHAR|CLOB|LONG|STRING)\s*(?:\(\s*\d+\s*(?:BYTE|CHAR)?\s*\))?"
+LIT_ASSIGN_RE = re.compile(
+    rf"(?<![.\w])({IDENT})\s*(?:{STRING_TYPE}\s*(?:\bDEFAULT\s+|:=\s*)|:=\s*)('(?:[^']|'')*')\s*;", re.I)
+ANY_ASSIGN_RE = re.compile(rf"(?<![.\w])({IDENT})\s*(?:{STRING_TYPE}\s*(?::=|\bDEFAULT\b)|:=)", re.I)
 MVIEW_REFRESH_RE = re.compile(r"DBMS_MVIEW\.REFRESH\s*\(\s*(?:list\s*=>\s*)?'([^']+)'", re.I)
 MVIEW_REFRESH_ANY_RE = re.compile(r"DBMS_MVIEW\.REFRESH\s*\(", re.I)
 SUBST_IDENT_RE = re.compile(r"(?:FROM|JOIN|INTO|UPDATE)\s+&&?\w+", re.I)
@@ -824,11 +894,55 @@ def completeness_pass(est: Estate, key: str, owner: str, static: str) -> None:
         unverifiable(est, key, owner, "writes" if kw not in ("FROM", "JOIN") else "reads", "unparsed-operand", m.group(0) + nxt[:20])
 
 
+def sqlplus_directive_lineage(est: Estate, key: str, text: str, path: Path, owner: str) -> None:
+    """SQL*Plus lines that are lineage of the script itself: `@file` / `@@file` / `START file` include another script
+    (`@@` resolves against the calling script's directory; `@` and `START` against the working directory then SQLPATH,
+    which is statically unknown, so the script's directory stands in for both), `SPOOL file` writes a report file
+    (`SPOOL OFF|OUT` closes it), `HOST` / `!` / `$` run an OS command."""
+    for m in INCLUDE_RE.finditer(text):
+        target = m.group(2).strip("'\"")
+        if "&" in target:
+            est.edges.append(Edge(key, f"{owner}.<&include>", "includes", "INFERRED", "substitution-in-identifier", m.group(0).strip()))
+            continue
+        rel = Path(target if Path(target).suffix else target + ".sql")
+        resolved = path.parent / rel                      # `@@`: the caller's directory; `@` / START: cwd/SQLPATH stand-in
+        dst = f"{owner}.{rel.stem.upper()}"
+        how = "@@ (caller-relative)" if m.group(1) == "@@" else "@ / START (cwd, then SQLPATH)"
+        if resolved.is_file():
+            est.add(dst, "SQL FILE", resolved.name)         # a plain DDL/DML file has object rows but no script row yet
+            est.edges.append(Edge(key, dst, "includes", "FACT", "", how))
+        else:
+            est.add(dst, "SQL FILE", "-").status = "not-in-census"
+            est.edges.append(Edge(key, dst, "includes", "INFERRED", "missing-include", f"{how}: {target} not in repo"))
+    for m in SPOOL_RE.finditer(text):
+        target = m.group(1).strip("'\"")
+        if target.upper() in ("OFF", "OUT"):
+            continue
+        if "&" in target:
+            est.edges.append(Edge(key, f"{owner}.<&spool>", "writes", "INFERRED", "substitution-in-identifier", m.group(0).strip()))
+            continue
+        dst = f"FILE.{target.upper()}"
+        est.add(dst, "SPOOL FILE", "-").status = "external"
+        est.edges.append(Edge(key, dst, "writes", "FACT", "", "SPOOL target"))
+    for m in HOST_RE.finditer(text):
+        est.edges.append(Edge(key, "OS.<shell>", "calls", "INFERRED", "os-shell", m.group(0).strip()[:80]))
+
+
 def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str) -> None:
     owner = key.split(".")[0] if "." in key else default_owner
     # dynamic SQL first (on the raw text, so string-literal statements are visible)
     dyn_vars = {m.group(1).upper(): m.group(2) for m in DYN_ASSIGN_RE.finditer(text)}
-    assigned = {m.group(1).upper() for m in ANY_ASSIGN_RE.finditer(text)}
+    assigned_n = Counter(m.group(1).upper() for m in ANY_ASSIGN_RE.finditer(text))
+    assigned = set(assigned_n)
+    # a variable whose EVERY assignment is one complete literal holds static SQL: parse each literal as such; a literal
+    # assignment followed by any other assignment (`v := v || ...`, `v := build()`) is only a literal prefix -> INFERRED
+    whole_lits: dict[str, list[str]] = {}
+    for m in LIT_ASSIGN_RE.finditer(text):
+        whole_lits.setdefault(m.group(1).upper(), []).append(m.group(2))
+    for var, lits in list(whole_lits.items()):
+        if len(lits) != assigned_n[var] or var in dyn_vars:
+            dyn_vars.setdefault(var, lits[0])
+            del whole_lits[var]
     exec_imm_seen = 0
     for m in EXEC_IMM_RE.finditer(text):
         exec_imm_seen += 1
@@ -837,6 +951,9 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
             lineage_unit(est, key, cls, arg.strip("'").replace("''", "'"), default_owner)  # literal: parse as static
         elif arg.startswith("'"):
             unverifiable(est, key, owner, "writes", "dynamic-sql-expression", m.group(0))   # 'lit' || expr: shape unknown
+        elif arg.upper() in whole_lits:
+            for lit in whole_lits[arg.upper()]:
+                lineage_unit(est, key, cls, lit.strip("'").replace("''", "'"), default_owner)
         elif arg.upper() in dyn_vars:
             prefix = dyn_vars[arg.upper()]
             pm = re.search(rf"(INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO|FROM)\s+({QNAME})?", prefix, re.I)
@@ -851,7 +968,10 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
     for m in OPEN_FOR_RE.finditer(text):
         vm = OPEN_FOR_VAR_RE.match(text, m.start())
         lit = re.compile(r"OPEN\s+\w+\s+FOR\s+('(?:[^']|'')*')\s*(;|USING\b)", re.I).match(text, m.start())
-        if vm and vm.group(1).upper() in dyn_vars.keys() | assigned:
+        if vm and vm.group(1).upper() in whole_lits:
+            for lit in whole_lits[vm.group(1).upper()]:
+                lineage_unit(est, key, cls, lit.strip("'").replace("''", "'"), default_owner)
+        elif vm and vm.group(1).upper() in dyn_vars.keys() | assigned:
             est.edges.append(Edge(key, f"{owner}.<{vm.group(1).upper()}>", "reads", "INFERRED", "dynamic-sql", "OPEN ... FOR <variable>"))
         elif lit:
             lineage_unit(est, key, cls, lit.group(1).strip("'").replace("''", "'"), default_owner)
@@ -982,8 +1102,9 @@ def run(fixture_dir: Path, albion: Path | None) -> dict:
     # lineage
     for key, cls, text in proc_units + albion_units:
         lineage_unit(est, key, cls, text, key.split(".")[0])
-    for key, text in sqlplus_units:
+    for key, text, path in sqlplus_units:
         lineage_unit(est, key, "SQLPLUS_SCRIPT", text, key.split(".")[0])
+        sqlplus_directive_lineage(est, key, text, path, key.split(".")[0])
     if albion_units:
         # documented replication feed (architecture_overview.md / package header comment): GoldenGate copy of Teradata STG_POLICY_360
         est.add("TERADATA.STG_POLICY_360", "EXTERNAL_TABLE", "docs").status = "external"
@@ -1121,6 +1242,22 @@ NEGATIVE_CASES: dict[str, tuple[str, str]] = {
                                        "quoted-identifier"),
     "comma_join_table_function_second": ("CREATE OR REPLACE VIEW poladm.v_cf AS SELECT 1 FROM poladm.a x, fn_not_enumerated(x.id) f;",
                                          "table-function-not-in-census"),
+    # ruled DBMS_* calls whose naming arguments are not literals (or are missing): controlled uncertainty, never a crash
+    "sched_job_name_variable": ("DECLARE l_name VARCHAR2(30) := 'JOB_X'; BEGIN DBMS_SCHEDULER.CREATE_JOB(job_name => l_name,\n"
+                                "  job_type => 'PLSQL_BLOCK', job_action => 'BEGIN NULL; END;'); END;", "scheduler-name-not-literal"),
+    "sched_job_no_args": ("BEGIN DBMS_SCHEDULER.CREATE_JOB(); END;", "scheduler-name-not-literal"),
+    "sched_program_positional_variable_name": ("DECLARE p VARCHAR2(30); BEGIN DBMS_SCHEDULER.CREATE_PROGRAM(p, 'PLSQL_BLOCK', 'BEGIN NULL; END;'); END;",
+                                               "scheduler-name-not-literal"),
+    "sched_job_action_variable": ("DECLARE a VARCHAR2(200) := build_action(); BEGIN DBMS_SCHEDULER.CREATE_JOB('POLADM.JOB_A', 'PLSQL_BLOCK', a); END;",
+                                  "scheduler-action-not-literal"),
+    "sched_job_program_variable": ("DECLARE p VARCHAR2(30) := pick(); BEGIN DBMS_SCHEDULER.CREATE_JOB('POLADM.JOB_V', program_name => p); END;",
+                                   "scheduler-program-not-literal"),
+    "rls_policy_missing_args": ("BEGIN DBMS_RLS.ADD_POLICY('POLADM', 'T_V'); END;", "policy-call-not-literal"),
+    "rls_policy_function_variable": ("DECLARE f VARCHAR2(30) := 'FN'; BEGIN DBMS_RLS.ADD_POLICY(object_schema => 'POLADM', object_name => 'T_V',\n"
+                                     "  policy_name => 'POL_V', policy_function => f); END;", "policy-call-not-literal"),
+    "redact_policy_object_variable": ("DECLARE t VARCHAR2(30) := 'T_R'; BEGIN DBMS_REDACT.ADD_POLICY(object_schema => 'POLADM', object_name => t,\n"
+                                      "  policy_name => 'POL_R', column_name => 'NINO', function_type => DBMS_REDACT.FULL); END;", "policy-call-not-literal"),
+    "redact_policy_no_args": ("BEGIN DBMS_REDACT.ADD_POLICY; DBMS_REDACT.ADD_POLICY(); END;", "policy-call-not-literal"),
 }
 POSITIVE_TEXT = """
 CREATE TABLE poladm.t_ok (id NUMBER, d DATE);
@@ -1149,6 +1286,7 @@ class Case:
     want_nodes: set = field(default_factory=set)
     forbid_edges: set = field(default_factory=set)
     want_evidence: set = field(default_factory=set)   # (src, dst, kind, evidence, risk) that MUST exist exactly so
+    files: dict = field(default_factory=dict)        # extra {relative path: text} written next to the case's own file
 
 
 POSITIVE_CASES: dict[str, Case] = {
@@ -1457,6 +1595,101 @@ POSITIVE_CASES.update({
         want_evidence={("POLADM.P_STATUS", "POLADM.LOG_STATUS", "writes", "FACT", ""),
                        ("POLADM.P_ROW", "POLADM.LOG_STATUS", "writes", "INFERRED", "update-columns-unknown")},
     ),
+    "sched_positional_arguments": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.prc_p IS BEGIN INSERT INTO poladm.t_p VALUES (1); END;\n/\n"
+        "BEGIN\n"
+        "  DBMS_SCHEDULER.CREATE_PROGRAM('POLADM.PRG_P', 'PLSQL_BLOCK', 'BEGIN poladm.prc_p; END;', 0, TRUE, 'nightly');\n"
+        "  DBMS_SCHEDULER.CREATE_JOB('POLADM.JOB_P', 'POLADM.PRG_P', SYSTIMESTAMP, 'FREQ=DAILY; BYHOUR=2', NULL,\n"
+        "    'DEFAULT_JOB_CLASS', TRUE, TRUE, 'program-based, all positional');\n"
+        "  DBMS_SCHEDULER.CREATE_JOB('JOB_I', 'PLSQL_BLOCK', 'BEGIN prc_p; END;', 0, TO_TIMESTAMP_TZ('2026-01-01 02:00:00 UTC',\n"
+        "    'YYYY-MM-DD HH24:MI:SS TZR'), 'FREQ=HOURLY', NULL, 'DEFAULT_JOB_CLASS', FALSE);\n"
+        "  DBMS_SCHEDULER.CREATE_JOB('JOB_M', program_name => 'PRG_P', enabled => TRUE);\n"
+        "END;",
+        want={("POLADM.JOB_P", "POLADM.PRG_P", "schedules"), ("POLADM.PRG_P", "POLADM.PRC_P", "calls"),
+              ("POLADM.JOB_I", "POLADM.PRC_P", "calls"), ("POLADM.JOB_M", "POLADM.PRG_P", "schedules"),
+              ("POLADM.PRC_P", "POLADM.T_P", "writes")},
+        want_nodes={("POLADM.PRG_P", "SCHEDULER PROGRAM"), ("POLADM.JOB_P", "SCHEDULER JOB"), ("POLADM.JOB_I", "SCHEDULER JOB"),
+                    ("POLADM.JOB_M", "SCHEDULER JOB")},
+        forbid={"POLADM.SCHED_POSITIONAL_ARGUMENTS", "POLADM.PLSQL_BLOCK", "POLADM.SYSTIMESTAMP"},
+    ),
+    "policy_positional_and_defaulted_schema": Case(
+        "CREATE TABLE poladm.t_v (id NUMBER, nino VARCHAR2(9));\n"
+        "CREATE OR REPLACE FUNCTION poladm.fn_v (s IN VARCHAR2, o IN VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN '1=1'; END;\n/\n"
+        "BEGIN\n"
+        "  DBMS_RLS.ADD_POLICY('POLADM', 'T_V', 'POL_V', 'POLADM', 'FN_V', 'SELECT,UPDATE', FALSE, TRUE);\n"
+        "  DBMS_RLS.ADD_POLICY(object_name => 't_v', policy_name => 'POL_V2', policy_function => 'fn_v');\n"
+        "  DBMS_REDACT.ADD_POLICY('POLADM', 'T_V', 'RED_V', NULL, 'NINO', NULL, DBMS_REDACT.FULL, NULL, '1=1', TRUE);\n"
+        "  DBMS_REDACT.ADD_POLICY(object_name => 'T_V', policy_name => 'RED_V2', column_name => 'NINO', function_type => DBMS_REDACT.PARTIAL);\n"
+        "END;",
+        want={("POLADM.POL_V", "POLADM.T_V", "defines-on"), ("POLADM.POL_V", "POLADM.FN_V", "calls"),
+              ("POLADM.POL_V2", "POLADM.T_V", "defines-on"), ("POLADM.POL_V2", "POLADM.FN_V", "calls"),
+              ("POLADM.RED_V", "POLADM.T_V", "defines-on"), ("POLADM.RED_V2", "POLADM.T_V", "defines-on")},
+        want_nodes={("POLADM.POL_V", "VPD POLICY"), ("POLADM.POL_V2", "VPD POLICY"), ("POLADM.RED_V", "REDACTION POLICY"),
+                    ("POLADM.RED_V2", "REDACTION POLICY")},
+        forbid={"POLADM.POLICY_POSITIONAL_AND_DEFAULTED_SCHEMA", "POLADM.NULL"},
+    ),
+    "sqlplus_includes_spool_host": Case(
+        "SET ECHO OFF FEEDBACK OFF\n"
+        "WHENEVER SQLERROR EXIT FAILURE ROLLBACK\n"
+        "SPOOL run_all.log\n"
+        "@@01_tables\n"
+        "@lib/02_views.sql\n"
+        "START 03_loads 2026-01-01 100\n"
+        "  @@04_step.sql\n"
+        "@missing_child\n"
+        "HOST rm -f run_all.tmp\n"
+        "!ls -l\n"
+        "SELECT count(*) FROM poladm.t_i;\n"
+        "SPOOL OFF\n"
+        "EXIT\n",
+        files={
+            "01_tables.sql": "CREATE TABLE poladm.t_i (id NUMBER);\n",
+            "lib/02_views.sql": "CREATE OR REPLACE VIEW poladm.v_i AS SELECT id FROM poladm.t_i;\n",
+            "03_loads.sql": "INSERT INTO poladm.t_i SELECT 1 FROM dual;\nCOMMIT;\n",
+            "04_step.sql": "SPOOL &out\n@@05_leaf\nSPO OFF\n",
+            "05_leaf.sql": "CREATE TABLE poladm.t_leaf (id NUMBER);\n",
+        },
+        want={("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.01_TABLES", "includes"),
+              ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.02_VIEWS", "includes"),
+              ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.03_LOADS", "includes"),
+              ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.04_STEP", "includes"),
+              ("POLADM.04_STEP", "POLADM.05_LEAF", "includes"),
+              ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "FILE.RUN_ALL.LOG", "writes"),
+              ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.T_I", "reads")},
+        want_evidence={("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.01_TABLES", "includes", "FACT", ""),
+                       ("POLADM.04_STEP", "POLADM.05_LEAF", "includes", "FACT", ""),
+                       ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.MISSING_CHILD", "includes", "INFERRED", "missing-include"),
+                       ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "OS.<shell>", "calls", "INFERRED", "os-shell"),
+                       ("POLADM.04_STEP", "POLADM.<&spool>", "writes", "INFERRED", "substitution-in-identifier")},
+        want_nodes={("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "SQLPLUS_SCRIPT"), ("POLADM.04_STEP", "SQLPLUS_SCRIPT"),
+                    ("POLADM.01_TABLES", "SQL FILE"), ("POLADM.03_LOADS", "DML SCRIPT"), ("POLADM.02_VIEWS", "SQL FILE")},
+        forbid={"FILE.OFF", "POLADM.OFF", "POLADM.EXIT", "POLADM.RM"},
+    ),
+    "dynamic_sql_whole_literal_variables": Case(
+        "CREATE OR REPLACE PROCEDURE poladm.p_dyn (c OUT SYS_REFCURSOR, p IN NUMBER) IS\n"
+        "  l_sql VARCHAR2(4000);\n"
+        "  l_q   CLOB := 'SELECT id FROM poladm.t_q WHERE id = :1';\n"
+        "  l_d   VARCHAR2(200 CHAR) DEFAULT 'DELETE FROM poladm.t_d WHERE id = :1';\n"
+        "  l_pre VARCHAR2(4000);\n"
+        "  l_cat VARCHAR2(4000);\n"
+        "BEGIN\n"
+        "  l_sql := 'INSERT INTO poladm.t_dyn SELECT * FROM poladm.t_src WHERE x = ''lit''';\n"
+        "  EXECUTE IMMEDIATE l_sql;\n"
+        "  OPEN c FOR l_q USING p;\n"
+        "  OPEN c FOR l_q;\n"
+        "  EXECUTE IMMEDIATE l_d USING p;\n"
+        "  l_pre := 'SELECT * FROM poladm.t_pre';\n"
+        "  l_pre := l_pre || ' WHERE id = ' || p;\n"
+        "  EXECUTE IMMEDIATE l_pre;\n"
+        "  l_cat := 'DELETE FROM ' || 't_' || p;\n"
+        "  EXECUTE IMMEDIATE l_cat;\n"
+        "END;",
+        want={("POLADM.P_DYN", "POLADM.T_DYN", "writes"), ("POLADM.P_DYN", "POLADM.T_SRC", "reads"),
+              ("POLADM.P_DYN", "POLADM.T_Q", "reads"), ("POLADM.P_DYN", "POLADM.T_D", "writes")},
+        want_evidence={("POLADM.P_DYN", "POLADM.<L_PRE>", "reads", "INFERRED", "dynamic-sql"),
+                       ("POLADM.P_DYN", "POLADM.<L_CAT>", "writes", "INFERRED", "dynamic-sql")},
+        forbid={"POLADM.<L_SQL>", "POLADM.<L_Q>", "POLADM.<L_D>", "POLADM.T_PRE"},
+    ),
 })
 
 
@@ -1487,6 +1720,9 @@ def selftest() -> int:
             d = Path(td) / name
             d.mkdir()
             (d / f"{name}.sql").write_text(case.sql + "\n/\n")
+            for rel, body in case.files.items():
+                (d / rel).parent.mkdir(parents=True, exist_ok=True)
+                (d / rel).write_text(body)
             res = run(d, None)
             have = {(e.src, e.dst, e.kind) for e in res["edges"]}
             for w in sorted(case.want - have):

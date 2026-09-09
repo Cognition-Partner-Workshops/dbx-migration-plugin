@@ -1,7 +1,7 @@
 # oracle-plsql static round-trip report
 
 Fixture files: 15; census rows: 48 enumerated (+1 referenced-only) (DATABASE LINK 1, DML SCRIPT 1, FUNCTION 1, GRANT 8, INDEX 5, MATERIALIZED VIEW 1, MATERIALIZED VIEW LOG 2, PACKAGE 1, PACKAGE FUNCTION 2, PACKAGE PROCEDURE 2, PROCEDURE 1, PUBLIC SYNONYM 1, REDACTION POLICY 1, ROLE 2, ROLE MEMBERSHIP 2, SCHEDULER JOB 1, SCHEDULER PROGRAM 1, SEQUENCE 2, SQLPLUS_SCRIPT 1, SYNONYM 1, TABLE 6, TRIGGER 1, VIEW 3, VPD POLICY 1)
-Fixture edges: 56 = FACT 53, INFERRED 3, UNVERIFIABLE 0
+Fixture edges: 57 = FACT 53, INFERRED 4, UNVERIFIABLE 0
 
 Albion pkg_policy_inquiry.sql: census rows 3 enumerated (+3 referenced-only) (ODS.ODS_CLAIMS, ODS.ODS_POLICY_360, ODS.PKG_POLICY_INQUIRY, ODS.PKG_POLICY_INQUIRY.GET_PARTY_CLAIMS, ODS.PKG_POLICY_INQUIRY.GET_POLICY_SUMMARY, TERADATA.STG_POLICY_360)
 Albion edges: 3 = FACT 2, INFERRED 1, UNVERIFIABLE 0
@@ -13,6 +13,7 @@ Albion edges: 3 = FACT 2, INFERRED 1, UNVERIFIABLE 0
 | POLADM.PKG_POLICY_RENEWAL.ARCHIVE_TO | POLADM.<L_SQL> | writes | dynamic-sql | literal prefix "'INSERT INTO poladm.'" |
 | ODS.V_CLAIMS_REMOTE | CLAIMS.CLAIM@CLAIMS_LINK | reads | external-db-link |  |
 | POLADM.FN_BROKER_PREDICATE | ODS.V_BROKER_HIERARCHY | reads | dynamic-predicate | VPD predicate string |
+| POLADM.14_RPT_POLICY_PAGE | POLADM.<&spool> | writes | substitution-in-identifier | SPOOL &spool_file |
 | TERADATA.STG_POLICY_360 | ODS.ODS_POLICY_360 | replication | freshness | GoldenGate nightly copy, up to 26h stale (architecture_overview.md) |
 
 ## Nodes referenced but not enumerated (inventory gaps, not lineage uncertainty)
