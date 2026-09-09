@@ -21,7 +21,7 @@ import json
 import re
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +39,20 @@ SQLPLUS_DIRECTIVE = re.compile(
 INCLUDE_RE = re.compile(r"^\s*(@@|@|STA(?:RT)?\s+(?!WITH\b))\s*(\S+)", re.I | re.M)
 SPOOL_RE = re.compile(r"^\s*SPO(?:OL)?\s+(\S+)", re.I | re.M)
 HOST_RE = re.compile(r"^\s*(?:HO(?:ST)?\b|[!$])(.*)$", re.I | re.M)
+# repository files of the estate (SKILL.md section 1, Repo files row): Oracle source in any of the documented suffixes,
+# SQL*Loader control files, and shell wrappers that drive sqlplus / sqlldr / Data Pump
+SOURCE_SUFFIXES = {".sql", ".pks", ".pkb", ".pls", ".plb", ".prc", ".fnc", ".trg", ".vw", ".seq", ".ddl"}
+LOADER_SUFFIXES = {".ctl"}
+WRAPPER_SUFFIXES = {".sh", ".ksh"}
+WRAPPER_TOOL_RE = re.compile(r"\b(sqlplus|sqlldr|expdp|impdp)\b", re.I)
+# inside a shell wrapper: `sqlplus ... @path [args]`, `sqlldr ... control=path`, a here-document fed to sqlplus
+SHELL_INCLUDE_RE = re.compile(r"(?<![\w$])(@@?)([^\s'\"]+)")
+SHELL_CONTROL_RE = re.compile(r"\bcontrol\s*=\s*['\"]?([^\s'\"]+)", re.I)
+SHELL_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n\s*\1\s*$", re.S | re.M)
+SHELL_DATAPUMP_RE = re.compile(r"\b(expdp|impdp)\b[^\n]*", re.I)
+# SQL*Loader control file: `INFILE 'x.dat'` ("*" = inline data), `[INSERT|APPEND|REPLACE|TRUNCATE] INTO TABLE t`
+LOADER_INFILE_RE = re.compile(r"\bINFILE\s+(\*|'[^']*'|\"[^\"]*\"|\S+)", re.I)
+LOADER_INTO_RE = re.compile(r"\b(?:(INSERT|APPEND|REPLACE|TRUNCATE)\s+)?INTO\s+TABLE\s+(\S+)", re.I)
 IDENT = r"[A-Za-z_][A-Za-z0-9_$#]*"
 QNAME = rf"(?:{IDENT}\.)?{IDENT}"
 KEYWORDS = {
@@ -75,7 +89,7 @@ class Node:
 class Edge:
     src: str
     dst: str
-    kind: str                       # reads | writes | consumes-sequence | calls | schedules | defines-on | alias-of | replication
+    kind: str                       # reads | writes | consumes-sequence | calls | schedules | defines-on | alias-of | replication | includes | census
     evidence: str                   # FACT | INFERRED | UNVERIFIABLE
     risk: str = ""
     detail: str = ""
@@ -277,6 +291,30 @@ def norm(name: str, default_owner: str) -> str:
     return name
 
 
+def base_key(key: str) -> str:
+    """A census key without its overload signature: OWNER.PKG.M(NUMBER,DATE) -> OWNER.PKG.M."""
+    return key.split("(", 1)[0]
+
+
+def rel_name(path: Path, root: Path) -> str:
+    """The path of a repository file relative to the estate root (posix separators); the bare name outside the root."""
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return path.name
+
+
+def file_key(owner: str, path: Path, root: Path) -> str:
+    """Census key of a file-level unit (SQL*Plus script, loose DML script, shell wrapper, loader control file):
+    OWNER.<relative path, upper-cased, `.sql` dropped, any other suffix kept as `_PKB`>. Nested files keep their directory
+    (`OWNER.LIB/02_VIEWS`) so two `load.sql` in different folders never share one row, and `pkg.pks` / `pkg.pkb` stay two
+    rows (`OWNER.PKG_PKS`, `OWNER.PKG_PKB`); dots inside the name become '_' so a file never looks like a package member."""
+    rel = rel_name(path, root)
+    if path.suffix.lower() == ".sql":
+        rel = rel[: -len(path.suffix)]
+    return f"{owner}." + rel.upper().replace(".", "_")
+
+
 class Estate:
     def __init__(self) -> None:
         self.nodes: dict[str, Node] = {}
@@ -400,27 +438,120 @@ def uncovered(text: str, covered: list[tuple[int, int]]) -> str:
     return "".join(out)
 
 
-def package_members(unit_text: str) -> list[tuple[str, str, int, int]]:
-    """(NAME, PROCEDURE|FUNCTION, start, end) of the top-level members of a package spec or body. A declaration
-    (`PROCEDURE p(...);`: spec entries, body forward declarations) ends at its ';'; an implementation (`... IS|AS ...`)
-    ends at its `END p;` and owns its nested local subprograms. An implementation closed by a bare `END;` ends at the
-    next member header (or the unit end) instead."""
-    out: list[tuple[str, str, int, int]] = []
+FORMAL_RE = re.compile(
+    rf"^\s*{IDENT}\s+(?:IN\s+OUT\s+|IN\s+|OUT\s+)?(?:NOCOPY\s+)?(.+?)\s*(?:(?::=|\bDEFAULT\b)\s*(.*))?$", re.I | re.S)
+
+
+@dataclass
+class Formal:
+    type: str          # normalised type: upper-cased, length/precision dropped (VARCHAR2, NUMBER, POLICY.ID%TYPE, ...)
+    optional: bool     # has a DEFAULT / := value
+
+
+def member_signature(header: str) -> list[Formal]:
+    """Formals of a subprogram header (the text after the member name up to IS|AS or ';'): `(a IN NUMBER, b VARCHAR2
+    DEFAULT 'x')` -> [NUMBER, VARCHAR2?]. A header without a parenthesis has no formals."""
+    op = header.find("(")
+    if op < 0:
+        return []
+    out: list[Formal] = []
+    for part in split_top_level(call_args(header, op)):
+        fm = FORMAL_RE.match(part)
+        if not fm or not part.strip():
+            continue
+        typ = re.sub(r"\s*\([^)]*\)", "", fm.group(1)).strip().upper()
+        typ = re.sub(r"\s+(BYTE|CHAR)$", "", re.sub(r"\s+", " ", typ))
+        out.append(Formal(typ, fm.group(2) is not None))
+    return out
+
+
+def signature_text(sig: list[Formal]) -> str:
+    return "(" + ",".join(f.type + ("?" if f.optional else "") for f in sig) + ")"
+
+
+@dataclass
+class Member:
+    name: str          # upper-cased member name
+    cls: str           # PROCEDURE | FUNCTION
+    sig: list[Formal]
+    start: int
+    end: int
+
+
+def package_members(unit_text: str) -> list[Member]:
+    """Top-level members of a package spec or body with their formal signature. A declaration (`PROCEDURE p(...);`:
+    spec entries, body forward declarations) ends at its ';'; an implementation (`... IS|AS ...`) ends at its `END p;`
+    and owns its nested local subprograms. An implementation closed by a bare `END;` ends at the next member header
+    (or the unit end) instead."""
+    out: list[Member] = []
     pos = 0
     for mm in MEMBER_RE.finditer(unit_text):
         if mm.start() < pos:
             continue
         name = mm.group(2)
-        after = mm.end() + len(top_level_cut(unit_text[mm.end():], MEMBER_HEAD_STOP_RE))
+        header = top_level_cut(unit_text[mm.end():], MEMBER_HEAD_STOP_RE)
+        after = mm.end() + len(header)
         if after >= len(unit_text) or unit_text[after] == ";":
             end = after + 1
         else:
             em = re.compile(rf"\bEND\s+{re.escape(name)}\s*;", re.I).search(unit_text, after)
             nxt = MEMBER_RE.search(unit_text, after)
             end = em.end() if em else (nxt.start() if nxt else len(unit_text))
-        out.append((name.upper(), mm.group(1).upper(), mm.start(), end))
+        out.append(Member(name.upper(), mm.group(1).upper(), member_signature(header), mm.start(), end))
         pos = end
     return out
+
+
+def register_members(est: Estate, pending: list[tuple[str, Member, str, str]], proc_units: list) -> None:
+    """Census rows for package members once every file is read (a spec and its body may live in different files):
+    a name declared with one signature is `OWNER.PKG.M`; a name overloaded inside its package gets one row per distinct
+    signature, `OWNER.PKG.M(NUMBER,VARCHAR2?)`, so the effects of each overload stay apart. Every declaration and
+    implementation of the same signature is one lineage unit."""
+    by_name: dict[tuple[str, str], list[tuple[str, Member, str, str]]] = {}
+    for pkg_key, mem, fname, text in pending:
+        by_name.setdefault((pkg_key, mem.name), []).append((pkg_key, mem, fname, text))
+    for (pkg_key, name), items in by_name.items():
+        sigs = {signature_text(m.sig) for _, m, _, _ in items}
+        for pkg_key, mem, fname, text in items:
+            key = f"{pkg_key}.{name}" + (signature_text(mem.sig) if len(sigs) > 1 else "")
+            node = est.add(key, f"PACKAGE {mem.cls}", fname)
+            node.signals["signature"] = signature_text(mem.sig)
+            if len(sigs) > 1:
+                node.signals["overloaded"] = True
+            proc_units.append((key, f"PACKAGE {mem.cls}", text))
+
+
+NUMERIC_TYPES = {"NUMBER", "INTEGER", "INT", "PLS_INTEGER", "BINARY_INTEGER", "NATURAL", "POSITIVE", "FLOAT", "BINARY_DOUBLE",
+                 "BINARY_FLOAT", "SIMPLE_INTEGER", "DEC", "DECIMAL", "NUMERIC", "REAL", "SMALLINT"}
+STRING_TYPES = {"VARCHAR2", "VARCHAR", "NVARCHAR2", "CHAR", "NCHAR", "CLOB", "NCLOB", "STRING", "LONG"}
+
+
+def resolve_overload(est: Estate, callee: str, actuals: list[str]) -> tuple[str | None, str]:
+    """Pick the overload of `callee` (a base key OWNER.PKG.M with overloaded rows in the census) that the call's actuals
+    can bind to. (key, '') when exactly one binds; (None, 'ambiguous-overload') when several or none do. Binding uses
+    arity (required <= positional + named actuals <= formals) and the literal type of each positional actual (a quoted
+    literal never binds a numeric formal, a numeric literal never a string one); a variable actual carries no static
+    type, so two same-arity overloads it could bind stay ambiguous."""
+    cands = [k for k, n in est.nodes.items() if base_key(k) == callee and "(" in k and n.signals.get("overloaded")]
+    if not cands:
+        return None, ""
+    named = [a for a in actuals if "=>" in a]
+    positional = [a.strip() for a in actuals if "=>" not in a and a.strip()]
+    fits: list[str] = []
+    for k in cands:
+        sig = [Formal(t.rstrip("?"), t.endswith("?")) for t in k[k.index("(") + 1:-1].split(",") if t]
+        required = sum(not f.optional for f in sig)
+        if len(positional) + len(named) > len(sig) or len(positional) + len(named) < required:
+            continue
+        ok = True
+        for a, f in zip(positional, sig, strict=False):    # positional actuals never outnumber the formals here
+            if a.startswith("'") and f.type.split(" ")[0] in NUMERIC_TYPES:
+                ok = False
+            if re.fullmatch(r"-?\d+(\.\d+)?", a) and f.type.split(" ")[0] in STRING_TYPES:
+                ok = False
+        if ok:
+            fits.append(k)
+    return (fits[0], "") if len(fits) == 1 else (None, "ambiguous-overload")
 
 
 def loose_unit_class(loose_static: str) -> str:
@@ -437,22 +568,99 @@ def loose_unit_class(loose_static: str) -> str:
     return "PLSQL SCRIPT" if re.search(r"\bBEGIN\b", loose_static, re.I) else "SQL SCRIPT"
 
 
-def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list, proc_units: list, deferred: list) -> None:
-    """`deferred` collects (src, raw_dst, kind, owner) edges whose target may be enumerated by a later file (grants,
-    index base tables, synonym targets); `run` resolves them after the whole census."""
+@dataclass
+class Census:
+    """Everything a census pass collects for the lineage pass that follows it."""
+    sqlplus_units: list = field(default_factory=list)   # (key, text, path, root)
+    proc_units: list = field(default_factory=list)      # (key, cls, text)
+    deferred: list = field(default_factory=list)        # (src, raw_dst, kind, owner): targets a later file may enumerate
+    members: list = field(default_factory=list)         # (pkg_key, Member, fname, text): rows made once all files are read
+    wrapper_units: list = field(default_factory=list)   # (key, text, path, root)
+    seen: set = field(default_factory=set)              # resolved paths already censused
+    covered_files: set = field(default_factory=set)     # relative names of files that yielded a row or a lineage unit
+
+
+def discover(root: Path) -> list[Path]:
+    """Repository files of an estate (SKILL.md section 1, Repo files row), recursively: every Oracle source suffix, SQL*Loader
+    control files, and shell wrappers that invoke sqlplus / sqlldr / expdp / impdp. Sorted by relative path so the
+    census order is stable."""
+    out: list[Path] = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        if suf in SOURCE_SUFFIXES or suf in LOADER_SUFFIXES:
+            out.append(p)
+        elif suf in WRAPPER_SUFFIXES and WRAPPER_TOOL_RE.search(p.read_text(errors="replace")):
+            out.append(p)
+    return out
+
+
+def census_path(est: Estate, path: Path, default_owner: str, root: Path, c: Census) -> None:
+    """Census one repository file by its kind (Oracle source, loader control file, shell wrapper); idempotent per path."""
+    rp = path.resolve()
+    if rp in c.seen:
+        return
+    c.seen.add(rp)
+    before = (len(est.nodes), len(c.members), len(c.proc_units), len(c.sqlplus_units), len(c.wrapper_units))
+    suf = path.suffix.lower()
+    if suf in LOADER_SUFFIXES:
+        census_loader(est, path, default_owner, root)
+    elif suf in WRAPPER_SUFFIXES:
+        census_wrapper(est, path, default_owner, root, c)
+    else:
+        census_file(est, path, default_owner, root, c)
+    if (len(est.nodes), len(c.members), len(c.proc_units), len(c.sqlplus_units), len(c.wrapper_units)) != before:
+        c.covered_files.add(rel_name(path, root))
+
+
+def census_loader(est: Estate, path: Path, default_owner: str, root: Path) -> None:
+    """SQL*Loader control file: one `SQLLDR CONTROL` row; `INTO TABLE t` is a write (REPLACE/TRUNCATE also delete), `INFILE
+    'x'` a read of an external file node (`INFILE *` is inline data). A control file naming no table is UNVERIFIABLE."""
+    text = strip_comments(path.read_text())
+    key = file_key(default_owner, path, root)
+    est.add(key, "SQLLDR CONTROL", rel_name(path, root))
+    for m in LOADER_INFILE_RE.finditer(text):
+        src = unquote(m.group(1)).strip('"')
+        if src == "*":
+            continue
+        est.add(f"FILE.{src.upper()}", "EXTERNAL FILE", "-").status = "external"
+        est.edges.append(Edge(key, f"FILE.{src.upper()}", "reads", "FACT", "", "SQL*Loader INFILE"))
+    targets = list(LOADER_INTO_RE.finditer(text))
+    if not targets:
+        unverifiable(est, key, default_owner, "writes", "loader-target-not-found", text[:120])
+    for m in targets:
+        mode = (m.group(1) or "INSERT").upper()
+        ops = "INSERT" if mode in ("INSERT", "APPEND") else "INSERT,DELETE"
+        est.edge(key, m.group(2).strip('"'), "writes", default_owner, f"SQL*Loader {mode}", ops=ops)
+
+
+def census_wrapper(est: Estate, path: Path, default_owner: str, root: Path, c: Census) -> None:
+    """Shell wrapper (.sh/.ksh) that drives sqlplus / sqlldr / Data Pump: one `SHELL WRAPPER` row whose lineage is drawn by
+    `wrapper_lineage` after the census (its include targets are censused first, like nested SQL*Plus includes)."""
+    raw = path.read_text(errors="replace")
+    key = file_key(default_owner, path, root)
+    est.add(key, "SHELL WRAPPER", rel_name(path, root), lines=len(raw.splitlines()),
+            tools=sorted({m.group(1).lower() for m in WRAPPER_TOOL_RE.finditer(raw)}))
+    c.wrapper_units.append((key, raw, path, root))
+
+
+def census_file(est: Estate, path: Path, default_owner: str, root: Path, c: Census) -> None:
+    """Census of one Oracle source file: object rows, deferred cross-file edges, lineage units (see `Census`)."""
+    proc_units, deferred = c.proc_units, c.deferred
     raw = path.read_text()
     text = normalize_qquotes(strip_comments(raw))
     # same offsets as `text`, string literals blanked: object headers are never matched inside a literal
     blanked = STRING_LIT_RE.sub(lambda m: "'" + " " * (len(m.group(0)) - 2) + "'", text)
     spans = unit_spans(text)
     covered: list[tuple[int, int]] = []       # spans whose lineage belongs to a named unit, not to the file's loose DML
-    fname = path.name
+    fname = rel_name(path, root)
+    script_key = file_key(default_owner, path, root)
     is_sqlplus = any(SQLPLUS_DIRECTIVE.match(ln) for ln in raw.splitlines())
     if is_sqlplus:
-        key = f"{default_owner}.{path.stem.upper()}"
-        est.add(key, "SQLPLUS_SCRIPT", fname,
+        est.add(script_key, "SQLPLUS_SCRIPT", fname,
                 lines=len(raw.splitlines()), substitution_vars=len(set(re.findall(r"&&?(\w+)", raw))))
-        sqlplus_units.append((key, text, path))
+        c.sqlplus_units.append((script_key, text, path, root))
     for m in PUBLIC_SYN_RE.finditer(blanked):
         est.public_synonyms[m.group(1).upper()] = norm(m.group(2).split("@")[0], default_owner) + (
             "@" + m.group(2).split("@")[1].upper() if "@" in m.group(2) else "")
@@ -483,6 +691,8 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
             continue
         key = norm(name, default_owner)
         node = est.add(key, cls, fname)
+        if cls == "PACKAGE" and node.cls == "PACKAGE BODY":
+            node.cls, node.file = cls, fname            # the spec is the object whichever file the census read first
         if cls == "TABLE":
             body = text[m.end():stmt_end]
             cols = re.findall(r"^\s*(\w+)\s+(NUMBER(?!\s*\()|NUMBER\s*\([^)]*\)|DATE|CHAR\s*\(\d+\)|TIMESTAMP[^,]*|RAW\s*\(\d+\)|CLOB|BINARY_DOUBLE|INTERVAL[^,]*)",
@@ -513,10 +723,9 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
                 # each member's body is its own lineage unit (callers resolve to OWNER.PKG.MEMBER); package-level
                 # declarations (constants, cursors, state) and the initialization block stay on the package node
                 members = package_members(unit_text)
-                for mname, mcls, s, e in members:
-                    est.add(f"{key}.{mname}", f"PACKAGE {mcls}", fname)
-                    proc_units.append((f"{key}.{mname}", f"PACKAGE {mcls}", unit_text[s:e]))
-                proc_units.append((key, cls, uncovered(unit_text, [(s, e) for _, _, s, e in members])))
+                for mem in members:
+                    c.members.append((key, mem, fname, unit_text[mem.start:mem.end]))
+                proc_units.append((key, cls, uncovered(unit_text, [(mem.start, mem.end) for mem in members])))
             else:
                 proc_units.append((key, cls, unit_text))
         if cls in ("VIEW", "MATERIALIZED VIEW"):
@@ -525,7 +734,6 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
             if cls == "MATERIALIZED VIEW":
                 node.signals["refresh"] = " ".join(re.findall(r"REFRESH\s+(\w+)\s+ON\s+(\w+)", unit_text, re.I)[0]) if re.search(
                     r"REFRESH\s+\w+\s+ON", unit_text, re.I) else "?"
-    script_key = f"{default_owner}.{path.stem.upper()}"
 
     def unparsed_call(kind: str, risk: str, call_text: str) -> None:
         # the call is real lineage the static model cannot name: the file becomes the script unit that carries it
@@ -602,9 +810,8 @@ def census_file(est: Estate, path: Path, default_owner: str, sqlplus_units: list
     loose = uncovered(text, covered)
     loose_cls = "" if is_sqlplus else loose_unit_class(STRING_LIT_RE.sub("''", loose))
     if loose_cls:
-        key = f"{default_owner}.{path.stem.upper()}"
-        est.add(key, loose_cls, fname)
-        proc_units.append((key, loose_cls, loose))
+        est.add(script_key, loose_cls, fname)
+        proc_units.append((script_key, loose_cls, loose))
 
 
 # --------------------------------------------------------------------------- lineage (section 2)
@@ -894,26 +1101,69 @@ def completeness_pass(est: Estate, key: str, owner: str, static: str) -> None:
         unverifiable(est, key, owner, "writes" if kw not in ("FROM", "JOIN") else "reads", "unparsed-operand", m.group(0) + nxt[:20])
 
 
-def sqlplus_directive_lineage(est: Estate, key: str, text: str, path: Path, owner: str) -> None:
-    """SQL*Plus lines that are lineage of the script itself: `@file` / `@@file` / `START file` include another script
-    (`@@` resolves against the calling script's directory; `@` and `START` against the working directory then SQLPATH,
-    which is statically unknown, so the script's directory stands in for both), `SPOOL file` writes a report file
-    (`SPOOL OFF|OUT` closes it), `HOST` / `!` / `$` run an OS command."""
-    for m in INCLUDE_RE.finditer(text):
+def include_targets(text: str, path: Path, shell: bool = False) -> list[tuple[str, str, Path | None]]:
+    """(directive, target as written, resolved path or None) for every `@file` / `@@file` / `START file` of a SQL*Plus
+    script (or the `@file` arguments of a shell wrapper). A target carrying a substitution / shell variable resolves to
+    None. `@@` resolves against the calling script's directory; `@` and `START` against the working directory then
+    SQLPATH, which is statically unknown, so the script's directory stands in for both."""
+    out: list[tuple[str, str, Path | None]] = []
+    for m in (SHELL_INCLUDE_RE if shell else INCLUDE_RE).finditer(text):
         target = m.group(2).strip("'\"")
-        if "&" in target:
-            est.edges.append(Edge(key, f"{owner}.<&include>", "includes", "INFERRED", "substitution-in-identifier", m.group(0).strip()))
+        if "&" in target or (shell and "$" in target):
+            out.append((m.group(1), target, None))
             continue
         rel = Path(target if Path(target).suffix else target + ".sql")
-        resolved = path.parent / rel                      # `@@`: the caller's directory; `@` / START: cwd/SQLPATH stand-in
-        dst = f"{owner}.{rel.stem.upper()}"
-        how = "@@ (caller-relative)" if m.group(1) == "@@" else "@ / START (cwd, then SQLPATH)"
+        out.append((m.group(1).strip(), target, path.parent / rel))
+    return out
+
+
+def include_edges(est: Estate, key: str, text: str, path: Path, root: Path, owner: str, shell: bool = False) -> None:
+    """`includes` edges of a script / wrapper (see include_targets): FACT to the included file's own row (censused by
+    `run` before this pass), INFERRED `missing-include` when the file is not in the repository."""
+    for directive, target, resolved in include_targets(text, path, shell):
+        if resolved is None:
+            est.edges.append(Edge(key, f"{owner}.<&include>", "includes", "INFERRED", "substitution-in-identifier", f"{directive}{target}"))
+            continue
+        dst = file_key(owner, resolved, root)
+        how = "@@ (caller-relative)" if directive.startswith("@@") else "@ / START (cwd, then SQLPATH)"
         if resolved.is_file():
-            est.add(dst, "SQL FILE", resolved.name)         # a plain DDL/DML file has object rows but no script row yet
+            est.add(dst, "SQL FILE", rel_name(resolved, root))   # a plain DDL/DML file has object rows but no script row yet
             est.edges.append(Edge(key, dst, "includes", "FACT", "", how))
         else:
             est.add(dst, "SQL FILE", "-").status = "not-in-census"
             est.edges.append(Edge(key, dst, "includes", "INFERRED", "missing-include", f"{how}: {target} not in repo"))
+
+
+def wrapper_lineage(est: Estate, key: str, text: str, path: Path, root: Path, owner: str) -> None:
+    """Shell wrapper lineage: `sqlplus ... @script` includes the script, `sqlldr ... control=f.ctl` calls the control
+    file's row, a here-document fed to sqlplus is parsed as the wrapper's own SQL, and expdp / impdp is an INFERRED
+    Data Pump copy whose object list the static model does not read."""
+    include_edges(est, key, text, path, root, owner, shell=True)
+    for m in SHELL_CONTROL_RE.finditer(text):
+        target = m.group(1)
+        if "$" in target:
+            est.edges.append(Edge(key, f"{owner}.<$control>", "calls", "INFERRED", "substitution-in-identifier", m.group(0)))
+            continue
+        resolved = path.parent / target
+        dst = file_key(owner, resolved, root)
+        if resolved.is_file():
+            est.edges.append(Edge(key, dst, "calls", "FACT", "", "sqlldr control file"))
+        else:
+            est.add(dst, "SQLLDR CONTROL", "-").status = "not-in-census"
+            est.edges.append(Edge(key, dst, "calls", "INFERRED", "missing-include", f"{target} not in repo"))
+    for m in SHELL_HEREDOC_RE.finditer(text):
+        body = normalize_qquotes(strip_comments(m.group(2)))
+        if any(SQLPLUS_DIRECTIVE.match(ln) for ln in body.splitlines()):
+            include_edges(est, key, body, path, root, owner)
+            sqlplus_directive_lineage(est, key, body, owner)
+        lineage_unit(est, key, "SQLPLUS_SCRIPT", body, owner)
+    for m in SHELL_DATAPUMP_RE.finditer(text):
+        est.edges.append(Edge(key, f"OS.<{m.group(1).lower()}>", "calls", "INFERRED", "datapump", m.group(0).strip()[:80]))
+
+
+def sqlplus_directive_lineage(est: Estate, key: str, text: str, owner: str) -> None:
+    """SQL*Plus lines that are lineage of the script itself besides includes (include_edges): `SPOOL file` writes a
+    report file (`SPOOL OFF|OUT` closes it), `HOST` / `!` / `$` run an OS command."""
     for m in SPOOL_RE.finditer(text):
         target = m.group(1).strip("'\"")
         if target.upper() in ("OFF", "OUT"):
@@ -1047,6 +1297,18 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
             unverifiable(est, key, owner, "calls", "external-side-effect-package", callee)
             continue
         cand = callee if callee in est.nodes else None
+        actuals = split_top_level(call_args(static, m.end() - 1))
+        if cand is None:
+            # an overloaded member: bind the actuals to exactly one signature or record the ambiguity
+            for full in ([callee] if callee.count(".") == 2 else [f"{owner}.{callee}"]):
+                ov, risk = resolve_overload(est, full, actuals)
+                if ov:
+                    cand = ov
+                elif risk:
+                    unverifiable(est, key, owner, "calls", risk, callee + "(" + ", ".join(a.strip() for a in actuals) + ")")
+                    cand = ""
+            if cand == "":
+                continue
         if cand is None and callee.count(".") == 2 and ".".join(callee.split(".")[:2]) in est.nodes:
             cand = callee  # package member not declared separately
         if cand is None and callee.count(".") == 1 and f"{owner}.{callee}" in est.nodes:
@@ -1066,13 +1328,20 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
     # an unqualified name resolves to a member of the enclosing package first (a sibling from inside a member, an own
     # member from the package-level code), then to a same-schema routine
     pkg = ""
-    if key.count(".") == 2:
-        pkg = key.rsplit(".", 1)[0]
+    if base_key(key).count(".") == 2:
+        pkg = base_key(key).rsplit(".", 1)[0]
     elif est.nodes.get(key) and est.nodes[key].cls in ("PACKAGE", "PACKAGE BODY"):
         pkg = key
     for m in UNQUAL_CALL_RE.finditer(static):
+        if preceding_word(static, m.start()) in ("PROCEDURE", "FUNCTION"):
+            continue                                     # the unit's own header, not a call
         cands = ([f"{pkg}.{m.group(1).upper()}"] if pkg else []) + [f"{owner}.{m.group(1).upper()}"]
         cand = next((c for c in cands if c in est.nodes and est.nodes[c].cls in PROCEDURAL_CLASSES), None)
+        if cand is None and pkg:
+            actuals = split_top_level(call_args(static, m.end() - 1))
+            cand, risk = resolve_overload(est, f"{pkg}.{m.group(1).upper()}", actuals)
+            if risk:
+                unverifiable(est, key, owner, "calls", risk, m.group(1) + "(" + ", ".join(a.strip() for a in actuals) + ")")
         if cand and cand != key and not key.startswith(cand + "."):
             est.edges.append(Edge(key, cand, "calls", "FACT", "", "unqualified call resolved against the census"))
     for m in PARENLESS_CALL_RE.finditer(static):
@@ -1081,30 +1350,70 @@ def lineage_unit(est: Estate, key: str, cls: str, text: str, default_owner: str)
             continue
         cands = [callee, f"{owner}.{callee}"] + ([f"{pkg}.{callee}"] if pkg else [])
         cand = next((c for c in cands if c in est.nodes and est.nodes[c].cls in PROCEDURAL_CLASSES), None)
+        if cand is None:
+            for full in cands:
+                cand, risk = resolve_overload(est, full, [])
+                if risk:
+                    unverifiable(est, key, owner, "calls", risk, callee)
+                if cand or risk:
+                    break
         if cand and cand != key and not key.startswith(cand + "."):
             est.edges.append(Edge(key, cand, "calls", "FACT", "", "call statement without argument list"))
     completeness_pass(est, key, owner, static)
 
 
+def census_includes(est: Estate, c: Census) -> None:
+    """Census every file a SQL*Plus script or shell wrapper includes that discovery did not already read (an include with
+    a suffix outside section 1, or a target outside the estate root), so nested includes become census and lineage units
+    and not just referenced-only rows. Loops until no script names an uncensused existing file."""
+    done = 0
+    while True:
+        units = [(k, t, p, r, False) for k, t, p, r in c.sqlplus_units] + [(k, t, p, r, True) for k, t, p, r in c.wrapper_units]
+        if done >= len(units):
+            return
+        for key, text, path, root, shell in units[done:]:
+            done += 1
+            targets = include_targets(text, path, shell)
+            if shell:
+                targets += [("control=", m.group(1), None if "$" in m.group(1) else path.parent / m.group(1)) for m in SHELL_CONTROL_RE.finditer(text)]
+            for _, _, resolved in targets:
+                if resolved is not None and resolved.is_file():
+                    census_path(est, resolved, key.split(".")[0], root, c)
+
+
 def run(fixture_dir: Path, albion: Path | None) -> dict:
     est = Estate()
-    sqlplus_units: list = []
-    proc_units: list = []
-    deferred: list = []
-    files = sorted(fixture_dir.glob("*.sql"))
+    c = Census()
+    files = discover(fixture_dir)
     for p in files:
-        census_file(est, p, "POLADM", sqlplus_units, proc_units, deferred)
+        census_path(est, p, "POLADM", fixture_dir, c)
     albion_units: list = []
     if albion and albion.exists():
-        census_file(est, albion, "ODS", [], albion_units, deferred)
-    for key, obj, kind, owner in deferred:  # resolved after the whole census so cross-file targets land on enumerated nodes
+        ac = Census()
+        census_file(est, albion, "ODS", albion.parent, ac)
+        register_members(est, ac.members, ac.proc_units)
+        albion_units = ac.proc_units
+        c.deferred += ac.deferred
+    census_includes(est, c)
+    register_members(est, c.members, c.proc_units)   # after every file: a spec and its body may sit in different files
+    for key, obj, kind, owner in c.deferred:  # resolved after the whole census so cross-file targets land on enumerated nodes
         est.edge(key, obj, kind, owner)
     # lineage
-    for key, cls, text in proc_units + albion_units:
+    for key, cls, text in c.proc_units + albion_units:
         lineage_unit(est, key, cls, text, key.split(".")[0])
-    for key, text, path in sqlplus_units:
+    for key, text, path, root in c.sqlplus_units:
         lineage_unit(est, key, "SQLPLUS_SCRIPT", text, key.split(".")[0])
-        sqlplus_directive_lineage(est, key, text, path, key.split(".")[0])
+        include_edges(est, key, text, path, root, key.split(".")[0])
+        sqlplus_directive_lineage(est, key, text, key.split(".")[0])
+    for key, text, path, root in c.wrapper_units:
+        wrapper_lineage(est, key, text, path, root, key.split(".")[0])
+    # every discovered file with any content must have produced a census row: a file the rules cannot classify is a
+    # visible inventory gap, never a silently dropped unit
+    censused_files = {n.file for n in est.nodes.values()} | c.covered_files
+    for p in files:
+        rel = rel_name(p, fixture_dir)
+        if rel not in censused_files and strip_comments(p.read_text(errors="replace")).strip():
+            unverifiable(est, file_key("POLADM", p, fixture_dir), "POLADM", "census", "file-not-censused", rel)
     if albion_units:
         # documented replication feed (architecture_overview.md / package header comment): GoldenGate copy of Teradata STG_POLICY_360
         est.add("TERADATA.STG_POLICY_360", "EXTERNAL_TABLE", "docs").status = "external"
@@ -1113,7 +1422,7 @@ def run(fixture_dir: Path, albion: Path | None) -> dict:
     dedupe_edges(est)
     trigger_fan_out(est)
     dedupe_edges(est)
-    return {"nodes": est.nodes, "edges": est.edges, "files": [p.name for p in files], "albion": bool(albion_units)}
+    return {"nodes": est.nodes, "edges": est.edges, "files": [rel_name(p, fixture_dir) for p in files], "albion": bool(albion_units)}
 
 
 def dedupe_edges(est: Estate) -> None:
@@ -1151,34 +1460,45 @@ def side_effect_closure(est: Estate, root: str) -> list[Edge]:
 def trigger_fan_out(est: Estate) -> None:
     """Writers of a trigger's base table inherit the trigger's full side-effect closure (section 2 trigger row).
 
-    Iterates to a fixed point so a trigger whose closure writes a second triggered table cascades too; the
-    per-trigger closure is cycle-safe (visited set) and the outer loop stops when no new edge appears.
+    Worklist to a true fixed point: every trigger is processed once, and is re-queued only when a new edge can change
+    what it propagates (a writer gained a write of its base table, or a node inside its closure gained an effect).
+    The per-trigger closure is cycle-safe (visited set) and every re-queue follows a strictly new (src, dst, kind)
+    edge, of which there are finitely many, so the loop terminates without an iteration cap; a mutually triggering
+    pair (t_a -> t_b -> t_a) settles once both closures are complete.
     """
-    for _ in range(32):
-        added = 0
-        triggers = [e for e in est.edges if e.kind == "defines-on" and est.nodes.get(e.src) and est.nodes[e.src].cls == "TRIGGER"]
-        existing = {(e.src, e.dst, e.kind) for e in est.edges}
-        for t in triggers:
-            closure = [c for c in side_effect_closure(est, t.src) if c.dst != t.dst]
-            # only writers whose DML events (and, for UPDATE OF, columns) the trigger declares fire it; a write of
-            # unknown shape is assumed to fire, an UPDATE with an unreadable SET list fires as INFERRED
-            writers: dict[str, str] = {}
-            for w in est.edges:
-                if w.kind != "writes" or w.dst != t.dst or w.src == t.src:
+    triggers = {e.src: e for e in est.edges if e.kind == "defines-on" and est.nodes.get(e.src) and est.nodes[e.src].cls == "TRIGGER"}
+    existing = {(e.src, e.dst, e.kind) for e in est.edges}
+    reach: dict[str, set[str]] = {}                 # trigger -> nodes whose effects its closure carries
+    queue = deque(triggers)
+    queued = set(triggers)
+    while queue:
+        tk = queue.popleft()
+        queued.discard(tk)
+        t = triggers[tk]
+        closure = [c for c in side_effect_closure(est, tk) if c.dst != t.dst]
+        reach[tk] = {c.src for c in closure} | {tk}
+        # only writers whose DML events (and, for UPDATE OF, columns) the trigger declares fire it; a write of
+        # unknown shape is assumed to fire, an UPDATE with an unreadable SET list fires as INFERRED
+        writers: dict[str, str] = {}
+        for w in est.edges:
+            if w.kind != "writes" or w.dst != t.dst or w.src == tk:
+                continue
+            fires, risk = ops_fire(t.ops, w.ops)
+            if fires and (w.src not in writers or not risk):
+                writers[w.src] = risk
+        for w, risk in writers.items():
+            for c in closure:
+                if w in (c.src, c.dst) or (w, c.dst, c.kind) in existing:
                     continue
-                fires, risk = ops_fire(t.ops, w.ops)
-                if fires and (w.src not in writers or not risk):
-                    writers[w.src] = risk
-            for w, risk in writers.items():
-                for c in closure:
-                    if w in (c.src, c.dst) or (w, c.dst, c.kind) in existing:
+                via = f"trigger fan-out via {tk}" + (f" -> {c.src}" if c.src != tk else "")
+                est.edges.append(Edge(w, c.dst, c.kind, "INFERRED" if risk else "FACT", risk, via, c.ops))
+                existing.add((w, c.dst, c.kind))
+                for ok, o in triggers.items():
+                    if ok in queued:
                         continue
-                    via = f"trigger fan-out via {t.src}" + (f" -> {c.src}" if c.src != t.src else "")
-                    est.edges.append(Edge(w, c.dst, c.kind, "INFERRED" if risk else "FACT", risk, via, c.ops))
-                    existing.add((w, c.dst, c.kind))
-                    added += 1
-        if not added:
-            return
+                    if (c.kind == "writes" and o.dst == c.dst) or w in reach.get(ok, ()):
+                        queue.append(ok)
+                        queued.add(ok)
 
 
 def report(res: dict) -> tuple[str, int]:
@@ -1258,6 +1578,16 @@ NEGATIVE_CASES: dict[str, tuple[str, str]] = {
     "redact_policy_object_variable": ("DECLARE t VARCHAR2(30) := 'T_R'; BEGIN DBMS_REDACT.ADD_POLICY(object_schema => 'POLADM', object_name => t,\n"
                                       "  policy_name => 'POL_R', column_name => 'NINO', function_type => DBMS_REDACT.FULL); END;", "policy-call-not-literal"),
     "redact_policy_no_args": ("BEGIN DBMS_REDACT.ADD_POLICY; DBMS_REDACT.ADD_POLICY(); END;", "policy-call-not-literal"),
+    # two same-arity overloads and a variable actual: the callee cannot be picked statically
+    "overload_ambiguous_variable_actual": (
+        "CREATE OR REPLACE PACKAGE poladm.pkg_amb AS PROCEDURE f (p IN NUMBER); PROCEDURE f (p IN VARCHAR2); END;\n/\n"
+        "CREATE OR REPLACE PACKAGE BODY poladm.pkg_amb AS\n"
+        "  PROCEDURE f (p IN NUMBER) IS BEGIN INSERT INTO poladm.t_amb_n VALUES (p); END;\n"
+        "  PROCEDURE f (p IN VARCHAR2) IS BEGIN INSERT INTO poladm.t_amb_s VALUES (p); END;\n"
+        "END;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_amb (v IN VARCHAR2) IS BEGIN poladm.pkg_amb.f(v); END;", "ambiguous-overload"),
+    # a supported suffix whose text no section-2 rule classifies is an inventory gap, never a silently skipped file
+    "alter_only.ddl": ("ALTER TABLE poladm.t_alt ADD (x NUMBER)", "file-not-censused"),
 }
 POSITIVE_TEXT = """
 CREATE TABLE poladm.t_ok (id NUMBER, d DATE);
@@ -1650,7 +1980,7 @@ POSITIVE_CASES.update({
             "05_leaf.sql": "CREATE TABLE poladm.t_leaf (id NUMBER);\n",
         },
         want={("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.01_TABLES", "includes"),
-              ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.02_VIEWS", "includes"),
+              ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.LIB/02_VIEWS", "includes"),
               ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.03_LOADS", "includes"),
               ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "POLADM.04_STEP", "includes"),
               ("POLADM.04_STEP", "POLADM.05_LEAF", "includes"),
@@ -1662,8 +1992,9 @@ POSITIVE_CASES.update({
                        ("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "OS.<shell>", "calls", "INFERRED", "os-shell"),
                        ("POLADM.04_STEP", "POLADM.<&spool>", "writes", "INFERRED", "substitution-in-identifier")},
         want_nodes={("POLADM.SQLPLUS_INCLUDES_SPOOL_HOST", "SQLPLUS_SCRIPT"), ("POLADM.04_STEP", "SQLPLUS_SCRIPT"),
-                    ("POLADM.01_TABLES", "SQL FILE"), ("POLADM.03_LOADS", "DML SCRIPT"), ("POLADM.02_VIEWS", "SQL FILE")},
-        forbid={"FILE.OFF", "POLADM.OFF", "POLADM.EXIT", "POLADM.RM"},
+                    ("POLADM.01_TABLES", "SQL FILE"), ("POLADM.03_LOADS", "DML SCRIPT"), ("POLADM.LIB/02_VIEWS", "SQL FILE"),
+                    ("POLADM.V_I", "VIEW")},
+        forbid={"FILE.OFF", "POLADM.OFF", "POLADM.EXIT", "POLADM.RM", "POLADM.02_VIEWS"},
     ),
     "dynamic_sql_whole_literal_variables": Case(
         "CREATE OR REPLACE PROCEDURE poladm.p_dyn (c OUT SYS_REFCURSOR, p IN NUMBER) IS\n"
@@ -1693,13 +2024,141 @@ POSITIVE_CASES.update({
 })
 
 
+def deep_trigger_chain_case(depth: int = 40) -> Case:
+    """t_00 -> trg_00 -> t_01 -> trg_01 -> ... -> t_<depth>, closed into a cycle by trg_<depth> writing t_00 again; a
+    procedure inserting into t_00 must be credited with every table of the chain (a fixed iteration cap would stop
+    short and a naive cascade would never terminate on the cycle)."""
+    parts = [f"CREATE TABLE poladm.t_{k:02d} (id NUMBER);" for k in range(depth + 1)]
+    for k in reversed(range(depth + 1)):      # bodies in reverse so a single forward pass cannot chain them
+        nxt = (k + 1) % (depth + 1)
+        parts.append(f"CREATE OR REPLACE TRIGGER poladm.trg_{k:02d} AFTER INSERT ON poladm.t_{k:02d} FOR EACH ROW\n"
+                     f"BEGIN INSERT INTO poladm.t_{nxt:02d} (id) VALUES (:NEW.id); END;\n/")
+    parts.append("CREATE OR REPLACE PROCEDURE poladm.p_chain IS BEGIN INSERT INTO poladm.t_00 (id) VALUES (1); END;")
+    return Case(
+        "\n".join(parts),
+        want={("POLADM.P_CHAIN", f"POLADM.T_{k:02d}", "writes") for k in range(depth + 1)}
+        | {(f"POLADM.TRG_{depth:02d}", f"POLADM.T_{depth - 1:02d}", "writes")},
+        want_nodes={(f"POLADM.TRG_{depth:02d}", "TRIGGER"), (f"POLADM.T_{depth:02d}", "TABLE")},
+    )
+
+
+POSITIVE_CASES.update({
+    "trigger_chain_deeper_than_32": deep_trigger_chain_case(40),
+    "overloaded_members_distinct_effects": Case(
+        "CREATE OR REPLACE PACKAGE poladm.pkg_ov AS\n"
+        "  PROCEDURE log_it (p_id IN NUMBER);\n"
+        "  PROCEDURE log_it (p_msg IN VARCHAR2, p_lvl IN PLS_INTEGER DEFAULT 1);\n"
+        "  PROCEDURE run_all;\n"
+        "END pkg_ov;\n/\n"
+        "CREATE OR REPLACE PACKAGE BODY poladm.pkg_ov AS\n"
+        "  PROCEDURE log_it (p_id IN NUMBER) IS\n"
+        "  BEGIN INSERT INTO poladm.t_num (id) VALUES (p_id); END log_it;\n"
+        "  PROCEDURE log_it (p_msg IN VARCHAR2, p_lvl IN PLS_INTEGER DEFAULT 1) IS\n"
+        "  BEGIN INSERT INTO poladm.t_str (msg, lvl) VALUES (p_msg, p_lvl); END log_it;\n"
+        "  PROCEDURE run_all IS\n"
+        "  BEGIN log_it(42); log_it('two args', 2); log_it('defaulted'); END run_all;\n"
+        "END pkg_ov;\n/\n"
+        "CREATE OR REPLACE PROCEDURE poladm.p_ov_caller IS\n"
+        "BEGIN poladm.pkg_ov.log_it(7); pkg_ov.log_it('hello'); END;",
+        want={("POLADM.PKG_OV.LOG_IT(NUMBER)", "POLADM.T_NUM", "writes"),
+              ("POLADM.PKG_OV.LOG_IT(VARCHAR2,PLS_INTEGER?)", "POLADM.T_STR", "writes"),
+              ("POLADM.PKG_OV.RUN_ALL", "POLADM.PKG_OV.LOG_IT(NUMBER)", "calls"),
+              ("POLADM.PKG_OV.RUN_ALL", "POLADM.PKG_OV.LOG_IT(VARCHAR2,PLS_INTEGER?)", "calls"),
+              ("POLADM.P_OV_CALLER", "POLADM.PKG_OV.LOG_IT(NUMBER)", "calls"),
+              ("POLADM.P_OV_CALLER", "POLADM.PKG_OV.LOG_IT(VARCHAR2,PLS_INTEGER?)", "calls")},
+        forbid_edges={("POLADM.PKG_OV.LOG_IT(NUMBER)", "POLADM.T_STR", "writes"),
+                      ("POLADM.PKG_OV.LOG_IT(VARCHAR2,PLS_INTEGER?)", "POLADM.T_NUM", "writes"),
+                      ("POLADM.PKG_OV", "POLADM.T_NUM", "writes"), ("POLADM.PKG_OV", "POLADM.T_STR", "writes")},
+        want_nodes={("POLADM.PKG_OV.LOG_IT(NUMBER)", "PACKAGE PROCEDURE"),
+                    ("POLADM.PKG_OV.LOG_IT(VARCHAR2,PLS_INTEGER?)", "PACKAGE PROCEDURE"), ("POLADM.PKG_OV.RUN_ALL", "PACKAGE PROCEDURE")},
+        forbid={"POLADM.PKG_OV.LOG_IT"},
+    ),
+    "nested_dirs_all_suffixes": Case(
+        "SET ECHO OFF\n@@ddl/tables/t_split\n@@pkg/pkg_split.pks\n@@pkg/pkg_split.pkb\nEXIT\n",
+        files={
+            "ddl/tables/t_split.sql": "CREATE TABLE poladm.t_split (id NUMBER, note VARCHAR2(30));\n"
+                                      "CREATE TABLE poladm.t_split_log (id NUMBER);\n",
+            "ddl/t_split_idx.ddl": "CREATE INDEX poladm.ix_split ON poladm.t_split (id);\n",
+            "pkg/pkg_split.pks": "CREATE OR REPLACE PACKAGE poladm.pkg_split AS\n  PROCEDURE go (p_id IN NUMBER);\nEND pkg_split;\n/\n",
+            "pkg/pkg_split.pkb": "CREATE OR REPLACE PACKAGE BODY poladm.pkg_split AS\n"
+                                 "  PROCEDURE go (p_id IN NUMBER) IS BEGIN INSERT INTO poladm.t_split (id) VALUES (p_id); END go;\n"
+                                 "END pkg_split;\n/\n",
+            "prc/p_split.prc": "CREATE OR REPLACE PROCEDURE poladm.p_split IS BEGIN pkg_split.go(1); END;\n/\n",
+            "fnc/f_split.fnc": "CREATE OR REPLACE FUNCTION poladm.f_split RETURN NUMBER IS n NUMBER;\n"
+                               "BEGIN SELECT COUNT(*) INTO n FROM poladm.t_split; RETURN n; END;\n/\n",
+            "trg/trg_split.trg": "CREATE OR REPLACE TRIGGER poladm.trg_split AFTER INSERT ON poladm.t_split FOR EACH ROW\n"
+                                 "BEGIN INSERT INTO poladm.t_split_log (id) VALUES (:NEW.id); END;\n/\n",
+            "vw/v_split.vw": "CREATE OR REPLACE VIEW poladm.v_split AS SELECT id FROM poladm.t_split_log;\n",
+            "seq/s_split.seq": "CREATE SEQUENCE poladm.s_split START WITH 1;\n",
+            "load/t_split.ctl": "LOAD DATA\nINFILE 't_split.dat'\nAPPEND\nINTO TABLE poladm.t_split\nFIELDS TERMINATED BY ','\n(id, note)\n",
+            "bin/run_split.sh": "#!/bin/sh\nsqlplus -s \"$CONN\" @../pkg/pkg_split.pkb\n"
+                                "sqlldr userid=\"$CONN\" control=../load/t_split.ctl log=/tmp/x.log\n",
+            "bin/nightly.ksh": "#!/bin/ksh\nsqlplus -s / as sysdba <<EOF\nINSERT INTO poladm.t_split_log (id) SELECT id FROM poladm.t_split;\nCOMMIT;\nEOF\n",
+            "bin/unrelated.sh": "#!/bin/sh\necho no oracle client here\n",
+            "docs/README.md": "not a repository unit\n",
+        },
+        want={("POLADM.NESTED_DIRS_ALL_SUFFIXES", "POLADM.DDL/TABLES/T_SPLIT", "includes"),
+              ("POLADM.NESTED_DIRS_ALL_SUFFIXES", "POLADM.PKG/PKG_SPLIT_PKS", "includes"),
+              ("POLADM.NESTED_DIRS_ALL_SUFFIXES", "POLADM.PKG/PKG_SPLIT_PKB", "includes"),
+              ("POLADM.PKG_SPLIT.GO", "POLADM.T_SPLIT", "writes"),
+              ("POLADM.PKG_SPLIT.GO", "POLADM.T_SPLIT_LOG", "writes"),           # trigger fan-out across .pkb / .trg
+              ("POLADM.P_SPLIT", "POLADM.PKG_SPLIT.GO", "calls"),
+              ("POLADM.F_SPLIT", "POLADM.T_SPLIT", "reads"),
+              ("POLADM.TRG_SPLIT", "POLADM.T_SPLIT", "defines-on"),
+              ("POLADM.IX_SPLIT", "POLADM.T_SPLIT", "defines-on"),
+              ("POLADM.V_SPLIT", "POLADM.T_SPLIT_LOG", "reads"),
+              ("POLADM.LOAD/T_SPLIT_CTL", "POLADM.T_SPLIT", "writes"),
+              ("POLADM.LOAD/T_SPLIT_CTL", "POLADM.T_SPLIT_LOG", "writes"),       # loader insert fires the trigger
+              ("POLADM.LOAD/T_SPLIT_CTL", "FILE.T_SPLIT.DAT", "reads"),
+              ("POLADM.BIN/RUN_SPLIT_SH", "POLADM.PKG/PKG_SPLIT_PKB", "includes"),
+              ("POLADM.BIN/RUN_SPLIT_SH", "POLADM.LOAD/T_SPLIT_CTL", "calls"),
+              ("POLADM.BIN/NIGHTLY_KSH", "POLADM.T_SPLIT", "reads"),
+              ("POLADM.BIN/NIGHTLY_KSH", "POLADM.T_SPLIT_LOG", "writes")},
+        want_nodes={("POLADM.T_SPLIT", "TABLE"), ("POLADM.PKG_SPLIT", "PACKAGE"), ("POLADM.PKG_SPLIT.GO", "PACKAGE PROCEDURE"),
+                    ("POLADM.P_SPLIT", "PROCEDURE"), ("POLADM.F_SPLIT", "FUNCTION"), ("POLADM.TRG_SPLIT", "TRIGGER"),
+                    ("POLADM.V_SPLIT", "VIEW"), ("POLADM.S_SPLIT", "SEQUENCE"), ("POLADM.IX_SPLIT", "INDEX"),
+                    ("POLADM.LOAD/T_SPLIT_CTL", "SQLLDR CONTROL"), ("POLADM.BIN/RUN_SPLIT_SH", "SHELL WRAPPER"),
+                    ("POLADM.BIN/NIGHTLY_KSH", "SHELL WRAPPER"), ("POLADM.DDL/TABLES/T_SPLIT", "SQL FILE")},
+        forbid={"POLADM.BIN/UNRELATED_SH", "POLADM.DOCS/README_MD", "POLADM.T_SPLIT_SQL", "POLADM.PKG/PKG_SPLIT", "POLADM.PKG_SPLIT_PKS"},
+    ),
+})
+
+
+def discovery_omission_check(td: Path) -> list[str]:
+    """Dropping any supported file from the nested case must be visible: the same tree minus one file must lose that
+    file's census row(s), so a run can never be green with a supported file silently unread. The main script includes
+    `pkg_split.pkb`, so its omission also has to surface as a `missing-include` edge."""
+    out: list[str] = []
+    case = POSITIVE_CASES["nested_dirs_all_suffixes"]
+    full = run(td / "nested_dirs_all_suffixes", None)
+    for victim in ("pkg/pkg_split.pkb", "trg/trg_split.trg", "load/t_split.ctl", "bin/run_split.sh", "ddl/tables/t_split.sql",
+                   "prc/p_split.prc", "fnc/f_split.fnc", "vw/v_split.vw", "seq/s_split.seq", "ddl/t_split_idx.ddl", "bin/nightly.ksh"):
+        d = td / ("omit_" + victim.replace("/", "_"))
+        d.mkdir()
+        (d / "nested_dirs_all_suffixes.sql").write_text(case.sql + "\n/\n")
+        for rel, body in case.files.items():
+            if rel != victim:
+                (d / rel).parent.mkdir(parents=True, exist_ok=True)
+                (d / rel).write_text(body)
+        res = run(d, None)
+        lost = {k for k, n in full["nodes"].items() if n.file == victim and n.status == "enumerated"}
+        if not lost:
+            out.append(f"omission {victim}: the full run has no enumerated row from this file")
+        still = {k for k in lost if res["nodes"].get(k) and res["nodes"][k].status == "enumerated" and res["nodes"][k].file == victim}
+        if still:
+            out.append(f"omission {victim}: rows still enumerated from the missing file: {sorted(still)}")
+        if victim == "pkg/pkg_split.pkb" and not any(e.risk == "missing-include" for e in res["edges"]):
+            out.append(f"omission {victim}: the including script did not record a missing-include edge")
+    return out
+
+
 def selftest() -> int:
     failures: list[str] = []
     with tempfile.TemporaryDirectory() as td:
         for name, (sql, risk) in NEGATIVE_CASES.items():
             d = Path(td) / name
             d.mkdir()
-            (d / f"{name}.sql").write_text(sql + "\n/\n")
+            (d / (name if "." in name else f"{name}.sql")).write_text(sql + "\n/\n")
             res = run(d, None)
             hits = [e for e in res["edges"] if e.evidence == "UNVERIFIABLE"]
             if not hits:
@@ -1741,6 +2200,7 @@ def selftest() -> int:
             bad = [e for e in res["edges"] if e.evidence == "UNVERIFIABLE"]
             if bad:
                 failures.append(f"{name}: supported syntax flagged: " + "; ".join(f"{e.risk} [{e.detail}]" for e in bad))
+        failures += discovery_omission_check(Path(td))
     # real fixture: zero UNVERIFIABLE, transitive trigger fan-out present, no Albion-only nodes without Albion
     res = run(FIXTURE, None)
     if any(e.evidence == "UNVERIFIABLE" for e in res["edges"]):
