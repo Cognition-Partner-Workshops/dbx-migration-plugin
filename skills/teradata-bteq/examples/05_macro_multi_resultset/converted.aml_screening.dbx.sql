@@ -69,11 +69,20 @@ AS BEGIN
 
     -- The source macro is one request: a failure leaves no result set behind. Here the unpublished run is already
     -- invisible to the views; the handler removes its rows so nothing is left for housekeeping, then re-raises so the
-    -- caller sees the failure exactly as EXEC did ("SIGNAL and RESIGNAL", sql-scripting.md).
+    -- caller sees the failure exactly as EXEC did ("SIGNAL and RESIGNAL", sql-scripting.md). The cleanup is gated on
+    -- persisted state, not on where the body failed: it only removes the run while its row is still unpublished
+    -- (COMPLETED_TS IS NULL). Once the publish UPDATE has committed, the run is the one the views resolve and its
+    -- retirement of older runs may be half done; deleting it then would leave the date with a published run row and
+    -- no result rows (or no run at all). So a post-publish failure keeps the new run, RESIGNALs (the caller still
+    -- learns retirement did not finish), and leaves only the retirement debris described below for housekeeping.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
-        DELETE FROM ${catalog}.${schema}.AML_SCREENING_RESULT WHERE RUN_ID = v_run_id;
-        DELETE FROM ${catalog}.${schema}.AML_SCREENING_RUN    WHERE RUN_ID = v_run_id;
+        DELETE FROM ${catalog}.${schema}.AML_SCREENING_RESULT
+        WHERE RUN_ID = v_run_id
+          AND EXISTS (SELECT 1 FROM ${catalog}.${schema}.AML_SCREENING_RUN
+                      WHERE RUN_ID = v_run_id AND COMPLETED_TS IS NULL);
+        DELETE FROM ${catalog}.${schema}.AML_SCREENING_RUN
+        WHERE RUN_ID = v_run_id AND COMPLETED_TS IS NULL;
         RESIGNAL;
     END;
 
@@ -178,18 +187,22 @@ AS BEGIN
     -- Retire runs for this date that were published *before* this one. In-flight runs (COMPLETED_TS IS NULL) are never
     -- touched, so a concurrent same-date CALL keeps its rows and, when it publishes later, becomes the visible run and
     -- retires this one -- "last EXEC wins", as on the source, with no interleaving of two runs' rows.
-    DELETE FROM ${catalog}.${schema}.AML_SCREENING_RESULT
-    WHERE SCREENING_DATE = v_date
-      AND RUN_ID IN (SELECT r.RUN_ID
-                     FROM ${catalog}.${schema}.AML_SCREENING_RUN r
-                     WHERE r.SCREENING_DATE = v_date
-                       AND r.COMPLETED_TS IS NOT NULL
-                       AND r.COMPLETED_TS < (SELECT COMPLETED_TS FROM ${catalog}.${schema}.AML_SCREENING_RUN
-                                             WHERE RUN_ID = v_run_id));
+    -- Order matters because the two DELETEs are separate commits: the run rows go first, the result rows second. The
+    -- views resolve a run through AML_SCREENING_RUN, so once an old run's row is gone its result rows are unreachable
+    -- (orphans), and a failure at any point leaves the date readable: before the first DELETE, old and new are both
+    -- published and QUALIFY picks the new one; between the two, the new run is the only published run and the old
+    -- results are invisible orphans; the reverse order would open a window with a published run row and no rows
+    -- behind it, and the handler (had it deleted the new run) would have widened it to "no run at all".
     DELETE FROM ${catalog}.${schema}.AML_SCREENING_RUN
     WHERE SCREENING_DATE = v_date
       AND COMPLETED_TS IS NOT NULL
       AND COMPLETED_TS < (SELECT COMPLETED_TS FROM ${catalog}.${schema}.AML_SCREENING_RUN WHERE RUN_ID = v_run_id);
+    -- Orphaned result rows for this date: retired runs (just above, or left by an earlier post-publish failure). A run
+    -- that is still in flight or died unpublished keeps its run row, so its results are not orphans and stay until the
+    -- maintenance task's housekeeping (NOTE.md).
+    DELETE FROM ${catalog}.${schema}.AML_SCREENING_RESULT r
+    WHERE r.SCREENING_DATE = v_date
+      AND NOT EXISTS (SELECT 1 FROM ${catalog}.${schema}.AML_SCREENING_RUN x WHERE x.RUN_ID = r.RUN_ID);
 END;
 
 -- Positional consumers of result set N read these instead of EXEC output. The macro's :screening_date parameter

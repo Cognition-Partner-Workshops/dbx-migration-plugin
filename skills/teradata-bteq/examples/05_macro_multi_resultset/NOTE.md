@@ -20,9 +20,17 @@ client's spool), a UC procedure that writes and publishes one run, and one view 
   latest published run per `SCREENING_DATE` (`QUALIFY ROW_NUMBER() ... = 1`), so an in-flight run is invisible, two
   concurrent same-date calls never interleave (the later publisher wins and retires the other -- last `EXEC` wins, as
   on the source), and a consumer reading after its own `CALL` returns sees a complete run. The `EXIT HANDLER` deletes
-  the failed run's rows and `RESIGNAL`s, so `CALL` fails the way `EXEC` did and leaves nothing behind; a run killed
-  with its session (no handler) stays unpublished and invisible -- housekeeping is `DELETE ... WHERE COMPLETED_TS IS
-  NULL AND STARTED_TS < <cutoff>` in the unit's maintenance task, not in the consumer path.
+  the failed run's rows *only while its run row is still unpublished* (`COMPLETED_TS IS NULL`, checked in the table,
+  not in a variable) and `RESIGNAL`s, so a pre-publish failure fails the way `EXEC` did and leaves nothing behind. A
+  post-publish failure -- retirement is two commits after the publish switch -- keeps the new run: deleting a published
+  run would leave the date with a run row and no results, or with no run at all if the old ones were already retired.
+  Retirement therefore deletes the old *run rows first* (the views resolve results through `AML_SCREENING_RUN`, so
+  their results become unreachable orphans) and then the orphaned result rows for the date (`NOT EXISTS` against the
+  run table; the cited `DELETE FROM` page recommends `NOT EXISTS` and rules out nested subqueries, which the earlier
+  `IN (SELECT ... WHERE ... < (SELECT ...))` form was). At every failure point the date has exactly one readable,
+  complete run. A run killed with its session (no handler) stays unpublished and invisible -- housekeeping is
+  `DELETE ... WHERE COMPLETED_TS IS NULL AND STARTED_TS < <cutoff>` on the run table, then the orphan `DELETE` above,
+  in the unit's maintenance task, not in the consumer path.
 - `ORDER BY` on a result set -> `SORT_ORDER` column (`ROW_NUMBER() OVER (ORDER BY ...)` at run time) plus a consumer
   contract: every positional read is `SELECT ... FROM VW_AML_<n> WHERE SCREENING_DATE = <d> ORDER BY SORT_ORDER`. The
   order lives in the consumer's statement, not in the view: a view has no row order, so an `ORDER BY` inside it would
@@ -53,6 +61,11 @@ client's spool), a UC procedure that writes and publishes one run, and one view 
   `EXEC AML_SCREENING(DATE '2024-03-31')` shadow-run compares the source result set against rows for a *newer* date
   -> **Tier 1** count mismatch and **Tier 3** keyed diff on `(CUSTOMER_ID, ACCOUNT_ID)` for that date's consumer read.
   The shadow-run calendar must include one backdated invocation so this is exercised.
+- Handler that deletes the run unconditionally, or retirement in the reverse order (results before run rows): a
+  failure injected between the two retirement commits leaves the date with a published run row and no result rows
+  (or, with the unconditional handler, no published run) -> **Tier 1** zero rows on every `VW_AML_*` for a date the
+  source returns rows for. The shadow-run's fault-injection list must include one post-publish failure, i.e. the
+  second retirement statement, not only a mid-`INSERT` one.
 - `DELETE date; INSERT x3` instead of the run ledger (two same-date calls interleaving, or a consumer reading between
   the DELETE and the third INSERT): **Tier 1** per-`RESULT_SET_NO` count on the date's view (doubled rows, or a set
   missing), and `count(*) > count(distinct CUSTOMER_ID, ACCOUNT_ID, RESULT_SET_NO)` on the date. The shadow-run must
@@ -73,6 +86,9 @@ client's spool), a UC procedure that writes and publishes one run, and one view 
   https://docs.databricks.com/aws/en/sql/language-manual/functions/uuid (opened).
 - `CREATE TABLE ... NOT NULL ... COMMENT`: `databricks-dbsql` `references/best-practices.md` "Dimension Table Patterns"
   example.
+- `DELETE FROM table_name [table_alias] WHERE` with `EXISTS`/`NOT EXISTS` and scalar subqueries; nested subqueries
+  unsupported; `NOT EXISTS` preferred over `NOT IN`:
+  https://docs.databricks.com/aws/en/sql/language-manual/delta-delete-from (opened).
 
 ## Not verified live
 - Whether a non-constant expression (`current_date()`) is accepted as a parameter `DEFAULT`; the NULL-sentinel form is

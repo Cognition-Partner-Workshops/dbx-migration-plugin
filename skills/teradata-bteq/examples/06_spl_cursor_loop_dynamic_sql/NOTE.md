@@ -55,9 +55,15 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   (docs.databricks.com/aws/en/optimizations/isolation/row-level-concurrency, opened), the loser's `UPDATE` raises and
   its handler runs -- so exactly one call owns the row and its cursor is the only one selecting `CLOSED` accounts:
   every account it archives is claimed by it alone. The handler and the normal exit release the lock with
-  `WHERE OWNER_RUN_ID = v_run_id`, so a call that failed *on* the lock never frees the owner's. A call refused the lock
-  has archived and charged nothing; the caller retries with an unchanged budget once the owner finishes (on the source
-  it would have waited on the lock instead of returning). Session death while holding the lock leaves
+  `WHERE OWNER_RUN_ID = v_run_id`, so a call that failed *on* the lock never frees the owner's; in the handler the
+  release is the *last* statement, after the ledger-and-`ARCHIVED` count, the budget deduction and the log row. The
+  count is only exact while no other call can flip a status: a ledgered-but-unmarked account is still `CLOSED`, and
+  if the lock were freed first a waiting call could archive it before this handler counted, pairing this call's
+  ledger row with an `ARCHIVED` the other call set -- both would charge it and the campaign ends one short. A failure
+  *inside* the handler (e.g. the `ETL_LOG` insert) leaves the lock held, which is the stale-lock path below, not a
+  double charge. A call refused the lock has archived and charged nothing; the caller retries with an unchanged budget
+  once the owner finishes (on the source it would have waited on the lock instead of returning). Session death while
+  holding the lock leaves
   `OWNER_RUN_ID` set: the next call is refused with that id in its message; the operator confirms the run is dead
   (no active job run, no `ETL_LOG` row for the id) and frees it with `UPDATE ... SET OWNER_RUN_ID = NULL WHERE
   OWNER_RUN_ID = '<id>'`. Freeing it automatically after a timeout needs the campaign's maximum runtime, which is an
@@ -107,8 +113,13 @@ procedure with cursors, loops, dynamic SQL, or explicit transactions. Uses the f
   the second call returns `75003` and archives nothing.
 - Lock released in the handler without the `OWNER_RUN_ID = v_run_id` predicate: a call refused the lock frees the
   owner's lock on its way out, and a third call is admitted alongside the owner -> same double-claim signature as
-  above, only visible when the shadow-run issues *three* overlapping calls. Lock never released on success: the second
-  scheduled campaign is refused forever -> **Tier 1** zero archived rows for every later campaign.
+  above, only visible when the shadow-run issues *three* overlapping calls. Lock released at the *top* of the handler
+  (before the count): the waiting retry archives the interrupted account between release and count, and both calls
+  charge it -> the two calls' returned `p_accounts_done` sum to one more than the campaign's `ARCHIVED` delta
+  (**Tier 1** on `DIM_ACCOUNT` vs the sum of the OUT values) and the interrupted account has two ledger rows both
+  pairing `LEDGER_TS < ETL_UPDATE_TS`; needs the injected failure placed *between* the ledger insert and the status
+  `UPDATE` with the retry queued behind the lock, which the fault-injection list must include. Lock never released on
+  success: the second scheduled campaign is refused forever -> **Tier 1** zero archived rows for every later campaign.
 
 ## Citations
 - `FOR ... AS query DO`, `WHILE`, `LEAVE`, `CASE` statement: `databricks-dbsql` `references/sql-scripting.md`

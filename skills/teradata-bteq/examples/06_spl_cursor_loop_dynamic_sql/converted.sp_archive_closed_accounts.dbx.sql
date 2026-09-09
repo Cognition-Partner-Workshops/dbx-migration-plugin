@@ -78,12 +78,14 @@ AS BEGIN
     -- a ledger row under each RUN_ID). Fixed return code: no cited SQLCODE/SQLSTATE read (example 04).
     -- The handler also frees the campaign lock, but only if this call holds it (OWNER_RUN_ID = v_run_id): when the
     -- failure *is* the lock (another call owns it, or this call's UPDATE lost the commit race) the release is a no-op
-    -- and the owner keeps running.
+    -- and the owner keeps running. The release is the handler's *last* statement: the ledger-and-ARCHIVED count is
+    -- only exact while nobody else can flip a status. An account this call ledgered but never marked is still CLOSED;
+    -- if the lock were freed first, a waiting call could archive it between the release and the count, this call
+    -- would then find its own ledger row paired with ARCHIVED and charge it, and the other call charges it too --
+    -- one account, two budgets, the campaign short by one. Counting, deducting and logging under the lock, then
+    -- releasing, makes "ARCHIVED with my ledger row" mean "marked by me" for the whole handler.
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
-        UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
-        SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
-        WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;
         SET p_return_code = -1;
         SET p_accounts_done = (SELECT COUNT(*)
                                FROM ${catalog}.${schema}.ARCHIVE_RUN_LEDGER l
@@ -94,6 +96,9 @@ AS BEGIN
         VALUES ('SP_ARCHIVE_CLOSED_ACCOUNTS', p_max_batch, 'ERROR',
                 'SQLEXCEPTION during archive run ' || v_run_id || ' after ' || CAST(p_accounts_done AS STRING)
                 || ' accounts (partial batch kept; re-run with the returned budget is idempotent)', current_timestamp());
+        UPDATE ${catalog}.${schema}.ARCHIVE_CAMPAIGN_LOCK
+        SET OWNER_RUN_ID = NULL, LOCKED_TS = NULL
+        WHERE LOCK_NAME = 'SP_ARCHIVE_CLOSED_ACCOUNTS' AND OWNER_RUN_ID = v_run_id;
     END;
 
     SET p_return_code = 0;
