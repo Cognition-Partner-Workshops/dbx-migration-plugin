@@ -547,6 +547,9 @@ def test_scripts_of_the_client_command_are_still_read(tmp_path: Path):
     "sqlplus svc@tdprod.corp.example <<EOF\nSET ECHO ON;\n@fix.sql\nEOF\necho done",
     "bteq <<-EOF\n\t.LOGON tdprod.corp.example/svc;\n\t.RUN FILE @fix.sql\n\tEOF",
     "cat <<A <<B\n@x\nA\n@y\nB\nbteq -i fix.sql",
+    "bteq <<EOF | tee /nonexistent/log\n@fix.sql\nEOF",
+    "sqlplus svc@tdprod.corp.example <<EOF && echo ok\n@fix.sql\nEOF",
+    "bteq <<EOF 2>&1 | grep -v Warning; echo done\n.RUN FILE @fix.sql\nEOF",
 ])
 def test_redirections_and_heredoc_lines_keep_the_client_context(cmd, tmp_path: Path):
     (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
@@ -560,6 +563,84 @@ def test_redirections_and_heredoc_lines_keep_the_client_context(cmd, tmp_path: P
 def test_redirection_operands_and_here_strings_are_not_scripts(tmp_path: Path):
     for cmd in ("bteq >/nonexistent/log 2>&1 <<< 'SELECT 1'", "databricks jobs list 2>/nonexistent/err | tee /nonexistent/out",
                 "rm -f /nonexistent/x >/nonexistent/log && databricks jobs list 2>&1"):
+        assert g._script_inputs(cmd, CFG) == [], cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat <<EOF | bteq\n@fix.sql\nEOF",
+    "cat <<EOF | sqlplus svc@tdprod.corp.example\nSET ECHO ON;\n@fix.sql\nEOF",
+    "cat <<EOF | tee /nonexistent/copy | bteq\n@fix.sql\nEOF",
+    "cat fix.sql | bteq",
+    "cat < fix.sql | bteq",
+    "echo @fix.sql | bteq",
+])
+def test_text_piped_into_a_client_is_its_script(cmd, tmp_path: Path):
+    (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    assert g._script_inputs(cmd, CFG) == ["fix.sql"], cmd
+    v = g.evaluate(cmd, CFG, root=tmp_path)
+    assert v.decision == "block" and "read-only" in v.reason, cmd
+
+
+def test_opaque_text_piped_into_a_legacy_client_is_blocked(tmp_path: Path):
+    for cmd in ("sed 's/x/y/' fix.sql | bteq", "python3 gen.py | sqlplus svc@tdprod.corp.example",
+                "cat $F | bteq", "gunzip -c fix.sql.gz | bteq"):
+        v = g.evaluate(cmd, CFG, root=tmp_path)
+        assert v.decision == "block", cmd
+    for cmd in ("cat <<EOF | bteq\nSELECT 1;\nEOF", "printf 'SELECT 1' | bteq",
+                "databricks jobs list | jq .", "jq -n '{}' | databricks api post /api/2.1/jobs/create"):
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat write.sql |& bteq",
+    "cat write.sql |\n bteq",
+    "cat write.sql | \n bteq",
+    "cat <<EOF |\n@write.sql\nEOF\nbteq",
+    "(cat write.sql; echo 'SELECT 1;') | bteq",
+    "( cat write.sql ) | bteq",
+    "{ cat write.sql; echo 'SELECT 1;'; } | bteq",
+    "(echo 'SELECT 1;'; (cat write.sql)) | sqlplus svc@tdprod.corp.example",
+    "(cat write.sql; echo 'SELECT 1;') | tee /nonexistent/log | bteq",
+    "cat write.sql | (cd /tmp; bteq)",
+    "cat write.sql | { echo start; bteq; }",
+    "cat write.sql | (echo start; (bteq))",
+])
+def test_every_pipeline_shape_into_a_client_carries_its_producers_text(cmd, tmp_path: Path):
+    (tmp_path / "write.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    assert g._script_inputs(cmd, CFG) == ["write.sql"], cmd
+    v = g.evaluate(cmd, CFG, root=tmp_path)
+    assert v.decision == "block" and "read-only" in v.reason, cmd
+
+
+def test_a_group_piped_into_a_legacy_client_is_judged_whole(tmp_path: Path):
+    (tmp_path / "read.sql").write_text("SELECT 1;\n")
+    for cmd in ("(cat read.sql; sed 's/x/y/' other.sql) | bteq",
+                "{ python3 gen.py; cat read.sql; } |& bteq", "ls | (cd /tmp; bteq)"):
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
+    for cmd in ("(cat read.sql; echo 'SELECT 2;') | bteq", "(cat read.sql) |& bteq",
+                "cat read.sql |\n bteq", "(cat a.sql) ; (cat read.sql) | bteq"):
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+    # the group before `;` is not part of the pipeline
+    assert g._script_inputs("(cat a.sql) ; (cat read.sql) | bteq", CFG) == ["read.sql"]
+
+
+def test_descriptor_of_a_redirection_is_not_a_cat_operand(tmp_path: Path):
+    (tmp_path / "read.sql").write_text("SELECT 1;\n")
+    for cmd in ("cat 2>/dev/null < read.sql | bteq", "cat read.sql 2>&1 | bteq",
+                "cat 2> /dev/null read.sql | bteq"):
+        assert g._script_inputs(cmd, CFG) == ["read.sql"], cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
+    # a file that happens to be named with digits is still a script
+    (tmp_path / "2").write_text("UPDATE sales.orders SET status = 'X';\n")
+    assert g._script_inputs("cat 2 | bteq", CFG) == ["2"]
+    assert g.evaluate("cat 2 | bteq", CFG, root=tmp_path).decision == "block"
+
+
+def test_a_heredoc_body_naming_a_client_is_data_not_context(tmp_path: Path):
+    (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    for cmd in ("cat <<'EOF' > run_later.sh\nbteq @fix.sql\nEOF", "cat <<EOF\nsqlplus svc@tdprod.corp.example @fix.sql\nEOF",
+                "tee notes.md <<'EOF'\nrun: databricks -f fix.sql\nEOF"):
         assert g._script_inputs(cmd, CFG) == [], cmd
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
 
