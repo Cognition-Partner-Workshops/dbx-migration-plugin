@@ -1,13 +1,13 @@
 ---
 name: informatica-xml
-description: Source-dialect skill for Informatica PowerCenter/IICS estates. Use when enumerating a PowerCenter repository or its XML exports (workflows, sessions, mappings, mapplets, parameter files, pre/post-session shell and SQL), extracting mapping lineage, converting mappings/sessions/workflows to Databricks (Lakeflow Spark Declarative Pipelines, PySpark, Lakeflow Jobs, DBSQL procedures for pre/post SQL), or reconciling a converted Informatica unit with the harness. Hardened against the Albion insurance fixture estate; DataStage is a separate future skill and is not covered here.
+description: Source-dialect skill for Informatica PowerCenter estates. Use when enumerating a PowerCenter repository or its XML exports (workflows, sessions, mappings, mapplets, parameter files, pre/post-session shell and SQL), extracting mapping lineage, converting mappings/sessions/workflows to Databricks (Lakeflow Spark Declarative Pipelines, PySpark, Lakeflow Jobs, DBSQL procedures for pre/post SQL), or reconciling a converted Informatica unit with the harness. Hardened against the Albion insurance fixture estate; IICS (cloud) exports and DataStage are separate future skills and are not covered here.
 ---
 
-# Informatica PowerCenter / IICS Dialect
+# Informatica PowerCenter Dialect
 
 ## 1. When to use / routing
 
-Use for PowerCenter 9.x/10.x (and IICS) repository XML exports: `MAPPING`, `SESSION`, `WORKFLOW`/`WORKLET`, `MAPPLET`, `.par` parameter files, pre/post-session commands and SQL. One unit = a mapping plus the sessions that run it plus their workflow task instances, keyed `<folder>.<mapping>`; reusable transformations and mapplets used by two or more mappings are shared objects (wave 0, convert once). Session-level `Sql Query` / `Lookup Sql Override` / `Source Filter` / `Pre SQL` / `Post SQL` overrides replace the mapping's SQL silently: always convert the session's effective SQL, transpiled with the connection's dialect skill (`teradata-bteq`, `oracle-plsql`).
+Use for PowerCenter 9.x/10.x repository XML exports (`POWERMART` documents): `MAPPING`, `SESSION`, `WORKFLOW`/`WORKLET`, `MAPPLET`, `.par` parameter files, pre/post-session commands and SQL. IICS assets (JSON/zip project exports, taskflows, mapping tasks) have a different format and asset model: do not route them here; record them as a front-door finding (`install-dbx-factory/playbooks/10-front_door_etl.md`) until an IICS skill exists. One unit = a mapping plus the sessions that run it plus their workflow task instances, keyed `<folder>.<mapping>`; reusable transformations and mapplets used by two or more mappings are shared objects (wave 0, convert once). Session-level `Sql Query` / `Lookup Sql Override` / `Source Filter` / `Pre SQL` / `Post SQL` overrides replace the mapping's SQL silently: always convert the session's effective SQL, transpiled with the connection's dialect skill (`teradata-bteq`, `oracle-plsql`).
 
 Everything Databricks-side goes through `skills/target-routing/SKILL.md` to the official skills; this file cites, never restates:
 
@@ -48,7 +48,7 @@ Parse the `POWERMART` export namespace-free with the DTD disabled (`powrmart.dtd
 | `nstring`, `ntext`, `text` | `STRING` | `TEXT` | codepage `Latin1`/`MS1252` -> UTF-8 on read (trap 18); `text` excluded from Tier 3, hash-compare |
 | `binary` | `BINARY` | `BYTEA` | `uuid_normalize` only for 16-byte GUIDs |
 | `date/time` (29,9) from `TIMESTAMP(6)`, Oracle `DATE` | `TIMESTAMP_NTZ` (zone-less legacy); `TIMESTAMP` only if STOP A says UTC | `TIMESTAMP [WITHOUT TIME ZONE]` | pass-through: `identity` at us; `datetime_utc_truncate_ms` only on `SYSDATE`/`SESSSTARTTIME`-fed and Pre-85 columns (traps 7, 8); into a `DATE` target: `CAST(ts AS DATE)` only after confirming the legacy truncated |
-| `timestamp with time zone` | `TIMESTAMP` (UTC) | `TIMESTAMP WITH TIME ZONE` | `datetime_utc_truncate_ms` (UTC normalisation) |
+| `timestamp with time zone` | `TIMESTAMP` (UTC) | `TIMESTAMP WITH TIME ZONE` | compare in UTC with `identity`: zone normalisation keeps the fraction, so a us mismatch must still fail; `datetime_utc_truncate_ms` only if the column is also clock-fed (trap 7) |
 | Flat-file `PICTURETEXT="9(09)V99"` (implied decimals) | `DECIMAL(11,2)` via `CAST(substr AS DECIMAL(11,0)) / 100` | `NUMERIC` | Tier 2 sum 100x off if missed (trap 21) |
 | Flat-file `9(05)` Julian `YYDDD`, `X(n)` codes | `STRING` + derived `DATE` | `TEXT`, `DATE` | pivot year lives in converted code (trap 22) |
 | Packed / `COMP-3` (Normalizer input) | `DECIMAL(p,s)` after unpacking | `NUMERIC` | hand conversion |
@@ -142,7 +142,7 @@ Databricks expressions are SQL, usable verbatim via `F.expr(...)` or in DBSQL. K
 | 80 | SQL transformation (`~param~`), Java / Custom / HTTP / XML transformations | `EXECUTE IMMEDIATE ... USING`; PySpark UDF; `http_request`; `from_xml` | dynamic SQL lineage INFERRED; no side effects inside SDP dataset functions |
 | 81 | Workflow link `$s.Status = SUCCEEDED` / `= FAILED` / empty / count predicate | `run_if: ALL_SUCCESS` / `AT_LEAST_ONE_FAILED` / `ALL_DONE` / upstream `taskValues.set` + downstream check | no expression-typed `run_if` |
 | 82 | Decision / Assignment task, `WORKFLOWVARIABLE` | SQL scripting `IF`/`DECLARE`/`SET` in one script, else a task publishing a task value | - |
-| 83 | Event Wait (`File Watch Name`), Event Raise, Timer | `trigger.file_arrival` on the landing location; `depends_on`; cron | `$$RUNDATE`-templated names become a glob; never `sleep` |
+| 83 | Event Wait (`File Watch Name`), Event Raise, Timer | `trigger.file_arrival` on the landing location; `depends_on`; cron | `$$RUNDATE`-templated names become a glob; never `sleep`; a wait after upstream tasks splits the workflow into two jobs at the wait, the second file-triggered and `run_if` on the first's outcome |
 | 84 | Command task / pre-post-session command | file moves -> volume ops task; `pmcmd startworkflow` -> `run_job_task`; `mailx` -> `email_notifications`; SFTP pull -> ingestion decision (D3) | other engines' scripts kicked = cross-pipeline edge (D5) |
 | 85 | `Recovery Strategy`, `Fail parent if this task fails`, `SUSPEND_ON_ERROR` | `max_retries`, `min_retry_interval_millis`; failure propagates via `run_if` | every load must be rerunnable from scratch |
 | 86 | `Truncate target table option`, `Target load type = Bulk` | `TRUNCATE` in the pre procedure or MV full recompute; plain Delta write | bulk loaders diverted duplicates silently (trap 26) |
@@ -186,7 +186,7 @@ Databricks expressions are SQL, usable verbatim via `F.expr(...)` or in DBSQL. K
 - Mapping -> one SDP file: `@dp.table` Auto Loader read for file sources (`_metadata.file_path` supplies `$$RUNDATE`-style values), `@dp.temporary_view` per lookup deduplicated to one row per key, row-preserving Expressions as `withColumn` on the same row, `@dp.materialized_view` target named after the legacy target with port names as aliases, `@dp.expect*` for every legacy row-error/reject condition plus a quarantine MV built from the negated conditions.
 - Workflow -> one Lakeflow Job: task key = session name, `pipeline_task` per SDP unit, `depends_on` + `run_if` per link, `trigger.file_arrival` for Event Wait, `email_notifications.on_failure` for the failure Email task, cron `schedule` with `timezone_id`, deployed `PAUSED` via `databricks-dabs`.
 - Pre/Post SQL and SQL-only tasks -> `CREATE PROCEDURE <unit>_pre()` / `<unit>_post()` (statements transpiled by the connection's dialect skill, `Continue` -> `DECLARE CONTINUE HANDLER`), `CALL`ed from `sql_task`s before/after the pipeline task; a Pre SQL `TRUNCATE`/`DELETE` on the target makes the unit a truncate-load.
-- `canonicalization.json` (list form, `recon.config.load_canon_rules`): `decimal_round` (trap 3; scale <= 10 or double-computed ports only), `datetime_utc_truncate_ms` (7, 8; clock-read / Pre-85 / zoned columns only), `rstrip_spaces` (4), `empty_string_is_null` (5, 16), `null_missing_equiv`, `collation_casefold` (17, flagged columns only), `identity`. Harness gaps, never faked: `zero_null_equiv`, `timestamp_offset_shift`, `codepage_transcode`, per-field rule parameters.
+- `canonicalization.json` (list form, `recon.config.load_canon_rules`): `decimal_round` (trap 3; scale <= 10 or double-computed ports only), `datetime_utc_truncate_ms` (7, 8; clock-read / Pre-85 columns only, never for zone normalisation alone), `rstrip_spaces` (4), `empty_string_is_null` (5, 16), `null_missing_equiv`, `collation_casefold` (17, flagged columns only), `identity`. Harness gaps, never faked: `zero_null_equiv`, `timestamp_offset_shift`, `codepage_transcode`, per-field rule parameters.
 
 ## 7. Examples
 

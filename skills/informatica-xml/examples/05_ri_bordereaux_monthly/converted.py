@@ -30,15 +30,13 @@ def bdx_claims_raw():
 @dp.temporary_view()
 def bdx_claims_mapped():  # each broker's own header renamed to the common shape by BROKER_ID; a column its layout lacks is NULL
     raw = spark.read.table("bdx_claims_raw")
-    layouts = [r for r in spark.read.table(BDX_LAYOUTS).collect() if r.SRC_COL in raw.columns]
-
-    def std(col):
-        expr = F.lit(None).cast("string")
-        for r in (r for r in layouts if r.STD_COL == col):
-            expr = F.when(F.col("BROKER_ID") == r.BROKER_ID, raw[r.SRC_COL]).otherwise(expr)
-        return expr.alias(col)
-
-    return raw.select("BROKER_ID", "FILE_MONTH", *[std(c) for c in STD_COLS])
+    cells = [c for c in raw.columns if c not in ("BROKER_ID", "FILE_MONTH")]  # schema only: no Spark action at planning time
+    out = raw.withColumn("cells", F.map_from_arrays(F.array(*[F.lit(c) for c in cells]), F.array(*[F.col(c) for c in cells])))
+    layouts = spark.read.table(BDX_LAYOUTS)  # one row per (BROKER_ID, STD_COL): the join must not multiply raw rows
+    for c in STD_COLS:
+        src = layouts.filter(F.col("STD_COL") == c).select("BROKER_ID", F.col("SRC_COL").alias(c + "_src"))
+        out = out.join(src, "BROKER_ID", "left").withColumn(c, F.try_element_at("cells", F.col(c + "_src")))
+    return out.select("BROKER_ID", "FILE_MONTH", *STD_COLS)
 
 
 @dp.temporary_view()

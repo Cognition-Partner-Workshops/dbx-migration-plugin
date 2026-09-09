@@ -7,7 +7,7 @@ from pyspark import pipelines as dp
 from pyspark.sql import Column, Window
 from pyspark.sql import functions as F
 
-MATCH_CONFIDENCE_FLOOR = float(spark.conf.get("informatica.MATCH_CONFIDENCE_FLOOR"))  # $$MATCH_CONFIDENCE_FLOOR=0.82
+# $$MATCH_CONFIDENCE_FLOOR=0.82 is in the .par but no exported transformation reads it: not made pipeline config (finding)
 PARTY_TABLE = spark.conf.get("informatica.party_table")
 CUSTOMERS_TABLE = spark.conf.get("informatica.apf_customers_table")
 REJECT = "NOT (birth_dt_present AND BIRTH_DT IS NULL)"  # TO_DATE row error -> reject file in legacy
@@ -54,18 +54,20 @@ def mdm_party_rows():  # every derived row, before the legacy reject condition s
     # one row per PARTY_ID before the join back; LEGACY_CUSTOMER_ID breaks ties deterministically (trap 9).
     survivor = Window.partitionBy("PARTY_ID").orderBy(F.col("cust_updated_ts").desc_nulls_last(), F.col("LEGACY_CUSTOMER_ID"))
 
-    def one_per_party(matches, prefix):
-        return (matches.withColumn("rn", F.row_number().over(survivor)).filter("rn = 1")
-                       .select("PARTY_ID", F.col("LEGACY_CUSTOMER_ID").alias(prefix + "_customer_id"), F.col("cust_email").alias(prefix + "_email")))
+    def one_per_party(matches, prefix):  # newest customer wins the id; the email exception scans every matched customer
+        email = F.lower(F.trim(F.col("cust_email")))
+        longest = F.max(F.when(email.isNotNull(), F.struct(F.length(email).alias("n"), email.alias("e")))).over(Window.partitionBy("PARTY_ID"))
+        return (matches.withColumn("rn", F.row_number().over(survivor)).withColumn("longest", longest["e"]).filter("rn = 1")
+                       .select("PARTY_ID", F.col("LEGACY_CUSTOMER_ID").alias(prefix + "_customer_id"), F.col("longest").alias(prefix + "_email")))
 
     nino_match = one_per_party(xm.join(cust, xm.NINO == cust.cust_nino), "nino")
     fuzzy = one_per_party(xm.join(cust, (xm.SURNAME_SOUNDEX == cust.cust_soundex) & (F.to_date(xm.BIRTH_DT) == cust.cust_dob)), "fuzzy")
 
     # EXP_EMAIL_DQ: LOWER(LTRIM(RTRIM(x))) -> lower(trim(x)); REG_MATCH -> rlike. The DESCRIPTION's survivorship
-    # exception ("email: longest-string wins") is applied over the party email and the NINO-first / fuzzy-fallback
-    # customer's email; equal lengths keep the party value (INFERRED). DQ runs on the surviving address.
+    # exception ("email: longest-string wins") is applied over the party email and the longest email of all customers
+    # in the winning match set (NINO if any, else fuzzy); ties: greatest string, then the party value (INFERRED).
     party_email = F.lower(F.trim(F.col("EMAIL")))
-    cust_email = F.lower(F.trim(F.when(F.col("nino_customer_id").isNotNull(), F.col("nino_email")).otherwise(F.col("fuzzy_email"))))
+    cust_email = F.when(F.col("nino_customer_id").isNotNull(), F.col("nino_email")).otherwise(F.col("fuzzy_email"))
     email_std = F.when(F.length(cust_email) > F.coalesce(F.length(party_email), F.lit(0)), cust_email).otherwise(party_email)
     email_dq = F.when(email_std.rlike(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$"), "VALID").otherwise("INVALID")
     return (party.join(xm.drop("NINO"), "PARTY_ID", "left").join(nino_match, "PARTY_ID", "left").join(fuzzy, "PARTY_ID", "left")
