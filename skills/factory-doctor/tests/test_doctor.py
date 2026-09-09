@@ -41,11 +41,13 @@ def test_probe_command_is_blocked_by_guard_and_harmless_otherwise():
     assert doctor.HOOK_PROBE_COMMAND.startswith("echo ")
 
 
-def test_ready_offline_with_probe_blocked(tmp_path):
+def test_offline_run_passes_every_local_check_but_is_never_ready(tmp_path):
     ws = make_workspace(tmp_path)
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, no_databricks=True)
     c = by_id(report)
-    assert report["ready"], [x for x in report["checks"] if x["status"] == "fail"]
+    assert not [x for x in report["checks"] if x["status"] == "fail"]
+    # an unverified identity can never certify a wave, however the check was skipped
+    assert not report["ready"] and report["blocking"] == ["databricks_identity=skipped"]
     assert c["workspace"]["status"] == "ok"
     assert c["stop_mode"]["data"]["stop_mode"] == "hard"
     assert c["allowed_targets"]["status"] == "ok" and c["allowed_targets"]["data"]["catalogs"] == ["mig_cat"]
@@ -62,7 +64,8 @@ def test_unknown_probe_is_unverified_and_carries_command(tmp_path):
     c = by_id(report)
     assert c["hook_platform_loaded"]["status"] == "unverified"
     assert c["hook_platform_loaded"]["data"]["probe_command"] == doctor.HOOK_PROBE_COMMAND
-    assert not report["ready"] and report["blocking"] == ["hook_platform_loaded=unverified"]
+    assert not report["ready"]
+    assert report["blocking"] == ["hook_platform_loaded=unverified", "databricks_identity=skipped"]
 
 
 def test_human_identity_is_not_ready(tmp_path, monkeypatch):
@@ -122,6 +125,26 @@ def test_missing_files_and_stop_mode_fail(tmp_path):
     assert c["stop_mode"]["status"] == "fail"
 
 
+def test_setup_outputs_glossary_and_tolerances_json_are_required(tmp_path):
+    ws = make_workspace(tmp_path, omit=("02_glossary.md", "03_recon_tolerances.json"))
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "fail"
+    assert c["workspace"]["data"]["missing"] == ["02_glossary.md", "03_recon_tolerances.json"]
+
+
+@pytest.mark.parametrize("who, expected", [
+    ({"userName": "someone@example.com", "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"]}, False),
+    ({"userName": "svc_migration", "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"]}, False),  # no '@' is not an SP
+    ({"displayName": "Local Admin"}, False),
+    ({"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}, True),  # application id as userName
+    ({"userName": "svc", "applicationId": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}, True),
+    ({"displayName": "mig-sp", "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServicePrincipal"]}, True),
+])
+def test_identity_classification_needs_positive_service_principal_evidence(who, expected):
+    _, is_sp = doctor.classify_identity(who)
+    assert is_sp is expected
+
+
 def test_warn_mode_and_empty_legacy_sources_are_warned(tmp_path):
     ws = make_workspace(tmp_path, allowed={"catalogs": ["mig_cat"], "guard_mode": "warn"})
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
@@ -140,10 +163,11 @@ def test_cli_writes_capabilities_json_and_exit_codes(tmp_path):
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
                         "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--hook-probe-result", "blocked"],
                        capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.returncode == 1, r.stdout + r.stderr  # offline: identity unverified, so not ready
     cap = json.loads((ws / ".migration" / "09_capabilities.json").read_text())
-    assert cap["schema"] == "dbx-migration-factory/capabilities/1" and cap["ready"] is True
-    assert "ready=True" in r.stdout
+    assert cap["schema"] == "dbx-migration-factory/capabilities/1" and cap["ready"] is False
+    assert cap["blocking"] == ["databricks_identity=skipped"]
+    assert "ready=False" in r.stdout and "databricks_identity=skipped" in r.stdout
 
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
                         "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--hook-probe-result", "not-blocked"],

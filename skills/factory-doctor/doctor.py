@@ -11,10 +11,11 @@ Usage:
                       [--hook-probe-result blocked|not-blocked|unknown] [--expect-identity NAME]
                       [--no-databricks] [--out PATH]
 
-Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and the security
-controls (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`,
-or `skipped` by an explicit flag; an `unverified` hook probe or a human identity is not ready.
-Other `warn`/`unverified` checks are advisory and listed in the JSON for the playbook to decide.
+Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and every security
+control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`;
+an `unverified` hook probe, a human identity, or an identity check `skipped` by `--no-databricks`
+is not ready (an offline report can never authorize a wave). Other `warn`/`unverified` checks are
+advisory and listed in the JSON for the playbook to decide.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,7 +35,9 @@ from pathlib import Path
 REQUIRED_FILES = (
     "00_context.md",
     "01_conventions.md",
+    "02_glossary.md",
     "03_recon_tolerances.md",
+    "03_recon_tolerances.json",
     "04_dependency_register.md",
     "05_progress.md",
     "06_decisions.md",
@@ -250,6 +254,23 @@ def check_drivers() -> Check:
 
 # ------------------------------------------------------------------ databricks identity
 
+_APPLICATION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+_SP_SCHEMA = "servicePrincipal"
+
+
+def classify_identity(who: dict) -> tuple[str, bool]:
+    """(userName, is_service_principal) from a SCIM `current-user me` document.
+
+    A service principal is recognised by positive evidence only: `applicationId`, a ServicePrincipal
+    SCIM schema, or a `userName` that is the application id (a UUID). Anything else, including a
+    username without an '@', is treated as a human identity, so the doctor fails closed."""
+    name = str(who.get("userName") or who.get("displayName") or "?")
+    schemas = [str(s) for s in who.get("schemas") or []]
+    is_sp = bool(who.get("applicationId")) or any(_SP_SCHEMA.lower() in s.lower() for s in schemas) \
+        or bool(_APPLICATION_ID.fullmatch(name))
+    return name, is_sp
+
+
 def check_databricks(expect_identity: str | None) -> list[Check]:
     out: list[Check] = []
     cli = shutil.which("databricks")
@@ -282,8 +303,7 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
     except json.JSONDecodeError:
         out.append(Check("databricks_identity", "fail", "current-user me returned non-JSON"))
         return out
-    name = who.get("userName") or who.get("displayName") or "?"
-    is_sp = "@" not in str(name)
+    name, is_sp = classify_identity(who)
     data = {"userName": name, "service_principal": is_sp}
     status = "ok"
     detail = f"authenticated as {name} ({'service principal' if is_sp else 'user'})"
@@ -318,7 +338,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
     blocking = [f"{c.id}={c.status}" for c in checks
-                if c.status == "fail" or (c.id in SECURITY_CONTROLS and c.status not in ("ok", "skipped"))]
+                if c.status == "fail" or (c.id in SECURITY_CONTROLS and c.status != "ok")]
     return {
         "schema": "dbx-migration-factory/capabilities/1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -339,7 +359,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--role", choices=("orchestrator", "child"), default="orchestrator")
     p.add_argument("--hook-probe-result", choices=("blocked", "not-blocked", "unknown"), default="unknown")
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
-    p.add_argument("--no-databricks", action="store_true", help="skip CLI/identity checks (offline)")
+    p.add_argument("--no-databricks", action="store_true",
+                   help="skip CLI/identity checks (offline; the report is never ready)")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
 

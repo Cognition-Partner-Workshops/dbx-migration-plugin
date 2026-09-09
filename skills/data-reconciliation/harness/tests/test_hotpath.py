@@ -8,12 +8,13 @@ import sqlite3
 import pytest
 
 from recon.adapters import _SqlAdapterBase
-from recon.config import ConfigError, ObjectMapping, Tolerances
+from recon.canon import Canonicalizer, CanonRule
+from recon.config import ConfigError, FieldMapping, MappingSpec, ObjectMapping, Tolerances
 from recon.cost import estimate_cost
 from recon.engine import run_recon
-from recon.tiers import _stratified_keys
+from recon.tiers import _object_aggregates, _stratified_keys, tier2_aggregates
 from tests.fakes import FakeSource, FakeTarget
-from tests.test_tiers import RULES, SPEC
+from tests.test_tiers import RULES, SPEC, TOL
 
 
 class CountingConn:
@@ -73,6 +74,109 @@ def test_table_aggregates_is_one_statement_and_matches_per_column():
     assert batched["name"]["min"] == "n1" and batched["name"]["max"] == "n99"
     assert "sum" not in batched["name"] or batched["name"]["sum"] is None
     assert ad.statements == 7  # 3 x (metrics + SUM probe) per-column, then 1 batched
+
+
+def test_probed_field_costs_one_statement_on_top_of_the_batched_one():
+    # a probed field must not re-run the 5-metric statement: batched metrics + one SUM, so the
+    # cost estimate's "1 + probes" per side is what actually goes over the wire
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="t", root_table="t", key_source=["id"], key_target="id",
+        fields=[FieldMapping("id", "id", "INTEGER", "int"),
+                FieldMapping("amt", "amt", "REAL", ""),        # target side undeclared -> probe
+                FieldMapping("name", "name", "TEXT", "int")])])  # conversion mapping -> probe
+    source, s_conn = sqlite_adapter(ROWS)
+    target, t_conn = sqlite_adapter(ROWS)
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
+    assert len(s_conn.statements) == 2 and len(t_conn.statements) == 2
+    assert s_conn.statements[1].startswith("SELECT SUM(name)")
+    assert t_conn.statements[1].startswith("SELECT SUM(amt)")
+    assert s_all["name"]["count"] == 100 and s_all["name"]["distinct_count"] > 0  # batched metrics kept
+    assert t_all["amt"]["sum"] == pytest.approx(sum(r[2] for r in ROWS if r[2] is not None))
+    est = estimate_cost(spec, TOL)
+    assert est["source_statements"]["tier2"] == source.statements == 2
+    assert est["target_statements"]["tier2"] == target.statements == 2
+
+
+def _typed_adapter(ddl: str, rows):
+    conn = CountingConn()
+    conn._c.execute(ddl)
+    conn._c.executemany(f"INSERT INTO t VALUES ({', '.join('?' * len(rows[0]))})", rows)
+    return _SqlAdapterBase(conn), conn
+
+
+def _tier2(spec, source, target):
+    return tier2_aggregates(spec, TOL, Canonicalizer([CanonRule("identity", "*")]), source, target)
+
+
+def test_one_source_field_mapped_to_numeric_and_nonnumeric_targets_keeps_both_sum_plans():
+    # `code` is TEXT holding digits; it maps to a TEXT column (no SUM) and to an INT column
+    # (conversion mapping: SUM must be probed on the source). Listing the skip mapping last
+    # must not erase the probe the first mapping needs, or the drift in `code_n` goes ungraded.
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="t", root_table="t", key_source=["id"], key_target="id",
+        fields=[FieldMapping("code", "code_n", "TEXT", "int"),
+                FieldMapping("code", "code", "TEXT", "TEXT")])])
+    source, s_conn = _typed_adapter("CREATE TABLE t (id INTEGER, code TEXT)",
+                                    [(i, str(i)) for i in range(1, 11)])
+    target, t_conn = _typed_adapter("CREATE TABLE t (id INTEGER, code TEXT, code_n INTEGER)",
+                                    [(i, str(i), i + (1 if i == 5 else 0)) for i in range(1, 11)])
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
+    assert [s.split(" FROM")[0] for s in s_conn.statements[1:]] == ["SELECT SUM(code)"]
+    assert s_all["code"]["sum"] == 55 and s_all["code"]["count"] == 10   # batched metrics kept
+    assert t_all["code_n"]["sum"] == 56 and t_all["code"].get("sum") is None
+    assert len(t_conn.statements) == 1                                    # code_n batched, code never summed
+    est = estimate_cost(spec, TOL)  # the STOP C estimate plans per physical column like the run
+    assert est["source_statements"]["tier2"] == len(s_conn.statements) == 2
+    assert est["target_statements"]["tier2"] == len(t_conn.statements) == 1
+    result = _tier2(spec, source, target)
+    assert ("aggregate_sum", "field code->code_n") in {(f.check, f.detail) for f in result.findings}
+    assert not [f for f in result.findings if f.detail == "field code->code"]
+
+
+def test_many_source_fields_mapped_to_one_target_field_keep_the_probe_the_conversion_needs():
+    # two source columns land in one TEXT target column: INT->TEXT needs a SUM probe on the target,
+    # TEXT->TEXT does not. Order of the mappings must not decide whether the probe happens.
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="t", root_table="t", key_source=["id"], key_target="id",
+        fields=[FieldMapping("qty", "label", "INTEGER", "TEXT"),
+                FieldMapping("label", "label", "TEXT", "TEXT")])])
+    source, s_conn = _typed_adapter("CREATE TABLE t (id INTEGER, qty INTEGER, label TEXT)",
+                                    [(i, i, str(i)) for i in range(1, 11)])
+    target, t_conn = _typed_adapter("CREATE TABLE t (id INTEGER, label TEXT)",
+                                    [(i, str(i + (1 if i == 5 else 0))) for i in range(1, 11)])
+    s_all, t_all, _, _ = _object_aggregates(spec.objects[0], source, target)
+    assert len(s_conn.statements) == 1 and s_all["qty"]["sum"] == 55      # qty batched, label skipped
+    assert [s.split(" FROM")[0] for s in t_conn.statements[1:]] == ["SELECT SUM(label)"]
+    assert t_all["label"]["sum"] == 56 and t_all["label"]["count"] == 10  # one probe, metrics kept
+    result = _tier2(spec, source, target)
+    assert ("aggregate_sum", "field qty->label") in {(f.check, f.detail) for f in result.findings}
+    # the reverse order requests exactly the same statements
+    spec.objects[0].fields.reverse()
+    source2, s_conn2 = _typed_adapter("CREATE TABLE t (id INTEGER, qty INTEGER, label TEXT)",
+                                      [(i, i, str(i)) for i in range(1, 11)])
+    target2, t_conn2 = _typed_adapter("CREATE TABLE t (id INTEGER, label TEXT)",
+                                      [(i, str(i)) for i in range(1, 11)])
+    _object_aggregates(spec.objects[0], source2, target2)
+    assert len(s_conn2.statements) == 1 and len(t_conn2.statements) == 2
+    est = estimate_cost(spec, TOL)
+    assert est["source_statements"]["tier2"] == 1 and est["target_statements"]["tier2"] == 2
+
+
+def test_estimate_counts_a_shared_column_once_under_its_strongest_plan():
+    # `amt` is declared numeric on the source in one mapping (batch) and undeclared in another
+    # (probe): the run reads it once in the batched statement, so the estimate must not add a probe.
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="t", root_table="t", key_source=["id"], key_target="id",
+        fields=[FieldMapping("amt", "amt", "", "decimal(10,2)"),
+                FieldMapping("amt", "amt_copy", "REAL", "double")])])
+    source, s_conn = _typed_adapter("CREATE TABLE t (id INTEGER, amt REAL)",
+                                    [(i, float(i)) for i in range(1, 11)])
+    target, t_conn = _typed_adapter("CREATE TABLE t (id INTEGER, amt REAL, amt_copy REAL)",
+                                    [(i, float(i), float(i)) for i in range(1, 11)])
+    _object_aggregates(spec.objects[0], source, target)
+    est = estimate_cost(spec, TOL)
+    assert est["source_statements"]["tier2"] == len(s_conn.statements) == 1
+    assert est["target_statements"]["tier2"] == len(t_conn.statements) == 1
 
 
 def test_table_aggregates_honours_where():
@@ -191,6 +295,46 @@ def test_tier3_stratified_catches_a_seeded_diff_in_every_stratum_edge():
     result = run_recon("u", "live", SPEC, tol, RULES, source, target)
     assert result["verdict"] == "FAIL"
     assert any(f["check"] == "field_diff" and "199" in f["detail"] for f in result["tiers"][2]["findings"])
+
+
+def test_null_key_count_is_one_statement_and_honours_where():
+    adapter, conn = sqlite_adapter(ROWS + [(None, 1, 1.0, "x"), (None, 2, 2.0, "y")])
+    assert adapter.null_key_count("t", ["id"]) == 2
+    assert adapter.null_key_count("t", ["id"], "grp = 1") == 1
+    assert adapter.null_key_count("t", ["id", "amt"]) == 2 + sum(1 for r in ROWS if r[2] is None)
+    assert len(conn.statements) == 3 and all("IS NULL" in s for s in conn.statements)
+
+
+def test_tier3_reports_null_comparison_keys_that_sampling_cannot_reach():
+    # Tier 1 counts and tier 2 aggregates are identical on both sides; the only difference is a
+    # NULL-key row whose name differs. A keyed sample can never fetch that row, so tier 3 has
+    # to name the null key instead of passing.
+    source, target = big_estate()
+    source.tables["ORDERS"].append({"ORDER_ID": None, "CUST_NAME": "5x", "TOTAL": 5.0})
+    target.objects["orders"].append({"order_id": None, "customer": {"name": "5y"},
+                                     "total": 5.0, "items": []})
+    tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=12)
+    result = run_recon("u", "live", SPEC, tol, RULES, source, target, seed=3)
+    assert result["tiers"][0]["passed"] and result["tiers"][1]["passed"]
+    t3 = result["tiers"][2]
+    assert result["verdict"] == "FAIL" and not t3["passed"]
+    checks = [f["check"] for f in t3["findings"]]
+    assert checks == ["null_comparison_key", "null_comparison_key"]
+    assert {f["detail"].split(":")[0] for f in t3["findings"]} == {"source", "target"}
+    assert t3["stats"]["orders"]["null_key_rows"] == {"source": 1, "target": 1}
+    assert source.calls["null_key_count"] == target.calls["null_key_count"] == 1
+    assert None not in {k[0] for k in source.last_fetch_keyed["keys"]}
+
+
+def test_null_key_rows_are_reported_in_full_diff_mode_too():
+    source, target = big_estate(n=20)
+    source.tables["ORDERS"].append({"ORDER_ID": None, "CUST_NAME": "5", "TOTAL": 5.0})
+    target.objects["orders"].append({"order_id": None, "customer": {"name": "5"}, "total": 5.0, "items": []})
+    result = run_recon("u", "live", SPEC, Tolerances(version="t"), RULES, source, target, seed=3)
+    t3 = result["tiers"][2]
+    assert t3["stats"]["orders"]["mode"] == "full_diff"
+    assert [f["check"] for f in t3["findings"]] == ["null_comparison_key", "null_comparison_key"]
+    assert t3["stats"]["orders"]["null_key_rows"] == {"source": 1, "target": 1}
 
 
 def test_tier3_stratified_counts_source_duplicates_without_streaming():
