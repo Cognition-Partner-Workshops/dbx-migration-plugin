@@ -3,8 +3,8 @@
   {"rule": "datetime_utc_truncate_ms", "applies_to": "DATETIMEOFFSET(p<=3)->TIMESTAMP (UTC-normalise; ms truncation is lossless at p<=3)", "params": {"precision_note": "never for DATETIME2/BIGDATETIME/TIME or DATETIMEOFFSET(p>3): truncating to ms hides valid us differences; those use identity, with DATETIME2(7)/DATETIMEOFFSET(7) extracted at us in the source query (GAP datetime_truncate_us)"}},
   {"rule": "collation_casefold", "applies_to": "STRING", "params": {"enabled_if": "census reports a *_CI_* database/column collation (sys.databases.collation_name, sys.columns.collation_name) or an SSIS no-cache Lookup on a CI database; disabled for Sybase ASE binary sort order (sp_helpsort)"}},
   {"rule": "rstrip_spaces", "applies_to": "CHAR->STRING", "params": {}},
-  {"rule": "decimal_round", "applies_to": "MONEY,SMALLMONEY,DECIMAL,NUMERIC->DECIMAL", "params": {"mode": "half_up", "places": 4, "places_note": "one params set per rule name (recon.canon.Canonicalizer indexes by rule); places = max(4, largest DECIMAL/NUMERIC scale in the census), raised through the tolerance record"}},
+  {"rule": "decimal_round", "applies_to": "only columns the target recomputes from MONEY/SMALLMONEY -> DECIMAL(19,4)/(10,4) (source rounds every MONEY operation to 4 places)", "params": {"mode": "half_up", "places": 4, "places_note": "never list this rule on a DECIMAL/NUMERIC(p,s) field or a loaded MONEY field: those are identity (exact at any scale; a recomputed DECIMAL column is cast to DECIMAL(p,s) in the converted SQL). One params set per rule name (recon.canon.Canonicalizer indexes by rule), so a per-scale places is GAP decimal_round_per_field"}},
   {"rule": "uuid_normalize", "applies_to": "UNIQUEIDENTIFIER->STRING", "params": {}},
   {"rule": "null_missing_equiv", "applies_to": "*", "params": {}},
-  {"rule": "identity", "applies_to": "*; loaded DATETIME, SMALLDATETIME, DATETIME2(p<=6), BIGDATETIME, TIME(p<=6) -> TIMESTAMP_NTZ/TIME compare exactly", "params": {}}
+  {"rule": "identity", "applies_to": "*; DECIMAL/NUMERIC(p,s) at any scale, loaded MONEY, loaded DATETIME, SMALLDATETIME, DATETIME2(p<=6), BIGDATETIME, TIME(p<=6) compare exactly", "params": {}}
 ]

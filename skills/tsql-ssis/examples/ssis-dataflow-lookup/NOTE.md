@@ -1,7 +1,7 @@
 # ssis-dataflow-lookup: `LoadPaymentFact.dtsx`
 
 Source: `source.dtsx`, a hand-written `.dtsx`-shaped package (the Sybase fixture has no SSIS).
-Converted: `converted.sql` (Jobs `sql_task` file) + `converted.yml` (job wrapper).
+Converted: `converted.sql` (Jobs `sql_task` file) + `converted.yml` (job wrapper) + `log_onerror.sql` (OnError task).
 
 Constructs: OLE DB Source with `?` bound to `User::LoadDate`; Lookup (Full cache, no-match
 redirected, reference query on `$Package::ServicerId`); Derived Column expressions (`YEAR()*100+MONTH()`,

@@ -22,7 +22,7 @@ resources:
           max_retries: 2                       # commit conflict with an outside dw writer: MERGEs are idempotent
           min_retry_interval_millis: 60000
           sql_task:
-            file: { path: ../sql/load_payment_fact.sql, source: WORKSPACE }   # converted.sql
+            file: { path: ./converted.sql, source: WORKSPACE }   # relative to this file in the bundle
             warehouse_id: ${var.warehouse_id}
             parameters:
               src_catalog: "{{job.parameters.src_catalog}}"
@@ -35,10 +35,7 @@ resources:
           depends_on: [{ task_key: load_payment_fact }]
           run_if: AT_LEAST_ONE_FAILED          # excluded on a clean run; one row per failed run (SSIS: one per error event)
           sql_task:
-            file: { path: ../sql/log_onerror_etl_log.sql, source: WORKSPACE }
-            # INSERT INTO IDENTIFIER(:tgt_catalog||'.'||:tgt_schema||'.etl_log') (package_name, event, message, logged_at)
-            # VALUES ('LoadPaymentFact', 'OnError', 'load_payment_fact ' || :result_state || ' ' || :error_code
-            #         || ' run ' || :run_id, current_timestamp());
+            file: { path: ./log_onerror.sql, source: WORKSPACE }
             warehouse_id: ${var.warehouse_id}
             parameters:
               tgt_catalog:  "{{job.parameters.tgt_catalog}}"

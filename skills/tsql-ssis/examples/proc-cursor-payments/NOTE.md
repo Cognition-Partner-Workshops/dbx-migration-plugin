@@ -21,6 +21,6 @@ Lineage: reads `loans`, `escrow_accounts`; calls `fn_calculate_amortization`; wr
 
 Recon: **Tier 1** `count(payments WHERE batch_id = b)` = eligible loans; `audit_trail` gains exactly
 one `BATCH_START` and one `PAYMENT_INS` per payment. **Tier 2** `sum(principal_amt)`, `sum(total_amt)`
-under `decimal_round` places=4 (MONEY residual). **Tier 3** on `loan_id`: `current_balance` after
+under `decimal_round` places=4 (recomputed from `MONEY`; loaded amounts are `identity`). **Tier 3** on `loan_id`: `current_balance` after
 the run; a failure-injection run must leave balances and payments unchanged and one `BATCH_START`
 row with `record_count = 0`.
