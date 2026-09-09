@@ -227,6 +227,44 @@ def test_tier2_sum_skipped_for_non_numeric():
     assert result["verdict"] == "PASS"  # 0-vs-None sum on a string field is not a finding
 
 
+def test_tier2_source_sum_follows_source_type_not_target_type():
+    # CODE is a string on the source and cast to a number in conversion: the source SUM must
+    # not ride in the batched statement (it would abort every metric on an engine that errors),
+    # it is probed alone; the undeclared target side is probed too, never assumed from the source
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="c", root_table="T", key_source=["ID"], key_target="id",
+        fields=[FieldMapping("ID", "id", "NUMBER", "long"),
+                FieldMapping("CODE", "code", "VARCHAR2(10)", "int"),
+                FieldMapping("AMT", "amt", "NUMBER(10,2)", "")])])
+    rows = [{"ID": 1, "CODE": "7", "AMT": 1.5}, {"ID": 2, "CODE": "8", "AMT": 2.5}]
+
+    class Source(FakeSource):
+        def field_aggregates(self, table, column, where=None):
+            out = super().field_aggregates(table, column, where)
+            if column == "CODE":
+                raise RuntimeError("ORA-01722: invalid number")  # the probe fails in isolation
+            return out
+
+    source = Source({"T": rows})
+    target = FakeTarget({"c": [{"id": 1, "code": "7", "amt": 1.5}, {"id": 2, "code": "8", "amt": 2.5}]})
+    from recon import tiers
+    c = spec.objects[0]
+    with pytest.raises(RuntimeError):
+        tiers._object_aggregates(c, source, target)
+    assert source.last_table_aggregates_numeric == ["ID", "AMT"]
+    assert source.calls["table_aggregates"] == 1  # the batched statement went out before the probe
+
+    source = FakeSource({"T": rows})
+    result = run_recon("u", "live", spec, TOL, RULES, source, target)
+    assert result["verdict"] == "PASS"
+    assert source.calls["field_aggregates"] == 1  # CODE probed alone
+    assert target.calls["field_aggregates"] == 1  # AMT (undeclared target type) probed alone
+    assert target.last_table_aggregates_numeric == ["id", "code"]
+    from recon.cost import estimate_cost
+    est = estimate_cost(spec, TOL)
+    assert est["source_statements"]["tier2"] == 2 and est["target_statements"]["tier2"] == 2
+
+
 def test_null_consistent_aggregates_green():
     # Adapter contract: SUM/MIN/MAX/DISTINCT-COUNT over non-null values only (SQL
     # semantics). A nullable numeric field with nulls on both sides must not produce

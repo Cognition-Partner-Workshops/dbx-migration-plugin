@@ -99,46 +99,76 @@ ORDER_PRESERVING_RULES = {
 
 # SUM is only meaningful for numeric fields. SUM of a string column errors or returns NULL
 # depending on the engine, so comparing sums on non-numeric fields manufactures false
-# findings. Numericness comes from the declared target_type (Spark SQL type name), falling
-# back to the observed source value.
-NUMERIC_TARGET_TYPES = {"int", "integer", "bigint", "long", "smallint", "tinyint", "double",
-                        "float", "decimal", "numeric", "number"}
+# findings. Each side's numericness comes from its own declared type (source_type in the
+# source engine's vocabulary, target_type in the target's); a side with no declaration, or
+# one whose declared type disagrees with the other side (a conversion mapping), is probed in
+# isolation so a failing SUM costs one statement instead of the batched one.
+NUMERIC_TYPES = {
+    "int", "integer", "bigint", "long", "smallint", "tinyint", "byteint", "double", "float", "real",
+    "double precision", "decimal", "numeric", "number", "money", "smallmoney", "decimal128",
+    "int2", "int4", "int8", "float4", "float8", "serial", "bigserial", "binary_float", "binary_double",
+}
+_NUMERIC_VALUE = (int, float, decimal.Decimal)
 
 
-def _is_numeric_field(f, source_sum: Any) -> bool:
-    if f.target_type:
-        return f.target_type.lower().split("(")[0] in NUMERIC_TARGET_TYPES
-    return isinstance(source_sum, (int, float, decimal.Decimal)) and not isinstance(source_sum, bool)
+def _type_numeric(type_name: str) -> bool | None:
+    if not type_name:
+        return None
+    return type_name.lower().split("(")[0].strip() in NUMERIC_TYPES
 
 
-def _declared_numeric(f) -> bool | None:
-    if f.target_type:
-        return f.target_type.lower().split("(")[0] in NUMERIC_TARGET_TYPES
-    return None
+def sum_plan(own_type: str, other_type: str) -> str:
+    """How one side obtains SUM for a field: 'batch' (declared numeric, in the table statement),
+    'probe' (undeclared, or declared non-numeric while the other side is numeric: a conversion
+    mapping the engine may still sum), or 'skip'."""
+    own = _type_numeric(own_type)
+    if own:
+        return "batch"
+    if own is None or _type_numeric(other_type):
+        return "probe"
+    return "skip"
+
+
+def _side_numeric(plan: str, agg: dict) -> bool:
+    if plan == "batch":
+        return True
+    s = agg.get("sum")
+    return plan == "probe" and isinstance(s, _NUMERIC_VALUE) and not isinstance(s, bool)
+
+
+def _is_numeric_field(f, s: dict, t: dict) -> bool:
+    return (_side_numeric(sum_plan(f.source_type, f.target_type), s)
+            and _side_numeric(sum_plan(f.target_type, f.source_type), t))
 
 
 def _object_aggregates(c: ObjectMapping, source, target) -> tuple[dict[str, dict], dict[str, dict]]:
     """All field aggregates for one object: one statement per side when the adapter batches,
-    one per field otherwise. SUM is requested only for fields declared numeric; undeclared
-    fields get the per-column probe (SUM may error on strings)."""
-    cols = [f.source for f in c.fields]
-    numeric_src = [f.source for f in c.fields if _declared_numeric(f)]
-    undeclared = [f for f in c.fields if _declared_numeric(f) is None]
+    one per field otherwise. Each side requests SUM per its own `sum_plan`; probed fields get
+    the isolated per-column statement so a SUM that errors never aborts the batched one."""
+    s_plan = {f.source: sum_plan(f.source_type, f.target_type) for f in c.fields}
+    cols = list(s_plan)
     if isinstance(source, BatchAggregates):
-        s_all = source.table_aggregates(c.root_table, cols, numeric_src, c.root_where)
-        for f in undeclared:
-            s_all[f.source] = source.field_aggregates(c.root_table, f.source, c.root_where)
+        s_all = source.table_aggregates(c.root_table, cols, [k for k, p in s_plan.items() if p == "batch"],
+                                        c.root_where)
+        for col, p in s_plan.items():
+            if p == "probe":
+                s_all[col] = source.field_aggregates(c.root_table, col, c.root_where)
     else:
-        s_all = {f.source: source.field_aggregates(c.root_table, f.source, c.root_where) for f in c.fields}
-    tcols = [f.target for f in c.fields]
-    numeric_tgt = [f.target for f in c.fields
-                   if _is_numeric_field(f, s_all[f.source].get("sum"))]
+        s_all = {col: source.field_aggregates(c.root_table, col, c.root_where) for col in cols}
+    t_plan = {f.target: sum_plan(f.target_type, f.source_type) for f in c.fields}
+
+    def t_probe(col: str) -> dict:
+        return (target.field_aggregates(c.object, col, c.target_where)
+                if c.target_where is not None else target.field_aggregates(c.object, col))
+
     if isinstance(target, BatchAggregates):
-        t_all = target.table_aggregates(c.object, tcols, numeric_tgt, c.target_where)
+        t_all = target.table_aggregates(c.object, list(t_plan), [k for k, p in t_plan.items() if p == "batch"],
+                                        c.target_where)
+        for col, p in t_plan.items():
+            if p == "probe":
+                t_all[col] = t_probe(col)
     else:
-        t_all = {f.target: (target.field_aggregates(c.object, f.target, c.target_where)
-                            if c.target_where is not None else target.field_aggregates(c.object, f.target))
-                 for f in c.fields}
+        t_all = {col: t_probe(col) for col in t_plan}
     return s_all, t_all
 
 
@@ -151,7 +181,7 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         for f in c.fields:
             checks += 1
             s, t = s_all[f.source], t_all[f.target]
-            numeric = _is_numeric_field(f, s.get("sum"))
+            numeric = _is_numeric_field(f, s, t)
             stats_to_check: tuple[str, ...] = ("null_rate", "distinct_count", "min", "max")
             if numeric:
                 stats_to_check += ("sum",)

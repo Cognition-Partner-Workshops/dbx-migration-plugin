@@ -57,6 +57,7 @@ class FakeSource:
                          where: str | None = None) -> dict[str, dict[str, Any]]:
         self.calls["table_aggregates"] += 1
         self.statements += 1
+        self.last_table_aggregates_numeric = list(numeric)
         out = {}
         for col in columns:
             agg = self._aggregates(table, col, where)
@@ -174,6 +175,8 @@ class FakeTarget:
         # counted as one statement, as a SQL target would issue.
         self.calls["table_aggregates"] += 1
         self.statements += 1
+        self.last_table_aggregates_numeric = list(numeric)
+        probes = self.calls["field_aggregates"]
         out = {}
         for col in columns:
             agg = (self.field_aggregates(object, col, where) if where is not None
@@ -181,9 +184,11 @@ class FakeTarget:
             if col not in numeric:
                 agg["sum"] = None
             out[col] = agg
+        self.calls["field_aggregates"] = probes  # only direct probes count as statements
         return out
 
     def field_aggregates(self, object: str, field_path: str, where=None) -> dict[str, Any]:
+        self.calls["field_aggregates"] += 1
         vals = [get_path(d, field_path) for d in self._rows(object, where)]
         vals = [None if v is MISSING else v for v in vals]
         nn = [v for v in vals if v is not None]

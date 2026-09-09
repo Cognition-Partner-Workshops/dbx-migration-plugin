@@ -314,7 +314,8 @@ def capability_block():
 
 
 def verify_prompt(passed, auto_merge):
-    depths = {b["id"]: batch_verify_depth(b) for b in passed}
+    by_id = {b["id"]: b for b in BATCHES}
+    depths = {p["batch"]: batch_verify_depth(by_id[p["batch"]]) for p in passed}
     merge_line = (
         "Merge every PR you mark PASS and list it in merged_prs, even if another unit in the wave failed; "
         "failed units are reopened next launch."
