@@ -1415,6 +1415,35 @@ def test_identifiers_that_are_not_one_name_are_refused(name):
         quote_ident(name, '"')
 
 
+def test_lakebase_target_validates_the_schema_before_it_connects(monkeypatch):
+    psycopg = pytest.importorskip("psycopg")
+    monkeypatch.setenv("T", "dsn-under-test")
+    connects = []
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: connects.append(dsn) or _db("db"))
+    with pytest.raises(ConfigError, match="invalid SQL identifier"):
+        LakebaseTargetAdapter("T", "db", "public.loan_servicing")
+    assert connects == []
+
+
+def test_databricks_target_validates_catalog_and_schema_before_it_connects(monkeypatch):
+    import recon.adapters as adapters
+    connects = []
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: connects.append(name))
+    with pytest.raises(ConfigError, match="invalid SQL identifier"):
+        adapters.DatabricksTargetAdapter("D", "", "silver")
+    assert connects == []
+
+
+def test_cleanup_notes_are_attached_without_add_note(monkeypatch):
+    import recon.engine as engine
+    monkeypatch.setattr(engine.sys, "version_info", (3, 10, 0))
+    exc = RuntimeError("tier failure")
+    engine._add_note(exc, "source close_window failed")
+    engine._add_note(exc, "source connection could not be dropped")
+    assert exc.__notes__ == ["source close_window failed", "source connection could not be dropped"]
+    assert str(exc) == "tier failure"
+
+
 def test_lakebase_target_qualifies_objects_with_escaped_identifiers(monkeypatch):
     psycopg = pytest.importorskip("psycopg")
     monkeypatch.setenv("T", "dsn-under-test")

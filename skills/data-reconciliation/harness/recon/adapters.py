@@ -1019,10 +1019,11 @@ class DatabricksTargetAdapter:
     them with the migration catalog and schema so a spec never points at production."""
 
     def __init__(self, secret_name: str, catalog: str, schema: str):
+        # names are validated before a session is opened so a bad name never leaks one
+        self._prefix = f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
         self._conn = _databricks_connect(secret_name)
         self._sql = _SqlAdapterBase(self._conn)
         self._sql.paramstyle = "pyformat"
-        self._prefix = f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
 
     @property
     def statements(self) -> int:
@@ -1331,9 +1332,9 @@ class LakebaseTargetAdapter(_PostgresBase):
 
     def __init__(self, secret_name: str, database: str, schema: str):
         import psycopg  # lazy: optional extra
-        super().__init__(psycopg.connect(_secret(secret_name)))
         self._schema = schema
-        self._schema_q = quote_ident(schema, '"')
+        self._schema_q = quote_ident(schema, '"')  # before connecting: a bad name leaks no session
+        super().__init__(psycopg.connect(_secret(secret_name)))
         self.database = self._bind_database(database)
 
     def _bind_database(self, expected: str) -> str:

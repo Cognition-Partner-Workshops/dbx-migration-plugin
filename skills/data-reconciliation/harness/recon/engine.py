@@ -5,6 +5,7 @@ Deterministic and idempotent: same inputs produce the same verdict; safe to re-r
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -85,6 +86,15 @@ def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source,
     return tiers
 
 
+def _add_note(exc: BaseException, note: str) -> None:
+    """`BaseException.add_note` on 3.11+; the same `__notes__` list by hand on 3.10, where the
+    traceback will not print it but callers and tests still see the release failures."""
+    if sys.version_info >= (3, 11):
+        exc.add_note(note)
+    else:
+        exc.__dict__.setdefault("__notes__", []).append(note)
+
+
 def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
               rules: list[CanonRule], source, target,
               ops: list[dict] | None = None, run_source=None, run_target=None,
@@ -125,7 +135,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         # run's error is what propagates, with any release failure attached to it
         if mode == "transactional":
             for err in abandon_window(source, target):
-                exc.add_note(str(err))
+                _add_note(exc, str(err))
         raise
     provenance_warnings = _snapshot_provenance_warnings(
         snapshot, source_family, spec, next(t for t in tiers if t.tier == 1))
