@@ -1,31 +1,25 @@
-# Converted unit: RI_CESSIONS / m_RI_BORDEREAUX_MONTHLY  (fixture: source.xml, source.bdx_transfer.ksh)
-# Target form: Lakeflow Spark Declarative Pipelines with Auto Loader ingestion of the broker CSVs
-# (databricks-pipelines references/auto-loader-python.md `spark.readStream.format("cloudFiles")` inside `@dp.table`;
-# SKILL.md "input_file_name() -> _metadata.file_path"; references/expectations-python.md for `@dp.expect*`). Ingestion of the files themselves (SFTP pull) is NOT converted here - see NOTE.md.
-#
-# Legacy: 14 hand-maintained broker-specific SOURCE definitions (not in the export) -> EXP_REKEY_POLICY,
-# EXP_AMT_CLEAN, LKP_SII_LOB -> ceded-claims computation per treaty -> Lloyd's-format outward bordereau.
-# Only the three transformations are exported; the rest is INFERRED from the MAPPING DESCRIPTION.
-
+# RI_CESSIONS / m_RI_BORDEREAUX_MONTHLY as a Lakeflow Spark Declarative Pipeline with Auto Loader ingestion
+# (databricks-pipelines references/auto-loader-python.md, references/expectations-python.md). The pre-step SFTP pull
+# (bdx_transfer.ksh: mget CLAIMS_BDX_${BRK}_*.csv per broker, then mailx) is an ingestion decision, not converted here.
+# Only EXP_REKEY_POLICY, EXP_AMT_CLEAN and LKP_SII_LOB are exported; the 14 per-broker SOURCE definitions, the
+# ceded-claims computation and the Lloyd's outward bordereau are INFERRED from the MAPPING DESCRIPTION.
+# ruff: noqa: F821  (`spark` is pre-imported in pipeline files: databricks-pipelines references/python-basics.md)
 from pyspark import pipelines as dp
-from pyspark.sql import Window, functions as F
+from pyspark.sql import Window
+from pyspark.sql import functions as F
 
-LANDING = spark.conf.get("informatica.bdx_landing_path")      # was /interface/inbound/bordereaux (bdx_transfer $LANDING)
+LANDING = spark.conf.get("informatica.bdx_landing_path")  # was /interface/inbound/bordereaux
 SII_LOB_MAP = spark.conf.get("informatica.sii_lob_map_table")  # REF_DB.SII_LOB_MAP
-EXPECTED_BROKERS = spark.conf.get("informatica.expected_brokers_table")  # same table the gate task reads
-
-# Broker files are Latin1/MS1252 (the pound sign is byte 0xA3 = CHR(163) in Latin1; in UTF-8 it is 0xC2 0xA3).
-# Reading with the wrong encoding turns '£' into 'Â£' and REPLACECHR(CHR(163)) removes only the second byte
-# (SKILL.md row 45, trap 18). The encoding is a per-broker fact recorded in the census, defaulting to the
-# repository CODEPAGE (Latin1 in source.xml).
+EXPECTED_BROKERS = spark.conf.get("informatica.expected_brokers_table")
+# Repository CODEPAGE is Latin1: the pound sign is one byte 0xA3 = CHR(163). Read as UTF-8 it becomes 'Â£' and the
+# REPLACECHR(CHR(163)) equivalent strips only the second byte (trap 18).
 BROKER_ENCODING = spark.conf.get("informatica.bdx_encoding", "ISO-8859-1")
 
 
-@dp.table(name="bdx_claims_raw", comment="Broker claims bordereaux CSVs as landed; one schema per broker is a decision")
+@dp.table(name="bdx_claims_raw", comment="Broker claims bordereaux CSVs as landed")
 def bdx_claims_raw():
     return (spark.readStream.format("cloudFiles")
-                 .option("cloudFiles.format", "csv")
-                 .option("header", "true")
+                 .option("cloudFiles.format", "csv").option("header", "true")
                  .option("encoding", BROKER_ENCODING)
                  .option("pathGlobFilter", "CLAIMS_BDX_BRK*_*.csv")
                  .load(LANDING)
@@ -35,82 +29,52 @@ def bdx_claims_raw():
 
 @dp.temporary_view()
 def bdx_claims_expected():
-    # Legacy had one hand-built SOURCE definition per broker: a file from an unknown broker had no mapping to load it.
-    # The converted equivalent is the expected-broker table (effective-from/to month) that the gate task also reads;
-    # a landed row whose BROKER_ID is not effective for its FILE_MONTH is flagged here and split below, so the
-    # published view can never contain an undeclared broker even when the pipeline is started without the gate.
+    # Legacy had one hand-built SOURCE per broker, so an unknown broker's file could not load. The expected-broker
+    # table (effective month range) replaces that; left_semi / left_anti keep the raw row count intact.
     raw = spark.read.table("bdx_claims_raw")
     allowed = (spark.read.table(EXPECTED_BROKERS)
                     .select(F.col("BROKER_ID").alias("exp_BROKER_ID"), "effective_from_month",
                             F.coalesce(F.col("effective_to_month"), F.lit("999912")).alias("effective_to_month"))
-                    .dropDuplicates(["exp_BROKER_ID", "effective_from_month", "effective_to_month"]))
-    match = ((raw.BROKER_ID == allowed.exp_BROKER_ID)
-             & (raw.FILE_MONTH >= allowed.effective_from_month)
+                    .dropDuplicates())
+    match = ((raw.BROKER_ID == allowed.exp_BROKER_ID) & (raw.FILE_MONTH >= allowed.effective_from_month)
              & (raw.FILE_MONTH <= allowed.effective_to_month))
-    # left_semi / left_anti keep the raw row count intact (no multiplication if a broker has overlapping rows)
     return (raw.join(allowed, match, "left_semi").withColumn("broker_expected", F.lit(True))
                .unionByName(raw.join(allowed, match, "left_anti").withColumn("broker_expected", F.lit(False))))
 
 
-@dp.materialized_view(name="ri_claims_bdx_unexpected_broker",
-                      comment="Rows from broker files not in the expected-broker set for their month; census evidence, never published")
+@dp.materialized_view(name="ri_claims_bdx_unexpected_broker", comment="Undeclared-broker rows: census evidence, never published")
 def ri_claims_bdx_unexpected_broker():
     return spark.read.table("bdx_claims_expected").filter(~F.col("broker_expected")).drop("broker_expected")
 
 
-def exp_rekey_policy(df):
-    # EXP_REKEY_POLICY: REPLACECHR(0, REPLACESTR(0, in_POLICY_REF, 'AL/', 'ALB-'), '/', '-')
-    # caseFlag 0 = case-insensitive on both: 'al/mot/1' also becomes 'ALB-mot-1' in Informatica (row 41, trap 17),
-    # so the REPLACESTR is (?i); REPLACECHR of a single '/' is case-free and becomes translate() (row 40).
-    rekeyed = F.translate(F.regexp_replace(F.col("POLICY_REF"), r"(?i)AL/", "ALB-"), "/", "-")
-    return df.withColumn("POLICY_NO", rekeyed)
-
-
-def exp_amt_clean(df):
-    # EXP_AMT_CLEAN: TO_DECIMAL(REPLACECHR(0, REPLACECHR(0, in_AMT_TXT, CHR(163), ''), ',', ''))  -> decimal(12,2) port
-    # TO_DECIMAL of a non-numeric string is 0 in Informatica; try_cast gives NULL (row 13). The legacy behaviour is
-    # reproduced (coalesce 0) AND the condition is surfaced as an expectation so the rows are countable. Empty string
-    # -> 0 as well. A value like '(1,234.56)' (accounting negative) is 0 in both engines: recorded as a finding.
-    stripped = F.translate(F.col("AMT_TXT"), "\u00a3,", "")      # CHR(163) in Latin1 = U+00A3; two REPLACECHR -> one translate
-    parsed = F.expr("try_cast(translate(AMT_TXT, '\u00a3,', '') AS DECIMAL(12,2))")
-    return (df.withColumn("AMT", F.coalesce(parsed, F.lit(0).cast("decimal(12,2)")))
-              .withColumn("amt_unparsable", F.col("AMT_TXT").isNotNull() & (F.trim(stripped) != "") & parsed.isNull()))
-
-
 @dp.temporary_view()
 def lkp_sii_lob():
-    # LKP_SII_LOB: reusable, cached; REF_DB.SII_LOB_MAP keyed by PRODUCT_CD (INFERRED from the description).
-    # The reference data is DRIFTED from the SAS copy (PET -> 'Other motor' here). The converted lookup reads the
-    # SAME table the Informatica session read, so the drift is reproduced and filed as a finding (SKILL.md trap 10).
-    # A Lookup returns exactly one row per input row whatever the cache holds ("Lookup policy on multiple match", not
-    # exported: Use Any/First/Last Value; row 74). One row per PRODUCT_CD is therefore enforced here so the join
-    # below can never multiply an input row; a duplicated PRODUCT_CD in the reference table is a finding, and the
-    # tie-break (min SII_LOB) is INFERRED and recorded in the unit brief.
-    ref = spark.read.table(SII_LOB_MAP).select("PRODUCT_CD", "SII_LOB")
-    one_per_key = Window.partitionBy("PRODUCT_CD").orderBy(F.col("SII_LOB").asc_nulls_last())
-    return (ref.withColumn("rn", F.row_number().over(one_per_key))
-               .filter(F.col("rn") == 1)
-               .drop("rn"))
+    # LKP_SII_LOB (reusable, cached; keyed by PRODUCT_CD, INFERRED). Reads the same drifted table the session read
+    # (PET -> 'Other motor'): the drift is reproduced and filed as a finding (trap 10). A Lookup returns exactly one
+    # row per input whatever the cache holds, so one row per PRODUCT_CD is enforced; the tie-break is INFERRED.
+    w = Window.partitionBy("PRODUCT_CD").orderBy(F.col("SII_LOB").asc_nulls_last())
+    return (spark.read.table(SII_LOB_MAP).select("PRODUCT_CD", "SII_LOB")
+                 .withColumn("rn", F.row_number().over(w)).filter("rn = 1").drop("rn"))
 
 
 @dp.materialized_view(name="ri_claims_bdx_std", comment="m_RI_BORDEREAUX_MONTHLY converted; grain = BROKER_ID, CLAIM_REF")
-@dp.expect("amount_parsable", "NOT amt_unparsable")            # legacy silently produced 0: warn, do not drop
-# INFERRED POLARIS key shape. Warn only: the legacy mapping has no Filter after EXP_REKEY_POLICY, so every input
-# row reached the target; and because REPLACESTR ran case-insensitively, 'al/mot/0000001' legitimately lands as
-# 'ALB-mot-0000001' (lower-case suffix preserved) - the check must be (?i) or those rows fail it.
+@dp.expect("amount_parsable", "NOT amt_unparsable")  # legacy silently produced 0: warn, do not drop
+# Warn only: no Filter follows EXP_REKEY_POLICY in the legacy mapping, and the case-insensitive REPLACESTR means
+# 'al/mot/0000001' legitimately lands as 'ALB-mot-0000001', so the check itself must be (?i).
 @dp.expect("policy_rekeyed", "POLICY_NO RLIKE '(?i)^ALB-[A-Z]{3}-[0-9]{7}$'")
 def ri_claims_bdx_std():
-    # Informatica Expression transformations are row-preserving: every output row IS an input row plus derived
-    # ports. The conversion keeps that shape: both Expressions are applied to the same raw row (withColumn), never
-    # computed in separate views and re-joined. (BROKER_ID, CLAIM_REF) is the declared grain of the OUTPUT, but a
-    # broker file may legitimately repeat a CLAIM_REF; a self-join on that pair would turn n copies into n*n rows,
-    # whereas the legacy pipeline emitted exactly n. Tier 1 counts per BROKER_ID catch the duplication as a finding.
     raw = spark.read.table("bdx_claims_expected").filter(F.col("broker_expected")).drop("broker_expected")
-    rows = exp_amt_clean(exp_rekey_policy(raw))
-    lob = spark.read.table("lkp_sii_lob")                        # one row per PRODUCT_CD (see above)
-    return (rows.join(lob, "PRODUCT_CD", "left")                 # connected Lookup: unmatched -> NULL SII_LOB, row kept
-                .select("BROKER_ID", "CLAIM_REF", "POLICY_NO", "AMT", "amt_unparsable",
-                        "SII_LOB",                                # NULL when the product is not in the map
-                        "PRODUCT_CD"))
-# Ceded-claims per quota-share treaty and the Lloyd's outward bordereau are described but not exported; they are
-# separate units in the census (INFERRED) and not part of this example.
+    # EXP_REKEY_POLICY: REPLACECHR(0, REPLACESTR(0, in_POLICY_REF, 'AL/', 'ALB-'), '/', '-'); caseFlag 0 -> (?i)
+    policy_no = F.translate(F.regexp_replace(F.col("POLICY_REF"), r"(?i)AL/", "ALB-"), "/", "-")
+    # EXP_AMT_CLEAN: TO_DECIMAL(REPLACECHR(0, REPLACECHR(0, in_AMT_TXT, CHR(163), ''), ',', '')) -> decimal(12,2).
+    # TO_DECIMAL of non-numeric/empty text is 0 in Informatica, NULL from try_cast: reproduce the 0 and count it.
+    stripped = F.translate(F.col("AMT_TXT"), "\u00a3,", "")
+    parsed = F.expr("try_cast(translate(AMT_TXT, '\u00a3,', '') AS DECIMAL(12,2))")
+    # Expressions are row-preserving: derive on the same raw row, never in separate views re-joined on
+    # (BROKER_ID, CLAIM_REF), which a broker file may repeat (n rows would become n*n).
+    rows = (raw.withColumn("POLICY_NO", policy_no)
+               .withColumn("AMT", F.coalesce(parsed, F.lit(0).cast("decimal(12,2)")))
+               .withColumn("amt_unparsable", F.col("AMT_TXT").isNotNull() & (F.trim(stripped) != "") & parsed.isNull()))
+    lob = spark.read.table("lkp_sii_lob")
+    return (rows.join(lob, "PRODUCT_CD", "left")  # connected Lookup: unmatched -> NULL SII_LOB, row kept
+                .select("BROKER_ID", "CLAIM_REF", "POLICY_NO", "AMT", "amt_unparsable", "SII_LOB", "PRODUCT_CD"))

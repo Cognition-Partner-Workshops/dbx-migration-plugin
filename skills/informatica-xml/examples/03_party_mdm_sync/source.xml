@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="ISO-8859-1"?>
 <!DOCTYPE POWERMART SYSTEM "powrmart.dtd">
+<!-- .par: $DBConnection_SRC=TD_POLICY_ADMIN_PROD  $DBConnection_TGT=ORA_MDM_HUB_PROD  $DBConnection_APF=TD_CORE_BANKING_PROD  $$MATCH_CONFIDENCE_FLOOR=0.82  $$SUSPECT_QUEUE_CAP=50000 -->
 <POWERMART CREATION_DATE="05/09/2024 09:18:55" REPOSITORY_VERSION="187.96">
 <REPOSITORY NAME="ALB_PROD_REPO" VERSION="187" CODEPAGE="Latin1" DATABASETYPE="Teradata">
 <FOLDER NAME="MDM_PARTY" GROUP="" OWNER="mdm_etl" SHARED="SHARED" DESCRIPTION="Party golden record sync. Uses mplt_DQ_PARTY_STANDARDISE (see mapplets/)." PERMISSIONS="rwx---r--" UUID="0f81b2ce-6a5d-4e30-92a4-770ac1de9b14">
@@ -24,6 +25,18 @@
             <TRANSFORMFIELD DATATYPE ="date/time" EXPRESSION ="TO_DATE(in_BIRTH_DT_TXT,'DD/MM/YYYY')" EXPRESSIONTYPE ="GENERAL" NAME ="out_BIRTH_DT" PORTTYPE ="OUTPUT" PRECISION ="29" SCALE ="9"/>
         </TRANSFORMATION>
     </MAPPING>
+
+    <!-- From informatica/mapplets/mplt_DQ_PARTY_STANDARDISE.xml (same SHARED folder; also used by wf_POLICY_MASTER_DAILY) -->
+    <MAPPLET DESCRIPTION ="Reusable party standardisation: name case, phone normalisation, postcode repair+validate (DQR-014 variant A - see also BTEQ variant in 04_stg_policy_360 and SAS variant in check_uk_postcode.sas; three engines, three answers). Consumed by wf_PARTY_MDM_SYNC and wf_POLICY_MASTER_DAILY. The GSS payroll estate has its OWN address standardiser (see legacy_shared_services) - a fourth variant, US-format, applied to UK addresses since a 2018 copy-paste." ISVALID ="YES" NAME ="mplt_DQ_PARTY_STANDARDISE" OBJECTVERSION ="1" VERSIONNUMBER ="8">
+        <TRANSFORMATION DESCRIPTION ="Proper-case names, strip double spaces." NAME ="EXP_NAME_STD" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="3">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_NAME" EXPRESSIONTYPE ="GENERAL" NAME ="in_NAME" PORTTYPE ="INPUT" PRECISION ="50" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="INITCAP(REPLACESTR(0, LTRIM(RTRIM(in_NAME)), '  ', ' '))" EXPRESSIONTYPE ="GENERAL" NAME ="out_NAME_STD" PORTTYPE ="OUTPUT" PRECISION ="50" SCALE ="0"/>
+        </TRANSFORMATION>
+        <TRANSFORMATION DESCRIPTION ="UK mobile normalisation to 07xxxxxxxxx; +44 prefix folded." NAME ="EXP_PHONE_STD" OBJECTVERSION ="1" REUSABLE ="NO" TYPE ="Expression" VERSIONNUMBER ="2">
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="in_PHONE" EXPRESSIONTYPE ="GENERAL" NAME ="in_PHONE" PORTTYPE ="INPUT" PRECISION ="20" SCALE ="0"/>
+            <TRANSFORMFIELD DATATYPE ="string" EXPRESSION ="IIF(SUBSTR(REPLACECHR(0,in_PHONE,' ',''),1,3)='+44','0'||SUBSTR(REPLACECHR(0,in_PHONE,' ',''),4),REPLACECHR(0,in_PHONE,' ',''))" EXPRESSIONTYPE ="GENERAL" NAME ="out_PHONE_STD" PORTTYPE ="OUTPUT" PRECISION ="20" SCALE ="0"/>
+        </TRANSFORMATION>
+    </MAPPLET>
 
     <WORKFLOW DESCRIPTION ="Nightly 01:30. Control-M ALB-MDM-0003. Must finish before wf_POLICY_MASTER_DAILY (03:15) - no explicit dependency defined, relies on runtime luck." ISENABLED ="YES" ISVALID ="YES" NAME ="wf_PARTY_MDM_SYNC" SERVERNAME ="ALB_INT_SVC" SERVER_DOMAINNAME ="Domain_ALB_PROD" VERSIONNUMBER ="24">
         <TASK NAME ="Start" REUSABLE ="NO" TYPE ="Start" VERSIONNUMBER ="1"/>

@@ -1,7 +1,0 @@
-[ALB_PROD_REPO.INS_POLICY.wf_POLICY_MASTER_DAILY.s_m_POLICY_MASTER_DAILY]
-$$RUNDATE=260115
-$DBConnection_TGT=TD_ETL_STAGING_PROD
-$DBConnection_LKP=TD_REF_PROD
-$InputFile_PLCYMSTR=/interface/inbound/plcymstr/PLCYMSTR_D260115.dat
-$BadFileName=/opt/informatica/bad/plcymstr_reject.bad
-$$COMMIT_INTERVAL=10000

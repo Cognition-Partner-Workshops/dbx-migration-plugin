@@ -1,6 +1,0 @@
-[ALB_PROD_REPO.FIN_BILLING.wf_BILLING_PREMIUM_RECON.s_m_BILLING_PREMIUM_RECON]
-$DBConnection_SRC=TD_BILLING_PROD
-$DBConnection_APF=TD_CORE_BANKING_PROD
-$OutputFile_BAD_APF=/interface/outbound/finance/BAD_APF_MATCH_$$RUNMONTH.csv
-$$IPT_RATE=0.12
-# NB $$IPT_RATE parameter exists but mapping hardcodes 0.12 anyway (see EXP_IPT_RECALC)
