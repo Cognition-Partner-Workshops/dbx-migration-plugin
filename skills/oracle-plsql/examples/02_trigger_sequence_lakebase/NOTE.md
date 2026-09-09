@@ -9,7 +9,7 @@ sequences: `policy_id` becomes an identity column and the trigger body is folded
 | row trigger, `INSERTING`/`UPDATING`, `:NEW`/`:OLD` | trigger function (`TG_OP`, `NEW`/`OLD`, `RETURN NEW`) + `CREATE TRIGGER` | construct map |
 | `seq.NEXTVAL` in PL/SQL | `nextval('schema.seq')` | function map |
 | `SYSDATE` into `DATE`; `SYS_CONTEXT('USERENV','SESSION_USER')` | `localtimestamp` into `timestamp(0)`; `session_user` | trap 3 |
-| `IF :NEW.x = '' THEN` (dead in Oracle) | live branch in Postgres, kept | trap 1 |
+| `IF :NEW.x = '' THEN` (dead in Oracle); `TRIM(:NEW.policy_no)` of blanks is NULL | live branch in Postgres, kept; `nullif(..., '')` on the normalised key | trap 1 |
 | `TRUNC(SYSDATE) BETWEEN TRUNC(a) AND TRUNC(b)` | `current_date BETWEEN a::date AND b::date` | function map |
 | `PRAGMA AUTONOMOUS_TRANSACTION` + `COMMIT` | plain procedure, no `COMMIT`; audit rows lost on caller rollback (decision) | trap 14 |
 | `WHEN OTHERS THEN ROLLBACK` | `WHEN OTHERS THEN NULL` (swallow, parity) | trap 13 |

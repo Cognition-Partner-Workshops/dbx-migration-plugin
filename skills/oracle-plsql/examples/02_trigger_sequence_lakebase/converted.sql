@@ -53,7 +53,7 @@ BEGIN
     l_event := 'UPDATE';
   END IF;
 
-  NEW.policy_no := replace(upper(trim(NEW.policy_no)), 'AL/', 'ALB-');
+  NEW.policy_no := nullif(replace(upper(trim(NEW.policy_no)), 'AL/', 'ALB-'), '');  -- blank key is NULL in Oracle
 
   IF NEW.cover_note_ref = '' THEN                   -- dead in Oracle ('' IS NULL); live here, keep it
     NEW.cover_note_ref := NULL;

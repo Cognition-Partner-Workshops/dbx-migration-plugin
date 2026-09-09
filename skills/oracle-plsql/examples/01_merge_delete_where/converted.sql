@@ -11,7 +11,7 @@ CREATE TEMPORARY TABLE stg_policy_feed (
 -- USING subquery materialised once: a temp view would be re-executed by every statement below.
 DROP TABLE IF EXISTS stg_policy_src;
 CREATE TEMPORARY TABLE stg_policy_src AS
-  SELECT replace(upper(trim(s.policy_no)), 'AL/', 'ALB-')  AS policy_no,
+  SELECT nullif(replace(upper(trim(s.policy_no)), 'AL/', 'ALB-'), '') AS policy_no,  -- blank key is NULL in Oracle
          s.party_id, b.broker_id, s.product_cd, s.policy_status,
          date_trunc('DAY', s.inception_dt)                   AS inception_dt,   -- TRUNC(date)
          s.expiry_dt, s.annual_premium,
