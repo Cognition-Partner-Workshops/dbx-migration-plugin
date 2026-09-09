@@ -49,6 +49,17 @@ DIGEST_MODULUS = 2_147_483_647
 MARKER_BRACKET_ATTEMPTS = 3
 
 
+_FK_ACTIONS = {"a": "no action", "r": "no action", "c": "cascade", "n": "set null",
+               "d": "set default", "no_action": "no action", "restrict": "no action",
+               "cascade": "cascade", "set_null": "set null", "set_default": "set default"}
+
+
+def _fk_action(raw: str) -> str:
+    """One spelling for a referential action across pg_constraint codes and sys.foreign_keys
+    descriptions."""
+    return _FK_ACTIONS.get(str(raw).lower(), str(raw).lower())
+
+
 def _digest_value(value: Any) -> Any:
     """Normalise an engine's SUM result so equal digests compare equal across drivers
     (Decimal('5.000000') vs int 5 vs float 5.0)."""
@@ -73,6 +84,10 @@ class SchemaFacts:
     primary_key: tuple[str, ...] = ()
     unique: set[tuple[str, ...]] = field(default_factory=set)
     foreign_keys: set[tuple[tuple[str, ...], str, tuple[str, ...]]] = field(default_factory=set)
+    # (on update, on delete) per foreign key, spelled `no action` / `cascade` / `set null` /
+    # `set default`; RESTRICT is folded into `no action` (same outcome, engine-specific timing)
+    foreign_key_actions: dict[tuple[tuple[str, ...], str, tuple[str, ...]], tuple[str, str]] = field(
+        default_factory=dict)
     not_null: set[str] = field(default_factory=set)
     indexes: set[tuple[str, ...]] = field(default_factory=set)
     check_count: int = 0
@@ -210,6 +225,8 @@ class _SqlAdapterBase:
     """Shared SQL implementation; subclasses provide a DB-API connection."""
 
     paramstyle = "qmark"
+    # Bound parameters one statement may carry; SQL Server's hard limit is 2100.
+    max_params = 2000
     bucket_sql = NTILE_SQL
     # Statement that pins a repeatable snapshot for the rest of the transaction; None when the
     # engine has none we can rely on (the window markers then carry the proof alone).
@@ -579,29 +596,38 @@ class _SqlAdapterBase:
         key_digests = [self._digest_sql(k, kind) for k, kind in zip(key_cols, key_kinds)]
         key_digestible = all(d is not None for d in key_digests)
         wm_digest = self._digest_sql(watermark, wm_kind) if watermark and wm_kind else None
-        exprs, values = [], []
-        for lo, hi in ranges:
-            # each CASE binds its own copy of the bounds: positional drivers cannot reuse them
-            terms = ["1"]
-            if key_digestible:
-                terms += [t for pair in key_digests for t in pair]
-            if wm_digest:
-                terms += [*wm_digest, f"CASE WHEN {watermark} IS NULL THEN 1 ELSE 0 END"]
-            for term in terms:
+        terms = []
+        if key_digestible:
+            terms += [t for pair in key_digests for t in pair]
+        if wm_digest:
+            terms += [*wm_digest, f"CASE WHEN {watermark} IS NULL THEN 1 ELSE 0 END"]
+        # one CASE assigns each row its range, so every bound is bound once; a key on a shared
+        # boundary lands in the lower range on both sides alike. Ranges are batched so one
+        # statement never carries more parameters than the engine accepts.
+        per_range = max(len(self._range_predicate(key_cols, lo, hi, 0)[1]) for lo, hi in ranges)
+        batch = max(1, self.max_params // max(1, per_range))
+        w = f" WHERE {where}" if where else ""
+        out: list[tuple[int, tuple | None, Any]] = []
+        for start in range(0, len(ranges), batch):
+            chunk = ranges[start:start + batch]
+            whens, values = [], []
+            for i, (lo, hi) in enumerate(chunk):
                 pred, vals = self._range_predicate(key_cols, lo, hi, len(values))
                 values += vals
-                exprs.append(f"SUM(CASE WHEN {pred} THEN {term} ELSE 0 END)")
-        w = f" WHERE {where}" if where else ""
-        row = list(self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}", self._params(values))[0])
-        out: list[tuple[int, tuple | None, Any]] = []
-
-        def moments() -> tuple:
-            return _digest_value(row.pop(0)), _digest_value(row.pop(0))
-        for _ in ranges:
-            n = int(row.pop(0) or 0)
-            keys = tuple(moments() for _ in key_cols) if key_digestible else None
-            wm = (*moments(), int(row.pop(0) or 0)) if wm_digest else None
-            out.append((n, keys, wm))
+                whens.append(f"WHEN {pred} THEN {i}")
+            cols = ", ".join(dict.fromkeys(list(key_cols) + ([watermark] if watermark else [])))
+            selected = ", ".join(["rng", "COUNT(*)"] + [f"SUM({t})" for t in terms])
+            sql = (f"SELECT {selected} FROM (SELECT CASE {' '.join(whens)} END AS rng, {cols} "
+                   f"FROM {table}{w}) r WHERE rng IS NOT NULL GROUP BY rng")
+            by_range = {int(r[0]): list(r[1:]) for r in self._rows(sql, self._params(values))}
+            for i in range(len(chunk)):
+                row = iter(by_range.get(i, [0] + [None] * len(terms)))
+                n = int(next(row) or 0)
+                keys = (tuple((_digest_value(next(row)), _digest_value(next(row))) for _ in key_cols)
+                        if key_digestible else None)
+                wm = ((_digest_value(next(row)), _digest_value(next(row)), int(next(row) or 0))
+                      if wm_digest else None)
+                out.append((n, keys, wm))
         return out
 
     def keys_in_range(self, table: str, key_cols: list[str], lo: tuple | None, hi: tuple | None,
@@ -739,7 +765,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             else:
                 facts.indexes.add(tuple(cols))
         rows = self._rows(
-            "SELECT fk.name, pc.name, rs.name + '.' + ro.name, rc.name "
+            "SELECT fk.name, pc.name, rs.name + '.' + ro.name, rc.name, "
+            "       fk.update_referential_action_desc, fk.delete_referential_action_desc "
             "FROM sys.foreign_keys fk "
             "JOIN sys.objects o ON o.object_id = fk.parent_object_id "
             "JOIN sys.schemas s ON s.schema_id = o.schema_id "
@@ -751,12 +778,14 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             "WHERE s.name = ? AND o.name = ? AND fk.is_disabled = 0 "
             "ORDER BY fk.name, fkc.constraint_column_id", (schema, name))
         by_fk: dict[str, list] = {}
-        for fk_name, col, ref_table, ref_col in rows:
-            entry = by_fk.setdefault(fk_name, [[], ref_table, []])
+        for fk_name, col, ref_table, ref_col, on_update, on_delete in rows:
+            entry = by_fk.setdefault(fk_name, [[], ref_table, [], (on_update, on_delete)])
             entry[0].append(col)
             entry[2].append(ref_col)
-        for cols, ref_table, ref_cols in by_fk.values():
-            facts.foreign_keys.add((tuple(cols), ref_table, tuple(ref_cols)))
+        for cols, ref_table, ref_cols, actions in by_fk.values():
+            fk = (tuple(cols), ref_table, tuple(ref_cols))
+            facts.foreign_keys.add(fk)
+            facts.foreign_key_actions[fk] = tuple(_fk_action(a) for a in actions)
         rows = self._rows(
             "SELECT c.name, c.is_nullable, c.is_identity FROM sys.columns c "
             "JOIN sys.objects o ON o.object_id = c.object_id "
@@ -938,7 +967,7 @@ class _PostgresBase(_SqlAdapterBase):
         rows = self._rows(
             "SELECT con.contype, con.conname, a.attname, "
             "       CASE WHEN con.contype = 'f' THEN rn.nspname || '.' || rc.relname END, "
-            "       ra.attname, k.ord "
+            "       ra.attname, k.ord, con.confupdtype, con.confdeltype "
             "FROM pg_constraint con "
             "JOIN pg_class c ON c.oid = con.conrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -954,19 +983,21 @@ class _PostgresBase(_SqlAdapterBase):
         # a CHECK that names no column (a constant, or only functions) has an empty conkey and
         # arrives as one row with a NULL column; it still counts
         by_con: dict[str, list] = {}
-        for ctype, cname, col, ref_table, ref_col, _ord in rows:
-            entry = by_con.setdefault(cname, [ctype, [], ref_table, []])
+        for ctype, cname, col, ref_table, ref_col, _ord, on_update, on_delete in rows:
+            entry = by_con.setdefault(cname, [ctype, [], ref_table, [], (on_update, on_delete)])
             if col is not None:
                 entry[1].append(col)
             if ref_col is not None:
                 entry[3].append(ref_col)
-        for ctype, cols, ref_table, ref_cols in by_con.values():
+        for ctype, cols, ref_table, ref_cols, actions in by_con.values():
             if ctype == "p":
                 facts.primary_key = tuple(cols)
             elif ctype == "u":
                 facts.unique.add(tuple(cols))
             elif ctype == "f":
-                facts.foreign_keys.add((tuple(cols), ref_table, tuple(ref_cols)))
+                fk = (tuple(cols), ref_table, tuple(ref_cols))
+                facts.foreign_keys.add(fk)
+                facts.foreign_key_actions[fk] = tuple(_fk_action(a) for a in actions)
             elif ctype == "c":
                 facts.check_count += 1
         # attnum 0 in indkey marks an expression key; a LEFT JOIN keeps those indexes visible

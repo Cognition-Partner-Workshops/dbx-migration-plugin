@@ -24,7 +24,8 @@ def schema():
     cur.execute(f"CREATE TABLE {name}.Parent (Parent_ID INT PRIMARY KEY, Other_ID INT UNIQUE)")
     cur.execute(f"CREATE TABLE {name}.Child (Child_ID INT PRIMARY KEY, Parent_ID INT NOT NULL, "
                 f"Other_ID INT, Amount DECIMAL(10,2), Status VARCHAR(10), "
-                f"CONSTRAINT FK_Child_Parent FOREIGN KEY (Parent_ID) REFERENCES {name}.Parent(Parent_ID), "
+                f"CONSTRAINT FK_Child_Parent FOREIGN KEY (Parent_ID) REFERENCES {name}.Parent(Parent_ID) "
+                f"ON UPDATE CASCADE ON DELETE NO ACTION, "
                 f"CONSTRAINT FK_Child_Other FOREIGN KEY (Other_ID) REFERENCES {name}.Parent(Other_ID), "
                 f"CONSTRAINT CK_Child_Amount CHECK (Amount >= 0), "
                 f"CONSTRAINT CK_Child_Status CHECK (Status IN ('open', 'closed')))")
@@ -47,6 +48,8 @@ def test_disabled_constraints_never_count_as_enforced(schema, monkeypatch):
     source = SqlServerSourceAdapter("RECON_TEST_SOURCE")
     facts = source.schema_facts(f"{schema}.Child")
     assert facts.primary_key == ("Child_ID",)
-    assert facts.foreign_keys == {(("Parent_ID",), f"{schema}.Parent", ("Parent_ID",))}
+    fk = (("Parent_ID",), f"{schema}.Parent", ("Parent_ID",))
+    assert facts.foreign_keys == {fk}
+    assert facts.foreign_key_actions == {fk: ("cascade", "no action")}
     assert facts.check_count == 1
     assert facts.not_null == {"Child_ID", "Parent_ID"}

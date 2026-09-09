@@ -233,8 +233,9 @@ def _ranges(source: StratifiedKeys, c: ObjectMapping, n: int, tol: Tolerances) -
     stratum's last key to this stratum's last key, plus two open-ended edges below the first
     and above the last source key. Strata alone would leave the gaps between them uncovered,
     and a target key living in a gap (a source row deleted since, or a stray insert) must be
-    counted. Neighbouring ranges share their boundary key on both sides alike; the set diff
-    dedupes any key seen twice."""
+    counted. Neighbouring ranges share a boundary key: fingerprints classify it into the lower
+    range on both sides alike, the streamed key sets include it in both and the set diff
+    dedupes it."""
     n_strata = max(1, min(tol.pk_set_ranges, n))
     strata = source.key_strata(c.root_table, c.key_source, n_strata, c.root_where)
     if not strata:
@@ -456,12 +457,18 @@ def _map_cols(cols: tuple, colmap: dict[str, str]) -> tuple:
     return tuple(colmap.get(col.lower(), col.lower()) for col in cols)
 
 
+def _lower_fk(fk: tuple) -> tuple:
+    cols, ref, rcols = fk
+    return (tuple(x.lower() for x in cols), ref.split(".")[-1].lower(),
+            tuple(x.lower() for x in rcols))
+
+
 def _lower_facts(f: SchemaFacts) -> SchemaFacts:
     return SchemaFacts(
         primary_key=tuple(x.lower() for x in f.primary_key),
         unique={tuple(x.lower() for x in u) for u in f.unique},
-        foreign_keys={(tuple(x.lower() for x in cols), ref.split(".")[-1].lower(),
-                       tuple(x.lower() for x in rcols)) for cols, ref, rcols in f.foreign_keys},
+        foreign_keys={_lower_fk(fk) for fk in f.foreign_keys},
+        foreign_key_actions={_lower_fk(fk): a for fk, a in f.foreign_key_actions.items()},
         not_null={x.lower() for x in f.not_null},
         indexes={tuple(x.lower() for x in i) for i in f.indexes},
         check_count=f.check_count, identity_columns={x.lower() for x in f.identity_columns},
@@ -572,6 +579,13 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
             if want not in t_lower.foreign_keys:
                 findings.append(Finding(c.object, "foreign_key_missing",
                                         f"source FK {cols} -> {ref}{rcols} expected on target as {want}"))
+                continue
+            s_act = s.foreign_key_actions.get((cols, ref, rcols))
+            t_act = t_lower.foreign_key_actions.get(want)
+            if s_act and t_act and s_act != t_act:
+                findings.append(Finding(c.object, "foreign_key_action_mismatch",
+                                        f"FK {want}: source acts (update, delete) = {s_act}, target "
+                                        f"{t_act}: parent changes propagate differently", s_act, t_act))
         in_scope = {o.object.lower() for o in spec.objects}
         for cols, ref, rcols in sorted(t_lower.foreign_keys - expected_fks):
             if ref not in in_scope:
@@ -641,6 +655,7 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                 seq_note = {"source_next": None if s_state is None else s_state.next,
                             "source_max": s_max,
                             "target_next": None if t_state is None else t_state.next}
+                collides = False
                 if t_state is None:
                     findings.append(Finding(c.object, "sequence_missing",
                                             f"target column {c.identity_target} owns no sequence/identity"))
@@ -649,24 +664,31 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                     # rows the source already holds when its next value is not below their minimum
                     seq_note.update(source_min=s_min, increment=t_state.increment)
                     if s_min is not None and t_state.next >= int(s_min):
+                        collides = True
                         findings.append(Finding(c.object, "sequence_behind_source",
                                                 f"target next value {t_state.next} >= source min "
                                                 f"{c.identity_source}={s_min} on a descending identity "
                                                 f"(increment {t_state.increment}): new inserts would collide",
                                                 s_min, t_state.next))
                 elif s_max is not None and t_state.next <= int(s_max):
+                    collides = True
                     findings.append(Finding(c.object, "sequence_behind_source",
                                             f"target next value {t_state.next} <= source max "
                                             f"{c.identity_source}={s_max}: new inserts would collide",
                                             s_max, t_state.next))
-                if (t_state is not None and s_state is not None
-                        and t_state.descending != s_state.descending):
-                    findings.append(Finding(c.object, "sequence_direction_mismatch",
-                                            f"source identity {c.identity_source} steps by "
-                                            f"{s_state.increment}, target {c.identity_target} by "
-                                            f"{t_state.increment}: the two sides hand out keys from "
-                                            "opposite ends and will meet",
-                                            s_state.increment, t_state.increment))
+                if t_state is not None and s_state is not None and t_state.increment != s_state.increment:
+                    step = (f"source identity {c.identity_source} steps by {s_state.increment}, "
+                            f"target {c.identity_target} by {t_state.increment}: ")
+                    if t_state.descending != s_state.descending:
+                        findings.append(Finding(c.object, "sequence_direction_mismatch",
+                                                step + "the two sides hand out keys from opposite ends "
+                                                "and will meet", s_state.increment, t_state.increment))
+                    elif not collides:
+                        # a colliding identity is reseeded anyway; a sound one that steps
+                        # differently still hands out keys the source never would
+                        findings.append(Finding(c.object, "sequence_increment_mismatch",
+                                                step + "target-generated keys follow a different "
+                                                "sequence", s_state.increment, t_state.increment))
         stats[c.object] = {"source": _facts_dict(s_raw), "target": _facts_dict(t_raw), "identity": seq_note}
     return TierResult(7, "schema_parity", not findings, checks, findings, stats)
 
@@ -679,7 +701,8 @@ def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any
 
 def _facts_dict(f: SchemaFacts) -> dict:
     return {"primary_key": list(f.primary_key), "unique": sorted(map(list, f.unique)),
-            "foreign_keys": sorted([list(c), r, list(rc)] for c, r, rc in f.foreign_keys),
+            "foreign_keys": sorted([list(c), r, list(rc), *f.foreign_key_actions.get((c, r, rc), ())]
+                                   for c, r, rc in f.foreign_keys),
             "not_null": sorted(f.not_null), "indexes": sorted(map(list, f.indexes)),
             "check_count": f.check_count, "identity_columns": sorted(f.identity_columns),
             "partial": sorted(map(list, f.partial)),

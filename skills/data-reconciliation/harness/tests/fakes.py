@@ -184,14 +184,21 @@ class _TransactionalMixin:
         keyed = [(self._tx_key(r, key_cols), r.get(watermark) if watermark else None) for r in rows]
         digestible_keys = all(kind in ("integer", "datetime") for kind in key_kinds)
         digest_wm = bool(watermark and wm_kind in ("integer", "datetime"))
+        # one CASE classifies each row: the first range whose bounds hold wins it, like the SQL
+        norm = [(lo if lo is None or isinstance(lo, tuple) else (lo,),
+                 hi if hi is None or isinstance(hi, tuple) else (hi,)) for lo, hi in ranges]
+        by_range: dict[int, list] = {i: [] for i in range(len(norm))}
+        for k, wm in keyed:
+            i = next((i for i, (lo, hi) in enumerate(norm)
+                      if (lo is None or k >= lo) and (hi is None or k <= hi)), None)
+            if i is not None:
+                by_range[i].append((k, wm))
         out = []
-        for lo, hi in ranges:
-            lo = lo if lo is None or isinstance(lo, tuple) else (lo,)
-            hi = hi if hi is None or isinstance(hi, tuple) else (hi,)
-            hit = [(k, wm) for k, wm in keyed if (lo is None or k >= lo) and (hi is None or k <= hi)]
+        for i in range(len(norm)):
+            hit = by_range[i]
             keys = None
             if digestible_keys:
-                keys = tuple(self._moments(k[i] for k, _ in hit) for i in range(len(key_cols)))
+                keys = tuple(self._moments(k[j] for k, _ in hit) for j in range(len(key_cols)))
             wm = None
             if digest_wm:
                 wm = (*self._moments(wm for _, wm in hit), sum(1 for _, wm in hit if wm is None))

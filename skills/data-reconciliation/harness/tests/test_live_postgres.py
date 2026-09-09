@@ -39,6 +39,8 @@ def schema():
     conn.execute(f"CREATE UNIQUE INDEX t_expr_partial_u ON {name}.t (lower(region)) WHERE active")
     conn.execute(f"ALTER TABLE {name}.t ADD CONSTRAINT t_dup_chk CHECK (dup > 0)")
     conn.execute(f"ALTER TABLE {name}.t ADD CONSTRAINT t_const_chk CHECK (1 < 2)")   # names no column
+    conn.execute(f"CREATE TABLE {name}.c (id INT PRIMARY KEY, t_id INT REFERENCES {name}.t (id) "
+                 f"ON UPDATE RESTRICT ON DELETE SET NULL)")
     # a concurrent unique build over duplicate values fails and leaves the index INVALID
     with pytest.raises(psycopg.errors.UniqueViolation):
         conn.execute(f"CREATE UNIQUE INDEX CONCURRENTLY t_dup_invalid_u ON {name}.t (dup)")
@@ -70,6 +72,10 @@ def test_partial_and_invalid_indexes_never_count_as_parity(schema, monkeypatch):
     # expression keys (attnum 0) stay visible as the key text of pg_get_indexdef
     assert facts.expression_unique == {"lower(code)"}           # partial unique is not uniqueness
     assert facts.expression_indexes == {"upper(region), id", "lower(region)"}  # INCLUDE dropped
+    child = target.schema_facts("c")
+    fk = (("t_id",), f"{schema}.t", ("id",))
+    assert child.foreign_keys == {fk}
+    assert child.foreign_key_actions == {fk: ("no action", "set null")}  # RESTRICT folds in
 
 
 def test_range_fingerprints_bind_through_psycopg(schema, monkeypatch):
@@ -77,8 +83,8 @@ def test_range_fingerprints_bind_through_psycopg(schema, monkeypatch):
     monkeypatch.setenv("RECON_TEST_TARGET", os.environ[DSN_VAR])
     target = LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), schema)
     fps = target.range_fingerprints("t", ["id"], ["integer"], None, None, [(None, (1,)), ((1,), None)])
-    assert [(n, k[0][0]) for n, k, _ in fps] == [(1, 1), (2, 3)]
-    assert [k[0][1] for _, k, _ in fps] == [1, 5]        # 1^2 and 1^2 + 2^2
+    assert [(n, k[0][0]) for n, k, _ in fps] == [(1, 1), (1, 2)]   # boundary key 1 lands once
+    assert [k[0][1] for _, k, _ in fps] == [1, 4]        # 1^2 and 2^2
 
 
 def test_numeric_keys_beyond_six_decimals_are_never_collapsed_into_one_digest(schema, monkeypatch):

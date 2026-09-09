@@ -12,6 +12,7 @@ from recon.adapters import (
     LakebaseTargetAdapter,
     SchemaFacts,
     TargetIdentityError,
+    _fk_action,
     _index_key_text,
     _PostgresBase,
     _SqlAdapterBase,
@@ -1387,6 +1388,58 @@ def test_range_fingerprints_carry_the_watermark_null_count():
     assert n == 4 and keys[0][0] == 10 and len(wm) == 3 and wm[2] == 1
 
 
+class _GroupedConn(_RecordingConn):
+    """Answers a GROUP BY rng statement with the rows handed in, keyed by the range index."""
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def cursor(self):
+        conn = self
+
+        class Cur:
+            def execute(self, sql, params=()):
+                conn.executed.append((sql, params))
+
+            def fetchall(self):
+                return conn.rows
+        return Cur()
+
+
+def _contiguous(n, width=2):
+    edges = [(i * 10,) * width for i in range(1, n)]
+    return list(zip([None] + edges, edges + [None]))
+
+
+def test_composite_key_fingerprints_stay_under_sql_server_parameter_limit():
+    # 64 ranges x 2 key columns x (sum, sum of squares) + a watermark: the old one-CASE-per-term
+    # shape bound the bounds ~8 times per range and crossed 2100 parameters on SQL Server
+    conn = _GroupedConn([(1, 5, 50, 7, 50, 7, 500, 9, 0), (3, 2, 20, 3, 20, 3, 200, 4, 1)])
+    adapter = _NoSnapshotAdapter(conn)
+    out = adapter.range_fingerprints("dbo.t", ["a", "b"], ["integer", "integer"], "version_no",
+                                     "integer", _contiguous(64))
+    (sql, params), = conn.executed
+    # a lexicographic 2-column bound is 3 parameters; 62 two-sided ranges + 2 open-ended edges
+    assert len(params) == 62 * 6 + 2 * 3 and sql.count("?") == len(params)
+    assert sql.startswith("SELECT rng, COUNT(*), SUM(") and sql.endswith("WHERE rng IS NOT NULL GROUP BY rng")
+    assert sql.count(" THEN 63 END AS rng") == 1 and " THEN 64 " not in sql
+    assert len(out) == 64
+    assert out[1] == (5, ((50, 7), (50, 7)), (500, 9, 0))
+    assert out[3] == (2, ((20, 3), (20, 3)), (200, 4, 1))
+    assert out[0] == (0, ((0, 0), (0, 0)), (0, 0, 0)) and out[63] == out[0]
+
+
+def test_range_fingerprints_split_into_statements_when_ranges_exceed_the_parameter_budget():
+    conn = _GroupedConn([(0, 1, 1, 1, 1, 1)])
+    adapter = _NoSnapshotAdapter(conn)
+    adapter.max_params = 20
+    out = adapter.range_fingerprints("dbo.t", ["a", "b"], ["integer", "integer"], None, None,
+                                     _contiguous(50))
+    # 6 parameters per range -> 3 ranges per statement -> 17 statements, every range answered
+    assert len(conn.executed) == 17 and all(len(p) <= 20 for _, p in conn.executed)
+    assert len(out) == 50 and out[0] == (1, ((1, 1), (1, 1)), None)
+
+
 def test_a_descending_target_identity_below_the_source_max_is_not_a_collision():
     # both identities count down from 1000: the source has handed out 1000..995, the target
     # sequence's next value 994 is below every source key, which is exactly the safe state
@@ -1428,6 +1481,49 @@ def test_an_ascending_identity_behind_the_source_max_is_still_a_collision():
     source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_seq=(4, 5))
     result = _run(source, target)
     assert _codes(result, "schema_parity") == ["sequence_behind_source"]
+
+
+def test_identities_with_different_increments_in_the_same_direction_are_a_finding():
+    _, borrowers = _rows()
+    loans = [_loan(i, changed=i, borrower_id=1 + i % 3) for i in range(1, 7)]
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
+                            src_seq=(7, 10), tgt_seq=(7, 1))
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == ["sequence_increment_mismatch"]
+    (finding,) = _tier(result, "schema_parity")["findings"]
+    assert "steps by 10" in finding["detail"]
+    assert (finding["source_value"], finding["target_value"]) == ("10", "1")
+
+
+SRC_FK = ((("borrower_id",), "dbo.borrowers", ("borrower_id",)))
+TGT_FK = ((("borrower_id",), "loan_servicing.borrowers", ("borrower_id",)))
+
+
+@pytest.mark.parametrize("src_act, tgt_act, codes", [
+    (("no action", "cascade"), ("no action", "no action"), ["foreign_key_action_mismatch"]),
+    (("no action", "cascade"), ("no action", "cascade"), []),
+    (("no action", "cascade"), None, []),  # a catalog that does not report actions is not graded
+])
+def test_foreign_key_referential_actions_are_compared(src_act, tgt_act, codes):
+    loans, borrowers = _rows(6)
+    src = _facts(LOANS_FACTS, foreign_key_actions={SRC_FK: src_act})
+    tgt = _facts(TARGET_LOANS_FACTS, foreign_key_actions={TGT_FK: tgt_act} if tgt_act else {})
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
+    source.schema["dbo.loans"] = src
+    result = _run(source, target)
+    assert _codes(result, "schema_parity") == codes
+    if codes:
+        (finding,) = _tier(result, "schema_parity")["findings"]
+        assert "source acts (update, delete) = ('no action', 'cascade')" in finding["detail"]
+        assert _tier(result, "schema_parity")["stats"]["loans"]["source"]["foreign_keys"] == [
+            [["borrower_id"], "dbo.borrowers", ["borrower_id"], "no action", "cascade"]]
+
+
+def test_referential_actions_normalise_across_catalogs():
+    assert [_fk_action(x) for x in ("a", "r", "c", "n", "d")] == \
+        ["no action", "no action", "cascade", "set null", "set default"]
+    assert [_fk_action(x) for x in ("NO_ACTION", "CASCADE", "SET_NULL", "SET_DEFAULT")] == \
+        ["no action", "cascade", "set null", "set default"]
 
 
 def test_a_composite_unique_declared_in_another_column_order_is_the_same_constraint():
