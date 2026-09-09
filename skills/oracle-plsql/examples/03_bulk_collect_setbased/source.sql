@@ -42,11 +42,11 @@ CREATE OR REPLACE PACKAGE BODY poladm.pkg_policy_renewal AS
     TYPE t_row_tab IS TABLE OF c_expiring%ROWTYPE INDEX BY PLS_INTEGER;
     l_rows t_row_tab;  l_ids t_id_tab;  l_new t_num_tab;
   BEGIN
-    g_run_id := NVL(g_run_id, 0) + 1;  p_rows_out := 0;
-    OPEN c_expiring;
+    g_run_id := NVL(g_run_id, 0) + 1;  p_rows_out := 0;  OPEN c_expiring;
     LOOP
       FETCH c_expiring BULK COLLECT INTO l_rows LIMIT 500;
       EXIT WHEN l_rows.COUNT = 0;
+      l_ids.DELETE;  l_new.DELETE;                                   -- a shorter last batch must not reuse stale rows
       FOR i IN 1 .. l_rows.COUNT LOOP
         l_ids(i) := l_rows(i).policy_id;
         l_new(i) := ROUND(l_rows(i).annual_premium * NVL(p_uplift, broker_uplift(l_rows(i).broker_id)), 2);

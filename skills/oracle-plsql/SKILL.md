@@ -26,18 +26,18 @@ column below names the rule per type).
 
 | Oracle | Delta / DBSQL (A) | Lakebase Postgres (L) | Loss | Canonicalization |
 |---|---|---|---|---|
-| `NUMBER(p,s)` | `DECIMAL(p,s)` | `NUMERIC(p,s)` | none | `decimal_round` |
+| `NUMBER(p,s)` | `DECIMAL(p,s)` | `NUMERIC(p,s)` | none | `identity` (exact; `decimal_round` places 10 would hide digits when `s > 10`) |
 | `NUMBER` (no scale), `NUMBER(*)` | `DECIMAL(38,10)` (raise scale if census `MAX(scale)` > 10; never `DOUBLE` for money) | `NUMERIC` | floating scale fixed | `decimal_round` half_even 10 |
 | `NUMBER(p<=18)`, `INTEGER`, `SMALLINT` | `BIGINT` (`DECIMAL(p,0)` for p>18) | `BIGINT` / `NUMERIC(p,0)` | none | `identity` |
-| `FLOAT(b)` | `DECIMAL(38,10)` if money-like, else `DOUBLE` | `NUMERIC` / `DOUBLE PRECISION` | `FLOAT` is decimal, not IEEE | `decimal_round` |
-| `BINARY_FLOAT` / `BINARY_DOUBLE` | `FLOAT` / `DOUBLE` | `REAL` / `DOUBLE PRECISION` | none | `decimal_round` places 6 |
+| `FLOAT(b)` | `DECIMAL(38,10)` if money-like, else `DOUBLE` | `NUMERIC` / `DOUBLE PRECISION` | `FLOAT` is decimal, not IEEE | `decimal_round` for `DECIMAL(38,10)`; `identity` for `DOUBLE` |
+| `BINARY_FLOAT` / `BINARY_DOUBLE` | `FLOAT` / `DOUBLE` | `REAL` / `DOUBLE PRECISION` | none | `identity` (same IEEE value; a per-type `places` is a harness gap) |
 | `VARCHAR2(n)`, `NVARCHAR2(n)`, `LONG` | `STRING` | `VARCHAR(n)` (`TEXT` for `BYTE` semantics with multibyte data) | `''` is NULL in Oracle only | `empty_string_is_null` |
 | `CHAR(n)`, `NCHAR(n)` | `STRING` (`COLLATE UTF8_BINARY_RTRIM` if compares must ignore padding `[dbsql:geospatial-collations.md#Collation Modifiers (DBR 16.2+)]`) | `CHAR(n)` (pads, ignores on compare) | padding, `LENGTH` | `rstrip_spaces`, then `empty_string_is_null` |
 | `CLOB`, `NCLOB` | `STRING` (census `MAX(DBMS_LOB.GETLENGTH)` vs target limit) | `TEXT` | none below limit | `empty_string_is_null` |
 | `BLOB`, `LONG RAW`, `RAW(n)` | `BINARY`; `RAW(16)` GUID -> `STRING` `lower(hex())` | `BYTEA`; `RAW(16)` from `SYS_GUID()` -> `UUID` | hex case/hyphens | `identity` (hash compare) / `uuid_normalize` |
 | `DATE` (always has seconds) | `TIMESTAMP_NTZ`; `DATE` only if census proves `TRUNC(col)=col` on 100% of rows | `TIMESTAMP(0)`; `DATE` under the same proof | time-of-day if mapped to `DATE` | `datetime_utc_truncate_ms` |
-| `TIMESTAMP(n)` | `TIMESTAMP_NTZ` (us; Oracle ns) | `TIMESTAMP(n)` (max 6) | ns -> us | `datetime_utc_truncate_ms` |
-| `TIMESTAMP WITH [LOCAL] TIME ZONE` | `TIMESTAMP` (instant in session TZ; source offset lost: sibling `STRING` if printed) | `TIMESTAMP WITH TIME ZONE` | original offset/region | `datetime_utc_truncate_ms` |
+| `TIMESTAMP(n)` | `TIMESTAMP_NTZ` (us; Oracle ns) | `TIMESTAMP(n)` (max 6) | ns -> us | `n <= 3`: `datetime_utc_truncate_ms`; `n > 3`: `identity` (drivers deliver us; ms truncation would hide sub-ms errors) |
+| `TIMESTAMP WITH [LOCAL] TIME ZONE` | `TIMESTAMP` (instant in session TZ; source offset lost: sibling `STRING` if printed) | `TIMESTAMP WITH TIME ZONE` | original offset/region | `identity` on `SYS_EXTRACT_UTC(col)` / `to_utc_timestamp(col,'UTC')` in the recon queries (a us-precision UTC rule is a harness gap) |
 | `INTERVAL YEAR TO MONTH` / `DAY TO SECOND` | `INTERVAL YEAR TO MONTH` / `INTERVAL DAY TO SECOND` (us) | same | ns | `identity` |
 | `ROWID`, `UROWID` | drop; PK or `BIGINT` surrogate if used as a key | drop (`ctid` unstable) | row address | `GAP` if consumed |
 | `XMLTYPE` | `STRING` + `xpath*`/`from_xml`; `VARIANT` if JSON upstream | `XML` / `TEXT` | schema validation, XMLIndex | `identity` on canonical string |
@@ -55,7 +55,7 @@ column below names the rule per type).
 | `NVL`, `NVL2`, `COALESCE`, `NULLIF`, `LNNVL(c)` | `nvl`, `nvl2`, `coalesce`, `nullif`, `NOT coalesce(c,false)` | same | Oracle evaluates `NVL`'s 2nd arg eagerly |
 | `DECODE(x,k,v,...,d)` | `decode(...)`; NULL keys -> `CASE WHEN x IS NULL AND k IS NULL` | edge | Oracle `DECODE(NULL,NULL,1)` = 1 |
 | `x = ''`, `LENGTH('')`, `TRIM('  ')` | `x IS NULL`; `length('')`=0; `nullif(trim(x),'')` | edge | `''` is NULL in Oracle only (trap 1) |
-| `a \|\| b`, `CONCAT(a,b)` | `concat_ws('',a,b)` or `coalesce(a,'')\|\|coalesce(b,'')` | edge | Oracle concatenates NULL as `''`; Databricks yields NULL |
+| `a \|\| b`, `CONCAT(a,b)` | `nullif(concat_ws('',a,b),'')` or `nullif(coalesce(a,'')\|\|coalesce(b,''),'')` | edge | Oracle concatenates NULL as `''` and an all-NULL result is NULL; Databricks `\|\|` yields NULL on any NULL, `concat_ws` yields `''` on all-NULL |
 | `SUBSTR`, `INSTR(s,sub[,pos[,nth]])`, `LENGTH`, `LENGTHB` | `substr`, `instr`/`locate(sub,s,pos)`, `length`, `length(cast(s AS BINARY))` | edge | `nth`/negative `pos` -> `regexp_instr` or UDF; `SUBSTRB` -> `BINARY` |
 | `REPLACE`, `TRANSLATE`, `LPAD`, `RPAD`, `SOUNDEX`, `ASCII`, `CHR` | same names | edge | `LPAD(s,0)` NULL vs `''`; non-UTF8 `NLS_CHARACTERSET` code points > 127 |
 | `TRIM/LTRIM/RTRIM(s[,set])` | `trim`, `ltrim([set,] s)`, `rtrim([set,] s)` | edge | argument order reversed; trimmed-to-nothing is NULL in Oracle |
@@ -126,7 +126,7 @@ Track: **A** analytical DBSQL, **L** Lakebase, **J** Lakeflow Jobs, **P** Lakefl
 | 1 | `''` is NULL | `''` stored as NULL, `x = ''` never true, `TRIM` to nothing is NULL; targets store `''` | Tier 1 null-count drift; Tier 3 `NULL` vs `''` | `nullif(trim(col),'')` on load; `x = ''` -> `IS NULL`; `empty_string_is_null` on every string column |
 | 2 | `NUMBER` without scale | floating scale, 38 digits; `DECIMAL(38,10)` fixes scale; `DOUBLE` drifts | Tier 2 `SUM` drift past the 10th decimal; `0.30000000000000004` diffs | scale from sampled `MAX(SCALE)`; never `DOUBLE` for money; `decimal_round` half_even 10 |
 | 3 | `DATE` carries time | seconds precision, `SYSDATE` defaults; lazy `DATE` mapping drops it | Tier 3 mismatch on non-midnight rows; per-day counts off by one day at `BETWEEN` midnight | `TIMESTAMP_NTZ`; `>= d1 AND < d2 + INTERVAL 1 DAY`; `date_trunc('DAY')`; `datetime_utc_truncate_ms` |
-| 4 | `TIMESTAMP WITH [LOCAL] TIME ZONE` | offset stored / normalised to DB TZ; target is one instant in session TZ | Tier 3 constant offset on every row (+1h) | compare as UTC instants; harness session TZ = UTC both sides; `datetime_utc_truncate_ms` |
+| 4 | `TIMESTAMP WITH [LOCAL] TIME ZONE` | offset stored / normalised to DB TZ; target is one instant in session TZ | Tier 3 constant offset on every row (+1h) | compare as UTC instants (`SYS_EXTRACT_UTC` / `to_utc_timestamp`) with `identity`; harness session TZ = UTC both sides |
 | 5 | `CHAR(n)` padding | pads and pad-compares; `STRING` does not | `COUNT(DISTINCT)`/join-cardinality drift; join to `VARCHAR2` keys yields 0 rows | `rtrim` on load or `COLLATE UTF8_BINARY_RTRIM`; `rstrip_spaces` then `empty_string_is_null` |
 | 6 | `CONNECT BY` order, cycles, `LEVEL` | depth-first, `ORDER SIBLINGS BY`; `NOCYCLE` flags the row whose child is an ancestor; recursive CTE has none of these, depth limit 100 | Tier 1 doubled rows or `RECURSION_LEVEL_LIMIT_EXCEEDED`; Tier 3 path/`is_cycle` on wrong row | carry `path ARRAY`, `NOT array_contains`; compute `is_cycle` after the walk; order by path |
 | 7 | `ROWNUM` pagination | assigned before `ORDER BY`; ties arbitrary | equal page counts, Tier 3 rows differ across pages | total order key (append PK); `row_number()` for `rn` |
