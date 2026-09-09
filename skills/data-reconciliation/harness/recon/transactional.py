@@ -52,6 +52,7 @@ from .watermarks import (
     EPOCH_SCALE,
     check_comparable,
     family,
+    in_form_of,
     lag_seconds,
     lag_units,
     later,
@@ -145,7 +146,9 @@ def open_window(spec: MappingSpec, source, target) -> TransactionalContext:
         if c.watermark_source and c.watermark_target:
             check_comparable(s_mark[1], t_mark[1],
                              f"{c.object}: {c.watermark_source} vs {c.watermark_target}")
-            win.hwm_target = t_mark[1]
+            # the predicates run on the source: a counter the target keeps as a bigint is
+            # rendered in the source column's own (binary) form, and the other way round
+            win.hwm_target = in_form_of(t_mark[1], s_mark[1])
             if win.hwm_target is not None:
                 newer = _newer_predicate(c.watermark_source, win.hwm_target, ctx.render)
                 where = f"({c.root_where}) AND {newer}" if c.root_where else newer
@@ -256,9 +259,13 @@ def _kind(value: Any) -> str:
     """Digest family of a key/watermark value: what portable sum the adapters can compute.
     Whole numbers (an int, or a Decimal the driver returned with no fractional scale) are
     `integer` and digest exactly; a fractional decimal or a float is `number`, which has no
-    exact portable digest, so such keys stream every range instead of being fingerprinted."""
+    exact portable digest, so such keys stream every range instead of being fingerprinted. A
+    binary counter (rowversion) is `binary`: also undigested, and no catalog declaration of
+    wholeness upgrades it, since the bytes are not a numeric column on either engine."""
     if isinstance(value, bool):
         return family(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "binary"
     if isinstance(value, int):
         return "integer"
     if isinstance(value, decimal.Decimal) and value.is_finite() and value.as_tuple().exponent >= 0:
@@ -268,7 +275,8 @@ def _kind(value: Any) -> str:
 
 def _common_kind(values: Iterable[Any]) -> str:
     """The one digest kind shared by every non-null value, or `other` when they disagree (a
-    numeric column whose scale varies per row) or none is known."""
+    numeric column whose scale varies per row, a binary counter beside its bigint copy) or
+    none is known."""
     kinds = {_kind(v) for v in values if v is not None}
     return kinds.pop() if len(kinds) == 1 else "other"
 
@@ -731,15 +739,21 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                 findings.append(Finding(c.object, "foreign_key_action_mismatch",
                                         f"FK {want}: source acts (update, delete) = {s_act}, target "
                                         f"{t_act}: parent changes propagate differently", s_act, t_act))
-        in_scope = {o.object.lower() for o in spec.objects}
+        # a target-only FK is a defect only when the mapping shows both ends: its local columns
+        # mapped here and its referenced columns mapped on the referenced object. A relationship
+        # over columns the mapping does not carry may well be the source's, spelled differently
+        mapped_ref_cols = {o.object.lower(): set(_column_map(spec, o).values()) for o in spec.objects}
         for cols, ref, rcols in sorted(set(t_fks) - expected_fks):
-            if ref not in in_scope:
+            if ref not in mapped_ref_cols:
                 stats.setdefault("foreign_keys_out_of_scope", []).append(
                     f"{c.object}: target FK {cols} -> {ref}")
-            else:
+            elif set(cols) <= mapped_targets and set(rcols) <= mapped_ref_cols[ref]:
                 tightened(Finding(c.object, "foreign_key_extra",
                                   f"target FK {cols} -> {ref}{rcols} has no source counterpart: "
                                   "legacy-valid orphans would be rejected"))
+            else:
+                stats.setdefault("target_only_columns_unverified", []).append(
+                    f"{c.object}: FK {cols} -> {ref}{rcols} covers a column outside the mapping")
         expected_not_null = {colmap[col] for col in s.not_null if col in colmap}
         for col in sorted(s.not_null):
             mapped = colmap.get(col, col)

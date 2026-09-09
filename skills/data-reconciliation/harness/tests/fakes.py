@@ -14,18 +14,11 @@ from typing import Any
 from recon.adapters import DIGEST_MODULUS, IdentityState, SchemaFacts, Stratum
 from recon.canon import MISSING
 from recon.paths import get_path
-from recon.watermarks import literal
+from recon.watermarks import instant, literal
 
 _EPOCH = dt.datetime(1970, 1, 1)  # noqa: DTZ001  fixtures use naive datetimes throughout
 _NUMERIC = (int, float, decimal.Decimal)
 _OPS = {" >= ": operator.ge, " > ": operator.gt, " <= ": operator.le, " < ": operator.lt}
-
-
-def _instant(value):
-    """Naive-UTC form of a datetime, mirroring recon.watermarks.instant for literal predicates."""
-    if isinstance(value, dt.datetime) and value.tzinfo is not None:
-        return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
-    return value
 
 
 def _agg_of(vals: list) -> dict[str, Any]:
@@ -53,8 +46,13 @@ def _matches(row: dict, where: str | None) -> bool:
         if value is None:
             return bool(null_ok) and _matches(row, scope.strip("() "))
         lit = lit.strip().strip("'")
-        edge = dt.datetime.fromisoformat(lit) if isinstance(value, dt.datetime) else type(value)(lit)
-        return _OPS[op](_instant(value), edge) and _matches(row, scope.strip("() "))
+        if isinstance(value, dt.datetime):
+            edge = dt.datetime.fromisoformat(lit)
+        elif isinstance(value, bytes):   # `0x...`, the engine's binary literal
+            edge = int(lit, 16)
+        else:
+            edge = type(value)(lit)
+        return _OPS[op](instant(value), edge) and _matches(row, scope.strip("() "))
     left, sep, right = where.partition("=")
     if not sep:
         return True
@@ -150,7 +148,7 @@ class _TransactionalMixin:
         if isinstance(value, _NUMERIC):
             return Decimal(str(value))
         if isinstance(value, dt.datetime):
-            return Decimal(int((_instant(value) - _EPOCH).total_seconds() * 1_000_000))
+            return Decimal(int((instant(value) - _EPOCH).total_seconds() * 1_000_000))
         if isinstance(value, dt.date):
             return Decimal((value - dt.date(1970, 1, 1)).days * 86_400_000_000)
         return None

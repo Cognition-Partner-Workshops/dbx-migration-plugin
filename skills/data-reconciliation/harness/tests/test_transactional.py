@@ -42,7 +42,15 @@ from recon.transactional import (
     _newer_predicate,
     open_window,
 )
-from recon.watermarks import instant, lag_seconds, lag_units, later, same
+from recon.watermarks import (
+    check_comparable,
+    in_form_of,
+    instant,
+    lag_seconds,
+    lag_units,
+    later,
+    same,
+)
 from tests.fakes import FakeSource, FakeTarget, FakeTypedSource
 
 T0 = dt.datetime(2026, 9, 1, 12, 0, 0)
@@ -402,6 +410,98 @@ def test_lag_seconds_only_reads_a_number_under_an_epoch_unit():
     assert lag_seconds(Decimal(3_000_000), 0, "epoch_us") == 3.0
     assert lag_units(10, 9) == 1 and lag_units(9, 10) == -1 and lag_units(None, 9) is None
     assert lag_units(_ts(3), _ts(0)) is None
+
+
+def _rowversion(n: int) -> bytes:
+    """A SQL Server rowversion as pyodbc returns it: 8 bytes, unsigned big-endian."""
+    return n.to_bytes(8, "big")
+
+
+def test_a_rowversion_watermark_is_the_unsigned_big_endian_counter_everywhere():
+    lo, hi = _rowversion(0x7FFF_FFFF_FFFF_FFFF), _rowversion(0x8000_0000_0000_0000)
+    # ordering: a signed reading would put `hi` below zero
+    assert instant(hi) == 2**63 and later(hi, lo) and not later(lo, hi)
+    assert later(bytearray(hi), memoryview(lo))
+    # a side that stores the counter as a bigint (a Lakebase target) compares with the bytes
+    check_comparable(_rowversion(2001), 2001, "rv")
+    assert same(_rowversion(2001), 2001) and same(_rowversion(2001), Decimal(2001))
+    assert not same(_rowversion(2001), 2000) and later(_rowversion(2001), 2000)
+    assert lag_units(_rowversion(2003), _rowversion(2001)) == 2
+    assert lag_units(_rowversion(2003), 2001) == 2 and lag_units(2001, _rowversion(2003)) == -2
+    assert lag_seconds(_rowversion(2003), _rowversion(2001), "counter") is None
+    # no portable exact digest for the raw bytes, and no catalog claim of wholeness upgrades them
+    # (whatever the target made of the counter): such a watermark streams instead
+    assert _kind(_rowversion(7)) == "binary"
+    assert _digest_kind([_rowversion(7)], "rv", "rv", {"rv"}, {"rv"}) == "binary"
+    assert _digest_kind([_rowversion(7), 7], "rv", "rv", {"rv"}, {"rv"}) == "other"
+    assert _NoSnapshotAdapter(_StubConn())._digest_sql("rv", "binary") is None
+    # the target's bigint high-watermark takes the source column's binary form (and width) for
+    # the source-side predicate; a fractional or oversized number stays as it is
+    assert in_form_of(2001, _rowversion(9)) == _rowversion(2001)
+    assert in_form_of(Decimal(2001), b"\x00\x01") == b"\x07\xd1"
+    assert in_form_of(_rowversion(2001), 5) == 2001
+    assert in_form_of(Decimal("2001.5"), _rowversion(9)) == Decimal("2001.5")
+    assert in_form_of(70000, b"\x00\x01") == 70000
+    assert in_form_of(T0, _rowversion(9)) is T0
+    # a datetime is still refused against it
+    with pytest.raises(ConfigError):
+        check_comparable(_rowversion(1), T0, "rv")
+
+
+def test_sql_server_renders_a_rowversion_bound_as_a_binary_literal():
+    rv = _rowversion(2001)
+    mssql, pg = _SqlServerLike(_StubConn()), _PostgresLike(_StubConn())
+    assert mssql.watermark_literal(rv) == "0x00000000000007d1"
+    assert _newer_predicate("rv", rv, mssql.watermark_literal) == "rv > 0x00000000000007d1"
+    assert _applied_predicate("rv", rv, mssql.watermark_literal) == \
+        "(rv <= 0x00000000000007d1 OR rv IS NULL)"
+    assert mssql.watermark_literal(bytearray(rv)) == mssql.watermark_literal(memoryview(rv))
+    # a bytea target column takes the same 8 bytes in Postgres syntax
+    assert pg.watermark_literal(rv) == "'\\x00000000000007d1'::bytea"
+    # a target that converted the counter to a bigint hands back a plain number
+    assert mssql.watermark_literal(2001) == "2001"
+
+
+def _rowversion_rows(behind: int):
+    loans, tgt, borrowers = _counter_rows(behind=behind, step=1)
+    for r in loans:
+        r["version_no"] = _rowversion(1000 + r["version_no"])
+    tgt = [dict(r) for r in loans[:12 - behind]]
+    return loans, tgt, borrowers
+
+
+def test_a_rowversion_watermark_opens_the_window_and_grades_by_unapplied_rows():
+    loans, tgt, borrowers = _rowversion_rows(behind=2)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_counter_spec("counter"),
+                  tol=Tolerances("t1", cdc_lag_max_s=0, cdc_in_flight_max_rows=2))
+    assert result["verdict"] == "PASS", result
+    stats = _tier(result, "cdc_lag_ordering")["stats"]["loans"]
+    assert stats["lag_units"] == 2 and stats["lag_s"] is None
+    assert _codes(result, "pk_set_diff") == []
+    # the in-flight predicate carried the binary literal the engine understands, and a target
+    # that stores the counter as a bigint gets a plain number on its side
+    source, target = _sides(loans, tgt, borrowers)
+    ctx = open_window(_counter_spec("counter"), source, target)
+    assert ctx.applied_where(_counter_spec("counter").objects[0]) == \
+        "(version_no <= 0x00000000000003f2 OR version_no IS NULL)"
+    for r in tgt:
+        r["version_no"] = instant(r["version_no"])
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_counter_spec("counter"),
+                  tol=Tolerances("t1", cdc_lag_max_s=0, cdc_in_flight_max_rows=2))
+    assert result["verdict"] == "PASS", result
+    assert _tier(result, "cdc_lag_ordering")["stats"]["loans"]["lag_units"] == 2
+
+
+def test_a_rowversion_target_ahead_of_the_source_is_an_ordering_violation():
+    loans, tgt, borrowers = _rowversion_rows(behind=0)
+    tgt[-1]["version_no"] = _rowversion(5000)
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=_counter_spec("counter"),
+                  tol=Tolerances("t1", cdc_in_flight_max_rows=100))
+    assert result["verdict"] == "FAIL"
+    assert _codes(result, "cdc_lag_ordering") == ["row_ahead_of_source", "target_ahead_of_source"]
 
 
 def test_mapping_watermark_unit_is_validated_and_loaded(tmp_path):
@@ -807,14 +907,20 @@ def test_target_only_constraints_on_unmapped_columns_or_out_of_scope_tables_are_
     facts = _tightened(
         unique=TARGET_LOANS_FACTS.unique | {("servicer_ref",)},
         foreign_keys=TARGET_LOANS_FACTS.foreign_keys
-        | {(("servicer_id",), "loan_servicing.servicers", ("servicer_id",))},
+        | {(("servicer_id",), "loan_servicing.servicers", ("servicer_id",)),
+           # a mapped parent, but the local column is outside the mapping...
+           (("servicer_id",), "loan_servicing.borrowers", ("borrower_id",)),
+           # ...or the referenced column is: neither is provably target-only
+           (("loan_number",), "loan_servicing.borrowers", ("legacy_ref",))},
         not_null=TARGET_LOANS_FACTS.not_null | {"servicer_ref", "servicer_id"})
     source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=facts)
     result = _run(source, target)
     assert _codes(result, "schema_parity") == []
     stats = _tier(result, "schema_parity")["stats"]
     assert stats["target_only_columns_unverified"] == [
-        "loans: unique ('servicer_ref',) covers a column outside the mapping"]
+        "loans: unique ('servicer_ref',) covers a column outside the mapping",
+        "loans: FK ('loan_number',) -> borrowers('legacy_ref',) covers a column outside the mapping",
+        "loans: FK ('servicer_id',) -> borrowers('borrower_id',) covers a column outside the mapping"]
     assert stats["foreign_keys_out_of_scope"] == [
         "loans: target FK ('servicer_id',) -> loan_servicing.servicers"]
 

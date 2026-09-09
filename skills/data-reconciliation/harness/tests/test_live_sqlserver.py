@@ -9,6 +9,7 @@ import pytest
 
 from recon.adapters import SqlServerSourceAdapter
 from recon.transactional import _applied_predicate, _newer_predicate
+from recon.watermarks import in_form_of, instant
 
 pyodbc = pytest.importorskip("pyodbc")
 
@@ -107,4 +108,33 @@ def test_datetime_bounds_are_exact_on_every_datetime_family_column(schema, monke
             assert source.row_count(f"{schema}.Stamps", applied) == 2, column
     finally:
         cur.execute(f"DROP TABLE {schema}.Stamps")
+        conn.close()
+
+
+def test_rowversion_bounds_compare_the_counter_byte_for_byte(schema, monkeypatch):
+    # pyodbc delivers rowversion as 8 bytes; the predicate must carry them as a binary literal
+    # of the same width, whether the applied watermark came back as bytes (target keeps the
+    # bytes) or as the bigint a Lakebase target stores instead (in_form_of widens it again)
+    monkeypatch.setenv("RECON_TEST_SOURCE", os.environ[DSN_VAR])
+    source = SqlServerSourceAdapter("RECON_TEST_SOURCE")
+    conn = pyodbc.connect(os.environ[DSN_VAR], autocommit=True)
+    cur = conn.cursor()
+    cur.execute(f"CREATE TABLE {schema}.RV (Id INT PRIMARY KEY, RV ROWVERSION)")
+    for i in (1, 2, 3):
+        cur.execute(f"INSERT INTO {schema}.RV (Id) VALUES ({i})")
+    cur.execute(f"UPDATE {schema}.RV SET Id = Id WHERE Id = 1")  # row 1 now carries the newest counter
+    try:
+        marks = dict(cur.execute(f"SELECT Id, RV FROM {schema}.RV").fetchall())
+        assert all(isinstance(v, bytes) and len(v) == 8 for v in marks.values())
+        assert source.max_watermark(f"{schema}.RV", "RV") == marks[1]
+        assert instant(marks[1]) > instant(marks[3]) > instant(marks[2])
+        for hwm in (marks[3], in_form_of(instant(marks[3]), marks[1])):
+            newer = _newer_predicate("RV", hwm, source.watermark_literal)
+            applied = _applied_predicate("RV", hwm, source.watermark_literal)
+            assert newer == f"RV > 0x{marks[3].hex()}"
+            assert source.row_count(f"{schema}.RV", newer) == 1, hwm
+            assert source.row_count(f"{schema}.RV", applied) == 2, hwm
+            assert [r["Id"] for r in source.fetch_keyed(f"{schema}.RV", ["Id"], [], where=newer)] == [1]
+    finally:
+        cur.execute(f"DROP TABLE {schema}.RV")
         conn.close()

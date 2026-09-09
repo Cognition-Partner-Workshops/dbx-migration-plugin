@@ -293,6 +293,8 @@ class _SqlAdapterBase:
     # sits one microsecond past the applied watermark, so the engine must compare it at that
     # precision rather than convert it to the column's coarser type first.
     datetime_bound_sql = "{lit}"
+    # Literal of a binary counter watermark (SQL Server rowversion) against this engine's column.
+    binary_literal_sql = "0x{hex}"
 
     def __init__(self, conn):
         self._conn = conn
@@ -563,7 +565,8 @@ class _SqlAdapterBase:
 
     def watermark_literal(self, value: Any) -> str:
         """How this engine wants a watermark bound in a predicate against its own column."""
-        lit = watermark_literal(value, utc_offset=self.watermark_literal_utc_offset)
+        lit = watermark_literal(value, utc_offset=self.watermark_literal_utc_offset,
+                                binary=self.binary_literal_sql)
         return self.datetime_bound_sql.format(lit=lit) if isinstance(value, dt.datetime) else lit
 
     def _change_token(self, table: str) -> Any:
@@ -1079,6 +1082,7 @@ class _PostgresBase(_SqlAdapterBase):
     # A timestamptz column reads an offset-less literal in the session TimeZone; a timestamp
     # column ignores the offset, so the explicit +00:00 is right for both under the UTC contract.
     watermark_literal_utc_offset = True
+    binary_literal_sql = "'\\x{hex}'::bytea"
 
     def open_window(self) -> str:
         """Every statement until close_window reads one REPEATABLE READ snapshot."""

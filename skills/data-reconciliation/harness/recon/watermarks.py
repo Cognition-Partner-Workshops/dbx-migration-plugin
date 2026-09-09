@@ -5,8 +5,10 @@ converted to UTC, a naive value is read as UTC already. That is the only reading
 with the range digests (epoch microseconds of the stored value) and with a CDC feed that
 copies a source `datetime`/`datetime2` column into a Lakebase `timestamptz`; a source that
 stores local wall-clock time must declare a UTC-normalising expression as its watermark.
-Two watermarks of different families (a datetime against a number) are never ordered by
-string fallback; they are a mapping error and are refused before the window opens.
+A binary counter (SQL Server `rowversion`, which pyodbc delivers as 8 bytes) is a number:
+its unsigned big-endian value, which is the order the engine assigns. Two watermarks of
+different families (a datetime against a number) are never ordered by string fallback; they
+are a mapping error and are refused before the window opens.
 """
 
 from __future__ import annotations
@@ -18,24 +20,46 @@ from typing import Any
 from .config import ConfigError
 
 _NUMBER = (int, float, decimal.Decimal)
+_BINARY = (bytes, bytearray, memoryview)
+
+
+def counter_value(value: bytes | bytearray | memoryview) -> int:
+    """The number a binary counter stands for: unsigned, big-endian (SQL Server rowversion)."""
+    return int.from_bytes(bytes(value), "big", signed=False)
 
 
 def instant(value: Any) -> Any:
-    """The comparable form of a watermark: naive UTC datetime for any datetime/date, the value
-    itself otherwise."""
+    """The comparable form of a watermark: naive UTC datetime for any datetime/date, the
+    unsigned integer of a binary counter, the value itself otherwise."""
     if isinstance(value, dt.datetime):
         if value.tzinfo is not None:
             return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
         return value
     if isinstance(value, dt.date):
         return dt.datetime.combine(value, dt.time())
+    if isinstance(value, _BINARY):
+        return counter_value(value)
+    return value
+
+
+def in_form_of(value: Any, like: Any) -> Any:
+    """`value` in the representation `like` uses, for a predicate the engine holding `like`
+    evaluates: a whole number becomes a binary counter of `like`'s width, a binary counter
+    becomes its number. Anything else (same form, unknown form, a fractional value or one that
+    does not fit the width) is returned as it is."""
+    if isinstance(like, _BINARY) and isinstance(value, _NUMBER) and not isinstance(value, bool):
+        whole = int(value)
+        if whole == value and 0 <= whole < 256 ** len(like):
+            return whole.to_bytes(len(like), "big")
+    elif isinstance(value, _BINARY) and isinstance(like, _NUMBER) and not isinstance(like, bool):
+        return counter_value(value)
     return value
 
 
 def family(value: Any) -> str:
     if isinstance(value, bool):
         return "other"
-    if isinstance(value, _NUMBER):
+    if isinstance(value, (*_NUMBER, *_BINARY)):
         return "number"
     if isinstance(value, (dt.datetime, dt.date)):
         return "datetime"
@@ -68,17 +92,21 @@ def same(a: Any, b: Any) -> bool:
     return instant(a) == instant(b)
 
 
-def literal(value: Any, utc_offset: bool = False) -> str:
+def literal(value: Any, utc_offset: bool = False, binary: str = "0x{hex}") -> str:
     """SQL literal of a watermark as a UTC instant. `utc_offset` appends an explicit `+00:00`
     for engines that read an offset-less literal in the session time zone when the column is
     zone-aware (Postgres timestamptz); engines whose zone-less types reject an offset (SQL
-    Server datetime) keep the bare form. Only datetimes and numbers are accepted; anything
-    else cannot be compared across engines."""
+    Server datetime) keep the bare form. A binary counter is rendered as the engine's binary
+    literal (`binary`, with the hex digits as written on the wire) so it compares against the
+    column byte for byte, never as a truncated integer. Only datetimes, numbers and binary
+    counters are accepted; anything else cannot be compared across engines."""
     if isinstance(value, dt.datetime):
         text = instant(value).isoformat(sep=" ", timespec="microseconds")
         return f"'{text}+00:00'" if utc_offset else f"'{text}'"
     if isinstance(value, dt.date):
         return f"'{value.isoformat()}'"
+    if isinstance(value, _BINARY):
+        return binary.format(hex=bytes(value).hex())
     if isinstance(value, bool) or not isinstance(value, _NUMBER):
         raise ConfigError(f"watermark values must be datetimes or numbers, got {type(value).__name__}")
     return str(value)
@@ -94,7 +122,7 @@ def lag_units(src: Any, tgt: Any) -> decimal.Decimal | None:
     either is null or the two are not comparable."""
     if src is None or tgt is None or not (family(src) == family(tgt) == "number"):
         return None
-    return decimal.Decimal(str(src)) - decimal.Decimal(str(tgt))
+    return decimal.Decimal(str(instant(src))) - decimal.Decimal(str(instant(tgt)))
 
 
 def lag_seconds(src: Any, tgt: Any, unit: str | None = None) -> float | None:
