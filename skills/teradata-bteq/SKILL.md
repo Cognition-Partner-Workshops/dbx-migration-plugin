@@ -28,8 +28,8 @@ Load `databricks-core` first. Hardened against the fixture estate `uc-dw-migrati
 | `NUMBER` (no p,s) | `DECIMAL(38,18)` or `DOUBLE` per profile | `NUMERIC` / `DOUBLE PRECISION` | precision | `decimal_round` | profile the column first |
 | `FLOAT` / `REAL` / `DOUBLE PRECISION` | `DOUBLE` | `DOUBLE PRECISION` | none | `decimal_round` (recon only) | |
 | `CHAR(n)` | `STRING COLLATE UTF8_BINARY_RTRIM` (`UTF8_LCASE_RTRIM` if also NOT CASESPECIFIC; "Collation Modifiers") | `TEXT` | semantics (padding) | `rstrip_spaces` | Teradata compares ignoring trailing blanks; loaders must not pad |
-| `VARCHAR(n)` (NOT CASESPECIFIC, Teradata-mode default) | `STRING COLLATE UTF8_LCASE` ("Collation Types") | `TEXT` | semantics (case fold) | `collation_casefold` | `DBC.ColumnsV.UpperCaseFlag = 'N'`; ANSI-mode sessions default to CASESPECIFIC: session mode is a census fact |
-| `... CASESPECIFIC` | `STRING` (`UTF8_BINARY`) | `TEXT` | none | `identity` | per-column exception |
+| `VARCHAR(n)` (NOT CASESPECIFIC, Teradata-mode default) | `STRING COLLATE UTF8_LCASE` ("Collation Types"); `UTF8_LCASE_RTRIM` where profiling finds trailing blanks | `TEXT` | semantics (case fold, padding) | `collation_casefold` + `rstrip_spaces` | Teradata blank-pads both operands of every character comparison, `VARCHAR` included; `DBC.ColumnsV.UpperCaseFlag = 'N'`; ANSI-mode sessions default to CASESPECIFIC: session mode is a census fact |
+| `... CASESPECIFIC` | `STRING` (`UTF8_BINARY`; `UTF8_BINARY_RTRIM` where trailing blanks occur) | `TEXT` | none / padding | `identity` / `rstrip_spaces` | case axis and `RTRIM` axis are independent |
 | `CHARACTER SET KANJISJIS` | `STRING` | `TEXT` | ordering | `identity` | Tier 4 report ordering only |
 | `CLOB` / `JSON` / `XML` | `STRING` (`VARIANT` for JSON if profile allows) | `TEXT` | none (storage) | `identity` | `JSONExtractValue` -> `get_json_object`; XPath hand-converted |
 | `BYTE(n)` / `VARBYTE(n)` / `BLOB` | `BINARY` | `BYTEA` | none | `identity` | `HASHROW` outputs: recompute, never migrate |
@@ -92,7 +92,7 @@ Load `databricks-core` first. Hardened against the fixture estate `uc-dw-migrati
 | 39 | `AVG(int_col)` | `AVG(CAST(int_col AS DECIMAL(...)))` | edge | Teradata truncates to integer, Spark returns `DOUBLE` |
 | 40 | `COUNT(DISTINCT s)` / `MIN/MAX(string)` | same | edge | collation decides case variants and the winner |
 | 41 | `SKEW` / `KURTOSIS` | `skewness` / `kurtosis` | edge | sample vs population: Tier 4 |
-| 42 | `XMLAGG(x ORDER BY k)` / `LISTAGG` | `array_join(collect_list(x) OVER (ORDER BY k ...))` / `listagg` | edge | verify `listagg` availability; ordering inside `array_agg` is not guaranteed |
+| 42 | `XMLAGG(x ORDER BY k)` (`TRIM(... (VARCHAR(n)))`) / `LISTAGG(x, ',') WITHIN GROUP (ORDER BY k)` | grouped `array_join(transform(array_sort(collect_list(struct(k, x))), s -> s.x), '')` / `listagg(x, ',') WITHIN GROUP (ORDER BY k)` | edge | one row per group, never a window; both skip NULLs; `XMLAGG` XML-escapes `<`/`&` and needs the sort key in the struct for a deterministic order; verify `listagg` availability; hand-convert when `x` is not plain text |
 | 43 | `STRTOK(s, delim, n)` / `STRTOK_SPLIT_TO_TABLE` | `split(s, re)[n - 1]` / `posexplode(split(...))` | edge | `STRTOK` collapses consecutive delimiters and is 1-based |
 | 44 | `NORMALIZE` / `P_INTERSECT` / `OVERLAPS` / `BEGIN(p)` / `END(p)` / `EXPAND ON` | gaps-and-islands over `_BEGIN`/`_END`; `a_begin < b_end AND b_begin < a_end`; `explode(sequence(...))` | none | Tier 3 on the decomposed columns |
 | 45 | `MERGE INTO ... WHEN MATCHED THEN UPD ... WHEN NOT MATCHED THEN INS` | `MERGE INTO` (`best-practices.md` "Quick Reference") | edge | both reject duplicate source keys: pre-dedupe with `QUALIFY` |

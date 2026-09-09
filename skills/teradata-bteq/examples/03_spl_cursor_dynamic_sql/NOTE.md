@@ -9,20 +9,22 @@ Source: skill-authored (fixture schema `DIM_ACCOUNT`, `FACT_TRANSACTION`, `ETL_L
   build-time allowlist (`${schema}`, `${archive_schema}`), never the caller's string.
 - `ACTIVITY_COUNT` -> explicit `SELECT COUNT(*)` (`INTO`); `SQLCODE`/`SQLSTATE` in the handler -> fixed return code.
 - `BT`/`ET` + `ROLLBACK` -> no drop-in. Per-statement Delta commits; the archive `INSERT` is idempotent
-  (`NOT EXISTS` on `TRANSACTION_ID`), the handler charges the `INOUT` budget with the accounts whose status `UPDATE`
-  committed, and a re-run finishes the batch. `BEGIN ATOMIC` (preview, `catalogManaged` tables) is the alternative
-  where the target profile allows it.
-- BT/ET also serialised overlapping callers (write locks held to `ET`); nothing does here. Decision item: run the
-  procedure from a job with `max_concurrent_runs: 1` (`databricks-jobs` `references/triggers-schedules.md`) or add
-  an explicit single-row lock table; recorded in `06_decisions.md`, not assumed.
+  (`NOT EXISTS` on `TRANSACTION_ID`), the counter increments before the status `UPDATE` so the `INOUT` budget the
+  handler returns is conservative (an interrupted account is charged once and redone by the re-run, never archived
+  twice). `BEGIN ATOMIC` (preview, `catalogManaged` tables) is the alternative where the target profile allows it.
+- BT/ET also serialised overlapping callers (write locks held to `ET`). Replaced by a seeded one-row
+  `ARCHIVE_CAMPAIGN_LOCK (LOCK_NAME STRING, OWNER_RUN_ID STRING, LOCKED_TS TIMESTAMP)`: claim with
+  `UPDATE ... WHERE OWNER_RUN_ID IS NULL`, read back, `SIGNAL 75003` if not the owner; released (owner-checked) on
+  both exits. Decision items: stale-lock timeout after a session dies mid-run; `max_concurrent_runs: 1` on the calling
+  job (`databricks-jobs` `references/triggers-schedules.md`) as belt-and-braces.
 
 ## Recon tier that catches a wrong conversion
 - **Tier 2** conservation: `sum(AMOUNT)` over `FACT_TRANSACTION` + archive must equal the source total; a
   non-idempotent `INSERT` after a mid-triple failure shows as archive excess.
 - **Tier 1** `p_accounts_done` vs `count(ACCOUNT_STATUS = 'ARCHIVED')` per campaign; a handler that does not
-  deduct from `p_max_batch` over-archives on retry.
+  deduct from `p_max_batch`, or two unserialised callers, over-archive on retry.
 - **Tier 3** keyed diff on rows present in both fact and archive (should be empty after a completed run).
 
 ## Not verified live
 `FOR` with a labelled `LEAVE`; `EXECUTE IMMEDIATE ... INTO ... USING`; `INOUT` write-back from inside an `EXIT`
-handler; `BEGIN ATOMIC` as a BT/ET replacement.
+handler; `BEGIN ATOMIC` as a BT/ET replacement; write-conflict behaviour of two `UPDATE`s on the same lock row.
