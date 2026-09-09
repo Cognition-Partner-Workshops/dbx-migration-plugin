@@ -213,3 +213,24 @@ def test_numeric_domains_are_numeric_columns_and_take_a_sum(schema, monkeypatch)
     finally:
         source._conn.close()
 
+
+def test_whole_number_columns_come_from_the_declared_scale(schema, monkeypatch):
+    # only integer types and NUMERIC with a declared scale of 0 (directly or through a domain)
+    # are whole; an unconstrained NUMERIC has no scale to trust and a float never qualifies
+    dsn = os.environ[DSN_VAR]
+    table = f"{schema}.w"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE DOMAIN {schema}.whole_d AS NUMERIC(10,0)")
+        conn.execute(f"CREATE DOMAIN {schema}.whole_dd AS {schema}.whole_d")
+        conn.execute(f"CREATE DOMAIN {schema}.cents_d AS NUMERIC(10,2)")
+        conn.execute(f"CREATE TABLE {table} (id BIGINT PRIMARY KEY, n0 NUMERIC(18,0), n2 NUMERIC(18,2), "
+                     f"free NUMERIC, f FLOAT8, d0 {schema}.whole_d, dd0 {schema}.whole_dd, "
+                     f"d2 {schema}.cents_d, s SMALLINT, code TEXT)")
+        conn.execute(f"INSERT INTO {table} VALUES (1, 1, 1, 1, 1, 1, 1, 1, 1, 'x')")
+    monkeypatch.setenv("RECON_TEST_SOURCE", dsn)
+    source = PostgresSourceAdapter("RECON_TEST_SOURCE")
+    try:
+        assert source.whole_number_columns(table) == {"id", "n0", "d0", "dd0", "s"}
+    finally:
+        source._conn.close()
+

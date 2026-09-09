@@ -34,6 +34,8 @@ from recon.report import render_summary
 from recon.transactional import (
     _applied_predicate,
     _common_kind,
+    _digest_kind,
+
     _kind,
     _map_expression,
     _newer_predicate,
@@ -408,6 +410,50 @@ def test_fractional_numeric_keys_stream_every_range_rather_than_trusting_a_round
     assert pk["stats"]["loans"]["fingerprint"] == "unavailable: every range streamed"
     assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
     assert "1000.0000007" in pk["findings"][0]["detail"] and "1000.0000099" in pk["findings"][1]["detail"]
+
+
+def test_a_fractional_key_between_whole_range_bounds_is_not_digested_as_an_integer():
+    # every stratum bound is whole (1, 3, 6, 9, 12) yet one interior key is fractional on each
+    # side; rounded into DECIMAL(38,0) both would digest as 5 and the range would look equal
+    loans, borrowers = _rows(12)
+    for r in loans:
+        r["current_balance"] = Decimal(r["loan_id"])
+    loans[4]["current_balance"] = Decimal("4.6")
+    spec = _spec()
+    spec.objects[0].key_source[:] = ["current_balance"]
+    spec.objects[0].key_target[:] = ["current_balance"]
+    tgt = [dict(r) for r in loans]
+    tgt[4]["current_balance"] = Decimal("5.4")
+    source, target = _sides(loans, tgt, borrowers)
+    result = _run(source, target, spec=spec, tol=Tolerances("t1", pk_set_ranges=4))
+    pk = _tier(result, "pk_set_diff")
+    assert pk["stats"]["loans"]["fingerprint"] == "unavailable: every range streamed"
+    assert [f["check"] for f in pk["findings"]] == ["pk_missing_on_target", "pk_extra_on_target"]
+    assert "4.6" in pk["findings"][0]["detail"] and "5.4" in pk["findings"][1]["detail"]
+    assert result["merge_eligible"] is False
+    assert source.calls["whole_number_columns"] == target.calls["whole_number_columns"] == 2
+
+
+def test_numeric_keys_digest_exactly_only_when_both_catalogs_declare_them_whole():
+    class _UntypedSource(FakeSource):
+        def whole_number_columns(self, table):
+            raise NotImplementedError
+
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    source, target = _sides(loans, tgt, borrowers)
+    fp = _tier(_run(source, target), "pk_set_diff")["stats"]["loans"]["fingerprint"]
+    assert fp.startswith("count+key_sum+key_sumsq")
+    untyped = _UntypedSource(source.tables, schema=source.schema, sequences=source.sequences)
+    fp = _tier(_run(untyped, target), "pk_set_diff")["stats"]["loans"]["fingerprint"]
+    assert fp == "unavailable: every range streamed"
+    # datetimes need no catalog proof; numerics are `number` (streamed) until both sides prove them
+    assert _digest_kind([T0], "a", "b", None, None) == "datetime"
+    assert _digest_kind([1, 2], "a", "b", {"a"}, {"b"}) == "integer"
+    assert _digest_kind([1, 2], "a", "b", {"a"}, set()) == "number"
+    assert _digest_kind([1, 2], "a", "b", None, {"b"}) == "number"
+    assert _digest_kind([Decimal("1.5")], "a", "b", {"a"}, {"b"}) == "integer"  # the catalog, not the sample, decides
+    assert _digest_kind(["x"], "a", "b", {"a"}, {"b"}) == "other"
 
 
 def test_digest_kind_is_exact_for_whole_numbers_only():

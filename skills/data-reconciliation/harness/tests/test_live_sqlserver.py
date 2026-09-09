@@ -55,6 +55,24 @@ def test_disabled_constraints_never_count_as_enforced(schema, monkeypatch):
     assert facts.not_null == {"Child_ID", "Parent_ID"}
 
 
+def test_whole_number_columns_come_from_the_declared_scale(schema, monkeypatch):
+    # integer types and DECIMAL/NUMERIC of scale 0 are whole; MONEY (scale 4), a scaled
+    # DECIMAL and FLOAT are not, however whole their current values happen to be
+    conn = pyodbc.connect(os.environ[DSN_VAR], autocommit=True)
+    cur = conn.cursor()
+    cur.execute(f"CREATE TABLE {schema}.W (Id BIGINT PRIMARY KEY, N0 NUMERIC(18,0), D2 DECIMAL(18,2), "
+                f"M MONEY, F FLOAT, T TINYINT, Code VARCHAR(10))")
+    cur.execute(f"INSERT INTO {schema}.W VALUES (1, 1, 1, 1, 1, 1, 'x')")
+    monkeypatch.setenv("RECON_TEST_SOURCE", os.environ[DSN_VAR])
+    source = SqlServerSourceAdapter("RECON_TEST_SOURCE")
+    try:
+        assert source.whole_number_columns(f"{schema}.W") == {"Id", "N0", "T"}
+        assert source.numeric_columns(f"{schema}.W") == {"Id", "N0", "D2", "M", "F", "T"}
+    finally:
+        cur.execute(f"DROP TABLE {schema}.W")
+        conn.close()
+
+
 def test_a_nullable_unique_key_keeps_one_null_row(schema, monkeypatch):
     # SQL Server treats NULL as a value for uniqueness: a unique index admits one NULL key,
     # unlike a default Postgres unique which admits any number of them

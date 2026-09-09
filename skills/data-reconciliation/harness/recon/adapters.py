@@ -162,6 +162,15 @@ class ColumnTypes(Protocol):
 
 
 @runtime_checkable
+class WholeNumberColumns(Protocol):
+    """Columns whose declared type guarantees whole-number values (integer types, exact decimals
+    of scale 0). Tier 5 fingerprints a numeric key or watermark exactly only on this evidence:
+    the sampled range bounds may all be whole while an interior key is fractional, and rounding
+    it into a DECIMAL(38,0) digest would let two distinct keys sum alike."""
+    def whole_number_columns(self, table: str) -> set[str]: ...
+
+
+@runtime_checkable
 class SumProbe(Protocol):
     """One isolated `SELECT SUM(col)` for a field whose numeric type is undeclared on this side;
     None when the engine rejects it. Pairs with `BatchAggregates` so a probed field costs one
@@ -344,6 +353,9 @@ class _SqlAdapterBase:
             self.window_released = reason
 
     def numeric_columns(self, table: str) -> set[str]:
+        raise NotImplementedError(f"{type(self).__name__} cannot read column types")
+
+    def whole_number_columns(self, table: str) -> set[str]:
         raise NotImplementedError(f"{type(self).__name__} cannot read column types")
 
     def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
@@ -837,6 +849,18 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             (schema, name))
         return {col for (col,) in rows}
 
+    def whole_number_columns(self, table: str) -> set[str]:
+        schema, name = _split_table(table, "dbo")
+        rows = self._rows(
+            "SELECT c.name FROM sys.columns c "
+            "JOIN sys.types t ON t.user_type_id = c.system_type_id "
+            "JOIN sys.objects o ON o.object_id = c.object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "WHERE s.name = ? AND o.name = ? AND (t.name IN ('tinyint', 'smallint', 'int', 'bigint') "
+            "OR (t.name IN ('decimal', 'numeric') AND c.scale = 0))",
+            (schema, name))
+        return {col for (col,) in rows}
+
     def identity_state(self, table: str, column: str) -> IdentityState | None:
         schema, name = _split_table(table, "dbo")
         rows = self._rows(
@@ -1093,6 +1117,25 @@ class _PostgresBase(_SqlAdapterBase):
             (schema, name))
         return {col for (col,) in rows}
 
+    def whole_number_columns(self, table: str) -> set[str]:
+        schema, name = _split_table(table, "public")
+        # numeric's typmod packs (precision << 16 | scale) + 4; -1 is unconstrained, so its scale
+        # is unknown and it is not whole. A domain carries the modifier on its own pg_type row.
+        rows = self._rows(
+            "WITH RECURSIVE col_type AS ("
+            "  SELECT a.attname, t.typname, t.typtype, t.typbasetype, a.atttypmod AS typmod, t.typtypmod "
+            "  FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "  JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid "
+            "  WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped "
+            "  UNION ALL "
+            "  SELECT ct.attname, t.typname, t.typtype, t.typbasetype, "
+            "         CASE WHEN ct.typmod <> -1 THEN ct.typmod ELSE ct.typtypmod END, t.typtypmod "
+            "  FROM col_type ct JOIN pg_type t ON t.oid = ct.typbasetype WHERE ct.typtype = 'd') "
+            "SELECT attname FROM col_type WHERE typtype <> 'd' AND (typname IN ('int2', 'int4', 'int8') "
+            "OR (typname = 'numeric' AND typmod <> -1 AND ((typmod - 4) & 65535) = 0))",
+            (schema, name))
+        return {col for (col,) in rows}
+
     def identity_state(self, table: str, column: str) -> IdentityState | None:
         schema, name = _split_table(table, "public")
         (seq,) = self._rows("SELECT pg_get_serial_sequence(%s, %s)",
@@ -1195,6 +1238,9 @@ class LakebaseTargetAdapter(_PostgresBase):
 
     def numeric_columns(self, object: str) -> set[str]:
         return super().numeric_columns(self._q(object))
+
+    def whole_number_columns(self, object: str) -> set[str]:
+        return super().whole_number_columns(self._q(object))
 
     def identity_state(self, object: str, column: str) -> IdentityState | None:
         return super().identity_state(self._q(object), column)

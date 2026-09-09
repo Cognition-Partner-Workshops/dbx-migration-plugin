@@ -39,7 +39,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import SchemaFacts, StratifiedKeys, TransactionalSide
+from .adapters import SchemaFacts, StratifiedKeys, TransactionalSide, WholeNumberColumns
 from .config import ConfigError, MappingSpec, ObjectMapping, Tolerances
 from .tiers import Finding, TierResult
 from .watermarks import (
@@ -265,6 +265,30 @@ def _common_kind(values: Iterable[Any]) -> str:
     return kinds.pop() if len(kinds) == 1 else "other"
 
 
+def _whole_columns(adapter, table: str) -> set[str] | None:
+    """The side's catalog-declared whole-number columns, or None when it cannot say."""
+    if not isinstance(adapter, WholeNumberColumns):
+        return None
+    try:
+        return adapter.whole_number_columns(table)
+    except NotImplementedError:
+        return None
+
+
+def _digest_kind(values: Iterable[Any], s_col: str, t_col: str,
+                 s_whole: set[str] | None, t_whole: set[str] | None) -> str:
+    """Digest kind for one key/watermark column. The sampled values decide only the family; a
+    numeric column is `integer` (exact digest) solely when both catalogs declare it whole, since
+    whole-valued bounds prove nothing about the keys between them. Unproven numerics are `number`
+    and stream every range."""
+    kind = _common_kind(values)
+    if kind not in ("integer", "number"):
+        return kind
+    if s_whole is not None and t_whole is not None and s_col in s_whole and t_col in t_whole:
+        return "integer"
+    return "number"
+
+
 def _fingerprint_complete(fps: list[tuple], nk: int, watermark: bool) -> bool:
     """True when every range carries a key digest (and a watermark digest if one is declared),
     so equal fingerprints really do mean equal key sets and equal watermarks."""
@@ -303,10 +327,15 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         nk = len(c.key_source)
         has_wm = bool(c.watermark_source and c.watermark_target)
         bounds = [b for r in ranges for b in r if b is not None and len(b) == nk]
-        key_kinds = [_common_kind(b[i] for b in bounds) for i in range(nk)]
+        s_whole, t_whole = None, None
+        if not tol.pk_set_stream_every_range:
+            s_whole, t_whole = _whole_columns(source, c.root_table), _whole_columns(target, c.object)
+        key_kinds = [_digest_kind((b[i] for b in bounds), c.key_source[i], c.key_target[i], s_whole, t_whole)
+                     for i in range(nk)]
         wm_kind = None
         if has_wm:
-            wm_kind = _common_kind(m[1] for m in ctx.open_markers[c.object] if len(m) > 1)
+            wm_kind = _digest_kind((m[1] for m in ctx.open_markers[c.object] if len(m) > 1),
+                                   c.watermark_source, c.watermark_target, s_whole, t_whole)
         complete = False
         if tol.pk_set_stream_every_range:
             fingerprint = "not used: every range streamed (pk_set_stream_every_range)"

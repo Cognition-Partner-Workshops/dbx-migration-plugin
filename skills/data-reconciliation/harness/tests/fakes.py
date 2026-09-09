@@ -92,6 +92,17 @@ class _TransactionalMixin:
     def _tx_rows(self, table, where):
         return [r for r in self._all_rows(table) if _matches(r, where)]
 
+    def whole_number_columns(self, table: str) -> set[str]:
+        """Fake catalog: a column is declared whole when every value is an int or a scale-0
+        Decimal (a fractional value anywhere in the fixture means the column has a scale)."""
+        self.calls["whole_number_columns"] += 1
+        self.statements += 1
+        rows = self._all_rows(table)
+        cols = {c for r in rows for c in r}
+        return {c for c in cols
+                if all(r.get(c) is None or (isinstance(r[c], int) and not isinstance(r[c], bool))
+                       or (isinstance(r[c], Decimal) and r[c].as_tuple().exponent >= 0) for r in rows)}
+
     def _key(self, r: dict, key_cols: list[str]) -> tuple:
         return tuple(r[k] if k in r else get_path(r, k) for k in key_cols)
 
