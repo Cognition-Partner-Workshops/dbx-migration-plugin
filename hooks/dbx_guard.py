@@ -45,17 +45,21 @@ DEFAULT_FORBIDDEN_BUNDLE_TARGETS = ("prod", "production")
 
 _SEG = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$-]*)"
 _THREE_PART = re.compile(rf"(?<![\w`.])({_SEG})\.({_SEG})\.({_SEG})(?![\w`.])")
+# the securable right after a write verb: three-part, or four-part when it is a column
+_TARGET_NAME = re.compile(rf"({_SEG})\.({_SEG})\.({_SEG})(?:\.{_SEG})?(?![\w`.])")
 
 _WRITE_STMT = re.compile(
     r"""(?:\b(?:
         INSERT\s+(?:INTO|OVERWRITE)\b
       | UPDATE\s+(?:TOP\s*\([^)]*\)\s+)?(?!SET\b)\S+(?:\s+(?:AS\s+)?(?!SET\b|WITH\b)[\w`\[\]$]+)?(?:\s+WITH\s*\([^)]*\))?\s+SET\b
       | DELETE\s+FROM\b
-      | MERGE\s+INTO\b
+      | MERGE\s+(?:WITH\s+SCHEMA\s+EVOLUTION\s+)?INTO\b
       | TRUNCATE\s+TABLE\b
       | CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+|EXTERNAL\s+|STREAMING\s+|MATERIALIZED\s+|LIVE\s+)*(?:TABLE|VIEW|SCHEMA|DATABASE|CATALOG|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE)\b
       | DROP\s+(?:TABLE|VIEW|SCHEMA|DATABASE|CATALOG|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE)\b
+      | UNDROP\s+(?:TABLE|SCHEMA)\b
       | ALTER\s+(?:TABLE|VIEW|SCHEMA|DATABASE|CATALOG|FUNCTION|PROCEDURE|VOLUME)\b
+      | COMMENT\s+ON\b
       | REPLACE\s+TABLE\b
       | GRANT\s+.+?\bON\b
       | REVOKE\s+.+?\bON\b
@@ -72,7 +76,7 @@ _WRITE_STMT = re.compile(
 _USE_CATALOG = re.compile(rf"\bUSE\s+CATALOG\s+({_SEG})", re.IGNORECASE)
 _CREATE_CATALOG = re.compile(rf"\b(?:CREATE|DROP|ALTER)\s+CATALOG\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({_SEG})", re.IGNORECASE)
 _SCHEMA_TWO_PART = re.compile(
-    rf"\b(?:CREATE|DROP|ALTER)\s+(?:SCHEMA|DATABASE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({_SEG})\.({_SEG})(?![\w`.])",
+    rf"\b(?:CREATE|DROP|ALTER|UNDROP)\s+(?:SCHEMA|DATABASE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({_SEG})\.({_SEG})(?![\w`.])",
     re.IGNORECASE,
 )
 _ON_CATALOG = re.compile(rf"\bON\s+CATALOG\s+({_SEG})", re.IGNORECASE)
@@ -98,7 +102,9 @@ _WRITE_TARGET_HEAD = re.compile(
       | CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+|EXTERNAL\s+|STREAMING\s+|MATERIALIZED\s+|LIVE\s+)*
         (?:TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE)(?:\s+IF\s+NOT\s+EXISTS)?
       | DROP\s+(?:TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE)(?:\s+IF\s+EXISTS)?
+      | UNDROP\s+TABLE
       | ALTER\s+(?:TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME)(?:\s+IF\s+EXISTS)?
+      | COMMENT\s+ON(?:\s+(?:TABLE|VIEW|MATERIALIZED\s+VIEW|VOLUME|FUNCTION|PROCEDURE|COLUMN))?
       | (?:GRANT|REVOKE)\s+.+?\bON\s+(?:(?:TABLE|VIEW|MATERIALIZED\s+VIEW|FUNCTION|PROCEDURE|VOLUME)\s+)?
       | (?:EXEC(?:UTE)?|CALL)
     )\s*""",
@@ -308,9 +314,11 @@ def _write_segments(text: str) -> list[tuple[int, str]]:
 
 
 def _shell_tokens(cmd: str) -> list[str]:
-    """Shell words with redirection operators as their own tokens; a quoted argument (usually
-    the SQL itself) is one word, so a `<` comparison inside it is never an operator."""
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    """Shell words with redirection operators, separators and newlines as their own tokens; a
+    quoted argument (usually the SQL itself) is one word, so a `<` comparison or a line break
+    inside it is never an operator."""
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
     lex.whitespace_split = True
     lex.commenters = ""
     try:
@@ -319,22 +327,38 @@ def _shell_tokens(cmd: str) -> list[str]:
         return [t.strip("'\"") for t in re.split(r"\s+|(?<!<)(<)(?!<)", cmd) if t]
 
 
-def _script_inputs(cmd: str) -> list[str]:
-    """Files a client is told to execute: `< f`, `@f`, `-f f`, `--file f`, `-i f`, `--input f`."""
-    files = []
-    toks = _shell_tokens(cmd)
-    for i, tok in enumerate(toks):
-        nxt = toks[i + 1] if i + 1 < len(toks) else ""
-        if tok == "<" or tok in _SCRIPT_FLAGS:
-            f = nxt
-        elif tok.startswith("@"):
-            f = tok[1:]
-        elif tok.startswith(tuple(fl + "=" for fl in _SCRIPT_FLAGS)):
-            f = tok.split("=", 1)[1]
+def _commands(toks: list[str]) -> list[list[str]]:
+    """The token list split into simple commands at `;`, `&&`, `||`, `|`, `&`, parentheses and
+    line breaks; `<` stays inside its command because it names that command's input."""
+    out: list[list[str]] = [[]]
+    for tok in toks:
+        if tok != "<" and re.fullmatch(r"[();<>|&\n]+", tok):
+            out.append([])
         else:
+            out[-1].append(tok)
+    return [c for c in out if c]
+
+
+def _script_inputs(cmd: str, cfg: GuardConfig | None = None) -> list[str]:
+    """Files a client is told to execute: `< f`, `@f`, `-f f`, `--file f`, `-i f`, `--input f`.
+    Given a config, read only from the simple commands that name a Databricks or legacy client
+    or a legacy source: the `-f` of `rm -f x && databricks jobs list` belongs to `rm`."""
+    files = []
+    for toks in _commands(_shell_tokens(cmd)):
+        if cfg is not None and not _has_context(" ".join(toks), cfg):
             continue
-        if f and not f.startswith("-") and not re.fullmatch(r"[<>|;&()]+", f):
-            files.append(f)
+        for i, tok in enumerate(toks):
+            nxt = toks[i + 1] if i + 1 < len(toks) else ""
+            if tok == "<" or tok in _SCRIPT_FLAGS:
+                f = nxt
+            elif tok.startswith("@"):
+                f = tok[1:]
+            elif tok.startswith(tuple(fl + "=" for fl in _SCRIPT_FLAGS)):
+                f = tok.split("=", 1)[1]
+            else:
+                continue
+            if f and not f.startswith("-") and not re.fullmatch(r"[<>|;&()]+", f):
+                files.append(f)
     return files
 
 
@@ -451,7 +475,7 @@ def _inline_scripts(cmd: str, root: Path, cfg: GuardConfig) -> tuple[str, list[s
     unreadable: list[str] = []
     if not _has_context(text, cfg):
         return text, unreadable, unreadable_shell
-    for f in _script_inputs(text):
+    for f in _script_inputs(text, cfg):
         body = _read_script(f, root)
         if body is None:
             unreadable.append(f)
@@ -543,7 +567,7 @@ def _catalogs_in_segment(seg: str) -> set[str]:
             return {_norm(m.group(1))}
     head = _WRITE_TARGET_HEAD.match(seg, start)
     if head:
-        m = _THREE_PART.match(seg, head.end())
+        m = _TARGET_NAME.match(seg, head.end())
         if m:
             return {_norm(m.group(1))}
     return set()

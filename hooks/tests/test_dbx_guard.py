@@ -44,6 +44,11 @@ def block(cmd: str, cfg=CFG):
     "databricks experimental aitools tools query \"CREATE SCHEMA IF NOT EXISTS mig_cat.wave1_u12\"",
     "databricks experimental aitools tools query \"GRANT SELECT ON SCHEMA mig_cat.wave1_u12 TO `recon-verifier`\"",
     "databricks experimental aitools tools query \"MERGE INTO mig_cat.s.t USING mig_cat.s.stg ON t.id = stg.id WHEN MATCHED THEN UPDATE SET *\"",
+    "databricks experimental aitools tools query \"MERGE WITH SCHEMA EVOLUTION INTO mig_cat.s.t USING prod_cat.s.stg ON t.id = stg.id WHEN MATCHED THEN UPDATE SET *\"",
+    "databricks experimental aitools tools query \"COMMENT ON TABLE mig_cat.wave1_u12.orders IS 'converted from sales.orders'\"",
+    "databricks experimental aitools tools query \"COMMENT ON COLUMN mig_cat.wave1_u12.orders.amount IS 'cents'\"",
+    "databricks experimental aitools tools query \"UNDROP TABLE mig_cat.wave1_u12.orders\"",
+    "databricks experimental aitools tools query \"SELECT comment FROM prod_cat.information_schema.tables WHERE note = 'UNDROP TABLE prod_cat.s.t' OR note = 'COMMENT ON TABLE prod_cat.s.t IS x'\"",
     "databricks experimental aitools tools query \"CALL mig_cat.wave1.usp_load_orders()\"",
     "databricks experimental aitools tools query \"SELECT * FROM legacy_fed.dbo.orders WHERE op_type = 'DELETE' AND last_update > '2024-01-01'\"",
     "databricks experimental aitools tools query \"SELECT * FROM prod_cat.audit.log WHERE stmt = 'DROP TABLE prod_cat.s.t' OR stmt = 'UPDATE prod_cat.s.t SET a = 1'\"",
@@ -88,6 +93,16 @@ def test_allowed(cmd):
     ("databricks experimental aitools tools query \"CREATE TABLE orders (id INT)\"", "unresolvable"),
     ("databricks experimental aitools tools query \"CREATE TABLE orders AS SELECT * FROM prod_cat.sales.orders\"", "prod_cat"),
     ("databricks experimental aitools tools query \"MERGE INTO prod_cat.s.t t USING mig_cat.s.stg s ON t.id=s.id WHEN MATCHED THEN DELETE\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"MERGE WITH SCHEMA EVOLUTION INTO prod_cat.s.t t USING mig_cat.s.stg s ON t.id=s.id WHEN MATCHED THEN UPDATE SET *\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"MERGE WITH SCHEMA EVOLUTION INTO t USING mig_cat.s.stg s ON t.id=s.id WHEN NOT MATCHED THEN INSERT *\"", "unresolvable"),
+    ("databricks experimental aitools tools query \"COMMENT ON TABLE prod_cat.sales.orders IS 'migrated'\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"COMMENT ON COLUMN prod_cat.sales.orders.amount IS 'cents'\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"COMMENT ON SCHEMA prod_cat.sales IS 'x'\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"COMMENT ON CATALOG prod_cat IS 'x'\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"COMMENT ON TABLE orders IS 'x'\"", "unresolvable"),
+    ("databricks experimental aitools tools query \"UNDROP TABLE prod_cat.sales.orders\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"UNDROP SCHEMA prod_cat.sales\"", "prod_cat"),
+    ("databricks experimental aitools tools query \"UNDROP TABLE WITH ID '0123-abcd'\"", "unresolvable"),
     ("databricks experimental aitools tools query \"DELETE FROM sales.orders WHERE 1=1\"", "unresolvable"),
     ("databricks experimental aitools tools query \"CALL prod_cat.ops.usp_repoint_consumers()\"", "prod_cat"),
     ("databricks experimental aitools tools query \"ALTER TABLE prod_cat.sales.orders ADD COLUMN x INT\"", "prod_cat"),
@@ -491,6 +506,37 @@ def test_non_client_commands_do_not_read_files(tmp_path: Path):
     approve("rm -f /nonexistent/thing && docker run -i img < /nonexistent/in.txt")
 
 
+@pytest.mark.parametrize("cmd", [
+    "rm -f /nonexistent/x && databricks jobs list",
+    "databricks jobs list; rm -f /nonexistent/x",
+    "tar -f /nonexistent/a.tar -x | databricks experimental aitools tools query \"SELECT 1 FROM mig_cat.s.t\"",
+    "rm -f /nonexistent/x\ndatabricks current-user me",
+    "grep -i pattern /nonexistent/log && sqlcmd -S legacy-prod -Q \"SELECT 1\"",
+    "docker run -i img < /nonexistent/in.txt && bteq <<'EOF'\nSELECT 1;\nEOF",
+])
+def test_flags_of_other_commands_in_the_chain_are_not_scripts(cmd, tmp_path: Path):
+    assert g._script_inputs(cmd, CFG) == []
+    assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve"
+
+
+def test_scripts_of_the_client_command_are_still_read(tmp_path: Path):
+    (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
+    for cmd in ("rm -f x && bteq < fix.sql", "bteq -i fix.sql; rm -f x", "echo start\nbteq < fix.sql\necho done",
+                "rm -f x && psql -h tdprod.corp.example -f fix.sql"):
+        assert g._script_inputs(cmd, CFG) == ["fix.sql"], cmd
+        v = g.evaluate(cmd, CFG, root=tmp_path)
+        assert v.decision == "block" and "read-only" in v.reason, cmd
+    (tmp_path / "load.sql").write_text("CREATE TABLE orders_v2 (id INT);\n")
+    v = g.evaluate("rm -f x && spark-sql -f load.sql", CFG, root=tmp_path)
+    assert v.decision == "block" and "unresolvable catalog" in v.reason
+    v = g.evaluate("rm -f x && spark-sql -f /nonexistent/load.sql", CFG, root=tmp_path)
+    assert v.decision == "block" and "cannot read" in v.reason
+    # inside an inspected shell script, the same scoping applies per line
+    (tmp_path / "run.sh").write_text("rm -f /nonexistent/x\nbteq < fix.sql\n")
+    v = g.evaluate("bash run.sh", CFG, root=tmp_path)
+    assert v.decision == "block" and "read-only" in v.reason and "cannot read" not in v.reason
+
+
 # ---------------------------------------------------------------- denied shapes: legacy writes
 
 @pytest.mark.parametrize("cmd", [
@@ -504,6 +550,9 @@ def test_non_client_commands_do_not_read_files(tmp_path: Path):
     "sqlplus svc@tdprod.corp.example @fix.sql\nTRUNCATE TABLE sales.orders;",
     "sqlplus ro_user/x@ORCL <<EOF\nDROP INDEX sales.ix_orders;\nEOF",
     "snowsql -q \"CREATE OR REPLACE VIEW sales.v_orders AS SELECT 1\"",
+    "sqlplus svc@tdprod.corp.example <<EOF\nCOMMENT ON TABLE sales.orders IS 'migrated';\nEOF",
+    "snowsql -q \"UNDROP TABLE sales.orders_bak\"",
+    "sqlcmd -S legacy-prod -Q \"MERGE WITH SCHEMA EVOLUTION INTO dbo.loans t USING dbo.stg s ON t.id=s.id WHEN MATCHED THEN UPDATE SET *\"",
     "docker exec -i legacy-prod isql -Usa -Q 'UPDATE dbo.loans SET status = 1 WHERE 1=1'",
     "sqlcmd -S legacy-prod -Q \"UPDATE dbo.loans AS l SET l.status = 1\"",
     "sqlcmd -S legacy-prod -Q \"UPDATE dbo.loans l SET status = 1\"",
