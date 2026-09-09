@@ -141,6 +141,13 @@ def test_continuous_mode_samples_tier3_and_skips_tier4():
     assert result["tiers"][2]["stats"]["orders"]["mode"] == "stratified_sample"
 
 
+def test_continuous_mode_records_the_depth_it_ran_at_not_the_one_requested():
+    source, target = make_green()
+    result = run_recon("u", "continuous", SPEC, TOL, RULES, source, target, depth="full")
+    assert result["tiers"][2]["stats"]["orders"]["mode"] == "stratified_sample"
+    assert result["depth"] == "sampled"
+
+
 def test_determinism():
     r1 = run(*make_green())
     r2 = run(*make_green())
