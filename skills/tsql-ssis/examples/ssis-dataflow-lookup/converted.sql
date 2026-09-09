@@ -1,121 +1,116 @@
 -- Converted under skills/tsql-ssis/SKILL.md §6 "SSIS Data Flow Task" rows (Source / Lookup /
--- Derived Column / OLE DB Destination / error output / OnError handler).
--- Lakeflow Spark Declarative Pipelines SQL, syntax per databricks-pipelines references:
---   temporary-view-sql.md   (CREATE TEMPORARY VIEW over STREAM(...); downstream STs read FROM STREAM(view_name))
---   streaming-table-sql.md  (CREATE OR REFRESH STREAMING TABLE, STREAM(table) source, stream-static join,
---                            CLUSTER BY, CONSTRAINT ... EXPECT, read_stream(..., skipChangeCommits => true))
---   expectations-sql.md     (warn / DROP ROW / FAIL UPDATE)
+-- Derived Column / OLE DB Destination / error output / OnError handler) and "SSIS Variables".
+-- Runs as the Lakeflow Jobs sql_task `load_payment_fact` in converted.yml (databricks-jobs
+-- references/task-types.md "SQL Task": sql_task.file + warehouse_id; docs /aws/en/jobs/sql: "The file can
+-- contain multiple SQL statements separated by semicolons"). Job parameters are pushed down to SQL tasks
+-- and read with the :name syntax (docs /aws/en/jobs/parameter-use "SQL: Use named parameters to retrieve parameter
+-- values"; converted.yml also passes them explicitly as sql_task.parameters); table names are built with IDENTIFIER()
+-- (docs sql-ref-names-identifier-clause: "The target table name of a MERGE ... A column, table or view
+-- referenced in a query").
 --
--- Target form: STREAMING TABLE, not MATERIALIZED VIEW. The package is an APPEND package: OLE DB Destination
--- fast load with no TRUNCATE / DELETE step, run once per LoadDate, so dw.fact_payment accumulates one day
--- per run and keeps every earlier day. A materialized view over a single ${load_date} window would be
--- recomputed for the new day on every refresh and REPLACE the previous day's rows (materialized-view-sql.md:
--- "batch processing with full refresh or incremental computation" of the defining query, and the defining
--- query only ever covers one window). databricks-pipelines SKILL.md "Streaming Table":
--- "incremental processing, exactly-once, append-only" is the SSIS destination's contract, so the SKILL §6
--- decision table (append/incremental -> ST) applies.
+-- Execution model: a PARAMETERISED BOUNDED BATCH, the same as the package. One SSIS execution =
+-- (User::LoadDate window, $Package::ServicerId): it re-read the whole window from dbo.payments and evaluated
+-- every row of it against the loans of THAT servicer. Both parameters are per execution (ServicerId is
+-- Required="True"; LoadDate is bound to the two ? markers), so the conversion is a job with two job parameters
+-- (:load_date, :servicer_id) and two set-based, idempotent MERGE statements over the same window.
 --
--- Idempotency key: the streaming checkpoint. Each payments row is processed exactly once, so re-triggering
--- the pipeline for the same day appends nothing (the source package had no key: re-running it for the same
--- LoadDate appended the day twice; that duplicate is a source defect, recorded as a per-unit decision in
--- NOTE.md, not reproduced). Re-loading one historical day on purpose is a full refresh of the table (the
--- streaming table rebuilds from the whole payments history), never a partial re-run.
+-- Why NOT a Lakeflow Spark Declarative Pipelines streaming table (the previous shape of this file): a streaming
+-- table checkpoints the payments rows it has consumed once, globally for the table. A per-run filter parameter
+-- cannot be applied retroactively: payments consumed under servicer 7 are never re-evaluated when the next run
+-- passes servicer 12, so that run's matches are lost and the first run's "no match" rows for servicer 12's
+-- payments stay wrong forever. The source re-evaluated the window on every execution; only a bounded batch
+-- reproduces that. A pipeline `configuration` key has the opposite defect (frozen at deploy time). SKILL §6
+-- "SSIS Data Flow" row: a Data Flow driven by a per-execution parameter is a bounded batch (sql_task + MERGE),
+-- never a streaming table; the streaming-table shape is for flows whose only variable is their own bookmark.
 --
--- The package parameter ServicerId (Required="True": supplied per execution) arrives per run as a pipeline-task
--- parameter and is read as the named parameter :servicer_id (docs /aws/en/jobs/parameter-use: "When you are
--- running SQL in a notebook or pipeline task, you can use the named parameter syntax"; the job forwards
--- pipeline_task.parameters.servicer_id = {{job.parameters.servicer_id}}, docs /aws/en/jobs/pipeline
--- "Parameters", Beta; converted.yml). It is NOT a pipeline `configuration` key (${servicer_id}): that is fixed
--- at deploy time, so every run would load the design-time default. Fallback without the Beta: one pipeline
--- per servicer with `configuration.servicer_id` and ${servicer_id} here (converted.yml comment; SKILL §6
--- "SSIS Variables").
--- Not verified live: named-parameter syntax inside an SDP SQL source file driven by pipeline_task.parameters.
--- User::LoadDate has no configuration key any more: the daily window was the package's own incremental
--- bookmark, and the checkpoint replaces it; load_date is derived per row below.
--- Runs as a pipeline_task inside converted.yml (databricks-jobs task-types.md), whose failure task keeps
--- the OnError handler's dw.etl_log write.
+-- Idempotency (the source had none: re-running a LoadDate appended the day twice, recorded in NOTE.md as a
+-- per-unit decision, not reproduced): MERGE ... WHEN NOT MATCHED THEN INSERT on the destination's business key
+-- (docs delta-merge-into). fact_payment is keyed on payment_id (a payment's loan belongs to exactly one servicer,
+-- so exactly one (window, servicer) execution can ever match it); err_payment_no_loan is keyed on
+-- (payment_id, servicer_id): "payment X has no loan under servicer S" is one fact per servicer, exactly what
+-- the source wrote once per execution. servicer_id is an ADDED column on the error table (the source table had
+-- no key at all), recorded in NOTE.md. A rerun of the same (load_date, servicer_id) therefore inserts nothing,
+-- a run for another servicer over the same window adds its own matches and its own no-match rows, and a
+-- deliberate reload of one day is the same statement again (never a full refresh of the table).
+--
+-- Window bounds: DATEADD(dd, 1, ?) -> date_add(d, 1) (docs functions/date_add: returns a DATE).
+-- Snapshot per statement: each MERGE reads payments and loans once, as of its own Delta snapshot
+-- (docs /optimizations/isolation/isolation-levels: readers see a consistent snapshot); that is the SSIS Full
+-- cache Lookup (one point-in-time load of the reference set per execution). converted.yml sets
+-- max_concurrent_runs: 1 (an SSIS package is not re-entrant) so two runs never race on the same window; a
+-- concurrent writer to fact_payment / err_payment_no_loan outside the job makes the MERGE fail at commit
+-- (docs /optimizations/isolation/row-level-concurrency: MERGE + MERGE "can conflict") and the job retries it.
+-- Failure between the two statements leaves the fact loaded and the error rows missing, exactly the
+-- non-transactional state a mid-flow SSIS failure left (TransactionOption=Supported, no enclosing transaction
+-- in the package); the rerun repairs it because both statements are idempotent.
+--
+-- The OnError event handler's dw.etl_log write lives in converted.yml as the sql_task log_onerror
+-- (run_if: AT_LEAST_ONE_FAILED after this task).
 
--- SRC payments (OLE DB Source, SQL command with two ? parameters bound to User::LoadDate).
--- Incremental read of the same column list. payments is insert-only in the fixture (no UPDATE or DELETE
--- against dbo.payments anywhere in schema/, stored_procs/, triggers/ or batch/; reversal_flag is set at
--- insert time), so a plain STREAM() read is valid. If the real estate updates payment rows, read
---   FROM STREAM read_stream('${catalog}.${schema}.payments', skipChangeCommits => true)
--- instead (streaming-table-sql.md): the SSIS window only ever saw a row's state on its load day too.
-CREATE TEMPORARY VIEW src_payments AS
-SELECT p.payment_id, p.loan_id, p.payment_date, p.effective_date,
-       p.principal_amt, p.interest_amt, p.escrow_amt, p.late_fee_amt,
-       p.total_amt, p.payment_type, p.reversal_flag, p.batch_id
-FROM STREAM(${catalog}.${schema}.payments) p;
-
--- LKP loans (Lookup, Full cache, parameterised reference query, no-match -> redirect)
--- Full cache == one point-in-time read of the reference set per package execution == a stream-static join:
--- loans is read as a static snapshot at stream start, payments incrementally (streaming-table-sql.md
--- "Stream-static join"). One triggered pipeline update per day == one SSIS execution == one snapshot.
--- (Partial/No cache would have re-queried per row and seen mid-run changes: SKILL §7 "SSIS Lookup cache".)
--- Lookup joins are case-INsensitive on a CI database only when CacheType != Full; with Full cache SSIS
--- compares in .NET (case- and trailing-space-SENSITIVE), so no collation folding is added for this package.
-CREATE TEMPORARY VIEW lkp_payments_loans AS
-SELECT s.*,
-       l.loan_type, l.investor_code, l.property_state,
-       l.loan_id AS lkp_loan_id
-FROM STREAM(src_payments) s
-LEFT JOIN (SELECT loan_id, loan_type, servicer_id, investor_code, property_state
-           FROM ${catalog}.${schema}.loans
-           WHERE servicer_id = :servicer_id) l              -- $Package::ServicerId, per run
-  ON s.loan_id = l.loan_id;
-
--- DER payment attrs (Derived Column). SSIS expression -> SQL (SKILL §6 "SSIS Derived Column"):
+-- SRC payments (OLE DB Source, SQL command, ? = User::LoadDate twice) + LKP loans (Full cache, reference query
+-- on ? = $Package::ServicerId, Lookup Match Output) + DER payment attrs + DST fact_payment (fast load, append).
+-- SSIS expression -> SQL (SKILL §6 "SSIS Derived Column"):
 --   YEAR(d) * 100 + MONTH(d)              -> year(d) * 100 + month(d)
 --   flag == "Y" ? TRUE : FALSE            -> flag = 'Y'
 --   a < 500 ? "LT500" : (...)             -> CASE
 --   (DT_WSTR,4)TRIM(loan_type)            -> trim(loan_type)  (SSIS TRIM strips spaces only)
--- Lookup Match Output -> fact; Lookup No Match Output -> error table.
--- DST fact_payment (OLE DB Destination, fast load, append). Persistent streaming table: every processed
--- day stays; each pipeline update appends only the payments rows not yet seen by the checkpoint.
-CREATE OR REFRESH STREAMING TABLE ${catalog}.${schema}.fact_payment (
-    CONSTRAINT loan_exists  EXPECT (lkp_loan_id IS NOT NULL) ON VIOLATION DROP ROW,   -- rows go to err_payment_no_loan below
-    CONSTRAINT amt_present  EXPECT (total_amt IS NOT NULL)                            -- FastLoadKeepNulls=false: DW default applied; warn only
-)
-CLUSTER BY (payment_month)
-COMMENT 'Converted from LoadPaymentFact.dtsx / DFT Load fact_payment (append destination; history retained)'
-AS
-SELECT payment_id,
-       loan_id,
-       year(payment_date) * 100 + month(payment_date)         AS payment_month,
-       payment_date,
-       trim(loan_type)                                        AS loan_type,       -- DER loan_type_trim
-       investor_code,
-       property_state,
-       principal_amt, interest_amt, escrow_amt, late_fee_amt,
-       coalesce(total_amt, CAST(0 AS DECIMAL(19,4)))          AS total_amt,       -- KeepNulls=false: DW column DEFAULT 0
-       reversal_flag = 'Y'                                    AS is_reversal,
-       CASE WHEN total_amt < 500  THEN 'LT500'
-            WHEN total_amt < 2000 THEN '500-2K'
-            ELSE 'GT2K' END                                   AS amt_bucket,
-       batch_id,
-       CAST(payment_date AS DATE)                             AS load_date,       -- == User::LoadDate for every row the source window admitted
-       lkp_loan_id
-FROM STREAM(lkp_payments_loans);
+-- Lookup joins are case-INsensitive on a CI database only when CacheType != Full; with Full cache SSIS compares
+-- in .NET (case- and trailing-space-SENSITIVE), so no collation folding is added for this package (SKILL §7).
+-- FastLoadKeepNulls=false: a NULL total_amt took the DW column DEFAULT (0) -> coalesce.
+MERGE INTO IDENTIFIER(:catalog || '.' || :schema || '.fact_payment') t
+USING (
+    SELECT p.payment_id,
+           p.loan_id,
+           year(p.payment_date) * 100 + month(p.payment_date)   AS payment_month,
+           p.payment_date,
+           trim(l.loan_type)                                     AS loan_type,       -- DER loan_type_trim
+           l.investor_code,
+           l.property_state,
+           p.principal_amt, p.interest_amt, p.escrow_amt, p.late_fee_amt,
+           coalesce(p.total_amt, CAST(0 AS DECIMAL(19,4)))       AS total_amt,
+           p.reversal_flag = 'Y'                                 AS is_reversal,
+           CASE WHEN p.total_amt < 500  THEN 'LT500'
+                WHEN p.total_amt < 2000 THEN '500-2K'
+                ELSE 'GT2K' END                                  AS amt_bucket,
+           p.batch_id,
+           CAST(:load_date AS DATE)                              AS load_date        -- == User::LoadDate
+    FROM IDENTIFIER(:catalog || '.' || :schema || '.payments') p
+    JOIN IDENTIFIER(:catalog || '.' || :schema || '.loans') l                          -- Lookup Match Output
+      ON l.loan_id = p.loan_id
+     AND l.servicer_id = CAST(:servicer_id AS INT)                                     -- reference query WHERE servicer_id = ?
+    WHERE p.payment_date >= CAST(:load_date AS TIMESTAMP_NTZ)                         -- p.payment_date >= ?
+      AND p.payment_date <  CAST(date_add(CAST(:load_date AS DATE), 1) AS TIMESTAMP_NTZ)   -- < DATEADD(dd, 1, ?)
+) s
+ON t.payment_id = s.payment_id
+WHEN NOT MATCHED THEN INSERT
+    (payment_id, loan_id, payment_month, payment_date, loan_type, investor_code, property_state,
+     principal_amt, interest_amt, escrow_amt, late_fee_amt, total_amt, is_reversal, amt_bucket,
+     batch_id, load_date)
+VALUES
+    (s.payment_id, s.loan_id, s.payment_month, s.payment_date, s.loan_type, s.investor_code, s.property_state,
+     s.principal_amt, s.interest_amt, s.escrow_amt, s.late_fee_amt, s.total_amt, s.is_reversal, s.amt_bucket,
+     s.batch_id, s.load_date);
 
--- DST err_payment_no_loan (Lookup No Match Output). SSIS wrote the unmatched rows to a second table;
--- expectations only drop or fail, they do not redirect, so the redirect is a second streaming table over the
--- same streaming view with the inverse predicate (SKILL §6 "error output redirection"). It is persistent
--- too: the source error table was also append-only, and its history is what the ops team reconciles.
--- Each streaming table keeps its own checkpoint over lkp_payments_loans, so the two outputs partition every
--- processed row exactly once between them.
-CREATE OR REFRESH STREAMING TABLE ${catalog}.${schema}.err_payment_no_loan
-COMMENT 'Lookup No Match Output of LoadPaymentFact.dtsx (append destination; history retained)'
-AS
-SELECT payment_id, loan_id, payment_date, total_amt, batch_id,
-       'LKP loans: no match'            AS error_desc,
-       CAST(payment_date AS DATE)       AS load_date
-FROM STREAM(lkp_payments_loans)
-WHERE lkp_loan_id IS NULL;
-
--- OnError event handler ("SQL Log OnError" -> dw.etl_log): a package-scope table write, part of the
--- customer's data contract (ops reads dw.etl_log). It is not emitted here because a pipeline update
--- cannot run SQL after its own failure; it lives in converted.yml as the sql_task log_onerror
--- (run_if: AT_LEAST_ONE_FAILED after the pipeline_task), which inserts the etl_log row:
---   INSERT INTO IDENTIFIER(:catalog||'.'||:schema||'.etl_log') (package_name, event, message, logged_at)
---   VALUES ('LoadPaymentFact', 'OnError', :message, current_timestamp());
--- The pipeline event log and the job's on_failure notification are additional signals, not replacements.
+-- DST err_payment_no_loan (Lookup No Match Output): the same window, the rows with no loan under this
+-- servicer. Same snapshot semantics as above; the two statements partition the window exactly the way the
+-- Lookup's two outputs did (a payment is either matched or not, for this servicer).
+MERGE INTO IDENTIFIER(:catalog || '.' || :schema || '.err_payment_no_loan') t
+USING (
+    SELECT p.payment_id, p.loan_id, p.payment_date, p.total_amt, p.batch_id,
+           CAST(:servicer_id AS INT)        AS servicer_id,        -- added column: the run's $Package::ServicerId
+           'LKP loans: no match'            AS error_desc,
+           CAST(:load_date AS DATE)         AS load_date
+    FROM IDENTIFIER(:catalog || '.' || :schema || '.payments') p
+    WHERE p.payment_date >= CAST(:load_date AS TIMESTAMP_NTZ)
+      AND p.payment_date <  CAST(date_add(CAST(:load_date AS DATE), 1) AS TIMESTAMP_NTZ)
+      AND NOT EXISTS (SELECT 1
+                      FROM IDENTIFIER(:catalog || '.' || :schema || '.loans') l
+                      WHERE l.loan_id = p.loan_id
+                        AND l.servicer_id = CAST(:servicer_id AS INT))
+) s
+ON  t.payment_id  = s.payment_id
+AND t.servicer_id = s.servicer_id
+WHEN NOT MATCHED THEN INSERT
+    (payment_id, loan_id, payment_date, total_amt, batch_id, servicer_id, error_desc, load_date)
+VALUES
+    (s.payment_id, s.loan_id, s.payment_date, s.total_amt, s.batch_id, s.servicer_id, s.error_desc, s.load_date);

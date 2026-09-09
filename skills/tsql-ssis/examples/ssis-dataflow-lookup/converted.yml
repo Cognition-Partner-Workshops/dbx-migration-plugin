@@ -1,67 +1,54 @@
-# Job + pipeline wrapper for converted.sql (LoadPaymentFact.dtsx), under skills/tsql-ssis/SKILL.md §6
-# "SSIS Data Flow Task" and "SSIS event handlers" rows.
-# Shapes per databricks-pipelines references/1-project-initialization-with-dab.md (pipeline resource:
-# catalog/schema/serverless/continuous: false/libraries glob; job with pipeline_task referencing
-# ${resources.pipelines.<name>.id}; daily periodic trigger), references/pipeline-configuration.md
-# (`configuration` is deploy-time key-value), databricks-jobs references/task-types.md
-# ("Pipeline Task", "SQL Task": sql_task.file + warehouse_id), notifications-monitoring.md (on_failure),
-# https://docs.databricks.com/aws/en/jobs/conditional-tasks (run_if AT_LEAST_ONE_FAILED; Excluded when unmet),
-# /aws/en/jobs/pipeline "Parameters" (Beta: "You can access job or task parameters in your pipeline task using
-# dynamic value references. You can override parameters by adding Key-Value pairs in the Parameters of your
-# task configuration"; Jobs API jobs/create: pipeline_task.parameters, "Key/value-map of parameters passed to
-# the pipeline execution"), /aws/en/jobs/parameter-use ("When you are running SQL in a notebook or pipeline
-# task, you can use the named parameter syntax" :name; SQL tasks read key-value parameters as :name) and
-# /aws/en/jobs/dynamic-value-references ({{job.run_id}}, {{tasks.<task_name>.result_state}},
-# {{tasks.<task_name>.error_code}}: "The error code for task <task_name> if an error occurred running the
-# task ... For successful tasks, this evaluates to an empty string").
+# Job wrapper for converted.sql (LoadPaymentFact.dtsx), under skills/tsql-ssis/SKILL.md §6 "SSIS Data Flow
+# Task" (per-execution parameter -> bounded batch), "SSIS Variables" and "SSIS event handlers" rows.
+# Shapes per databricks-jobs SKILL.md "Multi-Task Workflows" (depends_on / run_if / job parameters),
+# references/task-types.md ("SQL Task": sql_task.file + source: WORKSPACE + warehouse_id),
+# references/notifications-monitoring.md (on_failure, max_retries, max_concurrent_runs),
+# https://docs.databricks.com/aws/en/jobs/sql ("The file can contain multiple SQL statements separated by
+# semicolons"; task Parameters as key-value pairs referenced in the SQL asset), /aws/en/jobs/parameter-use
+# ("SQL: You can use dynamic value references in your task configuration. Use named parameters to retrieve
+# parameter values"), /aws/en/jobs/dynamic-value-references ({{job.parameters.<name>}}, {{job.run_id}},
+# {{job.start_time.<argument>}} usable as a job-parameter default, {{tasks.<task_name>.result_state}},
+# {{tasks.<task_name>.error_code}}: "For successful tasks, this evaluates to an empty string"),
+# /aws/en/jobs/conditional-tasks (run_if AT_LEAST_ONE_FAILED; Excluded when unmet).
+#
+# Execution model (converted.sql header): one job run == one package execution == one (LoadDate, ServicerId)
+# bounded batch, re-evaluating the whole window against that servicer's loans. Not a pipeline: a streaming
+# table's checkpoint is global, so a per-run filter parameter cannot re-evaluate rows a previous run consumed,
+# and a pipeline `configuration` key is frozen at deploy time. Both defects are the same bug from two sides:
+# the parameter must select the row set on every run, which only a bounded batch does.
 #
 # Mapping from source.dtsx:
-#   DFT Load fact_payment (Data Flow Task)          -> pipeline load_payment_fact (converted.sql), triggered
-#                                                      once a day like the SQL Agent schedule that ran the package.
+#   DFT Load fact_payment (Data Flow Task)          -> sql_task load_payment_fact (converted.sql: two idempotent
+#                                                      MERGE statements, fact + error output), one run a day like
+#                                                      the SQL Agent schedule that ran the package.
+#   User::LoadDate (bound to the two ? of the source  -> job parameter load_date. Default {{job.start_time.iso_date}}
+#     query)                                           stands in for what the Agent step set the variable to
+#                                                      (INFERRED: the census reads the step's /Set or the package
+#                                                      expression; the design value 2026-09-01 is not a default
+#                                                      anyone wants). Overridden per run to re-load a day.
 #   $Package::ServicerId (Required="True", value 7)  -> job parameter servicer_id (default "7", the package's
-#                                                      design value) -> pipeline_task.parameters.servicer_id
-#                                                      = {{job.parameters.servicer_id}} -> :servicer_id in
-#                                                      converted.sql. Required=True means the executor supplied
-#                                                      the value per execution (dtexec /Par, the SQL Agent step);
-#                                                      the Jobs equivalent is a per-run override of the job
-#                                                      parameter ("Run now with different parameters" / API
-#                                                      job_parameters), which the pipeline task forwards. A
-#                                                      pipeline `configuration` key cannot do this: it is fixed
-#                                                      at deploy time, so every run would load servicer 7.
-#   User::LoadDate                                  -> no equivalent needed: the streaming checkpoint is the
-#                                                      incremental bookmark (converted.sql header).
+#                                                      design value, what the Agent step passed). Required=True
+#                                                      means the executor supplied the value per execution
+#                                                      (dtexec /Par); the Jobs equivalent is a per-run override
+#                                                      ("Run now with different parameters" / API job_parameters).
+#                                                      Two servicers a day == two runs (or two run_job_task calls),
+#                                                      each re-reading the same window under its own value.
 #   OnError handler "SQL Log OnError" -> dw.etl_log -> sql_task log_onerror, run_if AT_LEAST_ONE_FAILED after
-#                                                      the pipeline task. Same table, same columns, same event
+#                                                      the load task. Same table, same columns, same event
 #                                                      literal 'OnError'; the customer's ops queries over
 #                                                      etl_log keep working. The on_failure notification is
 #                                                      an ADDITIONAL signal, not a replacement for the row.
 #   System::ErrorDescription (message column)       -> {{tasks.load_payment_fact.error_code}} plus the job run
-#                                                      id; the full error text lives in the pipeline event log,
+#                                                      id; the full error text lives in the query history,
 #                                                      which the run id keys into.
 #   Package name (package_name column)              -> the literal 'LoadPaymentFact' (System::PackageName).
+#   User::RowsRead                                  -> dropped (no consumer in the package).
 resources:
-  pipelines:
-    load_payment_fact:
-      name: load_payment_fact            # LoadPaymentFact.dtsx / DFT Load fact_payment
-      catalog: ${var.catalog}
-      schema: ${var.schema}              # dw schema of the loan_mart target catalog
-      serverless: true
-      continuous: false                  # one triggered update per day == one package execution
-      # No `configuration.servicer_id`: the value arrives per run from the job (pipeline_task.parameters
-      # below). Fallback where the pipeline-task Parameters Beta is not enabled in the workspace: one
-      # pipeline resource per servicer (load_payment_fact_s7, _s12, ...), each with
-      #   configuration: { servicer_id: "<n>" }
-      # and converted.sql reading ${servicer_id} instead of :servicer_id; the job then carries one
-      # pipeline_task per servicer. Never a single pipeline with the value fixed in `configuration`.
-      libraries:
-        - glob:
-            include: ../src/load_payment_fact/**    # converted.sql lives here
-
   jobs:
     load_payment_fact_job:
       name: load_payment_fact_job
       description: "Converted from LoadPaymentFact.dtsx (SQL Agent daily schedule)"
-      max_concurrent_runs: 1             # SSIS packages are not re-entrant
+      max_concurrent_runs: 1             # SSIS packages are not re-entrant; also keeps two runs off the same window
       trigger:
         periodic:
           interval: 1
@@ -70,8 +57,10 @@ resources:
         - name: catalog
           default: ${var.catalog}
         - name: schema
-          default: ${var.schema}
-        - name: servicer_id             # $Package::ServicerId; override per run exactly as dtexec /Par did
+          default: ${var.schema}         # dw schema of the loan_mart target catalog
+        - name: load_date                # User::LoadDate; the window [load_date, load_date + 1 day)
+          default: "{{job.start_time.iso_date}}"
+        - name: servicer_id              # $Package::ServicerId; override per run exactly as dtexec /Par did
           default: "7"                   #   (the package's ParameterValue). Scheduled runs use the default,
                                          #   which is what the SQL Agent step passed.
       email_notifications:
@@ -79,15 +68,21 @@ resources:
           - ${var.ops_email}
       tasks:
         - task_key: load_payment_fact
-          pipeline_task:
-            pipeline_id: ${resources.pipelines.load_payment_fact.id}
-            parameters:                  # Beta (docs /jobs/pipeline "Parameters"; Jobs API pipeline_task.parameters)
-              servicer_id: "{{job.parameters.servicer_id}}"   # read as :servicer_id in converted.sql
-            full_refresh: false          # a full refresh rebuilds fact_payment / err_payment_no_loan from all of
-                                         # payments; only used deliberately to re-load history, never on schedule
+          max_retries: 2                 # commit conflicts with an outside writer (converted.sql header): the
+          min_retry_interval_millis: 60000   # MERGEs are idempotent, so a retry re-evaluates the window safely
+          sql_task:
+            file:
+              path: ../sql/load_payment_fact.sql   # converted.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            parameters:                  # read as :catalog / :schema / :load_date / :servicer_id in converted.sql
+              catalog: "{{job.parameters.catalog}}"
+              schema: "{{job.parameters.schema}}"
+              load_date: "{{job.parameters.load_date}}"
+              servicer_id: "{{job.parameters.servicer_id}}"
 
         # OnError event handler: INSERT INTO dw.etl_log (package_name, event, message, logged_at)
-        # VALUES (?, 'OnError', ?, GETDATE()). Runs only when the pipeline task failed (Excluded on a clean
+        # VALUES (?, 'OnError', ?, GETDATE()). Runs only when the load task failed (Excluded on a clean
         # run: docs /jobs/conditional-tasks), so clean-run semantics are unchanged.
         # SSIS fires the handler once per error event (several rows per failed run are possible); the
         # conversion writes exactly one row per failed run (recorded delta, NOTE.md).
@@ -106,6 +101,8 @@ resources:
               source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
             parameters:
+              catalog: "{{job.parameters.catalog}}"
+              schema: "{{job.parameters.schema}}"
               run_id: "{{job.run_id}}"
               result_state: "{{tasks.load_payment_fact.result_state}}"
               error_code: "{{tasks.load_payment_fact.error_code}}"
