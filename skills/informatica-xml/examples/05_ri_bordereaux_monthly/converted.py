@@ -1,8 +1,9 @@
-# RI_CESSIONS / m_RI_BORDEREAUX_MONTHLY as a Lakeflow Spark Declarative Pipeline with Auto Loader ingestion
-# (databricks-pipelines references/auto-loader-python.md, expectations-python.md). The SFTP pull (bdx_transfer.ksh) is an
-# ingestion decision, not converted. Only EXP_REKEY_POLICY, EXP_AMT_CLEAN and LKP_SII_LOB are exported; the 14 per-broker
-# SOURCE definitions, the ceded-claims computation and the Lloyd's outward bordereau are INFERRED from the DESCRIPTION.
+# RI_CESSIONS / m_RI_BORDEREAUX_MONTHLY as a Lakeflow Spark Declarative Pipeline with Auto Loader ingestion (databricks-pipelines
+# references/auto-loader-python.md, expectations-python.md). The SFTP pull (bdx_transfer.ksh) is an ingestion decision, not converted.
+# Only EXP_REKEY_POLICY, EXP_AMT_CLEAN, LKP_SII_LOB are exported; the 14 per-broker SOURCEs, ceded claims, Lloyd's outward: INFERRED.
 # ruff: noqa: F821  (`spark` is pre-imported in pipeline files: databricks-pipelines references/python-basics.md)
+import functools
+
 from pyspark import pipelines as dp
 from pyspark.sql import Window
 from pyspark.sql import functions as F
@@ -11,25 +12,31 @@ LANDING = spark.conf.get("informatica.bdx_landing_path")  # was /interface/inbou
 SII_LOB_MAP = spark.conf.get("informatica.sii_lob_map_table")  # REF_DB.SII_LOB_MAP
 EXPECTED_BROKERS = spark.conf.get("informatica.expected_brokers_table")
 BDX_LAYOUTS = spark.conf.get("informatica.bdx_layout_table")  # the 14 per-broker SOURCE definitions as (BROKER_ID, STD_COL, SRC_COL) rows
+BROKERS = spark.conf.get("informatica.bdx_brokers").split(",")  # the same 14 SOURCE definitions' broker ids (BRK0001,...), fixed at deploy
 STD_COLS = ["CLAIM_REF", "POLICY_REF", "PRODUCT_CD", "AMT_TXT"]
 # CODEPAGE Latin1: the pound sign is one byte 0xA3 = CHR(163); read as UTF-8 it becomes 'Â£' and only '£' is stripped (trap 18)
 BROKER_ENCODING = spark.conf.get("informatica.bdx_encoding", "ISO-8859-1")
 
 
-@dp.table(name="bdx_claims_raw", comment="Broker claims bordereaux CSVs as landed, every broker's own columns as STRING")
-def bdx_claims_raw():
-    return (spark.readStream.format("cloudFiles")
-                 .option("cloudFiles.format", "csv").option("header", "true").option("encoding", BROKER_ENCODING)
-                 .option("cloudFiles.inferColumnTypes", "false")  # all-string; a new broker header adds columns, never shifts them
-                 .option("cloudFiles.schemaEvolutionMode", "addNewColumns").option("pathGlobFilter", "CLAIMS_BDX_BRK*_*.csv")
-                 .load(LANDING)
-                 .withColumn("BROKER_ID", F.regexp_extract(F.col("_metadata.file_path"), r"CLAIMS_BDX_(BRK\d{4})_", 1))
-                 .withColumn("FILE_MONTH", F.regexp_extract(F.col("_metadata.file_path"), r"CLAIMS_BDX_BRK\d{4}_(\d{6})", 1)))
+def broker_stream(broker):  # one stream per legacy SOURCE definition: a CSV schema is applied by position, so brokers with
+    # different header orders or broker-only columns never share one evolving schema; each table's columns are its own header
+    @dp.table(name=f"bdx_claims_raw_{broker}", comment=f"{broker} claims bordereaux CSVs as landed, own header, all STRING")
+    def raw_table():
+        return (spark.readStream.format("cloudFiles")
+                     .option("cloudFiles.format", "csv").option("header", "true").option("encoding", BROKER_ENCODING)
+                     .option("cloudFiles.inferColumnTypes", "false").option("pathGlobFilter", f"CLAIMS_BDX_{broker}_*.csv")
+                     .load(LANDING).withColumn("BROKER_ID", F.lit(broker))
+                     .withColumn("FILE_MONTH", F.regexp_extract(F.col("_metadata.file_path"), r"CLAIMS_BDX_BRK\d{4}_(\d{6})", 1)))
+
+
+for b in BROKERS:
+    broker_stream(b)
 
 
 @dp.temporary_view()
 def bdx_claims_mapped():  # each broker's own header renamed to the common shape by BROKER_ID; a column its layout lacks is NULL
-    raw = spark.read.table("bdx_claims_raw")
+    raw = functools.reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True),
+                           [spark.read.table(f"bdx_claims_raw_{b}") for b in BROKERS])
     cells = [c for c in raw.columns if c not in ("BROKER_ID", "FILE_MONTH")]  # schema only: no Spark action at planning time
     out = raw.withColumn("cells", F.map_from_arrays(F.array(*[F.lit(c) for c in cells]), F.array(*[F.col(c) for c in cells])))
     layouts = spark.read.table(BDX_LAYOUTS)  # one row per (BROKER_ID, STD_COL): the join must not multiply raw rows
@@ -40,14 +47,11 @@ def bdx_claims_mapped():  # each broker's own header renamed to the common shape
 
 
 @dp.temporary_view()
-def bdx_claims_expected():
-    # An unknown broker's file could not load in legacy (no SOURCE for it); the expected-broker table (effective month
-    # range) replaces that gate. left_semi / left_anti keep the raw row count intact.
+def bdx_claims_expected():  # a broker outside its effective month range is undeclared this month (legacy: no SOURCE, no load);
+    # an id absent from BROKERS is never read at all, as in legacy. left_semi / left_anti keep the raw row count intact.
     rows = spark.read.table("bdx_claims_mapped")
-    allowed = (spark.read.table(EXPECTED_BROKERS)
-                    .select(F.col("BROKER_ID").alias("exp_BROKER_ID"), "effective_from_month",
-                            F.coalesce(F.col("effective_to_month"), F.lit("999912")).alias("effective_to_month"))
-                    .dropDuplicates())
+    allowed = spark.read.table(EXPECTED_BROKERS).select(F.col("BROKER_ID").alias("exp_BROKER_ID"), "effective_from_month",
+                                                        F.coalesce(F.col("effective_to_month"), F.lit("999912")).alias("effective_to_month")).dropDuplicates()
     match = ((rows.BROKER_ID == allowed.exp_BROKER_ID) & (rows.FILE_MONTH >= allowed.effective_from_month)
              & (rows.FILE_MONTH <= allowed.effective_to_month))
     return (rows.join(allowed, match, "left_semi").withColumn("broker_expected", F.lit(True))
@@ -60,11 +64,10 @@ def ri_claims_bdx_unexpected_broker():
 
 
 @dp.temporary_view()
-def lkp_sii_lob():
-    # LKP_SII_LOB (reusable, cached; key PRODUCT_CD INFERRED) reads the same drifted table (PET -> 'Other motor', trap 10).
-    # A Lookup returns one row per input whatever the cache holds, so one row per PRODUCT_CD is enforced (tie-break INFERRED).
-    w = Window.partitionBy("PRODUCT_CD").orderBy(F.col("SII_LOB").asc_nulls_last())
-    return spark.read.table(SII_LOB_MAP).select("PRODUCT_CD", "SII_LOB").withColumn("rn", F.row_number().over(w)).filter("rn = 1").drop("rn")
+def lkp_sii_lob():  # LKP_SII_LOB (reusable, cached; key PRODUCT_CD INFERRED) reads the same drifted table (PET -> 'Other motor',
+    # trap 10). A Lookup returns one row per input whatever the cache holds: one row per PRODUCT_CD enforced (tie-break INFERRED)
+    rn = F.row_number().over(Window.partitionBy("PRODUCT_CD").orderBy(F.col("SII_LOB").asc_nulls_last()))
+    return spark.read.table(SII_LOB_MAP).select("PRODUCT_CD", "SII_LOB").withColumn("rn", rn).filter("rn = 1").drop("rn")
 
 
 @dp.materialized_view(name="ri_claims_bdx_std", comment="m_RI_BORDEREAUX_MONTHLY converted; grain = BROKER_ID, CLAIM_REF")
@@ -79,8 +82,7 @@ def ri_claims_bdx_std():
     # EXP_AMT_CLEAN: TO_DECIMAL(REPLACECHR(0, REPLACECHR(0, x, CHR(163), ''), ',', '')): bad text is 0 in Informatica, NULL from try_cast
     stripped = F.translate(F.col("AMT_TXT"), "\u00a3,", "")
     parsed = F.expr("try_cast(translate(AMT_TXT, '\u00a3,', '') AS DECIMAL(12,2))")
-    # Expressions are row-preserving: derive on the same raw row, never re-join on (BROKER_ID, CLAIM_REF), which files repeat
-    rows = (raw.withColumn("POLICY_NO", policy_no)
+    rows = (raw.withColumn("POLICY_NO", policy_no)  # row-preserving Expressions: derive on the same raw row, never re-join on the grain
                .withColumn("AMT", F.coalesce(parsed, F.lit(0).cast("decimal(12,2)")))
                .withColumn("amt_unparsable", F.col("AMT_TXT").isNotNull() & (F.trim(stripped) != "") & parsed.isNull()))
     return (rows.join(spark.read.table("lkp_sii_lob"), "PRODUCT_CD", "left")  # connected Lookup: unmatched -> NULL, row kept
