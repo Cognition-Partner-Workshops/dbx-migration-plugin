@@ -82,7 +82,8 @@ def test_a_delete_after_the_applied_position_inside_the_lag_is_in_flight_not_a_d
     assert pk["stats"]["loans"]["delete_evidence"]["applied_position"] == 10
     assert _tier(result, "cdc_lag_ordering")["stats"]["loans"]["in_flight_deletes"] == 1
     assert _tier(result, "keyed_diffs")["stats"]["loans"]["in_flight_deletes"] == 1
-    assert source.last_deletes_since == {"capture": "raw_loans", "key_cols": ["loan_id"], "after": 10, "upto": 15}
+    assert source.last_deletes_since == {"capture": "raw_loans", "key_cols": ["loan_id"], "after": 10, "upto": 15,
+                                         "where": None}
     # the evidence costs one target and two source statements per object and is its own line
     assert result["cost"]["delete_evidence_statements"] == {"source": 2, "target": 1}
     assert source.calls["deletes_since"] == 1 and source.calls["evidence_horizon"] == 1
@@ -255,6 +256,54 @@ def test_sides_without_the_evidence_protocols_keep_the_drain_before_run_contract
     assert pk["stats"]["loans"]["delete_evidence"]["status"] == "unsupported"
     assert _codes(result, "cdc_lag_ordering") == ["delete_evidence_unusable"]
     assert target.calls["applied_position"] == 0
+
+
+def _scoped_spec():
+    """The loans object reconciled for borrower 1 only, on both sides."""
+    spec = _spec_with_evidence()
+    loans = dataclasses.replace(spec.objects[0], root_where="borrower_id = 1", target_where="borrower_id = 1")
+    return dataclasses.replace(spec, objects=[loans, spec.objects[1]])
+
+
+def test_a_scoped_run_reads_tombstones_under_the_same_scope_predicate():
+    # loans 3, 6, 9, 12 belong to borrower 1; loan 3 was deleted inside the scope
+    loans, borrowers = _rows(12)
+    src, tgt = _deleted(loans, 3)
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 15, 5.0)]}, applied=10)
+    source.images = {"raw_loans": {(3,): {"loan_id": 3, "borrower_id": 1}}}
+    result = _run(source, target, spec=_scoped_spec(), tol=TOL)
+    assert result["verdict"] == "PASS", json.dumps(result["tiers"], default=str, indent=1)
+    assert _tier(result, "pk_set_diff")["stats"]["loans"]["in_flight_deletes"] == 1
+    assert source.last_deletes_since == {"capture": "raw_loans", "key_cols": ["loan_id"], "after": 10,
+                                         "upto": 15, "where": "borrower_id = 1"}
+
+
+def test_a_delete_outside_the_scope_never_vouches_for_a_stray_row_inside_it():
+    # borrower 2 deleted loan 7; the target holds a stray loan 7 filed under borrower 1. The
+    # tombstone's before-image is borrower 2's, so it is not evidence for the scoped run.
+    loans, borrowers = _rows(12)
+    src = [r for r in loans if r["loan_id"] != 7]
+    tgt = [dict(r, borrower_id=1) if r["loan_id"] == 7 else dict(r) for r in loans]
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(7, 15, 5.0)]}, applied=10)
+    source.images = {"raw_loans": {(7,): {"loan_id": 7, "borrower_id": 2}}}
+    result = _run(source, target, spec=_scoped_spec(), tol=TOL)
+    assert result["verdict"] == "FAIL"
+    pk = _tier(result, "pk_set_diff")
+    assert [f["check"] for f in pk["findings"]] == ["pk_extra_on_target"]
+    assert "(7,)" in pk["findings"][0]["detail"]
+    assert pk["stats"]["loans"]["in_flight_deletes"] == 0
+    assert pk["stats"]["loans"]["delete_evidence"]["events"] == 0
+    assert _codes(result, "counts_through_mapping") == ["root_count"]
+
+
+def test_a_tombstone_whose_image_cannot_answer_the_scope_is_not_evidence():
+    # a capture that did not keep the scope column: the fake's default image is the key alone
+    loans, borrowers = _rows(12)
+    src, tgt = _deleted(loans, 3)
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 15, 5.0)]}, applied=10)
+    result = _run(source, target, spec=_scoped_spec(), tol=TOL)
+    assert result["verdict"] == "FAIL"
+    assert [f["check"] for f in _tier(result, "pk_set_diff")["findings"]] == ["pk_extra_on_target"]
 
 
 def test_an_undeclared_object_reports_no_evidence_and_no_tier6_check():

@@ -146,7 +146,9 @@ def resolve_delete_evidence(c: ObjectMapping, tol: Tolerances, source, target) -
     the capture's retained horizon, then the deletes after that position (three statements).
     Only a key deleted after the applied position and no longer ago than cdc_lag_max_s becomes
     an in-flight delete; the latest position per key wins when a key was deleted more than
-    once. Anything the evidence cannot vouch for leaves the strict behaviour in force."""
+    once. The deletes are read under the object's own scope (root_where, on the deleted row's
+    before-image) so a delete outside the scope never vouches for a target-only key inside it.
+    Anything the evidence cannot vouch for leaves the strict behaviour in force."""
     de = c.delete_evidence
     if de is None:
         return DeleteEvidenceResult("absent", detail="no delete_evidence declared for this object")
@@ -183,7 +185,7 @@ def resolve_delete_evidence(c: ObjectMapping, tol: Tolerances, source, target) -
         result.detail = "target has applied every retained change"
         return result
     latest: dict[tuple, DeleteEvent] = {}
-    for ev in source.deletes_since(de.capture, c.key_source, applied, hi):
+    for ev in source.deletes_since(de.capture, c.key_source, applied, hi, c.root_where):
         pos = _as_position(ev.position)
         if not _compatible(pos, applied):
             result.status = "incompatible"

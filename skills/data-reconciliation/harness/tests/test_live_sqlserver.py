@@ -183,6 +183,12 @@ def test_cdc_delete_evidence_reads_tombstones_after_a_position(schema, monkeypat
         assert [(e.key, e.position) for e in later] == [((3,), by_key[(3,)])]
         if by_key[(3,)] < hi:  # only when the database logged something after the last delete
             assert source.deletes_since(capture, ["Id"], by_key[(3,)], hi) == []
+        # the scope predicate is evaluated on the deleted row's before-image (Seq is the row's
+        # value at delete time), and a scope the capture cannot answer errors instead of widening
+        assert sorted(e.key for e in source.deletes_since(capture, ["Id"], lo, hi, "Seq >= 2")) == [(2,), (3,)]
+        assert source.deletes_since(capture, ["Id"], lo, hi, "Seq > 3") == []
+        with pytest.raises(pyodbc.Error, match="Invalid column name 'NotCaptured'"):
+            source.deletes_since(capture, ["Id"], lo, hi, "NotCaptured = 1")
     finally:
         source.close_window()  # release the read transaction: disabling the capture drops its table
         cur.execute("EXEC sys.sp_cdc_disable_table @source_schema = ?, @source_name = 'T', "

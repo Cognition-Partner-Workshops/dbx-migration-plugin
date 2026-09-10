@@ -272,8 +272,15 @@ def check_drivers() -> Check:
 
 _CDC_QUERIES = {
     "is_cdc_enabled": "SELECT is_cdc_enabled FROM sys.databases WHERE database_id = DB_ID()",
-    "can_read_cdc": "SELECT HAS_PERMS_BY_NAME('cdc', 'SCHEMA', 'SELECT')",
-    "captures": "SELECT capture_instance FROM cdc.change_tables",
+    # Lists the capture instances *this identity may read* (db_owner, the capture's gating role,
+    # or SELECT on its captured columns), with role_name and captured_column_list; needs no SELECT
+    # on the cdc schema, unlike cdc.change_tables / cdc.captured_columns.
+    "captures": "EXEC sys.sp_cdc_help_change_data_capture",
+    "max_lsn": "SELECT sys.fn_cdc_get_max_lsn()",
+    # Bounded, read-only call of the generated function exactly as the harness will make it: the
+    # mapped key columns and the object's scope predicate over the single-position [max, max] range.
+    "probe": "SELECT TOP (1) {cols} FROM cdc.fn_cdc_get_all_changes_{capture}(?, ?, N'all') "
+             "WHERE __$operation = 1{scope}",
 }
 
 
@@ -282,13 +289,24 @@ def _pyodbc_connect(dsn: str):
     return pyodbc.connect(dsn, readonly=True, timeout=15)
 
 
+def _captured_columns(column_list: str) -> list[str]:
+    """`[loan_id], [borrower_id]` as sp_cdc_help_change_data_capture reports it -> names."""
+    return [c.strip().strip("[]") for c in str(column_list or "").split(",") if c.strip()]
+
+
 def check_delete_evidence(mapping: Path | None, source_secret: str | None, plugin_root: Path,
                           connect=_pyodbc_connect) -> Check:
     """Every `delete_evidence` block a mapping declares must be answerable on the source before a
-    transactional recon run: CDC on for the database, the migration identity able to SELECT from the
-    cdc schema, each declared capture instance present. Three metadata SELECTs, nothing else: CDC
-    is a source-side change the factory never makes (the doctor never runs sp_cdc_enable_*), so a
-    red row here is a customer decision to record, not a fix to apply."""
+    transactional recon run, under the exact access model the harness uses: CDC on for the
+    database; each declared capture instance visible to the migration identity through
+    sp_cdc_help_change_data_capture (db_owner, gating role, or SELECT on the captured columns: no
+    schema-wide SELECT on cdc is asked for); every mapped source key column among the capture's
+    captured columns; and one bounded call of the generated cdc.fn_cdc_get_all_changes_<capture>
+    over the single-position [max, max] range with the key columns and the object's root_where, so an
+    identity that cannot execute the function or a scope the capture cannot evaluate fails here
+    rather than mid-run. Metadata reads only: CDC is a source-side change the factory never makes
+    (the doctor never runs sp_cdc_enable_*), so a red row here is a customer decision to record,
+    not a fix to apply."""
     if mapping is None:
         return Check("delete_evidence", "skipped", "no --mapping given; declared delete evidence not verified")
     sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
@@ -310,33 +328,63 @@ def check_delete_evidence(mapping: Path | None, source_secret: str | None, plugi
     dsn = os.environ.get(source_secret)
     if not dsn:
         return Check("delete_evidence", "fail", f"source secret {source_secret} is not set in the environment")
-    wanted = sorted({de.capture for _, de in declared})
+    # capture -> [(key columns, scope)] as the harness will read it; the mapping validated the identifiers
+    reads: dict[str, list[tuple[list[str], str | None]]] = {}
+    for c in spec.objects:
+        if c.delete_evidence is not None:
+            reads.setdefault(c.delete_evidence.capture, []).append((list(c.key_source), c.root_where))
+    wanted = sorted(reads)
+    data: dict = {"kind": "sqlserver_cdc", "captures": wanted, "missing": [], "missing_columns": {}, "unreadable": {}}
+    fail = "delete_evidence", "fail"
     try:
         conn = connect(dsn)
         try:
             cur = conn.cursor()
             (enabled,) = cur.execute(_CDC_QUERIES["is_cdc_enabled"]).fetchall()[0]
-            (can_read,) = cur.execute(_CDC_QUERIES["can_read_cdc"]).fetchall()[0]
-            present = sorted({str(r[0]) for r in cur.execute(_CDC_QUERIES["captures"]).fetchall()}) \
-                if enabled and can_read else []
+            if not enabled:
+                return Check(*fail, "CDC is not enabled on the source database; enabling it is a source-side "
+                             "change (the factory never runs sp_cdc_enable_*): record the customer decision or "
+                             "drop delete_evidence and drain deletes before each run", data)
+            cur.execute(_CDC_QUERIES["captures"])
+            names = [d[0].lower() for d in cur.description]
+            cap_i, cols_i = names.index("capture_instance"), names.index("captured_column_list")
+            visible = {str(r[cap_i]): _captured_columns(r[cols_i]) for r in cur.fetchall()}
+            data["missing"] = [c for c in wanted if c not in visible]
+            if data["missing"]:
+                return Check(*fail, f"declared capture instance(s) not present or not readable by this identity "
+                             f"(db_owner, the capture's gating role, or SELECT on its captured columns): "
+                             f"{data['missing']}", data)
+            for cap in wanted:
+                keys = dict.fromkeys(k for key_cols, _ in reads[cap] for k in key_cols)
+                if absent := [k for k in keys if k not in visible[cap]]:
+                    data["missing_columns"][cap] = absent
+            if data["missing_columns"]:
+                return Check(*fail, "mapped source key column(s) are not captured, so deletes_since cannot "
+                             f"project the key: {data['missing_columns']}", data)
+            (hi,) = cur.execute(_CDC_QUERIES["max_lsn"]).fetchall()[0]
+            if hi is None:
+                return Check(*fail, "no change has been captured yet (fn_cdc_get_max_lsn is NULL): the evidence "
+                             "horizon is empty and every target-only key would be graded strictly", data)
+            for cap in wanted:
+                for key_cols, scope in reads[cap]:
+                    sql = _CDC_QUERIES["probe"].format(cols=", ".join(key_cols), capture=cap,
+                                                       scope=f" AND ({scope})" if scope else "")
+                    try:
+                        cur.execute(sql, (hi, hi)).fetchall()
+                    except Exception as e:  # noqa: BLE001 - the engine's refusal is the finding
+                        data["unreadable"][cap] = _redact(str(e))
+                        break
+            if data["unreadable"]:
+                return Check(*fail, "declared capture(s) cannot be read as the harness reads them (EXECUTE on "
+                             "cdc.fn_cdc_get_all_changes_<capture> with the key columns and root_where): "
+                             f"{data['unreadable']}", data)
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
-        return Check("delete_evidence", "fail", f"source query failed: {_redact(str(e))}")
-    missing = [c for c in wanted if c not in present]
-    data = {"kind": "sqlserver_cdc", "captures": wanted, "missing": missing}
-    if not enabled:
-        return Check("delete_evidence", "fail",
-                     "CDC is not enabled on the source database; enabling it is a source-side change "
-                     "(the factory never runs sp_cdc_enable_*): record the customer decision or drop "
-                     "delete_evidence and drain deletes before each run", data)
-    if not can_read:
-        return Check("delete_evidence", "fail",
-                     "migration identity cannot read the cdc schema (SELECT on schema cdc required)", data)
-    if missing:
-        return Check("delete_evidence", "fail",
-                     f"declared capture instance(s) missing on the source: {missing}", data)
-    return Check("delete_evidence", "ok", f"sqlserver_cdc: {len(wanted)} capture instance(s) present, cdc readable", data)
+        return Check(*fail, f"source query failed: {_redact(str(e))}", data)
+    return Check("delete_evidence", "ok",
+                 f"sqlserver_cdc: {len(wanted)} capture instance(s) readable by this identity, key columns "
+                 "captured, scoped read probed", data)
 
 
 # ------------------------------------------------------------------ databricks identity

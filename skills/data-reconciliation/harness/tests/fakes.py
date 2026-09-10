@@ -359,14 +359,17 @@ class FakeSource(_TransactionalMixin):
 class FakeCdcSource(FakeSource):
     """A source with a change stream (the `DeleteEvidence` protocol): `tombstones` maps a
     capture name to the DeleteEvents it retains; the horizon is (oldest, newest) retained
-    position unless `horizons` pins it (a capture whose entry is (None, None) retains nothing)."""
+    position unless `horizons` pins it (a capture whose entry is (None, None) retains nothing).
+    `images` maps capture -> {key: before-image row} for evaluating a scope predicate; a tombstone
+    without one carries only its key columns, as a capture that kept nothing else would."""
 
     kind = "sqlserver_cdc"
 
-    def __init__(self, tables, tombstones: dict[str, list[DeleteEvent]], horizons=None, **kw):
+    def __init__(self, tables, tombstones: dict[str, list[DeleteEvent]], horizons=None, images=None, **kw):
         super().__init__(tables, **kw)
         self.tombstones = tombstones
         self.horizons = horizons or {}
+        self.images = images or {}
 
     def delete_evidence_kind(self) -> str:
         return self.kind
@@ -382,13 +385,16 @@ class FakeCdcSource(FakeSource):
         newest = max(positions)  # retention starts at the mechanism's zero unless pinned
         return (bytes(len(newest)) if isinstance(newest, bytes) else 0), newest
 
-    def deletes_since(self, capture, key_cols, after, upto):
+    def deletes_since(self, capture, key_cols, after, upto, where=None):
         self.calls["deletes_since"] += 1
         self.statements += 1
-        self.last_deletes_since = {"capture": capture, "key_cols": key_cols, "after": after, "upto": upto}
+        self.last_deletes_since = {"capture": capture, "key_cols": key_cols, "after": after, "upto": upto,
+                                   "where": where}
+        images = self.images.get(capture, {})
         # an event of another position type is returned as is: the engine, not the fake, rejects it
         out = [e for e in self.tombstones.get(capture, [])
-               if type(e.position) is not type(after) or after < e.position <= upto]
+               if (type(e.position) is not type(after) or after < e.position <= upto)
+               and _matches(images.get(e.key, dict(zip(key_cols, e.key, strict=True))), where)]
         self.rows_fetched += len(out)
         return out
 

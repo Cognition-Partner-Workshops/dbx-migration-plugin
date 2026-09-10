@@ -222,11 +222,14 @@ def test_redact_keeps_plain_error_text():
 
 # ------------------------------------------------------------------ delete evidence preflight
 
-def _mapping(tmp_path: Path, *, evidence=True) -> Path:
-    obj = {"object": "loans", "root_table": "raw.loans", "key": {"source": ["Id"], "target": "id"},
+def _mapping(tmp_path: Path, *, evidence=True, key=("Id",), root_where=None) -> Path:
+    obj = {"object": "loans", "root_table": "raw.loans",
+           "key": {"source": list(key), "target": [k.lower() for k in key]},
            "fields": [{"source": "Id", "target": "id"}],
            "delete_evidence": {"kind": "sqlserver_cdc", "capture": "raw_loans",
                                "applied_position": {"table": "cdc_checkpoint", "column": "lsn"}}}
+    if root_where:
+        obj["root_where"] = root_where
     if not evidence:
         del obj["delete_evidence"]
     p = tmp_path / "mapping.json"
@@ -234,28 +237,60 @@ def _mapping(tmp_path: Path, *, evidence=True) -> Path:
     return p
 
 
-class FakeCdcConn:
-    """Read-only SQL Server fixture: answers the doctor's three metadata queries and records
-    every statement so a test can prove nothing else (in particular no sp_cdc_enable_*) ran."""
+_HELP_COLUMNS = ("source_schema", "source_table", "capture_instance", "object_id", "source_object_id",
+                 "start_lsn", "end_lsn", "supports_net_changes", "has_drop_pending", "role_name", "index_name",
+                 "filegroup_name", "create_date", "index_column_list", "captured_column_list")
+LSN = bytes(9) + b"\x01"
 
-    def __init__(self, *, db_enabled=1, can_read=1, captures=("raw_loans",)):
-        self.db_enabled, self.can_read, self.captures = db_enabled, can_read, list(captures)
+
+class FakeCdcConn:
+    """A SQL Server seen by a *capture-level* reader: SELECT on the captured columns of the source
+    table (or the gating role), EXECUTE on the generated cdc.fn_cdc_get_all_changes_<capture>,
+    nothing on the cdc schema itself (no cdc.change_tables / cdc.captured_columns, HAS_PERMS_BY_NAME
+    on the schema is 0). `captures` maps each capture this identity may read to (role_name,
+    captured columns), the shape sys.sp_cdc_help_change_data_capture reports. Records every statement
+    so a test can prove nothing else (in particular no sp_cdc_enable_*) ran."""
+
+    def __init__(self, *, db_enabled=1, captures=None, max_lsn=LSN, fn_errors=None):
+        self.db_enabled = db_enabled
+        self.captures = {"raw_loans": (None, ["Id", "Amount"])} if captures is None else captures
+        self.max_lsn, self.fn_errors = max_lsn, fn_errors or {}
         self.statements: list[str] = []
+        self.probes: list[tuple[str, tuple]] = []
 
     def cursor(self):
         return self
 
     def execute(self, sql, *params):
         self.statements.append(sql)
-        if "is_cdc_enabled" in sql:
+        low = sql.lower()
+        if "is_cdc_enabled" in low:
             self._rows = [(self.db_enabled,)]
-        elif "HAS_PERMS_BY_NAME" in sql:
-            self._rows = [(self.can_read,)]
-        elif "cdc.change_tables" in sql:
-            self._rows = [(c,) for c in self.captures]
+        elif "has_perms_by_name" in low:
+            self._rows = [(0,)]
+        elif "cdc.change_tables" in low or "cdc.captured_columns" in low:
+            raise RuntimeError("The SELECT permission was denied on the object 'change_tables'")
+        elif "sp_cdc_help_change_data_capture" in low:
+            self._rows = [("raw", cap.split("_", 1)[1], cap, 1, 2, LSN, None, 0, 0, role, "PK", None, None,
+                           "[Id]", ", ".join(f"[{c}]" for c in cols))
+                          for cap, (role, cols) in self.captures.items()]
+        elif "fn_cdc_get_max_lsn" in low:
+            self._rows = [(self.max_lsn,)]
+        elif "fn_cdc_get_all_changes_" in low:
+            capture = re.search(r"fn_cdc_get_all_changes_(\w+)", sql).group(1)
+            self.probes.append((sql, params))
+            if capture in self.fn_errors:
+                raise RuntimeError(self.fn_errors[capture])
+            if capture not in self.captures:
+                raise RuntimeError(f"Invalid object name 'cdc.fn_cdc_get_all_changes_{capture}'")
+            self._rows = []
         else:
             raise AssertionError(f"unexpected statement: {sql}")
         return self
+
+    @property
+    def description(self):
+        return [(c,) for c in _HELP_COLUMNS]
 
     def fetchall(self):
         return self._rows
@@ -279,29 +314,80 @@ def test_delete_evidence_declared_needs_a_named_source_secret(tmp_path, monkeypa
     assert c.status == "fail" and "LEGACY_ODBC" in c.detail and "not set" in c.detail
 
 
-def test_delete_evidence_ok_reads_only_metadata(tmp_path, monkeypatch):
+def _read_only(statements):
+    return all(s.lstrip().upper().startswith("SELECT") or "sp_cdc_help_change_data_capture" in s
+               for s in statements) and not any("sp_cdc_enable" in s.lower() or "sp_cdc_disable" in s.lower()
+                                                for s in statements)
+
+
+def test_delete_evidence_ok_for_a_capture_level_reader_without_schema_wide_select(tmp_path, monkeypatch):
+    # the identity cannot SELECT from the cdc schema (HAS_PERMS_BY_NAME = 0, cdc.change_tables
+    # denied) yet reads its capture through the gating role / captured-column grant: that is the
+    # access model the harness uses, so the doctor must pass it and must not ask for more
     monkeypatch.setenv("LEGACY_ODBC", "Driver=x;Server=y;PWD=never-printed")
     conn = FakeCdcConn()
     c = doctor.check_delete_evidence(_mapping(tmp_path), "LEGACY_ODBC", PLUGIN_ROOT, connect=lambda dsn: conn)
     assert c.status == "ok", c.detail
-    assert c.data == {"kind": "sqlserver_cdc", "captures": ["raw_loans"], "missing": []}
+    assert c.data == {"kind": "sqlserver_cdc", "captures": ["raw_loans"], "missing": [],
+                      "missing_columns": {}, "unreadable": {}}
     assert "never-printed" not in c.detail
-    assert all(s.lstrip().upper().startswith("SELECT") for s in conn.statements)
-    assert not any("sp_cdc" in s.lower() for s in conn.statements)
+    assert not any("has_perms_by_name" in s.lower() for s in conn.statements)
+    assert _read_only(conn.statements)
+    # one bounded probe per capture: the generated function, over the empty (max, max] range,
+    # selecting exactly the mapped key columns
+    assert len(conn.probes) == 1
+    sql, params = conn.probes[0]
+    assert "cdc.fn_cdc_get_all_changes_raw_loans(" in sql and "__$operation = 1" in sql
+    assert re.search(r"SELECT TOP \(\d+\) Id FROM", sql) and params == ((LSN, LSN),)
+
+
+def test_delete_evidence_probe_carries_the_scope_predicate(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    conn = FakeCdcConn()
+    c = doctor.check_delete_evidence(_mapping(tmp_path, root_where="Amount > 0"), "LEGACY_ODBC", PLUGIN_ROOT,
+                                     connect=lambda dsn: conn)
+    assert c.status == "ok", c.detail
+    assert "AND (Amount > 0)" in conn.probes[0][0]
+
+
+def test_delete_evidence_fails_when_a_capture_misses_a_mapped_key_column(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    conn = FakeCdcConn(captures={"raw_loans": (None, ["Amount"])})
+    c = doctor.check_delete_evidence(_mapping(tmp_path, key=("Id", "Amount")), "LEGACY_ODBC", PLUGIN_ROOT,
+                                     connect=lambda dsn: conn)
+    assert c.status == "fail"
+    assert "raw_loans" in c.detail and "['Id']" in c.detail and "captured" in c.detail
+    assert c.data["missing_columns"] == {"raw_loans": ["Id"]}
+    assert conn.probes == []  # nothing to read when the key cannot be projected
+    assert _read_only(conn.statements)
 
 
 @pytest.mark.parametrize("kw, needle", [
     ({"db_enabled": 0}, "CDC is not enabled"),
-    ({"can_read": 0}, "cannot read the cdc schema"),
-    ({"captures": ("raw_payments",)}, "raw_loans"),
+    ({"captures": {"raw_payments": (None, ["Id"])}}, "raw_loans"),
+    ({"fn_errors": {"raw_loans": "The EXECUTE permission was denied on the object 'fn_cdc_get_all_changes_raw_loans'"}},
+     "EXECUTE permission was denied"),
+    ({"fn_errors": {"raw_loans": "Invalid column name 'TenantId'"}}, "TenantId"),
+    ({"max_lsn": None}, "no change has been captured"),
 ])
 def test_delete_evidence_failures_name_the_source_side_gap(tmp_path, monkeypatch, kw, needle):
-    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x;PWD=never-printed")
     conn = FakeCdcConn(**kw)
     c = doctor.check_delete_evidence(_mapping(tmp_path), "LEGACY_ODBC", PLUGIN_ROOT, connect=lambda dsn: conn)
-    assert c.status == "fail" and needle in c.detail
+    assert c.status == "fail" and needle in c.detail and "never-printed" not in c.detail
     assert "sp_cdc_enable" not in c.detail.replace("never runs sp_cdc_enable", "")
-    assert not any("sp_cdc" in s.lower() for s in conn.statements)
+    assert _read_only(conn.statements)
+
+
+def test_delete_evidence_a_capture_not_visible_to_this_identity_is_named_as_unreadable(tmp_path, monkeypatch):
+    # sp_cdc_help_change_data_capture lists only the captures the caller may read, so an absent
+    # row is either no capture or no grant; both are the same customer-side finding
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    conn = FakeCdcConn(captures={})
+    c = doctor.check_delete_evidence(_mapping(tmp_path), "LEGACY_ODBC", PLUGIN_ROOT, connect=lambda dsn: conn)
+    assert c.status == "fail" and c.data["missing"] == ["raw_loans"]
+    assert "not present" in c.detail and "readable" in c.detail
+    assert conn.probes == []
 
 
 def test_delete_evidence_connection_error_is_redacted(tmp_path, monkeypatch):

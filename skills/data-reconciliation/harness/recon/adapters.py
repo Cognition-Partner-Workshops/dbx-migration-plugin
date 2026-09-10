@@ -252,11 +252,13 @@ class DeleteEvidence(Protocol):
     uses it to tell an in-flight delete (deleted on the source after the target's applied
     position, inside cdc_lag_max_s) from a stray target write. `evidence_horizon` is the
     (oldest retained, newest) position pair of one capture; `deletes_since` lists the deletes
-    whose position is after `after` and at or before `upto`. One statement each."""
+    whose position is after `after` and at or before `upto` and whose deleted row (the stream's
+    before-image) satisfies `where`, the object's source scope predicate: a delete outside the
+    scope is no evidence for a target-only key inside it. One statement each."""
     def delete_evidence_kind(self) -> str: ...
     def evidence_horizon(self, capture: str) -> tuple[Position | None, Position | None]: ...
     def deletes_since(self, capture: str, key_cols: list[str], after: Position,
-                      upto: Position) -> list[DeleteEvent]: ...
+                      upto: Position, where: str | None = None) -> list[DeleteEvent]: ...
 
 
 @runtime_checkable
@@ -1036,18 +1038,21 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
         return lo, hi
 
     def deletes_since(self, capture: str, key_cols: list[str], after: bytes,
-                      upto: bytes) -> list[DeleteEvent]:
+                      upto: bytes, where: str | None = None) -> list[DeleteEvent]:
         from .config import validate_identifier
         validate_identifier(capture)
         cols = ", ".join(validate_identifier(c) for c in key_cols)
         # from_lsn is inclusive, so step one past the applied position; the function rejects a
         # range that starts after it ends, which cannot happen because the caller only reads
         # when after < upto. Age is measured on the server's clock against the commit time the
-        # LSN maps to, so the two sides' clocks never meet.
+        # LSN maps to, so the two sides' clocks never meet. The scope predicate is evaluated on
+        # the deleted row's before-image, which the change table holds under the source column
+        # names; a scope column the capture did not keep is an engine error, never a wider read.
         rows = self._rows(
             f"SELECT __$start_lsn, DATEDIFF_BIG(MILLISECOND, sys.fn_cdc_map_lsn_to_time(__$start_lsn), "
             f"GETDATE()), {cols} FROM cdc.fn_cdc_get_all_changes_{capture}"
-            "(sys.fn_cdc_increment_lsn(?), ?, N'all') WHERE __$operation = 1",
+            "(sys.fn_cdc_increment_lsn(?), ?, N'all') WHERE __$operation = 1"
+            + (f" AND ({where})" if where else ""),
             (after, upto))
         self.rows_fetched += len(rows)
         return [DeleteEvent(tuple(r[2:]), bytes(r[0]), max(0.0, float(r[1]) / 1000.0)) for r in rows]
