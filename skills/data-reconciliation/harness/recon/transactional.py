@@ -115,15 +115,18 @@ class DeleteEvidenceResult:
     applied: Any = None
     horizon: tuple = (None, None)
     events: int = 0
-    in_flight: dict[tuple, DeleteEvent] = field(default_factory=dict)  # inside cdc_lag_max_s
-    aged: dict[tuple, DeleteEvent] = field(default_factory=dict)       # older than cdc_lag_max_s
+    # tombstoned keys the source snapshot no longer holds, split on cdc_lag_max_s
+    in_flight: dict[tuple, DeleteEvent] = field(default_factory=dict)
+    aged: dict[tuple, DeleteEvent] = field(default_factory=dict)
+    # tombstoned keys the source holds again (in scope): graded as ordinary rows
+    reinserted: dict[tuple, DeleteEvent] = field(default_factory=dict)
     detail: str = ""
 
     def as_stats(self) -> dict[str, Any]:
         return {"status": self.status, "kind": self.kind, "applied_position": _pos(self.applied),
                 "horizon": [_pos(self.horizon[0]), _pos(self.horizon[1])], "events": self.events,
                 "in_flight_deletes": len(self.in_flight), "aged_deletes": len(self.aged),
-                "detail": self.detail}
+                "reinserted": len(self.reinserted), "detail": self.detail}
 
 
 def _pos(p: Any) -> Any:
@@ -150,7 +153,10 @@ def resolve_delete_evidence(c: ObjectMapping, tol: Tolerances, source, target) -
     an in-flight delete; the latest position per key wins when a key was deleted more than
     once. The deletes are read under the object's own scope (root_where, on the deleted row's
     before-image) so a delete outside the scope never vouches for a target-only key inside it.
-    Anything the evidence cannot vouch for leaves the strict behaviour in force."""
+    A tombstone proves a delete happened, not that the key is still gone: the tombstoned keys
+    are then looked up in the source snapshot (one keyed read, in scope) and any key the source
+    holds again is `reinserted`, an ordinary row every tier grades on both sides. Anything the
+    evidence cannot vouch for leaves the strict behaviour in force."""
     de = c.delete_evidence
     if de is None:
         return DeleteEvidenceResult("absent", detail="no delete_evidence declared for this object")
@@ -206,9 +212,18 @@ def resolve_delete_evidence(c: ObjectMapping, tol: Tolerances, source, target) -
         key = tuple(ev.key)
         if key not in latest or pos > _as_position(latest[key].position):
             latest[key] = ev
+    present = set()
+    if latest:
+        present = {tuple(r[k] for k in c.key_source)
+                   for r in source.fetch_keyed(c.root_table, c.key_source, [], where=c.root_where,
+                                               keys=list(latest))}
     for key, ev in latest.items():
-        (result.in_flight if ev.age_s <= tol.cdc_lag_max_s else result.aged)[key] = ev
-    result.detail = f"{result.events} delete events after the applied position"
+        if key in present:
+            result.reinserted[key] = ev
+        else:
+            (result.in_flight if ev.age_s <= tol.cdc_lag_max_s else result.aged)[key] = ev
+    result.detail = (f"{result.events} delete events after the applied position"
+                     + (f", {len(result.reinserted)} keys since reinserted" if result.reinserted else ""))
     return result
 
 

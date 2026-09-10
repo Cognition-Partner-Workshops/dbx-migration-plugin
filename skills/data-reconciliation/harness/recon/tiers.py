@@ -270,27 +270,20 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                         "cannot exclude keys from its aggregates"))
                 continue
             # the exclusion is one statement on the target: its capacity is the smaller of the
-            # tier's own cap and what the adapter can bind for a key this wide. A key deleted
-            # and reinserted after the applied position is in both sets, so the cap is judged
-            # on their union; either set alone over the cap settles it without reading keys
+            # tier's own cap and what the adapter can bind for a key this wide. The in-flight
+            # source keys exist on the source and the in-flight deletes do not (a tombstoned key
+            # the source holds again is `reinserted`, an ordinary row), so the two sets are
+            # disjoint and their sum over the cap settles it without reading keys
             cap = min(IN_FLIGHT_EXCLUSION_CAP, target.exclusion_capacity(len(c.key_target)))
-            over = None
-            if max(in_flight, in_flight_deletes) > cap:
-                over = (f"{in_flight} source rows in flight and {in_flight_deletes} deletes in "
-                        f"flight")
-            else:
-                keys = list(dict.fromkeys((ctx.in_flight_keys(c, source) if in_flight else [])
-                                          + ctx.in_flight_delete_keys(c)))
-                if len(keys) > cap:
-                    over = (f"{len(keys)} distinct keys in flight ({in_flight} source rows, "
-                            f"{in_flight_deletes} deletes)")
-            if over is not None:
+            if in_flight + in_flight_deletes > cap:
                 checks += 1
                 findings.append(Finding(c.object, "aggregates_ungraded_in_flight",
-                                        f"{over} exceed the {cap}-key exclusion cap for a "
+                                        f"{in_flight} source rows in flight and {in_flight_deletes} "
+                                        f"deletes in flight exceed the {cap}-key exclusion cap for a "
                                         f"{len(c.key_target)}-column key; let the feed catch up "
                                         "before grading aggregates"))
                 continue
+            keys = (ctx.in_flight_keys(c, source) if in_flight else []) + ctx.in_flight_delete_keys(c)
             applied_subset[c.object] = {
                 "in_flight": in_flight,
                 **({"in_flight_deletes": in_flight_deletes} if in_flight_deletes else {}),

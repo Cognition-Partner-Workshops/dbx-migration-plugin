@@ -115,8 +115,12 @@ table whose newest position is taken; `bytea` for an LSN, an integer for a numer
 other type refused). Positions are opaque and only ordered within one mechanism: an integer against
 an LSN, or LSNs of different widths, is `delete_evidence_unusable`, never a guess. Three statements
 per object, all inside the window (applied position on the target, `fn_cdc_get_min_lsn`/`max_lsn`
-horizon and the delete rows after the applied position on the source), reported as the
-`delete_evidence` cost line; `cost.delete_evidence_statements` carries the actuals. A scoped object
+horizon and the delete rows after the applied position on the source), plus one keyed source read
+of the tombstoned keys when there are any, reported as the `delete_evidence` cost line;
+`cost.delete_evidence_statements` carries the actuals. A tombstone proves a delete happened, not
+that the key is still gone: a tombstoned key the source snapshot holds again is `reinserted` and
+graded as an ordinary row on both sides (tier 2 excludes only keys the source no longer has, so
+the two aggregates describe one applied set), never an in-flight delete. A scoped object
 (`root_where`) gets its scope applied to the deleted row's before-image, so a delete outside the
 scope never vouches for an in-scope target-only key; a capture that does not carry the scope
 columns errors rather than widening. The factory never enables CDC:

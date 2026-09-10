@@ -94,6 +94,7 @@ def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
             tgt["tier5"] += 1
             if c.delete_evidence is not None:
                 # applied position on the target; retained horizon + deletes since on the source
+                # (the keyed read of tombstoned keys happens only when there are any: estimated at zero)
                 src["delete_evidence"] += 2
                 tgt["delete_evidence"] += 1
             src["tier7"] += SCHEMA_FACT_STATEMENTS + (2 if c.identity_source else 0)

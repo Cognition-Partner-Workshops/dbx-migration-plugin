@@ -84,8 +84,9 @@ def test_a_delete_after_the_applied_position_inside_the_lag_is_in_flight_not_a_d
     assert _tier(result, "keyed_diffs")["stats"]["loans"]["in_flight_deletes"] == 1
     assert source.last_deletes_since == {"capture": "raw_loans", "key_cols": ["loan_id"], "after": 10, "upto": 15,
                                          "where": None}
-    # the evidence costs one target and two source statements per object and is its own line
-    assert result["cost"]["delete_evidence_statements"] == {"source": 2, "target": 1}
+    # the evidence costs one target and two source statements per object, plus one source read of
+    # the tombstoned keys once there are any, and is its own line
+    assert result["cost"]["delete_evidence_statements"] == {"source": 3, "target": 1}
     assert source.calls["deletes_since"] == 1 and source.calls["evidence_horizon"] == 1
     assert target.calls["applied_position"] == 1
 
@@ -378,15 +379,68 @@ def test_a_deleted_then_reinserted_source_key_is_never_a_target_only_candidate()
     assert result["verdict"] == "PASS", json.dumps(result["tiers"], default=str, indent=1)
     pk = _tier(result, "pk_set_diff")
     assert pk["stats"]["loans"]["in_flight_deletes"] == 0 and pk["stats"]["loans"]["in_flight_updates"] == 1
-    assert pk["stats"]["loans"]["delete_evidence"]["in_flight_deletes"] == 1
+    # the tombstone was read, but the key is on the source again: not a target-only candidate
+    assert pk["stats"]["loans"]["delete_evidence"]["in_flight_deletes"] == 0
+    assert pk["stats"]["loans"]["delete_evidence"]["reinserted"] == 1
     assert _tier(result, "counts_through_mapping")["stats"].get("count_gap_within_in_flight") is None
-    # the key is excluded from the target aggregates once, not twice
+    # the key is excluded from the target aggregates once (as an in-flight update), not twice
     assert target.last_excluded_keys == [(3,)]
+    assert _tier(result, "per_field_aggregates")["stats"]["applied_subset"]["loans"] == {
+        "in_flight": 1, "excluded_keys": 1}
+    # the reinsert check is one source read of the tombstoned keys, inside the window
+    assert result["cost"]["delete_evidence_statements"] == {"source": 3, "target": 1}
 
 
-def test_the_exclusion_cap_is_judged_on_the_deduplicated_key_set():
-    # loans 3 and 4 were deleted and reinserted after the applied position: each is both an
-    # in-flight update and an in-flight delete, yet the target statement binds 2 keys, not 4
+class _LoanReads(FakeCdcSource):
+    """Records every keyed read of dbo.loans: the tombstone lookup, then tier 3's sample."""
+
+    def fetch_keyed(self, table, key_cols, columns, where=None, keys=None):
+        if table == "dbo.loans" and keys is not None:
+            self.loan_reads.append([tuple(k) for k in keys])
+        yield from super().fetch_keyed(table, key_cols, columns, where, keys)
+
+
+def test_a_key_restored_with_its_old_watermark_is_graded_as_an_applied_row_on_both_sides():
+    # loan 7 was deleted after the applied position and restored as it was (same modified_date),
+    # so the target's copy is exactly what the source holds: an applied row, not in flight on
+    # either side. Excluding it from the target aggregates alone would compare unequal sets.
+    loans, borrowers = _rows(40)
+    tgt = [dict(r) for r in loans]
+    source, target = _sides(loans, tgt, borrowers, {"raw_loans": [_ev(7, 15, 5.0)]}, applied=10)
+    source.__class__ = _LoanReads
+    tol = Tolerances("t1", cdc_lag_max_s=60, sample_size=2)
+
+    def run():
+        source.loan_reads = []
+        result = _run(source, target, spec=_spec_with_evidence(), tol=tol, depth="sampled", seed=3)
+        lookup, sample = source.loan_reads
+        assert lookup == [(7,)] and source.last_fetch_keyed["where"] is None
+        assert (7,) not in sample, "pick a seed whose sample misses key 7"
+        return result
+
+    result = run()
+    assert result["verdict"] == "PASS", json.dumps(result["tiers"], default=str, indent=1)
+    agg = _tier(result, "per_field_aggregates")
+    assert agg["stats"].get("applied_subset", {}).get("loans") is None
+    assert target.calls["table_aggregates_excluding"] == 0
+    pk = _tier(result, "pk_set_diff")
+    assert pk["stats"]["loans"]["delete_evidence"]["in_flight_deletes"] == 0
+    assert pk["stats"]["loans"]["delete_evidence"]["reinserted"] == 1
+    assert _tier(result, "counts_through_mapping")["stats"].get("count_gap_within_in_flight") is None
+    # a field defect on that row is graded by tier 2 even though tier 3's sample never visits it
+    tgt[6]["current_balance"] = 999_999
+    result = run()
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    assert _codes(result, "keyed_diffs") == []
+    t2 = _tier(result, "per_field_aggregates")
+    assert {f["check"] for f in t2["findings"]} >= {"aggregate_sum", "aggregate_max"}
+    assert all(f["object"] == "loans" and "current_balance" in f["detail"] for f in t2["findings"])
+    assert target.calls["table_aggregates_excluding"] == 0
+
+
+def test_the_exclusion_cap_is_judged_on_the_disjoint_in_flight_and_deleted_key_sets():
+    # loans 3 and 4 were deleted and reinserted after the applied position: each is an in-flight
+    # update and a reinserted tombstone, so the target statement binds 2 keys, not 4
     loans, borrowers = _rows(12)
     tgt = [dict(r) for r in loans]
     loans[2]["modified_date"] = loans[3]["modified_date"] = _ts(30)
@@ -396,15 +450,17 @@ def test_the_exclusion_cap_is_judged_on_the_deduplicated_key_set():
     result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
     assert result["verdict"] == "PASS", json.dumps(result["tiers"], default=str, indent=1)
     agg = _tier(result, "per_field_aggregates")
-    assert agg["stats"]["applied_subset"]["loans"] == {"in_flight": 2, "in_flight_deletes": 2, "excluded_keys": 2}
+    assert agg["stats"]["applied_subset"]["loans"] == {"in_flight": 2, "excluded_keys": 2}
     assert target.last_excluded_keys == [(3,), (4,)]
-    # neither set alone exceeds the budget (3 updates, 3 deletes) but their union of 4 keys does
+    # neither set alone exceeds the budget (3 updates, 1 delete) but together the 4 keys do,
+    # and that is settled from the counts without reading the in-flight keys
     loans[4]["modified_date"] = _ts(30)
     source.tombstones["raw_loans"].append(_ev(6, 15, 5.0))
     source.tables["dbo.loans"] = [r for r in loans if r["loan_id"] != 6]
     result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
     assert _codes(result, "per_field_aggregates") == ["aggregates_ungraded_in_flight"]
-    assert "4 distinct keys" in _tier(result, "per_field_aggregates")["findings"][0]["detail"]
+    detail = _tier(result, "per_field_aggregates")["findings"][0]["detail"]
+    assert "3 source rows in flight and 1 deletes in flight exceed the 3-key" in detail
 
 
 def test_a_source_emptied_by_deletes_in_flight_is_not_a_stray_target():

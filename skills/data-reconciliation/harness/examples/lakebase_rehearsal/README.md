@@ -71,7 +71,9 @@ Rehearsals A-D ran before the mapping declared `delete_evidence`, so every `pk_e
 above was graded strictly. With evidence on (SQL Server CDC enabled by hand on the disposable
 fixture, `cdc_checkpoint` written by the loader) rehearsal A's stray `escrow_accounts` row still
 fails `pk_extra_on_target`, now worded "not deleted on the source after the target's applied
-position", and `delete_evidence_statements = {source: 5, target: 5}` on the clean run.
+position", and `delete_evidence_statements = {source: 10, target: 5}` on the clean run (one
+more source statement per object that has tombstones after the applied LSN: the keyed read that
+checks whether the source still holds them).
 
 Rehearsal E (`inject_source_deletes.sql` on the fixture SQL Server, run inside `cdc_lag_max_s`):
 `PASS`, merge-eligible. Tier 5 `loan_modifications` reads 3 delete events after the applied LSN,
@@ -80,7 +82,10 @@ allowance; tier 6 records `target_max_from_in_flight_delete: true` because the d
 carried the target's max `created_date` (4 ms newer than the surviving source max), so no
 `target_ahead_of_source`. `delete_evidence_statements = {source: 10, target: 5}`. The same state
 after 60 s: `FAIL` with `delete_lag_exceeded` ("3 source deletes still present on the target 141s
-after commit"), `pk_extra_on_target` for the same keys and `root_count`.
+after commit"), `pk_extra_on_target` for the same keys and `root_count`. After `restore_source_deletes.sql`, still
+inside `cdc_lag_max_s`: `PASS` with `reinserted: 3`, `in_flight_deletes: 0` and no tier 2
+exclusion (`applied_subset` absent) — the 3 tombstoned keys the source holds again are graded as
+ordinary rows on both sides.
 
 Rehearsal F (`inject_target_checkpoint_gap.sql`): `FAIL` with `delete_evidence_retention_gap`
 (applied LSN `...0001` older than the oldest retained change), strict `pk_extra_on_target` and
