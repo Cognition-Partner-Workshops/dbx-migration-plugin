@@ -9,7 +9,7 @@ environment variables that are set.
 Usage:
     python3 doctor.py [--workspace DIR] [--plugin-root DIR] [--role orchestrator|child]
                       [--hook-probe-result blocked|not-blocked|unknown] [--expect-identity NAME]
-                      [--no-databricks] [--mapping mapping.json --source-secret NAME] [--out PATH]
+                      [--no-databricks] [--mapping mapping_spec.json ... --source-secret NAME] [--out PATH]
 
 Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and every security
 control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`;
@@ -294,7 +294,39 @@ def _captured_columns(column_list: str) -> list[str]:
     return [c.strip().strip("[]") for c in str(column_list or "").split(",") if c.strip()]
 
 
-def check_delete_evidence(mapping: Path | None, source_secret: str | None, plugin_root: Path,
+UNIT_MAPPINGS = ".migration/units/*/mapping_spec.json"
+
+
+def check_delete_evidence_all(ws: Path, role: str, mappings: list[Path], source_secret: str | None,
+                              plugin_root: Path, connect=_pyodbc_connect,
+                              params: dict[str, str] | None = None) -> Check:
+    """One row over every unit mapping the run names. Omitting them is a blocking fail wherever a
+    unit mapping exists to be verified (a child always owns mapped units; the plan re-run before a
+    wave has them under .migration/units): a mapping declaring CDC evidence must fail here, not in
+    the recon run. Setup is the one not-applicable case, and only while no unit mapping exists yet."""
+    if not mappings:
+        existing = sorted(str(p.relative_to(ws)) for p in ws.glob(UNIT_MAPPINGS))
+        how = ("pass --mapping <unit mapping_spec.json> (repeatable, one per unit) --source-secret NAME "
+               "[--param ...] with the values the recon run will get")
+        if role == "child":
+            return Check("delete_evidence", "fail", f"a child preflight verifies every unit mapping in its batch; {how}",
+                         {"unit_mappings": existing})
+        if existing:
+            return Check("delete_evidence", "fail",
+                         f"{len(existing)} unit mapping(s) exist ({', '.join(existing[:3])}"
+                         f"{', ...' if len(existing) > 3 else ''}) but none was given; {how}",
+                         {"unit_mappings": existing})
+        return Check("delete_evidence", "skipped",
+                     f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}",
+                     {"unit_mappings": []})
+    rows = {str(m): check_delete_evidence(m, source_secret, plugin_root, connect=connect, params=params)
+            for m in mappings}
+    worst = "fail" if any(c.status == "fail" for c in rows.values()) else "ok"
+    return Check("delete_evidence", worst, "; ".join(f"{m}: {c.detail}" for m, c in rows.items()),
+                 {"mappings": {m: {"status": c.status, "detail": c.detail, **(c.data or {})} for m, c in rows.items()}})
+
+
+def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root: Path,
                           connect=_pyodbc_connect, params: dict[str, str] | None = None) -> Check:
     """Every `delete_evidence` block a mapping declares must be answerable on the source before a
     transactional recon run, under the exact access model the harness uses: CDC on for the
@@ -309,8 +341,6 @@ def check_delete_evidence(mapping: Path | None, source_secret: str | None, plugi
     sent with the mapping's spelling, is the exact check. Metadata reads only: CDC is a source-side
     change the factory never makes (the doctor never runs sp_cdc_enable_*), so a red row here is a
     customer decision to record, not a fix to apply."""
-    if mapping is None:
-        return Check("delete_evidence", "skipped", "no --mapping given; declared delete evidence not verified")
     sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
     from recon.config import ConfigError, load_mapping_spec
     try:
@@ -462,14 +492,14 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
 # ------------------------------------------------------------------ main
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
-        no_databricks: bool, mapping: Path | None = None, source_secret: str | None = None,
+        no_databricks: bool, mappings: list[Path] | None = None, source_secret: str | None = None,
         params: dict[str, str] | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root)]
     checks += check_hooks(plugin_root, ws, probe_result)
     checks.append(check_official_plugin(plugin_root))
     checks.append(check_harness(plugin_root))
     checks.append(check_drivers())
-    checks.append(check_delete_evidence(mapping, source_secret, plugin_root, params=params))
+    checks.append(check_delete_evidence_all(ws, role, mappings or [], source_secret, plugin_root, params=params))
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -501,8 +531,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
     p.add_argument("--no-databricks", action="store_true",
                    help="skip CLI/identity checks (offline; the report is never ready)")
-    p.add_argument("--mapping", type=Path,
-                   help="recon mapping.json; objects declaring delete_evidence are verified on the source")
+    p.add_argument("--mapping", type=Path, action="append", default=[], metavar="MAPPING_SPEC",
+                   help="recon mapping_spec.json of a unit (repeat per unit); objects declaring delete_evidence "
+                        "are verified on the source. Required for --role child and once unit mappings exist")
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="mapping ${NAME} placeholder value, same rules and values as dbx-recon run --param")

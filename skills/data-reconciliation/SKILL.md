@@ -124,8 +124,9 @@ the two aggregates describe one applied set), never an in-flight delete. A scope
 (`root_where`) gets its scope applied to the deleted row's before-image, so a delete outside the
 scope never vouches for an in-scope target-only key; a capture that does not carry the scope
 columns errors rather than widening. The factory never enables CDC:
-`factory-doctor --mapping mapping.json --source-secret NAME [--param name=value ...]` (the same
-`--param` values the run will get) verifies the source has it on, every declared capture exists and
+`factory-doctor --mapping mapping_spec.json --source-secret NAME [--param name=value ...]` (one
+`--mapping` per unit, the same `--param` values the run will get; a child or a plan re-run that omits
+them gets a blocking `fail`, not a skip) verifies the source has it on, every declared capture exists and
 captures each mapped `key.source` column (identifiers compared case-insensitively, as the server
 resolves them), and the identity can call that capture's `fn_cdc_get_all_changes_<capture>` with
 the key columns and scope exactly as written (one bounded read-only probe per object; no `SELECT`

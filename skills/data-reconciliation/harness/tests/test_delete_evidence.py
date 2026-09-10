@@ -222,6 +222,45 @@ def test_an_applied_position_older_than_the_retained_horizon_is_a_retention_gap(
     assert source.calls["deletes_since"] == 0  # nothing to read: the gap is decided by the horizon
 
 
+def test_an_applied_position_right_before_the_retained_horizon_is_not_a_gap():
+    # the delete read starts at the position after the checkpoint; when that is the oldest
+    # retained change nothing between them can have been cleaned up, so the evidence is whole
+    loans, borrowers = _rows(12)
+    src, tgt = _deleted(loans, 3)
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 25, 5.0)]}, applied=19,
+                            horizons={"raw_loans": (20, 25)})
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "PASS", json.dumps(result["tiers"], default=str, indent=1)
+    pk = _tier(result, "pk_set_diff")
+    assert pk["stats"]["loans"]["delete_evidence"]["status"] == "ok"
+    assert pk["stats"]["loans"]["in_flight_deletes"] == 1 and pk["findings"] == []
+    assert source.last_deletes_since["after"] == 19 and source.last_deletes_since["upto"] == 25
+    # one position further back and a change may have been retained and cleaned up in between
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 25, 5.0)]}, applied=18,
+                            horizons={"raw_loans": (20, 25)})
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert _codes(result, "cdc_lag_ordering") == ["delete_evidence_retention_gap"]
+    assert source.calls["deletes_since"] == 0
+
+
+def test_a_binary_position_succeeds_by_one_with_carry_like_fn_cdc_increment_lsn():
+    # LSNs are binary(10) integers: sys.fn_cdc_increment_lsn(0x..00FF) is 0x..0100, so a
+    # checkpoint at ..00FF against a horizon starting at ..0100 is whole, ..00FE is a gap
+    loans, borrowers = _rows(12)
+    src, tgt = _deleted(loans, 3)
+
+    def lsn(tail):
+        return bytes.fromhex("0000003000004d58" + tail)
+
+    horizon = (lsn("0100"), lsn("0200"))
+    for applied, status in ((lsn("00ff"), "ok"), (lsn("00fe"), "retention_gap")):
+        source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, lsn("0150"), 5.0)]},
+                                applied=applied, horizons={"raw_loans": horizon})
+        result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+        assert _tier(result, "pk_set_diff")["stats"]["loans"]["delete_evidence"]["status"] == status
+        assert (result["verdict"] == "PASS") is (status == "ok")
+
+
 def test_an_applied_position_past_the_retained_horizon_is_ahead_of_horizon_and_strict():
     # a feed cannot have applied a position the source never produced: wrong capture, wrong
     # database or a corrupt checkpoint; a clean-looking target must not merge on that evidence

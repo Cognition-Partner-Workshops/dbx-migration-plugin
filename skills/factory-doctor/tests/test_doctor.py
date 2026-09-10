@@ -17,7 +17,7 @@ import dbx_guard  # noqa: E402
 
 def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=()):
     mig = tmp_path / ".migration"
-    mig.mkdir()
+    mig.mkdir(parents=True)
     for f in doctor.REQUIRED_FILES:
         if f in omit:
             continue
@@ -61,7 +61,7 @@ def test_offline_run_passes_every_local_check_but_is_never_ready(tmp_path):
 
 def test_unknown_probe_is_unverified_and_carries_command(tmp_path):
     ws = make_workspace(tmp_path)
-    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, True)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
     c = by_id(report)
     assert c["hook_platform_loaded"]["status"] == "unverified"
     assert c["hook_platform_loaded"]["data"]["probe_command"] == doctor.HOOK_PROBE_COMMAND
@@ -77,7 +77,7 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
         doctor.Check("databricks_identity", "warn", "authenticated as someone@example.com (user)"),
         doctor.Check("databricks_warehouse", "warn", "none"),
     ])
-    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, no_databricks=False)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, no_databricks=False)
     assert report["summary"].get("fail", 0) == 0
     assert not report["ready"] and report["blocking"] == ["databricks_identity=warn"]
 
@@ -90,7 +90,7 @@ def test_service_principal_with_advisory_warns_is_ready(tmp_path, monkeypatch):
         doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
         doctor.Check("databricks_warehouse", "warn", "none"),
     ])
-    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, no_databricks=False)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, no_databricks=False)
     assert report["ready"] and report["blocking"] == []
 
 
@@ -233,6 +233,7 @@ def _mapping(tmp_path: Path, *, evidence=True, key=("Id",), root_where=None) -> 
     if not evidence:
         del obj["delete_evidence"]
     p = tmp_path / "mapping.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"version": "m1", "objects": [obj]}))
     return p
 
@@ -306,11 +307,46 @@ class FakeCdcConn:
         pass
 
 
-def test_delete_evidence_skipped_without_mapping_and_ok_when_none_declared(tmp_path):
-    c = doctor.check_delete_evidence(None, None, PLUGIN_ROOT)
-    assert c.status == "skipped" and "--mapping" in c.detail
+def test_delete_evidence_ok_when_none_declared(tmp_path):
     c = doctor.check_delete_evidence(_mapping(tmp_path, evidence=False), None, PLUGIN_ROOT)
     assert c.status == "ok" and "no object declares delete_evidence" in c.detail
+
+
+def test_no_mapping_is_not_applicable_only_at_setup_before_any_unit_mapping_exists(tmp_path):
+    # setup runs before a unit mapping exists: nothing to verify, and the row says so
+    ws = make_workspace(tmp_path)
+    c = doctor.check_delete_evidence_all(ws, "orchestrator", [], None, PLUGIN_ROOT)
+    assert c.status == "skipped" and "not applicable" in c.detail and "no unit mapping" in c.detail
+    # once unit mappings exist (plan re-run before a wave) omitting them is a blocking fail, not a
+    # skip: a mapping declaring CDC evidence must not reach recon unverified
+    unit = ws / ".migration" / "units" / "orders_load"
+    unit.mkdir(parents=True)
+    unit.joinpath("mapping_spec.json").write_text("{}")
+    c = doctor.check_delete_evidence_all(ws, "orchestrator", [], None, PLUGIN_ROOT)
+    assert c.status == "fail" and "--mapping" in c.detail and "orders_load" in c.detail
+    assert c.data["unit_mappings"] == [".migration/units/orders_load/mapping_spec.json"]
+    # a child always owns mapped units, so it never gets the setup skip
+    c = doctor.check_delete_evidence_all(make_workspace(tmp_path / "child"), "child", [], None, PLUGIN_ROOT)
+    assert c.status == "fail" and "--mapping" in c.detail and "--source-secret" in c.detail
+
+
+def test_every_named_mapping_is_checked_and_the_worst_row_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    ws = make_workspace(tmp_path)
+    clean = _mapping(tmp_path / "a", evidence=False)
+    cdc = _mapping(tmp_path / "b")
+    conn = FakeCdcConn(db_enabled=0)
+    c = doctor.check_delete_evidence_all(ws, "child", [clean, cdc], "LEGACY_ODBC", PLUGIN_ROOT,
+                                         connect=lambda dsn: conn)
+    assert c.status == "fail"
+    assert str(clean) in c.detail and str(cdc) in c.detail and "CDC is not enabled" in c.detail
+    assert set(c.data["mappings"]) == {str(clean), str(cdc)}
+    assert c.data["mappings"][str(clean)]["status"] == "ok"
+    assert c.data["mappings"][str(cdc)]["status"] == "fail"
+    conn = FakeCdcConn()
+    c = doctor.check_delete_evidence_all(ws, "child", [clean, cdc], "LEGACY_ODBC", PLUGIN_ROOT,
+                                         connect=lambda dsn: conn)
+    assert c.status == "ok" and conn.probes
 
 
 def test_delete_evidence_declared_needs_a_named_source_secret(tmp_path, monkeypatch):
@@ -393,15 +429,18 @@ def test_cli_param_uses_the_harness_rules(tmp_path, monkeypatch):
     mapping = _mapping(tmp_path, root_where="Amount > ${floor}")
     seen = {}
 
-    def fake(m, s, root, params=None):
+    def fake(m, s, root, connect=None, params=None):
         seen["params"] = params
+        seen.setdefault("mappings", []).append(m)
         return doctor.Check("delete_evidence", "ok", "")
 
     monkeypatch.setattr(doctor, "check_delete_evidence", fake)
     argv = ["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--no-databricks",
-            "--mapping", str(mapping), "--source-secret", "X", "--out", "-"]
+            "--mapping", str(mapping), "--mapping", str(_mapping(tmp_path / "two")),
+            "--source-secret", "X", "--out", "-"]
     doctor.main([*argv, "--param", "floor=100", "--param", "day=2026-01-01"])
     assert seen["params"] == {"floor": "100", "day": "2026-01-01"}
+    assert seen["mappings"] == [mapping, tmp_path / "two" / "mapping.json"]  # --mapping repeats, one per unit
     for bad in ("floor", "floor=1; DROP TABLE x", "floor=1 OR 1=1", "floor='a'"):
         seen.clear()
         with pytest.raises(SystemExit) as e:
@@ -466,12 +505,17 @@ def test_doctor_source_never_enables_cdc():
 
 def test_run_includes_delete_evidence_and_a_failed_check_blocks(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
-    real = doctor.check_delete_evidence
     monkeypatch.setattr(doctor, "check_delete_evidence",
-                        lambda m, s, root, params=None: doctor.Check("delete_evidence", "fail", "CDC is not enabled")
-                        if m is not None else real(m, s, root, params=params))
-    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True, mapping=Path("m.json"),
+                        lambda m, s, root, connect=None, params=None:
+                        doctor.Check("delete_evidence", "fail", "CDC is not enabled"))
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True, mappings=[Path("m.json")],
                         source_secret="LEGACY_ODBC")
     assert "delete_evidence=fail" in report["blocking"]
+    # a child preflight without its unit mappings is a blocking row, never a silent skip
     report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True)
+    assert by_id(report)["delete_evidence"]["status"] == "fail"
+    assert "delete_evidence=fail" in report["blocking"]
+    # setup (orchestrator, no unit mapping exists yet) is the one explicit not-applicable path
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
     assert by_id(report)["delete_evidence"]["status"] == "skipped"
+    assert report["blocking"] == ["databricks_identity=skipped"]

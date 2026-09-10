@@ -9,7 +9,7 @@ import uuid
 import pytest
 
 from recon.adapters import SqlServerSourceAdapter
-from recon.transactional import _applied_predicate, _newer_predicate
+from recon.transactional import _applied_predicate, _newer_predicate, _successor
 from recon.watermarks import in_form_of, instant
 
 pyodbc = pytest.importorskip("pyodbc")
@@ -170,6 +170,12 @@ def test_cdc_delete_evidence_reads_tombstones_after_a_position(schema, monkeypat
             time.sleep(1)
         assert n == 3, "capture job did not harvest the deletes"
         assert source.evidence_horizon("no_such_capture") == (None, None)
+        # the harness' successor is the server's: the retention check and the inclusive lower
+        # bound of the delete read agree on which position follows the checkpoint (with carry)
+        for tail in ("0005", "00ff", "ffff"):
+            lsn = bytes.fromhex("0000003100006ac0" + tail)
+            (nxt,) = cur.execute("SELECT sys.fn_cdc_increment_lsn(?)", (lsn,)).fetchone()
+            assert _successor(lsn) == bytes(nxt)
         lo, hi = source.evidence_horizon(capture)
         assert isinstance(lo, bytes) and isinstance(hi, bytes) and len(lo) == len(hi) == 10 and lo < hi
         events = source.deletes_since(capture, ["Id"], lo, hi)

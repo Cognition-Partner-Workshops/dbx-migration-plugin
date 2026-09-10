@@ -146,6 +146,15 @@ def _as_position(value: Any) -> Any:
     return bytes(value) if isinstance(value, (bytearray, memoryview)) else value
 
 
+def _successor(p: Any) -> Any:
+    """The position right after `p`: both mechanisms are integers (a binary LSN is big-endian,
+    as sys.fn_cdc_increment_lsn treats it), so it is p + 1 with carry. Only called on a position
+    below another, so it never overflows."""
+    if isinstance(p, int):
+        return p + 1
+    return (int.from_bytes(p, "big") + 1).to_bytes(len(p), "big")
+
+
 def resolve_delete_evidence(c: ObjectMapping, tol: Tolerances, source, target) -> DeleteEvidenceResult:
     """Read the tombstones one object needs, inside the window: the target's applied position,
     the capture's retained horizon, then the deletes after that position (three statements).
@@ -184,7 +193,10 @@ def resolve_delete_evidence(c: ObjectMapping, tol: Tolerances, source, target) -
         result.detail = (f"applied position {type(applied).__name__} cannot be ordered against "
                          f"{kind} positions {type(lo).__name__}")
         return result
-    if applied < lo:
+    # the delete read starts at the position after the checkpoint (that one is applied); a gap
+    # exists only when a position strictly between the checkpoint and the oldest retained change
+    # can have been cleaned up, i.e. when even the successor is older than the horizon
+    if applied < lo and _successor(applied) < lo:
         result.status = "retention_gap"
         result.detail = (f"target applied position {_pos(applied)} is older than the oldest "
                          f"retained change {_pos(lo)}: deletes between them are unknowable")

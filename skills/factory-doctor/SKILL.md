@@ -14,8 +14,8 @@ being applied.
 ```bash
 python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role orchestrator|child] \
     [--expect-identity <migration SP userName>] [--hook-probe-result blocked|not-blocked] \
-    [--mapping <recon mapping.json> --source-secret <ENV VAR NAME of the read-only source DSN>
-     --param name=value ...]   # the same --param values the recon run will get
+    [--mapping <unit mapping_spec.json> ... --source-secret <ENV VAR NAME of the read-only source DSN>
+     --param name=value ...]   # one --mapping per unit; the same --param values the recon run will get
 ```
 
 Writes `.migration/09_capabilities.json` and prints one line per check. Exit 0 = `ready`.
@@ -52,7 +52,7 @@ doctor therefore reports `hook_platform_loaded: unverified` until you prove it:
 | `official_databricks_plugin` | `warn` if some routed official skills are missing on disk; `unverified` if none visible locally (they are platform-loaded via `requiredPlugins`) | `target-routing` |
 | `recon_harness` | `dbx-recon selftest` fails or the harness is not importable | `data-reconciliation` |
 | `recon_drivers` | `warn` if `databricks-sql-connector` is missing (live/snapshot recon impossible) | harness `pyproject.toml` extras |
-| `delete_evidence` | a mapping object declares `delete_evidence` but the source has CDC off, a declared capture instance is missing or not visible to the identity, a capture does not capture every mapped `key.source` column (named in the row), or the identity cannot call that capture's `fn_cdc_get_all_changes_<capture>` with the key columns and `root_where`; `skipped` without `--mapping`. Three metadata reads plus one bounded read-only probe per object; no `SELECT` on the `cdc` schema is required, and the doctor never runs `sp_cdc_enable_*` (a source-side change is the customer's decision) | `data-reconciliation` |
+| `delete_evidence` | a mapping object declares `delete_evidence` but the source has CDC off, a declared capture instance is missing or not visible to the identity, a capture does not capture every mapped `key.source` column (named in the row), or the identity cannot call that capture's `fn_cdc_get_all_changes_<capture>` with the key columns and `root_where`; also `fail` when the mappings are omitted by `--role child` or once any `.migration/units/*/mapping_spec.json` exists (plan re-run) — `skipped` (not applicable) only at setup, before a unit mapping exists. Three metadata reads plus one bounded read-only probe per object; no `SELECT` on the `cdc` schema is required, and the doctor never runs `sp_cdc_enable_*` (a source-side change is the customer's decision) | `data-reconciliation` |
 | `databricks_cli` | CLI not on PATH | `databricks-core` |
 | `databricks_auth_kind` | `warn` unless OAuth M2M env (`DATABRICKS_HOST/CLIENT_ID/CLIENT_SECRET`) | `target-routing` auth rules |
 | `databricks_identity` | `current-user me` fails, or differs from `--expect-identity`; `warn` if a human user (still blocks `ready`) | `07_access_checklist.md` |
