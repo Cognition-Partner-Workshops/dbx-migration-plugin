@@ -235,6 +235,15 @@ def _validate_mapping_identifiers(c: dict) -> None:
             validate_identifier(f["target"])
 
 
+def _validate_segment(what: str, name: Any) -> None:
+    """One bare identifier: a capture instance is a sysname the adapter splices into a CDC function
+    name, and the applied-position table/column are quoted as single segments inside the target
+    schema the run was given. A qualified name would pass preflight and abort the run."""
+    validate_identifier(name)
+    if "." in name:
+        raise ConfigError(f"{what} must be a single identifier segment, got {name!r}")
+
+
 def _validate_delete_evidence(block: Any) -> None:
     if not isinstance(block, dict):
         raise ConfigError("delete_evidence must be an object")
@@ -243,13 +252,13 @@ def _validate_delete_evidence(block: Any) -> None:
                           f"got {block.get('kind')!r}")
     if not isinstance(block.get("capture"), str) or not block["capture"]:
         raise ConfigError("delete_evidence.capture must name the source capture instance")
-    validate_identifier(block["capture"])
+    _validate_segment("delete_evidence.capture", block["capture"])
     applied = block.get("applied_position")
     if not isinstance(applied, dict) or not applied.get("table") or not applied.get("column"):
         raise ConfigError("delete_evidence.applied_position must be an object with the target "
                           "table and column holding the last applied source position")
-    validate_identifier(applied["table"])
-    validate_identifier(applied["column"])
+    for key in ("table", "column"):
+        _validate_segment(f"delete_evidence.applied_position.{key}", applied[key])
     where = applied.get("where")
     if where is not None and not isinstance(where, str):
         raise ConfigError("delete_evidence.applied_position.where must be a string predicate")

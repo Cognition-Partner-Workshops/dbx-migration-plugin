@@ -648,6 +648,13 @@ def test_mapping_delete_evidence_where_is_optional_and_takes_params(tmp_path):
     ({k: v for k, v in VALID_BLOCK.items() if k != "applied_position"}, "applied_position"),
     (dict(VALID_BLOCK, applied_position={"table": "cdc_checkpoint"}), "applied_position"),
     (dict(VALID_BLOCK, applied_position={"table": "cdc_checkpoint", "column": "lsn) --"}), "invalid identifier"),
+    # qualified names would pass the source preflight and abort the run at the Lakebase adapter
+    # (the checkpoint lives in the target schema the run was given) or in the CDC function name
+    (dict(VALID_BLOCK, applied_position={"table": "ops.cdc_checkpoint", "column": "applied_lsn"}),
+     r"applied_position\.table must be a single identifier segment"),
+    (dict(VALID_BLOCK, applied_position={"table": "cdc_checkpoint", "column": "pos.applied_lsn"}),
+     r"applied_position\.column must be a single identifier segment"),
+    (dict(VALID_BLOCK, capture="dbo.raw_loans"), r"delete_evidence\.capture must be a single identifier segment"),
     (dict(VALID_BLOCK, applied_position={"table": "cdc_checkpoint", "column": "applied_lsn", "where": 1}),
      "where must be a string"),
     (dict(VALID_BLOCK, applied_position={"table": "cdc_checkpoint", "column": "applied_lsn",
