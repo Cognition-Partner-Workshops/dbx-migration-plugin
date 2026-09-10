@@ -1,7 +1,11 @@
 import ast
 import asyncio
 from collections import Counter
+import json
 import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,9 +20,9 @@ def _functions():
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES"}
+                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID"}
                     for t in node.targets))]
-    namespace = {"Counter": Counter}
+    namespace = {"Counter": Counter, "re": re}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -40,6 +44,7 @@ def _batch_runtime():
         "WorkflowAgentError": RuntimeError,
         "child_prompt": lambda batch: batch,
         "log": lambda message: None,
+        "pr_changed_paths": lambda branch: [],
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
@@ -456,7 +461,110 @@ def test_validate_manifest_compares_the_contract_with_the_doctor_record():
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "identity": None})
 
 
-def test_workflow_loads_the_doctor_record_next_to_the_waves_dir():
+def test_workflow_launches_from_a_fresh_doctor_run_not_the_editable_record():
     src = WORKFLOW.read_text()
     assert 'MANIFEST_PATH.parent.parent / "09_capabilities.json"' in src
+    assert "DOCTOR = fresh_doctor_report(RECORDED, MANIFEST)" in src
     assert "validate_manifest(MANIFEST, DOCTOR)" in src
+
+
+def _launch_ns(tmp_path, fake_run):
+    tree = ast.parse(WORKFLOW.read_text())
+    selected = [node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name in {"fresh_doctor_report", "pr_changed_paths"}]
+    ns = {"json": json, "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
+          "BASE_BRANCH": "main", "DOCTOR_PY": Path("/plugin/skills/factory-doctor/doctor.py"),
+          "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json"}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
+    ns["subprocess"] = type("S", (), {"run": staticmethod(fake_run), "SubprocessError": subprocess.SubprocessError,
+                                        "CalledProcessError": subprocess.CalledProcessError})
+    return ns
+
+
+def test_fresh_doctor_report_reruns_the_doctor_and_carries_only_a_blocked_hook_nonce(tmp_path):
+    calls = []
+    fresh = {"ready": True, "identity": {"userName": "sp-1", "host": "h"}, "checks": []}
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        Path(cmd[cmd.index("--out") + 1]).parent.mkdir(parents=True, exist_ok=True)
+        Path(cmd[cmd.index("--out") + 1]).write_text(json.dumps(fresh))
+        return subprocess.CompletedProcess(cmd, 1)
+
+    ns = _launch_ns(tmp_path, fake_run)
+    recorded = {"ready": True, "checks": [{"id": "hook_platform_loaded", "status": "ok", "data": {"probe_nonce": "ab12cd34"}}]}
+    manifest = _manifest(source={"family": "sqlserver", "secret": "LEGACY_ODBC", "params": {"db": "loan_servicing"}})
+    assert ns["fresh_doctor_report"](recorded, manifest) == fresh
+    cmd = calls[0]
+    assert cmd[:2] == [sys.executable, str(ns["DOCTOR_PY"])]
+    assert cmd[cmd.index("--workspace") + 1] == str(tmp_path)
+    assert cmd[cmd.index("--out") + 1] == str(tmp_path / ".migration" / "waves" / "wave-1.doctor.json")
+    assert cmd[cmd.index("--hook-probe-result") + 1] == "blocked:ab12cd34"
+    assert cmd[cmd.index("--expect-identity") + 1] == "sp-1" and cmd[cmd.index("--expect-catalogs") + 1] == "mig"
+    assert cmd[cmd.index("--source-family") + 1] == "sqlserver" and cmd[cmd.index("--source-secret") + 1] == "LEGACY_ODBC"
+    assert cmd[cmd.index("--param") + 1] == "db=loan_servicing" and "--no-databricks" not in cmd
+    # an unverified or failed hook row in the record is never turned into a claim
+    for row in ({"status": "unverified", "data": {"probe_nonce": "ab12cd34"}}, {"status": "ok", "data": {}}):
+        ns["fresh_doctor_report"]({"checks": [{"id": "hook_platform_loaded", **row}]}, _manifest())
+        assert calls[-1][calls[-1].index("--hook-probe-result") + 1] == "unknown" and "--source-family" not in calls[-1]
+
+
+def test_fresh_doctor_report_refuses_to_launch_without_a_report(tmp_path):
+    ns = _launch_ns(tmp_path, lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1))
+    with pytest.raises(SystemExit, match="doctor"):
+        ns["fresh_doctor_report"]({"checks": []}, _manifest())
+
+
+def test_pr_changed_paths_comes_from_git_and_is_none_when_git_cannot_answer(tmp_path):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[3] == "fetch":
+            return subprocess.CompletedProcess(cmd, 0)
+        return subprocess.CompletedProcess(cmd, 0, stdout="src/a.sql\n.migration/allowed_targets.json\n")
+
+    ns = _launch_ns(tmp_path, fake_run)
+    assert ns["pr_changed_paths"]("feat/x") == ["src/a.sql", ".migration/allowed_targets.json"]
+    assert calls[0][:5] == ["git", "-C", str(tmp_path), "fetch", "-q"] and calls[0][-1] == "feat/x"
+    assert calls[1][3:] == ["diff", "--name-only", "origin/main...origin/feat/x"]
+
+    def failing(cmd, **kw):
+        raise subprocess.CalledProcessError(128, cmd)
+
+    assert _launch_ns(tmp_path, failing)["pr_changed_paths"]("feat/x") is None
+
+
+def test_git_observed_ledger_changes_beat_a_clean_self_report():
+    ns = _batch_runtime()
+    ns["pr_changed_paths"] = lambda branch: ["src/loans.sql", ".migration/03_recon_tolerances.json"]
+    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered"
+    assert ".migration/03_recon_tolerances.json" in out["one_line_summary"]
+    ns["pr_changed_paths"] = lambda branch: None
+    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and "git" in out["one_line_summary"]
+
+
+@pytest.mark.parametrize("unit", ["../03_recon_tolerances.json", "u/..", "a/b", "wave-1", "", ".", "..", ".hidden", 3])
+def test_validate_manifest_rejects_unit_ids_that_are_not_a_plain_recon_dir_name(unit):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="unit id"):
+        validate_manifest(_manifest(batches=[{"id": "b", "units": [unit], "write_targets": ["t"], "brief": "x"}]))
+    validate_manifest(_manifest(batches=[{"id": "b", "units": ["orders_load", "u.v-2"], "write_targets": ["t"], "brief": "x"}]))
+
+
+@pytest.mark.parametrize("source", ["LEGACY_ODBC", {"family": "sqlserver"}, {"secret": "X"}, {"family": "", "secret": "X"},
+                                    {"family": "sqlserver", "secret": "X", "params": ["a=b"]}])
+def test_validate_manifest_checks_the_source_block(source):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="source"):
+        validate_manifest(_manifest(source=source))
+    validate_manifest(_manifest(source={"family": "postgres", "secret": "LAKEBASE_SRC"}))
+
+
+def test_child_prompt_passes_the_source_family_and_secret_to_the_doctor():
+    ns = _prompt_ns(_manifest(source={"family": "postgres", "secret": "LAKEBASE_SRC", "params": {"db": "x"}}))
+    text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+    assert "--source-family postgres --source-secret LAKEBASE_SRC --param db=x" in text
+    assert "--source-family" not in _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])

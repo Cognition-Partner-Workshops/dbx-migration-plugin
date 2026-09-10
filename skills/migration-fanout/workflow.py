@@ -35,11 +35,15 @@ Manifest shape (written by the plan playbook, read here):
     "source_rows_fetched": 180000, "warehouse_hours": 1.5  # result.json["cost"] land in the brief
   },
   "capabilities": {                           # required; copied from .migration/09_capabilities.json
-    "identity": "<migration SP userName>",   # (factory-doctor, ready=true) and compared with it
-    "host": "https://<workspace host>",       # field by field at launch. Children run the doctor
-    "catalogs": ["mig"],                       # with --expect-identity and report BLOCKED on any
-    "guard_mode": "block", "stop_mode": "hard", "ready": true   # mismatch. hard stop_mode
-  },                                          # requires auto_merge=false (humans merge).
+    "identity": "<migration SP userName>",   # (factory-doctor, ready=true) and compared field by
+    "host": "https://<workspace host>",       # field with a doctor run made at launch (written to
+    "catalogs": ["mig"],                       # <manifest>.doctor.json). Children run the doctor with
+    "guard_mode": "block", "stop_mode": "hard", "ready": true   # --expect-identity and report BLOCKED
+  },                                          # on any mismatch. hard stop_mode requires auto_merge=false.
+  "source": {"family": "sqlserver",         # optional; the legacy source the doctor's
+             "secret": "LEGACY_ODBC",         # source_principal_read_only row checks: engine, env var
+             "params": {"db": "loans"}},      # NAME of the DSN, mapping ${params}. Passed to every
+  "base_branch": "main",                     # doctor run. base_branch: PR diffs are taken against it.
   "batches": [
     {"id": "w2-b01", "units": ["orders_load", "orders_dim"],
      "write_targets": ["mig.orders", "mig.orders_dim"],
@@ -53,6 +57,9 @@ import asyncio
 import hashlib
 import json
 import os
+import re
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -68,7 +75,10 @@ MANIFEST = json.loads(MANIFEST_TEXT)
 DOCTOR_PATH = MANIFEST_PATH.parent.parent / "09_capabilities.json"
 if not DOCTOR_PATH.exists():
     raise SystemExit(f"no factory-doctor report at {DOCTOR_PATH}; run the doctor before launching a wave")
-DOCTOR = json.loads(DOCTOR_PATH.read_text())
+RECORDED = json.loads(DOCTOR_PATH.read_text())
+ROOT = MANIFEST_PATH.parent.parent.parent
+DOCTOR_PY = Path(__file__).resolve().parents[1] / "factory-doctor" / "doctor.py"
+BASE_BRANCH = MANIFEST.get("base_branch", "main")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_TEXT.encode()).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
@@ -125,6 +135,9 @@ MERGE_EVIDENCE_MODES = ("live", "snapshot", "transactional")
 # Values the child doctor compares its own findings against (hooks/dbx_guard.py, 00_context.md).
 GUARD_MODES = ("block", "warn")
 STOP_MODES = ("hard", "soft")
+# A unit id is the one directory under .migration/recon/ its child may write, so it is a plain
+# name: no separators, no leading dot, and not the verifier's wave-N.
+UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 
 def validate_manifest(m, doctor=None):
@@ -149,6 +162,17 @@ def validate_manifest(m, doctor=None):
             if not b.get(key):
                 raise SystemExit(f"batch {b['id']} is missing '{key}' (a child with no brief or "
                                  "no declared write targets cannot be launched safely)")
+        bad = [u for u in b["units"] if not isinstance(u, str) or not UNIT_ID.fullmatch(u)]
+        if bad:
+            raise SystemExit(f"batch {b['id']} unit id(s) {bad!r} are not a plain directory name "
+                             "(letters, digits, _ . -, not wave-*): the id names the only "
+                             ".migration/recon/<unit_id>/ its child may write")
+    src = m.get("source")
+    if src is not None and (not isinstance(src, dict)
+                            or not all(isinstance(src.get(k), str) and src[k] for k in ("family", "secret"))
+                            or not isinstance(src.get("params", {}), dict)):
+        raise SystemExit("manifest 'source' must be {family, secret (env var NAME of the DSN), params?}: what "
+                         "the doctor's source_principal_read_only row checks")
     if "verify_depth" in m and m["verify_depth"] not in VERIFY_DEPTHS:
         raise SystemExit(f"manifest 'verify_depth' must be one of {VERIFY_DEPTHS}")
     for b in m["batches"]:
@@ -180,7 +204,7 @@ def validate_manifest(m, doctor=None):
     if doctor is None:
         return
     if doctor.get("ready") is not True:
-        raise SystemExit("09_capabilities.json says ready=false: re-run the factory-doctor to green before a wave")
+        raise SystemExit(f"the factory-doctor is not ready now ({doctor.get('blocking')}): fix the D10 before a wave")
     ident = doctor.get("identity")
     rows = {c.get("id"): c.get("data") or {} for c in doctor.get("checks", []) if isinstance(c, dict)}
     if not isinstance(ident, dict) or not ident.get("userName") or not ident.get("host"):
@@ -197,7 +221,44 @@ def validate_manifest(m, doctor=None):
                              "09_capabilities.json; copy the doctor's values, never edit them")
 
 
+def fresh_doctor_report(recorded, m):
+    """09_capabilities.json is a file anyone can edit, so a wave launches from a doctor run made now,
+    written to <manifest>.doctor.json: identity, host, allowlist, tolerances, stop_mode and the
+    source principal are re-verified. Only the platform hook probe, which a shell has to run, is
+    carried over, and only by the nonce the recorded report says was blocked (the doctor rejects
+    any other)."""
+    hook = next((c for c in recorded.get("checks", []) if c.get("id") == "hook_platform_loaded"), {})
+    nonce = (hook.get("data") or {}).get("probe_nonce") if hook.get("status") == "ok" else None
+    caps, src, out = m["capabilities"], m.get("source") or {}, MANIFEST_PATH.with_suffix(".doctor.json")
+    cmd = [sys.executable, str(DOCTOR_PY), "--workspace", str(ROOT), "--out", str(out),
+           "--hook-probe-result", f"blocked:{nonce}" if nonce else "unknown",
+           "--expect-identity", caps["identity"], "--expect-catalogs", ",".join(caps["catalogs"])]
+    if src:
+        cmd += ["--source-family", src["family"], "--source-secret", src["secret"]]
+        cmd += [a for k, v in src.get("params", {}).items() for a in ("--param", f"{k}={v}")]
+    subprocess.run(cmd, check=False, timeout=900)
+    try:
+        return json.loads(out.read_text())
+    except (OSError, ValueError):
+        raise SystemExit(f"the factory-doctor wrote no report at {out}; fix the doctor before launching") from None
+
+
+validate_manifest(MANIFEST)
+DOCTOR = fresh_doctor_report(RECORDED, MANIFEST)
 validate_manifest(MANIFEST, DOCTOR)
+
+
+def pr_changed_paths(branch):
+    """What the PR really changes, from git rather than from the child's report: fetch its branch and
+    diff it against the base. None when git cannot answer, and then no PASS stands."""
+    git = ["git", "-C", str(ROOT)]
+    try:
+        subprocess.run(git + ["fetch", "-q", "origin", branch], check=True, capture_output=True, timeout=300)
+        r = subprocess.run(git + ["diff", "--name-only", f"origin/{BASE_BRANCH}...origin/{branch}"],
+                           check=True, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.split()
 
 
 def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
@@ -366,16 +427,21 @@ def child_prompt(batch):
 
 
 def capability_block(units):
-    caps = MANIFEST["capabilities"]
+    caps, src = MANIFEST["capabilities"], MANIFEST.get("source") or {}
     unit_flags = " ".join(f"--unit {u}" for u in units)
+    source_flags = " ".join([f"--source-family {src['family']} --source-secret {src['secret']}"]
+                            + [f"--param {k}={v}" for k, v in src.get("params", {}).items()]) if src else ""
     return (
         "CAPABILITY CONTRACT (from the orchestrator's factory-doctor run): "
         f"{json.dumps(caps, sort_keys=True)}\n"
         f"Before converting anything run the factory-doctor skill with --role child "
         f"--expect-identity {caps['identity']} {unit_flags} (exactly this batch; the doctor resolves "
         "and verifies every unit's .migration/units/<unit_id>/mapping_spec.json itself), "
-        "--source-secret naming the secret your recon gate passes as --source-dsn-secret, and the "
-        "same --param values the gate will get; then complete its hook probe. Any 'fail' row "
+        + (f"{source_flags} (the source the doctor checks for write access; the same secret your recon "
+           "gate passes as --source-dsn-secret)" if source_flags else
+           "--source-secret naming the secret your recon gate passes as --source-dsn-secret, and the "
+           "same --param values the gate will get")
+        + "; then complete its hook probe. Any 'fail' row "
         "(identity mismatch, harness missing, hooks not applied, allowlist differs from the "
         "contract, a unit's mapping missing, declared delete evidence not readable on the source) "
         "means status=BLOCKED with the check id in one_line_summary. Never continue as a different "
@@ -460,19 +526,23 @@ async def run_batch(batch, sem, breaker):
             out["failure_class"] = "missing_pr"
             out["one_line_summary"] = (
                 "PASS downgraded: no PR URL/branch reported; " + out["one_line_summary"])
-        changed = out.get("changed_paths")
-        if not isinstance(changed, list) or not all(isinstance(p, str) for p in changed):
-            if out["status"] == "PASS":
-                out["status"] = "FAIL"
-                out["failure_class"] = "ledger_tampered"
-                out["one_line_summary"] = (
-                    "PASS downgraded: changed_paths not reported, ledger integrity unverified; "
-                    + out["one_line_summary"])
-        elif tampered := ledger_violations(changed, batch["units"]):
+        # The ledger gate reads the PR's diff from git; the child's changed_paths can only add to it.
+        reported = out.get("changed_paths")
+        usable = isinstance(reported, list) and all(isinstance(p, str) for p in reported)
+        observed = pr_changed_paths(out["branch"]) if out.get("branch") else None
+        tampered = ledger_violations(sorted({*(reported if usable else []), *(observed or [])}), batch["units"])
+        if tampered:
             prefix = "PASS downgraded: " if out["status"] == "PASS" else ""
             out["status"] = "FAIL"
             out["failure_class"] = "ledger_tampered"
             out["one_line_summary"] = f"{prefix}PR changed the ledger ({', '.join(tampered)}); " + out["one_line_summary"]
+        elif out["status"] == "PASS" and (not usable or observed is None):
+            out["status"] = "FAIL"
+            out["failure_class"] = "ledger_tampered"
+            out["one_line_summary"] = (
+                "PASS downgraded: changed_paths "
+                + ("not reported" if not usable else "not verifiable from git (fetch or diff of the PR branch failed)")
+                + ", ledger integrity unverified; " + out["one_line_summary"])
         if out["status"] != "PASS" and batch["id"] not in REPLAYED:
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
