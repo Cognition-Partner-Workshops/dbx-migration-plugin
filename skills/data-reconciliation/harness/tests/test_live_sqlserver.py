@@ -3,6 +3,7 @@ names a throwaway database (the rehearsal fixture, never a legacy estate); the t
 temporary schema and drops it. The fixture is the only thing written to."""
 
 import os
+import time
 import uuid
 
 import pytest
@@ -138,4 +139,53 @@ def test_rowversion_bounds_compare_the_counter_byte_for_byte(schema, monkeypatch
             assert [r["Id"] for r in source.fetch_keyed(f"{schema}.RV", ["Id"], [], where=newer)] == [1]
     finally:
         cur.execute(f"DROP TABLE {schema}.RV")
+        conn.close()
+
+
+def test_cdc_delete_evidence_reads_tombstones_after_a_position(schema, monkeypatch):
+    # The capture instance is created on the throwaway schema only (CDC is already enabled on
+    # the fixture database; a legacy estate is never enabled from the harness). Deletes are
+    # listed with binary(10) positions and a server-clock age; inserts are not tombstones, a
+    # capture that does not exist has no horizon, and a position past the last delete reads nothing.
+    monkeypatch.setenv("RECON_TEST_SOURCE", os.environ[DSN_VAR])
+    source = SqlServerSourceAdapter("RECON_TEST_SOURCE")
+    conn = pyodbc.connect(os.environ[DSN_VAR], autocommit=True)
+    cur = conn.cursor()
+    if not cur.execute("SELECT is_cdc_enabled FROM sys.databases WHERE database_id = DB_ID()").fetchone()[0]:
+        pytest.skip("fixture database has no CDC")
+    capture = f"{schema}_T"
+    cur.execute(f"CREATE TABLE {schema}.T (Id INT PRIMARY KEY, Seq INT)")
+    cur.execute("EXEC sys.sp_cdc_enable_table @source_schema = ?, @source_name = 'T', "
+                "@role_name = NULL, @capture_instance = ?, @supports_net_changes = 0", (schema, capture))
+    try:
+        for i in (1, 2, 3):
+            cur.execute(f"INSERT INTO {schema}.T VALUES ({i}, {i})")
+        cur.execute(f"DELETE FROM {schema}.T WHERE Id IN (1, 2)")
+        cur.execute(f"DELETE FROM {schema}.T WHERE Id = 3")
+        deadline = time.time() + 60
+        while time.time() < deadline:  # the capture job polls the log every few seconds
+            (n,) = cur.execute(f"SELECT COUNT(*) FROM cdc.{capture}_CT WHERE __$operation = 1").fetchone()
+            if n == 3:
+                break
+            time.sleep(1)
+        assert n == 3, "capture job did not harvest the deletes"
+        assert source.evidence_horizon("no_such_capture") == (None, None)
+        lo, hi = source.evidence_horizon(capture)
+        assert isinstance(lo, bytes) and isinstance(hi, bytes) and len(lo) == len(hi) == 10 and lo < hi
+        events = source.deletes_since(capture, ["Id"], lo, hi)
+        assert sorted(e.key for e in events) == [(1,), (2,), (3,)]
+        assert all(isinstance(e.position, bytes) and len(e.position) == 10 and lo < e.position <= hi
+                   for e in events)
+        assert all(0.0 <= e.age_s < 120 for e in events)
+        by_key = {e.key: e.position for e in events}
+        assert by_key[(1,)] == by_key[(2,)] < by_key[(3,)]  # one statement, one commit position
+        later = source.deletes_since(capture, ["Id"], by_key[(2,)], hi)
+        assert [(e.key, e.position) for e in later] == [((3,), by_key[(3,)])]
+        if by_key[(3,)] < hi:  # only when the database logged something after the last delete
+            assert source.deletes_since(capture, ["Id"], by_key[(3,)], hi) == []
+    finally:
+        source.close_window()  # release the read transaction: disabling the capture drops its table
+        cur.execute("EXEC sys.sp_cdc_disable_table @source_schema = ?, @source_name = 'T', "
+                    "@capture_instance = ?", (schema, capture))
+        cur.execute(f"DROP TABLE {schema}.T")
         conn.close()

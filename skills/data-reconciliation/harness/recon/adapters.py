@@ -1018,6 +1018,40 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             return IdentityState(int(seed), step) if seed is not None else None
         return IdentityState(int(last) + step, step)
 
+    # Delete evidence: SQL Server Change Data Capture, read only. Positions are binary(10) LSNs.
+    # The capture instance must already exist (enabling CDC is a change to the source and is
+    # never made from here); the login needs SELECT on the cdc schema and EXECUTE on its
+    # functions. The horizon is the capture's low water mark (advanced by the cleanup job) and
+    # the database's newest captured LSN, so a target that applied past the horizon's start
+    # reads exactly the deletes it has not yet seen.
+    def delete_evidence_kind(self) -> str:
+        return "sqlserver_cdc"
+
+    def evidence_horizon(self, capture: str) -> tuple[bytes | None, bytes | None]:
+        lo, hi = self._rows("SELECT sys.fn_cdc_get_min_lsn(?), sys.fn_cdc_get_max_lsn()", (capture,))[0]
+        lo = bytes(lo) if lo is not None else None
+        hi = bytes(hi) if hi is not None else None
+        if lo is None or hi is None or not any(lo):  # all-zero: no such capture instance
+            return None, None
+        return lo, hi
+
+    def deletes_since(self, capture: str, key_cols: list[str], after: bytes,
+                      upto: bytes) -> list[DeleteEvent]:
+        from .config import validate_identifier
+        validate_identifier(capture)
+        cols = ", ".join(validate_identifier(c) for c in key_cols)
+        # from_lsn is inclusive, so step one past the applied position; the function rejects a
+        # range that starts after it ends, which cannot happen because the caller only reads
+        # when after < upto. Age is measured on the server's clock against the commit time the
+        # LSN maps to, so the two sides' clocks never meet.
+        rows = self._rows(
+            f"SELECT __$start_lsn, DATEDIFF_BIG(MILLISECOND, sys.fn_cdc_map_lsn_to_time(__$start_lsn), "
+            f"GETDATE()), {cols} FROM cdc.fn_cdc_get_all_changes_{capture}"
+            "(sys.fn_cdc_increment_lsn(?), ?, N'all') WHERE __$operation = 1",
+            (after, upto))
+        self.rows_fetched += len(rows)
+        return [DeleteEvent(tuple(r[2:]), bytes(r[0]), max(0.0, float(r[1]) / 1000.0)) for r in rows]
+
 
 class DatabricksSourceAdapter(_SqlAdapterBase):
     """Databricks as the SOURCE (workspace-to-workspace or Hive-to-UC moves)."""
@@ -1440,3 +1474,20 @@ class LakebaseTargetAdapter(_PostgresBase):
 
     def null_key_count(self, object: str, key_fields: list[str], where: str | None = None) -> int:
         return super().null_key_count(self._q(object), key_fields, where)
+
+    def applied_position(self, table: str, column: str, where: str | None) -> bytes | int | None:
+        """The newest recorded source position: a checkpoint table keyed by source table (one
+        row, `where` picks it) or a landing table carrying the position on every row. A bytea
+        column is a binary LSN (bytewise order, no MAX() in Postgres), an integer column a
+        numeric version; anything else is refused."""
+        w = f" WHERE {where}" if where else ""
+        col = quote_ident(column, '"')
+        rows = self._rows(f"SELECT {col} FROM {self._q(table)}{w} ORDER BY {col} DESC NULLS LAST LIMIT 1")
+        value = rows[0][0] if rows else None
+        if value is None or isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value)
+        from .config import ConfigError
+        raise ConfigError(f"{table}.{column}: applied position must be bytea or an integer, "
+                          f"got {type(value).__name__}")

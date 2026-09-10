@@ -13,6 +13,7 @@ from recon.adapters import (
     PostgresSourceAdapter,
     TargetIdentityError,
 )
+from recon.config import ConfigError
 from recon.transactional import _applied_predicate, _newer_predicate
 from recon.watermarks import literal
 
@@ -266,3 +267,25 @@ def test_whole_number_columns_come_from_the_declared_scale(schema, monkeypatch):
     finally:
         source._conn.close()
 
+
+
+def test_applied_position_reads_the_feed_checkpoint_as_bytes_or_int(schema, monkeypatch):
+    # A checkpoint table holds one row per source table (the predicate picks it) and carries the
+    # feed's position as bytea (a binary LSN) or as an integer (a numeric version); a landing
+    # table without a predicate answers with its newest position; an empty table has none, and
+    # a column of any other type is refused rather than compared.
+    monkeypatch.setenv("RECON_TEST_TARGET", os.environ[DSN_VAR])
+    conn = psycopg.connect(os.environ[DSN_VAR], autocommit=True)
+    conn.execute(f"CREATE TABLE {schema}.cdc_checkpoint (source_table TEXT PRIMARY KEY, lsn BYTEA, "
+                 f"version BIGINT, note TEXT)")
+    conn.execute(f"INSERT INTO {schema}.cdc_checkpoint VALUES ('raw.loans', '\\x00000030000001a80003', 42, 'x'), "
+                 f"('raw.payments', '\\x00000030000001b00001', 7, 'y')")
+    conn.execute(f"CREATE TABLE {schema}.landing (id INT, lsn BYTEA)")
+    target = LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), schema)
+    where = "source_table = 'raw.loans'"
+    assert target.applied_position("cdc_checkpoint", "lsn", where) == bytes.fromhex("00000030000001a80003")
+    assert target.applied_position("cdc_checkpoint", "version", where) == 42
+    assert target.applied_position("cdc_checkpoint", "lsn", None) == bytes.fromhex("00000030000001b00001")
+    assert target.applied_position("landing", "lsn", None) is None
+    with pytest.raises(ConfigError, match="bytea or an integer"):
+        target.applied_position("cdc_checkpoint", "note", where)
