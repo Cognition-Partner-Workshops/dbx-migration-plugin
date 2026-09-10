@@ -9,7 +9,8 @@ environment variables that are set.
 Usage:
     python3 doctor.py [--workspace DIR] [--plugin-root DIR] [--role orchestrator|child]
                       [--hook-probe-result blocked|not-blocked|unknown] [--expect-identity NAME]
-                      [--no-databricks] [--mapping mapping_spec.json ... --source-secret NAME] [--out PATH]
+                      [--no-databricks] [--unit ID ...] [--mapping mapping_spec.json ...]
+                      [--source-secret NAME] [--param NAME=VALUE ...] [--out PATH]
 
 Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and every security
 control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`;
@@ -297,33 +298,52 @@ def _captured_columns(column_list: str) -> list[str]:
 UNIT_MAPPINGS = ".migration/units/*/mapping_spec.json"
 
 
-def check_delete_evidence_all(ws: Path, role: str, mappings: list[Path], source_secret: str | None,
-                              plugin_root: Path, connect=_pyodbc_connect,
+def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: list[Path],
+                              source_secret: str | None, plugin_root: Path, connect=_pyodbc_connect,
                               params: dict[str, str] | None = None) -> Check:
-    """One row over every unit mapping the run names. Omitting them is a blocking fail wherever a
-    unit mapping exists to be verified (a child always owns mapped units; the plan re-run before a
-    wave has them under .migration/units): a mapping declaring CDC evidence must fail here, not in
-    the recon run. Setup is the one not-applicable case, and only while no unit mapping exists yet."""
-    if not mappings:
-        existing = sorted(str(p.relative_to(ws)) for p in ws.glob(UNIT_MAPPINGS))
-        how = ("pass --mapping <unit mapping_spec.json> (repeatable, one per unit) --source-secret NAME "
-               "[--param ...] with the values the recon run will get")
-        if role == "child":
-            return Check("delete_evidence", "fail", f"a child preflight verifies every unit mapping in its batch; {how}",
-                         {"unit_mappings": existing})
-        if existing:
+    """One row over every unit mapping this run is answerable for, resolved by the doctor rather than
+    trusted from whoever typed the command: a child names its batch (--unit, the ids in its brief)
+    and each unit's .migration/units/<id>/mapping_spec.json must exist and pass; an orchestrator
+    covers every unit mapping in the workspace. A subset can therefore never pass as the whole.
+    --mapping adds ad-hoc specs on top (a candidate mapping at setup, before its unit exists);
+    setup with nothing to verify is the one not-applicable case."""
+    unit_dir = ws / ".migration" / "units"
+    if role == "child":
+        if not units:
             return Check("delete_evidence", "fail",
-                         f"{len(existing)} unit mapping(s) exist ({', '.join(existing[:3])}"
-                         f"{', ...' if len(existing) > 3 else ''}) but none was given; {how}",
-                         {"unit_mappings": existing})
+                         "a child preflight covers every unit in its batch: pass --unit <id> for each unit in the "
+                         "brief, --source-secret NAME and the --param values the recon gate will get",
+                         {"units": [], "mappings": {}})
+        expected = {u: unit_dir / u / "mapping_spec.json" for u in dict.fromkeys(units)}
+    else:
+        if units:
+            return Check("delete_evidence", "fail",
+                         "--unit narrows nothing for an orchestrator: it verifies every unit mapping under "
+                         f"{UNIT_MAPPINGS}; --unit is for --role child", {"units": list(units), "mappings": {}})
+        expected = {p.parent.name: p for p in sorted(ws.glob(UNIT_MAPPINGS))}
+    missing = [u for u, p in expected.items() if not p.is_file()]
+    if missing:
+        return Check("delete_evidence", "fail",
+                     f"unit mapping(s) missing for {', '.join(missing)}: expected "
+                     f"{unit_dir.relative_to(ws)}/<id>/mapping_spec.json (hand-off incomplete; report BLOCKED)",
+                     {"units": list(expected), "missing_units": missing, "mappings": {}})
+    todo = dict(expected)
+    seen = {p.resolve() for p in expected.values()}
+    for m in mappings:
+        if m.resolve() not in seen:
+            seen.add(m.resolve())
+            todo[str(m)] = m
+    if not todo:
         return Check("delete_evidence", "skipped",
                      f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}",
-                     {"unit_mappings": []})
-    rows = {str(m): check_delete_evidence(m, source_secret, plugin_root, connect=connect, params=params)
-            for m in mappings}
+                     {"units": [], "mappings": {}})
+    rows = {label: check_delete_evidence(p, source_secret, plugin_root, connect=connect, params=params)
+            for label, p in todo.items()}
     worst = "fail" if any(c.status == "fail" for c in rows.values()) else "ok"
-    return Check("delete_evidence", worst, "; ".join(f"{m}: {c.detail}" for m, c in rows.items()),
-                 {"mappings": {m: {"status": c.status, "detail": c.detail, **(c.data or {})} for m, c in rows.items()}})
+    return Check("delete_evidence", worst, "; ".join(f"{label}: {c.detail}" for label, c in rows.items()),
+                 {"units": list(expected),
+                  "mappings": {label: {"status": c.status, "detail": c.detail, **(c.data or {})}
+                               for label, c in rows.items()}})
 
 
 def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root: Path,
@@ -492,14 +512,15 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
 # ------------------------------------------------------------------ main
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
-        no_databricks: bool, mappings: list[Path] | None = None, source_secret: str | None = None,
-        params: dict[str, str] | None = None) -> dict:
+        no_databricks: bool, units: list[str] | None = None, mappings: list[Path] | None = None,
+        source_secret: str | None = None, params: dict[str, str] | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root)]
     checks += check_hooks(plugin_root, ws, probe_result)
     checks.append(check_official_plugin(plugin_root))
     checks.append(check_harness(plugin_root))
     checks.append(check_drivers())
-    checks.append(check_delete_evidence_all(ws, role, mappings or [], source_secret, plugin_root, params=params))
+    checks.append(check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
+                                            params=params))
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -531,9 +552,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
     p.add_argument("--no-databricks", action="store_true",
                    help="skip CLI/identity checks (offline; the report is never ready)")
+    p.add_argument("--unit", action="append", default=[], metavar="UNIT_ID",
+                   help="(--role child) a unit of this batch, repeat per unit in the brief; its "
+                        ".migration/units/<id>/mapping_spec.json must exist and its declared delete_evidence "
+                        "is verified on the source. An orchestrator verifies every unit mapping in the workspace")
     p.add_argument("--mapping", type=Path, action="append", default=[], metavar="MAPPING_SPEC",
-                   help="recon mapping_spec.json of a unit (repeat per unit); objects declaring delete_evidence "
-                        "are verified on the source. Required for --role child and once unit mappings exist")
+                   help="additional recon mapping_spec.json to verify (a candidate mapping at setup)")
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="mapping ${NAME} placeholder value, same rules and values as dbx-recon run --param")
@@ -546,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
         params = parse_params(a.param)
 
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
-                 a.expect_identity, a.no_databricks, a.mapping, a.source_secret, params)
+                 a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
