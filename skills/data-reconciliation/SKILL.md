@@ -116,10 +116,15 @@ other type refused). Positions are opaque and only ordered within one mechanism:
 an LSN, or LSNs of different widths, is `delete_evidence_unusable`, never a guess. Three statements
 per object, all inside the window (applied position on the target, `fn_cdc_get_min_lsn`/`max_lsn`
 horizon and the delete rows after the applied position on the source), reported as the
-`delete_evidence` cost line; `cost.delete_evidence_statements` carries the actuals. The factory
-never enables CDC: `factory-doctor --mapping mapping.json --source-secret NAME` verifies the
-source has it on, the identity can read the `cdc` schema and every declared capture exists, and a
-red row is a customer decision to record (or drop the block and drain), not a fix to apply.
+`delete_evidence` cost line; `cost.delete_evidence_statements` carries the actuals. A scoped object
+(`root_where`) gets its scope applied to the deleted row's before-image, so a delete outside the
+scope never vouches for an in-scope target-only key; a capture that does not carry the scope
+columns errors rather than widening. The factory never enables CDC:
+`factory-doctor --mapping mapping.json --source-secret NAME` verifies the source has it on, every
+declared capture exists and captures each mapped `key.source` column, and the identity can call
+that capture's `fn_cdc_get_all_changes_<capture>` with the key columns and scope (one bounded
+read-only probe per object; no `SELECT` on the `cdc` schema is required or checked). A red row is a
+customer decision to record (or drop the block and drain), not a fix to apply.
 
 `--target-catalog` for a Lakebase run is the branch *database* name and must appear in
 `.migration/allowed_targets.json`; the adapter reads `current_database()` on connect and refuses
