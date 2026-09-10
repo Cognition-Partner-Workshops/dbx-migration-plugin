@@ -68,7 +68,10 @@ Then start an engagement with one front door: `!dbx_migrate_etl`, `!dbx_migrate_
 Lakebase operational track and a Delta analytical track). Operational-track units reconcile with
 `dbx-recon --mode transactional --target-kind lakebase`: both sides under a consistency window,
 in-flight CDC rows tolerated up to `cdc_lag_max_s`, PK-set diff, lag/ordering, and
-constraint/index/sequence parity on top of the set-based tiers.
+constraint/index/sequence parity on top of the set-based tiers. Deletes must be drained before
+the run unless the mapping declares `delete_evidence` (SQL Server CDC first) that lets the
+harness tell an in-flight delete from a stray target row; the factory verifies CDC is on and
+readable but never enables it.
 
 The official `databricks` plugin is installed automatically as a dependency (tracking its default
 branch). To pin it, add `"ref"` or `"sha"` to the `requiredPlugins` entry in
