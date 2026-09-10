@@ -218,3 +218,115 @@ def test_redact_named_secrets_and_dsn_userinfo(secretish, leak):
 def test_redact_keeps_plain_error_text():
     msg = "login failed for user 'sa' (password mismatch); token_count=3"
     assert doctor._redact(msg) == msg
+
+
+# ------------------------------------------------------------------ delete evidence preflight
+
+def _mapping(tmp_path: Path, *, evidence=True) -> Path:
+    obj = {"object": "loans", "root_table": "raw.loans", "key": {"source": ["Id"], "target": "id"},
+           "fields": [{"source": "Id", "target": "id"}],
+           "delete_evidence": {"kind": "sqlserver_cdc", "capture": "raw_loans",
+                               "applied_position": {"table": "cdc_checkpoint", "column": "lsn"}}}
+    if not evidence:
+        del obj["delete_evidence"]
+    p = tmp_path / "mapping.json"
+    p.write_text(json.dumps({"version": "m1", "objects": [obj]}))
+    return p
+
+
+class FakeCdcConn:
+    """Read-only SQL Server fixture: answers the doctor's three metadata queries and records
+    every statement so a test can prove nothing else (in particular no sp_cdc_enable_*) ran."""
+
+    def __init__(self, *, db_enabled=1, can_read=1, captures=("raw_loans",)):
+        self.db_enabled, self.can_read, self.captures = db_enabled, can_read, list(captures)
+        self.statements: list[str] = []
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, *params):
+        self.statements.append(sql)
+        if "is_cdc_enabled" in sql:
+            self._rows = [(self.db_enabled,)]
+        elif "HAS_PERMS_BY_NAME" in sql:
+            self._rows = [(self.can_read,)]
+        elif "cdc.change_tables" in sql:
+            self._rows = [(c,) for c in self.captures]
+        else:
+            raise AssertionError(f"unexpected statement: {sql}")
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        pass
+
+
+def test_delete_evidence_skipped_without_mapping_and_ok_when_none_declared(tmp_path):
+    c = doctor.check_delete_evidence(None, None, PLUGIN_ROOT)
+    assert c.status == "skipped" and "--mapping" in c.detail
+    c = doctor.check_delete_evidence(_mapping(tmp_path, evidence=False), None, PLUGIN_ROOT)
+    assert c.status == "ok" and "no object declares delete_evidence" in c.detail
+
+
+def test_delete_evidence_declared_needs_a_named_source_secret(tmp_path, monkeypatch):
+    monkeypatch.delenv("LEGACY_ODBC", raising=False)
+    c = doctor.check_delete_evidence(_mapping(tmp_path), None, PLUGIN_ROOT)
+    assert c.status == "fail" and "--source-secret" in c.detail
+    c = doctor.check_delete_evidence(_mapping(tmp_path), "LEGACY_ODBC", PLUGIN_ROOT)
+    assert c.status == "fail" and "LEGACY_ODBC" in c.detail and "not set" in c.detail
+
+
+def test_delete_evidence_ok_reads_only_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x;Server=y;PWD=never-printed")
+    conn = FakeCdcConn()
+    c = doctor.check_delete_evidence(_mapping(tmp_path), "LEGACY_ODBC", PLUGIN_ROOT, connect=lambda dsn: conn)
+    assert c.status == "ok", c.detail
+    assert c.data == {"kind": "sqlserver_cdc", "captures": ["raw_loans"], "missing": []}
+    assert "never-printed" not in c.detail
+    assert all(s.lstrip().upper().startswith("SELECT") for s in conn.statements)
+    assert not any("sp_cdc" in s.lower() for s in conn.statements)
+
+
+@pytest.mark.parametrize("kw, needle", [
+    ({"db_enabled": 0}, "CDC is not enabled"),
+    ({"can_read": 0}, "cannot read the cdc schema"),
+    ({"captures": ("raw_payments",)}, "raw_loans"),
+])
+def test_delete_evidence_failures_name_the_source_side_gap(tmp_path, monkeypatch, kw, needle):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    conn = FakeCdcConn(**kw)
+    c = doctor.check_delete_evidence(_mapping(tmp_path), "LEGACY_ODBC", PLUGIN_ROOT, connect=lambda dsn: conn)
+    assert c.status == "fail" and needle in c.detail
+    assert "sp_cdc_enable" not in c.detail.replace("never runs sp_cdc_enable", "")
+    assert not any("sp_cdc" in s.lower() for s in conn.statements)
+
+
+def test_delete_evidence_connection_error_is_redacted(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+
+    def boom(dsn):
+        raise RuntimeError("login failed for PWD=hunter2token99 at server")
+
+    c = doctor.check_delete_evidence(_mapping(tmp_path), "LEGACY_ODBC", PLUGIN_ROOT, connect=boom)
+    assert c.status == "fail" and "hunter2token99" not in c.detail
+
+
+def test_doctor_source_never_enables_cdc():
+    src = (SKILL / "doctor.py").read_text()
+    assert not re.search(r"sp_cdc_enable|sp_cdc_disable", src.replace("never runs sp_cdc_enable_*", ""))
+
+
+def test_run_includes_delete_evidence_and_a_failed_check_blocks(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    real = doctor.check_delete_evidence
+    monkeypatch.setattr(doctor, "check_delete_evidence",
+                        lambda m, s, root: doctor.Check("delete_evidence", "fail", "CDC is not enabled")
+                        if m is not None else real(m, s, root))
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True, mapping=Path("m.json"),
+                        source_secret="LEGACY_ODBC")
+    assert "delete_evidence=fail" in report["blocking"]
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True)
+    assert by_id(report)["delete_evidence"]["status"] == "skipped"

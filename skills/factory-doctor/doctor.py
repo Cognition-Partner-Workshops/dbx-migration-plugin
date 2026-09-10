@@ -9,7 +9,7 @@ environment variables that are set.
 Usage:
     python3 doctor.py [--workspace DIR] [--plugin-root DIR] [--role orchestrator|child]
                       [--hook-probe-result blocked|not-blocked|unknown] [--expect-identity NAME]
-                      [--no-databricks] [--out PATH]
+                      [--no-databricks] [--mapping mapping.json --source-secret NAME] [--out PATH]
 
 Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and every security
 control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`;
@@ -268,6 +268,77 @@ def check_drivers() -> Check:
                  {"drivers": present})
 
 
+# ------------------------------------------------------------------ delete evidence (source CDC)
+
+_CDC_QUERIES = {
+    "is_cdc_enabled": "SELECT is_cdc_enabled FROM sys.databases WHERE database_id = DB_ID()",
+    "can_read_cdc": "SELECT HAS_PERMS_BY_NAME('cdc', 'SCHEMA', 'SELECT')",
+    "captures": "SELECT capture_instance FROM cdc.change_tables",
+}
+
+
+def _pyodbc_connect(dsn: str):
+    import pyodbc
+    return pyodbc.connect(dsn, readonly=True, timeout=15)
+
+
+def check_delete_evidence(mapping: Path | None, source_secret: str | None, plugin_root: Path,
+                          connect=_pyodbc_connect) -> Check:
+    """Every `delete_evidence` block a mapping declares must be answerable on the source before a
+    transactional recon run: CDC on for the database, the migration identity able to SELECT from the
+    cdc schema, each declared capture instance present. Three metadata SELECTs, nothing else: CDC
+    is a source-side change the factory never makes (the doctor never runs sp_cdc_enable_*), so a
+    red row here is a customer decision to record, not a fix to apply."""
+    if mapping is None:
+        return Check("delete_evidence", "skipped", "no --mapping given; declared delete evidence not verified")
+    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
+    from recon.config import ConfigError, load_mapping_spec
+    try:
+        spec = load_mapping_spec(mapping)
+    except (ConfigError, OSError, ValueError) as e:
+        return Check("delete_evidence", "fail", f"{mapping}: {_redact(str(e))}")
+    declared = [(c.object, c.delete_evidence) for c in spec.objects if c.delete_evidence is not None]
+    if not declared:
+        return Check("delete_evidence", "ok", "no object declares delete_evidence (drain-before-run contract applies)")
+    kinds = sorted({de.kind for _, de in declared})
+    if kinds != ["sqlserver_cdc"]:
+        return Check("delete_evidence", "fail", f"unsupported delete_evidence kind(s) {kinds}")
+    if not source_secret:
+        return Check("delete_evidence", "fail",
+                     f"{len(declared)} object(s) declare delete_evidence; pass --source-secret NAME "
+                     "(env var holding the read-only source DSN) to verify CDC on the source")
+    dsn = os.environ.get(source_secret)
+    if not dsn:
+        return Check("delete_evidence", "fail", f"source secret {source_secret} is not set in the environment")
+    wanted = sorted({de.capture for _, de in declared})
+    try:
+        conn = connect(dsn)
+        try:
+            cur = conn.cursor()
+            (enabled,) = cur.execute(_CDC_QUERIES["is_cdc_enabled"]).fetchall()[0]
+            (can_read,) = cur.execute(_CDC_QUERIES["can_read_cdc"]).fetchall()[0]
+            present = sorted({str(r[0]) for r in cur.execute(_CDC_QUERIES["captures"]).fetchall()}) \
+                if enabled and can_read else []
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
+        return Check("delete_evidence", "fail", f"source query failed: {_redact(str(e))}")
+    missing = [c for c in wanted if c not in present]
+    data = {"kind": "sqlserver_cdc", "captures": wanted, "missing": missing}
+    if not enabled:
+        return Check("delete_evidence", "fail",
+                     "CDC is not enabled on the source database; enabling it is a source-side change "
+                     "(the factory never runs sp_cdc_enable_*): record the customer decision or drop "
+                     "delete_evidence and drain deletes before each run", data)
+    if not can_read:
+        return Check("delete_evidence", "fail",
+                     "migration identity cannot read the cdc schema (SELECT on schema cdc required)", data)
+    if missing:
+        return Check("delete_evidence", "fail",
+                     f"declared capture instance(s) missing on the source: {missing}", data)
+    return Check("delete_evidence", "ok", f"sqlserver_cdc: {len(wanted)} capture instance(s) present, cdc readable", data)
+
+
 # ------------------------------------------------------------------ databricks identity
 
 _APPLICATION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
@@ -340,12 +411,13 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
 # ------------------------------------------------------------------ main
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
-        no_databricks: bool) -> dict:
+        no_databricks: bool, mapping: Path | None = None, source_secret: str | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root)]
     checks += check_hooks(plugin_root, ws, probe_result)
     checks.append(check_official_plugin(plugin_root))
     checks.append(check_harness(plugin_root))
     checks.append(check_drivers())
+    checks.append(check_delete_evidence(mapping, source_secret, plugin_root))
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -377,11 +449,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
     p.add_argument("--no-databricks", action="store_true",
                    help="skip CLI/identity checks (offline; the report is never ready)")
+    p.add_argument("--mapping", type=Path,
+                   help="recon mapping.json; objects declaring delete_evidence are verified on the source")
+    p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
 
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
-                 a.expect_identity, a.no_databricks)
+                 a.expect_identity, a.no_databricks, a.mapping, a.source_secret)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
