@@ -147,6 +147,19 @@ def test_child_prompt_embeds_capability_contract():
     assert "BLOCKED" in text
 
 
+def test_child_prompt_names_exactly_its_batch_units_for_the_doctor():
+    # the child preflight covers its whole batch: the brief spells out one --unit per unit it owns,
+    # so a shorter list would be a visible deviation, and the doctor resolves the mapping paths
+    ns = _prompt_ns(_manifest(batches=[
+        {"id": "b", "units": ["loans", "payments"], "write_targets": ["t"], "brief": "brief"},
+        {"id": "c", "units": ["fees"], "write_targets": ["t2"], "brief": "brief"},
+    ]))
+    text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+    assert "--role child --expect-identity sp-1 --unit loans --unit payments (exactly this batch" in text
+    assert "--unit fees" not in text and "--mapping" not in text
+    assert "mapping_spec.json itself" in text
+
+
 @pytest.mark.parametrize("manifest", [
     _manifest(verify_depth="threshold"),   # verifier depth is a plan decision, never tolerance-driven
     _manifest(verify_depth="deep"),

@@ -95,7 +95,7 @@ def _load_snapshot(path: Path | None, mode: str) -> dict | None:
     return {key: data[key] for key in ("source", "extracted_at", "row_counts")}
 
 
-def _parse_params(items: list[str]) -> dict[str, str]:
+def parse_params(items: list[str]) -> dict[str, str]:
     params = {}
     for item in items:
         name, sep, value = item.partition("=")
@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             "one. Analytical-track units reconcile with --mode snapshot or live at a stated "
             "consistency point. See 14-front_door_oltp.")
 
-    params = _parse_params(args.param)
+    params = parse_params(args.param)
     if args.cmd == "estimate":
         spec = load_mapping_spec(args.mapping, params)
         tol = load_tolerances(args.tolerances)

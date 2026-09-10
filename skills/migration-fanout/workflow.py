@@ -299,7 +299,7 @@ def child_prompt(batch):
         f"Units: {json.dumps(batch['units'], sort_keys=True)}\n"
         f"Write targets you own (never write anywhere else): "
         f"{json.dumps(batch.get('write_targets', []), sort_keys=True)}\n\n"
-        + capability_block()
+        + capability_block(batch["units"])
         + "Rules that override anything else:\n"
         "- Do not edit files under .migration/. The workflow writes the ledger from your report.\n"
         "- Do not merge your own PR.\n"
@@ -315,14 +315,19 @@ def child_prompt(batch):
     )
 
 
-def capability_block():
+def capability_block(units):
     caps = MANIFEST["capabilities"]
+    unit_flags = " ".join(f"--unit {u}" for u in units)
     return (
         "CAPABILITY CONTRACT (from the orchestrator's factory-doctor run): "
         f"{json.dumps(caps, sort_keys=True)}\n"
         f"Before converting anything run the factory-doctor skill with --role child "
-        f"--expect-identity {caps['identity']} and complete its hook probe. Any 'fail' row "
-        "(identity mismatch, harness missing, hooks not applied, allowlist differs from the contract) "
+        f"--expect-identity {caps['identity']} {unit_flags} (exactly this batch; the doctor resolves "
+        "and verifies every unit's .migration/units/<unit_id>/mapping_spec.json itself), "
+        "--source-secret naming the secret your recon gate passes as --source-dsn-secret, and the "
+        "same --param values the gate will get; then complete its hook probe. Any 'fail' row "
+        "(identity mismatch, harness missing, hooks not applied, allowlist differs from the "
+        "contract, a unit's mapping missing, declared delete evidence not readable on the source) "
         "means status=BLOCKED with the check id in one_line_summary. Never continue as a different "
         "identity, never run `databricks auth login`, never edit .migration/allowed_targets.json.\n\n"
     )

@@ -67,14 +67,35 @@ sampled 125 of 880 rows, did not visit loan 5 and passed, so tier 2 is the only 
 the drift. Fields under `decimal_round` (`MONEY -> decimal(19,4)`) still have `sum` and
 `distinct_count` deferred to tier 3, as in every mode.
 
-Every `pk_extra_on_target` above is graded as a defect: the harness has no tombstone or
-CDC-position evidence, so an undrained source delete and a stray target write look the same
-and the run must start after deletes are drained.
+Rehearsals A-D ran before the mapping declared `delete_evidence`, so every `pk_extra_on_target`
+above was graded strictly. With evidence on (SQL Server CDC enabled by hand on the disposable
+fixture, `cdc_checkpoint` written by the loader) rehearsal A's stray `escrow_accounts` row still
+fails `pk_extra_on_target`, now worded "not deleted on the source after the target's applied
+position", and `delete_evidence_statements = {source: 10, target: 5}` on the clean run (one
+more source statement per object that has tombstones after the applied LSN: the keyed read that
+checks whether the source still holds them).
+
+Rehearsal E (`inject_source_deletes.sql` on the fixture SQL Server, run inside `cdc_lag_max_s`):
+`PASS`, merge-eligible. Tier 5 `loan_modifications` reads 3 delete events after the applied LSN,
+`in_flight_deletes: 3`, `extra_on_target: 0`; tier 1 counts the gap of 3 inside the in-flight
+allowance; tier 6 records `target_max_from_in_flight_delete: true` because the deleted rows
+carried the target's max `created_date` (4 ms newer than the surviving source max), so no
+`target_ahead_of_source`. `delete_evidence_statements = {source: 10, target: 5}`. The same state
+after 60 s: `FAIL` with `delete_lag_exceeded` ("3 source deletes still present on the target 141s
+after commit"), `pk_extra_on_target` for the same keys and `root_count`. After `restore_source_deletes.sql`, still
+inside `cdc_lag_max_s`: `PASS` with `reinserted: 3`, `in_flight_deletes: 0` and no tier 2
+exclusion (`applied_subset` absent) — the 3 tombstoned keys the source holds again are graded as
+ordinary rows on both sides.
+
+Rehearsal F (`inject_target_checkpoint_gap.sql`): `FAIL` with `delete_evidence_retention_gap`
+(applied LSN `...0001` older than the oldest retained change), strict `pk_extra_on_target` and
+`root_count`; the delete query is not issued (`source: 9`).
 
 ## Not proven here
 
 A real Lakebase branch (only the Postgres protocol and isolation level were exercised), a source
 with snapshot isolation enabled (the fallback path ran instead), a live CDC feed (lag was
-injected, not observed from Lakeflow Connect), and a source write during the window (the source
+injected, not observed from Lakeflow Connect), a source write during the window (the source
 is read-only in every rehearsal, so the change token detecting a below-max update or a balanced
-insert+delete is proven by the harness tests, not here).
+insert+delete is proven by the harness tests, not here), and delete evidence from anything but
+SQL Server CDC (Lakeflow Connect / Debezium change tables and audit tables have no adapter yet).

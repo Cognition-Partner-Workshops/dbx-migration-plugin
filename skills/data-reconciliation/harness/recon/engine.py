@@ -32,16 +32,19 @@ PLANNED_MODES: tuple[str, ...] = ()
 DEPTHS = ("threshold", "sampled", "full")
 
 
-def _cost(source, target, started: float) -> dict:
+def _cost(source, target, started: float, ctx=None) -> dict:
     def side(adapter):
         if isinstance(adapter, StatementCounting):
             return adapter.statements, adapter.rows_fetched
         return None, None
     s_stmts, s_rows = side(source)
     t_stmts, t_rows = side(target)
-    return {"source_statements": s_stmts, "source_rows_fetched": s_rows,
+    cost = {"source_statements": s_stmts, "source_rows_fetched": s_rows,
             "target_statements": t_stmts, "target_rows_fetched": t_rows,
             "elapsed_s": round(time.monotonic() - started, 3)}
+    if ctx is not None and ctx.deletes:
+        cost["delete_evidence_statements"] = dict(ctx.evidence_statements)
+    return cost
 
 def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | None,
                                   spec: MappingSpec, tier1) -> list[str]:
@@ -133,7 +136,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         require_transactional(source, target)
     try:
         if mode == "transactional":
-            ctx = open_window(spec, source, target)
+            ctx = open_window(spec, source, target, tol)
         tiers = _run_tiers(spec, tol, canon, source, target, seed, depth, mode, ops,
                            run_source, run_target, ctx)
     except BaseException as exc:
@@ -148,7 +151,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
     result = build_result(unit, mode, spec.version, tol.version, tiers,
                           seed=seed, params=params, snapshot=snapshot,
                           provenance_warnings=provenance_warnings, depth=depth,
-                          cost=_cost(source, target, started))
+                          cost=_cost(source, target, started, ctx))
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result

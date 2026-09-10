@@ -80,13 +80,19 @@ def tier1_counts(spec: MappingSpec, source, target, ctx=None) -> TierResult:
         tgt_n = target.target_row_count(c.object, c.target_where)
         stats["source_counts"][c.root_table] = src_n
         in_flight = ctx.in_flight(c) if ctx is not None else 0
-        if src_n != tgt_n and 0 <= src_n - tgt_n <= in_flight:
+        in_flight_deletes = ctx.in_flight_deletes(c) if ctx is not None else 0
+        # inserts the feed has not applied leave the target short; deletes it has not applied
+        # (proved by delete evidence) leave it long; the gap may be anywhere between
+        if src_n != tgt_n and -in_flight_deletes <= src_n - tgt_n <= in_flight:
             stats.setdefault("count_gap_within_in_flight", {})[c.object] = {
-                "gap": src_n - tgt_n, "in_flight": in_flight}
+                "gap": src_n - tgt_n, "in_flight": in_flight,
+                **({"in_flight_deletes": in_flight_deletes} if in_flight_deletes else {})}
         elif src_n != tgt_n:
+            flight = [f"{in_flight} in flight"] if in_flight else []
+            flight += [f"{in_flight_deletes} deletes in flight"] if in_flight_deletes else []
             findings.append(Finding(c.object, "root_count",
                                     f"rows({c.root_table})={src_n} vs target rows={tgt_n}"
-                                    + (f" ({in_flight} in flight)" if in_flight else "")))
+                                    + (f" ({', '.join(flight)})" if flight else "")))
         for e in c.embeds:
             checks += 1
             child_n = source.row_count(e.child_table, e.child_where)
@@ -251,7 +257,8 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
     applied_subset: dict[str, dict[str, Any]] = {}
     for c in spec.objects:
         in_flight = ctx.in_flight(c) if ctx is not None else 0
-        if in_flight:
+        in_flight_deletes = ctx.in_flight_deletes(c) if ctx is not None else 0
+        if in_flight or in_flight_deletes:
             # aggregate the applied set on both sides: the source bounded by the target's applied
             # watermark, the target minus the very keys that are in flight (their target values
             # are the pre-change ones). Every applied row stays in the comparison, so drift in a
@@ -263,17 +270,24 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                         "cannot exclude keys from its aggregates"))
                 continue
             # the exclusion is one statement on the target: its capacity is the smaller of the
-            # tier's own cap and what the adapter can bind for a key this wide
+            # tier's own cap and what the adapter can bind for a key this wide. The in-flight
+            # source keys exist on the source and the in-flight deletes do not (a tombstoned key
+            # the source holds again is `reinserted`, an ordinary row), so the two sets are
+            # disjoint and their sum over the cap settles it without reading keys
             cap = min(IN_FLIGHT_EXCLUSION_CAP, target.exclusion_capacity(len(c.key_target)))
-            if in_flight > cap:
+            if in_flight + in_flight_deletes > cap:
                 checks += 1
                 findings.append(Finding(c.object, "aggregates_ungraded_in_flight",
-                                        f"{in_flight} source rows in flight exceeds the {cap}-key "
-                                        f"exclusion cap for a {len(c.key_target)}-column key; let "
-                                        "the feed catch up before grading aggregates"))
+                                        f"{in_flight} source rows in flight and {in_flight_deletes} "
+                                        f"deletes in flight exceed the {cap}-key exclusion cap for a "
+                                        f"{len(c.key_target)}-column key; let the feed catch up "
+                                        "before grading aggregates"))
                 continue
-            keys = ctx.in_flight_keys(c, source)
-            applied_subset[c.object] = {"in_flight": in_flight, "excluded_keys": len(keys)}
+            keys = (ctx.in_flight_keys(c, source) if in_flight else []) + ctx.in_flight_delete_keys(c)
+            applied_subset[c.object] = {
+                "in_flight": in_flight,
+                **({"in_flight_deletes": in_flight_deletes} if in_flight_deletes else {}),
+                "excluded_keys": len(keys)}
             s_all, t_all, s_plan, t_plan = _object_aggregates(c, source, target, ctx.applied_where(c), keys)
         else:
             s_all, t_all, s_plan, t_plan = _object_aggregates(c, source, target)
@@ -493,6 +507,8 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                 + ([c.watermark_target] if wm else []))
         target_counts = {}
         in_flight_rows = 0
+        in_flight_deletes = set(ctx.in_flight_delete_keys(c)) if ctx is not None else set()
+        deleted_in_flight = 0
         for d in target.fetch_keyed(c.object, c.key_target, proj,
                                     where=c.target_where, keys=keys):
             key = tuple(_get_path(d, key_field) for key_field in c.key_target)
@@ -529,9 +545,14 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         for k in tgt_docs:
             if k not in src_rows and not sampled:
                 checks += 1
+                if k in in_flight_deletes:
+                    deleted_in_flight += 1
+                    continue
                 findings.append(Finding(c.object, "extra_doc", f"key={k}"))
         if wm:
             stats[c.object]["in_flight_rows"] = in_flight_rows
+        if in_flight_deletes:
+            stats[c.object]["in_flight_deletes"] = deleted_in_flight
         checks += _grade_embeds(c, canon, tol, source, src_rows, tgt_docs, sampled,
                                 findings, stats)
     return TierResult(3, "keyed_diffs", not findings, checks, findings, stats)

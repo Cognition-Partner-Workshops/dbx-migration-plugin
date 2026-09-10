@@ -9,7 +9,8 @@ environment variables that are set.
 Usage:
     python3 doctor.py [--workspace DIR] [--plugin-root DIR] [--role orchestrator|child]
                       [--hook-probe-result blocked|not-blocked|unknown] [--expect-identity NAME]
-                      [--no-databricks] [--out PATH]
+                      [--no-databricks] [--unit ID ...] [--mapping mapping_spec.json ...]
+                      [--source-secret NAME] [--param NAME=VALUE ...] [--out PATH]
 
 Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and every security
 control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`;
@@ -268,6 +269,177 @@ def check_drivers() -> Check:
                  {"drivers": present})
 
 
+# ------------------------------------------------------------------ delete evidence (source CDC)
+
+_CDC_QUERIES = {
+    "is_cdc_enabled": "SELECT is_cdc_enabled FROM sys.databases WHERE database_id = DB_ID()",
+    # Lists the capture instances *this identity may read* (db_owner, the capture's gating role,
+    # or SELECT on its captured columns), with role_name and captured_column_list; needs no SELECT
+    # on the cdc schema, unlike cdc.change_tables / cdc.captured_columns.
+    "captures": "EXEC sys.sp_cdc_help_change_data_capture",
+    "max_lsn": "SELECT sys.fn_cdc_get_max_lsn()",
+    # Bounded, read-only call of the generated function exactly as the harness will make it: the
+    # mapped key columns and the object's scope predicate over the single-position [max, max] range.
+    "probe": "SELECT TOP (1) {cols} FROM cdc.fn_cdc_get_all_changes_{capture}(?, ?, N'all') "
+             "WHERE __$operation = 1{scope}",
+}
+
+
+def _pyodbc_connect(dsn: str):
+    import pyodbc
+    return pyodbc.connect(dsn, readonly=True, timeout=15)
+
+
+def _captured_columns(column_list: str) -> list[str]:
+    """`[loan_id], [borrower_id]` as sp_cdc_help_change_data_capture reports it -> names."""
+    return [c.strip().strip("[]") for c in str(column_list or "").split(",") if c.strip()]
+
+
+UNIT_MAPPINGS = ".migration/units/*/mapping_spec.json"
+
+
+def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: list[Path],
+                              source_secret: str | None, plugin_root: Path, connect=_pyodbc_connect,
+                              params: dict[str, str] | None = None) -> Check:
+    """One row over every unit mapping this run is answerable for, resolved by the doctor rather than
+    trusted from whoever typed the command: a child names its batch (--unit, the ids in its brief)
+    and each unit's .migration/units/<id>/mapping_spec.json must exist and pass; an orchestrator
+    covers every unit mapping in the workspace. A subset can therefore never pass as the whole.
+    --mapping adds ad-hoc specs on top (a candidate mapping at setup, before its unit exists);
+    setup with nothing to verify is the one not-applicable case."""
+    unit_dir = ws / ".migration" / "units"
+    if role == "child":
+        if not units:
+            return Check("delete_evidence", "fail",
+                         "a child preflight covers every unit in its batch: pass --unit <id> for each unit in the "
+                         "brief, --source-secret NAME and the --param values the recon gate will get",
+                         {"units": [], "mappings": {}})
+        expected = {u: unit_dir / u / "mapping_spec.json" for u in dict.fromkeys(units)}
+    else:
+        if units:
+            return Check("delete_evidence", "fail",
+                         "--unit narrows nothing for an orchestrator: it verifies every unit mapping under "
+                         f"{UNIT_MAPPINGS}; --unit is for --role child", {"units": list(units), "mappings": {}})
+        expected = {p.parent.name: p for p in sorted(ws.glob(UNIT_MAPPINGS))}
+    missing = [u for u, p in expected.items() if not p.is_file()]
+    if missing:
+        return Check("delete_evidence", "fail",
+                     f"unit mapping(s) missing for {', '.join(missing)}: expected "
+                     f"{unit_dir.relative_to(ws)}/<id>/mapping_spec.json (hand-off incomplete; report BLOCKED)",
+                     {"units": list(expected), "missing_units": missing, "mappings": {}})
+    todo = dict(expected)
+    seen = {p.resolve() for p in expected.values()}
+    for m in mappings:
+        if m.resolve() not in seen:
+            seen.add(m.resolve())
+            todo[str(m)] = m
+    if not todo:
+        return Check("delete_evidence", "skipped",
+                     f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}",
+                     {"units": [], "mappings": {}})
+    rows = {label: check_delete_evidence(p, source_secret, plugin_root, connect=connect, params=params)
+            for label, p in todo.items()}
+    worst = "fail" if any(c.status == "fail" for c in rows.values()) else "ok"
+    return Check("delete_evidence", worst, "; ".join(f"{label}: {c.detail}" for label, c in rows.items()),
+                 {"units": list(expected),
+                  "mappings": {label: {"status": c.status, "detail": c.detail, **(c.data or {})}
+                               for label, c in rows.items()}})
+
+
+def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root: Path,
+                          connect=_pyodbc_connect, params: dict[str, str] | None = None) -> Check:
+    """Every `delete_evidence` block a mapping declares must be answerable on the source before a
+    transactional recon run, under the exact access model the harness uses: CDC on for the
+    database; each declared capture instance visible to the migration identity through
+    sp_cdc_help_change_data_capture (db_owner, gating role, or SELECT on the captured columns: no
+    schema-wide SELECT on cdc is asked for); every mapped source key column among the capture's
+    captured columns; and one bounded call of the generated cdc.fn_cdc_get_all_changes_<capture>
+    over the single-position [max, max] range with the key columns and the object's root_where, so an
+    identity that cannot execute the function or a scope the capture cannot evaluate fails here
+    rather than mid-run. The metadata comparison folds case (CDC metadata keeps the declared
+    spelling, the mapping's spelling is what the server resolves under its collation); the probe,
+    sent with the mapping's spelling, is the exact check. Metadata reads only: CDC is a source-side
+    change the factory never makes (the doctor never runs sp_cdc_enable_*), so a red row here is a
+    customer decision to record, not a fix to apply."""
+    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
+    from recon.config import ConfigError, load_mapping_spec
+    try:
+        spec = load_mapping_spec(mapping, params)
+    except (ConfigError, OSError, ValueError) as e:
+        return Check("delete_evidence", "fail", f"{mapping}: {_redact(str(e))}")
+    declared = [(c.object, c.delete_evidence) for c in spec.objects if c.delete_evidence is not None]
+    if not declared:
+        return Check("delete_evidence", "ok", "no object declares delete_evidence (drain-before-run contract applies)")
+    kinds = sorted({de.kind for _, de in declared})
+    if kinds != ["sqlserver_cdc"]:
+        return Check("delete_evidence", "fail", f"unsupported delete_evidence kind(s) {kinds}")
+    if not source_secret:
+        return Check("delete_evidence", "fail",
+                     f"{len(declared)} object(s) declare delete_evidence; pass --source-secret NAME "
+                     "(env var holding the read-only source DSN) to verify CDC on the source")
+    dsn = os.environ.get(source_secret)
+    if not dsn:
+        return Check("delete_evidence", "fail", f"source secret {source_secret} is not set in the environment")
+    # capture -> [(key columns, scope)] as the harness will read it; the mapping validated the identifiers
+    reads: dict[str, list[tuple[list[str], str | None]]] = {}
+    for c in spec.objects:
+        if c.delete_evidence is not None:
+            reads.setdefault(c.delete_evidence.capture, []).append((list(c.key_source), c.root_where))
+    wanted = sorted(reads)
+    data: dict = {"kind": "sqlserver_cdc", "captures": wanted, "missing": [], "missing_columns": {}, "unreadable": {}}
+    fail = "delete_evidence", "fail"
+    try:
+        conn = connect(dsn)
+        try:
+            cur = conn.cursor()
+            (enabled,) = cur.execute(_CDC_QUERIES["is_cdc_enabled"]).fetchall()[0]
+            if not enabled:
+                return Check(*fail, "CDC is not enabled on the source database; enabling it is a source-side "
+                             "change (the factory never runs sp_cdc_enable_*): record the customer decision or "
+                             "drop delete_evidence and drain deletes before each run", data)
+            cur.execute(_CDC_QUERIES["captures"])
+            names = [d[0].lower() for d in cur.description]
+            cap_i, cols_i = names.index("capture_instance"), names.index("captured_column_list")
+            visible = {str(r[cap_i]).casefold(): [c.casefold() for c in _captured_columns(r[cols_i])]
+                       for r in cur.fetchall()}
+            data["missing"] = [c for c in wanted if c.casefold() not in visible]
+            if data["missing"]:
+                return Check(*fail, f"declared capture instance(s) not present or not readable by this identity "
+                             f"(db_owner, the capture's gating role, or SELECT on its captured columns): "
+                             f"{data['missing']}", data)
+            for cap in wanted:
+                keys = dict.fromkeys(k for key_cols, _ in reads[cap] for k in key_cols)
+                if absent := [k for k in keys if k.casefold() not in visible[cap.casefold()]]:
+                    data["missing_columns"][cap] = absent
+            if data["missing_columns"]:
+                return Check(*fail, "mapped source key column(s) are not captured, so deletes_since cannot "
+                             f"project the key: {data['missing_columns']}", data)
+            (hi,) = cur.execute(_CDC_QUERIES["max_lsn"]).fetchall()[0]
+            if hi is None:
+                return Check(*fail, "no change has been captured yet (fn_cdc_get_max_lsn is NULL): the evidence "
+                             "horizon is empty and every target-only key would be graded strictly", data)
+            for cap in wanted:
+                for key_cols, scope in reads[cap]:
+                    sql = _CDC_QUERIES["probe"].format(cols=", ".join(key_cols), capture=cap,
+                                                       scope=f" AND ({scope})" if scope else "")
+                    try:
+                        cur.execute(sql, (hi, hi)).fetchall()
+                    except Exception as e:  # noqa: BLE001 - the engine's refusal is the finding
+                        data["unreadable"][cap] = _redact(str(e))
+                        break
+            if data["unreadable"]:
+                return Check(*fail, "declared capture(s) cannot be read as the harness reads them (EXECUTE on "
+                             "cdc.fn_cdc_get_all_changes_<capture> with the key columns and root_where): "
+                             f"{data['unreadable']}", data)
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
+        return Check(*fail, f"source query failed: {_redact(str(e))}", data)
+    return Check("delete_evidence", "ok",
+                 f"sqlserver_cdc: {len(wanted)} capture instance(s) readable by this identity, key columns "
+                 "captured, scoped read probed", data)
+
+
 # ------------------------------------------------------------------ databricks identity
 
 _APPLICATION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
@@ -340,12 +512,15 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
 # ------------------------------------------------------------------ main
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
-        no_databricks: bool) -> dict:
+        no_databricks: bool, units: list[str] | None = None, mappings: list[Path] | None = None,
+        source_secret: str | None = None, params: dict[str, str] | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root)]
     checks += check_hooks(plugin_root, ws, probe_result)
     checks.append(check_official_plugin(plugin_root))
     checks.append(check_harness(plugin_root))
     checks.append(check_drivers())
+    checks.append(check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
+                                            params=params))
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -377,11 +552,25 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
     p.add_argument("--no-databricks", action="store_true",
                    help="skip CLI/identity checks (offline; the report is never ready)")
+    p.add_argument("--unit", action="append", default=[], metavar="UNIT_ID",
+                   help="(--role child) a unit of this batch, repeat per unit in the brief; its "
+                        ".migration/units/<id>/mapping_spec.json must exist and its declared delete_evidence "
+                        "is verified on the source. An orchestrator verifies every unit mapping in the workspace")
+    p.add_argument("--mapping", type=Path, action="append", default=[], metavar="MAPPING_SPEC",
+                   help="additional recon mapping_spec.json to verify (a candidate mapping at setup)")
+    p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
+    p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                   help="mapping ${NAME} placeholder value, same rules and values as dbx-recon run --param")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
+    params = None
+    if a.param:
+        sys.path.insert(0, str(a.plugin_root.resolve() / "skills" / "data-reconciliation" / "harness"))
+        from recon.cli import parse_params
+        params = parse_params(a.param)
 
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
-                 a.expect_identity, a.no_databricks)
+                 a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:

@@ -11,7 +11,13 @@ from collections.abc import Iterable
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from recon.adapters import DIGEST_MODULUS, IdentityState, SchemaFacts, Stratum
+from recon.adapters import (
+    DIGEST_MODULUS,
+    DeleteEvent,
+    IdentityState,
+    SchemaFacts,
+    Stratum,
+)
 from recon.canon import MISSING
 from recon.paths import get_path
 from recon.watermarks import instant, literal
@@ -350,6 +356,49 @@ class FakeSource(_TransactionalMixin):
         return sum(1 for n in counts.values() if n > 1)
 
 
+class FakeCdcSource(FakeSource):
+    """A source with a change stream (the `DeleteEvidence` protocol): `tombstones` maps a
+    capture name to the DeleteEvents it retains; the horizon is (oldest, newest) retained
+    position unless `horizons` pins it (a capture whose entry is (None, None) retains nothing).
+    `images` maps capture -> {key: before-image row} for evaluating a scope predicate; a tombstone
+    without one carries only its key columns, as a capture that kept nothing else would."""
+
+    kind = "sqlserver_cdc"
+
+    def __init__(self, tables, tombstones: dict[str, list[DeleteEvent]], horizons=None, images=None, **kw):
+        super().__init__(tables, **kw)
+        self.tombstones = tombstones
+        self.horizons = horizons or {}
+        self.images = images or {}
+
+    def delete_evidence_kind(self) -> str:
+        return self.kind
+
+    def evidence_horizon(self, capture):
+        self.calls["evidence_horizon"] += 1
+        self.statements += 1
+        if capture in self.horizons:
+            return self.horizons[capture]
+        positions = [e.position for e in self.tombstones.get(capture, [])]
+        if not positions:
+            return (None, None)
+        newest = max(positions)  # retention starts at the mechanism's zero unless pinned
+        return (bytes(len(newest)) if isinstance(newest, bytes) else 0), newest
+
+    def deletes_since(self, capture, key_cols, after, upto, where=None):
+        self.calls["deletes_since"] += 1
+        self.statements += 1
+        self.last_deletes_since = {"capture": capture, "key_cols": key_cols, "after": after, "upto": upto,
+                                   "where": where}
+        images = self.images.get(capture, {})
+        # an event of another position type is returned as is: the engine, not the fake, rejects it
+        out = [e for e in self.tombstones.get(capture, [])
+               if (type(e.position) is not type(after) or after < e.position <= upto)
+               and _matches(images.get(e.key, dict(zip(key_cols, e.key, strict=True))), where)]
+        self.rows_fetched += len(out)
+        return out
+
+
 class FakeTypedSource(FakeSource):
     """A source whose catalog says which columns are numeric (the `ColumnTypes` protocol), as
     the SQL Server and Postgres adapters do; typed from the fixture rows' Python values."""
@@ -359,6 +408,18 @@ class FakeTypedSource(FakeSource):
         self.statements += 1
         return {col for r in self.tables[table] for col, v in r.items()
                 if isinstance(v, _NUMERIC) and not isinstance(v, bool)}
+
+
+class FakeCheckpointTarget:
+    """Mixin: the `AppliedPosition` protocol over `positions`, {(table, column, where): position}."""
+    calls: Counter
+    statements: int
+    positions: dict
+
+    def applied_position(self, table, column, where):
+        self.calls["applied_position"] += 1
+        self.statements += 1
+        return self.positions[(table, column, where)]
 
 
 class FakeTarget(_TransactionalMixin):

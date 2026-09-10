@@ -5,7 +5,7 @@ description: Preflight for a DBX migration workspace. Verifies the Databricks CL
 
 # factory-doctor
 
-Ten checks, one JSON, no warehouse spend. The point is to find out *before* fifty children
+Eleven checks, one JSON, no warehouse spend. The point is to find out *before* fifty children
 launch that the session is a human identity, the harness is not installed, or the hooks are not
 being applied.
 
@@ -13,7 +13,12 @@ being applied.
 
 ```bash
 python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role orchestrator|child] \
-    [--expect-identity <migration SP userName>] [--hook-probe-result blocked|not-blocked]
+    [--expect-identity <migration SP userName>] [--hook-probe-result blocked|not-blocked] \
+    [--unit <unit_id> ...] [--mapping <candidate mapping_spec.json> ...] \
+    [--source-secret <ENV VAR NAME of the read-only source DSN> --param name=value ...]
+# --role child: one --unit per unit in the batch brief (the doctor resolves and checks
+# .migration/units/<id>/mapping_spec.json itself); an orchestrator checks every unit mapping in the
+# workspace. --source-secret/--param: the same values the recon run will get.
 ```
 
 Writes `.migration/09_capabilities.json` and prints one line per check. Exit 0 = `ready`.
@@ -50,6 +55,7 @@ doctor therefore reports `hook_platform_loaded: unverified` until you prove it:
 | `official_databricks_plugin` | `warn` if some routed official skills are missing on disk; `unverified` if none visible locally (they are platform-loaded via `requiredPlugins`) | `target-routing` |
 | `recon_harness` | `dbx-recon selftest` fails or the harness is not importable | `data-reconciliation` |
 | `recon_drivers` | `warn` if `databricks-sql-connector` is missing (live/snapshot recon impossible) | harness `pyproject.toml` extras |
+| `delete_evidence` | a mapping object declares `delete_evidence` but the source has CDC off, a declared capture instance is missing or not visible to the identity, a capture does not capture every mapped `key.source` column (named in the row), or the identity cannot call that capture's `fn_cdc_get_all_changes_<capture>` with the key columns and `root_where`; the set of mappings is resolved by the doctor, never typed: `--role child` must name its batch with `--unit` (omitted: `fail`; a named unit without `.migration/units/<id>/mapping_spec.json`: `fail`, hand-off incomplete) and an orchestrator covers every `.migration/units/*/mapping_spec.json` in the workspace, so a subset can never pass as the whole; `--mapping` adds a candidate spec on top; `skipped` (not applicable) only at setup, before a unit mapping exists. Three metadata reads plus one bounded read-only probe per object; no `SELECT` on the `cdc` schema is required, and the doctor never runs `sp_cdc_enable_*` (a source-side change is the customer's decision) | `data-reconciliation` |
 | `databricks_cli` | CLI not on PATH | `databricks-core` |
 | `databricks_auth_kind` | `warn` unless OAuth M2M env (`DATABRICKS_HOST/CLIENT_ID/CLIENT_SECRET`) | `target-routing` auth rules |
 | `databricks_identity` | `current-user me` fails, or differs from `--expect-identity`; `warn` if a human user (still blocks `ready`) | `07_access_checklist.md` |
