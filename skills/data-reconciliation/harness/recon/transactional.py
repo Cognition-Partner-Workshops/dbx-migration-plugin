@@ -89,6 +89,7 @@ class KeyDiff:
     behind: list[tuple] = field(default_factory=list)    # target older, source already applied
     in_flight_deletes: list[tuple] = field(default_factory=list)  # target-only, deleted in time
     delete_lagging: list[tuple] = field(default_factory=list)     # target-only, deleted too long ago
+    in_flight_delete_max_wm: Any = None  # newest target watermark among the in-flight deletes
 
 
 # What the evidence read established for one object (DeleteEvidenceResult.status):
@@ -527,6 +528,7 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         in_flight_updates: set[tuple] = set()
         ahead: set[tuple] = set()
         behind: set[tuple] = set()
+        extra_wm: dict[tuple, Any] = {}
         streamed = 0
         for i in streamed_ranges:
             lo, hi = ranges[i]
@@ -535,6 +537,9 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
             streamed += len(s_keys) + len(t_keys)
             s_index = {tuple(k[:nk]): k[nk:] for k in s_keys}
             t_index = {tuple(k[:nk]): k[nk:] for k in t_keys}
+            if has_wm:
+                extra_wm.update((k, rest[0]) for k, rest in t_index.items()
+                                if k not in s_index and rest and rest[0] is not None)
             for key, rest in s_index.items():
                 s_wm = rest[0] if has_wm and rest else None
                 unapplied = has_wm and hwm is not None and s_wm is not None and later(s_wm, hwm)
@@ -568,6 +573,11 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         diff.ahead, diff.behind = sorted(ahead, key=repr), sorted(behind, key=repr)
         diff.in_flight_deletes = sorted(in_flight_deletes, key=repr)
         diff.delete_lagging = sorted((k for k in extra if k in evidence.aged), key=repr)
+        for k in in_flight_deletes:
+            wm = extra_wm.get(k)
+            if wm is not None and (diff.in_flight_delete_max_wm is None
+                                   or later(wm, diff.in_flight_delete_max_wm)):
+                diff.in_flight_delete_max_wm = wm
         stats[c.object] = {"ranges": len(ranges), "population": n, "fingerprint": fingerprint,
                            "mismatched_ranges": len(streamed_ranges), "keys_streamed": streamed,
                            "missing_on_target": len(missing_l), "extra_on_target": len(extra_l),
@@ -616,13 +626,19 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         s_wm, t_wm = s_open[1], t_open[1]
         fam = family(s_wm if s_wm is not None else t_wm)
         unit = c.watermark_unit or ("datetime" if fam == "datetime" else None)
-        lag = lag_seconds(s_wm, t_wm, unit)
-        units = lag_units(s_wm, t_wm)
+        # the target's max is no measure of lag or order when the row carrying it is a source
+        # delete still in flight: it is newer than every source row because the source row is
+        # gone, not because the target replayed anything; per-key ordering below still grades
+        deleted_max = (t_wm is not None and diff.in_flight_delete_max_wm is not None
+                       and not later(t_wm, diff.in_flight_delete_max_wm))
+        lag = None if deleted_max else lag_seconds(s_wm, t_wm, unit)
+        units = None if deleted_max else lag_units(s_wm, t_wm)
         in_flight = ctx.in_flight(c)
         stats[c.object] = {"watermark": f"{c.watermark_source}->{c.watermark_target}",
                            "unit": unit, "source_max": s_wm, "target_max": t_wm, "lag_s": lag,
                            "lag_units": units, "in_flight": in_flight,
                            "in_flight_deletes": len(diff.in_flight_deletes),
+                           "target_max_from_in_flight_delete": deleted_max,
                            "rows_ahead_on_target": len(diff.ahead),
                            "rows_behind_on_target": len(diff.behind)}
         if diff.ahead:
@@ -637,7 +653,7 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                                     f"applied watermark {t_wm!r} but the target row is older: lost or "
                                     f"misordered change; first {min(len(diff.behind), MAX_KEYS_IN_FINDING)}: "
                                     f"{diff.behind[:MAX_KEYS_IN_FINDING]}"))
-        if s_wm is None and t_wm is None:
+        if (s_wm is None and t_wm is None) or deleted_max:
             continue
         if s_wm is None or t_wm is None or (fam == "datetime") != (unit == "datetime"):
             # one side null, or a declared unit that does not fit the values: nothing to order

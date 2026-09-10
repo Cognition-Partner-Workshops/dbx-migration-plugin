@@ -145,6 +145,32 @@ def test_an_aged_delete_the_target_already_applied_is_not_a_finding():
     assert _tier(result, "pk_set_diff")["stats"]["loans"]["delete_evidence"]["aged_deletes"] == 1
 
 
+def test_an_in_flight_delete_of_the_newest_row_does_not_put_the_target_ahead_of_the_source():
+    # loan 12 carries the source's max watermark; deleting it leaves the target's max newer than
+    # the source's, which is the delete in flight, not a replayed or misordered apply
+    loans, borrowers = _rows(12)
+    src, tgt = _deleted(loans, 12)
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(12, 15, 5.0)]}, applied=10)
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "PASS", json.dumps(result["tiers"], default=str, indent=1)
+    cdc = _tier(result, "cdc_lag_ordering")
+    assert cdc["findings"] == []
+    assert cdc["stats"]["loans"]["in_flight_deletes"] == 1
+    assert cdc["stats"]["loans"]["target_max_from_in_flight_delete"] is True
+    assert cdc["stats"]["loans"]["lag_s"] is None
+
+
+def test_a_target_row_newer_than_every_source_row_still_reads_ahead_when_no_delete_explains_it():
+    loans, borrowers = _rows(12)
+    src, tgt = _deleted(loans, 3)
+    tgt.append(_loan(500, changed=99, borrower_id=1))
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 15, 5.0)]}, applied=10)
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    cdc = _tier(result, "cdc_lag_ordering")
+    assert [f["check"] for f in cdc["findings"]] == ["target_ahead_of_source"]
+    assert cdc["stats"]["loans"]["target_max_from_in_flight_delete"] is False
+
+
 def test_an_applied_position_older_than_the_retained_horizon_is_a_retention_gap():
     loans, borrowers = _rows(12)
     src, tgt = _deleted(loans, 3)
