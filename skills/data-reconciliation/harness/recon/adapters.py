@@ -17,10 +17,10 @@ import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
-from .paths import get_path
+from .fingerprint import DIGEST_MODULUS
+from .fingerprint import normalise as _digest_value
 from .watermarks import instant
 from .watermarks import literal as watermark_literal
 
@@ -39,13 +39,6 @@ def _as_key(value: Any) -> tuple:
     return value if isinstance(value, tuple) else (value,)
 
 
-# Range fingerprints carry two moments per digested column: the exact sum and the sum of
-# squared residues modulo this Mersenne prime (2^31 - 1). Two multisets that agree on count,
-# sum and sum of squares must differ in at least three elements, so any one- or two-key
-# substitution inside a range is provably visible; the modulus keeps a bigint key's or an
-# epoch-microsecond datetime's square inside DECIMAL(38,0) on every engine.
-DIGEST_MODULUS = 2_147_483_647
-
 # How often a fallback window marker re-reads (token, count/max, token) before giving up on a
 # quiet bracket and recording the unstable pair instead.
 MARKER_BRACKET_ATTEMPTS = 3
@@ -60,20 +53,6 @@ def _fk_action(raw: str) -> str:
     """One spelling for a referential action across pg_constraint codes and sys.foreign_keys
     descriptions."""
     return _FK_ACTIONS.get(str(raw).lower(), str(raw).lower())
-
-
-def _digest_value(value: Any) -> Any:
-    """Normalise an engine's SUM result so equal digests compare equal across drivers
-    (Decimal('5.000000') vs int 5 vs float 5.0)."""
-    if value is None:
-        return 0
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, float):
-        return int(value) if value.is_integer() else value
-    if isinstance(value, Decimal):
-        return int(value) if value == value.to_integral_value() else value
-    return value
 
 
 @dataclass
@@ -294,9 +273,7 @@ AGG_SQL = ("SELECT COUNT(*) AS n, COUNT({col}) AS nonnull, MIN({col}) AS mn, "
 
 
 # Bucket expression assigning each row to one of {n} equal-count strata ordered by key.
-# ANSI NTILE everywhere except Teradata, which only has QUANTILE (0-based).
 NTILE_SQL = "NTILE({n}) OVER (ORDER BY {order})"
-TERADATA_QUANTILE_SQL = "QUANTILE({n}, {order}) + 1"
 
 
 class _SqlAdapterBase:
@@ -584,7 +561,7 @@ class _SqlAdapterBase:
         if hasattr(self._conn, "rollback"):
             try:
                 self._conn.rollback()
-            except Exception:  # noqa: BLE001  nothing to roll back on some drivers
+            except Exception:  # noqa: BLE001, S110  nothing to roll back on some drivers
                 pass
         if self.snapshot_sql:
             try:
@@ -638,7 +615,7 @@ class _SqlAdapterBase:
         if self.isolation in ("snapshot", "repeatable_read"):
             try:
                 return tuple(self._rows(sql)[0])
-            except Exception:  # noqa: BLE001  driver-specific error type
+            except Exception:
                 if self.isolation != "snapshot":
                     raise
                 # SQL Server accepts SET ... SNAPSHOT and only fails on the first table read when
@@ -765,44 +742,31 @@ class _SqlAdapterBase:
 
 # ---- Source warehouses ------------------------------------------------------------------
 
-class RedshiftSourceAdapter(_SqlAdapterBase):
-    """Secret value: a libpq DSN, e.g. postgresql://user:pw@host:5439/db (read-only user)."""
+class _UntestedSourceAdapter(_SqlAdapterBase):
+    """A family the front door names but no engine has ever run: the registry row stays so a
+    mapping or `--family` naming it fails at load with this message instead of connecting to
+    an unverified statement set. The live-tested sources are SqlServer, Postgres, Databricks."""
 
-    paramstyle = "format"
-    def __init__(self, dsn_secret: str):
-        import psycopg2  # lazy: optional extra
-        super().__init__(psycopg2.connect(_secret(dsn_secret)))
-
-
-class SnowflakeSourceAdapter(_SqlAdapterBase):
-    """Secret value: JSON with account, user, password, warehouse, database, schema, role."""
-
-    paramstyle = "format"
-    def __init__(self, dsn_secret: str):
-        import snowflake.connector  # lazy: optional extra
-        super().__init__(snowflake.connector.connect(**json.loads(_secret(dsn_secret))))
-
-
-class TeradataSourceAdapter(_SqlAdapterBase):
-    """Secret value: JSON accepted by teradatasql.connect (host, user, password, ...)."""
-
-    bucket_sql = TERADATA_QUANTILE_SQL
-    mod_sql = "({x} MOD {m})"
+    family: str
 
     def __init__(self, dsn_secret: str):
-        import teradatasql  # lazy: optional extra
-        super().__init__(teradatasql.connect(_secret(dsn_secret)))
+        raise NotImplementedError(f"{self.family} source adapter is untested; see SKILL.md")
 
 
-class OracleSourceAdapter(_SqlAdapterBase):
-    """Secret value: user/password/dsn."""
+class RedshiftSourceAdapter(_UntestedSourceAdapter):
+    family = "redshift"
 
-    paramstyle = "named"
 
-    def __init__(self, dsn_secret: str):
-        import oracledb  # lazy: optional extra
-        user, password, dsn = _secret(dsn_secret).split("/", 2)
-        super().__init__(oracledb.connect(user=user, password=password, dsn=dsn))
+class SnowflakeSourceAdapter(_UntestedSourceAdapter):
+    family = "snowflake"
+
+
+class TeradataSourceAdapter(_UntestedSourceAdapter):
+    family = "teradata"
+
+
+class OracleSourceAdapter(_UntestedSourceAdapter):
+    family = "oracle"
 
 
 def _key_text(value: Any) -> str | None:

@@ -19,9 +19,15 @@ import uuid as uuid_mod
 from pathlib import Path
 
 from . import canon, engine, report  # noqa: F401
-from .config import (CanonRule, ConfigError, READ_ONLY_SQL_KEYWORDS,
-                     load_canon_rules, load_mapping_spec, load_tolerances,
-                     validate_identifier)
+from .config import (
+    READ_ONLY_SQL_KEYWORDS,
+    CanonRule,
+    ConfigError,
+    load_canon_rules,
+    load_mapping_spec,
+    load_tolerances,
+    validate_identifier,
+)
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
 

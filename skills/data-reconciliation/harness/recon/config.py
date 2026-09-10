@@ -22,9 +22,6 @@ IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)
 READ_ONLY_SQL_KEYWORDS = re.compile(
     r"\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|call|"
     r"exec|execute|copy|unload|into)\b", re.IGNORECASE)
-READ_ONLY_PREDICATE_KEYWORDS = re.compile(
-    r"\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|call|"
-    r"exec|execute|copy|unload|into|union)\b", re.IGNORECASE)
 
 
 def validate_identifier(name: str) -> str:
@@ -33,11 +30,114 @@ def validate_identifier(name: str) -> str:
     return name
 
 
-def _validate_predicate(value: str | None) -> str | None:
-    if (value is not None and
-            (any(token in value for token in (";", "--", "/*"))
-             or READ_ONLY_PREDICATE_KEYWORDS.search(value))):
-        raise ConfigError("predicates must be a single expression")
+# Mapping predicates (root_where, target_where, child_where, applied_position.where) are spliced
+# raw into SQL on both sides, so only this grammar is admitted; the first token outside it is named:
+#   predicate := term ((AND|OR) term)*
+#   term      := NOT term | '(' predicate ')' | operand comparison
+#   comparison := (= | <> | != | < | <= | > | >=) operand | IS [NOT] NULL | [NOT] LIKE operand
+#              | [NOT] IN '(' literal (',' literal)* ')' | [NOT] BETWEEN operand AND operand
+#   operand   := identifier | literal        (identifiers may be qualified, [..] or ".." quoted)
+#   literal   := 'string' | number | (DATE|TIMESTAMP) 'string' | ${param}
+_SEGMENT = r'(?:[A-Za-z_][\w$]*|\[[^\]]+\]|"(?:[^"]|"")+")'
+_PREDICATE_TOKEN = re.compile(
+    r"\s+|(?P<string>'(?:[^']|'')*')|(?P<param>\$\{\w+\})"
+    r"|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    rf"|(?P<word>{_SEGMENT}(?:\.{_SEGMENT})*)|(?P<punct><>|!=|<=|>=|[=<>(),])")
+_KEYWORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "date", "timestamp"}
+_RESERVED = {"select", "from", "where", "exists", "case", "when", "then", "else", "end", "union",
+             "join", *READ_ONLY_SQL_KEYWORDS.pattern[3:-3].split("|")}
+
+
+class _Predicate:
+    def __init__(self, text: str):
+        self.text, self.tokens, pos = text, [], 0
+        while pos < len(text):
+            m = _PREDICATE_TOKEN.match(text, pos)
+            if not m:
+                self.fail(re.match(r"\S+", text[pos:]).group())
+            if m.lastgroup:
+                self.tokens.append((m.lastgroup, m.group()))
+            pos = m.end()
+        self.i = 0
+
+    def fail(self, token: str | None = None):
+        got = repr(token if token is not None else self.tokens[self.i][1]) \
+            if token is not None or self.i < len(self.tokens) else "end of predicate"
+        raise ConfigError(f"predicates must be a single expression: unexpected {got} in {self.text!r}")
+
+    def take(self, *wanted: str) -> bool:
+        if self.i < len(self.tokens) and self.tokens[self.i][1].lower() in wanted:
+            self.i += 1
+            return True
+        return False
+
+    def expect(self, *wanted: str) -> None:
+        if not self.take(*wanted):
+            self.fail()
+
+    def parse(self) -> None:
+        self.predicate()
+        if self.i < len(self.tokens):
+            self.fail()
+
+    def predicate(self) -> None:
+        self.term()
+        while self.take("and", "or"):
+            self.term()
+
+    def term(self) -> None:
+        if self.take("not"):
+            return self.term()
+        if self.take("("):
+            self.predicate()
+            return self.expect(")")
+        self.operand()
+        if self.take("=", "<>", "!=", "<", "<=", ">", ">="):
+            return self.operand()
+        negated = self.take("not")
+        if self.take("in"):
+            self.expect("(")
+            self.literal()
+            while self.take(","):
+                self.literal()
+            self.expect(")")
+        elif self.take("between"):
+            self.operand()
+            self.expect("and")
+            self.operand()
+        elif self.take("like"):
+            self.operand()
+        elif not negated and self.take("is"):
+            self.take("not")
+            self.expect("null")
+        else:
+            self.fail()
+
+    def operand(self) -> None:
+        kind, text = self.tokens[self.i] if self.i < len(self.tokens) else (None, "")
+        if kind == "word" and text.lower() not in _KEYWORDS:
+            if text.lower() in _RESERVED:
+                self.fail()
+            if self.i + 1 < len(self.tokens) and self.tokens[self.i + 1][1] == "(":
+                self.fail(text + "(")
+            self.i += 1
+        else:
+            self.literal()
+
+    def literal(self) -> None:
+        kind = self.tokens[self.i][0] if self.i < len(self.tokens) else None
+        if self.take("date", "timestamp"):
+            kind = self.tokens[self.i][0] if self.i < len(self.tokens) else None
+            if kind != "string":
+                self.fail()
+        if kind not in ("string", "number", "param"):
+            self.fail()
+        self.i += 1
+
+
+def validate_predicate(value: str | None) -> str | None:
+    if value is not None:
+        _Predicate(value).parse()
     return value
 
 
@@ -262,7 +362,7 @@ def _validate_delete_evidence(block: Any) -> None:
     where = applied.get("where")
     if where is not None and not isinstance(where, str):
         raise ConfigError("delete_evidence.applied_position.where must be a string predicate")
-    _validate_predicate(where)
+    validate_predicate(where)
 
 
 def _delete_evidence(c: dict, params: dict[str, str], path: Path) -> DeleteEvidenceSpec | None:
@@ -273,7 +373,7 @@ def _delete_evidence(c: dict, params: dict[str, str], path: Path) -> DeleteEvide
     return DeleteEvidenceSpec(
         kind=block["kind"], capture=block["capture"],
         applied_table=applied["table"], applied_column=applied["column"],
-        applied_where=_validate_predicate(substitute_params(applied.get("where"), params, path)))
+        applied_where=validate_predicate(substitute_params(applied.get("where"), params, path)))
 
 
 def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> MappingSpec:
@@ -289,8 +389,8 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             ekey = e.get("key") or {}
             embeds.append(EmbedMapping(
                 array_path=e["array_path"], child_table=e["child_table"],
-                child_where=_validate_predicate(substitute_params(e.get("child_where"), params, path)),
-                target_where=_validate_predicate(substitute_params(e.get("target_where"), params, path)),
+                child_where=validate_predicate(substitute_params(e.get("child_where"), params, path)),
+                target_where=validate_predicate(substitute_params(e.get("target_where"), params, path)),
                 parent_key=list(e.get("parent_key", [])),
                 key_source=list(ekey.get("source", [])), key_target=ekey.get("target", ""),
                 fields=_field_mappings(e.get("fields", [])),
@@ -308,8 +408,8 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             object=c.get("object") or c["target_table"], root_table=c.get("root_table") or c["source_table"],
             key_source=list(key["source"]), key_target=key_targets,
             fields=fields_, embeds=embeds,
-            root_where=_validate_predicate(substitute_params(c.get("root_where"), params, path)),
-            target_where=_validate_predicate(substitute_params(c.get("target_where"), params, path)),
+            root_where=validate_predicate(substitute_params(c.get("root_where"), params, path)),
+            target_where=validate_predicate(substitute_params(c.get("target_where"), params, path)),
             watermark_source=(c.get("watermark") or {}).get("source"),
             watermark_target=(c.get("watermark") or {}).get("target"),
             watermark_unit=(c.get("watermark") or {}).get("unit"),

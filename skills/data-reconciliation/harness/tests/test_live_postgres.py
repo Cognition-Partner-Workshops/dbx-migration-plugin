@@ -7,7 +7,6 @@ import uuid
 from decimal import Decimal
 
 import pytest
-
 from recon.adapters import (
     LakebaseTargetAdapter,
     PostgresSourceAdapter,

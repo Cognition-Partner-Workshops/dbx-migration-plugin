@@ -5,7 +5,6 @@ import decimal
 import uuid
 
 import pytest
-
 from recon.canon import MISSING, CanonError, Canonicalizer
 from recon.config import CanonRule
 
@@ -25,7 +24,7 @@ def test_decimal_round_half_even():
 def test_datetime_utc_truncate_ms():
     c = canon(("datetime_utc_truncate_ms", {}))
     src = dt.datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=dt.timezone(dt.timedelta(hours=2)))
-    tgt = dt.datetime(2026, 1, 2, 1, 4, 5, 123000)  # UTC, ms precision
+    tgt = dt.datetime(2026, 1, 2, 1, 4, 5, 123000)  # noqa: DTZ001  UTC, ms precision
     ok, fired = c.equal(src, tgt, ["datetime_utc_truncate_ms"])
     assert ok and "datetime_utc_truncate_ms" in fired
 
@@ -33,11 +32,11 @@ def test_datetime_utc_truncate_ms():
 def test_datetime_grid_333():
     c = canon(("datetime_grid_333", {}))
     # SQL Server snapped .997 -> BSON stored .997; app wrote 1.000 on the mongo side
-    src = dt.datetime(2026, 1, 2, 3, 4, 5, 997000)
-    tgt = dt.datetime(2026, 1, 2, 3, 4, 6, 0)
+    src = dt.datetime(2026, 1, 2, 3, 4, 5, 997000)  # noqa: DTZ001
+    tgt = dt.datetime(2026, 1, 2, 3, 4, 6, 0)  # noqa: DTZ001
     ok, fired = c.equal(src, tgt, ["datetime_grid_333"])
     assert ok and "datetime_grid_333" in fired
-    assert not c.equal(src, dt.datetime(2026, 1, 2, 3, 4, 5, 950000), ["datetime_grid_333"])[0]
+    assert not c.equal(src, dt.datetime(2026, 1, 2, 3, 4, 5, 950000), ["datetime_grid_333"])[0]  # noqa: DTZ001
 
 
 def test_rstrip_spaces():

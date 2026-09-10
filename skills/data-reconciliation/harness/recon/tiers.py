@@ -441,13 +441,13 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
         previous_source_key = None
         source_run_count = 0
 
-        def record_source_key(key):
+        def record_source_key(key, runs=duplicate_source_runs):
             nonlocal previous_source_key, source_run_count
             if source_run_count and key == previous_source_key:
                 source_run_count += 1
                 return
             if source_run_count > 1:
-                duplicate_source_runs.append((previous_source_key, source_run_count))
+                runs.append((previous_source_key, source_run_count))
             previous_source_key = key
             source_run_count = 1
 
@@ -463,11 +463,9 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                                "coverage": round(len(src_rows) / n, 6) if n else 1.0}
         elif sampled:
             first, last, reservoir = [], [], []
-            seen = 0
-            for raw_key in source.iter_keys(c.root_table, c.key_source, c.root_where):
+            for seen, raw_key in enumerate(source.iter_keys(c.root_table, c.key_source, c.root_where), 1):
                 key = tuple(raw_key)
                 record_source_key(key)
-                seen += 1
                 if len(first) < 2:
                     first.append(key)
                 last = (last + [key])[-2:]
