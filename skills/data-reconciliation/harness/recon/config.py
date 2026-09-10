@@ -72,6 +72,23 @@ class EmbedMapping:
 # meaning, so lag is graded as the number of unapplied source rows against cdc_in_flight_max_rows.
 WATERMARK_UNITS = ("datetime", "epoch_s", "epoch_ms", "epoch_us", "counter")
 
+# Change streams the harness can read committed deletes from. sqlserver_cdc: the capture
+# instance's change table via cdc.fn_cdc_get_all_changes_<capture>, LSN positions.
+DELETE_EVIDENCE_KINDS = ("sqlserver_cdc",)
+
+
+@dataclass(frozen=True)
+class DeleteEvidenceSpec:
+    """Where tier 5 finds tombstones for one object: the source capture (CDC capture instance)
+    and the target column that records the last source position the feed applied (a checkpoint
+    row, or MAX over a landing table), read as MAX(applied_column) FROM applied_table WHERE
+    applied_where. Without this block every target-only key stays a finding."""
+    kind: str
+    capture: str
+    applied_table: str
+    applied_column: str
+    applied_where: str | None = None
+
 
 @dataclass(frozen=True)
 class ObjectMapping:
@@ -93,6 +110,7 @@ class ObjectMapping:
     watermark_unit: str | None = None
     identity_source: str | None = None
     identity_target: str | None = None
+    delete_evidence: DeleteEvidenceSpec | None = None
 
     def __post_init__(self):
         if isinstance(self.key_target, str):
@@ -200,6 +218,8 @@ def _validate_mapping_identifiers(c: dict) -> None:
         if block == "watermark" and pair.get("unit") is not None and pair["unit"] not in WATERMARK_UNITS:
             raise ConfigError(f"watermark unit must be one of {', '.join(WATERMARK_UNITS)}, "
                               f"got {pair['unit']!r}")
+    if c.get("delete_evidence") is not None:
+        _validate_delete_evidence(c["delete_evidence"])
     for e in c.get("embeds", []):
         validate_identifier(e["array_path"])
         validate_identifier(e["child_table"])
@@ -213,6 +233,38 @@ def _validate_mapping_identifiers(c: dict) -> None:
         for f in e.get("fields", []):
             validate_identifier(f["source"])
             validate_identifier(f["target"])
+
+
+def _validate_delete_evidence(block: Any) -> None:
+    if not isinstance(block, dict):
+        raise ConfigError("delete_evidence must be an object")
+    if block.get("kind") not in DELETE_EVIDENCE_KINDS:
+        raise ConfigError(f"delete_evidence.kind must be one of {', '.join(DELETE_EVIDENCE_KINDS)}, "
+                          f"got {block.get('kind')!r}")
+    if not isinstance(block.get("capture"), str) or not block["capture"]:
+        raise ConfigError("delete_evidence.capture must name the source capture instance")
+    validate_identifier(block["capture"])
+    applied = block.get("applied_position")
+    if not isinstance(applied, dict) or not applied.get("table") or not applied.get("column"):
+        raise ConfigError("delete_evidence.applied_position must be an object with the target "
+                          "table and column holding the last applied source position")
+    validate_identifier(applied["table"])
+    validate_identifier(applied["column"])
+    where = applied.get("where")
+    if where is not None and not isinstance(where, str):
+        raise ConfigError("delete_evidence.applied_position.where must be a string predicate")
+    _validate_predicate(where)
+
+
+def _delete_evidence(c: dict, params: dict[str, str], path: Path) -> DeleteEvidenceSpec | None:
+    block = c.get("delete_evidence")
+    if block is None:
+        return None
+    applied = block["applied_position"]
+    return DeleteEvidenceSpec(
+        kind=block["kind"], capture=block["capture"],
+        applied_table=applied["table"], applied_column=applied["column"],
+        applied_where=_validate_predicate(substitute_params(applied.get("where"), params, path)))
 
 
 def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> MappingSpec:
@@ -254,6 +306,7 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             watermark_unit=(c.get("watermark") or {}).get("unit"),
             identity_source=(c.get("identity") or {}).get("source"),
             identity_target=(c.get("identity") or {}).get("target"),
+            delete_evidence=_delete_evidence(c, params, path),
         ))
     if not objects:
         raise ConfigError(f"{path}: mapping spec has no objects")

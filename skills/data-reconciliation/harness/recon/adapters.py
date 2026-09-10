@@ -231,6 +231,41 @@ class TransactionalSide(Protocol):
     def identity_state(self, table: str, column: str) -> IdentityState | None: ...
 
 
+# A change-stream position: opaque, totally ordered within one mechanism (SQL Server CDC LSNs are
+# 10-byte binaries, Change Tracking versions are integers). Positions from different mechanisms
+# are never comparable; the evidence layer refuses a pair whose types or widths differ.
+Position = bytes | int
+
+
+@dataclass(frozen=True)
+class DeleteEvent:
+    """One row deleted on the source: its comparison key, the position the delete committed at,
+    and how many seconds ago that was on the source's own clock when the evidence was read."""
+    key: tuple
+    position: Position
+    age_s: float
+
+
+@runtime_checkable
+class DeleteEvidence(Protocol):
+    """A source that can list its committed deletes from a change stream (tombstones). Tier 5
+    uses it to tell an in-flight delete (deleted on the source after the target's applied
+    position, inside cdc_lag_max_s) from a stray target write. `evidence_horizon` is the
+    (oldest retained, newest) position pair of one capture; `deletes_since` lists the deletes
+    whose position is after `after` and at or before `upto`. One statement each."""
+    def delete_evidence_kind(self) -> str: ...
+    def evidence_horizon(self, capture: str) -> tuple[Position | None, Position | None]: ...
+    def deletes_since(self, capture: str, key_cols: list[str], after: Position,
+                      upto: Position) -> list[DeleteEvent]: ...
+
+
+@runtime_checkable
+class AppliedPosition(Protocol):
+    """A target that records how far into the source change stream its feed has applied:
+    MAX(column) of a checkpoint or landing table under an optional predicate (one statement)."""
+    def applied_position(self, table: str, column: str, where: str | None) -> Position | None: ...
+
+
 @runtime_checkable
 class NullKeyCounting(Protocol):
     """Rows whose comparison key has a NULL component. Such rows cannot be matched, bounded by

@@ -36,7 +36,7 @@ def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
     tgt: dict[str, int] = {"tier1": 0, "tier2": 0, "tier3": 0, "tier4": ops}
     if mode == "transactional":
         for side in (src, tgt):
-            side.update({"tier0": 0, "tier5": 0, "tier6": 0, "tier7": 0})
+            side.update({"tier0": 0, "tier5": 0, "tier6": 0, "tier7": 0, "delete_evidence": 0})
     rows_src: int | None = 0
     rows_tgt: int | None = 0
     modes: dict[str, str] = {}
@@ -92,6 +92,10 @@ def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
             # mismatched ranges (unknown ahead of the run, estimated at zero)
             src["tier5"] += 3
             tgt["tier5"] += 1
+            if c.delete_evidence is not None:
+                # applied position on the target; retained horizon + deletes since on the source
+                src["delete_evidence"] += 2
+                tgt["delete_evidence"] += 1
             src["tier7"] += SCHEMA_FACT_STATEMENTS + (2 if c.identity_source else 0)
             tgt["tier7"] += SCHEMA_FACT_STATEMENTS + (2 if c.identity_target else 0)
         src["tier3"] += sum(1 for e in c.embeds if e.parent_key and e.fields)

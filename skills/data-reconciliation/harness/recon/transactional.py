@@ -15,9 +15,12 @@ never still, so this mode adds what a set-based diff cannot say:
                                fingerprint differs; a swapped key or a moved watermark is caught
                                even when the counts agree. Missing keys whose source watermark
                                is newer than the target's applied watermark are in flight, not
-                               defects. The allowance never covers a target-only key: a deleted
-                               source row leaves no watermark to date the delete by, so deletes
-                               must be drained before the run and every extra key is a finding
+                               defects. A target-only key is an in-flight delete only when the
+                               source's change stream (delete_evidence in the mapping) shows it
+                               deleted after the target's applied position and inside
+                               cdc_lag_max_s; without that evidence a deleted source row leaves
+                               nothing to date the delete by, so deletes must be drained before
+                               the run and every extra key is a finding
   tier 6  cdc_lag_ordering     max(source watermark) - max(target watermark) against the
                                tolerance, plus the per-key ordering that tier 5 streamed: a
                                target row ahead of its source row is a replay/ordering
@@ -40,7 +43,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .adapters import (
+    AppliedPosition,
+    DeleteEvent,
+    DeleteEvidence,
     SchemaFacts,
+    StatementCounting,
     StratifiedKeys,
     TransactionalSide,
     WholeNumberColumns,
@@ -80,6 +87,117 @@ class KeyDiff:
     in_flight_updates: int = 0
     ahead: list[tuple] = field(default_factory=list)     # target watermark newer than source
     behind: list[tuple] = field(default_factory=list)    # target older, source already applied
+    in_flight_deletes: list[tuple] = field(default_factory=list)  # target-only, deleted in time
+    delete_lagging: list[tuple] = field(default_factory=list)     # target-only, deleted too long ago
+
+
+# What the evidence read established for one object (DeleteEvidenceResult.status):
+#   absent         no delete_evidence declared; every target-only key is a finding
+#   unsupported    declared, but a side does not implement DeleteEvidence / AppliedPosition
+#   no_position    the target has recorded no applied position yet
+#   unavailable    the capture retains no positions (not enabled, or nothing captured)
+#   incompatible   applied position and stream positions are of different mechanisms
+#   retention_gap  the target's applied position is older than the oldest retained change
+#   ok             deletes after the applied position were read
+# Every status but `ok` keeps the strict behaviour: no target-only key is demoted.
+EVIDENCE_STRICT = ("absent", "unsupported", "no_position", "unavailable", "incompatible",
+                   "retention_gap")
+
+
+@dataclass
+class DeleteEvidenceResult:
+    status: str
+    kind: str | None = None
+    applied: Any = None
+    horizon: tuple = (None, None)
+    events: int = 0
+    in_flight: dict[tuple, DeleteEvent] = field(default_factory=dict)  # inside cdc_lag_max_s
+    aged: dict[tuple, DeleteEvent] = field(default_factory=dict)       # older than cdc_lag_max_s
+    detail: str = ""
+
+    def as_stats(self) -> dict[str, Any]:
+        return {"status": self.status, "kind": self.kind, "applied_position": _pos(self.applied),
+                "horizon": [_pos(self.horizon[0]), _pos(self.horizon[1])], "events": self.events,
+                "in_flight_deletes": len(self.in_flight), "aged_deletes": len(self.aged),
+                "detail": self.detail}
+
+
+def _pos(p: Any) -> Any:
+    return p.hex() if isinstance(p, (bytes, bytearray, memoryview)) else p
+
+
+def _compatible(a: Any, b: Any) -> bool:
+    """Two positions of one mechanism: both whole numbers, or both binaries of one width."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return False
+    if isinstance(a, int) and isinstance(b, int):
+        return True
+    return isinstance(a, bytes) and isinstance(b, bytes) and len(a) == len(b)
+
+
+def _as_position(value: Any) -> Any:
+    return bytes(value) if isinstance(value, (bytearray, memoryview)) else value
+
+
+def resolve_delete_evidence(c: ObjectMapping, tol: Tolerances, source, target) -> DeleteEvidenceResult:
+    """Read the tombstones one object needs, inside the window: the target's applied position,
+    the capture's retained horizon, then the deletes after that position (three statements).
+    Only a key deleted after the applied position and no longer ago than cdc_lag_max_s becomes
+    an in-flight delete; the latest position per key wins when a key was deleted more than
+    once. Anything the evidence cannot vouch for leaves the strict behaviour in force."""
+    de = c.delete_evidence
+    if de is None:
+        return DeleteEvidenceResult("absent", detail="no delete_evidence declared for this object")
+    if not isinstance(source, DeleteEvidence) or not isinstance(target, AppliedPosition):
+        return DeleteEvidenceResult(
+            "unsupported", de.kind,
+            detail=f"{type(source).__name__} / {type(target).__name__} do not expose delete "
+                   "evidence and an applied position")
+    kind = source.delete_evidence_kind()
+    if kind != de.kind:
+        raise ConfigError(f"{c.object}: delete_evidence.kind {de.kind!r} but the source adapter "
+                          f"reads {kind!r}")
+    applied = _as_position(target.applied_position(de.applied_table, de.applied_column,
+                                                   de.applied_where))
+    if applied is None:
+        return DeleteEvidenceResult("no_position", kind,
+                                    detail=f"{de.applied_table}.{de.applied_column} holds no applied position")
+    lo, hi = (_as_position(p) for p in source.evidence_horizon(de.capture))
+    result = DeleteEvidenceResult("ok", kind, applied, (lo, hi))
+    if lo is None or hi is None:
+        result.status, result.detail = "unavailable", f"capture {de.capture!r} retains no positions"
+        return result
+    if not (_compatible(applied, lo) and _compatible(applied, hi)):
+        result.status = "incompatible"
+        result.detail = (f"applied position {type(applied).__name__} cannot be ordered against "
+                         f"{kind} positions {type(lo).__name__}")
+        return result
+    if applied < lo:
+        result.status = "retention_gap"
+        result.detail = (f"target applied position {_pos(applied)} is older than the oldest "
+                         f"retained change {_pos(lo)}: deletes between them are unknowable")
+        return result
+    if applied >= hi:
+        result.detail = "target has applied every retained change"
+        return result
+    latest: dict[tuple, DeleteEvent] = {}
+    for ev in source.deletes_since(de.capture, c.key_source, applied, hi):
+        pos = _as_position(ev.position)
+        if not _compatible(pos, applied):
+            result.status = "incompatible"
+            result.detail = f"delete event position {type(pos).__name__} does not match {type(applied).__name__}"
+            result.in_flight, result.aged = {}, {}
+            return result
+        if pos <= applied or pos > hi:
+            continue
+        result.events += 1
+        key = tuple(ev.key)
+        if key not in latest or pos > _as_position(latest[key].position):
+            latest[key] = ev
+    for key, ev in latest.items():
+        (result.in_flight if ev.age_s <= tol.cdc_lag_max_s else result.aged)[key] = ev
+    result.detail = f"{result.events} delete events after the applied position"
+    return result
 
 
 @dataclass
@@ -92,9 +210,23 @@ class TransactionalContext:
     render: Callable[[Any], str] = literal
     # each side's window strength once the opening markers are read; close_window compares
     strength_open: dict[str, str] = field(default_factory=dict)
+    deletes: dict[str, DeleteEvidenceResult] = field(default_factory=dict)
+    # statements the delete-evidence reads cost on each side (a cost line of their own)
+    evidence_statements: dict[str, int] = field(default_factory=lambda: {"source": 0, "target": 0})
 
     def in_flight(self, c: ObjectMapping) -> int:
         return self.windows.get(c.object, ObjectWindow()).in_flight
+
+    def delete_evidence(self, c: ObjectMapping) -> DeleteEvidenceResult:
+        return self.deletes.get(c.object) or DeleteEvidenceResult("absent")
+
+    def in_flight_deletes(self, c: ObjectMapping) -> int:
+        """Source keys deleted after the target's applied position, inside the lag tolerance:
+        the most target-only rows the feed may legitimately still hold (upper bound)."""
+        return len(self.delete_evidence(c).in_flight)
+
+    def in_flight_delete_keys(self, c: ObjectMapping) -> list[tuple]:
+        return sorted(self.delete_evidence(c).in_flight, key=repr)
 
     def hwm(self, c: ObjectMapping) -> Any:
         return self.windows.get(c.object, ObjectWindow()).hwm_target
@@ -134,8 +266,10 @@ def require_transactional(source, target) -> None:
                               f"TransactionalSide; {type(adapter).__name__} does not")
 
 
-def open_window(spec: MappingSpec, source, target) -> TransactionalContext:
-    """Pin both sides, read the opening markers, and measure the in-flight set per object."""
+def open_window(spec: MappingSpec, source, target,
+                tol: Tolerances | None = None) -> TransactionalContext:
+    """Pin both sides, read the opening markers, measure the in-flight set per object, and read
+    the delete evidence of every object that declares it (tol grades the deletes' lag)."""
     ctx = TransactionalContext(render=source.watermark_literal)
     iso = (source.open_window(), target.open_window())
     for c in spec.objects:
@@ -154,8 +288,17 @@ def open_window(spec: MappingSpec, source, target) -> TransactionalContext:
                 where = f"({c.root_where}) AND {newer}" if c.root_where else newer
                 win.in_flight = source.row_count(c.root_table, where)
         ctx.windows[c.object] = win
+        if c.delete_evidence is not None:
+            before = (_statements(source), _statements(target))
+            ctx.deletes[c.object] = resolve_delete_evidence(c, tol or Tolerances("-"), source, target)
+            ctx.evidence_statements["source"] += _statements(source) - before[0]
+            ctx.evidence_statements["target"] += _statements(target) - before[1]
     ctx.strength_open = {"source": source.window_strength(), "target": target.window_strength()}
     return ctx
+
+
+def _statements(adapter) -> int:
+    return adapter.statements if isinstance(adapter, StatementCounting) else 0
 
 
 def _newer_predicate(column: str, hwm: Any, render: Callable[[Any], str] = literal) -> str:
@@ -413,15 +556,25 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                 else:
                     behind.add(key)
             extra |= {k for k in t_index if k not in s_index}
+        # a target-only key is an in-flight delete only on the evidence read at open: deleted
+        # on the source after the target's applied position and inside the lag tolerance;
+        # one deleted earlier than that is a lagging delete and stays a finding
+        evidence = ctx.delete_evidence(c)
+        in_flight_deletes = {k for k in extra if k in evidence.in_flight}
+        extra -= in_flight_deletes
         missing_l, extra_l = sorted(missing, key=repr), sorted(extra, key=repr)
         diff.missing, diff.extra, diff.in_flight_missing = missing_l, extra_l, len(in_flight_missing)
         diff.in_flight_updates = len(in_flight_updates)
         diff.ahead, diff.behind = sorted(ahead, key=repr), sorted(behind, key=repr)
+        diff.in_flight_deletes = sorted(in_flight_deletes, key=repr)
+        diff.delete_lagging = sorted((k for k in extra if k in evidence.aged), key=repr)
         stats[c.object] = {"ranges": len(ranges), "population": n, "fingerprint": fingerprint,
                            "mismatched_ranges": len(streamed_ranges), "keys_streamed": streamed,
                            "missing_on_target": len(missing_l), "extra_on_target": len(extra_l),
                            "in_flight_missing": len(in_flight_missing),
                            "in_flight_updates": diff.in_flight_updates,
+                           "in_flight_deletes": len(in_flight_deletes),
+                           "delete_evidence": evidence.as_stats(),
                            "rows_ahead_on_target": len(diff.ahead),
                            "rows_behind_on_target": len(diff.behind)}
         if missing_l:
@@ -430,9 +583,15 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                                     f"{min(len(missing_l), MAX_KEYS_IN_FINDING)}: "
                                     f"{missing_l[:MAX_KEYS_IN_FINDING]}"))
         if extra_l:
+            if evidence.status == "ok":
+                why = (f"not deleted on the source after the target's applied position, so stray "
+                       f"writes or deletes older than cdc_lag_max_s ({len(diff.delete_lagging)} "
+                       f"of the latter)")
+            else:
+                why = (f"undrained deletes or stray writes; delete evidence {evidence.status}, so "
+                       "nothing tells them apart")
             findings.append(Finding(c.object, "pk_extra_on_target",
-                                    f"{len(extra_l)} target keys absent on source (undrained deletes "
-                                    f"or stray writes; no tombstone evidence to tell them apart); "
+                                    f"{len(extra_l)} target keys absent on source ({why}); "
                                     f"first {min(len(extra_l), MAX_KEYS_IN_FINDING)}: "
                                     f"{extra_l[:MAX_KEYS_IN_FINDING]}"))
     return TierResult(5, "pk_set_diff", not findings, checks, findings, stats)
@@ -443,9 +602,14 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
     findings, checks = [], 0
     stats: dict[str, Any] = {}
     for c in spec.objects:
+        diff = ctx.key_diffs.get(c.object, KeyDiff())
+        if c.delete_evidence is not None:
+            checks += 1
+            findings += _grade_deletes(c, tol, ctx.delete_evidence(c), diff)
         if not (c.watermark_source and c.watermark_target):
             stats[c.object] = {"watermark": None,
-                               "note": "no watermark declared: the window markers alone prove stillness"}
+                               "note": "no watermark declared: the window markers alone prove stillness",
+                               "in_flight_deletes": len(diff.in_flight_deletes)}
             continue
         checks += 1
         s_open, t_open = ctx.open_markers[c.object]
@@ -455,10 +619,10 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
         lag = lag_seconds(s_wm, t_wm, unit)
         units = lag_units(s_wm, t_wm)
         in_flight = ctx.in_flight(c)
-        diff = ctx.key_diffs.get(c.object, KeyDiff())
         stats[c.object] = {"watermark": f"{c.watermark_source}->{c.watermark_target}",
                            "unit": unit, "source_max": s_wm, "target_max": t_wm, "lag_s": lag,
                            "lag_units": units, "in_flight": in_flight,
+                           "in_flight_deletes": len(diff.in_flight_deletes),
                            "rows_ahead_on_target": len(diff.ahead),
                            "rows_behind_on_target": len(diff.behind)}
         if diff.ahead:
@@ -508,6 +672,27 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
                                     f"lag {lag:.3f}s > cdc_lag_max_s={tol.cdc_lag_max_s}s "
                                     f"({in_flight} source rows in flight)", s_wm, t_wm))
     return TierResult(6, "cdc_lag_ordering", not findings, checks, findings, stats)
+
+
+def _grade_deletes(c: ObjectMapping, tol: Tolerances, evidence: DeleteEvidenceResult,
+                   diff: KeyDiff) -> list[Finding]:
+    """Delete-side lag and evidence health for one object that declared delete_evidence."""
+    out: list[Finding] = []
+    if evidence.status == "retention_gap":
+        out.append(Finding(c.object, "delete_evidence_retention_gap", evidence.detail,
+                           _pos(evidence.horizon[0]), _pos(evidence.applied)))
+    elif evidence.status in EVIDENCE_STRICT and evidence.status != "absent":
+        out.append(Finding(c.object, "delete_evidence_unusable",
+                           f"delete_evidence declared but {evidence.status}: {evidence.detail}; "
+                           "target-only keys were graded strictly"))
+    if diff.delete_lagging:
+        oldest = max(evidence.aged[k].age_s for k in diff.delete_lagging)
+        out.append(Finding(c.object, "delete_lag_exceeded",
+                           f"{len(diff.delete_lagging)} source deletes still present on the target "
+                           f"{oldest:.0f}s after commit > cdc_lag_max_s={tol.cdc_lag_max_s}s; first "
+                           f"{min(len(diff.delete_lagging), MAX_KEYS_IN_FINDING)}: "
+                           f"{diff.delete_lagging[:MAX_KEYS_IN_FINDING]}"))
+    return out
 
 
 def _column_map(spec: MappingSpec, c: ObjectMapping) -> dict[str, str]:
