@@ -157,6 +157,40 @@ def test_an_in_flight_delete_of_the_newest_row_does_not_put_the_target_ahead_of_
     assert cdc["findings"] == []
     assert cdc["stats"]["loans"]["in_flight_deletes"] == 1
     assert cdc["stats"]["loans"]["target_max_from_in_flight_delete"] is True
+    # lag is measured from the newest target row that is not a delete in flight (loan 11)
+    assert cdc["stats"]["loans"]["target_max_excluding_deletes"] == _ts(11)
+    assert cdc["stats"]["loans"]["lag_s"] == 0.0
+    assert target.calls["table_aggregates_excluding"] == 2  # tier 2's, plus this one read
+
+
+def test_lag_is_still_graded_when_a_delete_in_flight_carries_the_target_max():
+    # loan 12 (target max) is deleted in flight; loan 13 was inserted 1000s later and is still
+    # unapplied: tier 5 rightly calls it in flight, tier 6 must still see the 989s of lag
+    loans, borrowers = _rows(12)
+    src, tgt = _deleted(loans, 12)
+    src.append(_loan(13, changed=1000, borrower_id=1))
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(12, 15, 5.0)]}, applied=10)
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "FAIL"
+    assert _tier(result, "pk_set_diff")["stats"]["loans"]["in_flight_missing"] == 1
+    cdc = _tier(result, "cdc_lag_ordering")
+    assert [f["check"] for f in cdc["findings"]] == ["cdc_lag_exceeded"]
+    assert cdc["stats"]["loans"]["target_max_from_in_flight_delete"] is True
+    assert cdc["stats"]["loans"]["lag_s"] == 989.0
+
+
+def test_lag_is_ungraded_not_skipped_when_every_target_row_is_a_delete_in_flight():
+    loans, borrowers = _rows(3)
+    tgt = [dict(r) for r in loans]
+    src = [_loan(13, changed=1000, borrower_id=1)]
+    events = [_ev(i, 15, 5.0) for i in (1, 2, 3)]
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": events}, applied=10)
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "FAIL"
+    cdc = _tier(result, "cdc_lag_ordering")
+    assert [f["check"] for f in cdc["findings"]] == ["cdc_lag_ungraded"]
+    assert "no applied watermark survives" in cdc["findings"][0]["detail"]
+    assert cdc["stats"]["loans"]["target_max_excluding_deletes"] is None
     assert cdc["stats"]["loans"]["lag_s"] is None
 
 
@@ -265,6 +299,71 @@ def test_a_deleted_then_reinserted_source_key_is_never_a_target_only_candidate()
     assert _tier(result, "counts_through_mapping")["stats"].get("count_gap_within_in_flight") is None
     # the key is excluded from the target aggregates once, not twice
     assert target.last_excluded_keys == [(3,)]
+
+
+def test_the_exclusion_cap_is_judged_on_the_deduplicated_key_set():
+    # loans 3 and 4 were deleted and reinserted after the applied position: each is both an
+    # in-flight update and an in-flight delete, yet the target statement binds 2 keys, not 4
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    loans[2]["modified_date"] = loans[3]["modified_date"] = _ts(30)
+    events = [_ev(3, 15, 5.0), _ev(4, 15, 5.0)]
+    source, target = _sides(loans, tgt, borrowers, {"raw_loans": events}, applied=10)
+    target.max_params = 3
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "PASS", json.dumps(result["tiers"], default=str, indent=1)
+    agg = _tier(result, "per_field_aggregates")
+    assert agg["stats"]["applied_subset"]["loans"] == {"in_flight": 2, "in_flight_deletes": 2, "excluded_keys": 2}
+    assert target.last_excluded_keys == [(3,), (4,)]
+    # neither set alone exceeds the budget (3 updates, 3 deletes) but their union of 4 keys does
+    loans[4]["modified_date"] = _ts(30)
+    source.tombstones["raw_loans"].append(_ev(6, 15, 5.0))
+    source.tables["dbo.loans"] = [r for r in loans if r["loan_id"] != 6]
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert _codes(result, "per_field_aggregates") == ["aggregates_ungraded_in_flight"]
+    assert "4 distinct keys" in _tier(result, "per_field_aggregates")["findings"][0]["detail"]
+
+
+def test_a_source_emptied_by_deletes_in_flight_is_not_a_stray_target():
+    loans, borrowers = _rows(1)
+    src, tgt = _deleted(loans, 1)
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(1, 15, 5.0)]}, applied=10)
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "PASS", json.dumps(result["tiers"], default=str, indent=1)
+    pk = _tier(result, "pk_set_diff")
+    assert pk["findings"] == []
+    assert pk["stats"]["loans"]["population"] == 0 and pk["stats"]["loans"]["target_population"] == 1
+    assert pk["stats"]["loans"]["in_flight_deletes"] == 1 and pk["stats"]["loans"]["extra_on_target"] == 0
+    assert target.calls["keys_in_range"] == 1
+    cdc = _tier(result, "cdc_lag_ordering")
+    assert cdc["findings"] == [] and cdc["stats"]["loans"]["target_max_from_in_flight_delete"] is True
+
+
+def test_a_source_emptied_by_deletes_still_grades_the_aged_and_unexplained_ones():
+    loans, borrowers = _rows(3)
+    src, tgt = _deleted(loans, 1, 2, 3)
+    events = [_ev(1, 15, 5.0), _ev(2, 12, 400.0)]  # loan 3 was never deleted on the source
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": events}, applied=10)
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "FAIL"
+    pk = _tier(result, "pk_set_diff")
+    assert [f["check"] for f in pk["findings"]] == ["pk_extra_on_target"]
+    detail = pk["findings"][0]["detail"]
+    assert "(2,)" in detail and "(3,)" in detail and "(1,)" not in detail
+    assert pk["stats"]["loans"]["in_flight_deletes"] == 1 and pk["stats"]["loans"]["extra_on_target"] == 2
+    assert "delete_lag_exceeded" in _codes(result, "cdc_lag_ordering")
+
+
+def test_a_source_emptied_without_usable_evidence_stays_strict_and_reads_no_keys():
+    loans, borrowers = _rows(1)
+    src, tgt = _deleted(loans, 1)
+    source, target = _sides(src, tgt, borrowers, {}, applied=10)
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "FAIL"
+    pk = _tier(result, "pk_set_diff")
+    assert [f["check"] for f in pk["findings"]] == ["pk_extra_on_target"]
+    assert "source is empty" in pk["findings"][0]["detail"]
+    assert target.calls["keys_in_range"] == 0
 
 
 def test_a_binary_lsn_position_orders_like_the_engine_does():
