@@ -7,6 +7,7 @@ run if any is missing a version field, because an unversioned input cannot be ci
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +67,12 @@ class EmbedMapping:
     fields: list[FieldMapping] = field(default_factory=list)
 
 
+# Numeric watermarks carry no time by themselves. epoch_* scale the difference to seconds so
+# tier 6 grades it against cdc_lag_max_s; counter (rowversion, a version column) has no time
+# meaning, so lag is graded as the number of unapplied source rows against cdc_in_flight_max_rows.
+WATERMARK_UNITS = ("datetime", "epoch_s", "epoch_ms", "epoch_us", "counter")
+
+
 @dataclass(frozen=True)
 class ObjectMapping:
     object: str
@@ -76,6 +83,16 @@ class ObjectMapping:
     embeds: list[EmbedMapping] = field(default_factory=list)
     root_where: str | None = None
     target_where: str | None = None
+    # Transactional mode (operational track). watermark: the change column on each side; rows
+    # whose source watermark is newer than the target's applied high-watermark are in flight,
+    # not defects. unit: what a numeric watermark measures (WATERMARK_UNITS); a datetime column
+    # needs none. identity: the source identity/sequence column and its target column, whose
+    # owned sequence must be ahead of every migrated key.
+    watermark_source: str | None = None
+    watermark_target: str | None = None
+    watermark_unit: str | None = None
+    identity_source: str | None = None
+    identity_target: str | None = None
 
     def __post_init__(self):
         if isinstance(self.key_target, str):
@@ -96,6 +113,29 @@ class Tolerances:
     numeric_abs_tol: float = 0.0
     aggregate_rel_tol: float = 0.0
     source_concurrency: int = 1
+    # Transactional mode: tolerated CDC lag between max(source watermark) and max(target
+    # watermark), and the number of key ranges the PK-set diff counts before streaming keys.
+    cdc_lag_max_s: float = 0.0
+    # Unapplied source rows tolerated when the watermark is a counter (no time unit to grade).
+    cdc_in_flight_max_rows: int = 0
+    pk_set_ranges: int = 64
+    # Tier 5 streams every key range instead of trusting equal range fingerprints (count, sum,
+    # sum of squares): the complete comparison for units where a three-or-more-key substitution
+    # that preserves both moments must be ruled out, at the cost of pulling every key.
+    pk_set_stream_every_range: bool = False
+    # A side with no pinned snapshot and no engine change token proves stillness only by
+    # (count, max watermark) markers, which miss updates below the max and balanced
+    # insert+delete pairs. False (default): such a run is not merge-eligible. True records the
+    # STOP A decision to accept marker-only evidence (Sybase ASE, logins without VIEW SERVER STATE).
+    accept_marker_only_window: bool = False
+    # Tier 7 fails a target that enforces a NOT NULL, unique, foreign-key or CHECK constraint the
+    # source does not: such a target rejects writes the legacy application makes today. True
+    # records the decision that the tightening is intended and demotes those findings to stats.
+    accept_target_only_constraints: bool = False
+    # Tier 7 fails when a source CHECK predicate and a target CHECK predicate are both unmatched
+    # after canonicalisation (dialect functions, different shapes): the harness can prove neither
+    # equivalence nor difference. True records that a human compared the listed pairs by hand.
+    accept_unverified_check_constraints: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +189,17 @@ def _validate_mapping_identifiers(c: dict) -> None:
     for f in c.get("fields", []):
         validate_identifier(f["source"])
         validate_identifier(f["target"])
+    for block in ("watermark", "identity"):
+        pair = c.get(block)
+        if pair is None:
+            continue
+        if not isinstance(pair, dict) or not pair.get("source") or not pair.get("target"):
+            raise ConfigError(f"{block} must be an object with source and target column names")
+        validate_identifier(pair["source"])
+        validate_identifier(pair["target"])
+        if block == "watermark" and pair.get("unit") is not None and pair["unit"] not in WATERMARK_UNITS:
+            raise ConfigError(f"watermark unit must be one of {', '.join(WATERMARK_UNITS)}, "
+                              f"got {pair['unit']!r}")
     for e in c.get("embeds", []):
         validate_identifier(e["array_path"])
         validate_identifier(e["child_table"])
@@ -198,10 +249,53 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             fields=fields_, embeds=embeds,
             root_where=_validate_predicate(substitute_params(c.get("root_where"), params, path)),
             target_where=_validate_predicate(substitute_params(c.get("target_where"), params, path)),
+            watermark_source=(c.get("watermark") or {}).get("source"),
+            watermark_target=(c.get("watermark") or {}).get("target"),
+            watermark_unit=(c.get("watermark") or {}).get("unit"),
+            identity_source=(c.get("identity") or {}).get("source"),
+            identity_target=(c.get("identity") or {}).get("target"),
         ))
     if not objects:
         raise ConfigError(f"{path}: mapping spec has no objects")
     return MappingSpec(version=version, objects=objects)
+
+
+def _flag(data: dict, key: str, path: Path) -> bool:
+    """A tolerance switch is a JSON boolean and nothing else: "false", 0 or null would
+    otherwise be coerced and silently widen what the run accepts."""
+    value = data.get(key, False)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{path}: {key} must be a JSON boolean (true/false), got {value!r}")
+    return value
+
+
+def _bound(data: dict, key: str, default: float, path: Path) -> float:
+    """A tolerance bound is a finite, non-negative JSON number. NaN compares false against
+    everything, so `lag > NaN` would never fail; infinity and negatives widen or invert the
+    check; booleans and numeric strings are refused rather than coerced."""
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{path}: {key} must be a JSON number, got {value!r}")
+    if not math.isfinite(value) or value < 0:
+        raise ConfigError(f"{path}: {key} must be finite and >= 0, got {value!r}")
+    return float(value)
+
+
+def _count(data: dict, key: str, default: int, path: Path) -> int:
+    """A tolerance count is a non-negative JSON integer; booleans and fractions are refused."""
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"{path}: {key} must be a non-negative JSON integer, got {value!r}")
+    return value
+
+
+def _positive_count(data: dict, key: str, default: int, path: Path) -> int:
+    """A tolerance count that sizes a plan (ranges, samples, concurrency) must be >= 1: zero
+    would silently collapse the plan and a coerced string or boolean would hide a typo."""
+    value = _count(data, key, default, path)
+    if value < 1:
+        raise ConfigError(f"{path}: {key} must be a positive JSON integer, got {value!r}")
+    return value
 
 
 def load_tolerances(path: Path) -> Tolerances:
@@ -209,11 +303,18 @@ def load_tolerances(path: Path) -> Tolerances:
     version = _require_version(data, path)
     return Tolerances(
         version=version,
-        full_diff_row_threshold=int(data.get("full_diff_row_threshold", 100_000)),
-        sample_size=int(data.get("sample_size", 1_000)),
-        numeric_abs_tol=float(data.get("numeric_abs_tol", 0.0)),
-        aggregate_rel_tol=float(data.get("aggregate_rel_tol", 0.0)),
-        source_concurrency=int(data.get("source_concurrency", 1)),
+        full_diff_row_threshold=_count(data, "full_diff_row_threshold", 100_000, path),
+        sample_size=_positive_count(data, "sample_size", 1_000, path),
+        numeric_abs_tol=_bound(data, "numeric_abs_tol", 0.0, path),
+        aggregate_rel_tol=_bound(data, "aggregate_rel_tol", 0.0, path),
+        source_concurrency=_positive_count(data, "source_concurrency", 1, path),
+        cdc_lag_max_s=_bound(data, "cdc_lag_max_s", 0.0, path),
+        cdc_in_flight_max_rows=_count(data, "cdc_in_flight_max_rows", 0, path),
+        pk_set_ranges=_positive_count(data, "pk_set_ranges", 64, path),
+        pk_set_stream_every_range=_flag(data, "pk_set_stream_every_range", path),
+        accept_marker_only_window=_flag(data, "accept_marker_only_window", path),
+        accept_target_only_constraints=_flag(data, "accept_target_only_constraints", path),
+        accept_unverified_check_constraints=_flag(data, "accept_unverified_check_constraints", path),
     )
 
 

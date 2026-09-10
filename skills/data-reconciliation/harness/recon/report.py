@@ -17,6 +17,8 @@ MAX_FINDINGS_IN_REPORT = 50
 MODE_NOTES = {
     "snapshot": " (PASS scoped to the snapshot watermark)",
     "fixture": " (fixture data: NOT a merge verdict, run live once before merging)",
+    "transactional": " (both sides live: PASS scoped to the consistency window that held and the "
+                     "target's applied CDC watermark)",
 }
 
 
@@ -28,15 +30,18 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  tiers: list[TierResult], seed: int = 0,
                  params: dict[str, str] | None = None,
                  snapshot: dict | None = None,
-                 provenance_warnings: list[str] | None = None) -> dict:
+                 provenance_warnings: list[str] | None = None,
+                 depth: str = "threshold", cost: dict | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
             warnings.append(f"UNGRADED embedded values: {path} (cardinality checked only; "
                             "declare embed key/fields in the mapping spec to grade values)")
+        for note in t.stats.get("unverified", []):
+            warnings.append(f"UNVERIFIED {t.name}: {note}")
     warnings.extend(provenance_warnings or [])
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
-    merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot")
+    merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and (mode != "snapshot" or snapshot is not None))
     return {
         "unit": unit,
@@ -44,8 +49,10 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "mapping_version": mapping_version,
         "tolerance_version": tolerance_version,
         "seed": seed,
+        "depth": depth,
         "params": params or {},
         "snapshot": snapshot,
+        "cost": cost or {},
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "tiers": [t.as_dict() for t in tiers],
         "warnings": warnings,
@@ -66,10 +73,13 @@ def render_report(result: dict) -> str:
         f"- Tolerance version: `{result['tolerance_version']}`",
         f"- Seed: `{result.get('seed', 0)}`" + (f" | Params: `{result['params']}`"
                                                 if result.get("params") else ""),
+        f"- Tier 3 depth: `{result.get('depth', 'threshold')}`",
         f"- Generated: {result['generated_at']}",
     ]
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
+    if result.get("cost"):
+        lines.append(f"- Cost: `{json.dumps(result['cost'], default=str)}`")
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [
@@ -112,12 +122,31 @@ def render_summary(result: dict) -> str:
         f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
         "(fixture/continuous evidence never merges)",
         f"- Mapping `{result['mapping_version']}` / tolerances `{result['tolerance_version']}`"
-        f" / seed `{result.get('seed', 0)}`"
+        f" / seed `{result.get('seed', 0)}` / depth `{result.get('depth', 'threshold')}`"
         + (f" / params `{result['params']}`" if result.get("params") else ""),
         f"- Generated: {result['generated_at']}",
     ]
+    cost = result.get("cost") or {}
+    if cost.get("source_statements") is not None:
+        lines.append(f"- Cost: source {cost['source_statements']} statements / "
+                     f"{cost['source_rows_fetched']} rows fetched; target {cost['target_statements']} "
+                     f"statements / {cost['target_rows_fetched']} rows; {cost['elapsed_s']}s")
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
+    window = next((t for t in result["tiers"] if t["name"] == "consistency_window"), None)
+    if window is not None:
+        iso = window["stats"].get("isolation", {})
+        in_flight = {o: m["in_flight_at_open"] for o, m in window["stats"].get("markers", {}).items()
+                     if m.get("in_flight_at_open")}
+        strength = window["stats"].get("strength", {})
+        def side(name):
+            how = strength.get(name)
+            return f"`{iso.get(name)}`" + (f" ({how})" if how and how != "snapshot" else "")
+        codes = {f["check"] for f in window["findings"]}
+        state = "held" if window["passed"] else ("MOVED" if "window_unstable" in codes else "UNPROVEN")
+        lines.append(f"- Consistency window: source isolation {side('source')}, target isolation "
+                     f"{side('target')}, {state}"
+                     + (f"; in flight at open: `{json.dumps(in_flight)}`" if in_flight else ""))
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [

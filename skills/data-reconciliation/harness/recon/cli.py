@@ -22,10 +22,19 @@ from . import canon, engine, report  # noqa: F401
 from .config import (CanonRule, ConfigError, READ_ONLY_SQL_KEYWORDS,
                      load_canon_rules, load_mapping_spec, load_tolerances,
                      validate_identifier)
-from .engine import MODES, run_recon
+from .cost import estimate_cost
+from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
 
-SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks")
-PARAM_RE = re.compile(r"^[A-Za-z0-9_\-:.T /]*$")
+SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres")
+# databricks: Delta under Unity Catalog (analytical track). lakebase: a schema in a Lakebase
+# branch database (operational track); --target-catalog then names the branch database and
+# must still appear in .migration/allowed_targets.json.
+TARGET_KINDS = ("databricks", "lakebase")
+# --mode transactional grades two live sides; a Delta target is loaded, not replicated, so
+# only the operational target accepts it.
+TRANSACTIONAL_TARGET_KINDS = ("lakebase",)
+# a --param value is one literal: a number, identifier, date or date + time; never an expression
+PARAM_RE = re.compile(r"^[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?$")
 
 
 def _single_identifier(value: str, option: str) -> str:
@@ -86,6 +95,18 @@ def _load_snapshot(path: Path | None, mode: str) -> dict | None:
     return {key: data[key] for key in ("source", "extracted_at", "row_counts")}
 
 
+def _parse_params(items: list[str]) -> dict[str, str]:
+    params = {}
+    for item in items:
+        name, sep, value = item.partition("=")
+        if not sep or not name:
+            raise SystemExit(f"--param must be NAME=VALUE, got '{item}'")
+        if not PARAM_RE.fullmatch(value):
+            raise SystemExit(f"invalid --param value for {name}")
+        params[name] = value
+    return params
+
+
 def selftest() -> int:
     """Blueprint post-setup check: exercises every canonicalization rule on sample values
     and verifies the engine and report modules import. No database connections."""
@@ -112,6 +133,18 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="dbx-recon")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="verify the harness install (no connections needed)")
+    e = sub.add_parser("estimate", help="statements/rows a run would cost (no connections); "
+                                        "summed per wave for the STOP C cost line")
+    e.add_argument("--mapping", required=True, type=Path)
+    e.add_argument("--tolerances", required=True, type=Path)
+    e.add_argument("--depth", choices=DEPTHS, default="threshold")
+    e.add_argument("--row-counts", type=Path,
+                   help="JSON {root_table: rows} from the analysis inventory; without it row "
+                        "transfer is reported as unknown")
+    e.add_argument("--ops-count", type=int, default=0, help="number of Tier 4 recorded ops")
+    e.add_argument("--mode", choices=MODES, default="live",
+                   help="transactional adds the window, PK-set and schema-parity statements")
+    e.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
     r = sub.add_parser("run", help="run the recon gate for one unit")
     r.add_argument("--unit", required=True)
     r.add_argument("--family", required=True, choices=SOURCE_FAMILIES)
@@ -121,13 +154,16 @@ def main(argv: list[str] | None = None) -> int:
                    help=".migration/03_tolerances.json, versioned")
     r.add_argument("--canonicalization", required=True, type=Path,
                    help="the source-dialect skill's recon_canonicalization rules, as JSON")
-    r.add_argument("--mode", required=True, choices=MODES)
+    r.add_argument("--mode", required=True, choices=MODES + PLANNED_MODES)
     r.add_argument("--source-dsn-secret", required=True,
                    help="ENV VAR NAME holding the source connection (read-only principal)")
+    r.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
     r.add_argument("--target-secret", required=True,
-                   help="ENV VAR NAME holding Databricks SQL JSON "
-                        "(convention: DATABRICKS_MIGRATION_SQL)")
-    r.add_argument("--target-catalog", required=True)
+                   help="ENV VAR NAME holding Databricks SQL JSON (convention: "
+                        "DATABRICKS_MIGRATION_SQL) or, for --target-kind lakebase, the branch "
+                        "endpoint's libpq DSN (convention: LAKEBASE_MIGRATION_DSN)")
+    r.add_argument("--target-catalog", required=True,
+                   help="Unity Catalog catalog, or the Lakebase branch database name")
     r.add_argument("--allowed-targets-file", type=Path,
                    default=Path(".migration/allowed_targets.json"))
     r.add_argument("--target-schema", required=True)
@@ -135,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--snapshot-manifest", type=Path)
     r.add_argument("--seed", type=int, default=0,
                    help="sampling seed (recorded in result.json for re-runnability)")
+    r.add_argument("--depth", choices=DEPTHS, default="threshold",
+                   help="Tier 3 depth: threshold (tolerance file decides), sampled (verifier "
+                        "default), full (cutover-critical units per the wave manifest's verify_depth)")
     r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="resolve a ${name} placeholder in the mapping spec's where clauses "
                         "(e.g. partition/date scoping); repeatable; recorded in result.json")
@@ -144,20 +183,39 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "selftest":
         return selftest()
 
+    if args.cmd == "run" and args.mode in PLANNED_MODES:
+        raise SystemExit(f"--mode {args.mode} is not implemented in this harness version")
+    if args.cmd == "run" and args.mode == "transactional" \
+            and args.target_kind not in TRANSACTIONAL_TARGET_KINDS:
+        raise SystemExit(
+            f"--mode transactional is not implemented for --target-kind {args.target_kind}: it "
+            "grades two live sides and only the operational target (--target-kind lakebase) is "
+            "one. Analytical-track units reconcile with --mode snapshot or live at a stated "
+            "consistency point. See 14-front_door_oltp.")
+
+    params = _parse_params(args.param)
+    if args.cmd == "estimate":
+        spec = load_mapping_spec(args.mapping, params)
+        tol = load_tolerances(args.tolerances)
+        row_counts = None
+        if args.row_counts is not None:
+            try:
+                row_counts = json.loads(args.row_counts.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SystemExit(f"cannot read row counts {args.row_counts}: {exc}") from None
+            if not isinstance(row_counts, dict) or any(
+                    isinstance(v, bool) or not isinstance(v, int) for v in row_counts.values()):
+                raise SystemExit(f"{args.row_counts} must be a JSON object of integer row counts")
+        print(json.dumps(estimate_cost(spec, tol, args.depth, row_counts, args.ops_count,
+                                       mode=args.mode), indent=2))
+        return 0
+
     allowed_catalogs = _load_allowed_targets(args.allowed_targets_file)
     target_catalog = _single_identifier(args.target_catalog, "target-catalog")
     target_schema = _single_identifier(args.target_schema, "target-schema")
     if target_catalog not in allowed_catalogs:
         raise SystemExit(f"--target-catalog {target_catalog!r} is not in {args.allowed_targets_file}")
 
-    params = {}
-    for item in args.param:
-        name, sep, value = item.partition("=")
-        if not sep or not name:
-            raise SystemExit(f"--param must be NAME=VALUE, got '{item}'")
-        if not PARAM_RE.fullmatch(value):
-            raise SystemExit(f"invalid --param value for {name}")
-        params[name] = value
     spec = load_mapping_spec(args.mapping, params)
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
@@ -174,17 +232,30 @@ def main(argv: list[str] | None = None) -> int:
                     f"ops entry missing required keys: {op.get('name', '?')}")
             for key in ("source_sql", "target_sql"):
                 _validate_sql(op[key], op.get("name", "?"))
-    from .adapters import SOURCE_ADAPTERS, DatabricksTargetAdapter
+    from .adapters import (
+        SOURCE_ADAPTERS,
+        DatabricksTargetAdapter,
+        LakebaseTargetAdapter,
+        TargetIdentityError,
+    )
 
     source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
-    target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
+    if args.target_kind == "lakebase":
+        # --target-catalog names the Lakebase database; the adapter refuses a DSN that lands
+        # anywhere else, so the allowlist binds the connection and not just the label
+        try:
+            target = LakebaseTargetAdapter(args.target_secret, target_catalog, target_schema)
+        except TargetIdentityError as exc:
+            raise SystemExit(str(exc)) from None
+    else:
+        target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
-                       source_family=args.family)
-    print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} "
+                       source_family=args.family, depth=args.depth)
+    print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")
     return 0 if result["verdict"] == "PASS" else 1

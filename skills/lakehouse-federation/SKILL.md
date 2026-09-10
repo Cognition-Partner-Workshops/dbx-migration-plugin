@@ -5,7 +5,18 @@ description: Set up and use Databricks Lakehouse Federation to a legacy source (
 
 # Lakehouse Federation
 
-Federation gives Databricks a read-only live view of the legacy system through a connection plus a foreign catalog. It is the default coexistence and reconciliation mechanism whenever a JDBC path exists.
+Federation gives Databricks a read-only live view of the legacy system through a connection plus a foreign catalog. It is the default coexistence and reconciliation mechanism whenever a JDBC path exists. The official Databricks plugin has no federation skill (its `databricks-lakeflow-connect` decision tree names Federation as the query-in-place alternative), so this skill owns the setup; UC object conventions come from `target-routing` → `databricks-unity-catalog`.
+
+## Federation or Lakeflow Connect
+
+| Need | Use |
+|---|---|
+| Read legacy tables in place for recon, CTAS of small tables, coexistence reads | Federation (this skill) |
+| Keep a copy in the migration catalog current under continuous legacy writes | Lakeflow Connect via `backfill-planner` (connector row) |
+| Copy a large, static table once | `backfill-planner` partitioned copy, sourced through the foreign catalog |
+| Snowflake / Redshift / Synapse / BigQuery copy on a schedule | Lakeflow Connect foreign-catalog connector, which reads through this skill's foreign catalog |
+
+Federation never becomes the production consumer path: at STOP E consumers point at Delta tables in the target catalog, and federation stays a recon and rollback bridge until decommission.
 
 ## Setup
 1. Confirm the source engine is supported for federation and network path exists (private link/VPN requirements are D10 dependencies; fire them early).

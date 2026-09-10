@@ -1,5 +1,12 @@
 {
   "name": "dbx-migration-factory",
-  "version": "0.1.0",
-  "description": "Databricks migration factory: target-convention skills, reconciliation and prediction-parity harnesses, Lakebridge wrapper, source-dialect skills, guardrail rules, and a bootstrap skill that installs the DBX v1 playbook chain into the org."
+  "version": "0.2.0",
+  "description": "Databricks migration factory: source-dialect skills, reconciliation and prediction-parity harnesses, Lakebridge wrapper, enforcement hooks, target routing onto the official Databricks skills, guardrail rules, and a bootstrap skill that installs the DBX playbook chain into the org.",
+  "requiredPlugins": [
+    {
+      "source": "git-subdir",
+      "url": "https://github.com/databricks/databricks-agent-skills.git",
+      "path": "plugins/databricks/claude"
+    }
+  ]
 }

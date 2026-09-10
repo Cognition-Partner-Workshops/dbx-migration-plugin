@@ -1,0 +1,45 @@
+# Job wrapper for converted.sql (LoadPaymentFact.dtsx). One run = one package execution =
+# one (LoadDate, ServicerId) bounded batch. Shapes: databricks-jobs (sql_task, job parameters,
+# run_if, max_retries); docs /jobs/parameter-use (:name in SQL), /jobs/dynamic-value-references.
+resources:
+  jobs:
+    load_payment_fact_job:
+      name: load_payment_fact_job
+      max_concurrent_runs: 1                 # a package is not re-entrant (this job only)
+      trigger:
+        periodic: { interval: 1, unit: DAYS }
+      parameters:
+        - { name: src_catalog, default: "${var.src_catalog}" }   # OLTP_LoanServicing (read only)
+        - { name: src_schema,  default: "${var.src_schema}" }    #   loan_servicing.dbo
+        - { name: tgt_catalog, default: "${var.tgt_catalog}" }   # DW_LoanMart
+        - { name: tgt_schema,  default: "${var.tgt_schema}" }    #   loan_mart.dw
+        - { name: load_date,   default: "{{job.start_time.iso_date}}" }  # User::LoadDate (INFERRED default)
+        - { name: servicer_id, default: "7" }  # $Package::ServicerId (Required): override per run, as dtexec /Par did
+      email_notifications:
+        on_failure: ["${var.ops_email}"]
+      tasks:
+        - task_key: load_payment_fact          # DFT Load fact_payment
+          max_retries: 2                       # commit conflict with an outside dw writer: MERGEs are idempotent
+          min_retry_interval_millis: 60000
+          sql_task:
+            file: { path: ./converted.sql, source: WORKSPACE }   # relative to this file in the bundle
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              src_catalog: "{{job.parameters.src_catalog}}"
+              src_schema:  "{{job.parameters.src_schema}}"
+              tgt_catalog: "{{job.parameters.tgt_catalog}}"
+              tgt_schema:  "{{job.parameters.tgt_schema}}"
+              load_date:   "{{job.parameters.load_date}}"
+              servicer_id: "{{job.parameters.servicer_id}}"
+        - task_key: log_onerror                # OnError handler: INSERT INTO dw.etl_log (...) VALUES (?, 'OnError', ?, GETDATE())
+          depends_on: [{ task_key: load_payment_fact }]
+          run_if: AT_LEAST_ONE_FAILED          # excluded on a clean run; one row per failed run (SSIS: one per error event)
+          sql_task:
+            file: { path: ./log_onerror.sql, source: WORKSPACE }
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              tgt_catalog:  "{{job.parameters.tgt_catalog}}"
+              tgt_schema:   "{{job.parameters.tgt_schema}}"
+              run_id:       "{{job.run_id}}"
+              result_state: "{{tasks.load_payment_fact.result_state}}"
+              error_code:   "{{tasks.load_payment_fact.error_code}}"

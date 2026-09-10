@@ -11,7 +11,7 @@ The customer says "we're moving off Redshift." This playbook turns that into a c
 ## Procedure
 1. **Consume the intake template first**: if a filled `00_intake_template.md` was attached or committed, load it, mark its rows FACT, probe the environment to fill what it left blank (DISCOVERED), and propose defaults for the rest (PROPOSED). Ask live only what neither the template nor a probe can answer.
 2. Pin engine and version; probe catalog access with one live metadata query; register D10s for anything blocked.
-3. Attach the matching dialect skill (`redshift-sql`, `teradata-bteq`, `bigquery-sql`, ...). If none exists, generic ANSI translation plus a build-the-skill wave-0 item, stated plainly.
+3. Attach the matching dialect skill: list `skills/*/SKILL.md` in the installed plugin and pick by name (`redshift-sql`, `teradata-bteq`, and, as they land, `tsql-ssis` for SQL Server / Synapse / Sybase and `oracle-plsql`). Never claim a skill exists because a recon adapter or Lakebridge dialect flag exists for the engine (BigQuery, Snowflake, Netezza are in that state). If none exists: generic ANSI translation plus a build-the-skill wave-0 item from `skills/_dialect-skill-template.md`, stated plainly at intake. Load `target-routing` alongside the dialect skill; it names the official Databricks skill for each conversion target.
 4. Set family defaults for the chain: unit = view / procedure / scheduled query / load script; lineage extraction = catalog metadata + view dependency graphs + query history; SQL profile is the dominant surface; the physical design translation (dist/sort keys, partitioning to liquid clustering) is a named dictionary concern; federation-first coexistence.
 5. Record intake facts in `.migration/00_context.md` shape. Record `stop_mode` (default `soft`; `hard` only if the user asks, per engagement or per named stop) — see the orchestrator's Stop mode section. Then run `!dbx_migrate_pipeline` **in this same session**, right away. Do not open a new session, do not ask the user to run it, do not stop here: the orchestrator reads the intake facts you just wrote and begins ingest and setup as normal. The user's next message from Devin is STOP A.
 
@@ -21,7 +21,7 @@ The customer says "we're moving off Redshift." This playbook turns that into a c
 
 ## Advice and Pointers
 - Warehouse migrations look easier than ETL migrations and hide their difficulty in the same two places every time: engine-specific function semantics (numeric truncation, timestamp behavior) and the untracked consumer population. The dictionary and the D4 sweep are where this family's engagements are won.
-- Stored procedures are the schedule risk in this family: procedural dialects (Teradata SPL, Redshift plpgsql) convert slower than views; the inventory's complexity ranking should weight them accordingly.
+- Stored procedures are the schedule risk in this family: procedural dialects (Teradata SPL, Redshift plpgsql, T-SQL, PL/SQL) convert slower than views; the inventory's complexity ranking should weight them accordingly. The default target for a like-for-like procedure is a DBSQL stored procedure (SQL scripting, DBR 17+), not a PySpark rewrite; the SQL profile should say when PySpark is allowed.
 - Federation approval is the single highest-leverage early request; fire it at intake if the user can approve it directly.
 
 ## Forbidden Actions

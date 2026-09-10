@@ -141,6 +141,34 @@ def test_continuous_mode_samples_tier3_and_skips_tier4():
     assert result["tiers"][2]["stats"]["orders"]["mode"] == "stratified_sample"
 
 
+def test_continuous_mode_records_the_depth_it_ran_at_not_the_one_requested():
+    source, target = make_green()
+    result = run_recon("u", "continuous", SPEC, TOL, RULES, source, target, depth="full")
+    assert result["tiers"][2]["stats"]["orders"]["mode"] == "stratified_sample"
+    assert result["depth"] == "sampled"
+
+
+def test_cli_reports_the_effective_depth_not_the_requested_one(tmp_path: Path, monkeypatch, capsys):
+    from recon import adapters, cli
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig"]}))
+    source, target = make_green()
+    monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "oracle", lambda secret: source)
+    monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: target)
+    monkeypatch.setattr(cli, "load_mapping_spec", lambda path, params: SPEC)
+    monkeypatch.setattr(cli, "load_tolerances", lambda path: TOL)
+    monkeypatch.setattr(cli, "load_canon_rules", lambda path: RULES)
+    rc = cli.main(["run", "--unit", "u", "--family", "oracle", "--mode", "continuous", "--depth", "full",
+                   "--mapping", "m", "--tolerances", "t", "--canonicalization", "c",
+                   "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+                   "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out")])
+    assert rc == 0
+    line = capsys.readouterr().out
+    assert "depth=sampled" in line and "depth=full" not in line
+    assert json.loads((tmp_path / "out" / "result.json").read_text())["depth"] == "sampled"
+
+
 def test_determinism():
     r1 = run(*make_green())
     r2 = run(*make_green())
@@ -225,6 +253,44 @@ def test_tier2_sum_skipped_for_non_numeric():
     target = Target({"c": [{"id": 1, "name": "x"}]})
     result = run_recon("u", "live", spec, TOL, RULES, source, target)
     assert result["verdict"] == "PASS"  # 0-vs-None sum on a string field is not a finding
+
+
+def test_tier2_source_sum_follows_source_type_not_target_type():
+    # CODE is a string on the source and cast to a number in conversion: the source SUM must
+    # not ride in the batched statement (it would abort every metric on an engine that errors),
+    # it is probed alone; the undeclared target side is probed too, never assumed from the source
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="c", root_table="T", key_source=["ID"], key_target="id",
+        fields=[FieldMapping("ID", "id", "NUMBER", "long"),
+                FieldMapping("CODE", "code", "VARCHAR2(10)", "int"),
+                FieldMapping("AMT", "amt", "NUMBER(10,2)", "")])])
+    rows = [{"ID": 1, "CODE": "7", "AMT": 1.5}, {"ID": 2, "CODE": "8", "AMT": 2.5}]
+
+    class Source(FakeSource):
+        def sum_probe(self, table, column, where=None):
+            out = super().sum_probe(table, column, where)
+            if column == "CODE":
+                raise RuntimeError("ORA-01722: invalid number")  # the probe fails in isolation
+            return out
+
+    source = Source({"T": rows})
+    target = FakeTarget({"c": [{"id": 1, "code": "7", "amt": 1.5}, {"id": 2, "code": "8", "amt": 2.5}]})
+    from recon import tiers
+    c = spec.objects[0]
+    with pytest.raises(RuntimeError):
+        tiers._object_aggregates(c, source, target)
+    assert source.last_table_aggregates_numeric == ["ID", "AMT"]
+    assert source.calls["table_aggregates"] == 1  # the batched statement went out before the probe
+
+    source = FakeSource({"T": rows})
+    result = run_recon("u", "live", spec, TOL, RULES, source, target)
+    assert result["verdict"] == "PASS"
+    assert source.calls["sum_probe"] == 1 and source.calls["field_aggregates"] == 0  # CODE: one SUM alone
+    assert target.calls["sum_probe"] == 1 and target.calls["field_aggregates"] == 0  # AMT undeclared: one SUM
+    assert target.last_table_aggregates_numeric == ["id", "code"]
+    from recon.cost import estimate_cost
+    est = estimate_cost(spec, TOL)
+    assert est["source_statements"]["tier2"] == 2 and est["target_statements"]["tier2"] == 2
 
 
 def test_null_consistent_aggregates_green():
@@ -325,6 +391,19 @@ def test_cli_rejects_unsafe_param_before_adapter(tmp_path: Path):
                   "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
                   "--target-catalog", "c", "--allowed-targets-file", str(allowlist), "--target-schema", "s",
                   "--param", "x=bad'"])
+
+
+@pytest.mark.parametrize("value", ["bad'", "1 OR 1 IS NOT NULL", "1 -- x", "1 /* x */", "x; drop", "", "a b"])
+def test_param_value_must_be_one_literal(value):
+    from recon.cli import _parse_params
+    with pytest.raises(SystemExit, match="invalid --param value"):
+        _parse_params([f"x={value}"])
+
+
+@pytest.mark.parametrize("value", ["42", "wave_07", "2026-09-08", "2026-09-08 12:30:00.5", "2026-09-08T12:30:00", "a/b"])
+def test_param_value_literals_pass(value):
+    from recon.cli import _parse_params
+    assert _parse_params([f"x={value}"]) == {"x": value}
 
 
 def test_cli_rejects_target_outside_allowlist_before_adapter(tmp_path: Path, monkeypatch):
