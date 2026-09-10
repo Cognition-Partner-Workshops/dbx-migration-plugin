@@ -251,10 +251,11 @@ class FakeCdcConn:
     captured columns), the shape sys.sp_cdc_help_change_data_capture reports. Records every statement
     so a test can prove nothing else (in particular no sp_cdc_enable_*) ran."""
 
-    def __init__(self, *, db_enabled=1, captures=None, max_lsn=LSN, fn_errors=None):
+    def __init__(self, *, db_enabled=1, captures=None, max_lsn=LSN, fn_errors=None, case_sensitive=False):
         self.db_enabled = db_enabled
         self.captures = {"raw_loans": (None, ["Id", "Amount"])} if captures is None else captures
         self.max_lsn, self.fn_errors = max_lsn, fn_errors or {}
+        self.case_sensitive = case_sensitive  # database collation: identifiers resolve CI unless set
         self.statements: list[str] = []
         self.probes: list[tuple[str, tuple]] = []
 
@@ -281,8 +282,14 @@ class FakeCdcConn:
             self.probes.append((sql, params))
             if capture in self.fn_errors:
                 raise RuntimeError(self.fn_errors[capture])
-            if capture not in self.captures:
+            fold = (lambda s: s) if self.case_sensitive else str.casefold
+            known = {fold(c): cols for c, (_, cols) in self.captures.items()}
+            if fold(capture) not in known:
                 raise RuntimeError(f"Invalid object name 'cdc.fn_cdc_get_all_changes_{capture}'")
+            projected = re.search(r"SELECT TOP \(\d+\) (.+?) FROM", sql).group(1).split(", ")
+            for col in projected:
+                if fold(col) not in {fold(c) for c in known[fold(capture)]}:
+                    raise RuntimeError(f"Invalid column name '{col}'")
             self._rows = []
         else:
             raise AssertionError(f"unexpected statement: {sql}")
@@ -350,6 +357,58 @@ def test_delete_evidence_probe_carries_the_scope_predicate(tmp_path, monkeypatch
     assert "AND (Amount > 0)" in conn.probes[0][0]
 
 
+def test_delete_evidence_identifiers_compare_as_the_server_resolves_them(tmp_path, monkeypatch):
+    # CDC metadata keeps the declared spelling while a case-insensitive collation resolves the
+    # mapping's spelling: the metadata comparison must not be stricter than the server, and the
+    # probe (sent with the mapping's spelling) is what decides on a case-sensitive one
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    conn = FakeCdcConn(captures={"Raw_Loans": (None, ["ID", "AMOUNT"])})
+    c = doctor.check_delete_evidence(_mapping(tmp_path, key=("Id", "Amount")), "LEGACY_ODBC", PLUGIN_ROOT,
+                                     connect=lambda dsn: conn)
+    assert c.status == "ok", c.detail
+    assert c.data["missing"] == [] and c.data["missing_columns"] == {}
+    assert "fn_cdc_get_all_changes_raw_loans(" in conn.probes[0][0] and "Id, Amount FROM" in conn.probes[0][0]
+    conn = FakeCdcConn(captures={"Raw_Loans": (None, ["ID", "AMOUNT"])}, case_sensitive=True)
+    c = doctor.check_delete_evidence(_mapping(tmp_path, key=("Id", "Amount")), "LEGACY_ODBC", PLUGIN_ROOT,
+                                     connect=lambda dsn: conn)
+    assert c.status == "fail" and "raw_loans" in c.data["unreadable"]
+    assert "Invalid object name" in c.detail
+
+
+def test_delete_evidence_resolves_mapping_params_like_the_harness(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    mapping = _mapping(tmp_path, root_where="Amount > ${floor}")
+    conn = FakeCdcConn()
+    c = doctor.check_delete_evidence(mapping, "LEGACY_ODBC", PLUGIN_ROOT, connect=lambda dsn: conn)
+    assert c.status == "fail" and "${floor}" in c.detail and "--param floor" in c.detail
+    assert conn.probes == []
+    c = doctor.check_delete_evidence(mapping, "LEGACY_ODBC", PLUGIN_ROOT, connect=lambda dsn: conn,
+                                     params={"floor": "100"})
+    assert c.status == "ok", c.detail
+    assert "AND (Amount > 100)" in conn.probes[0][0]
+
+
+def test_cli_param_uses_the_harness_rules(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    mapping = _mapping(tmp_path, root_where="Amount > ${floor}")
+    seen = {}
+
+    def fake(m, s, root, params=None):
+        seen["params"] = params
+        return doctor.Check("delete_evidence", "ok", "")
+
+    monkeypatch.setattr(doctor, "check_delete_evidence", fake)
+    argv = ["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--no-databricks",
+            "--mapping", str(mapping), "--source-secret", "X", "--out", "-"]
+    doctor.main([*argv, "--param", "floor=100", "--param", "day=2026-01-01"])
+    assert seen["params"] == {"floor": "100", "day": "2026-01-01"}
+    for bad in ("floor", "floor=1; DROP TABLE x", "floor=1 OR 1=1", "floor='a'"):
+        seen.clear()
+        with pytest.raises(SystemExit) as e:
+            doctor.main([*argv, "--param", bad])
+        assert seen == {} and "--param" in str(e.value), bad
+
+
 def test_delete_evidence_fails_when_a_capture_misses_a_mapped_key_column(tmp_path, monkeypatch):
     monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
     conn = FakeCdcConn(captures={"raw_loans": (None, ["Amount"])})
@@ -409,8 +468,8 @@ def test_run_includes_delete_evidence_and_a_failed_check_blocks(tmp_path, monkey
     ws = make_workspace(tmp_path)
     real = doctor.check_delete_evidence
     monkeypatch.setattr(doctor, "check_delete_evidence",
-                        lambda m, s, root: doctor.Check("delete_evidence", "fail", "CDC is not enabled")
-                        if m is not None else real(m, s, root))
+                        lambda m, s, root, params=None: doctor.Check("delete_evidence", "fail", "CDC is not enabled")
+                        if m is not None else real(m, s, root, params=params))
     report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True, mapping=Path("m.json"),
                         source_secret="LEGACY_ODBC")
     assert "delete_evidence=fail" in report["blocking"]

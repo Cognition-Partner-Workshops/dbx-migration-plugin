@@ -295,7 +295,7 @@ def _captured_columns(column_list: str) -> list[str]:
 
 
 def check_delete_evidence(mapping: Path | None, source_secret: str | None, plugin_root: Path,
-                          connect=_pyodbc_connect) -> Check:
+                          connect=_pyodbc_connect, params: dict[str, str] | None = None) -> Check:
     """Every `delete_evidence` block a mapping declares must be answerable on the source before a
     transactional recon run, under the exact access model the harness uses: CDC on for the
     database; each declared capture instance visible to the migration identity through
@@ -304,15 +304,17 @@ def check_delete_evidence(mapping: Path | None, source_secret: str | None, plugi
     captured columns; and one bounded call of the generated cdc.fn_cdc_get_all_changes_<capture>
     over the single-position [max, max] range with the key columns and the object's root_where, so an
     identity that cannot execute the function or a scope the capture cannot evaluate fails here
-    rather than mid-run. Metadata reads only: CDC is a source-side change the factory never makes
-    (the doctor never runs sp_cdc_enable_*), so a red row here is a customer decision to record,
-    not a fix to apply."""
+    rather than mid-run. The metadata comparison folds case (CDC metadata keeps the declared
+    spelling, the mapping's spelling is what the server resolves under its collation); the probe,
+    sent with the mapping's spelling, is the exact check. Metadata reads only: CDC is a source-side
+    change the factory never makes (the doctor never runs sp_cdc_enable_*), so a red row here is a
+    customer decision to record, not a fix to apply."""
     if mapping is None:
         return Check("delete_evidence", "skipped", "no --mapping given; declared delete evidence not verified")
     sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
     from recon.config import ConfigError, load_mapping_spec
     try:
-        spec = load_mapping_spec(mapping)
+        spec = load_mapping_spec(mapping, params)
     except (ConfigError, OSError, ValueError) as e:
         return Check("delete_evidence", "fail", f"{mapping}: {_redact(str(e))}")
     declared = [(c.object, c.delete_evidence) for c in spec.objects if c.delete_evidence is not None]
@@ -348,15 +350,16 @@ def check_delete_evidence(mapping: Path | None, source_secret: str | None, plugi
             cur.execute(_CDC_QUERIES["captures"])
             names = [d[0].lower() for d in cur.description]
             cap_i, cols_i = names.index("capture_instance"), names.index("captured_column_list")
-            visible = {str(r[cap_i]): _captured_columns(r[cols_i]) for r in cur.fetchall()}
-            data["missing"] = [c for c in wanted if c not in visible]
+            visible = {str(r[cap_i]).casefold(): [c.casefold() for c in _captured_columns(r[cols_i])]
+                       for r in cur.fetchall()}
+            data["missing"] = [c for c in wanted if c.casefold() not in visible]
             if data["missing"]:
                 return Check(*fail, f"declared capture instance(s) not present or not readable by this identity "
                              f"(db_owner, the capture's gating role, or SELECT on its captured columns): "
                              f"{data['missing']}", data)
             for cap in wanted:
                 keys = dict.fromkeys(k for key_cols, _ in reads[cap] for k in key_cols)
-                if absent := [k for k in keys if k not in visible[cap]]:
+                if absent := [k for k in keys if k.casefold() not in visible[cap.casefold()]]:
                     data["missing_columns"][cap] = absent
             if data["missing_columns"]:
                 return Check(*fail, "mapped source key column(s) are not captured, so deletes_since cannot "
@@ -459,13 +462,14 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
 # ------------------------------------------------------------------ main
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
-        no_databricks: bool, mapping: Path | None = None, source_secret: str | None = None) -> dict:
+        no_databricks: bool, mapping: Path | None = None, source_secret: str | None = None,
+        params: dict[str, str] | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root)]
     checks += check_hooks(plugin_root, ws, probe_result)
     checks.append(check_official_plugin(plugin_root))
     checks.append(check_harness(plugin_root))
     checks.append(check_drivers())
-    checks.append(check_delete_evidence(mapping, source_secret, plugin_root))
+    checks.append(check_delete_evidence(mapping, source_secret, plugin_root, params=params))
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -500,11 +504,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mapping", type=Path,
                    help="recon mapping.json; objects declaring delete_evidence are verified on the source")
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
+    p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                   help="mapping ${NAME} placeholder value, same rules and values as dbx-recon run --param")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
+    params = None
+    if a.param:
+        sys.path.insert(0, str(a.plugin_root.resolve() / "skills" / "data-reconciliation" / "harness"))
+        from recon.cli import parse_params
+        params = parse_params(a.param)
 
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
-                 a.expect_identity, a.no_databricks, a.mapping, a.source_secret)
+                 a.expect_identity, a.no_databricks, a.mapping, a.source_secret, params)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:

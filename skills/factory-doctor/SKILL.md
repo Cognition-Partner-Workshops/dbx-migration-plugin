@@ -14,7 +14,8 @@ being applied.
 ```bash
 python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role orchestrator|child] \
     [--expect-identity <migration SP userName>] [--hook-probe-result blocked|not-blocked] \
-    [--mapping <recon mapping.json> --source-secret <ENV VAR NAME of the read-only source DSN>]
+    [--mapping <recon mapping.json> --source-secret <ENV VAR NAME of the read-only source DSN>
+     --param name=value ...]   # the same --param values the recon run will get
 ```
 
 Writes `.migration/09_capabilities.json` and prints one line per check. Exit 0 = `ready`.

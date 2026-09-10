@@ -221,6 +221,40 @@ def test_an_applied_position_older_than_the_retained_horizon_is_a_retention_gap(
     assert source.calls["deletes_since"] == 0  # nothing to read: the gap is decided by the horizon
 
 
+def test_an_applied_position_past_the_retained_horizon_is_ahead_of_horizon_and_strict():
+    # a feed cannot have applied a position the source never produced: wrong capture, wrong
+    # database or a corrupt checkpoint; a clean-looking target must not merge on that evidence
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    source, target = _sides(loans, tgt, borrowers, {"raw_loans": [_ev(3, 15, 5.0)]}, applied=30,
+                            horizons={"raw_loans": (5, 20)})
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
+    cdc = _tier(result, "cdc_lag_ordering")
+    assert [f["check"] for f in cdc["findings"]] == ["delete_evidence_unusable"]
+    assert "ahead_of_horizon" in cdc["findings"][0]["detail"] and "30" in cdc["findings"][0]["detail"]
+    assert _tier(result, "pk_set_diff")["stats"]["loans"]["delete_evidence"]["status"] == "ahead_of_horizon"
+    assert source.calls["deletes_since"] == 0
+    # and with a target-only key the strict grading applies
+    src, tgt = _deleted(loans, 3)
+    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 15, 5.0)]}, applied=30,
+                            horizons={"raw_loans": (5, 20)})
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert [f["check"] for f in _tier(result, "pk_set_diff")["findings"]] == ["pk_extra_on_target"]
+
+
+def test_an_applied_position_equal_to_the_horizon_is_fully_applied():
+    loans, borrowers = _rows(12)
+    tgt = [dict(r) for r in loans]
+    source, target = _sides(loans, tgt, borrowers, {"raw_loans": [_ev(3, 15, 5.0)]}, applied=20,
+                            horizons={"raw_loans": (5, 20)})
+    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
+    assert result["verdict"] == "PASS" and result["merge_eligible"] is True
+    assert _tier(result, "cdc_lag_ordering")["findings"] == []
+    assert _tier(result, "pk_set_diff")["stats"]["loans"]["delete_evidence"]["status"] == "ok"
+    assert source.calls["deletes_since"] == 0
+
+
 def test_a_capture_that_retains_nothing_is_unavailable_and_strict():
     loans, borrowers = _rows(12)
     src, tgt = _deleted(loans, 3)

@@ -100,10 +100,12 @@ class KeyDiff:
 #   unavailable    the capture retains no positions (not enabled, or nothing captured)
 #   incompatible   applied position and stream positions are of different mechanisms
 #   retention_gap  the target's applied position is older than the oldest retained change
-#   ok             deletes after the applied position were read
+#   ahead_of_horizon  the applied position is newer than anything the capture has produced:
+#                  a corrupt checkpoint, or the wrong capture / source database
+#   ok             deletes after the applied position were read (or nothing is left to apply)
 # Every status but `ok` keeps the strict behaviour: no target-only key is demoted.
 EVIDENCE_STRICT = ("absent", "unsupported", "no_position", "unavailable", "incompatible",
-                   "retention_gap")
+                   "retention_gap", "ahead_of_horizon")
 
 
 @dataclass
@@ -181,7 +183,13 @@ def resolve_delete_evidence(c: ObjectMapping, tol: Tolerances, source, target) -
         result.detail = (f"target applied position {_pos(applied)} is older than the oldest "
                          f"retained change {_pos(lo)}: deletes between them are unknowable")
         return result
-    if applied >= hi:
+    if applied > hi:
+        result.status = "ahead_of_horizon"
+        result.detail = (f"target applied position {_pos(applied)} is newer than the newest change "
+                         f"the capture has produced {_pos(hi)}: the checkpoint cannot come from this "
+                         f"capture")
+        return result
+    if applied == hi:
         result.detail = "target has applied every retained change"
         return result
     latest: dict[tuple, DeleteEvent] = {}
