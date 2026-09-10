@@ -14,7 +14,7 @@ def _functions():
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
-                    and node.name in {"validate_manifest", "validate_verify"})
+                    and node.name in {"validate_manifest", "validate_verify", "ledger_violations"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES"}
                     for t in node.targets))]
@@ -28,6 +28,7 @@ def _batch_runtime():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
+                or (isinstance(node, ast.FunctionDef) and node.name == "ledger_violations")
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id == "MERGE_EVIDENCE_MODES" for t in node.targets))]
     namespace = {
@@ -240,7 +241,7 @@ def test_replayed_failures_do_not_refill_breaker():
                     "failure_class": "same", "one_line_summary": "replayed"}
         return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live",
                 "pr_url": "https://example/pr/held", "branch": "feature/held",
-                "one_line_summary": "held passed"}
+                "changed_paths": ["src/held.sql"], "one_line_summary": "held passed"}
 
     namespace["agent"] = agent
 
@@ -296,7 +297,8 @@ def _run_one(namespace, report):
 @pytest.mark.parametrize("mode", ["live", "snapshot", "transactional"])
 def test_pass_with_merge_evidence_mode_is_kept(mode):
     out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode,
-                                      "pr_url": "https://example/pr/1", "branch": "f", "one_line_summary": "ok"})
+                                      "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"],
+                                      "one_line_summary": "ok"})
     assert out["status"] == "PASS" and "failure_class" not in out
 
 
@@ -333,3 +335,128 @@ def test_first_run_requires_wave_run_id():
     finally:
         if old is not None:
             os.environ["WAVE_RUN_ID"] = old
+
+
+# ---------------------------------------------------------------- ledger gate (changed_paths)
+
+LEDGER_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targets.json",
+                ".migration/06_decisions.md", ".migration/09_capabilities.json", ".migration/units/u/mapping_spec.json"]
+
+
+def _pass(**extra):
+    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "pr_url": "https://example/pr/1",
+            "branch": "f", "one_line_summary": "ok", **extra}
+
+
+def test_clean_diff_stays_pass_and_recon_evidence_for_its_own_units_is_allowed():
+    ns = _batch_runtime()
+    out = _run_one(ns, _pass(changed_paths=["src/loans.sql", ".migration/recon/u/result.json"]))
+    assert out["status"] == "PASS" and "failure_class" not in out
+    assert ns["ledger_violations"](["a.py", ".migration/recon/u/x", ".migration/recon/u/deep/y"], ["u"]) == []
+
+
+@pytest.mark.parametrize("path", LEDGER_FILES + [".migration/recon/other_unit/result.json", ".migration/recon/wave-1/report.md"])
+def test_diff_touching_the_ledger_is_downgraded_to_ledger_tampered(path):
+    out = _run_one(_batch_runtime(), _pass(changed_paths=["src/loans.sql", path]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered"
+    assert path in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
+
+
+@pytest.mark.parametrize("report", [_pass(), _pass(changed_paths="src/x.sql"), _pass(changed_paths=[".migration/x", 3])])
+def test_pass_without_a_usable_changed_paths_is_not_pass(report):
+    out = _run_one(_batch_runtime(), report)
+    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered"
+    assert "changed_paths" in out["one_line_summary"]
+
+
+def test_a_failed_child_that_touched_the_ledger_is_still_reclassified():
+    out = _run_one(_batch_runtime(), {"status": "FAIL", "recon_verdict": "FAIL", "recon_mode": "live",
+                                      "failure_class": "decimal_rounding", "one_line_summary": "off by one",
+                                      "changed_paths": [".migration/03_recon_tolerances.json"]})
+    assert out["failure_class"] == "ledger_tampered"
+
+
+def test_breaker_counts_ledger_tampering():
+    ns = _batch_runtime()
+
+    async def agent(prompt, **kwargs):
+        return _pass(changed_paths=[".migration/allowed_targets.json"])
+
+    ns["agent"] = agent
+
+    async def exercise():
+        breaker = ns["Breaker"](3)
+        for i in range(3):
+            await ns["run_batch"]({"id": f"b{i}", "units": ["u"], "write_targets": ["t"], "brief": "b"},
+                                  asyncio.Semaphore(1), breaker)
+        return breaker
+
+    assert asyncio.run(exercise()).tripped_on == "ledger_tampered"
+
+
+def test_child_schema_requires_changed_paths():
+    tree = ast.parse(WORKFLOW.read_text())
+    ns = {t.id: ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+          for t in node.targets if isinstance(t, ast.Name) and t.id.endswith("_SCHEMA")}
+    for schema in (ns["CHILD_SCHEMA"], ns["VERIFY_SCHEMA"]):
+        assert "changed_paths" in schema["required"]
+        assert schema["properties"]["changed_paths"]["items"] == {"type": "string"}
+        assert "git diff --name-only" in schema["properties"]["changed_paths"]["description"]
+
+
+def test_prompts_demand_changed_paths_and_base_branch_policy_files():
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"](_manifest()["batches"][0])
+    assert "git diff --name-only" in child and "changed_paths" in child
+    assert ".migration/recon/<unit_id>/" in child and "ledger_tampered" in child
+    verify = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1"}], False)
+    assert "git diff --name-only" in verify and "changed_paths" in verify
+    assert "03_recon_tolerances.json" in verify and "allowed_targets.json" in verify
+    assert "base branch" in verify and "not the PR" in verify
+    assert ".migration/recon/<unit_id>/" in verify and "ledger_tampered" in verify
+
+
+def test_validate_verify_requires_changed_paths_inside_the_wave_report_dir():
+    validate_verify = _functions()["validate_verify"]
+    passed = [{"batch": "w2-b03", "units": ["u"], "pr_url": "https://example/pr/3"}]
+    ok = {"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "PASS"}, "merged_prs": [], "findings": [],
+          "changed_paths": [".migration/recon/wave-2/report.md"]}
+    assert validate_verify(ok, passed, False, wave=2) == []
+    problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-2/report.md",
+                                                        ".migration/03_recon_tolerances.json"]}, passed, False, wave=2)
+    assert problems == ["verifier output invalid: ledger tampered, changed .migration/03_recon_tolerances.json"]
+    problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-3/report.md"]}, passed, False, wave=2)
+    assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/wave-3/report.md"]
+    problems = validate_verify({k: v for k, v in ok.items() if k != "changed_paths"}, passed, False, wave=2)
+    assert problems == ["verifier output invalid: changed_paths must be a list of paths (git diff --name-only)"]
+
+
+# ---------------------------------------------------------------- capability contract vs the doctor's record (A3)
+
+DOCTOR = {"schema": "dbx-migration-factory/capabilities/1", "ready": True,
+          "identity": {"userName": "sp-1", "service_principal": True, "host": "https://adb-1.azuredatabricks.net"},
+          "checks": [{"id": "allowed_targets", "status": "ok", "data": {"catalogs": ["mig"], "guard_mode": "block"}},
+                     {"id": "stop_mode", "status": "ok", "data": {"stop_mode": "soft"}}]}
+
+
+def test_validate_manifest_compares_the_contract_with_the_doctor_record():
+    validate_manifest = _functions()["validate_manifest"]
+    validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), DOCTOR)
+    for caps, needle in ((_caps(), "host"),
+                         (_caps(host="https://adb-2.azuredatabricks.net"), "host"),
+                         (_caps(host=DOCTOR["identity"]["host"], identity="sp-2"), "identity"),
+                         (_caps(host=DOCTOR["identity"]["host"], catalogs=["mig", "prod"]), "catalogs"),
+                         (_caps(host=DOCTOR["identity"]["host"], guard_mode="warn"), "guard_mode"),
+                         (_caps(host=DOCTOR["identity"]["host"], stop_mode="hard"), "stop_mode")):
+        with pytest.raises(SystemExit, match=f"capabilities.*{needle}.*09_capabilities.json"):
+            validate_manifest(_manifest(capabilities=caps, auto_merge=False), DOCTOR)
+    with pytest.raises(SystemExit, match="ready"):
+        validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "ready": False})
+    with pytest.raises(SystemExit, match="09_capabilities.json"):
+        validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "identity": None})
+
+
+def test_workflow_loads_the_doctor_record_next_to_the_waves_dir():
+    src = WORKFLOW.read_text()
+    assert 'MANIFEST_PATH.parent.parent / "09_capabilities.json"' in src
+    assert "validate_manifest(MANIFEST, DOCTOR)" in src

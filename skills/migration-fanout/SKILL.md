@@ -33,13 +33,14 @@ redoes finished work.
 
 | Guard | What it does |
 |---|---|
-| Manifest check | Refuses to start if the manifest is missing, a batch has no brief or no write targets, or batch ids repeat. |
+| Manifest check | Refuses to start if the manifest is missing, a batch has no brief or no write targets, or batch ids repeat; or if `.migration/09_capabilities.json` is missing, not `ready`, or its identity, host, catalogs, guard_mode or stop_mode differ from the manifest's `capabilities`. |
 | Collision check | Refuses to start if two batches claim the same write target. If children report an overlap after the fact, merges are held and the brief says so. |
 | Closed-wave guard | Refuses to start only if the wave closed clean (`closed: true` in the result); a halted or failed wave resumes only with the same `run_id` and `WAVE_RESUME=1`. Invalid result JSON also requires `WAVE_RESUME=1` to continue. Redo on purpose with `WAVE_RERUN=1`. |
 | Width | At most `width` children at once (default 20). |
 | Circuit breaker | After `breaker_threshold` (default 3) children fail with the same `failure_class`, no new children launch. Running ones finish. |
 | Single ledger writer | Children never edit `.migration/`. The result file is written here, once. |
-| Independent verify | A separate session re-runs recon over every PASS batch and, if `auto_merge` is true, merges only what it marks PASS. |
+| Ledger gate | Every child and the verifier report `changed_paths` (`git diff --name-only <base>...<head>`). A PASS whose PR touches anything under `.migration/` other than its own `.migration/recon/<unit_id>/` (verifier: `.migration/recon/wave-N/`) becomes FAIL with `failure_class: ledger_tampered`, which the breaker counts; a missing list is the same. |
+| Independent verify | A separate session re-runs recon over every PASS batch with `03_recon_tolerances.json` and `allowed_targets.json` from the base branch, never the PR's, and, if `auto_merge` is true, merges only what it marks PASS. |
 | Resume | Same `run_id` replays finished agents. |
 
 ## After the run

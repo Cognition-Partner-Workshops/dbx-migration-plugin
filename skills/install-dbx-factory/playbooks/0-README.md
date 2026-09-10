@@ -173,7 +173,7 @@ The kit ships as two packages with different lifecycles:
 **The plugin (`dbx-migration-factory`)** carries everything environment-shaped and customer-invariant, versioned centrally and installed into the customer's Devin org in one step:
 - the `target-routing` skill and a declared dependency on the official `databricks` plugin (`databricks/databricks-agent-skills`), which supplies every Databricks product skill (DBSQL, Lakeflow Pipelines/Jobs/Connect, bundles, Unity Catalog, Lakebase, serverless); the factory carries only migration-specific deltas on top;
 - the harness skills (`data-reconciliation`, `prediction-parity`, `migration-fanout`, `backfill-planner`, `governance-mapping`, `lakehouse-federation`) and the `factory-doctor` preflight;
-- enforcement hooks (`hooks.json`): a PreToolUse guard that blocks writes outside `.migration/allowed_targets.json` and non-read statements against legacy sources, and a PostToolUse hint that recognises Databricks auth/scope failures;
+- an enforcement hook (`hooks.json`): a PreToolUse guard that blocks writes outside `.migration/allowed_targets.json` and non-read statements against legacy sources; the `factory-doctor` proves the source principal cannot write regardless, since a hook can be absent;
 - always-on rules that mirror the kit's guardrails (never modify legacy source, reference secrets by name only, write only to the migration catalog), so even off-playbook sessions inherit them;
 - accelerator tool wrappers, chiefly the `lakebridge` skill (see the catalog): install, dialect coverage, output interpretation;
 - the `install-dbx-factory` bootstrap skill, which imports the playbooks and proposes the environment blueprint.

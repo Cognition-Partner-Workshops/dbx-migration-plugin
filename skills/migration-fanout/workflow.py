@@ -35,7 +35,8 @@ Manifest shape (written by the plan playbook, read here):
     "source_rows_fetched": 180000, "warehouse_hours": 1.5  # result.json["cost"] land in the brief
   },
   "capabilities": {                           # required; copied from .migration/09_capabilities.json
-    "identity": "<migration SP userName>",   # (factory-doctor, ready=true). Children run the doctor
+    "identity": "<migration SP userName>",   # (factory-doctor, ready=true) and compared with it
+    "host": "https://<workspace host>",       # field by field at launch. Children run the doctor
     "catalogs": ["mig"],                       # with --expect-identity and report BLOCKED on any
     "guard_mode": "block", "stop_mode": "hard", "ready": true   # mismatch. hard stop_mode
   },                                          # requires auto_merge=false (humans merge).
@@ -64,6 +65,10 @@ if not MANIFEST_PATH.exists():
                      "plan playbook wrote, then re-run.")
 MANIFEST_TEXT = MANIFEST_PATH.read_text()
 MANIFEST = json.loads(MANIFEST_TEXT)
+DOCTOR_PATH = MANIFEST_PATH.parent.parent / "09_capabilities.json"
+if not DOCTOR_PATH.exists():
+    raise SystemExit(f"no factory-doctor report at {DOCTOR_PATH}; run the doctor before launching a wave")
+DOCTOR = json.loads(DOCTOR_PATH.read_text())
 MANIFEST_SHA = hashlib.sha256(MANIFEST_TEXT.encode()).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
@@ -122,8 +127,11 @@ GUARD_MODES = ("block", "warn")
 STOP_MODES = ("hard", "soft")
 
 
-def validate_manifest(m):
-    """Fail here, in one line, instead of 20 children failing on a missing field."""
+def validate_manifest(m, doctor=None):
+    """Fail here, in one line, instead of 20 children failing on a missing field. With the doctor's
+    report (.migration/09_capabilities.json) the capability contract must repeat what the doctor
+    verified, field by field: a manifest cannot claim an identity, host or allowlist the doctor did
+    not see."""
     for key in ("wave", "repo", "child_macro", "verify_macro", "batches"):
         if key not in m:
             raise SystemExit(f"manifest is missing '{key}'")
@@ -169,12 +177,41 @@ def validate_manifest(m):
     if caps["stop_mode"] == "hard" and m.get("auto_merge", True):
         raise SystemExit("manifest 'auto_merge' must be false under capabilities.stop_mode 'hard': "
                          "merge authority stays with a human")
+    if doctor is None:
+        return
+    if doctor.get("ready") is not True:
+        raise SystemExit("09_capabilities.json says ready=false: re-run the factory-doctor to green before a wave")
+    ident = doctor.get("identity")
+    rows = {c.get("id"): c.get("data") or {} for c in doctor.get("checks", []) if isinstance(c, dict)}
+    if not isinstance(ident, dict) or not ident.get("userName") or not ident.get("host"):
+        raise SystemExit("09_capabilities.json records no verified identity and host; a wave launches only from a "
+                         "doctor report that saw the migration principal")
+    recorded = {"identity": ident["userName"], "host": ident["host"],
+                "catalogs": sorted(rows.get("allowed_targets", {}).get("catalogs") or []),
+                "guard_mode": rows.get("allowed_targets", {}).get("guard_mode"),
+                "stop_mode": rows.get("stop_mode", {}).get("stop_mode")}
+    for key, want in recorded.items():
+        got = sorted(caps["catalogs"]) if key == "catalogs" else caps.get(key)
+        if got != want:
+            raise SystemExit(f"manifest 'capabilities.{key}' is {got!r} but the doctor recorded {want!r} in "
+                             "09_capabilities.json; copy the doctor's values, never edit them")
 
 
-validate_manifest(MANIFEST)
+validate_manifest(MANIFEST, DOCTOR)
 
 
-def validate_verify(verify, passed, auto_merge) -> list[str]:
+def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
+    """Paths under .migration/ that a child (recon evidence for its own units) or the verifier (the
+    wave report) may not have changed. Everything else under .migration/ is the ledger, written only
+    by the workflow and the humans it stops for."""
+    allowed = tuple(f".migration/recon/{u}/" for u in unit_ids)
+    if wave is not None:
+        allowed += (f".migration/recon/wave-{wave}/",)
+    return [p for p in changed_paths
+            if p.startswith(".migration/") and not p.startswith(allowed)]
+
+
+def validate_verify(verify, passed, auto_merge, wave=None) -> list[str]:
     """Return verifier-output problems without reading files or mutating input."""
     problems = []
     if not isinstance(verify, dict):
@@ -218,6 +255,12 @@ def validate_verify(verify, passed, auto_merge) -> list[str]:
                 problems.append(f"verifier output invalid: merged_prs is missing {url} for {batch['batch']}")
     if not isinstance(verify.get("findings"), list):
         problems.append("verifier output invalid: findings must be a list")
+    changed = verify.get("changed_paths")
+    if not isinstance(changed, list) or not all(isinstance(p, str) for p in changed):
+        problems.append("verifier output invalid: changed_paths must be a list of paths (git diff --name-only)")
+    else:
+        problems += [f"verifier output invalid: ledger tampered, changed {p}"
+                     for p in ledger_violations(changed, [], wave)]
     return problems
 
 WAVE = MANIFEST["wave"]
@@ -254,12 +297,14 @@ CHILD_SCHEMA = {
         "recon_mode": {"type": "string", "description": "recon --mode of the evidence run (fixture never merges)"},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
+        "changed_paths": {"type": "array", "items": {"type": "string"},
+                          "description": "every path the PR changes: git diff --name-only <base>...<head>"},
         "skill_feedback": {"type": "array", "items": {"type": "string"}},
         "recon_cost": {"type": "object",
                        "description": "result.json['cost'] of the final live/snapshot/transactional run"},
         "one_line_summary": {"type": "string"},
     },
-    "required": ["status", "recon_verdict", "recon_mode", "write_targets", "one_line_summary"],
+    "required": ["status", "recon_verdict", "recon_mode", "write_targets", "changed_paths", "one_line_summary"],
 }
 
 VERIFY_SCHEMA = {
@@ -270,10 +315,12 @@ VERIFY_SCHEMA = {
         "merged_prs": {"type": "array", "items": {"type": "string"}},
         "findings": {"type": "array", "items": {"type": "string"}},
         "report_path": {"type": "string"},
+        "changed_paths": {"type": "array", "items": {"type": "string"},
+                          "description": "every path your report branch changes: git diff --name-only <base>...<head>"},
         "recon_cost": {"type": "object",
                        "description": "summed result.json['cost'] over the verifier's re-runs"},
     },
-    "required": ["wave_verdict", "unit_verdicts", "findings"],
+    "required": ["wave_verdict", "unit_verdicts", "findings", "changed_paths"],
 }
 
 
@@ -301,7 +348,10 @@ def child_prompt(batch):
         f"{json.dumps(batch.get('write_targets', []), sort_keys=True)}\n\n"
         + capability_block(batch["units"])
         + "Rules that override anything else:\n"
-        "- Do not edit files under .migration/. The workflow writes the ledger from your report.\n"
+        "- Do not edit files under .migration/ except your own recon evidence under "
+        ".migration/recon/<unit_id>/. The workflow writes the ledger from your report.\n"
+        "- Report every path your PR changes in changed_paths (`git diff --name-only <base>...<head>`); "
+        "any other .migration/ path in it turns your PASS into FAIL ledger_tampered.\n"
         "- Do not merge your own PR.\n"
         f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
         "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
@@ -348,7 +398,11 @@ def verify_prompt(passed, auto_merge):
         f"You are the independent verifier for wave {WAVE}. Repo: {REPO}. You did not write "
         f"any of this code.\nRun the playbook {MANIFEST['verify_macro']} exactly as written over "
         f"these batches:\n{json.dumps(passed, sort_keys=True, indent=1)}\n\n"
-        "Re-run the recon harness yourself. Do not trust the PR's pasted evidence. "
+        "Re-run the recon harness yourself. Do not trust the PR's pasted evidence, and run it with "
+        "03_recon_tolerances.json and allowed_targets.json from the base branch, not the PR (a child that "
+        "loosened a tolerance must fail here). For each PR run `git diff --name-only <base>...<head>`: any "
+        ".migration/ path outside .migration/recon/<unit_id>/ is a FAIL for that unit with finding "
+        "ledger_tampered. "
         f"Mark a unit PASS only if you re-ran the harness in one of {list(MERGE_EVIDENCE_MODES)} "
         "(the same mode the child used: transactional for Lakebase/operational units) and result.json "
         "says merge_eligible=true. "
@@ -358,7 +412,8 @@ def verify_prompt(passed, auto_merge):
         "Sum result.json['cost'] over your runs into recon_cost.\n"
         f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{WAVE}/report.md, "
         f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
-        "report_path. Do not edit any other file under .migration/. Each finding is one plain "
+        "report_path. Do not edit any other file under .migration/; report your branch's "
+        "`git diff --name-only <base>...<head>` in changed_paths. Each finding is one plain "
         "sentence a lead can read without opening anything."
     )
 
@@ -405,6 +460,19 @@ async def run_batch(batch, sem, breaker):
             out["failure_class"] = "missing_pr"
             out["one_line_summary"] = (
                 "PASS downgraded: no PR URL/branch reported; " + out["one_line_summary"])
+        changed = out.get("changed_paths")
+        if not isinstance(changed, list) or not all(isinstance(p, str) for p in changed):
+            if out["status"] == "PASS":
+                out["status"] = "FAIL"
+                out["failure_class"] = "ledger_tampered"
+                out["one_line_summary"] = (
+                    "PASS downgraded: changed_paths not reported, ledger integrity unverified; "
+                    + out["one_line_summary"])
+        elif tampered := ledger_violations(changed, batch["units"]):
+            prefix = "PASS downgraded: " if out["status"] == "PASS" else ""
+            out["status"] = "FAIL"
+            out["failure_class"] = "ledger_tampered"
+            out["one_line_summary"] = f"{prefix}PR changed the ledger ({', '.join(tampered)}); " + out["one_line_summary"]
         if out["status"] != "PASS" and batch["id"] not in REPLAYED:
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
@@ -553,7 +621,7 @@ async def main():
     else:
         log("verify: skipped, no batch passed")
 
-    verify_problems = validate_verify(verify, passed, auto_merge) if verify is not None else []
+    verify_problems = validate_verify(verify, passed, auto_merge, WAVE) if verify is not None else []
     if verify_problems:
         if not isinstance(verify, dict):
             verify = {"wave_verdict": "FAIL", "unit_verdicts": {}, "findings": []}

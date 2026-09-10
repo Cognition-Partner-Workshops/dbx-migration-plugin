@@ -2,6 +2,8 @@ import json
 import re
 import subprocess
 import sys
+import types
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -15,7 +17,13 @@ import doctor  # noqa: E402
 import dbx_guard  # noqa: E402
 
 
-def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=()):
+def _git(ws: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(ws), "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                          check=True, capture_output=True, text=True).stdout
+
+
+def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), commit=True):
+    """A setup-complete workspace, committed as the setup playbook leaves it before STOP A."""
     mig = tmp_path / ".migration"
     mig.mkdir(parents=True)
     for f in doctor.REQUIRED_FILES:
@@ -28,6 +36,10 @@ def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=()):
             mig.joinpath(f).write_text(f"# context\n\nstop_mode: {stop_mode}\n")
         else:
             mig.joinpath(f).write_text(f"# {f}\n")
+    _git(tmp_path, "init", "-q")
+    if commit:
+        _git(tmp_path, "add", "-A")
+        _git(tmp_path, "commit", "-qm", "setup")
     return tmp_path
 
 
@@ -35,16 +47,26 @@ def by_id(report):
     return {c["id"]: c for c in report["checks"]}
 
 
+def probed(ws):
+    """What a session does before the live probe: one doctor run (report written) issues the nonce the probe echoes."""
+    first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
+    return "blocked:" + by_id(first)["hook_platform_loaded"]["data"]["probe_nonce"]
+
+
 def test_probe_command_is_blocked_by_guard_and_harmless_otherwise():
     cfg = dbx_guard.GuardConfig.from_dict({"catalogs": ["mig_cat"]})
-    v = dbx_guard.evaluate(doctor.HOOK_PROBE_COMMAND, cfg)
-    assert v.decision == "block" and "__dbx_guard_probe__" in v.reason
-    assert doctor.HOOK_PROBE_COMMAND.startswith("echo ")
+    probe = doctor.HOOK_PROBE_COMMAND.format(nonce="c0ffee42")
+    v = dbx_guard.evaluate(probe, cfg)
+    # the block reason echoes the probe catalog, nonce included: that echo is what the session
+    # hands back to the doctor, so a `blocked` claim cannot be typed without having seen it
+    assert v.decision == "block" and "__dbx_guard_probe__c0ffee42" in v.reason
+    assert probe.startswith("echo ")
 
 
 def test_offline_run_passes_every_local_check_but_is_never_ready(tmp_path):
     ws = make_workspace(tmp_path)
-    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, no_databricks=True)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", probed(ws), None, no_databricks=True)
     c = by_id(report)
     assert not [x for x in report["checks"] if x["status"] == "fail"]
     # an unverified identity can never certify a wave, however the check was skipped
@@ -64,9 +86,41 @@ def test_unknown_probe_is_unverified_and_carries_command(tmp_path):
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
     c = by_id(report)
     assert c["hook_platform_loaded"]["status"] == "unverified"
-    assert c["hook_platform_loaded"]["data"]["probe_command"] == doctor.HOOK_PROBE_COMMAND
+    nonce = c["hook_platform_loaded"]["data"]["probe_nonce"]
+    assert re.fullmatch(r"[0-9a-f]{8}", nonce)
+    assert c["hook_platform_loaded"]["data"]["probe_command"] == doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)
+    assert "blocked:<nonce>" in c["hook_platform_loaded"]["detail"]
     assert not report["ready"]
     assert report["blocking"] == ["hook_platform_loaded=unverified", "databricks_identity=skipped"]
+
+
+def test_platform_probe_is_verified_by_the_nonce_the_last_report_issued(tmp_path):
+    ws = make_workspace(tmp_path)
+    first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
+    nonce = by_id(first)["hook_platform_loaded"]["data"]["probe_nonce"]
+    ok = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
+    assert by_id(ok)["hook_platform_loaded"]["status"] == "ok"
+    assert by_id(ok)["hook_platform_loaded"]["data"] == {"probe_nonce": nonce}
+    # a nonce that was never issued for this workspace (typed, stale, or from another report)
+    # proves nothing: the row stays unverified and a fresh nonce is issued
+    for claim in ("blocked:deadbeef", "blocked:"):
+        again = doctor.run(ws, PLUGIN_ROOT, "orchestrator", claim, None, True)
+        row = by_id(again)["hook_platform_loaded"]
+        assert row["status"] == "unverified" and "did not match" in row["detail"]
+        assert row["data"]["probe_nonce"] not in (nonce, "deadbeef")
+    # a workspace with no prior report has no nonce to match, so nothing verifies it yet
+    fresh = doctor.run(make_workspace(tmp_path / "fresh"), PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
+    assert by_id(fresh)["hook_platform_loaded"]["status"] == "unverified"
+
+
+def test_cli_rejects_a_bare_blocked_claim(tmp_path):
+    ws = make_workspace(tmp_path)
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--plugin-root",
+                        str(PLUGIN_ROOT), "--no-databricks", "--hook-probe-result", "blocked"],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "blocked:<nonce>" in r.stderr
+    assert not (ws / ".migration" / "09_capabilities.json").exists()
 
 
 def test_human_identity_is_not_ready(tmp_path, monkeypatch):
@@ -77,7 +131,7 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
         doctor.Check("databricks_identity", "warn", "authenticated as someone@example.com (user)"),
         doctor.Check("databricks_warehouse", "warn", "none"),
     ])
-    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, no_databricks=False)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", probed(ws), None, no_databricks=False)
     assert report["summary"].get("fail", 0) == 0
     assert not report["ready"] and report["blocking"] == ["databricks_identity=warn"]
 
@@ -90,7 +144,7 @@ def test_service_principal_with_advisory_warns_is_ready(tmp_path, monkeypatch):
         doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
         doctor.Check("databricks_warehouse", "warn", "none"),
     ])
-    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, no_databricks=False)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", probed(ws), None, no_databricks=False)
     assert report["ready"] and report["blocking"] == []
 
 
@@ -172,13 +226,17 @@ def test_bad_allowlist_fails(tmp_path):
 
 def test_cli_writes_capabilities_json_and_exit_codes(tmp_path):
     ws = make_workspace(tmp_path)
-    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
-                        "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--hook-probe-result", "blocked"],
-                       capture_output=True, text=True)
+    argv = [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT),
+            "--no-databricks"]
+    r = subprocess.run(argv, capture_output=True, text=True, check=False)
+    assert r.returncode == 1, r.stdout + r.stderr
+    cap = json.loads((ws / ".migration" / "09_capabilities.json").read_text())
+    nonce = by_id(cap)["hook_platform_loaded"]["data"]["probe_nonce"]
+    r = subprocess.run([*argv, "--hook-probe-result", f"blocked:{nonce}"], capture_output=True, text=True, check=False)
     assert r.returncode == 1, r.stdout + r.stderr  # offline: identity unverified, so not ready
     cap = json.loads((ws / ".migration" / "09_capabilities.json").read_text())
     assert cap["schema"] == "dbx-migration-factory/capabilities/1" and cap["ready"] is False
-    assert cap["blocking"] == ["databricks_identity=skipped"]
+    assert cap["blocking"] == ["databricks_identity=skipped"] and cap["identity"] is None
     assert "ready=False" in r.stdout and "databricks_identity=skipped" in r.stdout
 
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
@@ -535,7 +593,7 @@ def test_run_includes_delete_evidence_and_a_failed_check_blocks(tmp_path, monkey
                         lambda m, s, root, connect=None, params=None:
                         doctor.Check("delete_evidence", "fail", "CDC is not enabled"))
     _unit_mapping(ws, "loans")
-    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True, units=["loans"],
+    report = doctor.run(ws, PLUGIN_ROOT, "child", probed(ws), None, True, units=["loans"],
                         source_secret="LEGACY_ODBC")
     assert "delete_evidence=fail" in report["blocking"]
     # a child preflight without its batch is a blocking row, never a silent skip
@@ -543,6 +601,311 @@ def test_run_includes_delete_evidence_and_a_failed_check_blocks(tmp_path, monkey
     assert by_id(report)["delete_evidence"]["status"] == "fail"
     assert "delete_evidence=fail" in report["blocking"]
     # setup (orchestrator, no unit mapping exists yet) is the one explicit not-applicable path
-    report = doctor.run(make_workspace(tmp_path / "setup"), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    setup = make_workspace(tmp_path / "setup")
+    report = doctor.run(setup, PLUGIN_ROOT, "orchestrator", probed(setup), None, True)
     assert by_id(report)["delete_evidence"]["status"] == "skipped"
     assert report["blocking"] == ["databricks_identity=skipped"]
+
+
+# ------------------------------------------------------------------ source principal read-only (A1)
+
+class FakePrivConn:
+    """A source seen through the doctor's privilege queries. `roles` are the principal's server or
+    database-wide flags (sysadmin, db_owner, alter_any_database; superuser for Postgres),
+    `writable` maps a table to the write privileges it holds, `absent` tables cannot be resolved.
+    Records every statement so a test can prove the check only ever asked questions."""
+
+    def __init__(self, *, roles=(), writable=None, absent=(), read_only="on"):
+        self.roles, self.writable, self.absent, self.read_only = set(roles), writable or {}, set(absent), read_only
+        self.statements: list[tuple[str, tuple]] = []
+        self.closed = False
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, *params):
+        self.statements.append((sql, params))
+        low, args = sql.lower(), tuple(params[0]) if params else ()
+        if "is_srvrolemember" in low:
+            self._rows = [tuple(int(r in self.roles) for r in ("sysadmin", "db_owner", "alter_any_database"))]
+        elif "has_perms_by_name" in low:
+            t = args[0]
+            self._rows = [(None,) * 4 if t in self.absent else
+                          tuple(int(p in self.writable.get(t, ())) for p in ("INSERT", "UPDATE", "DELETE", "ALTER"))]
+        elif "rolsuper" in low:
+            self._rows = [("superuser" in self.roles,)]
+        elif "has_table_privilege" in low:
+            t = args[0]
+            if t in self.absent:
+                raise RuntimeError(f'relation "{t}" does not exist')
+            held = self.writable.get(t, ())
+            self._rows = [tuple(p in held for p in ("INSERT", "UPDATE", "DELETE", "TRUNCATE")) + ("CREATE" in held,)]
+        elif "transaction_read_only" in low:
+            self._rows = [(self.read_only,)]
+        else:
+            raise AssertionError(f"unexpected statement: {sql}")
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        self.closed = True
+
+
+def _asked_only_questions(conn):
+    return all(s.lstrip().upper().startswith("SELECT") for s, _ in conn.statements)
+
+
+TABLES = ["raw.loans", "raw.payments"]
+
+
+def test_sqlserver_select_only_principal_is_ok_and_the_row_says_readonly_is_advisory(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x;PWD=never-printed")
+    conn = FakePrivConn()
+    c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    assert c.status == "ok", c.detail
+    assert c.data["tables"] == TABLES and c.data["roles"] == [] and c.data["writable"] == {}
+    assert "readonly=True" in c.data["stats"] and "advisory" in c.data["stats"]
+    assert "never-printed" not in json.dumps(asdict(c))
+    assert conn.closed and _asked_only_questions(conn)
+    # one role query, then one HAS_PERMS_BY_NAME row per in-scope table, parameterised, never interpolated
+    perms = [(s, a) for s, a in conn.statements if "HAS_PERMS_BY_NAME(?" in s]
+    assert [a[0][0] for _, a in perms] == TABLES
+    assert all(p in perms[0][0] for p in ("'INSERT'", "'UPDATE'", "'DELETE'", "'ALTER'"))
+    assert any("IS_SRVROLEMEMBER('sysadmin')" in s and "IS_MEMBER('db_owner')" in s
+               and "HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER ANY DATABASE')" in s for s, _ in conn.statements)
+
+
+@pytest.mark.parametrize("kw, needle", [
+    ({"roles": ["sysadmin"]}, "sysadmin"),
+    ({"roles": ["db_owner"]}, "db_owner"),
+    ({"roles": ["alter_any_database"]}, "ALTER ANY DATABASE"),
+    ({"writable": {"raw.payments": ["INSERT", "DELETE"]}}, "raw.payments: INSERT, DELETE"),
+    ({"writable": {"raw.loans": ["ALTER"]}}, "raw.loans: ALTER"),
+])
+def test_sqlserver_principal_that_can_write_in_scope_fails_naming_object_and_privilege(monkeypatch, kw, needle):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x;PWD=never-printed")
+    conn = FakePrivConn(**kw)
+    c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    assert c.status == "fail" and needle in c.detail and "never-printed" not in c.detail
+    assert "readonly=True" in c.detail and "advisory" in c.detail  # the fail explains why the flag is no defence
+    assert _asked_only_questions(conn)
+
+
+def test_postgres_branches(monkeypatch):
+    monkeypatch.setenv("LAKEBASE_SRC", "postgres://u:never-printed@h/db")
+    conn = FakePrivConn()
+    c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC", connect=lambda dsn: conn)
+    assert c.status == "ok", c.detail
+    assert "transaction_read_only=on" in c.data["stats"] and "advisory" in c.data["stats"]
+    assert "never-printed" not in json.dumps(asdict(c)) and _asked_only_questions(conn)
+    priv = [(s, a) for s, a in conn.statements if "has_table_privilege" in s]
+    assert len(priv) == 1 and priv[0][1][0] == ("public.loans",) * 4 + ("public",)
+    assert all(p in priv[0][0] for p in ("'INSERT'", "'UPDATE'", "'DELETE'", "'TRUNCATE'", "has_schema_privilege(%s, 'CREATE')"))
+    for kw, needle in (({"roles": ["superuser"]}, "superuser"),
+                       ({"writable": {"public.loans": ["TRUNCATE"]}}, "public.loans: TRUNCATE"),
+                       ({"writable": {"public.loans": ["CREATE"]}}, "public.loans: CREATE on schema"),
+                       ({"absent": ["public.loans"]}, "does not exist")):
+        c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC",
+                                          connect=lambda dsn, kw=kw: FakePrivConn(**kw))
+        assert c.status == "fail" and needle in c.detail, (kw, c.detail)
+
+
+def test_default_connectors_open_read_only_the_way_each_driver_accepts(monkeypatch):
+    """psycopg 3 takes read_only as a connection attribute, not a libpq keyword (that raises)."""
+    calls = {}
+
+    class FakePg:
+        class Conn:
+            read_only = False
+
+        @staticmethod
+        def connect(conninfo, **kw):
+            calls.update(conninfo=conninfo, kw=kw)
+            return FakePg.Conn()
+
+    monkeypatch.setitem(sys.modules, "psycopg", FakePg)
+    conn = doctor._psycopg_connect("postgres://u:pw@h/db")
+    assert calls == {"conninfo": "postgres://u:pw@h/db", "kw": {"connect_timeout": 15}} and conn.read_only is True
+    fake_odbc = types.SimpleNamespace(connect=lambda dsn, **kw: (dsn, kw))
+    monkeypatch.setitem(sys.modules, "pyodbc", fake_odbc)
+    assert doctor._pyodbc_connect("Driver=x") == ("Driver=x", {"readonly": True, "timeout": 15})
+
+
+def test_unresolvable_object_and_untestable_families_are_unverified_never_ok(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC",
+                                      connect=lambda dsn: FakePrivConn(absent=["raw.payments"]))
+    assert c.status == "unverified" and "raw.payments" in c.detail and c.data["unresolved"] == ["raw.payments"]
+    for family in ("teradata", "oracle", "redshift", "snowflake"):
+        c = doctor.check_source_principal(TABLES, family, "LEGACY_ODBC", connect=lambda dsn: FakePrivConn())
+        assert c.status == "unverified" and family in c.detail and "privilege query" in c.detail
+
+
+def test_source_principal_needs_the_secret_and_redacts_driver_errors(monkeypatch):
+    monkeypatch.delenv("LEGACY_ODBC", raising=False)
+    c = doctor.check_source_principal(TABLES, "sqlserver", None)
+    assert c.status == "fail" and "--source-secret" in c.detail
+    c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC")
+    assert c.status == "fail" and "LEGACY_ODBC" in c.detail and "not set" in c.detail
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+
+    def boom(dsn):
+        raise RuntimeError("login failed for PWD=hunter2token99 at server")
+
+    c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC", connect=boom)
+    assert c.status == "fail" and "hunter2token99" not in c.detail and "login failed" in c.detail
+
+
+def test_run_resolves_the_in_scope_tables_from_the_same_mappings_as_delete_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    monkeypatch.setattr(doctor, "check_delete_evidence",
+                        lambda m, s, root, connect=None, params=None: doctor.Check("delete_evidence", "ok", ""))
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans")
+    _unit_mapping(ws, "payments", evidence=False)
+    seen = {}
+
+    def fake(tables, family, secret, connect=None):
+        seen.update(tables=tables, family=family, secret=secret)
+        return doctor.Check("source_principal_read_only", "unverified", "stub")
+
+    monkeypatch.setattr(doctor, "check_source_principal", fake)
+    report = doctor.run(ws, PLUGIN_ROOT, "child", probed(ws), None, True, units=["loans", "payments"],
+                        source_secret="LEGACY_ODBC")
+    assert seen == {"tables": ["raw.loans"], "family": "sqlserver", "secret": "LEGACY_ODBC"}
+    # unverified for a declared source blocks readiness; a fail does too
+    assert "source_principal_read_only=unverified" in report["blocking"]
+    # --source-family is authoritative; without it the family comes from the mapping's delete_evidence kind
+    seen.clear()
+    doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_secret="LEGACY_ODBC",
+               source_family="postgres")
+    assert seen["family"] == "postgres" and seen["tables"] == ["raw.loans"]
+    # a mapping that declares no evidence kind and no --source-family cannot be verified, never passed
+    monkeypatch.setattr(doctor, "check_source_principal", lambda *a, **k: pytest.fail("must not connect"))
+    ws2 = make_workspace(tmp_path / "nokind")
+    _unit_mapping(ws2, "loans", evidence=False)
+    report = doctor.run(ws2, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_secret="LEGACY_ODBC")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "unverified" and "--source-family" in row["detail"]
+    assert "source_principal_read_only=unverified" in report["blocking"]
+    # setup, before any unit mapping exists: not applicable, and not blocking
+    setup = make_workspace(tmp_path / "setup")
+    report = doctor.run(setup, PLUGIN_ROOT, "orchestrator", probed(setup), None, True)
+    assert by_id(report)["source_principal_read_only"]["status"] == "skipped"
+    assert report["blocking"] == ["databricks_identity=skipped"]
+
+
+def test_cli_source_family_choices_and_help(tmp_path):
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--help"], capture_output=True, text=True, check=True)
+    assert "--source-family" in r.stdout and "--expect-catalogs" in r.stdout and "blocked:<nonce>" in r.stdout
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(make_workspace(tmp_path)),
+                        "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--source-family", "databricks"],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 2 and "--source-family" in r.stderr
+
+
+# ------------------------------------------------------------------ ledger integrity rows (A2c)
+
+def test_allowlist_committed_is_ok_only_when_both_contract_files_equal_head(tmp_path):
+    ws = make_workspace(tmp_path)
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "ok" and c.data == {".migration/allowed_targets.json": "clean",
+                                           ".migration/03_recon_tolerances.json": "clean"}
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat", "prod"]}))
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "fail" and c.data[".migration/allowed_targets.json"] == "modified since HEAD"
+    assert "allowed_targets.json modified since HEAD" in c.detail and "03_recon_tolerances" not in c.detail
+    _git(ws, "add", "-A")  # staging is not committing
+    assert doctor.check_allowlist_committed(ws).status == "fail"
+    _git(ws, "commit", "-qm", "decision")
+    assert doctor.check_allowlist_committed(ws).status == "ok"
+    _git(ws, "rm", "-q", "--cached", ".migration/03_recon_tolerances.json")
+    _git(ws, "commit", "-qm", "oops")
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "untracked"
+    (ws / ".migration" / "03_recon_tolerances.json").unlink()
+    assert doctor.check_allowlist_committed(ws).data[".migration/03_recon_tolerances.json"] == "missing"
+
+
+def test_allowlist_committed_compares_bytes_not_git_status(tmp_path):
+    ws = make_workspace(tmp_path)
+    _git(ws, "update-index", "--assume-unchanged", ".migration/03_recon_tolerances.json")
+    (ws / ".migration" / "03_recon_tolerances.json").write_text("{}")
+    assert _git(ws, "status", "--porcelain").strip() == ""
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "modified since HEAD"
+
+
+def test_allowlist_committed_fails_outside_a_repository(tmp_path):
+    ws = make_workspace(tmp_path, commit=False)
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "fail" and "untracked" in c.detail
+    import shutil
+    shutil.rmtree(ws / ".git")
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "fail" and "git" in c.detail.lower()
+
+
+def test_allowlist_matches_contract(tmp_path):
+    ws = make_workspace(tmp_path)
+    c = doctor.check_allowlist_matches_contract(ws, None)
+    assert c.status == "skipped" and "--expect-catalogs" in c.detail
+    c = doctor.check_allowlist_matches_contract(ws, ["mig_cat"])
+    assert c.status == "ok" and c.data == {"expected": ["mig_cat"], "allowlist": ["mig_cat"]}
+    c = doctor.check_allowlist_matches_contract(ws, ["mig_cat", "prod"])
+    assert c.status == "fail" and "prod" in c.detail and c.data["expected"] == ["mig_cat", "prod"]
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, expect_catalogs=["other"])
+    assert "allowlist_matches_contract=fail" in report["blocking"]
+    (ws / ".migration" / "allowed_targets.json").write_text("{}")
+    assert doctor.check_allowlist_matches_contract(ws, ["mig_cat"]).status == "fail"
+
+
+def test_run_blocks_on_an_uncommitted_contract_and_the_cli_parses_expect_catalogs(tmp_path):
+    ws = make_workspace(tmp_path)
+    (ws / ".migration" / "03_recon_tolerances.json").write_text('{"row_count": 0.5}')
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    assert "allowlist_committed=fail" in report["blocking"]
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--plugin-root",
+                        str(PLUGIN_ROOT), "--no-databricks", "--expect-catalogs", "mig_cat, other", "--out", "-"],
+                       capture_output=True, text=True, check=False)
+    assert "allowlist_matches_contract=fail" in r.stdout and "['mig_cat', 'other']" in r.stdout
+
+
+# ------------------------------------------------------------------ identity + host (A3)
+
+def _fake_cli(monkeypatch, me, describe):
+    def run(cmd, timeout=0):
+        if cmd[1:3] == ["current-user", "me"]:
+            return 0, json.dumps(me), ""
+        if cmd[1:3] == ["auth", "describe"]:
+            return 0, json.dumps(describe), ""
+        return 0, "v0.2", ""
+    monkeypatch.setattr(doctor, "_run", run)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/databricks")
+
+
+def test_identity_row_records_the_verified_host_and_the_report_exposes_it(tmp_path, monkeypatch):
+    sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
+    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
+    checks = {c.id: c for c in doctor.check_databricks(None)}
+    assert checks["databricks_identity"].status == "ok"
+    assert checks["databricks_identity"].data == {"userName": sp["userName"], "service_principal": True,
+                                                  "host": "https://adb-1.azuredatabricks.net"}
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, False)
+    assert report["identity"] == checks["databricks_identity"].data
+    # no host means the workflow has nothing to pin children to: fail closed
+    _fake_cli(monkeypatch, sp, {"status": "error"})
+    checks = {c.id: c for c in doctor.check_databricks(None)}
+    assert checks["databricks_identity"].status == "fail" and "host" in checks["databricks_identity"].detail
+
+
+# ------------------------------------------------------------------ hooks.json (post-hint cut)
+
+def test_hooks_json_registers_only_the_guard():
+    data = json.loads((PLUGIN_ROOT / "hooks.json").read_text())
+    assert list(data) == ["PreToolUse"]
+    assert "hooks/dbx_guard.py" in data["PreToolUse"][0]["hooks"][0]["command"]
+    assert data["PreToolUse"][0]["matcher"] == "exec"
+    assert not (PLUGIN_ROOT / "hooks" / "dbx_post_hint.py").exists()

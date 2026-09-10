@@ -8,15 +8,17 @@ environment variables that are set.
 
 Usage:
     python3 doctor.py [--workspace DIR] [--plugin-root DIR] [--role orchestrator|child]
-                      [--hook-probe-result blocked|not-blocked|unknown] [--expect-identity NAME]
-                      [--no-databricks] [--unit ID ...] [--mapping mapping_spec.json ...]
-                      [--source-secret NAME] [--param NAME=VALUE ...] [--out PATH]
+                      [--hook-probe-result blocked:<nonce>|not-blocked|unknown] [--expect-identity NAME]
+                      [--expect-catalogs A,B] [--no-databricks] [--unit ID ...]
+                      [--mapping mapping_spec.json ...] [--source-secret NAME] [--source-family F]
+                      [--param NAME=VALUE ...] [--out PATH]
 
-Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere and every security
-control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`;
-an `unverified` hook probe, a human identity, or an identity check `skipped` by `--no-databricks`
-is not ready (an offline report can never authorize a wave). Other `warn`/`unverified` checks are
-advisory and listed in the JSON for the playbook to decide.
+Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere, every security
+control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`,
+and `source_principal_read_only` not `unverified`; an `unverified` hook probe, a human identity,
+or an identity check `skipped` by `--no-databricks` is not ready (an offline report can never
+authorize a wave). Other `warn`/`unverified` checks are advisory and listed in the JSON for the
+playbook to decide.
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -52,12 +55,19 @@ M2M_VARS = ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
 DRIVERS = {"databricks": "databricks.sql", "redshift": "psycopg2", "snowflake": "snowflake.connector",
            "teradata": "teradatasql", "oracle": "oracledb", "sqlserver": "pyodbc", "postgres": "psycopg"}
+SOURCE_FAMILIES = tuple(sorted(k for k in DRIVERS if k != "databricks"))
+# The committed wave contract: the guard and the harness read the working copy, so a working copy
+# that differs from HEAD is a contract nobody reviewed.
+LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
+CAPABILITIES = ".migration/09_capabilities.json"
 
 # Safe live probe: if the platform loads hooks.json, the guard blocks this before it runs; if it
 # does not, `echo` prints a line and nothing else happens. Either way no Databricks call is made.
+# The nonce is issued per report and echoed in the guard's block reason, so `blocked:<nonce>` can
+# only be passed back by a session that saw the block.
 HOOK_PROBE_COMMAND = (
     "echo 'databricks experimental aitools tools query "
-    "\"DROP TABLE __dbx_guard_probe__.x.y\"' # factory-doctor hook probe: expected BLOCKED"
+    "\"DROP TABLE __dbx_guard_probe__{nonce}.x.y\"' # factory-doctor hook probe: expected BLOCKED"
 )
 
 
@@ -166,25 +176,33 @@ def check_allowed_targets(ws: Path, plugin_root: Path) -> Check:
 
 # ------------------------------------------------------------------ plugin / hooks / harness
 
+def _issued_nonce(ws: Path) -> str | None:
+    """The probe nonce the last report written for this workspace issued, if any."""
+    try:
+        checks = json.loads((ws / CAPABILITIES).read_text()).get("checks", [])
+        return next(c["data"].get("probe_nonce") for c in checks if c.get("id") == "hook_platform_loaded")
+    except (OSError, ValueError, StopIteration, AttributeError, KeyError):
+        return None
+
+
 def check_hooks(plugin_root: Path, ws: Path, probe_result: str) -> list[Check]:
     out: list[Check] = []
     hooks_json = plugin_root / "hooks.json"
     guard = plugin_root / "hooks" / "dbx_guard.py"
-    hint = plugin_root / "hooks" / "dbx_post_hint.py"
-    if not hooks_json.exists() or not guard.exists() or not hint.exists():
-        out.append(Check("hooks_files", "fail", f"hooks.json / hooks/dbx_guard.py / hooks/dbx_post_hint.py not all present under {plugin_root}"))
+    if not hooks_json.exists() or not guard.exists():
+        out.append(Check("hooks_files", "fail", f"hooks.json / hooks/dbx_guard.py not both present under {plugin_root}"))
         return out
     try:
         data = json.loads(hooks_json.read_text())
         pre = data["PreToolUse"][0]["hooks"][0]["command"]
         assert "dbx_guard.py" in pre
-        out.append(Check("hooks_files", "ok", "hooks.json registers dbx_guard.py (PreToolUse) and dbx_post_hint.py (PostToolUse)"))
+        out.append(Check("hooks_files", "ok", "hooks.json registers dbx_guard.py (PreToolUse)"))
     except (KeyError, IndexError, AssertionError, json.JSONDecodeError) as e:
         out.append(Check("hooks_files", "fail", f"hooks.json malformed: {e!r}"))
         return out
 
     # Functional check: feed the guard the probe event directly; it must block.
-    event = json.dumps({"tool_name": "exec", "tool_input": {"command": HOOK_PROBE_COMMAND}})
+    event = json.dumps({"tool_name": "exec", "tool_input": {"command": HOOK_PROBE_COMMAND.format(nonce="self")}})
     try:
         r = subprocess.run([sys.executable, str(guard)], input=event, text=True, capture_output=True,
                            timeout=30, cwd=ws, env={**os.environ, "CLAUDE_PROJECT_DIR": str(ws)})
@@ -196,18 +214,77 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str) -> list[Check]:
     except subprocess.TimeoutExpired:
         out.append(Check("hook_guard_functional", "fail", "dbx_guard.py timed out on the probe"))
 
-    # Platform check: hooks are fail-open on the platform side, so only a live probe proves loading.
-    if probe_result == "blocked":
-        out.append(Check("hook_platform_loaded", "ok", "live probe was BLOCKED: the platform is running hooks.json"))
+    # Platform check: hooks are fail-open on the platform side, so only a live probe proves loading,
+    # and only the nonce this workspace's last report issued proves the probe was the one run.
+    issued = _issued_nonce(ws)
+    if issued and probe_result == f"blocked:{issued}":
+        out.append(Check("hook_platform_loaded", "ok", "live probe was BLOCKED: the platform is running hooks.json",
+                         {"probe_nonce": issued}))
     elif probe_result == "not-blocked":
         out.append(Check("hook_platform_loaded", "fail",
                          "live probe ran unblocked: hooks.json is not being applied in this session. Treat as a D10; "
                          "do not launch children until fixed (plugin not installed at org level, or hooks disabled)."))
     else:
+        nonce = secrets.token_hex(4)
+        why = ("the nonce did not match the one this workspace's last report issued; "
+               if probe_result.startswith("blocked:") else "")
         out.append(Check("hook_platform_loaded", "unverified",
-                         "run the probe command in this session's shell and re-run the doctor with "
-                         "--hook-probe-result blocked|not-blocked", {"probe_command": HOOK_PROBE_COMMAND}))
+                         why + "run the probe command in this session's shell; the guard's block message names "
+                         "__dbx_guard_probe__<nonce>; re-run the doctor with --hook-probe-result blocked:<nonce> "
+                         "(or not-blocked if the echo printed)",
+                         {"probe_command": HOOK_PROBE_COMMAND.format(nonce=nonce), "probe_nonce": nonce}))
     return out
+
+
+# ------------------------------------------------------------------ ledger integrity
+
+def check_allowlist_committed(ws: Path) -> Check:
+    """The allowlist and the tolerances the children and the verifier are held to are the ones HEAD
+    committed: the working copy must be byte-equal to `git show HEAD:<path>` (git status can be
+    silenced with assume-unchanged; bytes cannot). A differing, untracked or missing copy names
+    which file and how."""
+    states: dict[str, str] = {}
+    for rel in LEDGER_CONTRACT_FILES:
+        try:
+            r = subprocess.run(["git", "-C", str(ws), "show", f"HEAD:{rel}"], capture_output=True, timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return Check("allowlist_committed", "fail", f"git show HEAD:{rel} failed under {ws}: {_redact(str(e))}")
+        err = r.stderr.decode(errors="replace").strip()
+        in_head = r.returncode == 0
+        if not in_head and not re.search(r"exist in 'HEAD'|not in 'HEAD'|invalid object name 'HEAD'", err):
+            return Check("allowlist_committed", "fail", f"git cannot read HEAD:{rel} under {ws}: {_redact(err)}; the "
+                         "workspace must be the committed repository the wave is planned from")
+        try:
+            disk = (ws / rel).read_bytes()
+        except OSError:
+            states[rel] = "missing"
+            continue
+        states[rel] = "untracked" if not in_head else "clean" if disk == r.stdout else "modified since HEAD"
+    bad = [f"{rel} {state}" for rel, state in states.items() if state != "clean"]
+    if bad:
+        return Check("allowlist_committed", "fail",
+                     "the working copy is not the committed contract: " + "; ".join(bad) +
+                     ". Restore HEAD's copy, or commit the change through a recorded decision, then re-run", states)
+    return Check("allowlist_committed", "ok", "allowed_targets.json and 03_recon_tolerances.json are byte-equal to HEAD",
+                 states)
+
+
+def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None) -> Check:
+    """The catalogs the plan/brief's capability contract names must be exactly the allowlist's."""
+    if expect_catalogs is None:
+        return Check("allowlist_matches_contract", "skipped",
+                     "no --expect-catalogs given (the catalogs in the wave's capability contract); nothing to compare")
+    p = ws / ".migration" / "allowed_targets.json"
+    try:
+        cats = json.loads(p.read_text()).get("catalogs")
+    except (OSError, ValueError, AttributeError) as e:
+        return Check("allowlist_matches_contract", "fail", f"{p.name} unreadable: {_redact(str(e))}")
+    data = {"expected": list(expect_catalogs), "allowlist": cats}
+    if not isinstance(cats, list) or sorted(cats) != sorted(expect_catalogs):
+        return Check("allowlist_matches_contract", "fail",
+                     f"allowlist catalogs {cats} differ from the contract's {list(expect_catalogs)}; a catalog is "
+                     "added by a recorded decision and a new doctor run, never by editing either side", data)
+    return Check("allowlist_matches_contract", "ok", f"allowlist catalogs match the contract: {cats}", data)
 
 
 def check_official_plugin(plugin_root: Path) -> Check:
@@ -290,6 +367,13 @@ def _pyodbc_connect(dsn: str):
     return pyodbc.connect(dsn, readonly=True, timeout=15)
 
 
+def _psycopg_connect(dsn: str):
+    import psycopg
+    conn = psycopg.connect(dsn, connect_timeout=15)
+    conn.read_only = True
+    return conn
+
+
 def _captured_columns(column_list: str) -> list[str]:
     """`[loan_id], [borrower_id]` as sp_cdc_help_change_data_capture reports it -> names."""
     return [c.strip().strip("[]") for c in str(column_list or "").split(",") if c.strip()]
@@ -298,41 +382,52 @@ def _captured_columns(column_list: str) -> list[str]:
 UNIT_MAPPINGS = ".migration/units/*/mapping_spec.json"
 
 
-def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: list[Path],
-                              source_secret: str | None, plugin_root: Path, connect=_pyodbc_connect,
-                              params: dict[str, str] | None = None) -> Check:
-    """One row over every unit mapping this run is answerable for, resolved by the doctor rather than
-    trusted from whoever typed the command: a child names its batch (--unit, the ids in its brief)
-    and each unit's .migration/units/<id>/mapping_spec.json must exist and pass; an orchestrator
-    covers every unit mapping in the workspace. A subset can therefore never pass as the whole.
-    --mapping adds ad-hoc specs on top (a candidate mapping at setup, before its unit exists);
-    setup with nothing to verify is the one not-applicable case."""
+def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path]
+                     ) -> tuple[dict[str, Path], dict[str, Path], tuple | None]:
+    """(expected unit -> mapping, every spec to check, problem) for the mappings this run is
+    answerable for, resolved by the doctor rather than trusted from whoever typed the command: a
+    child names its batch (--unit, the ids in its brief) and each unit's
+    .migration/units/<id>/mapping_spec.json must exist; an orchestrator covers every unit mapping in
+    the workspace. A subset can therefore never pass as the whole. --mapping adds ad-hoc specs on top
+    (a candidate mapping at setup, before its unit exists). `problem` is (status, detail, data) when
+    the set itself is wrong; an empty `todo` is setup, before any unit mapping exists."""
     unit_dir = ws / ".migration" / "units"
     if role == "child":
         if not units:
-            return Check("delete_evidence", "fail",
-                         "a child preflight covers every unit in its batch: pass --unit <id> for each unit in the "
-                         "brief, --source-secret NAME and the --param values the recon gate will get",
-                         {"units": [], "mappings": {}})
+            return {}, {}, ("fail",
+                            ("a child preflight covers every unit in its batch: pass --unit <id> for each unit in the "
+                             "brief, --source-secret NAME and the --param values the recon gate will get"),
+                            {"units": [], "mappings": {}})
         expected = {u: unit_dir / u / "mapping_spec.json" for u in dict.fromkeys(units)}
     else:
         if units:
-            return Check("delete_evidence", "fail",
-                         "--unit narrows nothing for an orchestrator: it verifies every unit mapping under "
-                         f"{UNIT_MAPPINGS}; --unit is for --role child", {"units": list(units), "mappings": {}})
+            return {}, {}, ("fail",
+                            ("--unit narrows nothing for an orchestrator: it verifies every unit mapping under "
+                             f"{UNIT_MAPPINGS}; --unit is for --role child"), {"units": list(units), "mappings": {}})
         expected = {p.parent.name: p for p in sorted(ws.glob(UNIT_MAPPINGS))}
     missing = [u for u, p in expected.items() if not p.is_file()]
     if missing:
-        return Check("delete_evidence", "fail",
-                     f"unit mapping(s) missing for {', '.join(missing)}: expected "
-                     f"{unit_dir.relative_to(ws)}/<id>/mapping_spec.json (hand-off incomplete; report BLOCKED)",
-                     {"units": list(expected), "missing_units": missing, "mappings": {}})
+        return expected, {}, ("fail",
+                              (f"unit mapping(s) missing for {', '.join(missing)}: expected "
+                               f"{unit_dir.relative_to(ws)}/<id>/mapping_spec.json (hand-off incomplete; report BLOCKED)"),
+                              {"units": list(expected), "missing_units": missing, "mappings": {}})
     todo = dict(expected)
     seen = {p.resolve() for p in expected.values()}
     for m in mappings:
         if m.resolve() not in seen:
             seen.add(m.resolve())
             todo[str(m)] = m
+    return expected, todo, None
+
+
+def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: list[Path],
+                              source_secret: str | None, plugin_root: Path, connect=_pyodbc_connect,
+                              params: dict[str, str] | None = None) -> Check:
+    """One row over every unit mapping this run is answerable for (resolve_mappings); setup with
+    nothing to verify is the one not-applicable case."""
+    expected, todo, problem = resolve_mappings(ws, role, units, mappings)
+    if problem:
+        return Check("delete_evidence", *problem)
     if not todo:
         return Check("delete_evidence", "skipped",
                      f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}",
@@ -440,6 +535,122 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
                  "captured, scoped read probed", data)
 
 
+# ------------------------------------------------------------------ source principal read-only
+
+# Per family: the admin flags that make every table writable, the query answering them, and the
+# per-table query with one boolean column per privilege in TABLE_PRIVILEGES. Every value is a
+# question about the principal; nothing here can change the source. Families without an entry
+# are reported `unverified`, never `ok`.
+_ROLE_FLAGS = {"sqlserver": ("sysadmin", "db_owner", "ALTER ANY DATABASE"), "postgres": ("superuser",)}
+_TABLE_PRIVILEGES = {"sqlserver": ("INSERT", "UPDATE", "DELETE", "ALTER"),
+                     "postgres": ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "CREATE on schema")}
+_PRIVILEGE_QUERIES = {
+    "sqlserver": {
+        "roles": "SELECT IS_SRVROLEMEMBER('sysadmin'), IS_MEMBER('db_owner'), "
+                 "HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER ANY DATABASE')",
+        "table": "SELECT " + ", ".join(f"HAS_PERMS_BY_NAME(?, 'OBJECT', '{p}')" for p in _TABLE_PRIVILEGES["sqlserver"]),
+        "read_only": None,
+    },
+    "postgres": {
+        "roles": "SELECT rolsuper FROM pg_roles WHERE rolname = current_user",
+        "table": "SELECT " + ", ".join(f"has_table_privilege(%s, '{p}')" for p in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"))
+                 + ", has_schema_privilege(%s, 'CREATE')",
+        "read_only": "SELECT current_setting('transaction_read_only')",
+    },
+}
+_READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect}
+_ADVISORY = ("driver-level read-only (SQL Server readonly=True, Postgres default_transaction_read_only) is advisory, "
+             "a hint the server may ignore; only the principal's grants stop writes")
+
+
+def _table_params(family: str, table: str) -> tuple:
+    if family == "sqlserver":
+        return (table,) * 4
+    return (table,) * 4 + (table.rsplit(".", 1)[0] if "." in table else "public",)
+
+
+def check_source_principal(tables: list[str], family: str, source_secret: str | None, connect=None) -> Check:
+    """The principal behind --source-secret must not be able to write any in-scope source object:
+    no admin role and no INSERT/UPDATE/DELETE/ALTER (TRUNCATE, schema CREATE on Postgres) on any
+    table the resolved mappings read. This is the control the guard's docstring defers to for
+    clients the hook cannot read into; `readonly=True` on the connection is advisory and is
+    reported as such in `stats`. A failure names object and privilege, never the credential."""
+    cid = "source_principal_read_only"
+    q = _PRIVILEGE_QUERIES.get(family)
+    if q is None:
+        return Check(cid, "unverified", f"{family}: no privilege query implemented for this family (untested), so the "
+                     "source principal's write privileges are unknown; confirm SELECT-only grants by hand and record it",
+                     {"family": family, "tables": tables})
+    if not source_secret:
+        return Check(cid, "fail", f"{family} source with {len(tables)} in-scope table(s); pass --source-secret NAME "
+                     "(env var holding the source DSN) so the principal's write privileges can be checked")
+    dsn = os.environ.get(source_secret)
+    if not dsn:
+        return Check(cid, "fail", f"source secret {source_secret} is not set in the environment")
+    data: dict = {"family": family, "tables": tables, "roles": [], "writable": {}, "unresolved": [], "stats": ""}
+    try:
+        conn = (connect or _READ_ONLY_CONNECT[family])(dsn)
+        try:
+            cur = conn.cursor()
+            if q["read_only"]:
+                (ro,) = cur.execute(q["read_only"]).fetchall()[0]
+                data["stats"] = f"connection opened read_only=True, transaction_read_only={ro}; {_ADVISORY}"
+            else:
+                data["stats"] = f"connection opened with pyodbc readonly=True; {_ADVISORY}"
+            flags = cur.execute(q["roles"]).fetchall()[0]
+            data["roles"] = [name for name, held in zip(_ROLE_FLAGS[family], flags) if held]
+            for t in tables:
+                row = cur.execute(q["table"], _table_params(family, t)).fetchall()[0]
+                if any(v is None for v in row):
+                    data["unresolved"].append(t)
+                elif held := [p for p, v in zip(_TABLE_PRIVILEGES[family], row) if v]:
+                    data["writable"][t] = held
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
+        return Check(cid, "fail", f"source query failed: {_redact(str(e))}", data)
+    can_write = [f"role {r}" for r in data["roles"]] + [f"{t}: {', '.join(p)}" for t, p in data["writable"].items()]
+    if can_write:
+        return Check(cid, "fail", f"{family}: the source principal can write in scope ({'; '.join(can_write)}); the "
+                     f"factory needs a SELECT-only principal, and {_ADVISORY}", data)
+    if data["unresolved"]:
+        return Check(cid, "unverified", f"{family}: privileges could not be evaluated for {data['unresolved']} (object "
+                     "not found or not visible to this principal); nothing is proven about them", data)
+    return Check(cid, "ok", f"{family}: no admin role and no write privilege on {len(tables)} in-scope table(s); "
+                 f"{data['stats']}", data)
+
+
+def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str | None,
+                               source_family: str | None, plugin_root: Path, params: dict[str, str] | None = None
+                               ) -> Check:
+    """Every source table the resolved mappings read (root tables and embedded child tables), against
+    --source-family, or the family the mappings' delete_evidence kind implies."""
+    cid = "source_principal_read_only"
+    _, todo, problem = resolve_mappings(ws, role, units, mappings)
+    if problem:
+        return Check(cid, *problem)
+    if not todo:
+        return Check(cid, "skipped", f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}")
+    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
+    from recon.config import ConfigError, load_mapping_spec
+    tables: dict[str, None] = {}
+    kinds: set[str] = set()
+    for p in todo.values():
+        try:
+            spec = load_mapping_spec(p, params)
+        except (ConfigError, OSError, ValueError) as e:
+            return Check(cid, "fail", f"{p}: {_redact(str(e))}")
+        for o in spec.objects:
+            tables.update(dict.fromkeys([o.root_table, *(e.child_table for e in o.embeds)]))
+            if o.delete_evidence is not None:
+                kinds.add(o.delete_evidence.kind)
+    family = source_family or ("sqlserver" if kinds == {"sqlserver_cdc"} else None)
+    if not family:
+        return Check(cid, "unverified", "source family not declared: pass --source-family "
+                     f"{'|'.join(SOURCE_FAMILIES)} so the principal's privileges can be checked", {"tables": list(tables)})
+    return check_source_principal(list(tables), family, source_secret)
+
+
 # ------------------------------------------------------------------ databricks identity
 
 _APPLICATION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
@@ -492,11 +703,19 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
         out.append(Check("databricks_identity", "fail", "current-user me returned non-JSON"))
         return out
     name, is_sp = classify_identity(who)
-    data = {"userName": name, "service_principal": is_sp}
+    rc, desc, _ = _run([cli, "auth", "describe", "--output", "json"], timeout=60)
+    try:
+        host = json.loads(desc)["details"]["host"] if rc == 0 else None
+    except (ValueError, KeyError, TypeError):
+        host = None
+    data = {"userName": name, "service_principal": is_sp, "host": host}
     status = "ok"
-    detail = f"authenticated as {name} ({'service principal' if is_sp else 'user'})"
+    detail = f"authenticated as {name} ({'service principal' if is_sp else 'user'}) on {host}"
     if expect_identity and str(name).lower() != expect_identity.lower():
         status, detail = "fail", detail + f"; expected {expect_identity} (recorded in 07_access_checklist.md)"
+    elif not host:
+        status = "fail"
+        detail += "; workspace host not resolved by `databricks auth describe`, so the wave manifest cannot pin children to it"
     elif not is_sp:
         status, detail = "warn", detail + "; unattended sessions must not run as a human identity"
     out.append(Check("databricks_identity", status, detail, data))
@@ -513,14 +732,18 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
         no_databricks: bool, units: list[str] | None = None, mappings: list[Path] | None = None,
-        source_secret: str | None = None, params: dict[str, str] | None = None) -> dict:
-    checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root)]
+        source_secret: str | None = None, params: dict[str, str] | None = None,
+        expect_catalogs: list[str] | None = None, source_family: str | None = None) -> dict:
+    checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root),
+                           check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs)]
     checks += check_hooks(plugin_root, ws, probe_result)
     checks.append(check_official_plugin(plugin_root))
     checks.append(check_harness(plugin_root))
     checks.append(check_drivers())
     checks.append(check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
                                             params=params))
+    checks.append(check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
+                                             plugin_root, params=params))
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -529,8 +752,11 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
     blocking = [f"{c.id}={c.status}" for c in checks
-                if c.status == "fail" or (c.id in SECURITY_CONTROLS and c.status != "ok")]
+                if c.status == "fail" or (c.id in SECURITY_CONTROLS and c.status != "ok")
+                or (c.id == "source_principal_read_only" and c.status == "unverified")]
+    identity = next((c.data for c in checks if c.id == "databricks_identity" and c.data), None)
     return {
+        "identity": identity,
         "schema": "dbx-migration-factory/capabilities/1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "role": role,
@@ -548,8 +774,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workspace", type=Path, default=Path.cwd())
     p.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parents[2])
     p.add_argument("--role", choices=("orchestrator", "child"), default="orchestrator")
-    p.add_argument("--hook-probe-result", choices=("blocked", "not-blocked", "unknown"), default="unknown")
+    p.add_argument("--hook-probe-result", default="unknown", metavar="blocked:<nonce>|not-blocked|unknown",
+                   help="outcome of running the probe_command of the last report; the nonce is the one the "
+                        "guard's block message named")
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
+    p.add_argument("--expect-catalogs", metavar="A,B", type=lambda s: [c.strip() for c in s.split(",") if c.strip()],
+                   help="catalogs the wave's capability contract names; must equal allowed_targets.json's")
     p.add_argument("--no-databricks", action="store_true",
                    help="skip CLI/identity checks (offline; the report is never ready)")
     p.add_argument("--unit", action="append", default=[], metavar="UNIT_ID",
@@ -559,10 +789,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mapping", type=Path, action="append", default=[], metavar="MAPPING_SPEC",
                    help="additional recon mapping_spec.json to verify (a candidate mapping at setup)")
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
+    p.add_argument("--source-family", choices=SOURCE_FAMILIES,
+                   help="source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="mapping ${NAME} placeholder value, same rules and values as dbx-recon run --param")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
+    if a.hook_probe_result == "blocked":
+        p.error("--hook-probe-result blocked:<nonce> is required: the nonce the guard's block message named for the probe_command "
+                "of the last report")
     params = None
     if a.param:
         sys.path.insert(0, str(a.plugin_root.resolve() / "skills" / "data-reconciliation" / "harness"))
@@ -570,7 +805,8 @@ def main(argv: list[str] | None = None) -> int:
         params = parse_params(a.param)
 
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
-                 a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params)
+                 a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params,
+                 a.expect_catalogs, a.source_family)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
