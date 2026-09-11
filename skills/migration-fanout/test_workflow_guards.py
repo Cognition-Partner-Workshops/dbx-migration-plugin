@@ -462,6 +462,8 @@ DOCTOR = {"schema": "dbx-migration-factory/capabilities/1", "ready": True,
 def test_validate_manifest_compares_the_contract_with_the_doctor_record():
     validate_manifest = _functions()["validate_manifest"]
     validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), DOCTOR)
+    # the doctor records guard-normalized catalog names; a manifest spelling the guard accepts is the same contract
+    validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"], catalogs=["`MIG` "])), DOCTOR)
     for caps, needle in ((_caps(), "host"),
                          (_caps(host="https://adb-2.azuredatabricks.net"), "host"),
                          (_caps(host=DOCTOR["identity"]["host"], identity="sp-2"), "identity"),
