@@ -11,7 +11,7 @@ from recon.config import ConfigError, DeleteEvidenceSpec, Tolerances, load_mappi
 from recon.cost import estimate_cost
 
 from tests.fakes import FakeCdcSource, FakeCheckpointTarget, FakeSource, FakeTarget
-from tests.test_transactional import (
+from tests.loans import (
     BORROWER_FACTS,
     LOANS_FACTS,
     TARGET_LOANS_FACTS,
@@ -207,19 +207,46 @@ def test_a_target_row_newer_than_every_source_row_still_reads_ahead_when_no_dele
     assert cdc["stats"]["loans"]["target_max_from_in_flight_delete"] is False
 
 
-def test_an_applied_position_older_than_the_retained_horizon_is_a_retention_gap():
+LSN = (b"\x00" * 10, b"\x00" * 9 + b"\x10")
+
+
+@pytest.mark.parametrize("status, sides, cdc_code, pk_detail, cdc_detail, calls", [
+    # calls: (source.evidence_horizon, source.deletes_since, target.applied_position)
+    ("retention_gap", {"tombstones": {"raw_loans": [_ev(3, 25, 5.0)]}, "applied": 10,
+                       "horizons": {"raw_loans": (20, 25)}},
+     "delete_evidence_retention_gap", "retention_gap", None, (1, 0, 1)),  # decided by the horizon alone
+    ("ahead_of_horizon", {"tombstones": {"raw_loans": [_ev(3, 15, 5.0)]}, "applied": 30,
+                          "horizons": {"raw_loans": (5, 20)}},
+     "delete_evidence_unusable", None, "ahead_of_horizon", (1, 0, 1)),
+    ("unavailable", {"tombstones": {}, "applied": 10}, "delete_evidence_unusable", None, "unavailable", (1, 0, 1)),
+    ("no_position", {"tombstones": {"raw_loans": [_ev(3, 15, 5.0)]}, "applied": None},
+     "delete_evidence_unusable", None, None, (0, 0, 1)),
+    ("unsupported", {"tombstones": None, "applied": 10, "source_cls": FakeSource},
+     "delete_evidence_unusable", "undrained deletes", None, (0, 0, 0)),  # drain-before-run contract
+    *(("incompatible", {"tombstones": {"raw_loans": [_ev(3, horizon[1], 5.0)]}, "applied": applied,
+                         "horizons": {"raw_loans": horizon}},
+       "delete_evidence_unusable", None, None, (1, 0, 1))
+      for applied, horizon in ((10, LSN),            # integer checkpoint against LSNs
+                               (b"\x00" * 8, LSN),   # a binary of another width
+                               (True, (1, 20)))),    # a boolean is not a position
+])
+def test_a_target_only_key_stays_strict_whenever_the_evidence_cannot_vouch_for_it(
+        status, sides, cdc_code, pk_detail, cdc_detail, calls):
     loans, borrowers = _rows(12)
     src, tgt = _deleted(loans, 3)
-    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 25, 5.0)]}, applied=10,
-                            horizons={"raw_loans": (20, 25)})
+    source, target = _sides(src, tgt, borrowers, **sides)
     result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
-    assert result["verdict"] == "FAIL"
+    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
     assert _codes(result, "counts_through_mapping") == ["root_count"]
     pk = _tier(result, "pk_set_diff")
     assert [f["check"] for f in pk["findings"]] == ["pk_extra_on_target"]
-    assert "(3,)" in pk["findings"][0]["detail"] and "retention_gap" in pk["findings"][0]["detail"]
-    assert _codes(result, "cdc_lag_ordering") == ["delete_evidence_retention_gap"]
-    assert source.calls["deletes_since"] == 0  # nothing to read: the gap is decided by the horizon
+    assert "(3,)" in pk["findings"][0]["detail"] and (pk_detail or "") in pk["findings"][0]["detail"]
+    assert pk["stats"]["loans"]["delete_evidence"]["status"] == status
+    cdc = _tier(result, "cdc_lag_ordering")
+    assert [f["check"] for f in cdc["findings"]] == [cdc_code]
+    assert (cdc_detail or "") in cdc["findings"][0]["detail"]
+    assert (source.calls["evidence_horizon"], source.calls["deletes_since"],
+            target.calls["applied_position"]) == calls
 
 
 def test_an_applied_position_right_before_the_retained_horizon_is_not_a_gap():
@@ -275,12 +302,6 @@ def test_an_applied_position_past_the_retained_horizon_is_ahead_of_horizon_and_s
     assert "ahead_of_horizon" in cdc["findings"][0]["detail"] and "30" in cdc["findings"][0]["detail"]
     assert _tier(result, "pk_set_diff")["stats"]["loans"]["delete_evidence"]["status"] == "ahead_of_horizon"
     assert source.calls["deletes_since"] == 0
-    # and with a target-only key the strict grading applies
-    src, tgt = _deleted(loans, 3)
-    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 15, 5.0)]}, applied=30,
-                            horizons={"raw_loans": (5, 20)})
-    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
-    assert [f["check"] for f in _tier(result, "pk_set_diff")["findings"]] == ["pk_extra_on_target"]
 
 
 def test_an_applied_position_equal_to_the_horizon_is_fully_applied():
@@ -293,43 +314,6 @@ def test_an_applied_position_equal_to_the_horizon_is_fully_applied():
     assert _tier(result, "cdc_lag_ordering")["findings"] == []
     assert _tier(result, "pk_set_diff")["stats"]["loans"]["delete_evidence"]["status"] == "ok"
     assert source.calls["deletes_since"] == 0
-
-
-def test_a_capture_that_retains_nothing_is_unavailable_and_strict():
-    loans, borrowers = _rows(12)
-    src, tgt = _deleted(loans, 3)
-    source, target = _sides(src, tgt, borrowers, {}, applied=10)
-    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
-    assert result["verdict"] == "FAIL"
-    assert [f["check"] for f in _tier(result, "pk_set_diff")["findings"]] == ["pk_extra_on_target"]
-    cdc = _tier(result, "cdc_lag_ordering")
-    assert [f["check"] for f in cdc["findings"]] == ["delete_evidence_unusable"]
-    assert "unavailable" in cdc["findings"][0]["detail"]
-
-
-def test_a_target_with_no_applied_position_yet_is_strict():
-    loans, borrowers = _rows(12)
-    src, tgt = _deleted(loans, 3)
-    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, 15, 5.0)]}, applied=None)
-    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
-    assert result["verdict"] == "FAIL"
-    assert [f["check"] for f in _tier(result, "pk_set_diff")["findings"]] == ["pk_extra_on_target"]
-    assert _codes(result, "cdc_lag_ordering") == ["delete_evidence_unusable"]
-    assert source.calls["evidence_horizon"] == 0 and source.calls["deletes_since"] == 0
-
-
-def test_sides_without_the_evidence_protocols_keep_the_drain_before_run_contract():
-    loans, borrowers = _rows(12)
-    src, tgt = _deleted(loans, 3)
-    source, target = _sides(src, tgt, borrowers, None, applied=10, source_cls=FakeSource)
-    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
-    assert result["verdict"] == "FAIL"
-    pk = _tier(result, "pk_set_diff")
-    assert [f["check"] for f in pk["findings"]] == ["pk_extra_on_target"]
-    assert "undrained deletes" in pk["findings"][0]["detail"]
-    assert pk["stats"]["loans"]["delete_evidence"]["status"] == "unsupported"
-    assert _codes(result, "cdc_lag_ordering") == ["delete_evidence_unusable"]
-    assert target.calls["applied_position"] == 0
 
 
 def _scoped_spec():
@@ -555,24 +539,6 @@ def test_a_binary_lsn_position_orders_like_the_engine_does():
     stats = _tier(result, "pk_set_diff")["stats"]["loans"]["delete_evidence"]
     assert stats["applied_position"] == lsn(0x1000).hex()
     assert stats["horizon"] == [bytes(10).hex(), lsn(0x1500).hex()]
-
-
-@pytest.mark.parametrize("applied, horizon", [
-    (10, (b"\x00" * 10, b"\x00" * 9 + b"\x10")),      # integer checkpoint against LSNs
-    (b"\x00" * 8, (b"\x00" * 10, b"\x00" * 9 + b"\x10")),  # a binary of another width
-    (True, (1, 20)),                                    # a boolean is not a position
-])
-def test_positions_from_different_mechanisms_are_never_compared(applied, horizon):
-    loans, borrowers = _rows(12)
-    src, tgt = _deleted(loans, 3)
-    source, target = _sides(src, tgt, borrowers, {"raw_loans": [_ev(3, horizon[1], 5.0)]},
-                            applied=applied, horizons={"raw_loans": horizon})
-    result = _run(source, target, spec=_spec_with_evidence(), tol=TOL)
-    assert result["verdict"] == "FAIL"
-    assert [f["check"] for f in _tier(result, "pk_set_diff")["findings"]] == ["pk_extra_on_target"]
-    assert _tier(result, "pk_set_diff")["stats"]["loans"]["delete_evidence"]["status"] == "incompatible"
-    assert _codes(result, "cdc_lag_ordering") == ["delete_evidence_unusable"]
-    assert source.calls["deletes_since"] == 0
 
 
 def test_an_event_whose_position_type_differs_from_the_stream_is_incompatible():

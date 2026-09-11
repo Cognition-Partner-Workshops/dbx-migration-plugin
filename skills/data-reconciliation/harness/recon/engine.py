@@ -14,8 +14,15 @@ from .canon import Canonicalizer
 from .config import CanonRule, ConfigError, MappingSpec, Tolerances
 from .report import build_result, write_outputs
 from .tiers import tier1_counts, tier2_aggregates, tier3_diffs, tier4_parity
-from .transactional import (abandon_window, close_window, open_window, require_transactional, tier5_pk_set,
-                            tier6_cdc, tier7_schema_parity)
+from .transactional import (
+    abandon_window,
+    close_window,
+    open_window,
+    require_transactional,
+    tier5_pk_set,
+    tier6_cdc,
+    tier7_schema_parity,
+)
 
 # fixture: same checks as live, run against a small fixture copy of the source during
 # development and fix rounds. A fixture PASS is never a merge verdict; it only earns the unit
@@ -96,11 +103,11 @@ def _report_release_failure(exc: BaseException, note: str) -> None:
     for embedded callers."""
     try:
         print(f"dbx-recon: {note}", file=sys.stderr, flush=True)
-    except Exception:  # noqa: BLE001  reporting must never replace the run's error
+    except Exception:  # noqa: BLE001, S110  reporting must never replace the run's error
         pass
-    if sys.version_info >= (3, 11):
+    try:
         exc.add_note(note)
-    else:
+    except AttributeError:  # 3.10
         exc.__dict__.setdefault("__notes__", []).append(note)
 
 

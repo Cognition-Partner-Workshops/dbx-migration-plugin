@@ -1,9 +1,12 @@
 ---
 name: redshift-sql
 description: Source-dialect skill for Amazon Redshift estates. Use when enumerating a Redshift estate, extracting lineage from Redshift SQL/views/procedures, or converting Redshift SQL to Databricks SQL. v0 stub seeded from prior engagement work.
+status: stub — no harness, guidance only
 ---
 
 # Redshift SQL Dialect (v0)
+
+This skill is a stub: guidance seeded from prior engagement work, with no harness, fixture or rehearsal behind it (the `dbx-recon` Redshift source adapter is untested and refuses to run; see `data-reconciliation/SKILL.md`). Verify every rule below against the customer's engine before relying on it.
 
 ## 1. Enumeration
 Units: tables/views per schema (`pg_catalog`/`svv_` system views), stored procedures (`pg_proc`), scheduled/ETL SQL from the repo, and query-history-derived report queries (`sys_query_history` / `stl_query`) for the hidden-consumer sweep. Census key: schema.object.

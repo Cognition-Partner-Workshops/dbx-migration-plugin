@@ -2,16 +2,26 @@
 one mismatch per class, proving each tier catches its class and the engine gates on Tier 1.
 """
 
-import copy
 import decimal
 import json
 from pathlib import Path
-import pytest
 
-from recon.config import (CanonRule, ObjectMapping, EmbedMapping, FieldMapping,
-                          MappingSpec, Tolerances, load_canon_rules, load_mapping_spec,
-                          load_tolerances, ConfigError, validate_identifier)
+import pytest
+from recon.config import (
+    CanonRule,
+    ConfigError,
+    EmbedMapping,
+    FieldMapping,
+    MappingSpec,
+    ObjectMapping,
+    Tolerances,
+    load_canon_rules,
+    load_mapping_spec,
+    load_tolerances,
+    validate_identifier,
+)
 from recon.engine import run_recon
+
 from tests.fakes import FakeSource, FakeTarget
 
 RULES = [CanonRule("rstrip_spaces", "*"), CanonRule("empty_string_is_null", "*"),
@@ -626,8 +636,8 @@ def test_composite_key_full_and_sampled_diff():
 
 
 def test_tier4_multiset_matching_canonicalizes_decimal_and_order():
-    from recon.tiers import tier4_parity
     from recon.canon import Canonicalizer
+    from recon.tiers import tier4_parity
     ops = [{"name": "rows", "object": "orders", "rules": []}]
     result = tier4_parity(
         ops, Canonicalizer([CanonRule("identity", "*")]),
@@ -638,8 +648,8 @@ def test_tier4_multiset_matching_canonicalizes_decimal_and_order():
 
 
 def test_tier4_multiset_matching_preserves_duplicates():
-    from recon.tiers import tier4_parity
     from recon.canon import Canonicalizer
+    from recon.tiers import tier4_parity
     result = tier4_parity(
         [{"name": "rows", "object": "orders", "rules": []}],
         Canonicalizer([CanonRule("identity", "*")]), TOL,

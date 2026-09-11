@@ -4,15 +4,22 @@ the verify-depth knob, and cost accounting in the result."""
 import json
 import random
 import sqlite3
+from itertools import pairwise
 
 import pytest
-
 from recon.adapters import _SqlAdapterBase
 from recon.canon import Canonicalizer, CanonRule
-from recon.config import ConfigError, FieldMapping, MappingSpec, ObjectMapping, Tolerances
+from recon.config import (
+    ConfigError,
+    FieldMapping,
+    MappingSpec,
+    ObjectMapping,
+    Tolerances,
+)
 from recon.cost import estimate_cost
 from recon.engine import run_recon
 from recon.tiers import _object_aggregates, _stratified_keys, tier2_aggregates
+
 from tests.fakes import FakeSource, FakeTarget
 from tests.test_tiers import RULES, SPEC, TOL
 
@@ -193,7 +200,7 @@ def test_key_strata_covers_range_and_is_contiguous():
     assert len(strata) == 4
     assert strata[0].lo == (1,) and strata[-1].hi == (100,)
     assert sum(s.n for s in strata) == 100
-    for a, b in zip(strata, strata[1:]):
+    for a, b in pairwise(strata):
         assert a.hi < b.lo
     with_where = ad.key_strata("t", ["id"], 2, where="grp = 0")
     assert sum(s.n for s in with_where) == 33
@@ -219,7 +226,7 @@ def test_key_strata_composite_bounds_are_disjoint_when_first_key_is_shared():
     assert len(conn.statements) == 1 and len(strata) == 4
     assert strata[0].lo == (1, 1) and strata[-1].hi == (1, 100)
     assert [s.n for s in strata] == [25, 25, 25, 25]
-    for a, b in zip(strata, strata[1:]):
+    for a, b in pairwise(strata):
         assert a.hi < b.lo
     sampled: set[tuple] = set()
     for s in strata:

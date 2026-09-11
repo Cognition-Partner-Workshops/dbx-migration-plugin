@@ -19,7 +19,7 @@ Dependencies, not conversion difficulty, are what make data migrations slow and 
 | D6 | shared table with non-migrated writers | dual-write window; legacy remains writer + federated read; documented deferral |
 | D7 | external hand-off (SFTP, queue, partner feed) | preserve format contract exactly; re-platform the transport at cutover |
 | D8 | security / governance contract | reproduce in UC (row filters, masks, grants) before any consumer re-points |
-| D9 | ML model / scoring consumer | prediction-parity gate per the ML-SCORING profile before re-pointing |
+| D9 | ML model / scoring consumer | prediction-parity gate (playbook 6, ML-SCORING step) per the profile before re-pointing |
 | D10 | environment / access dependency | fire the request now; track to closure; gates fan-out width |
 
 ## What's Needed From User (decide mode)
