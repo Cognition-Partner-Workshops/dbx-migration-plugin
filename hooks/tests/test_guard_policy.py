@@ -145,14 +145,25 @@ def test_databricks_unrecognised_or_mutating_shapes_block(cmd):
 
 
 @pytest.mark.parametrize("cmd", [
-    "databricks tables delete mig_cat.s.t", "databricks schemas create s mig_cat", "databricks schemas delete mig_cat.s",
+    "databricks tables delete mig_cat.s.t", "databricks schemas create s mig_cat",
     "databricks volumes create mig_cat s v MANAGED", "databricks volumes delete mig_cat.s.v",
-    "databricks grants update schema mig_cat.s --json '{}'", "databricks catalogs update mig_cat --json '{}'",
     "databricks fs rm dbfs:/Volumes/mig_cat/s/v/f", "databricks fs cp x.csv dbfs:/Volumes/mig_cat/s/v/",
+    "databricks fs cp dbfs:/Volumes/mig_cat/s/v/a.csv ./a.csv",
     "databricks api delete /api/2.1/unity-catalog/tables/mig_cat.s.t",
 ])
 def test_databricks_mutation_of_an_allowlisted_securable_passes(cmd):
     approve(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "databricks schemas delete mig_cat.s",  # probe2 #4: catalog lifecycle is not an object write
+    "databricks grants update schema mig_cat.s --json '{}'",  # probe2 #4: permissions are not object writes
+    "databricks catalogs update mig_cat --json '{}'",  # probe2 #4: catalog lifecycle is not an object write
+    "databricks catalogs delete mig_cat", "databricks grants update catalog mig_cat --json '{}'",
+    "databricks sql execute -e 'GRANT USE CATALOG ON CATALOG mig_cat TO `x`'", "databricks sql execute -e 'DROP CATALOG mig_cat'",
+])
+def test_catalog_lifecycle_and_permissions_block_even_on_the_allowlisted_catalog(cmd):
+    assert "lifecycle" in block(cmd).reason
 
 
 @pytest.mark.parametrize("cmd", [
@@ -225,8 +236,10 @@ def test_identity_swaps_block(cmd):
 
 
 def test_identity_variables_without_a_client_in_the_segment_are_not_the_guards_business():
-    approve("export DATABRICKS_HOST=https://x; git status")
+    block("export DATABRICKS_HOST=https://x; git status")  # probe2 #3: an export outlives the command; the next one runs as it
+    approve("DATABRICKS_HOST=https://x git status; databricks jobs list")
     approve("echo $DATABRICKS_TOKEN | wc -c")
+    approve("echo DATABRICKS_TOKEN=x; databricks jobs list")
 
 
 # ---------------------------------------------------------------- A2(a) `.migration/` integrity

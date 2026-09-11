@@ -61,8 +61,6 @@ def block(cmd: str, cfg=CFG):
     "databricks bundle deploy -t migration",
     "databricks bundle run --target migration nightly_orders",
     "databricks schemas create wave1_u12 mig_cat",
-    "databricks schemas delete mig_cat.wave1_u12",
-    "databricks grants update schema mig_cat.wave1_u12 --json '{\"changes\": []}'",
     "databricks jobs list",
     "bteq <<'EOF'\n.LOGON tdprod.corp.example/svc_ro;\nSELECT COUNT(*) FROM sales.orders;\n.QUIT\nEOF",
     "docker exec -i sybase-fixture isql -Usa -Q 'SELECT TOP 5 * FROM dbo.loans'",
@@ -99,6 +97,8 @@ def test_sql_text_outside_any_client_is_prose(cmd):
     "bash -c \"databricks --profile demo experimental aitools tools query 'INSERT INTO mig_cat.s.t SELECT 1'\"",  # A3: profile swap
     "jq -n '{}' | databricks api post /api/2.1/jobs/create",  # A4: CLI mutation outside the read allowlist
     "(echo x | bteq; cat write.sql) < read.sql",  # A6: opaque `echo x` stdin into a legacy-only client
+    "databricks schemas delete mig_cat.wave1_u12",  # probe2 #4: catalog lifecycle is not an object write
+    "databricks grants update schema mig_cat.wave1_u12 --json '{\"changes\": []}'",  # probe2 #4: permissions are not object writes
 ])
 def test_expectations_flipped_by_the_red_team_review(cmd):
     """Rows that approved before the red-team review; each encodes a finding the review condemned."""

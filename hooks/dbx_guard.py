@@ -68,6 +68,7 @@ this policy is pinned to; add a row there before changing a shape.
 """
 from __future__ import annotations
 
+import fnmatch
 import itertools
 import json
 import os
@@ -80,7 +81,8 @@ from pathlib import Path
 CONFIG_REL = Path(".migration") / "allowed_targets.json"
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024
 DEFAULT_FORBIDDEN_BUNDLE_TARGETS = ("prod", "production")
-PROBE_SENTINEL = "__dbx_guard_probe__"   # named by the doctor's HOOK_PROBE_COMMAND; a command naming it always blocks
+PROBE_SENTINEL = "__dbx_guard_probe__"   # prefix of the doctor's HOOK_PROBE_COMMAND token; a command naming it always blocks
+_PROBE = re.compile(re.escape(PROBE_SENTINEL) + r"\w*")
 
 _SEG = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$-]*)"
 _OBJ = r"TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE"
@@ -91,14 +93,18 @@ _WRITE = re.compile(
       | UPDATE\s+(?!STATISTICS\b|SET\b|OF\b)(?:TOP\s*\([^)]*\))?
       | DELETE\s+FROM
       | MERGE\s+(?:WITH\s+SCHEMA\s+EVOLUTION\s+)?INTO
-      | (?:TRUNCATE|REPLACE|OPTIMIZE|VACUUM|RESTORE|REFRESH)\s+TABLE
+      | (?:TRUNCATE|REPLACE|RESTORE|REFRESH|REORG|ANALYZE)\s+TABLE
+      | (?:OPTIMIZE|VACUUM)(?:\s+TABLE)?
+      | REFRESH\s+MATERIALIZED\s+VIEW
+      | MSCK\s+REPAIR\s+TABLE
+      | SYNC\s+(?:AS\s+EXTERNAL\s+)?(?=(?:SCHEMA|TABLE)\b)(?:TABLE\s+)?
       | COPY\s+INTO
       | CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+|EXTERNAL\s+|STREAMING\s+|MATERIALIZED\s+|LIVE\s+)*
         (?=(?:{_OBJ}|SCHEMA|DATABASE|CATALOG)\b)(?:(?:{_OBJ})\s+(?:IF\s+NOT\s+EXISTS\s+)?)?
       | (?:DROP|ALTER)\s+(?=(?:{_OBJ}|SCHEMA|DATABASE|CATALOG)\b)(?:(?:{_OBJ})\s+(?:IF\s+EXISTS\s+)?)?
       | UNDROP\s+(?=(?:TABLE|SCHEMA)\b)(?:TABLE\s+)?
       | COMMENT\s+ON\s+(?:(?:{_OBJ}|MATERIALIZED\s+VIEW|COLUMN)\s+)?
-      | (?:GRANT|REVOKE)\s+.+?\bON\s+(?:(?:{_OBJ}|MATERIALIZED\s+VIEW)\s+)?
+      | (?:GRANT|REVOKE|DENY)\s+.+?\bON\s+(?:(?:{_OBJ}|MATERIALIZED\s+VIEW)\s+)?
       | (?:EXEC(?:UTE)?|CALL)\s+(?!IMMEDIATE\b)(?=(?:\[?[\w$]+\]?\.)+\[?[\w$]+)
     )
       | (?:^|(?<=[;\n]))\s*(?:EXEC(?:UTE)?|CALL)\s+(?!IMMEDIATE\b)(?=[\[@`\w])
@@ -112,10 +118,13 @@ _IDENTIFIER_LITERAL = re.compile(r"\bIDENTIFIER\s*\(\s*'([^']*)'\s*\)", re.IGNOR
 _IDENTIFIER_DYNAMIC = re.compile(r"\bIDENTIFIER\s*\(", re.IGNORECASE)
 _EXEC_IMMEDIATE_DYNAMIC = re.compile(r"\bEXEC(?:UTE)?\s+IMMEDIATE\s+(?!')\S", re.IGNORECASE)
 _BUNDLE_TARGET = re.compile(r"(?:^|\s)(?:-t|--target)(?:=|\s+)(\S+)")
+_PERMISSION = re.compile(r"^\s*(?:GRANT|REVOKE|DENY)\b.*\bON\s+CATALOG\b|^\s*(?:CREATE|ALTER|DROP)\s+CATALOG\b", re.IGNORECASE | re.DOTALL)
 
 _LEGACY_ONLY = ("bteq", "sqlplus", "sqlldr", "snowsql", "mload", "fastload", "fastexport", "tbuild", "tdload")
 _LOADERS = ("sqlldr", "mload", "fastload", "tbuild", "tdload")
-_GENERIC = ("psql", "pgcli", "sqlcmd", "osql", "isql", "tsql", "mysql", "mariadb", "sqlite3", "bcp", "beeline", "trino", "presto")
+_WRITERS = ("pg_restore", "pgloader", "liquibase", "flyway", "sqitch")   # migration tools: every run writes its target
+_GENERIC = ("psql", "pgcli", "sqlcmd", "osql", "isql", "tsql", "mysql", "mariadb", "sqlite3", "bcp", "beeline", "trino", "presto",
+            "mssql-cli", "go-sqlcmd", "usql", *_WRITERS)
 _DBX_CLIENTS = ("databricks", "dbx-recon", "spark-sql", "dbsqlcli")
 _IDENTITY_CLIENTS = ("databricks", "dbx-recon", "spark-sql")
 _PYTHON = re.compile(r"python[0-9.]*|spark-submit")
@@ -124,20 +133,30 @@ _CLIENT_WORD = re.compile(r"(?<![\w-])(?:" + "|".join(map(re.escape, (*_DBX_CLIE
 
 _SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
 _SEPARATORS = (";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}", "\n")
-_PREFIX_WORDS = ("sudo", "env", "nohup", "time", "exec", "command", "nice", "xargs", "timeout", "stdbuf")
+_PREFIX_WORDS = ("sudo", "env", "nohup", "time", "exec", "command", "nice", "xargs", "timeout", "stdbuf", "uvx", "npx", "pipx")
+_PREFIX_VALUE_FLAGS = {"sudo": ("-u", "-g", "-C"), "env": ("-u", "--unset", "-C", "-S"), "uvx": ("--from", "--with", "-p", "--python"),
+                       "npx": ("-p", "--package"), "pipx": ("--spec",)}
 _ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
-_IDENTITY_VAR = re.compile(r"^(?:export\s+)?DATABRICKS_(?:TOKEN|HOST|CONFIG_PROFILE|CLIENT_\w+)=")
+# credential / endpoint / profile selection of the Databricks CLI and SDK: never changed from a session
+_IDENTITY_VAR = re.compile(r"^(?:DATABRICKS_\w+|ARM_CLIENT_\w+|ARM_TENANT_ID|AZURE_\w+|GOOGLE_CREDENTIALS|GOOGLE_APPLICATION_CREDENTIALS)$")
+_CONFIG_HOME_VAR = ("HOME", "XDG_CONFIG_HOME")   # where ~/.databrickscfg is looked up; protected on a client's own segment
+_FUNCTION_DEF = re.compile(r"(?:^|[;&|\n{}()]\s*)(?:function\s+[\w.-]+|[\w.-]+\s*\(\s*\))")
 # flags whose value is the SQL text itself (psql -c, sqlcmd/isql/snowsql -Q/-q, spark-sql/dbsqlcli/mysql -e ...)
 _SQL_VALUE_FLAGS = ("-c", "-Q", "-q", "-e", "--query", "--sql", "--statement", "--execute", "--command")
 _SCRIPT_FLAGS = ("-f", "-i", "--file", "--input")
-_HOST_FLAGS = ("-S", "-h", "-H", "--host", "--server")
+_HOST_FLAGS = ("-S", "-h", "-H", "--host", "--server", "--hostname", "--url", "-url")
+_HOST_ENV = ("PGHOST", "PGHOSTADDR", "PGSERVICE", "MYSQL_HOST", "SQLCMDSERVER")
+_DSN_POSITIONAL = ("isql", "usql", "pgloader")   # clients whose first positional is the DSN / URL, not a database name
+_RUN_FILE = re.compile(r"(?<!\S)@(\S+)|^\s*\.RUN\s+FILE\s*=?\s*(\S+)", re.IGNORECASE | re.MULTILINE)
 _DYNAMIC_SQL_EXECUTOR = (r"(?:\bEXEC(?:UTE)?\s+IMMEDIATE|\bsp_executesql|\bEXEC(?:UTE)?\s*\(|"
                          r"\.(?:execute|executemany|sql|run_query|execute_statement)\s*\(|\bstatement\s*=)")
 _DYNAMIC_SQL_CALLER = re.compile(_DYNAMIC_SQL_EXECUTOR + r"\s*N?\s*$", re.IGNORECASE)
 _PY_LITERAL = re.compile(_DYNAMIC_SQL_EXECUTOR + r"\s*[rbuf]*(['\"]{3}|['\"])(.*?)\1", re.IGNORECASE | re.DOTALL)
 _PY_WRITE = re.compile(r"""['"][wax]\+?['"]|\.write\w*\(|json\.dump\(|os\.(?:remove|unlink|rename|replace|chmod|rmdir|makedirs|mkdir)\(|"""
                        r"""shutil\.|\.(?:unlink|rename|rmdir|mkdir|touch|chmod)\(""")
-_MIGRATION_PATH = re.compile(r"[^\s'\"()]*\.migration/[^\s'\"()]*")
+_MIGRATION_PATH = re.compile(r"[^\s'\"()]*\.migration(?:/[^\s'\"()]*)?")
+_RMTREE = re.compile(r"rmtree\(\s*(?:['\"]([^'\"]*)['\"]|(os\.getcwd\(\)|Path\.cwd\(\)|Path\(\s*(?:['\"]\.?['\"])?\s*\)))")
+_SQL_OUT_PATH = re.compile(r"(?i)(?:\bTO\s+|\\[ow]\s+|:out\s+|\bSPOOL\s+|\bFILE\s*=\s*)'?([^\s'\"]*\.migration(?:/[^\s'\"]*)?)")
 
 # read shapes: leading keyword, then no write keyword anywhere at statement level
 _READ_HEAD = ("SELECT", "WITH", "SET", "USE", "DECLARE")
@@ -166,9 +185,10 @@ _DBX_READ = {
     "workspace": {"list", "export", "get-status"}, "secrets": {"list-scopes", "list-secrets"},
     "auth": {"describe", "env", "token", "profiles"}, "fs": {"ls", "cat", "head"}, "api": {"get"}, "bundle": {"validate", "summary"},
 }
-_CLI_CATALOG_ARG = {"grants update": 1, "grants delete": 1, "schemas create": 1, "schemas delete": 0, "schemas update": 0,
-                    "tables delete": 0, "volumes create": 0, "volumes delete": 0, "volumes update": 0, "functions delete": 0,
-                    "functions update": 0, "catalogs create": 0, "catalogs delete": 0, "catalogs update": 0}
+# (catalog lifecycle and permissions -- `catalogs create|update|delete`, `grants update`, `schemas delete` -- are not
+# object writes inside an allowlisted catalog and stay blocked whatever the allowlist says)
+_CLI_CATALOG_ARG = {"schemas create": 1, "schemas update": 0, "tables delete": 0, "volumes create": 0, "volumes delete": 0,
+                    "volumes update": 0, "functions delete": 0, "functions update": 0}
 _DBX_VALUE_FLAGS = {"-o", "--output", "--log-level", "--log-file", "--log-format", "--progress-format", "-t", "--target", "-p",
                     "--profile", "--host", "--warehouse-id", "--catalog", "--schema", "--format", "--wait-timeout", "--json",
                     "--var", "--file", "--language", "--string-value", "--bytes-value", "-e", "--statement", "--query"}
@@ -176,6 +196,7 @@ _UC_PATH = re.compile(r"unity-catalog/(?:tables|schemas|volumes|functions)/([^/?
 _VOLUME_PATH = re.compile(r"^(?:dbfs:)?/Volumes/([^/]+)/")
 _DBX_HOST = re.compile(r"\$\{?DATABRICKS_HOST\b|\.(?:cloud\.databricks\.com|azuredatabricks\.net|gcp\.databricks\.com)\b", re.IGNORECASE)
 _HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+_CURL_VALUE_SHORT = "dFTHouAebcmwxEKUyYzCDQrtPO"   # short options that take a value (end a bundled cluster)
 
 
 @dataclass
@@ -209,7 +230,7 @@ class GuardConfig:
             mode=mode,
             forbidden_bundle_targets=tuple(t.lower() for t in lists["forbidden_bundle_targets"]),
             target_hosts=[h.lower() for h in lists["target_hosts"]],
-            bundle_targets=[t.lower() for t in lists["bundle_targets"]],
+            bundle_targets=lists["bundle_targets"],   # DAB / dbt targets are case-sensitive: compared exactly
             path=path,
         )
 
@@ -226,10 +247,12 @@ def _norm(ident: str) -> str:
 
 
 def find_config(start: Path) -> Path | None:
+    """The allowlist path of the nearest `.migration/` directory up the tree, whether or not the
+    file exists there (a workspace with the directory but no readable allowlist fails closed);
+    None only when no `.migration/` exists at all."""
     for d in [start, *start.parents]:
-        candidate = d / CONFIG_REL
-        if candidate.is_file():
-            return candidate
+        if (d / CONFIG_REL).is_file() or (d / CONFIG_REL.parent).is_dir():
+            return d / CONFIG_REL
     return None
 
 
@@ -237,7 +260,7 @@ def load_config(start: Path) -> GuardConfig | None:
     path = find_config(start.resolve())
     if path is None:
         return None
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text())   # OSError when .migration/ exists without the file: the caller blocks
     if not isinstance(data, dict):
         raise ValueError(f"{path} must be a JSON object")
     return GuardConfig.from_dict(data, path)
@@ -418,8 +441,8 @@ def _strip_redirects(words: list[str]) -> tuple[list[str], list[str], str | None
 
 
 def _at_files(texts: list[str]) -> list[str]:
-    """`@file` words on script lines (SQL*Plus `@fix.sql`, BTEQ `.RUN FILE @fix.sql`)."""
-    return [m.group(1) for t in texts for m in re.finditer(r"(?<!\S)@(\S+)", t)]
+    """File directives on script lines: SQL*Plus `@fix.sql`, BTEQ `.RUN FILE=fix.sql` / `.RUN FILE @fix.sql`."""
+    return [(m.group(1) or m.group(2)).lstrip("@") for t in texts for m in _RUN_FILE.finditer(t)]
 
 
 def _piped_scripts(producer: _Simple) -> list[str]:
@@ -517,6 +540,7 @@ class _Seg:
     opaque: str | None              # a piped producer whose output the guard cannot read
     scripts: list[str]              # files it executes
     ctx: str = ""                   # text of the wrapper (`ssh host`) this command was nested in
+    fed: list[str] = field(default_factory=list)   # words of the producers piped into it
 
     @property
     def argv0(self) -> str:
@@ -578,7 +602,9 @@ def _program(words: list[str], assigns: list[str]) -> list[str]:
         elif w in _PREFIX_WORDS:
             i += 1 + (w == "timeout")
             while i < len(words) and words[i].startswith("-"):
-                i += 2 if w in ("sudo", "env") and words[i] in ("-u", "-i", "-C", "-g") else 1
+                if w == "env" and words[i] in ("-u", "--unset") and i + 1 < len(words):
+                    assigns.append(words[i + 1] + "=")   # unsetting a variable changes the environment too
+                i += 2 if words[i] in _PREFIX_VALUE_FLAGS.get(w, ()) else 1
         else:
             break
     return words[i:]
@@ -639,7 +665,8 @@ def _segments(text: str, ctx: str = "", depth: int = 0) -> list[_Seg]:
                 stdin.extend(pheredocs)
         redirects = [w for i, w in enumerate(c.words) if _REDIRECT_OP.fullmatch(w) or (i and _REDIRECT_OP.fullmatch(c.words[i - 1]))]
         seg = _Seg(argv, c.words, c.raw, heredocs, assigns, herestring, stdin, opaque,
-                   _scripts_of(c, argv + redirects if wrapper else None), " ".join(x for x in (ctx, wrapper) if x))
+                   _scripts_of(c, argv + redirects if wrapper else None), " ".join(x for x in (ctx, wrapper) if x),
+                   [w for p in c.feeds for w in p.words])
         if seg.argv0 == "alias":
             for a in argv[1:]:
                 if "=" in a:
@@ -682,6 +709,9 @@ def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
                 violations.append(f"`{base}` fed by process substitution; the guard cannot read what it would run")
         elif "xargs" in s.words and ctx:
             violations.append("`xargs` builds a client invocation from stdin; the guard cannot read the statement it would run")
+        if ctx and s.argv and _expands(s.raw_of(s.argv[0]).rsplit("/", 1)[-1]):
+            violations.append(f"variable `{s.raw_of(s.argv[0])[:40]}` in command position; the guard cannot tell which program "
+                              "it would run (same class as `eval`)")
         if ctx:
             for i, r in enumerate(s.raw):
                 if _expands(r) and _sql_bearing(s, i) and not _REDIRECT_OP.fullmatch(s.words[i - 1] if i else ""):
@@ -696,6 +726,9 @@ def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
     if ctx and _substitutes(cmd):
         violations.append("command/process substitution in a Databricks or legacy command; the statement is built at run "
                           "time, so inline it as text")
+    if ctx and _FUNCTION_DEF.search(re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', " ", cmd)):
+        violations.append("shell function defined in a Databricks or legacy command; the guard cannot follow what a call of "
+                          "it would run (same class as `eval`)")
     return violations
 
 
@@ -768,21 +801,27 @@ def _non_read(seg: _Seg, sql: str) -> list[str]:
     bad = [s for s in _statements(sql) if not _is_read(s)]
     if seg.argv0 == "bcp" and "in" in seg.argv[1:4]:
         bad.insert(0, "bcp ... in (loader)")
+    if seg.argv0 in _WRITERS:
+        bad.insert(0, f"{seg.argv0} (a migration tool: every run writes its target)")
     if seg.opaque:
         bad.insert(0, f"stdin from `{seg.opaque}`, a program or expansion the guard cannot read")
     return [b.split("\n", 1)[0][:80] for b in bad]
 
 
 def _hosts(seg: _Seg) -> list[str]:
-    """Host / DSN candidates of a generic client: host flags, positionals, `$VAR` names, URI hosts."""
+    """Host / DSN candidates of a generic client: host flags and environment, URI and keyword hosts,
+    `$VAR` names, and the first positional only for clients whose positional is a DSN (a database
+    name or a SQL argument is never a host)."""
     sql = set(_flag_values(seg.argv, _SQL_VALUE_FLAGS)) | set(seg.scripts)
     out = list(_flag_values(seg.argv, _HOST_FLAGS))
-    out += [w for w in seg.argv[1:] if not w.startswith("-") and w not in sql]
-    joined = " ".join(seg.argv[1:])
+    out += [a.split("=", 1)[1] for a in seg.assigns if a.split("=", 1)[0] in _HOST_ENV]
+    if seg.argv0 in _DSN_POSITIONAL:
+        out += [w for w in seg.argv[1:2] if not w.startswith("-") and w not in sql]
+    joined = " ".join(w for w in seg.argv[1:] if w not in sql)
     out += re.findall(r"\$\{?(\w+)\}?", joined)
-    out += re.findall(r"://(?:[^@/\s]*@)?([^:/?\s]+)", joined)
-    out += re.findall(r"(?i)\b(?:host|server|data source)=([^;\s]+)", joined)
-    return [re.split(r"[,:\\]", h, 1)[0].lower() for h in out if h]
+    out += re.findall(r"://(?:[^@/\s]*@)?([^:/?\s;]+)", joined)
+    out += re.findall(r"(?i)\b(?:host|hostaddr|server|data source|addr)=([^;\s]+)", joined)
+    return [re.split(r"[,:\\]", re.sub(r"^(?:tcp|np|lpc):", "", h, flags=re.IGNORECASE), 1)[0].lower() for h in out if h]
 
 
 def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
@@ -792,7 +831,8 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     tail = " (legacy is read-only in every phase)"
     if base in _LOADERS:
         return [f"`{base}` is a loader: nothing but reads ever runs against a legacy source" + tail]
-    sql, unreadable = _sql_text(seg, root)
+    extra = [seg.argv[1]] if base == "bcp" and len(seg.argv) > 2 and "queryout" in seg.argv[2:4] else []
+    sql, unreadable = _sql_text(seg, root, extra)
     bad = _non_read(seg, sql)
     violations = []
     if unreadable:
@@ -843,6 +883,9 @@ def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, in_dbx:
         head = stmt.strip().split("\n", 1)[0][:80]
         if _IDENTIFIER_DYNAMIC.search(stmt):
             violations.append(f"IDENTIFIER(<non-literal>) names the target of a write at run time: `{head}`")
+        elif in_dbx and _PERMISSION.match(stmt):
+            violations.append(f"catalog lifecycle / permission change `{head}`; the allowlist authorizes object writes inside a "
+                              "catalog, never grants or the catalog itself (those happen at STOP E)")
         elif cat is not None:
             if cat not in allowed:
                 violations.append(f"write to catalog(s) {[cat]} outside allowlist {sorted(allowed)}: `{head}`")
@@ -864,8 +907,8 @@ def _check_target(kind: str, words: list[str], cfg: GuardConfig) -> list[str]:
         return [f"`{kind}` target `{t}` is not a literal; use a name from bundle_targets {cfg.bundle_targets}"]
     if t.lower() in cfg.forbidden_bundle_targets:
         return [f"`{kind}` to forbidden target {t!r} (forbidden_bundle_targets); production deploys happen only at STOP E"]
-    if t.lower() not in cfg.bundle_targets:
-        return [f"`{kind}` target {t!r} not in bundle_targets {cfg.bundle_targets} (empty = every deploy blocks)"]
+    if t not in cfg.bundle_targets:
+        return [f"`{kind}` target {t!r} not in bundle_targets {cfg.bundle_targets} (exact, case-sensitive; empty = every deploy blocks)"]
     return []
 
 
@@ -896,11 +939,16 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         if m and _norm(m.group(1).split(".")[0]) in cfg.catalogs:
             return []
     elif group == "fs" and verb in ("cp", "rm", "mkdir", "mkdirs"):
-        cats = [_norm(m.group(1)) for a in args if (m := _VOLUME_PATH.match(a))]
-        if cats and all(c in cfg.catalogs for c in cats):
+        remote = [a for a in args if a.startswith(("dbfs:", "/")) or "://" in a]
+        cats = [_norm(m.group(1)) if (m := _VOLUME_PATH.match(a)) else None for a in remote]
+        if remote and len(args) >= (2 if verb == "cp" else 1) and all(c in cfg.catalogs for c in cats) and not any(map(_expands, args)):
             return []
-        return [f"`databricks fs {verb}` outside an allowlisted volume (/Volumes/<catalog>/...): {args}"]
+        return [(f"`databricks fs {verb}` with a remote path outside an allowlisted volume (dbfs:/Volumes/<catalog>/...; every "
+                 f"remote end of a `cp`, no variables): {args}")]
     key = f"{group} {verb}"
+    if key in ("catalogs create", "catalogs update", "catalogs delete", "schemas delete", "grants update", "grants delete"):
+        return [(f"`databricks {key}` on {' '.join(args) or '<securable>'!r}: the allowlist authorizes object writes inside a "
+                 "catalog, never catalog lifecycle or permissions (those happen at STOP E)")]
     if key in _CLI_CATALOG_ARG:
         idx = _CLI_CATALOG_ARG[key]
         name = args[idx] if len(args) > idx else ""
@@ -925,8 +973,11 @@ def _check_rest(seg: _Seg) -> list[str]:
                 method = nxt.upper()
             elif w.startswith(("-X", "--request=")):
                 method = w.split("=", 1)[-1][2 if w.startswith("-X") else 0:].upper()
-            elif w.startswith(("--data", "--json", "--form", "--upload-file")) or re.fullmatch(r"-[a-zA-Z]*[dFT][a-zA-Z]*", w):
+            elif w.startswith(("--data", "--json", "--form", "--upload-file")):
                 body = True
+            elif w.startswith("-") and not w.startswith("--"):   # bundled short options: `-sSd'{}'`, `-F`, `-T`
+                first = next((ch for ch in w[1:] if ch in _CURL_VALUE_SHORT), "")
+                body = body or (first != "" and first in "dFT")
         elif seg.argv0 == "wget":
             if w.startswith("--method"):
                 method = (w.split("=", 1)[1] if "=" in w else nxt).upper()
@@ -943,67 +994,166 @@ def _check_rest(seg: _Seg) -> list[str]:
 
 
 def _check_identity(segs: list[_Seg]) -> list[str]:
+    """The session runs as the doctor-verified migration principal only: no credential / endpoint /
+    profile variable is set, exported or unset (the shell persists it for the next command), no
+    HOME/XDG_CONFIG_HOME or profile flag is put on a client's own segment."""
     violations = []
-    exported = [w for s in segs for w in [*s.assigns, *s.argv[:2]] if _IDENTITY_VAR.match(w)]
-    exported += [s.argv[1] for s in segs if s.argv0 == "export" and len(s.argv) > 1 and _IDENTITY_VAR.match(s.argv[1])]
+    tail = "; the session runs as the doctor-verified migration principal only"
     for s in segs:
-        if s.argv0 not in _IDENTITY_CLIENTS:
-            continue
-        for v in exported:
-            violations.append(f"identity swap: `{v.split('=', 1)[0]}=` set around `{s.argv0}`; the session runs as the doctor-verified "
-                              "migration principal only")
-        if s.argv0 == "databricks":
+        client = s.argv0 in _IDENTITY_CLIENTS
+        persistent = s.argv0 in ("export", "unset", "declare", "typeset", "setenv") or not s.argv   # outlives the command
+        names = [a.split("=", 1)[0] for a in s.assigns]
+        if persistent:
+            names += [w.split("=", 1)[0] for w in s.argv[1:] if not w.startswith("-")]
+        for n in names:
+            if _IDENTITY_VAR.match(n) and (client or persistent):
+                violations.append(f"identity swap: `{n}=` {'around `' + s.argv0 + '`' if client else 'changed for the session'}" + tail)
+            elif n in _CONFIG_HOME_VAR and client:
+                violations.append(f"identity swap: `{n}=` moves the Databricks config lookup around `{s.argv0}`" + tail)
+        if client and s.argv0 != "spark-sql":
             flags = [w for w in s.argv[1:] if w in ("--profile", "-p", "--host") or w.startswith(("--profile=", "--host="))]
             if flags or s.argv[1:3] == ["auth", "login"] or s.argv[1:2] == ["configure"]:
-                violations.append(f"identity swap through `databricks {' '.join(flags or s.argv[1:3])}`; the session runs as the "
-                                  "doctor-verified migration principal only")
+                violations.append(f"identity swap through `{s.argv0} {' '.join(flags or s.argv[1:3])}`" + tail)
     return violations
 
 
-def _protected(path: str, cwd: str) -> bool:
-    p = os.path.normpath(path if path.startswith("/") else os.path.join(cwd, path))
-    parts = p.split("/")
-    if ".migration" not in parts:
-        return False
-    rest = parts[parts.index(".migration") + 1:]
-    return not (len(rest) > 1 and rest[0] in ("recon", "waves"))
+# heads that only read their operands; anything else naming `.migration` is a write (fail closed)
+_READ_HEADS = frozenset(("cat", "less", "more", "head", "tail", "grep", "rg", "egrep", "fgrep", "zgrep", "diff", "cmp", "ls", "stat",
+                         "wc", "file", "jq", "yq", "md5sum", "sha1sum", "sha256sum", "sort", "uniq", "cut", "tr", "awk", "gawk",
+                         "mawk", "sed", "tree", "du", "echo", "printf", "test", "[", "[[", "cd", "pushd", "popd", "dirname",
+                         "basename", "realpath", "readlink", "which", "type", "find", "tar", "unzip", "column", "nl", "od", "xxd",
+                         "strings", "pytest", "ruff", "true", "false", "sleep", "date", "env", "printenv", "set", "export", "unset",
+                         "dbx-recon", "databricks"))   # the two clients read the allowlist; their outputs go through --out / -o
+_WRITE_LAST_OPERAND = ("cp", "rsync", "install", "ln", "scp")
+_RECURSIVE_HEADS = ("rm", "chmod", "chown", "chgrp", "rsync", "chattr", "setfacl")
+_OUTPUT_FLAGS = ("-o", "-O", "--output", "--out", "--out-file", "--output-file", "--outfile", "--file")
+_GIT_DESTRUCTIVE = ("--hard", "--merge", "--keep")
 
 
-_WRITE_ANY_OPERAND = ("rm", "rmdir", "truncate", "chmod", "chown", "chgrp", "touch", "mkdir", "shred", "unlink", "tee", "mv")
-_WRITE_LAST_OPERAND = ("cp", "rsync", "install", "ln")
-_GIT_WRITES = ("checkout", "restore", "rm", "mv", "clean")
+def _touch(path: str, cwd: str, root: Path) -> str:
+    """How a literal path relates to the protected part of `.migration/`: 'inside' (a protected entry,
+    literally or through a glob / brace / `?` that could match one), 'self' (`.migration` itself),
+    'above' (`.`, `..`, `$PWD`, `~` or an absolute path at or above the workspace root), or ''."""
+    p = re.sub(r"\$\{?PWD\}?|\$\(pwd\)", ".", path)
+    p = os.path.expanduser(re.sub(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", "*", p))   # a brace list could name anything in it
+    if p in ("", "-") or p.isdigit():
+        return ""
+    p = os.path.normpath(p if p.startswith("/") else os.path.join(cwd, p))
+    parts = [x for x in p.split("/") if x not in ("", ".")]
+    for i, part in enumerate(parts):
+        # a glob counts only at the top of the workspace, where the ledger lives; a literal `.migration` anywhere
+        if part == ".migration" or (i == 0 and not p.startswith("/") and re.search(r"[*?\[]", part)
+                                     and fnmatch.fnmatchcase(".migration", part)):
+            rest = parts[i + 1:]
+            if not rest:
+                return "self"
+            return "" if len(rest) > 1 and rest[0] in ("recon", "waves") else "inside"
+    if p.startswith("/"):
+        try:
+            p = os.path.relpath(p, root)
+        except ValueError:
+            return ""
+        parts = [x for x in p.split("/") if x not in ("", ".")]
+    return "above" if all(x == ".." for x in parts) else ""
 
 
-def _check_integrity(segs: list[_Seg]) -> list[str]:
-    """Nothing but the recon harness and the workflow writes under `.migration/`."""
+def _in_place(base: str, argv: list[str]) -> bool:
+    if base == "sed":
+        return any(re.match(r"-[nEersuz]*i", w) or w.startswith("--in-place") for w in argv[1:])
+    if base == "perl":
+        return any(re.match(r"-[a-zA-Z]*i", w) for w in argv[1:])
+    if base in ("awk", "gawk", "mawk"):
+        return "--inplace" in argv or ("-i" in argv and "inplace" in argv)
+    return False
+
+
+def _patch_texts(s: _Seg, files: list[str], root: Path, how: str) -> list[str]:
+    """Violations of a patch applier: the guard reads every patch it is given and blocks one it
+    cannot read or one that touches `.migration/`."""
+    if s.opaque or (not files and not s.stdin and not s.heredocs):
+        return [f"`{how}` on a patch the guard cannot read (stdin from a program or the terminal); write it to a file first"]
+    out = []
+    for f in files:
+        body = _read_script(f, root)
+        if body is None:
+            out.append(_unreadable_msg([f], f"`{how}`"))
+        elif _MIGRATION_PATH.search(body):
+            out.append(f"`{how}` of a patch that touches .migration/ ({f}); ledgers and the allowlist change only through a recorded decision")
+    if _MIGRATION_PATH.search("\n".join([*s.stdin, *s.heredocs])):
+        out.append(f"`{how}` of a patch that touches .migration/; ledgers and the allowlist change only through a recorded decision")
+    return out
+
+
+def _check_integrity(segs: list[_Seg], root: Path) -> list[str]:
+    """Nothing but the recon harness and the workflow writes under `.migration/`: any head whose
+    literal operands name a protected entry blocks unless it only reads; a destructive recursive
+    verb on `.`, `..`, the workspace root or `.migration` itself blocks too."""
     violations, cwd = [], ""
+    all_kinds = ("inside", "self", "above")
 
-    def hit(path: str, how: str) -> None:
-        if _protected(path, cwd):
+    def hit(path: str, how: str, kinds: tuple[str, ...] = ("inside", "self")) -> None:
+        if _touch(path, cwd, root) in kinds:
             violations.append(f"`{how}` writes `{path}` under .migration/ (only .migration/recon/ and .migration/waves/ are "
                               "written by commands; ledgers and the allowlist change only through a recorded decision)")
 
     for s in segs:
         base, argv = s.argv0, s.argv
         operands = [w for w in argv[1:] if not w.startswith("-")]
+        values = operands + [w.split("=", 1)[1] for w in argv[1:] if "=" in w]          # `dd of=`, `--output=`
         for op, operand in zip(s.words, [*s.words[1:], ""]):
-            if _REDIRECT_OP.fullmatch(op) and ">" in op and operand and not operand.isdigit() and operand != "-":
+            if _REDIRECT_OP.fullmatch(op) and ">" in op:
                 hit(operand, f"{op} {operand}")
-        if base == "cd" and operands and not _expands(operands[0]):
-            cwd = os.path.normpath(operands[0] if operands[0].startswith("/") else os.path.join(cwd, operands[0]))
-        elif base in _WRITE_ANY_OPERAND or (base in ("sed", "perl") and any(w.startswith(("-i", "--in-place")) for w in argv)):
-            for o in operands:
-                hit(o, base)
-        elif base in _WRITE_LAST_OPERAND and operands:
-            hit(operands[-1], base)
-        elif base == "git" and argv[1:2] and argv[1] in _GIT_WRITES:
-            for o in operands[1:]:
-                hit(o, f"git {argv[1]}")
-        elif _PYTHON.fullmatch(base) or base in ("perl", "ruby", "node"):
-            text = "\n".join([*_flag_values(argv, ("-c", "-e")), *s.heredocs])
+        for flag, value in itertools.pairwise(argv):
+            if flag in _OUTPUT_FLAGS:
+                hit(value, f"{base} {flag}")
+        if base in ("cd", "pushd"):
+            if operands and not _expands(operands[0]):
+                cwd = os.path.normpath(operands[0] if operands[0].startswith("/") else os.path.join(cwd, operands[0]))
+        elif base == "git":
+            verb, gops = (argv[1] if len(argv) > 1 else ""), operands[1:]
+            if verb == "clean" or (verb == "reset" and any(w in argv for w in _GIT_DESTRUCTIVE)):
+                violations.append(f"`git {verb}` discards working-copy changes across the workspace, .migration/ included; "
+                                  "revert a ledger only through a recorded decision")
+            elif verb in ("checkout", "restore", "rm", "mv"):
+                for o in gops:
+                    hit(o, f"git {verb}", all_kinds if verb in ("checkout", "restore") else ("inside", "self"))
+            elif verb in ("apply", "am"):
+                violations += _patch_texts(s, gops + s.scripts, root, f"git {verb}")
+        elif base == "patch":
+            violations += _patch_texts(s, s.scripts, root, "patch")
+        elif _PYTHON.fullmatch(base) or base in ("perl", "ruby", "node") and not _in_place(base, argv):
+            text = "\n".join([*_flag_values(argv, ("-c", "-e")), *s.heredocs, *s.stdin])
             if _PY_WRITE.search(text):
                 for p in _MIGRATION_PATH.findall(text):
                     hit(p, f"{base} script")
+                for m in _RMTREE.finditer(text):
+                    hit(m.group(1) if m.group(1) is not None else ".", f"{base} rmtree", all_kinds)
+        elif base == "find":
+            if any(w in argv for w in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls")) or any(w.startswith("-fprint") for w in argv):
+                for o in operands:
+                    hit(o, "find with an action", all_kinds)
+        elif base in ("tar", "bsdtar"):
+            if any(re.match(r"-?[a-zA-Z]*x", w) for w in argv[1:2]) or "--extract" in argv or "--get" in argv:
+                for d in _flag_values(argv, ("-C", "--directory")) or ["."]:
+                    hit(d, f"{base} extract into", all_kinds)
+        elif base == "unzip":
+            if not any(w in argv for w in ("-l", "-t", "-p", "-z", "-Z")):
+                for d in _flag_values(argv, ("-d",)) or ["."]:
+                    hit(d, "unzip into", all_kinds)
+        elif base in _GENERIC or base in _LEGACY_ONLY:
+            sql = " ".join([*_flag_values(argv, _SQL_VALUE_FLAGS), *s.heredocs, *s.stdin, s.herestring or ""])
+            for p in [*values, *_SQL_OUT_PATH.findall(sql)]:
+                hit(p, f"{base} output")
+        elif base in _READ_HEADS and not _in_place(base, argv):
+            continue
+        else:
+            recursive = base in _RECURSIVE_HEADS and any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*", w) or w in ("--recursive", "--delete")
+                                                        for w in argv[1:])
+            if "xargs" in s.words and any(_touch(w, cwd, root) for w in s.fed):
+                violations.append(f"`xargs {base}` on names listed from .migration/; ledgers and the allowlist change only through a "
+                                  "recorded decision")
+            for o in values[-1:] if base in _WRITE_LAST_OPERAND else values:
+                hit(o, base, all_kinds if recursive else ("inside", "self"))
     return violations
 
 
@@ -1044,7 +1194,7 @@ def _check_segment(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     if base == "dbx-recon":
         return [f"--target-catalog {_norm(c)!r} outside allowlist {sorted(cfg.catalogs)}"
                 for c in _flag_values(seg.argv, ("--target-catalog",)) if _norm(c) not in cfg.catalogs]
-    if base == "dbt" and seg.argv[1:2] and seg.argv[1] in ("run", "build", "seed"):
+    if base == "dbt" and seg.argv[1:2] and seg.argv[1] in ("run", "build", "seed", "snapshot", "run-operation"):
         return _check_target(f"dbt {seg.argv[1]}", seg.argv[2:], cfg)
     if base in _REST_CLIENTS:
         return _check_rest(seg)
@@ -1079,11 +1229,11 @@ def _analyse(text: str, cfg: GuardConfig, root: Path, depth: int = 0) -> tuple[l
 def evaluate(command: str, cfg: GuardConfig, root: Path | None = None) -> Verdict:
     root = root or _project_root()
     violations: list[str] = []
-    if PROBE_SENTINEL in command:
-        violations.append(f"`{PROBE_SENTINEL}` is the factory-doctor's hook probe; it always blocks so the doctor can tell the "
+    if m := _PROBE.search(command):
+        violations.append(f"`{m.group()}` is the factory-doctor's hook probe; it always blocks so the doctor can tell the "
                           "hook is loaded without touching Databricks")
     segs, found = _analyse(command, cfg, root)
-    violations += found + _check_identity(segs) + _check_integrity(segs)
+    violations += found + _check_identity(segs) + _check_integrity(segs, root)
     for seg in segs:
         violations += _check_segment(seg, cfg, root)
     return _verdict(list(dict.fromkeys(violations)), cfg)
