@@ -1072,6 +1072,7 @@ PROBES3 = [
     ("F5 cd then ../ script", "cd sub && psql -h legacy.corp -f ../w.sql", "block"),
     ("F5 cd then ../ read script (approve)", "cd sub && psql -h legacy.corp -f ../r.sql", "approve"),
     ("F5 cd then missing script", "cd sub && psql -h legacy.corp -f nope.sql", "block"),
+    ("F5 special-file script (/dev/zero) cannot be read in full", "bash /dev/zero", "block"),
     # R1: every host candidate must be allowlisted, not any
     ("R1 two -h, allowlisted first", "psql -h lakebase-host -h evil.corp -c 'DROP TABLE t'", "block"),
     ("R1 -h allowlisted + URI elsewhere", "psql -h lakebase-host 'postgresql://evil.corp/db' -c 'DROP TABLE t'", "block"),

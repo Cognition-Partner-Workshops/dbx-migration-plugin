@@ -484,7 +484,9 @@ def _read_script(f: str, root: Path, at: str | None = "") -> str | None:
         return None
     p = (root if not at else Path(at) if at.startswith("/") else root / at) / os.path.expandvars(os.path.expanduser(f))
     try:
-        return None if p.stat().st_size > _MAX_SCRIPT_BYTES else p.read_text(errors="replace")
+        with p.open(errors="replace") as fh:
+            body = fh.read(_MAX_SCRIPT_BYTES + 1)
+        return None if len(body) > _MAX_SCRIPT_BYTES else body
     except OSError:
         return None
 
