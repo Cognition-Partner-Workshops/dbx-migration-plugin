@@ -2,7 +2,7 @@
 import datetime as dt
 
 import pytest
-from recon import adapters
+from recon import adapters, cli
 from recon.adapters import (
     SOURCE_ADAPTERS,
     LakebaseTargetAdapter,
@@ -36,6 +36,21 @@ def test_untested_source_families_fail_fast_before_any_driver_is_touched(family,
 def test_every_cli_family_is_either_live_tested_or_refused():
     assert set(SOURCE_FAMILIES) == set(SOURCE_ADAPTERS)
     assert set(SOURCE_FAMILIES) - set(UNTESTED_FAMILIES) == {"sqlserver", "postgres", "databricks"}
+
+
+@pytest.mark.parametrize("family", UNTESTED_FAMILIES)
+def test_cli_exits_cleanly_on_an_untested_family_without_touching_the_target(family, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
+    for loader in ("load_mapping_spec", "load_tolerances", "load_canon_rules"):
+        monkeypatch.setattr(cli, loader, lambda *a: None)
+    monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: pytest.fail("target was built"))
+    with pytest.raises(SystemExit, match=f"^--family {family}: {family} source adapter is untested; see SKILL.md$"):
+        cli.main(["run", "--unit", "u", "--family", family, "--mapping", "m", "--tolerances", "t",
+                  "--canonicalization", "c", "--mode", "fixture", "--source-dsn-secret", "SOURCE",
+                  "--target-secret", "TARGET", "--target-catalog", "mig", "--target-schema", "s",
+                  "--out", str(tmp_path / "out")])
 
 
 @pytest.mark.parametrize("name, quote, expected", [

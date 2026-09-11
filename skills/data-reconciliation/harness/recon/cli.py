@@ -245,7 +245,10 @@ def main(argv: list[str] | None = None) -> int:
         TargetIdentityError,
     )
 
-    source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
+    try:
+        source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
+    except NotImplementedError as exc:  # an untested family: refused before any connection
+        raise SystemExit(f"--family {args.family}: {exc}") from None
     if args.target_kind == "lakebase":
         # --target-catalog names the Lakebase database; the adapter refuses a DSN that lands
         # anywhere else, so the allowlist binds the connection and not just the label

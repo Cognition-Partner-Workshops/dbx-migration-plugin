@@ -743,9 +743,9 @@ class _SqlAdapterBase:
 # ---- Source warehouses ------------------------------------------------------------------
 
 class _UntestedSourceAdapter(_SqlAdapterBase):
-    """A family the front door names but no engine has ever run: the registry row stays so a
-    mapping or `--family` naming it fails at load with this message instead of connecting to
-    an unverified statement set. The live-tested sources are SqlServer, Postgres, Databricks."""
+    """A family the front door names but no engine has ever run: the registry row stays so
+    `--family` naming it exits with this message where the adapter would be built, instead of
+    connecting to an unverified statement set. Live-tested: SqlServer, Postgres, Databricks."""
 
     family: str
 
