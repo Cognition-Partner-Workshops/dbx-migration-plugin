@@ -60,7 +60,8 @@ _PROBE = re.compile(re.escape(PROBE_SENTINEL) + r"\w*")
 
 _SEG = r"(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$-]*)"   # one identifier part, quoted or bare
 _OBJ = r"TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE"
-_METASTORE = r"SHARE|RECIPIENT|PROVIDER|CONNECTION|EXTERNAL\s+LOCATION|STORAGE\s+CREDENTIAL|SERVICE\s+CREDENTIAL|CLEAN\s+ROOM"   # catalog-less
+_METASTORE = (r"METASTORE|ANY\s+FILE|SHARE|RECIPIENT|PROVIDER|CONNECTION|EXTERNAL\s+LOCATION|STORAGE\s+CREDENTIAL|SERVICE\s+CREDENTIAL"
+              r"|CLEAN\s+ROOM")   # catalog-less securables
 # a write statement's verb phrase; the match ends where its target securable starts
 _WRITE = re.compile(
     rf"""(?:\b(?:
