@@ -853,11 +853,14 @@ def test_a_replayed_pass_that_fails_the_gate_now_is_a_new_failure_the_breaker_co
     # the PR still stands: PASS, nothing counted
     out, counted = run(passed, ("c" * 40, []), _pass(changed_paths=["src/a.sql"]))
     assert out["status"] == "PASS" and counted == {}
-    # a replayed FAIL is the failure the resumed run already counted
+    # a replayed FAIL is the failure the resumed run already counted, unless the gate now gives it another class
     failed = {**passed, "status": "FAIL", "failure_class": "recon_fail"}
-    out, counted = run(failed, ("c" * 40, []), {"status": "FAIL", "recon_verdict": "FAIL", "failure_class": "recon_fail",
-                                                 "pr_url": "https://example/pr/1", "one_line_summary": "replayed"})
+    replayed = {"status": "FAIL", "recon_verdict": "FAIL", "failure_class": "recon_fail",
+                "pr_url": "https://example/pr/1", "one_line_summary": "replayed"}
+    out, counted = run(failed, ("c" * 40, []), replayed)
     assert out["status"] == "FAIL" and counted == {}
+    out, counted = run(failed, ("e" * 40, [".migration/allowed_targets.json"]), replayed)
+    assert out["failure_class"] == "ledger_tampered" and counted == {"ledger_tampered": 1}
 
 
 @pytest.mark.parametrize("value", ["--upload-pack=touch /tmp/x", "-q", "main..x", "a b", "", 3, "^main", "m:n"])
