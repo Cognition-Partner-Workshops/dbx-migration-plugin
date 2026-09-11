@@ -648,9 +648,9 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
             return subprocess.CompletedProcess(cmd, 0, stdout="v" * 40 + "\n")
         if "--" in cmd:  # the verifier tree against a gated PR head, restricted to that PR's unit evidence
             return subprocess.CompletedProcess(cmd, 0, stdout=".migration/recon/u/result.json\n" if "1" * 40 in cmd else "")
-        return subprocess.CompletedProcess(cmd, 0, stdout="\n".join([
-            ".migration/recon/wave-2/report.md", "src/loans.sql", ".migration/recon/u/result.json",
-            ".migration/recon/u/rows.csv", ".migration/recon/v/result.json", ".migration/03_recon_tolerances.json"]) + "\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout=(
+            ".migration/recon/wave-2/report.md\nsrc/loans.sql\n.migration/recon/u/result.json\n"
+            ".migration/recon/u/rows.csv\n.migration/recon/v/result.json\n.migration/03_recon_tolerances.json\n"))
 
     ns = _launch_ns(tmp_path, fake_run)
     passed = [{"batch": "b1", "units": ["u"], "pr_head": "1" * 40}, {"batch": "b2", "units": ["v"], "pr_head": "2" * 40}]
