@@ -38,12 +38,13 @@ def validate_identifier(name: str) -> str:
 #              | [NOT] IN '(' literal (',' literal)* ')' | [NOT] BETWEEN operand AND operand
 #   operand   := identifier | literal        (identifiers may be qualified, [..] or ".." quoted)
 #   literal   := 'string' | number | (DATE|TIMESTAMP) 'string' | ${param}
+# DATE / TIMESTAMP are keywords only when a string literal follows; otherwise they are columns.
 _SEGMENT = r'(?:[A-Za-z_][\w$]*|\[[^\]]+\]|"(?:[^"]|"")+")'
 _PREDICATE_TOKEN = re.compile(
     r"\s+|(?P<string>'(?:[^']|'')*')|(?P<param>\$\{\w+\})"
     r"|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
     rf"|(?P<word>{_SEGMENT}(?:\.{_SEGMENT})*)|(?P<punct><>|!=|<=|>=|[=<>(),])")
-_KEYWORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "date", "timestamp"}
+_KEYWORDS = {"and", "or", "not", "in", "between", "is", "null", "like"}
 _RESERVED = {"select", "from", "where", "exists", "case", "when", "then", "else", "end", "union",
              "join", *READ_ONLY_SQL_KEYWORDS.pattern[3:-3].split("|")}
 
@@ -113,9 +114,13 @@ class _Predicate:
         else:
             self.fail()
 
+    def _typed_literal(self) -> bool:
+        return (self.i + 1 < len(self.tokens) and self.tokens[self.i][1].lower() in ("date", "timestamp")
+                and self.tokens[self.i + 1][0] == "string")
+
     def operand(self) -> None:
         kind, text = self.tokens[self.i] if self.i < len(self.tokens) else (None, "")
-        if kind == "word" and text.lower() not in _KEYWORDS:
+        if kind == "word" and text.lower() not in _KEYWORDS and not self._typed_literal():
             if text.lower() in _RESERVED:
                 self.fail()
             if self.i + 1 < len(self.tokens) and self.tokens[self.i + 1][1] == "(":
@@ -125,11 +130,9 @@ class _Predicate:
             self.literal()
 
     def literal(self) -> None:
+        if self._typed_literal():
+            self.i += 1
         kind = self.tokens[self.i][0] if self.i < len(self.tokens) else None
-        if self.take("date", "timestamp"):
-            kind = self.tokens[self.i][0] if self.i < len(self.tokens) else None
-            if kind != "string":
-                self.fail()
         if kind not in ("string", "number", "param"):
             self.fail()
         self.i += 1

@@ -21,6 +21,8 @@ ACCEPTED = [
     "code LIKE 'LN%' AND note NOT LIKE '%x''y%'",
     "loan_id != 7 AND version_no > 2001",
     "hire_date < DATE '2026-01-01' AND ts <= TIMESTAMP '2026-01-01 00:00:00'",
+    # date / timestamp are columns unless they introduce a typed string literal
+    "date >= DATE '2026-01-01' AND timestamp IS NOT NULL AND t.date < timestamp",
     "  status = 'A'  ",
 ]
 
@@ -49,6 +51,7 @@ REJECTED = [
     ("", ""),
     ("a", ""),
     ("a IS 1", "1"),
+    ("a = DATE 1", "1"),
     ("a b", "b"),
     ("a = $x", "$x"),
 ]
