@@ -272,9 +272,13 @@ validate_manifest(MANIFEST, DOCTOR)
 def ref_changed_paths(ref):
     """Paths a ref on origin changes against the base, from git. None when git cannot answer, and then
     no PASS stands. Callers pass refs the workflow built itself, never a name a child reported.
-    Renames are reported as delete + add so a ledger file moved under recon/ still names its old path."""
+    Renames are reported as delete + add so a ledger file moved under recon/ still names its old path.
+    The base is refreshed first: the verifier merges PRs into it during the wave, so the clone-time
+    origin/<base> would attribute every merged unit's recon evidence to the next ref diffed."""
     git = ["git", "-C", str(ROOT)]
     try:
+        subprocess.run(git + ["fetch", "-q", "origin", f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}"],
+                       check=True, capture_output=True, timeout=300)
         subprocess.run(git + ["fetch", "-q", "origin", ref], check=True, capture_output=True, timeout=300)
         r = subprocess.run(git + ["diff", "--name-only", "--no-renames", f"origin/{BASE_BRANCH}...FETCH_HEAD"],
                            check=True, capture_output=True, text=True, timeout=300)
