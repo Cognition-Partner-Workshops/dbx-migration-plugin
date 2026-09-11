@@ -181,7 +181,7 @@ _NON_READ_WORD = re.compile(
 _SIDE_EFFECT_FN = re.compile(
     r"\b(?:nextval|setval|set_config|pg_sleep(?:_for|_until)?|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|"
     r"pg_rotate_logfile|pg_(?:try_)?advisory_\w*lock\w*|lo_(?:import|export|unlink|creat|create|put|truncate)|dblink\w*|"
-    r"(?:sys\.)?(?:dbms|utl)_\w+(?:\.\w+)*|opendatasource)\s*\(|\.NEXTVAL\b", re.IGNORECASE)
+    r"opendatasource)\s*\(|\b(?:sys\.)?(?:dbms|utl)_\w+\.\w+\b|\.NEXTVAL\b", re.IGNORECASE)
 
 # Databricks CLI: read verbs per command group; mutations that name a securable, with the index of
 # the positional carrying its catalog (`grants update SECURABLE_TYPE FULL_NAME`, `schemas create
