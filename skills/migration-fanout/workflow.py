@@ -117,7 +117,7 @@ if resume:
                          "run_id to run_workflow and WAVE_RUN_ID, or WAVE_RERUN=1 for a fresh run")
 
 REPLAYED = {
-    b["id"]: b["status"] for b in (prior or {}).get("batches", [])
+    b["id"]: b for b in (prior or {}).get("batches", [])
     if b.get("status") in ("PASS", "FAIL", "BLOCKED")
 } if resume and isinstance(prior, dict) else {}
 
@@ -265,25 +265,28 @@ def fresh_doctor_report(m):
     return report
 
 
-def wave_base():
-    """The base branch's commit on origin, now. Every ledger diff of this run is anchored here: the
-    verifier merges PRs into the base during the wave, so a later origin/<base> would both hide a PR it
-    already contains (the head becomes its own merge base) and attribute merged units to the next diff."""
+def _base_tip():
     git = ["git", "-C", str(ROOT)]
+    subprocess.run(git + ["fetch", "-q", "origin", f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}"],
+                   check=True, capture_output=True, timeout=300)
+    return subprocess.run(git + ["rev-parse", "--verify", f"origin/{BASE_BRANCH}^{{commit}}"],
+                          check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+
+
+def wave_base():
+    """The base branch's commit on origin, now."""
     try:
-        subprocess.run(git + ["fetch", "-q", "origin", f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}"],
-                       check=True, capture_output=True, timeout=300)
-        r = subprocess.run(git + ["rev-parse", "--verify", f"origin/{BASE_BRANCH}^{{commit}}"],
-                           check=True, capture_output=True, text=True, timeout=300)
+        return _base_tip()
     except (OSError, subprocess.SubprocessError) as e:
         raise SystemExit(f"cannot resolve origin/{BASE_BRANCH} in {ROOT} ({e}); the ledger gate needs the base commit")
-    return r.stdout.strip()
 
 
 def launch_base():
-    """The commit this run's ledger diffs are anchored at, persisted beside the manifest before the
-    doctor, any child or the verifier runs. A resume reuses it (the run may have stopped before writing
-    any result, after the verifier merged PRs): a base re-read then would contain the heads to be diffed."""
+    """The base commit when this run launched, persisted beside the manifest before the doctor, any child
+    or the verifier runs; a resume reuses it. It anchors the ledger diff of a head the base already
+    contains (the verifier merges PRs into the base during the wave) and is what the verifier's tree of a
+    unit it did not merge is held to. The run may have stopped after the verifier merged and before any
+    result was written, so a base re-read on resume would already contain the heads to be diffed."""
     if resume:
         try:
             sha = BASE_SHA_PATH.read_text().strip()
@@ -313,16 +316,23 @@ def _git_paths(*args):
 
 
 def ref_changed_paths(ref):
-    """(head sha, paths) a ref on origin changes against the launch base, from git. None when git cannot
-    answer, and then no PASS stands. Callers pass refs the workflow built itself, never a name a child
-    reported. Renames are reported as delete + add so a ledger file moved under recon/ still names its
-    old path."""
+    """(head sha, paths) a ref on origin changes, from git: from its fork point on the base as it is now
+    (a child launched on a resume forked from a base the verifier had merged accepted units into; those
+    are not its diff), or from the launch base when the base already contains the head (it would be its
+    own merge base and diff to nothing). None when git cannot answer, and then no PASS stands. Callers
+    pass refs the workflow built itself, never a name a child reported. Renames are reported as delete +
+    add so a ledger file moved under recon/ still names its old path."""
     git = ["git", "-C", str(ROOT)]
     try:
         subprocess.run(git + ["fetch", "-q", "origin", ref], check=True, capture_output=True, timeout=300)
         head = subprocess.run(git + ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
                               check=True, capture_output=True, text=True, timeout=300).stdout.strip()
-        return head, _git_paths(f"{BASE_SHA}...{head}")
+        tip = _base_tip()
+        merged = subprocess.run(git + ["merge-base", "--is-ancestor", head, tip],
+                                check=False, capture_output=True, timeout=300).returncode
+        if merged not in (0, 1):
+            raise subprocess.SubprocessError(f"merge-base rc={merged}")
+        return head, _git_paths(f"{BASE_SHA if merged == 0 else tip}...{head}")
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -337,10 +347,11 @@ def pr_changed_paths(pr_url):
 
 
 def verifier_changed_paths(wave, passed):
-    """What the verifier itself changed on recon/wave-N. Its branch is diffed from the launch base, so
-    the PRs it merged are in it; a passed unit's evidence drops out only where the verifier's tree is
-    byte-identical to the gated PR head's, so a result.json it rewrote (or a head re-pushed after the
-    gate) stays and fails the wave. None when git cannot answer, or a passed batch has no gated head."""
+    """What the verifier itself changed on recon/wave-N. A passed unit's evidence drops out only where
+    the verifier's tree is byte-identical to the gated PR head's (it merged that head) or to the launch
+    base's (it did not touch the unit: auto_merge off), so a result.json it rewrote (or a head re-pushed
+    after the gate) stays and fails the wave. None when git cannot answer, or a passed batch has no
+    gated head."""
     got = ref_changed_paths(f"recon/wave-{wave}")
     if got is None or not all(isinstance(p.get("pr_head"), str) for p in passed):
         return None
@@ -349,7 +360,7 @@ def verifier_changed_paths(wave, passed):
     own = {p for p in paths if not p.startswith(tuple(d for ds in dirs.values() for d in ds))}
     try:
         for pr_head, ds in dirs.items():
-            own.update(_git_paths(pr_head, head, "--", *ds))
+            own.update(set(_git_paths(pr_head, head, "--", *ds)) & set(_git_paths(BASE_SHA, head, "--", *ds)))
     except (OSError, subprocess.SubprocessError):
         return None
     return sorted(own)
@@ -624,10 +635,16 @@ async def run_batch(batch, sem, breaker):
             out["failure_class"] = "missing_pr"
             out["one_line_summary"] = (
                 "PASS downgraded: no PR URL/branch reported; " + out["one_line_summary"])
-        # The ledger gate reads the PR's diff from git; the child's changed_paths can only add to it.
+        # The ledger gate reads the PR's diff from git; the child's changed_paths can only add to it. A
+        # replayed PASS keeps the head gated in the run being resumed: that run's verifier may have merged
+        # it since, and re-diffing it would attribute other accepted units to it.
         reported = out.get("changed_paths")
         usable = isinstance(reported, list) and all(isinstance(p, str) for p in reported)
-        gated = pr_changed_paths(out.get("pr_url"))
+        record = REPLAYED.get(batch["id"])
+        if isinstance(record, dict) and record.get("status") == "PASS" and isinstance(record.get("pr_head"), str):
+            gated = (record["pr_head"], [])
+        else:
+            gated = pr_changed_paths(out.get("pr_url"))
         observed = gated[1] if gated else None
         if gated:
             out["pr_head"] = gated[0]

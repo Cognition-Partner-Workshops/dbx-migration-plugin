@@ -496,7 +496,7 @@ def _launch_ns(tmp_path, fake_run):
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"fresh_doctor_report", "pr_changed_paths", "ref_changed_paths", "wave_base",
-                                      "launch_base", "verifier_changed_paths", "_git_paths"})
+                                      "launch_base", "verifier_changed_paths", "_git_paths", "_base_tip"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id == "PR_URL" for t in node.targets))]
     ns = {"json": json, "os": os, "re": re, "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
@@ -563,29 +563,45 @@ def test_fresh_doctor_report_never_reads_a_stale_report(tmp_path):
         ns["fresh_doctor_report"](_manifest())
 
 
-def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
-    calls = []
-
+def _git_fake(calls, head, merged, paths):
+    """git as the gate sees it: the PR head fetched into FETCH_HEAD, origin/main at 't'*40 (fresh fetch),
+    `merge-base --is-ancestor` answering whether the head is already in it, one diff."""
     def fake_run(cmd, **kw):
         calls.append(cmd)
         if cmd[3] == "fetch":
             return subprocess.CompletedProcess(cmd, 0)
         if cmd[3] == "rev-parse":
-            return subprocess.CompletedProcess(cmd, 0, stdout="c" * 40 + "\n")
-        return subprocess.CompletedProcess(cmd, 0, stdout="src/a.sql\n.migration/allowed_targets.json\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout=("t" * 40 if "origin/main^{commit}" in cmd else head) + "\n")
+        if cmd[3] == "merge-base":
+            return subprocess.CompletedProcess(cmd, 0 if merged else 1)
+        return subprocess.CompletedProcess(cmd, 0, stdout=paths)
+    return fake_run
 
-    ns = _launch_ns(tmp_path, fake_run)
+
+def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
+    calls = []
+    ns = _launch_ns(tmp_path, _git_fake(calls, "c" * 40, False, "src/a.sql\n.migration/allowed_targets.json\n"))
     # the gated head's sha comes back with the paths: the verifier's tree is later held to exactly it
     assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == (
         "c" * 40, ["src/a.sql", ".migration/allowed_targets.json"])
     # the host writes refs/pull/N/head; the child's branch name never reaches git
     assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "refs/pull/42/head"]
     assert calls[1][3:] == ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]
+    # the base is fetched now, not read from the launch snapshot: a child launched on a resume forked from
+    # a base the verifier had merged accepted units into, and those units are not its diff
+    assert calls[2][3:] == ["fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]
+    assert calls[3][3:] == ["rev-parse", "--verify", "origin/main^{commit}"]
+    assert calls[4][3:] == ["merge-base", "--is-ancestor", "c" * 40, "t" * 40]
     # --no-renames: a ledger file moved under an allowed recon/ path must still surface its old path.
-    # The diff is anchored at the base SHA snapshotted at launch, not at origin/main: a PR already
-    # merged into the base would otherwise be its own merge base and diff to nothing
-    assert calls[2][3:] == ["diff", "--name-only", "--no-renames", "b" * 40 + "..." + "c" * 40]
-    assert len(calls) == 3
+    # An unmerged head diffs from its own fork point on the base (three-dot against the fresh tip)
+    assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "t" * 40 + "..." + "c" * 40]
+    assert len(calls) == 6
+    calls.clear()
+    # a head the base already contains (the verifier merged it before the run stopped, or a child merged
+    # its own PR) would be its own merge base and diff to nothing: it is anchored at the launch base instead
+    ns = _launch_ns(tmp_path, _git_fake(calls, "c" * 40, True, "src/a.sql\n"))
+    assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == ("c" * 40, ["src/a.sql"])
+    assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "b" * 40 + "..." + "c" * 40]
     calls.clear()
     for url in ("https://github.com/other/repo/pull/42", "https://github.com/acme/dbx-target/pull/x",
                 "https://github.com/acme/dbx-target/pull/42/../../other/repo/pull/1", "", None, 42):
@@ -639,30 +655,44 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
 
 def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_it_merged(tmp_path):
     calls = []
+    # the verifier's tree per unit dir: u rewritten (differs from the gated head 1*40 and from the launch
+    # base b*40), v byte-identical to its gated head, w untouched (differs from the gated head it did not
+    # merge, auto_merge off, but equals the base)
+    trees = {("1" * 40, ".migration/recon/u/"): ".migration/recon/u/result.json\n",
+             ("b" * 40, ".migration/recon/u/"): ".migration/recon/u/result.json\n.migration/recon/u/rows.csv\n",
+             ("2" * 40, ".migration/recon/v/"): "", ("b" * 40, ".migration/recon/v/"): ".migration/recon/v/result.json\n",
+             ("3" * 40, ".migration/recon/w/"): ".migration/recon/w/result.json\n", ("b" * 40, ".migration/recon/w/"): ""}
 
     def fake_run(cmd, **kw):
         calls.append(cmd)
         if cmd[3] == "fetch":
             return subprocess.CompletedProcess(cmd, 0)
         if cmd[3] == "rev-parse":
-            return subprocess.CompletedProcess(cmd, 0, stdout="v" * 40 + "\n")
-        if "--" in cmd:  # the verifier tree against a gated PR head, restricted to that PR's unit evidence
-            return subprocess.CompletedProcess(cmd, 0, stdout=".migration/recon/u/result.json\n" if "1" * 40 in cmd else "")
+            return subprocess.CompletedProcess(cmd, 0, stdout=("t" * 40 if "origin/main^{commit}" in cmd else "v" * 40) + "\n")
+        if cmd[3] == "merge-base":
+            return subprocess.CompletedProcess(cmd, 1)
+        if "--" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout=trees[cmd[6], cmd[9]])
         return subprocess.CompletedProcess(cmd, 0, stdout=(
             ".migration/recon/wave-2/report.md\nsrc/loans.sql\n.migration/recon/u/result.json\n"
             ".migration/recon/u/rows.csv\n.migration/recon/v/result.json\n.migration/03_recon_tolerances.json\n"))
 
     ns = _launch_ns(tmp_path, fake_run)
-    passed = [{"batch": "b1", "units": ["u"], "pr_head": "1" * 40}, {"batch": "b2", "units": ["v"], "pr_head": "2" * 40}]
-    # merged evidence byte-identical to the gated PR head drops out; a rewritten result.json, the verifier's
-    # own report and anything else that reached the branch stay
+    passed = [{"batch": "b1", "units": ["u"], "pr_head": "1" * 40}, {"batch": "b2", "units": ["v"], "pr_head": "2" * 40},
+              {"batch": "b3", "units": ["w"], "pr_head": "3" * 40}]
+    # merged evidence byte-identical to the gated PR head drops out, so does evidence the verifier never
+    # touched (its tree equals the launch base: with auto_merge off it merges nothing); a rewritten
+    # result.json, the verifier's own report and anything else that reached the branch stay
     assert ns["verifier_changed_paths"](2, passed) == [
         ".migration/03_recon_tolerances.json", ".migration/recon/u/result.json", ".migration/recon/wave-2/report.md",
         "src/loans.sql"]
     assert calls[0][3:] == ["fetch", "-q", "origin", "recon/wave-2"]
-    assert calls[2][3:] == ["diff", "--name-only", "--no-renames", "b" * 40 + "..." + "v" * 40]
-    assert calls[3][3:] == ["diff", "--name-only", "--no-renames", "1" * 40, "v" * 40, "--", ".migration/recon/u/"]
-    assert calls[4][3:] == ["diff", "--name-only", "--no-renames", "2" * 40, "v" * 40, "--", ".migration/recon/v/"]
+    assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "t" * 40 + "..." + "v" * 40]
+    assert calls[6][3:] == ["diff", "--name-only", "--no-renames", "1" * 40, "v" * 40, "--", ".migration/recon/u/"]
+    assert calls[7][3:] == ["diff", "--name-only", "--no-renames", "b" * 40, "v" * 40, "--", ".migration/recon/u/"]
+    assert calls[8][3:] == ["diff", "--name-only", "--no-renames", "2" * 40, "v" * 40, "--", ".migration/recon/v/"]
+    assert calls[10][3:] == ["diff", "--name-only", "--no-renames", "3" * 40, "v" * 40, "--", ".migration/recon/w/"]
+    assert calls[11][3:] == ["diff", "--name-only", "--no-renames", "b" * 40, "v" * 40, "--", ".migration/recon/w/"]
     # a passed batch whose gated head is unknown, or a diff git cannot answer: unverifiable, no PASS stands
     assert ns["verifier_changed_paths"](2, [{"batch": "b1", "units": ["u"]}]) is None
 
@@ -687,6 +717,25 @@ def test_git_observed_ledger_changes_beat_a_clean_self_report():
     ns["pr_changed_paths"] = lambda pr_url: None
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and "git" in out["one_line_summary"]
+
+
+def test_a_replayed_pass_keeps_the_gate_it_passed_in_the_run_being_resumed():
+    """On a resume the finished child replays, but its PR has been merged by that run's verifier (or
+    forked after other accepted units were), so re-diffing it now would attribute their evidence to it.
+    The recorded record is the workflow's own ledger: its gated head stands, git is not asked again."""
+    ns = _batch_runtime()
+    ns["pr_changed_paths"] = lambda pr_url: pytest.fail("a replayed PASS must not be re-gated")
+    ns["REPLAYED"] = {"b": {"id": "b", "status": "PASS", "pr_head": "c" * 40}}
+    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
+    assert out["status"] == "PASS" and out["pr_head"] == "c" * 40
+    # a replayed FAIL, or a PASS recorded before any head was gated, is gated like a new result
+    for record in ({"id": "b", "status": "FAIL", "pr_head": "c" * 40}, {"id": "b", "status": "PASS"}, "PASS"):
+        ns["REPLAYED"] = {"b": record}
+        ns["pr_changed_paths"] = lambda pr_url: ("d" * 40, [".migration/03_recon_tolerances.json"])
+        out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
+        assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and out["pr_head"] == "d" * 40
+    src = WORKFLOW.read_text()
+    assert re.search(r'REPLAYED = \{\n    b\["id"\]: b for b in', src)
 
 
 @pytest.mark.parametrize("value", ["--upload-pack=touch /tmp/x", "-q", "main..x", "a b", "", 3, "^main", "m:n"])

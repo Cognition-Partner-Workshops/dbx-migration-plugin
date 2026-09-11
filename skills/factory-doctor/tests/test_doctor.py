@@ -612,19 +612,24 @@ class FakePrivConn:
     """A source seen through the doctor's privilege queries. `roles` are the principal's server or
     database-wide flags and role memberships, named as the query names them (sysadmin, db_owner,
     ALTER ANY DATABASE, CONTROL SERVER; rolsuper, pg_write_server_files for Postgres); `writable` maps a
-    table to the write privileges it holds; `absent` tables cannot be resolved. Indirection: `impersonate`
+    table to the write privileges it holds; `absent` tables do not exist, and answer like the engines do:
+    OBJECT_ID / to_regclass NULL, HAS_PERMS_BY_NAME 0 (not NULL), has_table_privilege / ::regclass an
+    UndefinedTable error. Indirection: `impersonate`
     lists principals the principal may IMPERSONATE, `execute` the procedures/functions it may EXECUTE,
     `set_role` maps a Postgres role it is a member of (directly or through `direct`, the roles it was granted
-    itself, when given) to the write it would gain via SET ROLE, `unusable` names memberships granted with
+    itself, when given) to the write it would gain via SET ROLE, `set_role_execute` to the functions that role
+    (and not the session) may EXECUTE, `unusable` names memberships granted with
     `SET FALSE, INHERIT FALSE` (Postgres 16: a path exists, but neither SET ROLE nor inheritance can use it);
     `columns` maps a table to {column: [privileges]} granted at column level only (invisible to the table-level query).
     Records every statement so a test can prove the check only ever asked questions."""
 
     def __init__(self, *, roles=(), writable=None, absent=(), read_only="on", impersonate=(), execute=(),
-                 set_role=None, columns=None, direct=None, unusable=()):
+                 set_role=None, columns=None, direct=None, unusable=(), set_role_execute=None):
         self.roles, self.writable, self.absent, self.read_only = set(roles), writable or {}, set(absent), read_only
         self.impersonate, self.execute_on, self.set_role = list(impersonate), list(execute), set_role or {}
-        self.columns, self.direct = columns or {}, list(self.set_role if direct is None else direct)
+        self.set_role_execute = set_role_execute or {}
+        self.columns = columns or {}
+        self.direct = list({**self.set_role, **self.set_role_execute} if direct is None else direct)
         self.unusable = set(unusable)
         self.statements: list[tuple[str, tuple]] = []
         self.closed = False
@@ -644,26 +649,33 @@ class FakePrivConn:
                           if p.startswith(kind.lower())]
         elif "sys.objects" in low:
             self._rows = [(p, "EXECUTE") for p in self.execute_on]
+        elif "object_id(?)" in low or "to_regclass(%s)" in low:
+            self._rows = [(None if args[0] in self.absent else f"oid of {args[0]}",)]
         elif "fn_my_permissions" in low or "has_column_privilege" in low:
+            if args[0] in self.absent and "::regclass" in low:
+                raise RuntimeError(f'relation "{args[0]}" does not exist')
             self._rows = [(c, p) for c, privs in self.columns.get(args[0], {}).items() for p in privs]
-        elif "has_perms_by_name" in low:
+        elif "has_perms_by_name" in low:  # an absent object answers 0 on every privilege, never NULL
             t = args[0]
-            self._rows = [(None,) * 4 if t in self.absent else
-                          tuple(int(p in self.writable.get(t, ())) for p in ("INSERT", "UPDATE", "DELETE", "ALTER"))]
+            self._rows = [tuple(int(p in self.writable.get(t, ())) for p in ("INSERT", "UPDATE", "DELETE", "ALTER"))]
         elif "rolsuper" in low and "pg_auth_members" not in low:
             names = re.findall(r"\b(rolsuper|rolcreaterole|rolcreatedb|rolbypassrls)\b|pg_has_role\(current_user, '(\w+)'", sql)
             self._rows = [tuple("".join(n) in self.roles for n in names)]
         elif "pg_auth_members" in low:  # direct memberships only
             self._rows = [(r,) for r in self.direct]
         elif "pg_has_role(current_user, oid," in low:  # transitive: every role reachable through memberships
-            reachable = {*self.direct, *self.set_role}
+            reachable = {*self.direct, *self.set_role, *self.set_role_execute}
             if "'usage, set'" in low:  # a 16+ server answers only for memberships that inherit or can SET ROLE
                 reachable -= self.unusable
             self._rows = [(r,) for r in sorted(reachable)]
+        elif "pg_proc" in low and len(args) == 2:  # (schemas, role): what SET ROLE <role> may EXECUTE
+            self._rows = [(f, "EXECUTE") for f in self.set_role_execute.get(args[1], ())]
         elif "pg_proc" in low:
             self._rows = [(f, "EXECUTE") for f in self.execute_on]
         elif "has_table_privilege" in low and len(args) == 4:  # (role, table, role, schema): the SET ROLE walk
             role, t = args[0], args[1]
+            if t in self.absent:
+                raise RuntimeError(f'relation "{t}" does not exist')
             self._rows = [(t in self.set_role.get(role, ()), False)]
         elif "has_table_privilege" in low:
             t = args[0]
@@ -773,10 +785,14 @@ def test_a_table_level_grant_is_not_repeated_per_column(monkeypatch):
     conn = FakePrivConn(writable={"raw.loans": ["UPDATE"]}, columns={"raw.loans": {"[a]": ["UPDATE"], "[b]": ["UPDATE"]}})
     c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
     assert c.status == "fail" and c.data["writable"] == {"raw.loans": ["UPDATE"]}
-    # an unresolved table is not asked about column by column either
+    # an unresolved table is not asked about at all: HAS_PERMS_BY_NAME answers 0 for it (a false "no write"),
+    # so existence is settled first, by OBJECT_ID, and the privilege queries run only for what resolved
     conn = FakePrivConn(absent=["raw.loans"])
-    doctor.check_source_principal(["raw.loans"], "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
-    assert not any("fn_my_permissions" in s for s, _ in conn.statements)
+    c = doctor.check_source_principal(["raw.loans", "raw.payments"], "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    assert c.status == "unverified" and c.data["unresolved"] == ["raw.loans"]
+    assert [a[0] for s, a in conn.statements if "OBJECT_ID(?)" in s] == [("raw.loans",), ("raw.payments",)]
+    asked = [a[0][0] for s, a in conn.statements if "HAS_PERMS_BY_NAME(?" in s or "fn_my_permissions" in s]
+    assert asked == ["raw.payments", "raw.payments"]
 
 
 def test_postgres_branches(monkeypatch):
@@ -792,7 +808,6 @@ def test_postgres_branches(monkeypatch):
     for kw, needle in (({"roles": ["rolsuper"]}, "rolsuper"),
                        ({"writable": {"public.loans": ["TRUNCATE"]}}, "public.loans: TRUNCATE"),
                        ({"writable": {"public.loans": ["CREATE"]}}, "public.loans: CREATE on schema"),
-                       ({"absent": ["public.loans"]}, "does not exist"),
                        # indirection: role attributes, file/program roles, function EXECUTE, SET ROLE to a writer
                        ({"roles": ["rolcreaterole"]}, "role rolcreaterole"),
                        ({"roles": ["rolcreatedb"]}, "role rolcreatedb"),
@@ -803,6 +818,9 @@ def test_postgres_branches(monkeypatch):
                        ({"set_role": {"loader": ["public.loans"]}}, "SET ROLE loader: public.loans write"),
                        # nested: granted only `etl`, which is itself a member of the writer `loader`
                        ({"set_role": {"loader": ["public.loans"]}, "direct": ["etl"]}, "SET ROLE loader: public.loans write"),
+                       # a SET-only role that may EXECUTE a definer function the session may not: a write path too
+                       ({"set_role_execute": {"loader": ["public.post_payment(integer)"]}},
+                        "SET ROLE loader: public.post_payment(integer) EXECUTE"),
                        ({"columns": {"public.loans": {"balance": ["INSERT", "UPDATE"]}}},
                         "public.loans: INSERT on column balance, UPDATE on column balance")):
         c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC",
@@ -814,6 +832,9 @@ def test_postgres_branches(monkeypatch):
     assert c.status == "ok", c.detail
     walk = [a[0] for s, a in conn.statements if s.startswith("SELECT has_table_privilege") and len(a[0]) == 4]
     assert walk == [("readers", "raw.loans", "readers", "raw"), ("readers", "raw.payments", "readers", "raw")]
+    # and about the in-scope functions it could EXECUTE after SET ROLE (the session's own EXECUTE misses them)
+    as_role_fn = [a[0] for s, a in conn.statements if "pg_proc" in s and "has_function_privilege(%s, p.oid" in s]
+    assert as_role_fn == [(["raw"], "readers")]
     # the membership list is transitive (pg_has_role), not one hop of pg_auth_members, and on 16+ asks for
     # memberships the session can use (USAGE = inherits, SET = SET ROLE-able); before 16 MEMBER implied both
     assert not any("pg_auth_members" in s for s, _ in conn.statements)
@@ -824,8 +845,8 @@ def test_postgres_branches(monkeypatch):
     c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC",
                                       connect=lambda dsn: FakePrivConn(set_role={"loader": ["public.loans"]}, unusable=["loader"]))
     assert c.status == "ok", c.detail
-    fn = [(s, a[0]) for s, a in conn.statements if "pg_proc" in s]
-    assert len(fn) == 1 and fn[0][1] == (["raw"],) and "prosecdef" in fn[0][0] and "has_function_privilege" in fn[0][0]
+    fn = [(s, a[0]) for s, a in conn.statements if "pg_proc" in s and "has_function_privilege(p.oid" in s]
+    assert len(fn) == 1 and fn[0][1] == (["raw"],) and "prosecdef" in fn[0][0]
     # column grants: one query per table over pg_attribute, excluding what the table-level grant already covers
     cols = [(s, a[0]) for s, a in conn.statements if "has_column_privilege" in s]
     assert [a for _, a in cols] == [("raw.loans",), ("raw.payments",)]
@@ -860,6 +881,20 @@ def test_unresolvable_object_and_untestable_families_are_unverified_never_ok(mon
     c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC",
                                       connect=lambda dsn: FakePrivConn(absent=["raw.payments"]))
     assert c.status == "unverified" and "raw.payments" in c.detail and c.data["unresolved"] == ["raw.payments"]
+    # Postgres: has_table_privilege / ::regclass raise for a relation that does not exist, so existence is
+    # settled by to_regclass first and no privilege query, table-level, column-level or as a role, names it;
+    # the other tables are still evaluated, and a write on one of them still fails the row
+    monkeypatch.setenv("LAKEBASE_SRC", "postgres://u:x@h/db")
+    conn = FakePrivConn(absent=["raw.payments"], set_role={"readers": []})
+    c = doctor.check_source_principal(TABLES, "postgres", "LAKEBASE_SRC", connect=lambda dsn: conn)
+    assert c.status == "unverified" and "raw.payments" in c.detail and c.data["unresolved"] == ["raw.payments"]
+    assert [a[0] for s, a in conn.statements if "to_regclass(%s)" in s] == [("raw.loans",), ("raw.payments",)]
+    named = [a[0] for s, a in conn.statements if "has_table_privilege" in s or "has_column_privilege" in s]
+    assert named and all("raw.payments" not in a for a in named)
+    assert ("raw.loans",) * 4 + ("raw",) in named and ("readers", "raw.loans", "readers", "raw") in named
+    conn = FakePrivConn(absent=["raw.payments"], writable={"raw.loans": ["INSERT"]})
+    c = doctor.check_source_principal(TABLES, "postgres", "LAKEBASE_SRC", connect=lambda dsn: conn)
+    assert c.status == "fail" and "raw.loans: INSERT" in c.detail and c.data["unresolved"] == ["raw.payments"]
     for family in ("teradata", "oracle", "redshift", "snowflake"):
         c = doctor.check_source_principal(TABLES, family, "LEGACY_ODBC", connect=lambda dsn: FakePrivConn())
         assert c.status == "unverified" and family in c.detail and "privilege query" in c.detail

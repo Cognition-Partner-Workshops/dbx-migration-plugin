@@ -554,7 +554,10 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
 # ------------------------------------------------------------------ source principal read-only
 
 # Per family: the admin flags and role memberships that make every table writable (directly or by
-# granting/impersonating one's way to it), the query answering them, the per-table query with one
+# granting/impersonating one's way to it), the query answering them, the per-table `exists` query
+# (NULL: the object does not exist or is not visible; the privilege functions would then answer 0
+# on SQL Server, a false "no write", or raise on Postgres, so nothing else is asked about it and the
+# row is `unverified`), the per-table query with one
 # boolean column per privilege in TABLE_PRIVILEGES, the per-table `columns` query returning
 # (column, privilege) rows for a write granted at column level (a table-level check does not see
 # it), and the `indirect` queries, each returning
@@ -564,7 +567,7 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
 # Postgres every role the session can reach through memberships (`pg_has_role` is transitive, so a
 # writer behind an intermediate role counts; on 16+ only memberships that inherit (USAGE) or can
 # SET ROLE (SET), since a `SET FALSE, INHERIT FALSE` grant confers nothing; before 16 MEMBER implied
-# both) that holds a write on an in-scope table or schema. Every value
+# both) that holds a write on an in-scope table or schema, or EXECUTE on such a function. Every value
 # is a question about the principal; nothing here can change the source. Families without an
 # entry are reported `unverified`, never `ok`.
 _SRV_ROLES = ("sysadmin", "securityadmin", "serveradmin", "dbcreator", "bulkadmin")
@@ -573,6 +576,9 @@ _SRV_PERMS = ("CONTROL SERVER", "ALTER ANY DATABASE", "IMPERSONATE ANY LOGIN", "
 _PG_ATTRS = ("rolsuper", "rolcreaterole", "rolcreatedb", "rolbypassrls")
 _PG_ROLES = ("pg_write_server_files", "pg_execute_server_program")
 _ROLE_FLAGS = {"sqlserver": _SRV_ROLES + _DB_ROLES + _SRV_PERMS, "postgres": _PG_ATTRS + _PG_ROLES}
+_PG_FUNCTIONS = ("SELECT n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', "
+                 "'EXECUTE' FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = ANY(%s) "
+                 "AND (p.prosecdef OR p.proacl IS NOT NULL) AND has_function_privilege({who}p.oid, 'EXECUTE') ORDER BY 1")
 _TABLE_PRIVILEGES = {"sqlserver": ("INSERT", "UPDATE", "DELETE", "ALTER"),
                      "postgres": ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "CREATE on schema")}
 _PRIVILEGE_QUERIES = {
@@ -580,6 +586,7 @@ _PRIVILEGE_QUERIES = {
         "roles": "SELECT " + ", ".join([*(f"IS_SRVROLEMEMBER('{r}')" for r in _SRV_ROLES),
                                           *(f"IS_MEMBER('{r}')" for r in _DB_ROLES),
                                           *(f"HAS_PERMS_BY_NAME(NULL, NULL, '{p}')" for p in _SRV_PERMS)]),
+        "exists": "SELECT OBJECT_ID(?)",
         "table": "SELECT " + ", ".join(f"HAS_PERMS_BY_NAME(?, 'OBJECT', '{p}')" for p in _TABLE_PRIVILEGES["sqlserver"]),
         "columns": ("SELECT QUOTENAME(subentity_name), permission_name FROM fn_my_permissions(?, 'OBJECT') "
                     "WHERE subentity_name <> '' AND permission_name = 'UPDATE' ORDER BY 1"),
@@ -596,15 +603,15 @@ _PRIVILEGE_QUERIES = {
     "postgres": {
         "roles": "SELECT " + ", ".join([*_PG_ATTRS, *(f"pg_has_role(current_user, '{r}', 'MEMBER')" for r in _PG_ROLES)])
                  + " FROM pg_roles WHERE rolname = current_user",
+        "exists": "SELECT to_regclass(%s)",
         "table": "SELECT " + ", ".join(f"has_table_privilege(%s, '{p}')" for p in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"))
                  + ", has_schema_privilege(%s, 'CREATE')",
         "columns": ("SELECT a.attname, p FROM pg_attribute a CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE']) AS p "
                     "WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped "
                     "AND has_column_privilege(a.attrelid, a.attnum, p) AND NOT has_table_privilege(a.attrelid, p) "
                     "ORDER BY 1, 2"),
-        "functions": "SELECT n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', "
-                     "'EXECUTE' FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = ANY(%s) "
-                     "AND (p.prosecdef OR p.proacl IS NOT NULL) AND has_function_privilege(p.oid, 'EXECUTE') ORDER BY 1",
+        "functions": _PG_FUNCTIONS.format(who=""),
+        "as_role_functions": _PG_FUNCTIONS.format(who="%s, "),
         "members": "SELECT rolname FROM pg_roles WHERE rolname <> current_user AND pg_has_role(current_user, oid, "
                    "CASE WHEN current_setting('server_version_num')::int >= 160000 THEN 'USAGE, SET' ELSE 'MEMBER' END) "
                    "ORDER BY 1",
@@ -627,8 +634,9 @@ def _table_params(family: str, table: str) -> tuple:
     return (table,) * 4 + (_schema(table),)
 
 
-def _indirect_writes(cur, q: dict, family: str, tables: list[str]) -> list[str]:
-    """`object: privilege` for every write path that is not a grant on an in-scope table."""
+def _indirect_writes(cur, q: dict, family: str, tables: list[str], resolved: list[str]) -> list[str]:
+    """`object: privilege` for every write path that is not a grant on an in-scope table. Only `resolved`
+    tables are named to the engine (Postgres raises for a relation that does not exist)."""
     found: list[str] = []
     for sql in q.get("indirect", ()):
         found += [f"{obj}: {priv}" for obj, priv in cur.execute(sql).fetchall()]
@@ -636,9 +644,11 @@ def _indirect_writes(cur, q: dict, family: str, tables: list[str]) -> list[str]:
         schemas = list(dict.fromkeys(_schema(t) for t in tables))
         found += [f"{obj}: {priv}" for obj, priv in cur.execute(q["functions"], (schemas,)).fetchall()]
         for (role,) in cur.execute(q["members"]).fetchall():  # what SET ROLE <role> would unlock
-            for t in tables:
+            for t in resolved:
                 write, create = cur.execute(q["as_role"], (role, t, role, _schema(t))).fetchall()[0]
                 found += [f"SET ROLE {role}: {t} {w}" for w, held in (("write", write), ("CREATE on schema", create)) if held]
+            found += [f"SET ROLE {role}: {obj} {priv}"
+                      for obj, priv in cur.execute(q["as_role_functions"], (schemas, role)).fetchall()]
     return found
 
 
@@ -676,16 +686,18 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
                 data["stats"] = f"connection opened with pyodbc readonly=True; {_ADVISORY}"
             flags = cur.execute(q["roles"]).fetchall()[0]
             data["roles"] = [name for name, held in zip(_ROLE_FLAGS[family], flags) if held]
+            resolved = []
             for t in tables:
-                row = cur.execute(q["table"], _table_params(family, t)).fetchall()[0]
-                if any(v is None for v in row):
+                if cur.execute(q["exists"], (t,)).fetchall()[0][0] is None:
                     data["unresolved"].append(t)
                     continue
+                resolved.append(t)
+                row = cur.execute(q["table"], _table_params(family, t)).fetchall()[0]
                 held = [p for p, v in zip(_TABLE_PRIVILEGES[family], row) if v]
                 held += [f"{p} on column {c}" for c, p in cur.execute(q["columns"], (t,)).fetchall() if p not in held]
                 if held:
                     data["writable"][t] = held
-            data["indirect"] = _indirect_writes(cur, q, family, tables)
+            data["indirect"] = _indirect_writes(cur, q, family, tables, resolved)
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
