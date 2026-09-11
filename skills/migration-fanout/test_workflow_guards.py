@@ -4,6 +4,7 @@ from collections import Counter
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +21,8 @@ def _functions():
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD"}
+                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
+                                                         "PARAM_VALUE"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
@@ -195,7 +197,7 @@ def _prompt_ns(manifest):
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES"}
                     for t in node.targets))]
-    ns = {"json": __import__("json"), "WAVE": 1, "REPO": "repo", "MANIFEST": manifest,
+    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "REPO": "repo", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled")}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     return ns
@@ -628,12 +630,30 @@ def test_validate_manifest_rejects_unit_ids_that_are_not_a_plain_recon_dir_name(
                                     {"family": "sqlserver", "secret": "X", "params": {"db": "loans && rm -rf ."}},
                                     {"family": "sqlserver", "secret": "X", "params": {"db=x --unit": "y"}},
                                     {"family": "sqlserver", "secret": "X", "params": {"db": "--role orchestrator"}},
+                                    {"family": "sqlserver", "secret": "X", "params": {"as_of": "2026-09-08 18:43:52 x"}},
+                                    {"family": "sqlserver", "secret": "X", "params": {"as_of": "2026-09-08  18:43"}},
+                                    {"family": "sqlserver", "secret": "X", "params": {"db": "a'b"}},
                                     {"family": "sqlserver", "secret": "X", "params": {"db": 7}}])
 def test_validate_manifest_checks_the_source_block(source):
     validate_manifest = _functions()["validate_manifest"]
     with pytest.raises(SystemExit, match="source"):
         validate_manifest(_manifest(source=source))
     validate_manifest(_manifest(source={"family": "postgres", "secret": "LAKEBASE_SRC", "params": {"db": "loan_servicing"}}))
+
+
+def test_param_values_follow_the_recon_contract_so_a_timestamp_is_accepted():
+    """A mapping's ${as_of} is typically 'YYYY-MM-DD hh:mm:ss'; the recon CLI accepts exactly that
+    (PARAM_RE), so the workflow must not reject it, and must quote it so the child's shell passes one value."""
+    sys.path.insert(0, str(WORKFLOW.parents[1] / "data-reconciliation" / "harness"))
+    from recon.cli import PARAM_RE
+    ns = _functions()
+    assert ns["PARAM_VALUE"].pattern == PARAM_RE.pattern.removeprefix("^").removesuffix("$")
+    source = {"family": "sqlserver", "secret": "X", "params": {"as_of": "2026-09-08 18:43:52", "db": "loans"}}
+    ns["validate_manifest"](_manifest(source=source))
+    text = _prompt_ns(_manifest(source=source))["child_prompt"](_manifest()["batches"][0])
+    flags = text[text.index("--source-family"):].split(" (the source")[0]
+    assert shlex.split(flags) == ["--source-family", "sqlserver", "--source-secret", "X",
+                                  "--param", "as_of=2026-09-08 18:43:52", "--param", "db=loans"]
 
 
 def test_child_prompt_passes_the_source_family_and_secret_to_the_doctor():

@@ -55,7 +55,8 @@ M2M_VARS = ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
 # The adapters the harness can actually run (its other families fail fast, so no driver is probed for them).
 DRIVERS = {"databricks": "databricks.sql", "sqlserver": "pyodbc", "postgres": "psycopg"}
-SOURCE_FAMILIES = ("oracle", "postgres", "redshift", "snowflake", "sqlserver", "teradata")
+# The families `dbx-recon run --family` accepts; only sqlserver and postgres have a privilege query.
+SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", "sqlserver", "teradata")
 # The committed wave contract: the guard and the harness read the working copy, so a working copy
 # that differs from HEAD is a contract nobody reviewed.
 LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
@@ -550,7 +551,9 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
 
 # Per family: the admin flags and role memberships that make every table writable (directly or by
 # granting/impersonating one's way to it), the query answering them, the per-table query with one
-# boolean column per privilege in TABLE_PRIVILEGES, and the `indirect` queries, each returning
+# boolean column per privilege in TABLE_PRIVILEGES, the per-table `columns` query returning
+# (column, privilege) rows for a write granted at column level (a table-level check does not see
+# it), and the `indirect` queries, each returning
 # (object, privilege) rows for a write path that bypasses table grants: IMPERSONATE on a visible
 # login/user, EXECUTE on any procedure in the source database (every proc is assumed to write),
 # EXECUTE on a SECURITY DEFINER or explicitly-granted function in an in-scope schema. Every value
@@ -570,6 +573,8 @@ _PRIVILEGE_QUERIES = {
                                           *(f"IS_MEMBER('{r}')" for r in _DB_ROLES),
                                           *(f"HAS_PERMS_BY_NAME(NULL, NULL, '{p}')" for p in _SRV_PERMS)]),
         "table": "SELECT " + ", ".join(f"HAS_PERMS_BY_NAME(?, 'OBJECT', '{p}')" for p in _TABLE_PRIVILEGES["sqlserver"]),
+        "columns": ("SELECT QUOTENAME(subentity_name), permission_name FROM fn_my_permissions(?, 'OBJECT') "
+                    "WHERE subentity_name <> '' AND permission_name = 'UPDATE' ORDER BY 1"),
         "indirect": (
             ("SELECT 'LOGIN ' + name, 'IMPERSONATE' FROM sys.server_principals WHERE type IN ('S', 'U', 'C', 'K') "
              "AND name <> SUSER_SNAME() AND HAS_PERMS_BY_NAME(name, 'LOGIN', 'IMPERSONATE') = 1"),
@@ -585,6 +590,10 @@ _PRIVILEGE_QUERIES = {
                  + " FROM pg_roles WHERE rolname = current_user",
         "table": "SELECT " + ", ".join(f"has_table_privilege(%s, '{p}')" for p in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"))
                  + ", has_schema_privilege(%s, 'CREATE')",
+        "columns": ("SELECT a.attname, p FROM pg_attribute a CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE']) AS p "
+                    "WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped "
+                    "AND has_column_privilege(a.attrelid, a.attnum, p) AND NOT has_table_privilege(a.attrelid, p) "
+                    "ORDER BY 1, 2"),
         "functions": "SELECT n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', "
                      "'EXECUTE' FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = ANY(%s) "
                      "AND (p.prosecdef OR p.proacl IS NOT NULL) AND has_function_privilege(p.oid, 'EXECUTE') ORDER BY 1",
@@ -627,8 +636,8 @@ def _indirect_writes(cur, q: dict, family: str, tables: list[str]) -> list[str]:
 def check_source_principal(tables: list[str], family: str, source_secret: str | None, connect=None) -> Check:
     """The principal behind --source-secret must not be able to write any in-scope source object,
     directly or through indirection: no admin role or server permission, no INSERT/UPDATE/DELETE/
-    ALTER (TRUNCATE, schema CREATE on Postgres) on any table the resolved mappings read, no
-    IMPERSONATE, no EXECUTE on a procedure (or SECURITY DEFINER / explicitly-granted function) and
+    ALTER (TRUNCATE, schema CREATE on Postgres) on any table the resolved mappings read, at table
+    or column level, no IMPERSONATE, no EXECUTE on a procedure (or SECURITY DEFINER / explicitly-granted function) and
     no SET ROLE-able membership that would unlock a write. This is the control the guard's
     docstring defers to for clients the hook cannot read into; `readonly=True` on the connection
     is advisory and is reported as such in `stats`. A failure names object and privilege, never
@@ -662,7 +671,10 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
                 row = cur.execute(q["table"], _table_params(family, t)).fetchall()[0]
                 if any(v is None for v in row):
                     data["unresolved"].append(t)
-                elif held := [p for p, v in zip(_TABLE_PRIVILEGES[family], row) if v]:
+                    continue
+                held = [p for p, v in zip(_TABLE_PRIVILEGES[family], row) if v]
+                held += [f"{p} on column {c}" for c, p in cur.execute(q["columns"], (t,)).fetchall() if p not in held]
+                if held:
                     data["writable"][t] = held
             data["indirect"] = _indirect_writes(cur, q, family, tables)
         finally:
@@ -678,7 +690,7 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
     if data["unresolved"]:
         return Check(cid, "unverified", f"{family}: privileges could not be evaluated for {data['unresolved']} (object "
                      "not found or not visible to this principal); nothing is proven about them", data)
-    return Check(cid, "ok", f"{family}: no admin role, no write privilege on {len(tables)} in-scope table(s), no "
+    return Check(cid, "ok", f"{family}: no admin role, no write privilege on {len(tables)} in-scope table(s) or their columns, no "
                  f"IMPERSONATE/EXECUTE/SET ROLE path to one; {data['stats']}", data)
 
 

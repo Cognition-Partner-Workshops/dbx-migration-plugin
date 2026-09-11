@@ -614,13 +614,15 @@ class FakePrivConn:
     ALTER ANY DATABASE, CONTROL SERVER; rolsuper, pg_write_server_files for Postgres); `writable` maps a
     table to the write privileges it holds; `absent` tables cannot be resolved. Indirection: `impersonate`
     lists principals the principal may IMPERSONATE, `execute` the procedures/functions it may EXECUTE,
-    `set_role` maps a Postgres role it is a member of to the write it would gain via SET ROLE.
+    `set_role` maps a Postgres role it is a member of to the write it would gain via SET ROLE; `columns` maps a
+    table to {column: [privileges]} granted at column level only (invisible to the table-level query).
     Records every statement so a test can prove the check only ever asked questions."""
 
     def __init__(self, *, roles=(), writable=None, absent=(), read_only="on", impersonate=(), execute=(),
-                 set_role=None):
+                 set_role=None, columns=None):
         self.roles, self.writable, self.absent, self.read_only = set(roles), writable or {}, set(absent), read_only
         self.impersonate, self.execute_on, self.set_role = list(impersonate), list(execute), set_role or {}
+        self.columns = columns or {}
         self.statements: list[tuple[str, tuple]] = []
         self.closed = False
 
@@ -639,6 +641,8 @@ class FakePrivConn:
                           if p.startswith(kind.lower())]
         elif "sys.objects" in low:
             self._rows = [(p, "EXECUTE") for p in self.execute_on]
+        elif "fn_my_permissions" in low or "has_column_privilege" in low:
+            self._rows = [(c, p) for c, privs in self.columns.get(args[0], {}).items() for p in privs]
         elif "has_perms_by_name" in low:
             t = args[0]
             self._rows = [(None,) * 4 if t in self.absent else
@@ -692,6 +696,9 @@ def test_sqlserver_select_only_principal_is_ok_and_the_row_says_readonly_is_advi
     perms = [(s, a) for s, a in conn.statements if "HAS_PERMS_BY_NAME(?" in s]
     assert [a[0][0] for _, a in perms] == TABLES
     assert all(p in perms[0][0] for p in ("'INSERT'", "'UPDATE'", "'DELETE'", "'ALTER'"))
+    # and one column-grant query per table: a column-level UPDATE is not a table-level permission
+    cols = [(s, a) for s, a in conn.statements if "fn_my_permissions(?, 'OBJECT')" in s]
+    assert [a[0] for _, a in cols] == [(t,) for t in TABLES] and "subentity_name <> ''" in cols[0][0]
     assert any("IS_SRVROLEMEMBER('sysadmin')" in s and "IS_MEMBER('db_owner')" in s
                and "HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER ANY DATABASE')" in s for s, _ in conn.statements)
     assert c.data["indirect"] == []
@@ -741,6 +748,7 @@ def test_many_executable_procs_are_counted_not_dumped(monkeypatch):
     ({"impersonate": ["login etl_admin"]}, "LOGIN etl_admin: IMPERSONATE"),
     ({"impersonate": ["user dbo"]}, "USER dbo: IMPERSONATE"),
     ({"execute": ["[raw].[usp_post_payment]"]}, "[raw].[usp_post_payment]: EXECUTE"),
+    ({"columns": {"raw.loans": {"[balance]": ["UPDATE"]}}}, "raw.loans: UPDATE on column [balance]"),
 ])
 def test_sqlserver_principal_that_can_write_in_scope_fails_naming_object_and_privilege(monkeypatch, kw, needle):
     monkeypatch.setenv("LEGACY_ODBC", "Driver=x;PWD=never-printed")
@@ -751,6 +759,18 @@ def test_sqlserver_principal_that_can_write_in_scope_fails_naming_object_and_pri
     assert _asked_only_questions(conn)
 
 
+def test_a_table_level_grant_is_not_repeated_per_column(monkeypatch):
+    """fn_my_permissions lists every column under a table-level UPDATE; the row names the table once."""
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    conn = FakePrivConn(writable={"raw.loans": ["UPDATE"]}, columns={"raw.loans": {"[a]": ["UPDATE"], "[b]": ["UPDATE"]}})
+    c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    assert c.status == "fail" and c.data["writable"] == {"raw.loans": ["UPDATE"]}
+    # an unresolved table is not asked about column by column either
+    conn = FakePrivConn(absent=["raw.loans"])
+    doctor.check_source_principal(["raw.loans"], "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    assert not any("fn_my_permissions" in s for s, _ in conn.statements)
+
+
 def test_postgres_branches(monkeypatch):
     monkeypatch.setenv("LAKEBASE_SRC", "postgres://u:never-printed@h/db")
     conn = FakePrivConn()
@@ -758,7 +778,7 @@ def test_postgres_branches(monkeypatch):
     assert c.status == "ok", c.detail
     assert "transaction_read_only=on" in c.data["stats"] and "advisory" in c.data["stats"]
     assert "never-printed" not in json.dumps(asdict(c)) and _asked_only_questions(conn)
-    priv = [(s, a) for s, a in conn.statements if "has_table_privilege" in s]
+    priv = [(s, a) for s, a in conn.statements if s.startswith("SELECT has_table_privilege")]
     assert len(priv) == 1 and priv[0][1][0] == ("public.loans",) * 4 + ("public",)
     assert all(p in priv[0][0] for p in ("'INSERT'", "'UPDATE'", "'DELETE'", "'TRUNCATE'", "has_schema_privilege(%s, 'CREATE')"))
     for kw, needle in (({"roles": ["rolsuper"]}, "rolsuper"),
@@ -772,7 +792,9 @@ def test_postgres_branches(monkeypatch):
                        ({"roles": ["pg_write_server_files"]}, "role pg_write_server_files"),
                        ({"roles": ["pg_execute_server_program"]}, "role pg_execute_server_program"),
                        ({"execute": ["public.post_payment(integer)"]}, "public.post_payment(integer): EXECUTE"),
-                       ({"set_role": {"loader": ["public.loans"]}}, "SET ROLE loader: public.loans write")):
+                       ({"set_role": {"loader": ["public.loans"]}}, "SET ROLE loader: public.loans write"),
+                       ({"columns": {"public.loans": {"balance": ["INSERT", "UPDATE"]}}},
+                        "public.loans: INSERT on column balance, UPDATE on column balance")):
         c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC",
                                           connect=lambda dsn, kw=kw: FakePrivConn(**kw))
         assert c.status == "fail" and needle in c.detail, (kw, c.detail)
@@ -780,10 +802,14 @@ def test_postgres_branches(monkeypatch):
     conn = FakePrivConn(set_role={"readers": []})
     c = doctor.check_source_principal(["raw.loans", "raw.payments"], "postgres", "LAKEBASE_SRC", connect=lambda dsn: conn)
     assert c.status == "ok", c.detail
-    walk = [a[0] for s, a in conn.statements if "has_table_privilege" in s and len(a[0]) == 4]
+    walk = [a[0] for s, a in conn.statements if s.startswith("SELECT has_table_privilege") and len(a[0]) == 4]
     assert walk == [("readers", "raw.loans", "readers", "raw"), ("readers", "raw.payments", "readers", "raw")]
     fn = [(s, a[0]) for s, a in conn.statements if "pg_proc" in s]
     assert len(fn) == 1 and fn[0][1] == (["raw"],) and "prosecdef" in fn[0][0] and "has_function_privilege" in fn[0][0]
+    # column grants: one query per table over pg_attribute, excluding what the table-level grant already covers
+    cols = [(s, a[0]) for s, a in conn.statements if "has_column_privilege" in s]
+    assert [a for _, a in cols] == [("raw.loans",), ("raw.payments",)]
+    assert "pg_attribute" in cols[0][0] and "NOT has_table_privilege" in cols[0][0] and "attisdropped" in cols[0][0]
     assert any("pg_has_role(current_user, 'pg_write_server_files', 'MEMBER')" in s and "rolbypassrls" in s
                for s, _ in conn.statements)
 
@@ -877,9 +903,26 @@ def test_cli_source_family_choices_and_help(tmp_path):
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--help"], capture_output=True, text=True, check=True)
     assert "--source-family" in r.stdout and "--expect-catalogs" in r.stdout and "blocked:<nonce>" in r.stdout
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(make_workspace(tmp_path)),
-                        "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--source-family", "databricks"],
+                        "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--source-family", "mysql"],
                        capture_output=True, text=True, check=False)
     assert r.returncode == 2 and "--source-family" in r.stderr
+
+
+def test_source_families_are_the_harness_families_and_databricks_is_unverified(tmp_path, monkeypatch):
+    """The doctor accepts exactly the families `dbx-recon run --family` accepts (a Databricks-to-Databricks
+    unit is one); a family without a tested privilege query is `unverified` and blocks, never `ok`."""
+    cli = (PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness" / "recon" / "cli.py").read_text()
+    families = re.search(r"^SOURCE_FAMILIES = \((.*)\)$", cli, re.MULTILINE).group(1)
+    assert set(doctor.SOURCE_FAMILIES) == set(re.findall(r'"(\w+)"', families)) and "databricks" in doctor.SOURCE_FAMILIES
+    monkeypatch.setenv("SRC_DBX", "token=never-printed")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "databricks" in c.detail and "never-printed" not in json.dumps(asdict(c))
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_secret="SRC_DBX",
+                        source_family="databricks")
+    assert by_id(report)["source_principal_read_only"]["status"] == "unverified"
+    assert "source_principal_read_only=unverified" in report["blocking"] and report["ready"] is False
 
 
 # ------------------------------------------------------------------ ledger integrity rows (A2c)

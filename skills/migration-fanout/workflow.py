@@ -58,6 +58,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections import Counter
@@ -137,6 +138,9 @@ UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
 # Manifest values that reach a command line (git refs here, the children's doctor flags): one plain
 # word, so nothing in them is ever an option, a range or a shell operator.
 WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+# A source.params value: the one literal recon.cli.PARAM_RE accepts (number, identifier, date, or
+# date + time, so one space at most), shell-quoted wherever it is rendered into a command line.
+PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
 # A PR of this repo, as the host names it; its head is refs/pull/N/head, which only the host writes.
 PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
 
@@ -181,10 +185,12 @@ def validate_manifest(m, doctor=None):
     src = m.get("source")
     if src is not None and (not isinstance(src, dict) or not isinstance(src.get("params", {}), dict)
                             or not all(isinstance(v, str) and WORD.fullmatch(v) for v in
-                                       (src.get("family"), src.get("secret"), *src.get("params", {}).keys(),
-                                        *src.get("params", {}).values()))):
-        raise SystemExit("manifest 'source' must be {family, secret (env var NAME of the DSN), params?}, every value "
-                         "one plain word (letters, digits, _ . / -): they become the doctor's command line")
+                                       (src.get("family"), src.get("secret"), *src.get("params", {}).keys()))
+                            or not all(isinstance(v, str) and PARAM_VALUE.fullmatch(v)
+                                       for v in src.get("params", {}).values())):
+        raise SystemExit("manifest 'source' must be {family, secret (env var NAME of the DSN), params?}: family, secret "
+                         "and param names one plain word (letters, digits, _ . / -), param values what dbx-recon run "
+                         "--param accepts (a number, identifier, date or date + time); they become the doctor's command line")
     if "verify_depth" in m and m["verify_depth"] not in VERIFY_DEPTHS:
         raise SystemExit(f"manifest 'verify_depth' must be one of {VERIFY_DEPTHS}")
     for b in m["batches"]:
@@ -459,7 +465,7 @@ def capability_block(units):
     caps, src = MANIFEST["capabilities"], MANIFEST.get("source") or {}
     unit_flags = " ".join(f"--unit {u}" for u in units)
     source_flags = " ".join([f"--source-family {src['family']} --source-secret {src['secret']}"]
-                            + [f"--param {k}={v}" for k, v in src.get("params", {}).items()]) if src else ""
+                            + [f"--param {shlex.quote(f'{k}={v}')}" for k, v in src.get("params", {}).items()]) if src else ""
     return (
         "CAPABILITY CONTRACT (from the orchestrator's factory-doctor run): "
         f"{json.dumps(caps, sort_keys=True)}\n"
