@@ -825,6 +825,41 @@ def test_a_replayed_pass_keeps_the_gate_it_passed_in_the_run_being_resumed():
     assert re.search(r'REPLAYED = \{\n    b\["id"\]: b for b in', src)
 
 
+def test_a_replayed_pass_that_fails_the_gate_now_is_a_new_failure_the_breaker_counts():
+    """A replayed failure was counted by the run being resumed and is not counted again; a replayed PASS
+    whose PR no longer stands (gained a ledger edit, or cannot be verified) is a failure that run never
+    saw, so it counts, or three such PRs would never halt the wave."""
+    ns = _batch_runtime()
+    sha = ns["prompt_sha"](ns["child_prompt"](dict(BATCH)))
+    passed = {"id": "b", "status": "PASS", "pr_head": "c" * 40, "pr_url": "https://example/pr/1", "prompt_sha": sha}
+
+    def run(record, gate, report):
+        ns["REPLAYED"] = {"b": record}
+        ns["replay_gate"] = lambda record, pr_url: gate
+        ns["pr_changed_paths"] = lambda pr_url: gate
+        breaker = ns["Breaker"](3)
+
+        async def agent(prompt, **kwargs):
+            return dict(report)
+
+        ns["agent"] = agent
+        out = asyncio.run(ns["run_batch"](dict(BATCH), asyncio.Semaphore(1), breaker))
+        return out, dict(breaker.classes)
+
+    out, counted = run(passed, ("e" * 40, [".migration/allowed_targets.json"]), _pass(changed_paths=["src/a.sql"]))
+    assert out["failure_class"] == "ledger_tampered" and counted == {"ledger_tampered": 1}
+    out, counted = run(passed, None, _pass(changed_paths=["src/a.sql"]))
+    assert out["failure_class"] == "ledger_tampered" and counted == {"ledger_tampered": 1}
+    # the PR still stands: PASS, nothing counted
+    out, counted = run(passed, ("c" * 40, []), _pass(changed_paths=["src/a.sql"]))
+    assert out["status"] == "PASS" and counted == {}
+    # a replayed FAIL is the failure the resumed run already counted
+    failed = {**passed, "status": "FAIL", "failure_class": "recon_fail"}
+    out, counted = run(failed, ("c" * 40, []), {"status": "FAIL", "recon_verdict": "FAIL", "failure_class": "recon_fail",
+                                                 "pr_url": "https://example/pr/1", "one_line_summary": "replayed"})
+    assert out["status"] == "FAIL" and counted == {}
+
+
 @pytest.mark.parametrize("value", ["--upload-pack=touch /tmp/x", "-q", "main..x", "a b", "", 3, "^main", "m:n"])
 def test_validate_manifest_rejects_base_branch_and_wave_values_git_could_misread(value):
     validate_manifest = _functions()["validate_manifest"]

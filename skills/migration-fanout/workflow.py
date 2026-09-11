@@ -689,7 +689,8 @@ async def run_batch(batch, sem, breaker):
                 "PASS downgraded: changed_paths "
                 + ("not reported" if not usable else "not verifiable from git (not a PR of this repo, or its fetch or diff failed)")
                 + ", ledger integrity unverified; " + out["one_line_summary"])
-        if out["status"] != "PASS" and batch["id"] not in REPLAYED:
+        # a replayed failure was counted by the run being resumed; a replayed PASS failing the gate now was not
+        if out["status"] != "PASS" and (record is None or (isinstance(record, dict) and record.get("status") == "PASS")):
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
             f"{out['one_line_summary']}")
