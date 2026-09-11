@@ -33,7 +33,8 @@ def digest(value: Any) -> Decimal | None:
     if isinstance(value, dt.datetime):
         if value.tzinfo is not None:
             value = value.astimezone(dt.timezone.utc).replace(tzinfo=None)
-        return Decimal(int((value - _EPOCH).total_seconds() * 1_000_000))
+        delta = value - _EPOCH  # integer arithmetic: total_seconds() is a float and rounds past ~2255
+        return Decimal((delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds)
     if isinstance(value, dt.date):
         return Decimal((value - _EPOCH.date()).days * 86_400_000_000)
     return None

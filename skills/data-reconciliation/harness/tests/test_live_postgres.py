@@ -13,6 +13,7 @@ from recon.adapters import (
     TargetIdentityError,
 )
 from recon.config import ConfigError
+from recon.fingerprint import moments
 from recon.transactional import _applied_predicate, _newer_predicate
 from recon.watermarks import literal
 
@@ -86,6 +87,25 @@ def test_range_fingerprints_bind_through_psycopg(schema, monkeypatch):
     fps = target.range_fingerprints("t", ["id"], ["integer"], None, None, [(None, (1,)), ((1,), None)])
     assert [(n, k[0][0]) for n, k, _ in fps] == [(1, 1), (1, 2)]   # boundary key 1 lands once
     assert [k[0][1] for _, k, _ in fps] == [1, 4]        # 1^2 and 2^2
+
+
+def test_engine_digests_are_the_ones_the_fakes_compute(schema, monkeypatch):
+    # the SQL rendering of recon.fingerprint and its Python evaluation must agree to the
+    # microsecond, out to the SCD open-row sentinel, or a fake-backed test proves nothing
+    dsn = os.environ[DSN_VAR]
+    rows = [(1, dt.datetime(2026, 9, 8, 18, 43, 52, 164112)),  # noqa: DTZ001
+            (2, dt.datetime(9999, 12, 31, 23, 59, 59, 999999)),  # noqa: DTZ001
+            (2**62, None)]
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE TABLE {schema}.f (id BIGINT PRIMARY KEY, ts TIMESTAMP, tz TIMESTAMPTZ)")
+        for k, ts in rows:
+            conn.execute(f"INSERT INTO {schema}.f VALUES (%s, %s, %s AT TIME ZONE 'UTC')", (k, ts, ts))
+    monkeypatch.setenv("RECON_TEST_TARGET", dsn)
+    target = LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), schema)
+    expected = (3, (moments(k for k, _ in rows),), (*moments(ts for _, ts in rows), 1))
+    for wm in ("ts", "tz"):
+        [got] = target.range_fingerprints("f", ["id"], ["integer"], wm, "datetime", [(None, None)])
+        assert got == expected, wm
 
 
 def test_numeric_keys_beyond_six_decimals_are_never_collapsed_into_one_digest(schema, monkeypatch):

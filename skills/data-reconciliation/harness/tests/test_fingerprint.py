@@ -23,6 +23,8 @@ def test_digest_is_the_whole_number_the_sql_casts_to():
     assert digest(dt.datetime(1970, 1, 1, 0, 0, 1)) == Decimal(1_000_000)  # noqa: DTZ001
     assert digest(dt.date(1970, 1, 2)) == Decimal(86_400_000_000)
     assert digest(True) is digest(None) is digest("7") is None
+    sentinel = dt.datetime(9999, 12, 31, 23, 59, 59, 999_999)  # noqa: DTZ001  SCD open-row marker
+    assert digest(sentinel) == Decimal(253_402_300_799_999_999)  # exact, not float-rounded
 
 
 def test_moments_are_the_exact_sum_and_the_sum_of_squared_residues():
