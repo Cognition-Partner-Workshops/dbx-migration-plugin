@@ -17,7 +17,7 @@ The repo root *is* the plugin, so the repo itself is the installable unit.
 ```
 .devin-plugin/plugin.json   plugin manifest (name, version, requiredPlugins -> official databricks plugin)
 AGENTS.md                   always-on guardrails
-hooks.json, hooks/          PreToolUse write-scope guard (hard block) + PostToolUse auth/scope hint
+hooks.json, hooks/          PreToolUse write-scope guard (fail closed, see below) + PostToolUse auth/scope hint
 skills/                     one directory per skill
 skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills (child-session brief)
 skills/lakebridge/          analyzer/transpiler invocation, dialect flags, seeded coverage table
@@ -72,6 +72,40 @@ constraint/index/sequence parity on top of the set-based tiers. Deletes must be 
 the run unless the mapping declares `delete_evidence` (SQL Server CDC first) that lets the
 harness tell an in-flight delete from a stray target row; the factory verifies CDC is on and
 readable but never enables it.
+
+## Write-scope guard (`hooks/dbx_guard.py`)
+
+The PreToolUse hook recognises the client a shell command runs and lets only known read shapes
+through; everything else it recognises blocks. It is a no-op outside a workspace (no
+`.migration/allowed_targets.json` up the tree) and reads its policy from that file:
+
+```json
+{
+  "catalogs": ["migration_cat"],
+  "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp"],
+  "guard_mode": "block",
+  "target_hosts": ["fixture-host", "LAKEBASE_MIGRATION_DSN"],
+  "bundle_targets": ["migration", "dev"],
+  "forbidden_bundle_targets": ["prod", "production"]
+}
+```
+
+| key | required | meaning |
+|---|---|---|
+| `catalogs` | yes | Unity Catalog catalogs a Databricks write (`sql execute`, `spark-sql`, `tables delete mig_cat.s.t`, `fs rm dbfs:/Volumes/mig_cat/...`, `api delete .../tables/mig_cat.s.t`) may target. Also read by `dbx-recon`. |
+| `legacy_sources` | no | secret names, hosts, DSNs and profiles of the legacy estate. A generic SQL client whose command mentions one, and every legacy-only client (`bteq`, `sqlplus`, `snowsql`, ...), is held to read shapes only; loaders always block. |
+| `guard_mode` | no | `block` (default) or `warn` (approve with the reason attached). |
+| `target_hosts` | no | hosts / DSN names a generic SQL client (`psql`, `sqlcmd`, `isql`, `mysql`, ...) may run a non-read statement against. Must be literals in the command. **Missing or empty: every generic-client write blocks.** |
+| `bundle_targets` | no | targets `databricks bundle deploy\|run\|destroy` and `dbt run\|build\|seed` may use with a literal `-t/--target`. **Missing or empty: every deploy blocks.** |
+| `forbidden_bundle_targets` | no | extra denylist on top of `bundle_targets`; default `["prod", "production"]`. |
+
+Always blocked regardless of config: `databricks` commands outside the read allowlist whose
+securable is not in `catalogs`, non-GET or bodied REST calls to a Databricks host, identity swaps
+(`auth login`, `--profile`, `DATABRICKS_TOKEN=`... around a Databricks client), writes under
+`.migration/` except `recon/` and `waves/`, and anything the guard cannot read (unreadable
+scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`). Python/JDBC/Spark programs are
+only cheaply inspected for literal SQL; the factory-doctor's read-only-principal row is the control
+for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row there to pin a new shape.
 
 The official `databricks` plugin is installed automatically as a dependency (tracking its default
 branch). To pin it, add `"ref"` or `"sha"` to the `requiredPlugins` entry in

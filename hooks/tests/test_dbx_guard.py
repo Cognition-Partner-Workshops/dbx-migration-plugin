@@ -15,6 +15,8 @@ import dbx_post_hint as h  # noqa: E402
 CFG = g.GuardConfig.from_dict({
     "catalogs": ["mig_cat"],
     "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp.example", "legacy-prod"],
+    "target_hosts": ["localhost"],
+    "bundle_targets": ["migration"],
 })
 
 
