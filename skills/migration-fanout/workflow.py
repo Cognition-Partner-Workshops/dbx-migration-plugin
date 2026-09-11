@@ -143,6 +143,8 @@ UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
 # Manifest values that reach a command line (git refs here, the children's doctor flags): one plain
 # word, so nothing in them is ever an option, a range or a shell operator.
 WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+# source.secret is the NAME of the environment variable holding the DSN, as a POSIX shell can set it.
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A source.params value: the one literal recon.cli.PARAM_RE accepts (number, identifier, date, or
 # date + time, so one space at most), shell-quoted wherever it is rendered into a command line.
 PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
@@ -172,38 +174,35 @@ def validate_manifest(m, doctor=None):
         raise SystemExit(f"batch ids must be unique and non-empty: {dupes}")
     owners = {}
     for b in m["batches"]:
-        for u in b.get("units") or []:
-            owners.setdefault(u, []).append(b["id"])
-    shared = {u: bs for u, bs in owners.items() if len(bs) > 1}
-    if shared:
-        raise SystemExit(f"a unit id belongs to one batch (its child alone writes .migration/recon/<unit_id>/): {shared}")
-    for b in m["batches"]:
         for key in ("units", "write_targets", "brief"):
             if not b.get(key):
                 raise SystemExit(f"batch {b['id']} is missing '{key}' (a child with no brief or "
                                  "no declared write targets cannot be launched safely)")
+        if "verify_depth" in b and b["verify_depth"] not in VERIFY_DEPTHS:
+            raise SystemExit(f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
         bad = [u for u in b["units"] if not isinstance(u, str) or not UNIT_ID.fullmatch(u)]
         if bad:
-            raise SystemExit(f"batch {b['id']} unit id(s) {bad!r} are not a plain directory name "
-                             "(letters, digits, _ . -, not wave-*): the id names the only "
-                             ".migration/recon/<unit_id>/ its child may write")
+            raise SystemExit(f"batch {b['id']} unit id(s) {bad!r} are not a plain directory name (letters, digits, "
+                             "_ . -, not wave-*): the id names the only .migration/recon/<unit_id>/ its child may write")
+        for u in b["units"]:
+            owners.setdefault(u, []).append(b["id"])
+    shared = {u: bs for u, bs in owners.items() if len(bs) > 1}
+    if shared:
+        raise SystemExit(f"a unit id belongs to one batch (its child alone writes .migration/recon/<unit_id>/): {shared}")
     src = m.get("source")
     if src is not None and (not isinstance(src, dict) or not isinstance(src.get("params", {}), dict)
                             or not all(isinstance(v, str) and WORD.fullmatch(v) for v in
-                                       (src.get("family"), src.get("secret"), *src.get("params", {}).keys()))
+                                       (src.get("family"), *src.get("params", {}).keys()))
+                            or not isinstance(src.get("secret"), str) or not ENV_NAME.fullmatch(src["secret"])
                             or not all(isinstance(v, str) and PARAM_VALUE.fullmatch(v)
                                        for v in src.get("params", {}).values())):
-        raise SystemExit("manifest 'source' must be {family, secret (env var NAME of the DSN), params?}: family, secret "
-                         "and param names one plain word (letters, digits, _ . / -), param values what dbx-recon run "
-                         "--param accepts (a number, identifier, date or date + time); they become the doctor's command line")
+        raise SystemExit("manifest 'source' must be {family, secret (env var NAME of the DSN), params?}: family and "
+                         "param names one plain word (letters, digits, _ . / -), secret a shell variable name, param "
+                         "values what dbx-recon run --param accepts; they become the doctor's command line")
     if "verify_depth" in m and m["verify_depth"] not in VERIFY_DEPTHS:
         raise SystemExit(f"manifest 'verify_depth' must be one of {VERIFY_DEPTHS}")
-    for b in m["batches"]:
-        if "verify_depth" in b and b["verify_depth"] not in VERIFY_DEPTHS:
-            raise SystemExit(f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
     if "cost_estimate" in m and not isinstance(m["cost_estimate"], dict):
-        raise SystemExit("manifest 'cost_estimate' must be an object (output of `dbx-recon estimate`, "
-                         "summed over the wave)")
+        raise SystemExit("manifest 'cost_estimate' must be an object (output of `dbx-recon estimate`, summed over the wave)")
     caps = m.get("capabilities")
     if not isinstance(caps, dict) or not isinstance(caps.get("identity"), str) or not caps["identity"]:
         raise SystemExit("manifest 'capabilities' must be an object with a non-empty 'identity' "
@@ -212,10 +211,9 @@ def validate_manifest(m, doctor=None):
     if (not isinstance(caps.get("catalogs"), list) or not caps["catalogs"]
             or not all(isinstance(c, str) and c for c in caps["catalogs"])):
         raise SystemExit("manifest 'capabilities.catalogs' must be the non-empty allowlist of catalog names")
-    if caps.get("guard_mode") not in GUARD_MODES:
-        raise SystemExit(f"manifest 'capabilities.guard_mode' must be one of {GUARD_MODES}")
-    if caps.get("stop_mode") not in STOP_MODES:
-        raise SystemExit(f"manifest 'capabilities.stop_mode' must be one of {STOP_MODES}")
+    for key, allowed in (("guard_mode", GUARD_MODES), ("stop_mode", STOP_MODES)):
+        if caps.get(key) not in allowed:
+            raise SystemExit(f"manifest 'capabilities.{key}' must be one of {allowed}")
     if caps.get("ready") is not True:
         raise SystemExit("manifest 'capabilities.ready' must be true: the factory-doctor preflight "
                          "did not pass; fix the D10 and re-run the doctor before launching a wave")
@@ -352,6 +350,22 @@ def pr_changed_paths(pr_url):
     if not m or m["repo"].lower() != REPO.lower():
         return None
     return ref_changed_paths(f"refs/pull/{m['n']}/head")
+
+
+def replay_gate(record, pr_url):
+    """The gate a replayed PASS keeps: its recorded head, while the PR still points at it or the base
+    already contains it (the resumed run's verifier merged it; its diff now would attribute other
+    accepted units to it). A PR URL names no tree: a PR that gained commits since is gated at its current
+    head like a new child's. None when git cannot answer."""
+    got = pr_changed_paths(pr_url)
+    if got is None or got[0] == record["pr_head"]:
+        return got and (got[0], [])
+    try:
+        merged = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", record["pr_head"], _base_tip()],
+                                check=False, capture_output=True, timeout=300).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (record["pr_head"], []) if merged == 0 else got if merged == 1 else None
 
 
 def verifier_changed_paths(wave, passed):
@@ -648,15 +662,15 @@ async def run_batch(batch, sem, breaker):
             out["one_line_summary"] = (
                 "PASS downgraded: no PR URL/branch reported; " + out["one_line_summary"])
         # The ledger gate reads the PR's diff from git; the child's changed_paths can only add to it. A
-        # replayed PASS keeps the head gated in the run being resumed: that run's verifier may have merged
-        # it since, and re-diffing it would attribute other accepted units to it. It is the same result
-        # only if it answered this prompt (the runtime replays unchanged prompts) and names the same PR.
+        # replayed PASS may keep the head gated in the run being resumed (replay_gate says whether that
+        # head still stands), but only for the same result: one that answered this prompt (the runtime
+        # replays unchanged prompts) and names the same PR.
         reported = out.get("changed_paths")
         usable = isinstance(reported, list) and all(isinstance(p, str) for p in reported)
         record = REPLAYED.get(batch["id"])
         if (isinstance(record, dict) and record.get("status") == "PASS" and isinstance(record.get("pr_head"), str)
                 and record.get("prompt_sha") == out["prompt_sha"] and record.get("pr_url") == out.get("pr_url")):
-            gated = (record["pr_head"], [])
+            gated = replay_gate(record, out["pr_url"])
         else:
             gated = pr_changed_paths(out.get("pr_url"))
         observed = gated[1] if gated else None

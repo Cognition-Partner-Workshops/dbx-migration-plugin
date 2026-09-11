@@ -573,7 +573,7 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
 _SRV_ROLES = ("sysadmin", "securityadmin", "serveradmin", "dbcreator", "bulkadmin")
 _DB_ROLES = ("db_owner", "db_ddladmin", "db_datawriter", "db_securityadmin")
 _SRV_PERMS = ("CONTROL SERVER", "ALTER ANY DATABASE", "IMPERSONATE ANY LOGIN", "ALTER ANY LOGIN")
-_PG_ATTRS = ("rolsuper", "rolcreaterole", "rolcreatedb", "rolbypassrls")
+_PG_ATTRS = ("rolsuper", "rolcreaterole", "rolcreatedb")
 _PG_ROLES = ("pg_write_server_files", "pg_execute_server_program")
 _ROLE_FLAGS = {"sqlserver": _SRV_ROLES + _DB_ROLES + _SRV_PERMS, "postgres": _PG_ATTRS + _PG_ROLES}
 _PG_FUNCTIONS = ("SELECT n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', "
@@ -628,12 +628,6 @@ def _schema(table: str) -> str:
     return table.rsplit(".", 1)[0] if "." in table else "public"
 
 
-def _table_params(family: str, table: str) -> tuple:
-    if family == "sqlserver":
-        return (table,) * 4
-    return (table,) * 4 + (_schema(table),)
-
-
 def _indirect_writes(cur, q: dict, family: str, tables: list[str], resolved: list[str]) -> list[str]:
     """`object: privilege` for every write path that is not a grant on an in-scope table. Only `resolved`
     tables are named to the engine (Postgres raises for a relation that does not exist)."""
@@ -679,11 +673,8 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
         conn = (connect or _READ_ONLY_CONNECT[family])(dsn)
         try:
             cur = conn.cursor()
-            if q["read_only"]:
-                (ro,) = cur.execute(q["read_only"]).fetchall()[0]
-                data["stats"] = f"connection opened read_only=True, transaction_read_only={ro}; {_ADVISORY}"
-            else:
-                data["stats"] = f"connection opened with pyodbc readonly=True; {_ADVISORY}"
+            ro = f", transaction_read_only={cur.execute(q['read_only']).fetchall()[0][0]}" if q["read_only"] else ""
+            data["stats"] = f"connection opened readonly=True{ro}; {_ADVISORY}"
             flags = cur.execute(q["roles"]).fetchall()[0]
             data["roles"] = [name for name, held in zip(_ROLE_FLAGS[family], flags) if held]
             resolved = []
@@ -692,7 +683,7 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
                     data["unresolved"].append(t)
                     continue
                 resolved.append(t)
-                row = cur.execute(q["table"], _table_params(family, t)).fetchall()[0]
+                row = cur.execute(q["table"], (t,) * 4 + ((_schema(t),) if family == "postgres" else ())).fetchall()[0]
                 held = [p for p, v in zip(_TABLE_PRIVILEGES[family], row) if v]
                 held += [f"{p} on column {c}" for c, p in cur.execute(q["columns"], (t,)).fetchall() if p not in held]
                 if held:

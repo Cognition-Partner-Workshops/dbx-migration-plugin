@@ -811,7 +811,6 @@ def test_postgres_branches(monkeypatch):
                        # indirection: role attributes, file/program roles, function EXECUTE, SET ROLE to a writer
                        ({"roles": ["rolcreaterole"]}, "role rolcreaterole"),
                        ({"roles": ["rolcreatedb"]}, "role rolcreatedb"),
-                       ({"roles": ["rolbypassrls"]}, "role rolbypassrls"),
                        ({"roles": ["pg_write_server_files"]}, "role pg_write_server_files"),
                        ({"roles": ["pg_execute_server_program"]}, "role pg_execute_server_program"),
                        ({"execute": ["public.post_payment(integer)"]}, "public.post_payment(integer): EXECUTE"),
@@ -826,6 +825,9 @@ def test_postgres_branches(monkeypatch):
         c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC",
                                           connect=lambda dsn, kw=kw: FakePrivConn(**kw))
         assert c.status == "fail" and needle in c.detail, (kw, c.detail)
+    # BYPASSRLS widens what a read sees, it grants no write path: not a finding
+    c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC", connect=lambda dsn: FakePrivConn(roles=["rolbypassrls"]))
+    assert c.status == "ok", c.detail
     # a membership whose role holds no in-scope write is not a finding, but is still asked about per table
     conn = FakePrivConn(set_role={"readers": []})
     c = doctor.check_source_principal(["raw.loans", "raw.payments"], "postgres", "LAKEBASE_SRC", connect=lambda dsn: conn)
@@ -851,8 +853,8 @@ def test_postgres_branches(monkeypatch):
     cols = [(s, a[0]) for s, a in conn.statements if "has_column_privilege" in s]
     assert [a for _, a in cols] == [("raw.loans",), ("raw.payments",)]
     assert "pg_attribute" in cols[0][0] and "NOT has_table_privilege" in cols[0][0] and "attisdropped" in cols[0][0]
-    assert any("pg_has_role(current_user, 'pg_write_server_files', 'MEMBER')" in s and "rolbypassrls" in s
-               for s, _ in conn.statements)
+    assert any("pg_has_role(current_user, 'pg_write_server_files', 'MEMBER')" in s and "rolcreatedb" in s
+               and "rolbypassrls" not in s for s, _ in conn.statements)
 
 
 def test_default_connectors_open_read_only_the_way_each_driver_accepts(monkeypatch):

