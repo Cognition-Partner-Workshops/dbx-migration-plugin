@@ -5,7 +5,7 @@
   "requiredPlugins": [
     {
       "source": "git-subdir",
-      "url": "https://github.com/databricks/databricks-agent-skills.git",
+      "url": "https://github.com/databricks/databricks-agent-skills",
       "path": "plugins/databricks/claude",
       "sha": "f2e82274b10d0769016afdf0520f0010c6981198"
     }

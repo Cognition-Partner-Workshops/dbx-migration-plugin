@@ -1,7 +1,6 @@
 ---
 name: redshift-sql
 description: Source-dialect skill for Amazon Redshift estates. Use when enumerating a Redshift estate, extracting lineage from Redshift SQL/views/procedures, or converting Redshift SQL to Databricks SQL. v0 stub seeded from prior engagement work.
-status: stub — no harness, guidance only
 ---
 
 # Redshift SQL Dialect (v0)
