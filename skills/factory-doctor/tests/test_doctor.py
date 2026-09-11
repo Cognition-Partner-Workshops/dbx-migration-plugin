@@ -1058,17 +1058,23 @@ def test_hooks_json_registers_only_the_guard():
 
 def test_hook_guard_functional_requires_the_probe_token_in_the_block_reason(tmp_path):
     """rc=2 plus a generic block is not proof the guard read the probe: the reason must echo the
-    full `__dbx_guard_probe__<nonce>` token the doctor sent (the bare prefix can be hardcoded)."""
+    full `__dbx_guard_probe__<nonce>` token the doctor sent, with a nonce fresh per invocation (the
+    prefix, or a token seen in an earlier run, can be hardcoded)."""
     ws = make_workspace(tmp_path)
     fake_root = tmp_path / "plugin"
     (fake_root / "hooks").mkdir(parents=True)
     (fake_root / "hooks.json").write_text(json.dumps(
         {"PreToolUse": [{"matcher": "exec", "hooks": [{"command": "python hooks/dbx_guard.py"}]}]}))
     guard = fake_root / "hooks" / "dbx_guard.py"
-    for reason in ("generic deny", "__dbx_guard_probe__ is never allowed"):
-        guard.write_text(f'import sys; print(\'{{"decision": "block", "reason": "{reason}"}}\'); sys.exit(2)\n')
-        c = {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"]
-        assert c.status == "fail" and "__dbx_guard_probe__self" in c.detail, reason
     guard.write_text('import sys, json; cmd = json.load(sys.stdin)["tool_input"]["command"]\n'
                      'print(json.dumps({"decision": "block", "reason": "blocked: " + cmd})); sys.exit(2)\n')
-    assert {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"].status == "ok"
+    seen = []
+    for _ in range(2):
+        c = {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"]
+        assert c.status == "ok"
+        seen.append(re.search(r"__dbx_guard_probe__(\w+)", c.detail).group(1))
+    assert seen[0] != seen[1] and "self" not in seen
+    for reason in ("generic deny", "__dbx_guard_probe__ is never allowed", f"__dbx_guard_probe__{seen[1]} replayed"):
+        guard.write_text(f'import sys; print(\'{{"decision": "block", "reason": "{reason}"}}\'); sys.exit(2)\n')
+        c = {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"]
+        assert c.status == "fail" and "__dbx_guard_probe__" in c.detail, reason

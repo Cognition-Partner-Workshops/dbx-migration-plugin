@@ -204,10 +204,11 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str) -> list[Check]:
         return out
 
     # Functional check: feed the guard the probe event directly; it must block, and the reason must
-    # echo the full probe token (prefix + nonce) so a blanket deny that hardcodes the prefix cannot
-    # pass as the guard having read the command.
-    token = HOOK_PROBE_TOKEN.format(nonce="self")
-    event = json.dumps({"tool_name": "exec", "tool_input": {"command": HOOK_PROBE_COMMAND.format(nonce="self")}})
+    # echo the full probe token (prefix + a nonce fresh for this invocation) so a blanket deny that
+    # hardcodes the prefix, or a token seen before, cannot pass as the guard having read the command.
+    nonce = secrets.token_hex(4)
+    token = HOOK_PROBE_TOKEN.format(nonce=nonce)
+    event = json.dumps({"tool_name": "exec", "tool_input": {"command": HOOK_PROBE_COMMAND.format(nonce=nonce)}})
     try:
         r = subprocess.run([sys.executable, str(guard)], input=event, text=True, capture_output=True,
                            timeout=30, cwd=ws, env={**os.environ, "CLAUDE_PROJECT_DIR": str(ws)})
