@@ -471,6 +471,13 @@ PROBES2 = [
     ("unzip into ws", "unzip m.zip", "block"),
     ("git checkout -- .migration", "git checkout -- .migration/03_recon_tolerances.json", "block"),
     ("git checkout -- .", "git checkout -- .", "block"),
+    ("git -C ws checkout -- .migration", "git -C {ws} checkout -- .migration/03_recon_tolerances.json", "block"),      # round 4
+    ("git -C ws/src checkout -- ../.migration", "git -C {ws}/src checkout -- ../.migration/06_decisions.md", "block"),  # round 4
+    ("git -C ws checkout -- .", "git -C {ws} checkout -- .", "block"),                                                  # round 4
+    ("git -C ws reset --hard", "git -C {ws} reset --hard", "block"),                                                    # round 4
+    ("git -C ws clean -fdx", "git -C {ws} clean -fdx", "block"),                                                        # round 4
+    ("git -C ws log (approve)", "git -C {ws} log --oneline", "approve"),                                                # round 4
+    ("git -C ws add .migration (approve)", "git -C {ws} add .migration/06_decisions.md", "approve"),                    # round 4
     ("git checkout branch (approve)", "git checkout -b feature/x", "approve"),
     ("git stash (approve)", "git stash", "approve"),
     ("git reset --hard", "git reset --hard HEAD~1", "block"),
@@ -725,17 +732,100 @@ def plugin(tmp_path_factory) -> Path:
     ("run the running guard's tests (approve)", "python3 -m pytest {plugin}/hooks/tests -q", "approve"),
     ("sed -i the repo checkout's guard (approve: dev target, not the running guard)", "sed -i 's/a/b/' {repo}/hooks/dbx_guard.py", "approve"),
     ("redirect over the repo checkout's hooks.json (approve)", "echo '{{}}' > {repo}/hooks.json", "approve"),
+    # round 4: fixers and formatters rewrite their operands in place
+    ("ruff --fix on the hooks dir", "ruff check --fix {plugin}/hooks/", "block"),
+    ("ruff --fix-only on the running guard", "ruff check --fix-only {plugin}/hooks/dbx_guard.py", "block"),
+    ("ruff format the running guard", "ruff format {plugin}/hooks/dbx_guard.py", "block"),
+    ("ruff format the plugin dir", "ruff format {plugin}", "block"),
+    ("black the hooks dir", "black {plugin}/hooks", "block"),
+    ("isort the running guard", "isort {plugin}/hooks/dbx_guard.py", "block"),
+    ("autopep8 -i the running guard", "autopep8 -i {plugin}/hooks/dbx_guard.py", "block"),
+    ("yapf -i the running guard", "yapf -i {plugin}/hooks/dbx_guard.py", "block"),
+    ("autoflake --in-place the running guard", "autoflake --in-place --remove-all-unused-imports {plugin}/hooks/dbx_guard.py", "block"),
+    ("ruff check without --fix (approve)", "ruff check {plugin}/hooks/", "approve"),
+    ("ruff format --check (approve)", "ruff format --check {plugin}/hooks", "approve"),
+    # round 4: `git -C <dir>` is a cd for the working-copy rules
+    ("git -C plugin checkout -- the guard", "git -C {plugin} checkout -- hooks/dbx_guard.py", "block"),
+    ("git -C plugin checkout <ref> -- the guard", "git -C {plugin} checkout HEAD~1 -- hooks/dbx_guard.py", "block"),
+    ("git -C plugin restore the guard", "git -C {plugin} restore hooks/dbx_guard.py", "block"),
+    ("git -C plugin/hooks checkout -- bare name", "git -C {plugin}/hooks checkout -- dbx_guard.py", "block"),
+    ("git -C plugin stash", "git -C {plugin} stash", "block"),
+    ("git -C plugin stash push", "git -C {plugin} stash push -- hooks", "block"),
+    ("git -C plugin stash pop", "git -C {plugin} stash pop", "block"),
+    ("git -C plugin reset --hard", "git -C {plugin} reset --hard", "block"),
+    ("git -C plugin clean -fdx", "git -C {plugin} clean -fdx", "block"),
+    ("git -c then -C plugin checkout", "git -c core.pager=cat -C {plugin} checkout -- hooks.json", "block"),
+    ("git -C=style plugin checkout", "git -C{plugin} checkout -- hooks/dbx_guard.py", "block"),
+    ("cd plugin then git stash", "cd {plugin} && git stash", "block"),
+    ("git -C plugin log (approve)", "git -C {plugin} log --oneline -3", "approve"),
+    ("git -C plugin status (approve)", "git -C {plugin} status", "approve"),
+    ("git -C plugin diff (approve)", "git -C {plugin} diff -- hooks/dbx_guard.py", "approve"),
+    ("git -C plugin stash list (approve)", "git -C {plugin} stash list", "approve"),
+    ("git -C plugin stash show (approve)", "git -C {plugin} stash show -p", "approve"),
+    ("git stash in the workspace (approve)", "git stash", "approve"),
+    ("git -C ws stash (approve)", "git -C {ws} stash", "approve"),
+    # round 4: no `cwd` in the event -> a relative operand that could be the running guard blocks
+    ("relative sed -i hooks/dbx_guard.py, no event cwd", "sed -i 's/a/b/' hooks/dbx_guard.py", "block"),
+    ("relative ../hooks/dbx_guard.py, no event cwd", "sed -i 's/a/b/' ../hooks/dbx_guard.py", "block"),
+    ("relative ruff --fix hooks/, no event cwd", "ruff check --fix hooks/", "block"),
+    ("relative redirect over hooks.json, no event cwd", "echo '{{}}' > hooks.json", "block"),
+    ("relative rm under hooks/tests, no event cwd", "rm hooks/tests/test_probe_table.py", "block"),
+    ("relative glob hook*/dbx_guard.py, no event cwd", "chmod 000 hook*/dbx_guard.py", "block"),
+    ("cd hooks then bare dbx_guard.py, no event cwd", "cd hooks && sed -i 's/a/b/' dbx_guard.py", "block"),
+    ("cd sub then ../hooks/dbx_guard.py, no event cwd", "cd src && sed -i 's/a/b/' ../hooks/dbx_guard.py", "block"),
+    ("git checkout -- relative guard, no event cwd", "git checkout -- hooks/dbx_guard.py", "block"),
+    ("relative cat hooks/dbx_guard.py (approve)", "cat hooks/dbx_guard.py", "approve"),
+    ("relative ruff check hooks/ (approve)", "ruff check hooks/", "approve"),
+    ("relative pytest hooks/tests (approve)", "python3 -m pytest hooks/tests -q", "approve"),
+    ("relative write elsewhere (approve)", "sed -i 's/a/b/' src/app.py", "approve"),
+    ("relative lookalike hooks-doc/ (approve)", "sed -i 's/a/b/' hooks-doc/readme.md", "approve"),
+    ("relative lookalike .git/hooks/pre-commit (approve)", "chmod +x .git/hooks/pre-commit", "approve"),
+    ("relative lookalike hooks.json.bak (approve)", "echo x > hooks.json.bak", "approve"),
 ], ids=lambda x: x if isinstance(x, str) and " " in x else None)
 def test_running_guard_tree_is_tamper_proof(label: str, command: str, expected: str, plugin: Path, workspace2: Path):
-    link = workspace2 / "plug"
+    _assert_plugin(label, command, expected, plugin, workspace2, event_cwd=None)
+
+
+@pytest.mark.parametrize("label,event_cwd,command,expected", [
+    # round 4: the event's `cwd` is where relative operands resolve
+    ("cwd=plugin: relative sed -i", "plugin", "sed -i 's/a/b/' hooks/dbx_guard.py", "block"),
+    ("cwd=plugin/hooks: ../hooks/dbx_guard.py", "hooks", "sed -i 's/a/b/' ../hooks/dbx_guard.py", "block"),
+    ("cwd=plugin/hooks: bare dbx_guard.py", "hooks", "sed -i 's/a/b/' dbx_guard.py", "block"),
+    ("cwd=plugin: ruff --fix hooks/", "plugin", "ruff check --fix hooks/", "block"),
+    ("cwd=plugin: ruff format .", "plugin", "ruff format .", "block"),
+    ("cwd=plugin: black .", "plugin", "black .", "block"),
+    ("cwd=plugin: redirect over hooks.json", "plugin", "echo '{{}}' > hooks.json", "block"),
+    ("cwd=plugin: git checkout -- the guard", "plugin", "git checkout -- hooks/dbx_guard.py", "block"),
+    ("cwd=plugin: git stash", "plugin", "git stash", "block"),
+    ("cwd=plugin: rm -rf .", "plugin", "rm -rf .", "block"),
+    ("cwd=plugin: cd .. then rm -rf the plugin by name", "plugin", "cd .. && rm -rf {plugin_name}", "block"),
+    ("cwd=plugin: cat the guard (approve)", "plugin", "cat hooks/dbx_guard.py", "approve"),
+    ("cwd=plugin: ruff check hooks/ (approve)", "plugin", "ruff check hooks/", "approve"),
+    ("cwd=ws: relative hooks/ is not the running guard (approve)", "ws", "sed -i 's/a/b/' hooks/dbx_guard.py", "approve"),
+    ("cwd=ws: relative hooks.json is not the running guard (approve)", "ws", "echo '{{}}' > hooks.json", "approve"),
+    ("cwd=ws: ruff --fix hooks/ is not the running guard (approve)", "ws", "ruff check --fix hooks/", "approve"),
+    ("cwd=ws: .migration write still blocks", "ws", "echo x > .migration/06_decisions.md", "block"),
+    ("cwd=ws/src: ../.migration write still blocks", "src", "echo x > ../.migration/06_decisions.md", "block"),
+], ids=lambda x: x if isinstance(x, str) and " " in x else None)
+def test_event_cwd_resolves_relative_operands(label: str, event_cwd: str, command: str, expected: str, plugin: Path, workspace2: Path):
+    (workspace2 / "src").mkdir(exist_ok=True)
+    cwd = {"plugin": plugin, "hooks": plugin / "hooks", "ws": workspace2, "src": workspace2 / "src"}[event_cwd]
+    _assert_plugin(label, command, expected, plugin, workspace2, event_cwd=str(cwd))
+
+
+def _assert_plugin(label: str, command: str, expected: str, plugin: Path, ws: Path, event_cwd: str | None) -> None:
+    link = ws / "plug"
     if not link.exists():
         link.symlink_to(plugin)
-    command = command.format(plugin=plugin, ws=workspace2, repo=GUARD.parents[1])
+    command = command.format(plugin=plugin, plugin_name=plugin.name, ws=ws, repo=GUARD.parents[1])
     event = {"tool_name": "exec", "tool_input": {"command": command}}
+    if event_cwd is not None:
+        event["cwd"] = event_cwd
     r = subprocess.run([sys.executable, str(plugin / "hooks" / "dbx_guard.py")], input=json.dumps(event), text=True, check=False,
-                       capture_output=True, cwd=workspace2, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(workspace2)})
+                       capture_output=True, cwd=ws, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(ws)})
     decision = "block" if r.returncode == 2 else "approve"
     assert r.returncode in (0, 2), r.stderr
     assert decision == expected, f"{label}: {command!r} -> {decision} ({r.stdout})"
     if expected == "block":
-        assert "guard" in json.loads(r.stdout)["reason"]
+        reason = json.loads(r.stdout)["reason"]
+        assert "guard" in reason or ".migration" in reason, reason

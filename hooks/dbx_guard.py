@@ -39,8 +39,11 @@ judges each by the program it runs:
   touch`, `git checkout|restore|rm`, inline Python naming a `.migration/` path with a write call)
   blocks, except under `.migration/recon/` and `.migration/waves/`. Reads stay approved. The same
   writer detection protects the running guard's own plugin tree (`hooks.json`, `hooks/**`, resolved
-  through symlinks) from edits, `chmod`, `rm`, `mv`; a checkout of this repo elsewhere is an ordinary
-  development target.
+  through symlinks) from edits, `chmod`, `rm`, `mv`, in-place fixers (`ruff --fix|format`, `black`,
+  `isort`, ...) and `git checkout|restore|stash|reset --hard|clean`, with `git -C <dir>` read as a cd.
+  Relative operands resolve against the event's `cwd`; without one they are judged against the
+  workspace root and, fail closed, by name (`hooks/...`, `hooks.json`, `dbx_guard.py` could be the
+  running guard). A checkout of this repo elsewhere is an ordinary development target.
 * `python x.py` / `spark-submit x.py` / `python -c` / a Python heredoc: a literal SQL string handed
   to `.execute(`, `.sql(`, `execute_statement(` or `statement=` is judged like the clients above;
   anything else in a program approves, and an unreadable `spark-submit` script blocks. Programs
@@ -1057,9 +1060,11 @@ _READ_HEADS = frozenset(("cat", "less", "more", "head", "tail", "grep", "rg", "e
                          "dbx-recon", "databricks"))   # the two clients read the allowlist; their outputs go through --out / -o
 _WRITE_LAST_OPERAND = ("cp", "rsync", "install", "ln", "scp")
 _RECURSIVE_HEADS = ("rm", "chmod", "chown", "chgrp", "rsync", "chattr", "setfacl")
+_FIXERS = ("ruff", "black", "isort", "autopep8", "yapf", "autoflake")   # rewrite their operands (files or whole trees) in place
 # the Databricks CLI's identity store: `~/.databrickscfg` (any directory), `~/.databricks/` (token cache), `~/.config/databricks/`
 _IDENTITY_FILE = re.compile(r"(?:^|/)(?:\.databrickscfg|\.databricks(?:/.*)?|\.config/databricks(?:/.*)?)$")
 _GUARD_TREE = Path(os.path.realpath(__file__)).parent.parent   # the running plugin: hooks.json + hooks/**
+_GUARD_FILE = Path(__file__).name
 _PATH_LITERAL = re.compile(r"['\"]((?:[~./$]|/)[^'\"\n]{0,300})['\"]")
 _OUTPUT_FLAGS = ("-o", "-O", "--output", "--out", "--out-file", "--output-file", "--outfile", "--file")
 _GIT_DESTRUCTIVE = ("--hard", "--merge", "--keep")
@@ -1077,6 +1082,24 @@ def _touch(path: str, cwd: str, root: Path) -> str:
         return ""
     p = os.path.normpath(p if p.startswith("/") else os.path.join(cwd, p))
     return _touch_migration(p, root) or _touch_identity(p) or _guard_touch(p, root)
+
+
+def _guard_names(p: str) -> str:
+    """A relative path whose base directory is unknown (no `cwd` in the event: the shell may be sitting
+    in the plugin directory) is judged by name: `hooks/**`, `hooks.json` or the guard's own file name,
+    after any leading `..`, could be the running guard -> 'guard' (fail closed)."""
+    parts = [x for x in p.split("/") if x not in ("", ".")]
+    while parts and parts[0] == "..":
+        parts.pop(0)
+    if not parts:
+        return ""
+    def names(name: str, part: str) -> bool:   # a glob counts when it spells out part of the name (`hook*`, not `*`)
+        return part == name or (fnmatch.fnmatchcase(name, part)
+                                and any(len(w) >= 3 and w in name for w in re.findall(r"\w+", part)))
+    head, last = parts[0], parts[-1]
+    if names("hooks", head) or (len(parts) == 1 and names("hooks.json", last)) or names(_GUARD_FILE, last):
+        return "guard"
+    return ""
 
 
 def _touch_identity(p: str) -> str:
@@ -1109,6 +1132,8 @@ def _guard_touch(p: str, root: Path) -> str:
     """How a normalised path relates to the running guard's own tree (symlinks resolved, a glob
     component matched against the real names): 'guard' for `hooks.json` / `hooks/**`, 'guard-above'
     for the plugin directory or an ancestor of it, '' otherwise."""
+    if not p.startswith("/") and (kind := _guard_names(p)):
+        return kind
     parts = os.path.realpath(p if p.startswith("/") else os.path.join(root, p)).strip("/").split("/")
     tree = [*_GUARD_TREE.parts[1:], "hooks"]
     for i, part in enumerate(parts[:len(tree)]):
@@ -1125,6 +1150,9 @@ def _in_place(base: str, argv: list[str]) -> bool:
         return any(re.match(r"-[a-zA-Z]*i", w) for w in argv[1:])
     if base in ("awk", "gawk", "mawk"):
         return "--inplace" in argv or ("-i" in argv and "inplace" in argv)
+    if base == "ruff":
+        return any(w in argv for w in ("--fix", "--fix-only", "--unsafe-fixes")) or (
+            argv[1:2] == ["format"] and not any(w in argv for w in ("--check", "--diff")))
     return False
 
 
@@ -1145,15 +1173,34 @@ def _patch_texts(s: _Seg, files: list[str], root: Path, how: str) -> list[str]:
     return out
 
 
-def _check_integrity(segs: list[_Seg], root: Path) -> list[str]:
+def _git_globals(argv: list[str], cwd: str) -> tuple[str, list[str]]:
+    """Split git's global options off: the directory `-C <dir>` (chained, relative to `cwd`) moves the
+    working copy to, and the rest of argv starting at the sub-command."""
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        w = argv[i]
+        if w == "-C" or w == "-c" or w in ("--git-dir", "--work-tree", "--namespace"):
+            if w == "-C" and i + 1 < len(argv):
+                cwd = os.path.normpath(argv[i + 1] if argv[i + 1].startswith("/") else os.path.join(cwd, argv[i + 1]))
+            i += 2
+        else:
+            if w.startswith("-C") and len(w) > 2:
+                cwd = os.path.normpath(w[2:] if w[2:].startswith("/") else os.path.join(cwd, w[2:]))
+            i += 1
+    return cwd, argv[i:]
+
+
+def _check_integrity(segs: list[_Seg], root: Path, cwd: str = "") -> list[str]:
     """Nothing but the recon harness and the workflow writes under `.migration/`: any head whose
     literal operands name a protected entry blocks unless it only reads; a destructive recursive
-    verb on `.`, `..`, the workspace root or `.migration` itself blocks too."""
-    violations, cwd = [], ""
+    verb on `.`, `..`, the workspace root or `.migration` itself blocks too. `cwd` is where relative
+    operands resolve ('' when the event did not say: relative to the workspace root, and a name that
+    could be the running guard's counts as the guard)."""
+    violations = []
     all_kinds = ("inside", "self", "above")
 
-    def hit(path: str, how: str, kinds: tuple[str, ...] = ("inside", "self"), destructive: bool = False) -> None:
-        kind = _touch(path, cwd, root)
+    def hit(path: str, how: str, kinds: tuple[str, ...] = ("inside", "self"), destructive: bool = False, at: str | None = None) -> None:
+        kind = _touch(path, cwd if at is None else at, root)
         if kind in kinds:
             violations.append(f"`{how}` writes `{path}` under .migration/ (only .migration/recon/ and .migration/waves/ are "
                               "written by commands; ledgers and the allowlist change only through a recorded decision)")
@@ -1178,13 +1225,17 @@ def _check_integrity(segs: list[_Seg], root: Path) -> list[str]:
             if operands and not _expands(operands[0]):
                 cwd = os.path.normpath(operands[0] if operands[0].startswith("/") else os.path.join(cwd, operands[0]))
         elif base == "git":
-            verb, gops = (argv[1] if len(argv) > 1 else ""), operands[1:]
-            if verb == "clean" or (verb == "reset" and any(w in argv for w in _GIT_DESTRUCTIVE)):
+            at, gargv = _git_globals(argv, cwd)
+            verb, gops = (gargv[0] if gargv else ""), [w for w in gargv[1:] if not w.startswith("-")]
+            if verb == "clean" or (verb == "reset" and any(w in gargv for w in _GIT_DESTRUCTIVE)):
                 violations.append(f"`git {verb}` discards working-copy changes across the workspace, .migration/ included; "
                                   "revert a ledger only through a recorded decision")
+                hit(".", f"git {verb}", (), destructive=True, at=at)
             elif verb in ("checkout", "restore", "rm", "mv"):
                 for o in gops:
-                    hit(o, f"git {verb}", all_kinds if verb in ("checkout", "restore") else ("inside", "self"))
+                    hit(o, f"git {verb}", all_kinds if verb in ("checkout", "restore") else ("inside", "self"), at=at)
+            elif verb == "stash" and gops[:1] not in (["list"], ["show"]):
+                hit(".", "git stash", (), destructive=True, at=at)   # rewrites the working copy: the guard tree only
             elif verb in ("apply", "am"):
                 violations += _patch_texts(s, gops + s.scripts, root, f"git {verb}")
         elif base == "patch":
@@ -1221,7 +1272,7 @@ def _check_integrity(segs: list[_Seg], root: Path) -> list[str]:
                 violations.append(f"`xargs {base}` on names listed from .migration/; ledgers and the allowlist change only through a "
                                   "recorded decision")
             for o in values[-1:] if base in _WRITE_LAST_OPERAND else values:
-                hit(o, base, all_kinds if recursive else ("inside", "self"), destructive=base in ("mv", *_RECURSIVE_HEADS))
+                hit(o, base, all_kinds if recursive else ("inside", "self"), destructive=base in ("mv", *_RECURSIVE_HEADS, *_FIXERS))
     return violations
 
 
@@ -1294,14 +1345,14 @@ def _analyse(text: str, cfg: GuardConfig, root: Path, depth: int = 0) -> tuple[l
     return segs, violations
 
 
-def evaluate(command: str, cfg: GuardConfig, root: Path | None = None) -> Verdict:
+def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str = "") -> Verdict:
     root = root or _project_root()
     violations: list[str] = []
     if m := _PROBE.search(command):
         violations.append(f"`{m.group()}` is the factory-doctor's hook probe; it always blocks so the doctor can tell the "
                           "hook is loaded without touching Databricks")
     segs, found = _analyse(command, cfg, root)
-    violations += found + _check_identity(segs) + _check_integrity(segs, root)
+    violations += found + _check_identity(segs) + _check_integrity(segs, root, cwd)
     for seg in segs:
         violations += _check_segment(seg, cfg, root)
     return _verdict(list(dict.fromkeys(violations)), cfg)
@@ -1334,15 +1385,16 @@ def _cd_targets(cmd: str) -> list[str | None]:
     return out
 
 
-def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path) -> Verdict:
+def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str = "") -> Verdict:
     """`evaluate` against the starting workspace and every workspace the command `cd`s into: a
     write must be allowed by each allowlist involved, and a client command that moves to a
-    directory the guard cannot resolve is not clearable."""
+    directory the guard cannot resolve is not clearable. `cwd` is the event's working directory
+    when it carries one ('' -> the workspace root)."""
     violations: list[str] = []
-    first = evaluate(command, cfg, root)
+    first = evaluate(command, cfg, root, cwd)
     violations += first.violations or ([first.reason] if first.decision == "block" else [])
     seen = {cfg.path}
-    cwd = root
+    cwd = Path(cwd) if cwd else root
     for target in _cd_targets(command):
         if target is None:
             if _has_context(command, cfg):
@@ -1383,6 +1435,8 @@ def main(stdin_text: str | None = None) -> int:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str) or not command.strip():
         return 0
+    cwd = event.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and cwd.startswith("/") else ""
     try:
         cfg = load_config(_project_root())
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -1392,7 +1446,7 @@ def main(stdin_text: str | None = None) -> int:
         return 2
     if cfg is None:
         return 0
-    verdict = evaluate_with_workdirs(command, cfg, _project_root())
+    verdict = evaluate_with_workdirs(command, cfg, _project_root(), cwd)
     if verdict.decision == "block":
         print(json.dumps({"decision": "block", "reason": verdict.reason}))
         print(verdict.reason, file=sys.stderr)
