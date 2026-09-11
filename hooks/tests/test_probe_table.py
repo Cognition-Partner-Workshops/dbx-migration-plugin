@@ -958,3 +958,249 @@ def _assert_plugin(label: str, command: str, expected: str, plugin: Path, ws: Pa
     if expected == "block":
         reason = json.loads(r.stdout)["reason"]
         assert "guard" in reason or ".migration" in reason, reason
+
+
+# ---------------------------------------------------------------- Devin Review disposition round (PR #12)
+# F1 variable paths, F2 reassigned DSN names, F3 aliased REST hosts, F4 long dynamic SQL, F5 scripts after
+# `cd`, R1 several host candidates, R2 option-bearing wrappers, N1 isolation-level SET, N2 T-SQL lock hints.
+
+ALLOWLIST3 = {
+    "catalogs": ["mig_cat"],
+    "legacy_sources": ["legacy.corp", "LEGACY_TD_DSN"],
+    "guard_mode": "block",
+    "target_hosts": ["lakebase-host", "LAKEBASE_DSN"],
+    "bundle_targets": ["migration"],
+}
+FILES3 = {
+    "r.sql": "SELECT 1;\n",
+    "w.sql": "DROP TABLE t;\n",
+    "sub/r.sql": "DROP TABLE t;\n",          # the same name as the root's read script, a write here
+    "sub/w.sql": "SELECT 1;\n",
+    "sub/run.sh": "rm -f ../.migration/allowed_targets.json\nbteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF\n",
+    "run.sh": "echo benign\n",
+}
+_GAP = " " * 120
+_COMMENT_GAP = "\n-- a long comment " + "x" * 80 + "\n"
+
+PROBES3 = [
+    # F1: a `.migration/` path assigned to a shell variable, then written through it
+    ("F1 var path redirect", 'P=.migration/allowed_targets.json; printf \'{}\' > "$P"', "block"),
+    ("F1 var path braces redirect", 'P=.migration/06_decisions.md; echo x >> "${P}"', "block"),
+    ("F1 export var path tee", 'export OUT=.migration/06_decisions.md && echo x | tee $OUT', "block"),
+    ("F1 var dir + file", 'D=.migration; echo x > $D/06_decisions.md', "block"),
+    ("F1 var path rm", 'F=".migration/allowed_targets.json"; rm -f "$F"', "block"),
+    ("F1 var path sed -i", 'F=.migration/allowed_targets.json; sed -i "s/a/b/" "$F"', "block"),
+    ("F1 var path cp dest", 'T=.migration/allowed_targets.json; cp /tmp/x "$T"', "block"),
+    ("F1 chained var", 'D=.migration; F=$D/allowed_targets.json; echo x > $F', "block"),
+    ("F1 var abs ws path", 'W={ws}; echo x > $W/.migration/allowed_targets.json', "block"),
+    ("F1 var path read (approve)", 'F=.migration/06_decisions.md; cat "$F"', "approve"),
+    ("F1 var path recon write (approve)", 'F=.migration/recon/u1/log; echo x > "$F"', "approve"),
+    ("F1 var other path write (approve)", 'F=notes.md; echo x > "$F"', "approve"),
+    ("F1 unresolved var redirect (approve: a redirect only creates/appends, cf. `> $OUT` in test_dbx_guard)", 'echo x > "$OUT"', "approve"),
+    ("F1 unresolved var rm (fail closed)", 'rm -rf "$TARGET_DIR"', "block"),
+    ("F1 HOME/TMPDIR redirects resolve (approve)", 'echo x > $TMPDIR/log && echo y > $HOME/log', "approve"),
+    ("F1 unresolved var in read (approve)", 'cat "$F" && ls $D', "approve"),
+    ("F1 unresolved var in pytest args (approve)", 'pytest -k "$K" tests/', "approve"),
+    # F2: a configured DSN / host name reassigned in the shell
+    ("F2 reassign target DSN, same command", "LAKEBASE_DSN=postgresql://legacy.corp/db psql \"$LAKEBASE_DSN\" -c 'DROP TABLE t'", "block"),
+    ("F2 export target DSN alone", "export LAKEBASE_DSN=postgresql://other.corp/db", "block"),
+    ("F2 assign target DSN alone", "LAKEBASE_DSN=postgresql://other.corp/db", "block"),
+    ("F2 env target DSN around psql", "env LAKEBASE_DSN=postgresql://other.corp/db psql \"$LAKEBASE_DSN\" -c 'DROP TABLE t'", "block"),
+    ("F2 unset target DSN", "unset LAKEBASE_DSN", "block"),
+    ("F2 reassign legacy DSN name", "export LEGACY_TD_DSN=x", "block"),
+    ("F2 other variable (approve)", "export MY_DSN=x && echo ok", "approve"),
+    ("F2 psql via target DSN name (approve)", "psql \"$LAKEBASE_DSN\" -c 'DROP TABLE t'", "approve"),
+    # F3: Databricks host reached through an alias variable
+    ("F3 alias of DATABRICKS_HOST, POST", 'H=$DATABRICKS_HOST; curl -X POST "$H/api/2.1/jobs/create" -d \'{}\'', "block"),
+    ("F3 alias of DATABRICKS_HOST braces, DELETE", 'H="${DATABRICKS_HOST}"; curl -X DELETE "$H/api/2.1/catalogs/prod"', "block"),
+    ("F3 alias of a databricks.com host", 'B=https://adb-1.2.azuredatabricks.net; curl -X POST $B/api/2.0/clusters/create -d @c.json', "block"),
+    ("F3 unresolved var + /api/2.x POST (fail closed)", 'curl -X POST "$H/api/2.1/jobs/create" -d \'{}\'', "block"),
+    ("F3 alias, GET (approve)", 'H=$DATABRICKS_HOST; curl -s "$H/api/2.0/clusters/list"', "approve"),
+    ("F3 unresolved var + /api/2.x GET (approve)", 'curl -s "$H/api/2.0/clusters/list"', "approve"),
+    ("F3 non-databricks var host POST (approve)", 'H=https://example.org; curl -X POST "$H/hook" -d \'{}\'', "approve"),
+    # F4: a write literal fed to a dynamic-SQL executor across a long gap (Databricks: the literal names the catalog)
+    ("F4 EXECUTE IMMEDIATE long space gap to prod", f"databricks sql execute --query \"EXECUTE IMMEDIATE{_GAP}'DROP TABLE prod.s.t'\"", "block"),
+    ("F4 EXECUTE IMMEDIATE comment gap to prod", f"databricks sql execute --query \"EXECUTE IMMEDIATE{_COMMENT_GAP}'DROP TABLE prod.s.t'\"", "block"),
+    ("F4 EXECUTE IMMEDIATE block-comment gap to prod", "databricks sql execute --query \"EXECUTE IMMEDIATE /* " + "y" * 90 + " */ 'DROP TABLE prod.s.t'\"", "block"),
+    ("F4 spark-sql EXECUTE IMMEDIATE long gap to prod", f"spark-sql -e \"EXECUTE IMMEDIATE{_GAP}'INSERT INTO prod.s.t VALUES (1)'\"", "block"),
+    ("F4 sp_executesql long gap on legacy", f"sqlcmd -S legacy.corp -Q \"EXEC sp_executesql{_GAP}N'DROP TABLE t'\"", "block"),
+    ("F4 EXECUTE IMMEDIATE long gap to mig_cat (approve)", f"databricks sql execute --query \"EXECUTE IMMEDIATE{_GAP}'DROP TABLE mig_cat.s.t'\"", "approve"),
+    ("F4 EXECUTE IMMEDIATE read literal (approve)", f"databricks sql execute --query \"EXECUTE IMMEDIATE{_GAP}'SELECT 1'\"", "approve"),
+    ("F4 literal in WHERE after long gap (approve)", f"psql -h legacy.corp -c \"SELECT 1 FROM t WHERE note ={_GAP}'DROP TABLE t'\"", "approve"),
+    ("F4 dbx literal in WHERE after long gap (approve)", f"databricks sql execute --query \"SELECT 1 FROM mig_cat.s.t WHERE note ={_GAP}'DROP TABLE prod.s.t'\"", "approve"),
+    # F5: scripts resolve from the directory the command is in when the client runs
+    ("F5 cd then relative write script", "cd sub && psql -h legacy.corp -f r.sql", "block"),
+    ("F5 cd then relative stdin script", "cd sub; psql -h legacy.corp < r.sql", "block"),
+    ("F5 cd then sqlcmd -i", "cd sub && sqlcmd -S legacy.corp -i r.sql", "block"),
+    ("F5 cd then shell script", "cd sub && bash run.sh", "block"),
+    ("F5 cd then source script", "cd sub; source run.sh", "block"),
+    ("F5 subshell cd then shell script", "(cd sub && bash run.sh)", "block"),
+    ("F5 cd then ./script", "cd sub && ./run.sh", "block"),
+    ("F5 cd then ../ benign root script (approve)", "cd sub && bash ../run.sh", "approve"),
+    ("F5 root benign script (approve)", "bash run.sh", "approve"),
+    ("F5 sub script by path (control)", "bash sub/run.sh", "block"),
+    ("F5 cd then bteq .RUN FILE relative", "cd sub && bteq <<EOF\n.LOGON legacy.corp/u,p\n.RUN FILE=r.sql\nEOF", "block"),
+    ("F5 cd then psql DSN name -f", 'cd sub && psql "$LEGACY_TD_DSN" -f r.sql', "block"),
+    ("F5 pushd then relative write script", "pushd sub && psql -h legacy.corp -f r.sql", "block"),
+    ("F5 env -C then relative write script", "env -C sub psql -h legacy.corp -f r.sql", "block"),
+    ("F5 cd to unresolvable dir then script (fail closed)", "cd $D && psql -h legacy.corp -f r.sql", "block"),
+    ("F5 cd then relative read script (approve)", "cd sub && psql -h legacy.corp -f w.sql", "approve"),
+    ("F5 root script read before cd (approve)", "psql -h legacy.corp -f r.sql && cd sub", "approve"),
+    ("F5 root script write before cd", "psql -h legacy.corp -f w.sql && cd sub", "block"),
+    ("F5 cd then ../ script", "cd sub && psql -h legacy.corp -f ../w.sql", "block"),
+    ("F5 cd then ../ read script (approve)", "cd sub && psql -h legacy.corp -f ../r.sql", "approve"),
+    ("F5 cd then missing script", "cd sub && psql -h legacy.corp -f nope.sql", "block"),
+    # R1: every host candidate must be allowlisted, not any
+    ("R1 two -h, allowlisted first", "psql -h lakebase-host -h evil.corp -c 'DROP TABLE t'", "block"),
+    ("R1 -h allowlisted + URI elsewhere", "psql -h lakebase-host 'postgresql://evil.corp/db' -c 'DROP TABLE t'", "block"),
+    ("R1 PGHOST allowlisted, -h other", "PGHOST=lakebase-host psql -h evil.corp -c 'DROP TABLE t'", "block"),
+    ("R1 sqlcmd -S twice", "sqlcmd -S lakebase-host -S evil.corp -Q 'DROP TABLE t'", "block"),
+    ("R1 -h allowlisted + host= keyword", "psql -h lakebase-host 'host=evil.corp dbname=x' -c 'DROP TABLE t'", "block"),
+    ("R1 DSN name + other -h", "psql \"$LAKEBASE_DSN\" -h evil.corp -c 'DROP TABLE t'", "block"),
+    ("R1 single allowlisted host (approve)", "psql -h lakebase-host -c 'DROP TABLE t'", "approve"),
+    ("R1 allowlisted host + -U var (approve)", "psql -h lakebase-host -U $PGUSER -d db -c 'DROP TABLE t'", "approve"),
+    ("R1 allowlisted host + db positional (approve)", "mysql -h lakebase-host mydb -e 'DROP TABLE t'", "approve"),
+    ("R1 URI allowlisted only (approve)", "psql 'postgresql://u@lakebase-host:5432/db' -c 'DROP TABLE t'", "approve"),
+    ("R1 sqlcmd allowlisted + -U -P vars (approve)", "sqlcmd -S lakebase-host -U $SQLUSER -P $SQLPASS -Q 'DROP TABLE t'", "approve"),
+    ("R1 host + port suffix (approve)", "sqlcmd -S lakebase-host,1433 -Q 'DROP TABLE t'", "approve"),
+    # R2: option-bearing wrappers around a client
+    ("R2 nice -n 10 sqlcmd legacy write", "nice -n 10 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 timeout -s KILL 5 sqlcmd", "timeout -s KILL 5 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 timeout -k 5 10 sqlcmd", "timeout -k 5 10 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 stdbuf -o 0 sqlcmd", "stdbuf -o 0 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 nice --adjustment 10 psql", "nice --adjustment 10 psql -h legacy.corp -c 'DROP TABLE t'", "block"),
+    ("R2 ionice -c 3 sqlcmd (unknown wrapper)", "ionice -c 3 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 taskset -c 0 psql (unknown wrapper)", "taskset -c 0 psql -h legacy.corp -c 'DROP TABLE t'", "block"),
+    ("R2 watch -n 5 sqlcmd (unknown wrapper)", "watch -n 5 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 nice -n 10 databricks api post", "nice -n 10 databricks api post /api/2.1/jobs/create --json '{}'", "block"),
+    ("R2 nice -n 10 curl POST dbx", "nice -n 10 curl -X POST $DATABRICKS_HOST/api/2.1/jobs/create -d '{}'", "block"),
+    ("R2 nice -n 10 psql legacy read (approve)", "nice -n 10 psql -h legacy.corp -c 'SELECT 1'", "approve"),
+    ("R2 timeout -s KILL 5 databricks read (approve)", "timeout -s KILL 5 databricks clusters list", "approve"),
+    ("R2 nice -n 10 psql target write (approve)", "nice -n 10 psql -h lakebase-host -c 'DROP TABLE t'", "approve"),
+    ("R2 which sqlcmd (approve)", "which sqlcmd psql", "approve"),
+    ("R2 grep for a client name (approve)", "grep -rn sqlcmd docs/", "approve"),
+    ("R2 man sqlcmd (approve)", "man sqlcmd", "approve"),
+    ("R2 echo a client name (approve)", "echo psql -h legacy.corp", "approve"),
+    ("R2 git commit mentioning a client (approve)", "git commit -m 'switch sqlcmd to psql'", "approve"),
+    # N1: isolation-level / READ ONLY `SET TRANSACTION` is the harness's consistency-window idiom (a read); READ WRITE is not
+    ("N1 SET TRANSACTION ISOLATION LEVEL SNAPSHOT (approve)", "sqlcmd -S legacy.corp -Q 'SET TRANSACTION ISOLATION LEVEL SNAPSHOT; SELECT 1'", "approve"),
+    ("N1 SET TRANSACTION ISOLATION LEVEL READ COMMITTED (approve)", "sqlcmd -S legacy.corp -Q 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SELECT 1'", "approve"),
+    ("N1 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE (approve)", "psql -h legacy.corp -c 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1'", "approve"),
+    ("N1 SET TRANSACTION READ ONLY (approve)", "psql -h legacy.corp -c 'SET TRANSACTION READ ONLY; SELECT 1'", "approve"),
+    ("N1 SET TRANSACTION ISOLATION LEVEL ..., READ ONLY (approve)", "psql -h legacy.corp -c 'SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY; SELECT 1'", "approve"),
+    ("N1 SET TRANSACTION READ WRITE", "psql -h legacy.corp -c 'SET TRANSACTION READ WRITE; SELECT 1'", "block"),
+    ("N1 SET TRANSACTION ISOLATION LEVEL ..., READ WRITE", "psql -h legacy.corp -c 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE; SELECT 1'", "block"),
+    ("N1 SET TRANSACTION alone", "psql -h legacy.corp -c 'SET TRANSACTION; SELECT 1'", "block"),
+    ("N1 SET IMPLICIT_TRANSACTIONS ON", "sqlcmd -S legacy.corp -Q 'SET IMPLICIT_TRANSACTIONS ON; SELECT 1'", "block"),
+    ("N1 SET NOCOUNT ON (approve)", "sqlcmd -S legacy.corp -Q 'SET NOCOUNT ON; SELECT 1'", "approve"),
+    # N2: exclusive / held lock hints on a legacy read are an availability attack on the source, not a read
+    ("N2 WITH (TABLOCKX) on legacy", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (TABLOCKX)'", "block"),
+    ("N2 WITH (XLOCK, HOLDLOCK) on legacy", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (XLOCK, HOLDLOCK)'", "block"),
+    ("N2 WITH (HOLDLOCK) on legacy", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (HOLDLOCK)'", "block"),
+    ("N2 WITH (UPDLOCK) on legacy", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (UPDLOCK)'", "block"),
+    ("N2 WITH (SERIALIZABLE) on legacy", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (SERIALIZABLE)'", "block"),
+    ("N2 WITH (TABLOCK) on legacy", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (tablock)'", "block"),
+    ("N2 WITH (PAGLOCK, XLOCK) on legacy", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (PAGLOCK, XLOCK)'", "block"),
+    ("N2 WITH (NOLOCK) (approve)", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (NOLOCK)'", "approve"),
+    ("N2 WITH (READPAST) (approve)", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (READPAST)'", "approve"),
+    ("N2 WITH (READCOMMITTED) (approve)", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (READCOMMITTED)'", "approve"),
+    ("N2 WITH (READUNCOMMITTED, INDEX(ix)) (approve)", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (READUNCOMMITTED, INDEX(ix_a))'", "approve"),
+    ("N2 WITH (PAGLOCK) alone (approve)", "sqlcmd -S legacy.corp -Q 'SELECT * FROM dbo.x WITH (PAGLOCK)'", "approve"),
+    ("N2 CTE named WITH (approve)", "sqlcmd -S legacy.corp -Q 'WITH c AS (SELECT 1 AS a) SELECT a FROM c'", "approve"),
+    ("N2 lock hint word in a literal (approve)", "sqlcmd -S legacy.corp -Q \"SELECT 1 FROM dbo.x WHERE hint = 'WITH (TABLOCKX)'\"", "approve"),
+    ("N2 SELECT FOR UPDATE on legacy", "psql -h legacy.corp -c 'SELECT * FROM t FOR UPDATE'", "block"),
+    ("N2 SELECT FOR NO KEY UPDATE on legacy", "psql -h legacy.corp -c 'SELECT * FROM t FOR NO KEY UPDATE'", "block"),
+    ("N2 SELECT FOR SHARE on legacy", "psql -h legacy.corp -c 'SELECT * FROM t FOR SHARE'", "block"),
+    ("N2 LOCK TABLE on legacy", "psql -h legacy.corp -c 'LOCK TABLE t IN ACCESS EXCLUSIVE MODE'", "block"),
+    ("N2 Teradata LOCKING TABLE FOR EXCLUSIVE", "bteq <<EOF\n.LOGON legacy.corp/u,p\nLOCKING TABLE t FOR EXCLUSIVE SELECT * FROM t;\nEOF", "block"),
+    ("N2 Teradata LOCKING TABLE FOR WRITE", "bteq <<EOF\n.LOGON legacy.corp/u,p\nLOCKING TABLE t FOR WRITE SELECT * FROM t;\nEOF", "block"),
+    ("N2 Teradata LOCKING ROW FOR ACCESS (approve)", "bteq <<EOF\n.LOGON legacy.corp/u,p\nLOCKING ROW FOR ACCESS SELECT * FROM t;\nEOF", "approve"),
+    ("N2 Teradata LOCKING TABLE FOR ACCESS (approve)", "bteq <<EOF\n.LOGON legacy.corp/u,p\nLOCKING TABLE t FOR ACCESS SELECT * FROM t;\nEOF", "approve"),
+    ("N2 Teradata LOCKING TABLE FOR READ (approve)", "bteq <<EOF\n.LOGON legacy.corp/u,p\nLOCKING TABLE t FOR READ SELECT * FROM t;\nEOF", "approve"),
+    ("N2 Teradata LOCK ROW FOR ACCESS NOWAIT (approve)", "bteq <<EOF\n.LOGON legacy.corp/u,p\nLOCK ROW FOR ACCESS NOWAIT SELECT * FROM t;\nEOF", "approve"),
+    # R2 (class): any head the guard has no rule for, in front of a client word, is an unrecognised wrapper
+    ("R2 strace -f -o bteq write", "strace -f -o /tmp/t bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF", "block"),
+    ("R2 script -q bteq write", "script -q /tmp/o bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF", "block"),
+    ("R2 chroot / bteq write", "chroot / bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF", "block"),
+    ("R2 systemd-run --scope bteq write", "systemd-run --scope bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF", "block"),
+    ("R2 flock -w 5 /tmp/l bteq write", "flock -w 5 /tmp/l bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF", "block"),
+    ("R2 unbuffer psql legacy write", "unbuffer psql -h legacy.corp -c 'DROP TABLE t'", "block"),
+    ("R2 unknown wrapper, legacy read", "strace -f psql -h legacy.corp -c 'SELECT 1'", "block"),
+    ("R2 unknown wrapper, databricks read", "caffeinate -i databricks clusters list", "block"),
+    ("R2 unknown wrapper, legacy source token only", "arch -x86_64 ./mytool --dsn legacy.corp", "block"),
+    ("R2 nice -5 bteq write", "nice -5 bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF", "block"),
+    ("R2 stdbuf -o0 sqlcmd write", "stdbuf -o0 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 timeout --signal=KILL 10 sqlcmd write", "timeout --signal=KILL 10 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 env -i sqlcmd write", "env -i sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 sudo -E sqlcmd write", "sudo -E sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 doas -u app sqlcmd write", "doas -u app sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 command -p sqlcmd write", "command -p sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 time -p sqlcmd write", "time -p sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
+    ("R2 ssh -p 22 host bteq write", "ssh -p 22 h 'bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF'", "block"),
+    ("R2 ssh -o opt host bteq write", "ssh -o StrictHostKeyChecking=no h 'bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF'", "block"),
+    ("R2 docker exec -e X=1 c bteq write", "docker exec -e X=1 c bteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF", "block"),
+    ("R2 docker run -v a:b img sqlcmd write", "docker run -v /a:/b img sqlcmd -S legacy.corp -Q 'DELETE t'", "block"),
+    ("R2 kubectl exec -it pod -c c -- sqlcmd write", "kubectl exec -it pod -c c -- sqlcmd -S legacy.corp -Q 'DELETE t'", "block"),
+    ("R2 kubectl exec pod -- sh -c sqlcmd write", "kubectl exec pod -- sh -c 'sqlcmd -S legacy.corp -Q \"DELETE t\"'", "block"),
+    ("R2 ssh -p 22 host psql read (approve)", "ssh -p 22 h 'psql -h legacy.corp -c \"SELECT 1\"'", "approve"),
+    ("R2 docker exec -e X=1 c psql read (approve)", "docker exec -e X=1 c psql -h legacy.corp -c 'SELECT 1'", "approve"),
+    ("R2 sudo -E databricks read (approve)", "sudo -E databricks clusters list", "approve"),
+    ("R2 env -i psql legacy read (approve)", "env -i psql -h legacy.corp -c 'SELECT 1'", "approve"),
+    ("R2 pytest naming a client (approve)", "pytest -k sqlcmd hooks/tests", "approve"),
+    ("R2 cat a file named after a client (approve)", "cat docs/psql.md", "approve"),
+    ("R2 pip install a client (approve)", "pip install databricks-sdk psycopg2", "approve"),
+    ("R2 make with a client in a target name (approve)", "make lint", "approve"),
+    ("R2 diff two sql files (approve)", "diff r.sql w.sql", "approve"),
+    # R1 (class): -d/--dbname conninfo and URI hosts are candidates too
+    ("R1 --host=ok -h evil", "psql --host=lakebase-host -h evil.corp -c 'DROP TABLE t'", "block"),
+    ("R1 -h evil then -h ok (last wins)", "psql -h evil.corp -h lakebase-host -c 'DROP TABLE t'", "block"),
+    ("R1 -h ok -d 'host=evil'", "psql -h lakebase-host -d 'host=evil.corp dbname=x' -c 'DROP TABLE t'", "block"),
+    ("R1 -h ok --dbname=uri evil", "psql -h lakebase-host --dbname=postgresql://evil.corp/db -c 'DROP TABLE t'", "block"),
+    ("R1 mysql -h ok -h evil", "mysql -h lakebase-host -h evil.corp -e 'DROP TABLE t'", "block"),
+    ("R1 uri ok + -h evil", "psql postgresql://lakebase-host/db -h evil.corp -c 'DROP TABLE t'", "block"),
+    ("R1 -h ok, host in SQL comment (approve)", "psql -h lakebase-host -c 'INSERT INTO t VALUES (1) -- evil.corp'", "approve"),
+    ("R1 -h ok -d plain db name (approve)", "psql -h lakebase-host -d mydb -c 'DROP TABLE t'", "approve"),
+    ("R1 -h ok --dbname=conninfo same host (approve)", "psql -h lakebase-host --dbname='host=lakebase-host dbname=x' -c 'DROP TABLE t'", "approve"),
+]
+
+
+@pytest.fixture(scope="module")
+def workspace3(tmp_path_factory) -> Path:
+    ws = tmp_path_factory.mktemp("probe3_ws")
+    (ws / ".migration").mkdir()
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps(ALLOWLIST3))
+    (ws / ".migration" / "recon" / "u1").mkdir(parents=True)
+    (ws / "sub").mkdir()
+    for fname, body in FILES3.items():
+        (ws / fname).write_text(body)
+    return ws
+
+
+@pytest.mark.parametrize("label,command,expected", PROBES3, ids=[p[0] for p in PROBES3])
+def test_probe3(label: str, command: str, expected: str, workspace3: Path):
+    command = command.replace("{ws}", str(workspace3))
+    decision, reason = decide(command, workspace3)
+    assert decision == expected, f"{label}: {command!r} -> {decision} ({reason})"
+
+
+@pytest.mark.parametrize("label,event_cwd,command,expected", [
+    ("F5 event cwd=sub: relative write script", "sub", "psql -h legacy.corp -f r.sql", "block"),
+    ("F5 event cwd=sub: stdin write script", "sub", "psql -h legacy.corp < r.sql", "block"),
+    ("F5 event cwd=sub: relative read script (approve)", "sub", "psql -h legacy.corp -f w.sql", "approve"),
+    ("F5 event cwd=sub: ../ write script", "sub", "psql -h legacy.corp -f ../w.sql", "block"),
+    ("F5 event cwd=sub: cd .. then read script (approve)", "sub", "cd .. && psql -h legacy.corp -f r.sql", "approve"),
+    ("F5 event cwd=sub: cd .. then write script", "sub", "cd .. && psql -h legacy.corp -f w.sql", "block"),
+    ("F5 event cwd=ws: read script (approve)", "ws", "psql -h legacy.corp -f r.sql", "approve"),
+], ids=lambda x: x if isinstance(x, str) and " " in x else None)
+def test_probe3_event_cwd(label: str, event_cwd: str, command: str, expected: str, workspace3: Path):
+    cwd = {"ws": workspace3, "sub": workspace3 / "sub"}[event_cwd]
+    event = {"tool_name": "exec", "tool_input": {"command": command}, "cwd": str(cwd)}
+    r = subprocess.run([sys.executable, str(GUARD)], input=json.dumps(event), text=True, capture_output=True, check=False,
+                       cwd=workspace3, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(workspace3)})
+    assert r.returncode in (0, 2), r.stderr
+    decision = "block" if r.returncode == 2 else "approve"
+    assert decision == expected, f"{label}: {command!r} -> {decision} ({r.stdout})"
+
+
+def test_probe3_labels_are_unique():
+    assert len({p[0] for p in PROBES3}) == len(PROBES3)

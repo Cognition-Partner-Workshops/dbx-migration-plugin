@@ -95,7 +95,7 @@ through; everything else it recognises blocks. It is a no-op outside a workspace
 | `catalogs` | yes | Unity Catalog catalogs a Databricks write (`sql execute`, `spark-sql`, `tables delete mig_cat.s.t`, `fs rm dbfs:/Volumes/mig_cat/...`, `api delete .../tables/mig_cat.s.t`) may target. Also read by `dbx-recon`. |
 | `legacy_sources` | no | secret names, hosts, DSNs and profiles of the legacy estate. A generic SQL client whose command mentions one, and every legacy-only client (`bteq`, `sqlplus`, `snowsql`, ...), is held to read shapes only; loaders always block. |
 | `guard_mode` | no | `block` (default) or `warn` (approve with the reason attached). |
-| `target_hosts` | no | hosts / DSN names a generic SQL client (`psql`, `sqlcmd`, `isql`, `mysql`, ...) may run a non-read statement against. Must be literals in the command. **Missing or empty: every generic-client write blocks.** |
+| `target_hosts` | no | hosts / DSN names a generic SQL client (`psql`, `sqlcmd`, `isql`, `mysql`, ...) may run a non-read statement against. Every host candidate on the line (`-h`/`-S`/`--host`, `PGHOST=`, a positional or `-d` URI / conninfo) must be a literal in the list, and there must be at least one. **Missing or empty: every generic-client write blocks.** |
 | `bundle_targets` | no | targets `databricks bundle deploy\|run\|destroy` and `dbt run\|build\|seed` may use with a literal `-t/--target`. **Missing or empty: every deploy blocks.** |
 | `forbidden_bundle_targets` | no | extra denylist on top of `bundle_targets`; default `["prod", "production"]`. |
 
@@ -104,9 +104,13 @@ securable is not in `catalogs`, non-GET or bodied REST calls to a Databricks hos
 (`auth login`, `--profile`, `DATABRICKS_TOKEN=`... around a Databricks client, writes to
 `.databrickscfg` / `~/.databricks/` / `~/.config/databricks/`, `auth token|env` which print the
 token), `EXPLAIN ANALYZE <write>` and side-effecting functions (`nextval`, `pg_terminate_backend`,
-`dblink`, `DBMS_*`, `OPENROWSET`, ...) on a legacy source, writes under `.migration/` except
-`recon/` and `waves/`, edits to the running guard's own plugin tree, and anything the guard cannot
-read (unreadable scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`). Python/JDBC/Spark programs are
+`dblink`, `DBMS_*`, `OPENROWSET`, ...) and lock / transaction tokens that hold the source (`WITH (TABLOCKX|XLOCK|UPDLOCK|HOLDLOCK|SERIALIZABLE)`,
+`FOR UPDATE|SHARE`, `LOCKING ... FOR WRITE|EXCLUSIVE`, `SET TRANSACTION READ WRITE`) on a legacy source -- `SET TRANSACTION
+ISOLATION LEVEL <any>` / `READ ONLY`, `NOLOCK`-style hints and Teradata `LOCKING ... FOR ACCESS|READ` are reads --, writes under `.migration/` except
+`recon/` and `waves/`, edits to the running guard's own plugin tree, a program the guard has no rule for in front of a SQL
+client (`strace`, `chroot`, `firejail`, ...; `env`, `nice`, `nohup`, `timeout`, `sudo`, `ssh host`, `docker exec|run`, `kubectl exec` are modelled), and anything the guard cannot
+read (unreadable scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`, a relative script after a `cd` it cannot resolve). Every relative
+script or SQL file is read from the directory the command runs in (event `cwd`, `cd`, `pushd`, `env -C`, `git -C`). Python/JDBC/Spark programs are
 only cheaply inspected for literal SQL; the factory-doctor's read-only-principal row is the control
 for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row there to pin a new shape.
 
