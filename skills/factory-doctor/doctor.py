@@ -557,8 +557,10 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
 # (object, privilege) rows for a write path that bypasses table grants: IMPERSONATE on a visible
 # login/user, EXECUTE on any procedure in the source database (every proc is assumed to write),
 # EXECUTE on a SECURITY DEFINER or explicitly-granted function in an in-scope schema, and on
-# Postgres every role SET ROLE can reach (`pg_has_role(..., 'MEMBER')` is transitive, so a writer
-# behind an intermediate role counts) that holds a write on an in-scope table or schema. Every value
+# Postgres every role the session can reach through memberships (`pg_has_role` is transitive, so a
+# writer behind an intermediate role counts; on 16+ only memberships that inherit (USAGE) or can
+# SET ROLE (SET), since a `SET FALSE, INHERIT FALSE` grant confers nothing; before 16 MEMBER implied
+# both) that holds a write on an in-scope table or schema. Every value
 # is a question about the principal; nothing here can change the source. Families without an
 # entry are reported `unverified`, never `ok`.
 _SRV_ROLES = ("sysadmin", "securityadmin", "serveradmin", "dbcreator", "bulkadmin")
@@ -599,8 +601,9 @@ _PRIVILEGE_QUERIES = {
         "functions": "SELECT n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', "
                      "'EXECUTE' FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = ANY(%s) "
                      "AND (p.prosecdef OR p.proacl IS NOT NULL) AND has_function_privilege(p.oid, 'EXECUTE') ORDER BY 1",
-        "members": "SELECT rolname FROM pg_roles WHERE rolname <> current_user "
-                   "AND pg_has_role(current_user, oid, 'MEMBER') ORDER BY 1",
+        "members": "SELECT rolname FROM pg_roles WHERE rolname <> current_user AND pg_has_role(current_user, oid, "
+                   "CASE WHEN current_setting('server_version_num')::int >= 160000 THEN 'USAGE, SET' ELSE 'MEMBER' END) "
+                   "ORDER BY 1",
         "as_role": "SELECT has_table_privilege(%s, %s, 'INSERT,UPDATE,DELETE,TRUNCATE'), has_schema_privilege(%s, %s, 'CREATE')",
         "read_only": "SELECT current_setting('transaction_read_only')",
     },
