@@ -6,7 +6,8 @@ Reads a Devin PreToolUse event on stdin ({"tool_name", "tool_input": {"command"}
 
 * `databricks` / `spark-sql` / `dbsqlcli`: an explicit read allowlist (`_DBX_READ`) passes; a mutation needs a securable in an
   allowlisted catalog; SQL (flags, positionals, `.sql` files) may write only to allowlisted catalogs (three-part names, `USE
-  CATALOG`, `--catalog`); `catalogs: ["*"]` is the catalog literally named `*`. REST (`curl`/`wget`/`http`) to a workspace
+  CATALOG`, `--catalog`); catalog lifecycle, grants and `_METASTORE` securables (shares, recipients, connections, locations,
+  credentials) always block; `catalogs: ["*"]` is the catalog literally named `*`. REST (`curl`/`wget`/`http`) to a workspace
   host: GET without a body only. `bundle deploy|run|destroy` and `dbt run|build|seed`: a literal `-t/--target` in
   `bundle_targets`, never a forbidden one.
 * Identity: `auth login|configure|token|env`, `--profile`/`--host`, `DATABRICKS_*=` around a client, writes to the CLI's
@@ -59,6 +60,7 @@ _PROBE = re.compile(re.escape(PROBE_SENTINEL) + r"\w*")
 
 _SEG = r"(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$-]*)"   # one identifier part, quoted or bare
 _OBJ = r"TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE"
+_METASTORE = r"SHARE|RECIPIENT|PROVIDER|CONNECTION|EXTERNAL\s+LOCATION|STORAGE\s+CREDENTIAL|SERVICE\s+CREDENTIAL|CLEAN\s+ROOM"   # catalog-less
 # a write statement's verb phrase; the match ends where its target securable starts
 _WRITE = re.compile(
     rf"""(?:\b(?:
@@ -68,8 +70,8 @@ _WRITE = re.compile(
       | (?:TRUNCATE|REPLACE|RESTORE|REFRESH|REORG|ANALYZE)\s+TABLE | (?:OPTIMIZE|VACUUM)(?:\s+TABLE)? | REFRESH\s+MATERIALIZED\s+VIEW
       | SYNC\s+(?:AS\s+EXTERNAL\s+)?(?=(?:SCHEMA|TABLE)\b)(?:TABLE\s+)?
       | CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+|EXTERNAL\s+|STREAMING\s+|MATERIALIZED\s+|LIVE\s+)*
-        (?=(?:{_OBJ}|SCHEMA|DATABASE|CATALOG)\b)(?:(?:{_OBJ})\s+(?:IF\s+NOT\s+EXISTS\s+)?)?
-      | (?:DROP|ALTER)\s+(?=(?:{_OBJ}|SCHEMA|DATABASE|CATALOG)\b)(?:(?:{_OBJ})\s+(?:IF\s+EXISTS\s+)?)?
+        (?=(?:{_OBJ}|SCHEMA|DATABASE|CATALOG|{_METASTORE})\b)(?:(?:{_OBJ})\s+(?:IF\s+NOT\s+EXISTS\s+)?)?
+      | (?:DROP|ALTER)\s+(?=(?:{_OBJ}|SCHEMA|DATABASE|CATALOG|{_METASTORE})\b)(?:(?:{_OBJ})\s+(?:IF\s+EXISTS\s+)?)?
       | UNDROP\s+(?=(?:TABLE|SCHEMA)\b)(?:TABLE\s+)?
       | COMMENT\s+ON\s+(?:(?:{_OBJ}|MATERIALIZED\s+VIEW|COLUMN)\s+)?
       | (?:GRANT|REVOKE|DENY)\s+.+?\bON\s+(?:(?:{_OBJ}|MATERIALIZED\s+VIEW)\s+)?
@@ -879,9 +881,9 @@ def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, who: st
         head = stmt.strip().split("\n", 1)[0][:80]
         if _IDENTIFIER_DYNAMIC.search(stmt):
             violations.append(f"IDENTIFIER(<non-literal>) names the target of a write at run time: `{head}`")
-        elif who and re.match(_PERMISSION.format(c="|".join(cats)), stmt, re.IGNORECASE | re.DOTALL):
-            violations.append(f"catalog lifecycle / permission change `{head}`; the allowlist authorizes object writes inside a "
-                              "catalog, never grants or the catalog itself (those happen at STOP E)")
+        elif who and re.match(_PERMISSION.format(c="|".join((*cats, _METASTORE))), stmt, re.IGNORECASE | re.DOTALL):
+            violations.append(f"catalog / metastore lifecycle or permission change `{head}`; the allowlist authorizes object writes "
+                              "inside a catalog, never grants or the containers themselves (those happen at STOP E)")
         elif cat is not None:
             if cat not in allowed:
                 violations.append(f"write to catalog(s) {[cat]} outside allowlist {sorted(allowed)}: `{head}`")
