@@ -40,11 +40,11 @@ def test_untested_source_families_fail_fast_before_any_driver_or_the_target_is_t
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
     for loader in ("load_mapping_spec", "load_tolerances", "load_canon_rules"):
-        monkeypatch.setattr(cli, loader, lambda *a: None)
+        monkeypatch.setattr(cli, loader, lambda *a, name=loader: pytest.fail(f"{name} ran before the family was refused"))
     monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: pytest.fail("target was built"))
     with pytest.raises(SystemExit, match=f"^--family {family}: {family} source adapter is untested; see SKILL.md$"):
-        cli.main(["run", "--unit", "u", "--family", family, "--mapping", "m", "--tolerances", "t",
-                  "--canonicalization", "c", "--mode", "fixture", "--source-dsn-secret", "SOURCE",
+        cli.main(["run", "--unit", "u", "--family", family, "--mapping", "missing", "--tolerances", "missing",
+                  "--canonicalization", "missing", "--mode", "fixture", "--source-dsn-secret", "SOURCE",
                   "--target-secret", "TARGET", "--target-catalog", "mig", "--target-schema", "s",
                   "--out", str(tmp_path / "out")])
 

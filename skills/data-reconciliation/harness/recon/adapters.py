@@ -1039,6 +1039,11 @@ SOURCE_ADAPTERS = {
 }
 
 
+def is_untested_source_family(family: str) -> bool:
+    adapter = SOURCE_ADAPTERS[family]
+    return isinstance(adapter, type) and issubclass(adapter, _UntestedSourceAdapter)
+
+
 # ---- Databricks target ------------------------------------------------------------------
 
 def _databricks_connect(secret_name: str):

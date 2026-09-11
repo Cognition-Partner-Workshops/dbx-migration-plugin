@@ -221,6 +221,16 @@ def main(argv: list[str] | None = None) -> int:
     target_schema = _single_identifier(args.target_schema, "target-schema")
     if target_catalog not in allowed_catalogs:
         raise SystemExit(f"--target-catalog {target_catalog!r} is not in {args.allowed_targets_file}")
+    from .adapters import (
+        SOURCE_ADAPTERS,
+        DatabricksTargetAdapter,
+        LakebaseTargetAdapter,
+        TargetIdentityError,
+        is_untested_source_family,
+    )
+    if is_untested_source_family(args.family):  # refused before any input file is read
+        raise SystemExit(f"--family {args.family}: {args.family} source adapter is untested; "
+                         "see SKILL.md")
 
     spec = load_mapping_spec(args.mapping, params)
     tol = load_tolerances(args.tolerances)
@@ -238,17 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"ops entry missing required keys: {op.get('name', '?')}")
             for key in ("source_sql", "target_sql"):
                 _validate_sql(op[key], op.get("name", "?"))
-    from .adapters import (
-        SOURCE_ADAPTERS,
-        DatabricksTargetAdapter,
-        LakebaseTargetAdapter,
-        TargetIdentityError,
-    )
-
-    try:
-        source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
-    except NotImplementedError as exc:  # an untested family: refused before any connection
-        raise SystemExit(f"--family {args.family}: {exc}") from None
+    source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
     if args.target_kind == "lakebase":
         # --target-catalog names the Lakebase database; the adapter refuses a DSN that lands
         # anywhere else, so the allowlist binds the connection and not just the label
