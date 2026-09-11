@@ -449,6 +449,12 @@ def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_repo
     assert tampered == ["verifier output invalid: ledger tampered, changed .migration/allowed_targets.json"]
     unverifiable = validate_verify(ok, passed, False, wave=2, observed=None)
     assert len(unverifiable) == 1 and "recon/wave-2" in unverifiable[0] and "git" in unverifiable[0]
+    # the branch is diffed from the launch base, so PRs the verifier merged show up in it: the passed
+    # units' own evidence is theirs to have changed, anything else under .migration/ is not
+    merged = [".migration/recon/wave-2/report.md", "src/loans.sql", ".migration/recon/u/result.json"]
+    assert validate_verify(ok, passed, False, wave=2, observed=merged) == []
+    problems = validate_verify(ok, passed, False, wave=2, observed=[*merged, ".migration/recon/other/result.json"])
+    assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/other/result.json"]
     src = WORKFLOW.read_text()
     assert 'validate_verify(verify, passed, auto_merge, WAVE, ref_changed_paths(f"recon/wave-{WAVE}"))' in src
 
@@ -490,11 +496,11 @@ def _launch_ns(tmp_path, fake_run):
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
-                    and node.name in {"fresh_doctor_report", "pr_changed_paths", "ref_changed_paths"})
+                    and node.name in {"fresh_doctor_report", "pr_changed_paths", "ref_changed_paths", "wave_base"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id == "PR_URL" for t in node.targets))]
     ns = {"json": json, "os": os, "re": re, "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
-          "BASE_BRANCH": "main", "REPO": "github.com/acme/dbx-target",
+          "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target",
           "DOCTOR_PY": Path("/plugin/skills/factory-doctor/doctor.py"),
           "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json"}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
@@ -567,13 +573,13 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
 
     ns = _launch_ns(tmp_path, fake_run)
     assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == ["src/a.sql", ".migration/allowed_targets.json"]
-    # the base is refreshed first: the verifier merges PRs into it during the wave, so a clone-time
-    # origin/main would attribute every merged unit's recon evidence to the next diff
-    assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]
     # the host writes refs/pull/N/head; the child's branch name never reaches git
-    assert calls[1] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "refs/pull/42/head"]
-    # --no-renames: a ledger file moved under an allowed recon/ path must still surface its old path
-    assert calls[2][3:] == ["diff", "--name-only", "--no-renames", "origin/main...FETCH_HEAD"]
+    assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "refs/pull/42/head"]
+    # --no-renames: a ledger file moved under an allowed recon/ path must still surface its old path.
+    # The diff is anchored at the base SHA snapshotted at launch, not at origin/main: a PR already
+    # merged into the base would otherwise be its own merge base and diff to nothing
+    assert calls[1][3:] == ["diff", "--name-only", "--no-renames", "b" * 40 + "...FETCH_HEAD"]
+    assert len(calls) == 2
     calls.clear()
     for url in ("https://github.com/other/repo/pull/42", "https://github.com/acme/dbx-target/pull/x",
                 "https://github.com/acme/dbx-target/pull/42/../../other/repo/pull/1", "", None, 42):
@@ -585,6 +591,30 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
 
     assert _launch_ns(tmp_path, failing)["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") is None
     assert _launch_ns(tmp_path, failing)["ref_changed_paths"]("recon/wave-2") is None
+
+
+def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_merge(tmp_path):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="a" * 40 + "\n")
+
+    ns = _launch_ns(tmp_path, fake_run)
+    assert ns["wave_base"]() == "a" * 40
+    assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]
+    assert calls[1] == ["git", "-C", str(tmp_path), "rev-parse", "--verify", "origin/main^{commit}"]
+
+    def failing(cmd, **kw):
+        raise subprocess.CalledProcessError(128, cmd)
+
+    with pytest.raises(SystemExit, match="main"):
+        _launch_ns(tmp_path, failing)["wave_base"]()
+    src = WORKFLOW.read_text()
+    # taken right after the manifest is validated, before the doctor run and any child; a resumed run
+    # keeps the SHA its first launch recorded rather than re-reading a base the verifier has merged into
+    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = .*wave_base\(\)\n", src)
+    assert 'prior.get("base_sha")' in src and '"base_sha": BASE_SHA' in src
 
 
 def test_git_observed_ledger_changes_beat_a_clean_self_report():

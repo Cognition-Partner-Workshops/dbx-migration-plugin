@@ -264,23 +264,35 @@ def fresh_doctor_report(m):
     return report
 
 
+def wave_base():
+    """The base branch's commit on origin, now. Every ledger diff of this run is anchored here: the
+    verifier merges PRs into the base during the wave, so a later origin/<base> would both hide a PR it
+    already contains (the head becomes its own merge base) and attribute merged units to the next diff."""
+    git = ["git", "-C", str(ROOT)]
+    try:
+        subprocess.run(git + ["fetch", "-q", "origin", f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}"],
+                       check=True, capture_output=True, timeout=300)
+        r = subprocess.run(git + ["rev-parse", "--verify", f"origin/{BASE_BRANCH}^{{commit}}"],
+                           check=True, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SystemExit(f"cannot resolve origin/{BASE_BRANCH} in {ROOT} ({e}); the ledger gate needs the base commit")
+    return r.stdout.strip()
+
+
 validate_manifest(MANIFEST)
+BASE_SHA = (prior.get("base_sha") if resume and isinstance(prior, dict) else None) or wave_base()
 DOCTOR = fresh_doctor_report(MANIFEST)
 validate_manifest(MANIFEST, DOCTOR)
 
 
 def ref_changed_paths(ref):
-    """Paths a ref on origin changes against the base, from git. None when git cannot answer, and then
-    no PASS stands. Callers pass refs the workflow built itself, never a name a child reported.
-    Renames are reported as delete + add so a ledger file moved under recon/ still names its old path.
-    The base is refreshed first: the verifier merges PRs into it during the wave, so the clone-time
-    origin/<base> would attribute every merged unit's recon evidence to the next ref diffed."""
+    """Paths a ref on origin changes against the launch base, from git. None when git cannot answer, and
+    then no PASS stands. Callers pass refs the workflow built itself, never a name a child reported.
+    Renames are reported as delete + add so a ledger file moved under recon/ still names its old path."""
     git = ["git", "-C", str(ROOT)]
     try:
-        subprocess.run(git + ["fetch", "-q", "origin", f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}"],
-                       check=True, capture_output=True, timeout=300)
         subprocess.run(git + ["fetch", "-q", "origin", ref], check=True, capture_output=True, timeout=300)
-        r = subprocess.run(git + ["diff", "--name-only", "--no-renames", f"origin/{BASE_BRANCH}...FETCH_HEAD"],
+        r = subprocess.run(git + ["diff", "--name-only", "--no-renames", f"{BASE_SHA}...FETCH_HEAD"],
                            check=True, capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -309,7 +321,8 @@ def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
 
 def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> list[str]:
     """Return verifier-output problems without reading files or mutating input. `observed` is what git
-    says the verifier's recon/wave-N branch changes (None: it could not be fetched or diffed)."""
+    says the verifier's recon/wave-N branch changes against the launch base (None: it could not be
+    fetched or diffed); PRs the verifier merged are in it, so the passed units' own evidence is allowed."""
     problems = []
     if not isinstance(verify, dict):
         return ["verifier output invalid: expected an object"]
@@ -359,8 +372,9 @@ def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> lis
     if wave is not None and observed is None:
         problems.append(f"verifier output invalid: branch recon/wave-{wave} not verifiable from git (fetch or diff "
                         "failed), ledger integrity unverified")
+    units = [u for p in passed for u in p.get("units", [])]
     problems += [f"verifier output invalid: ledger tampered, changed {p}"
-                 for p in ledger_violations(sorted({*changed, *(observed or [])}), [], wave)]
+                 for p in ledger_violations(sorted({*changed, *(observed or [])}), units, wave)]
     return problems
 
 WAVE = MANIFEST["wave"]
@@ -745,7 +759,7 @@ async def main():
     result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
     result_tmp.write_text(json.dumps({
         "wave": WAVE, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
-        "run_id": os.environ.get("WAVE_RUN_ID"),
+        "run_id": os.environ.get("WAVE_RUN_ID"), "base_sha": BASE_SHA,
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
         "closed": closed,
         "write_target_overlaps": surprises,
