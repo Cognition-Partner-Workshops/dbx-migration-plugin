@@ -1098,6 +1098,18 @@ def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str 
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 
+def _dirs(event: dict, tool_input: dict) -> tuple[Path, str, str]:
+    """(workspace root whose allowlist applies, the command's directory or '' when unknown, the directory git runs in).
+    The project dir is the workspace; hosted sessions set it to `/` and run the hook from `/`, so there the command's own
+    `workdir` (or the session's $HOME when the tool gave none) is the workspace."""
+    def abs_(v: object) -> str:
+        return v if isinstance(v, str) and v.startswith("/") and v != "/" else ""
+    workdir, cwd = abs_(tool_input.get("workdir")), abs_(event.get("cwd"))
+    here = workdir or abs_(os.getcwd()) or str(Path.home())
+    project = abs_(os.environ.get("CLAUDE_PROJECT_DIR")) or abs_(os.environ.get("DEVIN_PROJECT_DIR"))
+    return Path(project or workdir or here), cwd or workdir, here
+
+
 def main(stdin_text: str | None = None) -> int:
     raw = stdin_text if stdin_text is not None else sys.stdin.read()
     try:
@@ -1108,8 +1120,7 @@ def main(stdin_text: str | None = None) -> int:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str) or not command.strip():
         return 0
-    cwd = c if isinstance(c := event.get("cwd"), str) and c.startswith("/") else ""
-    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("DEVIN_PROJECT_DIR") or os.getcwd())
+    root, cwd, here = _dirs(event, tool_input)
     try:
         cfg = load_config(root)
     except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
@@ -1117,7 +1128,7 @@ def main(stdin_text: str | None = None) -> int:
     else:
         if cfg is None:
             return 0
-        verdict = evaluate_with_workdirs(command, cfg, root, cwd, os.getcwd())
+        verdict = evaluate_with_workdirs(command, cfg, root, cwd, here)
     if verdict.reason:
         print(json.dumps({"decision": verdict.decision, "reason": verdict.reason}))
     if verdict.decision == "block":
