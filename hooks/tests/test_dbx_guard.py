@@ -14,6 +14,8 @@ import dbx_guard as g  # noqa: E402
 CFG = g.GuardConfig.from_dict({
     "catalogs": ["mig_cat"],
     "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp.example", "legacy-prod"],
+    "target_hosts": ["localhost"],
+    "bundle_targets": ["migration"],
 })
 
 
@@ -58,13 +60,11 @@ def block(cmd: str, cfg=CFG):
     "databricks bundle deploy -t migration",
     "databricks bundle run --target migration nightly_orders",
     "databricks schemas create wave1_u12 mig_cat",
-    "databricks schemas delete mig_cat.wave1_u12",
-    "databricks grants update schema mig_cat.wave1_u12 --json '{\"changes\": []}'",
     "databricks jobs list",
     "bteq <<'EOF'\n.LOGON tdprod.corp.example/svc_ro;\nSELECT COUNT(*) FROM sales.orders;\n.QUIT\nEOF",
     "docker exec -i sybase-fixture isql -Usa -Q 'SELECT TOP 5 * FROM dbo.loans'",
-    "psql -h localhost -d fixture -c \"CREATE TABLE loans (id int)\"",
-    "psql -h localhost -d fixture -c \"INSERT INTO loans VALUES (1)\"",
+    "psql -h localhost -d mig_cat -c \"CREATE TABLE loans (id int)\"",   # round 8: the database must be allowlisted too
+    "psql -h localhost -d mig_cat -c \"INSERT INTO loans VALUES (1)\"",
     "python3 -c \"print('DROP TABLE is a string in a test fixture name')\"",
     "grep -rn 'INSERT INTO' skills/ | head",
     "echo 'the updated_at column and the deleted flag' > notes.txt",
@@ -78,7 +78,7 @@ def test_allowed(cmd):
 @pytest.mark.parametrize("cmd", [
     "git commit -m 'unit u12: INSERT INTO prod_cat.sales.orders SELECT ... is the legacy load, converted'",
     "git commit -am \"MERGE INTO prod_cat.s.t rewritten as MERGE INTO mig_cat.s.t\"",
-    "echo 'CREATE TABLE prod_cat.sales.orders_v2 (id INT)' >> .migration/05_findings.md",
+    "echo 'CREATE TABLE prod_cat.sales.orders_v2 (id INT)' >> 05_findings.md",
     "echo \"-- legacy: UPDATE other_cat.s.t SET a = 1\" > notes.sql",
     "printf '%s\\n' 'DROP TABLE prod_cat.s.t' 'INSERT INTO prod_cat.s.t SELECT 1' > converted/todo.txt",
     "cat > analysis.md <<'EOF'\nThe legacy job runs INSERT INTO prod_cat.sales.orders nightly.\nEOF",
@@ -87,6 +87,21 @@ def test_allowed(cmd):
 ])
 def test_sql_text_outside_any_client_is_prose(cmd):
     approve(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'CREATE TABLE prod_cat.sales.orders_v2 (id INT)' >> .migration/05_findings.md",  # A2a: ledger write
+    "databricks --profile $PROFILE experimental aitools tools query \"SELECT 1\"",  # A3: profile swap
+    "databricks --profile demo experimental aitools tools query \"SELECT 1 -- DROP TABLE prod_cat.s.t\"",  # A3: profile swap
+    "bash -c \"databricks --profile demo experimental aitools tools query 'INSERT INTO mig_cat.s.t SELECT 1'\"",  # A3: profile swap
+    "jq -n '{}' | databricks api post /api/2.1/jobs/create",  # A4: CLI mutation outside the read allowlist
+    "(echo x | bteq; cat write.sql) < read.sql",  # A6: opaque `echo x` stdin into a legacy-only client
+    "databricks schemas delete mig_cat.wave1_u12",  # probe2 #4: catalog lifecycle is not an object write
+    "databricks grants update schema mig_cat.wave1_u12 --json '{\"changes\": []}'",  # probe2 #4: permissions are not object writes
+])
+def test_expectations_flipped_by_the_red_team_review(cmd):
+    """Rows that approved before the red-team review; each encodes a finding the review condemned."""
+    block(cmd)
 
 
 # ...and the same statement handed to a client is still a write
@@ -338,7 +353,7 @@ def test_runtime_built_statement_is_blocked(cmd, needle):
 @pytest.mark.parametrize("cmd", [
     # expansion outside the SQL argument (connection, secret name, paths, flags) stays readable
     "psql \"$LEGACY_TD_DSN\" -c \"SELECT count(*) FROM sales.orders\"",
-    "databricks --profile $PROFILE experimental aitools tools query \"SELECT 1\"",
+    "databricks -o json experimental aitools tools query \"SELECT 1\" > $OUT",
     "dbx-recon run --unit $UNIT --family teradata --source-dsn-secret LEGACY_TD_DSN --target-catalog mig_cat --out $OUT",
     "$HOME/bin/sqlplus -S svc_ro@tdprod.corp.example <<'EOF'\nSELECT 1 FROM dual;\nEOF",
     "sqlcmd -S legacy-prod -Q 'SELECT * FROM dbo.rates WHERE amt > $100'",
@@ -402,7 +417,7 @@ def test_shell_words_are_not_sql_comments(cmd):
 @pytest.mark.parametrize("cmd", [
     # inside a SQL argument a comment is a comment in every shape SQL allows: compact, with an
     # apostrophe or quotes in it, in a single- or double-quoted argument, in a heredoc body
-    "databricks --profile demo experimental aitools tools query \"SELECT 1 -- DROP TABLE prod_cat.s.t\"",
+    "databricks -o json experimental aitools tools query \"SELECT 1 -- DROP TABLE prod_cat.s.t\"",
     "databricks experimental aitools tools query \"SELECT 1 --DROP TABLE prod_cat.s.t\"",
     "databricks experimental aitools tools query \"SELECT 1 -- don't DROP TABLE prod_cat.s.t\"",
     "databricks experimental aitools tools query \"SELECT 1 /* it's fine: DROP TABLE prod_cat.s.t */\"",
@@ -417,7 +432,7 @@ def test_shell_words_are_not_sql_comments(cmd):
     # the same inside the body of `sh -c`
     "bash -c \"databricks experimental aitools tools query 'SELECT 1 -- DROP TABLE prod_cat.s.t'\"",
     "bash -c 'databricks experimental aitools tools query \"SELECT 1 -- DROP TABLE prod_cat.s.t\"'",
-    "bash -c \"databricks --profile demo experimental aitools tools query 'INSERT INTO mig_cat.s.t SELECT 1'\"",
+    "bash -c \"databricks -o json experimental aitools tools query 'INSERT INTO mig_cat.s.t SELECT 1'\"",
     # a literal is still a literal
     "databricks experimental aitools tools query \"SELECT * FROM mig_cat.s.t WHERE note = 'DROP TABLE prod_cat.s.t'\"",
 ])
@@ -595,196 +610,99 @@ def test_redirection_operands_and_here_strings_are_not_scripts(tmp_path: Path):
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
 
 
+# ------------------------------------------------- pipeline / redirection shapes (black-box)
+# Formerly white-box tests on the bash model (`_script_inputs`, `_shell_tokens`, `_commands`).
+# Same command strings; the decision is the one the fail-closed model gives. Fixture files:
+# read.sql = SELECT, write.sql / fix.sql / `2` / `0` = UPDATE; a.sql, other.sql, gen.py, foo2, 20
+# do not exist.
+
+def _shapes_ws(tmp_path: Path) -> Path:
+    write = "UPDATE sales.orders SET status = 'X';\n"
+    for name in ("fix.sql", "write.sql", "2", "0"):
+        (tmp_path / name).write_text(write)
+    (tmp_path / "read.sql").write_text("SELECT 1;\n")
+    return tmp_path
+
+
 @pytest.mark.parametrize("cmd", [
+    # text piped into a client is its script
     "cat <<EOF | bteq\n@fix.sql\nEOF",
     "cat <<EOF | sqlplus svc@tdprod.corp.example\nSET ECHO ON;\n@fix.sql\nEOF",
     "cat <<EOF | tee /nonexistent/copy | bteq\n@fix.sql\nEOF",
-    "cat fix.sql | bteq",
-    "cat < fix.sql | bteq",
-    "echo @fix.sql | bteq",
-])
-def test_text_piped_into_a_client_is_its_script(cmd, tmp_path: Path):
-    (tmp_path / "fix.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
-    assert g._script_inputs(cmd, CFG) == ["fix.sql"], cmd
-    v = g.evaluate(cmd, CFG, root=tmp_path)
-    assert v.decision == "block" and "read-only" in v.reason, cmd
-
-
-def test_opaque_text_piped_into_a_legacy_client_is_blocked(tmp_path: Path):
-    for cmd in ("sed 's/x/y/' fix.sql | bteq", "python3 gen.py | sqlplus svc@tdprod.corp.example",
-                "cat $F | bteq", "gunzip -c fix.sql.gz | bteq"):
-        v = g.evaluate(cmd, CFG, root=tmp_path)
-        assert v.decision == "block", cmd
-    for cmd in ("cat <<EOF | bteq\nSELECT 1;\nEOF", "printf 'SELECT 1' | bteq",
-                "databricks jobs list | jq .", "jq -n '{}' | databricks api post /api/2.1/jobs/create"):
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
-
-
-@pytest.mark.parametrize("cmd", [
-    "cat write.sql |& bteq",
-    "cat write.sql |\n bteq",
-    "cat write.sql | \n bteq",
+    "cat fix.sql | bteq", "cat < fix.sql | bteq", "echo @fix.sql | bteq",
+    # opaque producers
+    "sed 's/x/y/' fix.sql | bteq", "python3 gen.py | sqlplus svc@tdprod.corp.example",
+    "cat $F | bteq", "gunzip -c fix.sql.gz | bteq",
+    "(cat read.sql; sed 's/x/y/' other.sql) | bteq", "{ python3 gen.py; cat read.sql; } |& bteq",
+    "ls | (cd /tmp; bteq)", "(python3 gen.py) 2>&1 | bteq", "{ cat read.sql; python3 gen.py; } 2>&1 | bteq",
+    # every pipeline shape carries the producer's text
+    "cat write.sql |& bteq", "cat write.sql |\n bteq", "cat write.sql | \n bteq",
     "cat <<EOF |\n@write.sql\nEOF\nbteq",
-    "(cat write.sql; echo 'SELECT 1;') | bteq",
-    "( cat write.sql ) | bteq",
+    "(cat write.sql; echo 'SELECT 1;') | bteq", "( cat write.sql ) | bteq",
     "{ cat write.sql; echo 'SELECT 1;'; } | bteq",
     "(echo 'SELECT 1;'; (cat write.sql)) | sqlplus svc@tdprod.corp.example",
     "(cat write.sql; echo 'SELECT 1;') | tee /nonexistent/log | bteq",
-    "cat write.sql | (cd /tmp; bteq)",
-    "cat write.sql | { echo start; bteq; }",
-    "cat write.sql | (echo start; (bteq))",
+    "cat write.sql | (cd /tmp; bteq)", "cat write.sql | { echo start; bteq; }",
+    "cat write.sql | (echo start; (bteq))", "(cat write.sql | bteq) 2>&1 > /dev/null",
+    # a digit operand is a file, not a descriptor
+    "cat 2 | bteq", "cat 2 >/dev/null | bteq", "true 2>/dev/null; cat 2 >log | bteq",
+    "cat 2 > /dev/null 2>&1 | bteq", "echo '2>&1' > /dev/null; cat 2 >&2 | bteq",
+    "cat '2'>/dev/null | bteq", 'cat "2">/dev/null | bteq', "cat \\2>/dev/null | bteq",
+    "cat '2'>&1 | bteq", "cat ''2>/dev/null | bteq", "cat '2'>/dev/null 2>&1 | bteq",
+    "(echo 'SELECT 1;'; cat '2') 2>&1 | bteq",
+    # unreadable operands (the file does not exist) fail closed
+    "cat read.sql foo2>/dev/null | bteq", 'cat "2"0<read.sql | bteq', "cat a\\ b 2 >/dev/null | bteq",
+    # input redirections
+    "cat 0<write.sql | bteq", "bteq 0<write.sql", "cat 0 < read.sql | bteq", "cat - read.sql < 0 | bteq",
+    "cat < write.sql | bteq",
+    # a redirection after a group belongs to the group
+    "(cat write.sql) 2>&1 | bteq", "{ cat write.sql; } 2>/dev/null | bteq",
+    "(bteq) < write.sql", "(cat read.sql; cat write.sql) 2>&1 | bteq",
+    # a group input reaches every member ...
+    "(bteq; echo done) < write.sql", "{ bteq; echo done; } < write.sql",
+    "{ echo start; bteq; echo done; } < write.sql", "(echo start; bteq) 0<write.sql",
+    "((bteq); echo done) < write.sql", "(true; (bteq; echo); echo) < write.sql",
+    "(bteq; echo done) < write.sql > /dev/null 2>&1",
+    "(bteq < read.sql; sqlplus svc@tdprod.corp.example) < write.sql",
+    "(bteq < write.sql; echo) < read.sql",
+    "(cat | bteq) < write.sql", "(cat - | bteq) < write.sql", "(cat read.sql - | bteq) < write.sql",
+    "(cat read.sql | bteq; sqlplus svc@tdprod.corp.example) < write.sql",
+    "(bteq < read.sql; bteq) < write.sql", "(cat read.sql | (bteq); bteq) < write.sql",
+    "(bteq <&0) < write.sql", "(bteq 0<&0) < write.sql", "(cat <&0 | bteq) < write.sql",
+    "(bteq) < read.sql < write.sql", "(bteq) < write.sql < read.sql",
+    "{ bteq; } 0<read.sql < write.sql", "(cat | bteq) < read.sql < write.sql",
+    # ... including members whose own stdin bash would have taken instead: the fail-closed model
+    # does not fuse descriptors, so a write file redirected onto a group blocks whatever the
+    # member's own `<`, heredoc, here-string, pipe or `<&-`/`<&3` would have done
+    "(bteq < read.sql; echo) < write.sql", "(bteq 0<read.sql) < write.sql",
+    "((bteq) < read.sql; echo) < write.sql", "(cat read.sql | bteq) < write.sql",
+    "(cat read.sql | (echo; bteq)) < write.sql", "(cat read.sql | { echo; bteq; }) < write.sql",
+    "(bteq <<< 'SELECT 1') < write.sql", "(bteq <<EOF\nSELECT 1;\nEOF\n) < write.sql",
+    "(bteq <&-) < write.sql", "(bteq <&3) < write.sql", "((bteq) < read.sql) < write.sql",
+    "(bteq < read.sql) < write.sql; echo",
 ])
-def test_every_pipeline_shape_into_a_client_carries_its_producers_text(cmd, tmp_path: Path):
-    (tmp_path / "write.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
-    assert g._script_inputs(cmd, CFG) == ["write.sql"], cmd
-    v = g.evaluate(cmd, CFG, root=tmp_path)
-    assert v.decision == "block" and "read-only" in v.reason, cmd
+def test_pipeline_and_redirection_shapes_that_block(cmd, tmp_path: Path):
+    v = g.evaluate(cmd, CFG, root=_shapes_ws(tmp_path))
+    assert v.decision == "block", cmd
 
 
-def test_a_group_piped_into_a_legacy_client_is_judged_whole(tmp_path: Path):
-    (tmp_path / "read.sql").write_text("SELECT 1;\n")
-    for cmd in ("(cat read.sql; sed 's/x/y/' other.sql) | bteq",
-                "{ python3 gen.py; cat read.sql; } |& bteq", "ls | (cd /tmp; bteq)"):
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    for cmd in ("(cat read.sql; echo 'SELECT 2;') | bteq", "(cat read.sql) |& bteq",
-                "cat read.sql |\n bteq", "(cat a.sql) ; (cat read.sql) | bteq"):
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
-    # the group before `;` is not part of the pipeline
-    assert g._script_inputs("(cat a.sql) ; (cat read.sql) | bteq", CFG) == ["read.sql"]
-
-
-def test_descriptor_of_a_redirection_is_not_a_cat_operand(tmp_path: Path):
-    (tmp_path / "read.sql").write_text("SELECT 1;\n")
-    for cmd in ("cat 2>/dev/null < read.sql | bteq", "cat read.sql 2>&1 | bteq",
-                "cat 2> /dev/null read.sql | bteq"):
-        assert g._script_inputs(cmd, CFG) == ["read.sql"], cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
-    # a file that happens to be named with digits is still a script
-    (tmp_path / "2").write_text("UPDATE sales.orders SET status = 'X';\n")
-    assert g._script_inputs("cat 2 | bteq", CFG) == ["2"]
-    assert g.evaluate("cat 2 | bteq", CFG, root=tmp_path).decision == "block"
-    # ... also when a redirection follows it with a space: `2` is the operand, not a descriptor,
-    # however often the same digit sits against an operator elsewhere on the line
-    for cmd in ("cat 2 >/dev/null | bteq", "true 2>/dev/null; cat 2 >log | bteq",
-                "cat 2 > /dev/null 2>&1 | bteq", "echo '2>&1' > /dev/null; cat 2 >&2 | bteq"):
-        assert g._script_inputs(cmd, CFG) == ["2"], cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    # a descriptor is the whole word before the operator: `foo2>x` is the argument foo2
-    assert g._script_inputs("cat read.sql foo2>/dev/null | bteq", CFG) == ["read.sql", "foo2"]
-    # ... and only unquoted digits are one: quoted or escaped, `2` is a filename written against `>`
-    for cmd in ("cat '2'>/dev/null | bteq", 'cat "2">/dev/null | bteq', "cat \\2>/dev/null | bteq",
-                "cat '2'>&1 | bteq", "cat ''2>/dev/null | bteq", "cat '2'>/dev/null 2>&1 | bteq",
-                "(echo 'SELECT 1;'; cat '2') 2>&1 | bteq"):
-        assert "2" in g._script_inputs(cmd, CFG), cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    # `"2"0<f` is the word 20 with f on its stdin, which cat ignores in favour of its operand
-    assert g._script_inputs('cat "2"0<read.sql | bteq', CFG) == ["20"]
-    for cmd in ("cat '2'>/dev/null | bteq", 'cat "2">/dev/null | bteq', "cat \\2>/dev/null | bteq"):
-        assert g._shell_tokens(cmd) == ["cat", "2", ">", "/dev/null", "|", "bteq"], cmd
-    # the bare forms keep their meaning
-    assert g._shell_tokens("cat 2>/dev/null 0<read.sql | bteq") == ["cat", "2>", "/dev/null", "0<", "read.sql", "|", "bteq"]
-    assert g._script_inputs("cat 2>/dev/null 0<read.sql | bteq", CFG) == ["read.sql"]
-    # escaped whitespace shifts the words between the lexers: fuse nothing rather than guess
-    assert g._script_inputs("cat a\\ b 2 >/dev/null | bteq", CFG) == ["a b", "2"]
-
-
-def test_an_input_descriptor_written_against_its_operator_is_not_a_cat_operand(tmp_path: Path):
-    (tmp_path / "read.sql").write_text("SELECT 1;\n")
-    for cmd in ("cat 0<read.sql | bteq", "cat 0< read.sql | bteq", "cat 0<read.sql 2>&1 | bteq",
-                "bteq 0<read.sql", "cat read.sql 3<&0 | bteq"):
-        assert g._script_inputs(cmd, CFG) == ["read.sql"], cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
-    (tmp_path / "write.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
-    for cmd in ("cat 0<write.sql | bteq", "bteq 0<write.sql"):
-        assert g._script_inputs(cmd, CFG) == ["write.sql"], cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    # `0 < f` with a space is the file named 0 plus a stdin redirect: cat prints its operand and
-    # leaves the stdin alone
-    (tmp_path / "0").write_text("UPDATE sales.orders SET status = 'X';\n")
-    assert g._script_inputs("cat 0 < read.sql | bteq", CFG) == ["0"]
-    assert g.evaluate("cat 0 < read.sql | bteq", CFG, root=tmp_path).decision == "block"
-    assert g._script_inputs("cat read.sql < 0 | bteq", CFG) == ["read.sql"]
-    assert g._script_inputs("cat - read.sql < 0 | bteq", CFG) == ["read.sql", "0"]
-
-
-def test_a_redirection_after_a_group_belongs_to_the_group(tmp_path: Path):
-    (tmp_path / "read.sql").write_text("SELECT 1;\n")
-    for cmd in ("(cat read.sql) 2>&1 | bteq", "{ cat read.sql; } 2>&1 | bteq",
-                "(cat read.sql) 2>/dev/null | bteq", "(cat read.sql) >>/tmp/log 2>&1 | bteq",
-                "(echo 'SELECT 2;'; cat read.sql) 2>&1 | bteq",
-                "(cat read.sql) 2>&1 | tee /nonexistent/log | bteq",
-                "(bteq) < read.sql", "{ echo start; bteq; } < read.sql",
-                "(bteq 2>&1) 0<read.sql", "(bteq) 2>&1 < read.sql"):
-        assert g._script_inputs(cmd, CFG) == ["read.sql"], cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
-    (tmp_path / "write.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
-    for cmd in ("(cat write.sql) 2>&1 | bteq", "{ cat write.sql; } 2>/dev/null | bteq",
-                "(bteq) < write.sql", "(cat read.sql; cat write.sql) 2>&1 | bteq"):
-        assert "write.sql" in g._script_inputs(cmd, CFG), cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    # the redirection does not make an opaque producer readable
-    assert g.evaluate("(python3 gen.py) 2>&1 | bteq", CFG, root=tmp_path).decision == "block"
-    assert g.evaluate("{ cat read.sql; python3 gen.py; } 2>&1 | bteq", CFG, root=tmp_path).decision == "block"
-
-
-def test_a_group_input_redirection_reaches_every_command_in_the_group(tmp_path: Path):
-    (tmp_path / "read.sql").write_text("SELECT 1;\n")
-    (tmp_path / "write.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
-    for cmd in ("(bteq; echo done) < write.sql", "{ bteq; echo done; } < write.sql",
-                "{ echo start; bteq; echo done; } < write.sql", "(echo start; bteq) 0<write.sql",
-                "((bteq); echo done) < write.sql", "(true; (bteq; echo); echo) < write.sql",
-                "(bteq; echo done) < write.sql > /dev/null 2>&1",
-                "(bteq < read.sql; sqlplus svc@tdprod.corp.example) < write.sql"):
-        assert "write.sql" in g._script_inputs(cmd, CFG), cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    for cmd in ("(bteq; echo done) < read.sql", "{ echo start; bteq; echo done; } < read.sql",
-                "(bteq; cat write.sql) < read.sql"):
-        assert g._script_inputs(cmd, CFG) == ["read.sql"], cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
-    # a command's own redirection stays with it as well
-    assert g._script_inputs("(bteq < write.sql; echo) < read.sql", CFG) == ["write.sql"]
-    assert g.evaluate("(bteq < write.sql; echo) < read.sql", CFG, root=tmp_path).decision == "block"
-
-
-def test_a_group_input_skips_members_whose_stdin_is_already_taken(tmp_path: Path):
-    (tmp_path / "read.sql").write_text("SELECT 1;\n")
-    (tmp_path / "write.sql").write_text("UPDATE sales.orders SET status = 'X';\n")
-    # a member's own `<`, heredoc or here-string, or a pipe feeding it (or the group it runs in),
-    # replaces the group's stdin: the group file never reaches that member
-    for cmd in ("(bteq < read.sql; echo) < write.sql", "(bteq 0<read.sql) < write.sql",
-                "((bteq) < read.sql; echo) < write.sql", "(cat read.sql | bteq) < write.sql",
-                "(cat read.sql | (echo; bteq)) < write.sql", "(cat read.sql | { echo; bteq; }) < write.sql",
-                "(bteq <<< 'SELECT 1') < write.sql", "(bteq <<EOF\nSELECT 1;\nEOF\n) < write.sql",
-                "(echo x | bteq; cat write.sql) < read.sql"):
-        assert "write.sql" not in g._script_inputs(cmd, CFG), cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
-    # `cat` with a file operand does not read the stdin the group hands it; without one, or with
-    # `-`, it does, and what it pipes on is the client's script
-    assert g._script_inputs("(cat read.sql | bteq) < write.sql", CFG) == ["read.sql"]
-    for cmd in ("(cat | bteq) < write.sql", "(cat - | bteq) < write.sql", "(cat read.sql - | bteq) < write.sql",
-                "cat < write.sql | bteq", "(cat read.sql | bteq; sqlplus svc@tdprod.corp.example) < write.sql",
-                "(bteq < read.sql; bteq) < write.sql", "(cat read.sql | (bteq); bteq) < write.sql"):
-        assert "write.sql" in g._script_inputs(cmd, CFG), cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    # `<&0` duplicates stdin onto itself: the group's file still reaches the client. `<&-` closes
-    # it and `<&3` takes another descriptor: those do replace it
-    for cmd in ("(bteq <&0) < write.sql", "(bteq 0<&0) < write.sql", "(cat <&0 | bteq) < write.sql"):
-        assert g._script_inputs(cmd, CFG) == ["write.sql"], cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    for cmd in ("(bteq <&-) < write.sql", "(bteq <&3) < write.sql"):
-        assert g._script_inputs(cmd, CFG) == [], cmd
-    # successive group redirections are all opened, in shell order: a redirection this group
-    # already handed down is not the member's own, so the later file reaches it too
-    for cmd in ("(bteq) < read.sql < write.sql", "(bteq) < write.sql < read.sql",
-                "{ bteq; } 0<read.sql < write.sql", "(cat | bteq) < read.sql < write.sql"):
-        assert "write.sql" in g._script_inputs(cmd, CFG), cmd
-        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "block", cmd
-    # an inner group's redirection is the member's own relative to the outer group
-    assert g._script_inputs("((bteq) < read.sql) < write.sql", CFG) == ["read.sql"]
-    # nobody inherits it: the operand is consumed, not read as a command of its own
-    assert g._commands(g._shell_tokens("(bteq < read.sql) < write.sql; echo"))[-1].words == ["echo"]
-    # output redirections after the group still land on every member
-    assert g._script_inputs("(cat write.sql | bteq) 2>&1 > /dev/null", CFG) == ["write.sql"]
+@pytest.mark.parametrize("cmd", [
+    "cat <<EOF | bteq\nSELECT 1;\nEOF", "printf 'SELECT 1' | bteq", "databricks jobs list | jq .",
+    "(cat read.sql; echo 'SELECT 2;') | bteq", "(cat read.sql) |& bteq", "cat read.sql |\n bteq",
+    "(cat a.sql) ; (cat read.sql) | bteq",
+    "cat 2>/dev/null < read.sql | bteq", "cat read.sql 2>&1 | bteq", "cat 2> /dev/null read.sql | bteq",
+    "cat 2>/dev/null 0<read.sql | bteq",
+    "cat 0<read.sql | bteq", "cat 0< read.sql | bteq", "cat 0<read.sql 2>&1 | bteq", "bteq 0<read.sql",
+    "cat read.sql 3<&0 | bteq", "cat read.sql < 0 | bteq",
+    "(cat read.sql) 2>&1 | bteq", "{ cat read.sql; } 2>&1 | bteq", "(cat read.sql) 2>/dev/null | bteq",
+    "(cat read.sql) >>/tmp/log 2>&1 | bteq", "(echo 'SELECT 2;'; cat read.sql) 2>&1 | bteq",
+    "(cat read.sql) 2>&1 | tee /nonexistent/log | bteq",
+    "(bteq) < read.sql", "{ echo start; bteq; } < read.sql", "(bteq 2>&1) 0<read.sql", "(bteq) 2>&1 < read.sql",
+    "(bteq; echo done) < read.sql", "{ echo start; bteq; echo done; } < read.sql", "(bteq; cat write.sql) < read.sql",
+])
+def test_pipeline_and_redirection_shapes_that_approve(cmd, tmp_path: Path):
+    v = g.evaluate(cmd, CFG, root=_shapes_ws(tmp_path))
+    assert v.decision == "approve", cmd
 
 
 def test_a_heredoc_body_naming_a_client_is_data_not_context(tmp_path: Path):
