@@ -537,24 +537,49 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
 
 # ------------------------------------------------------------------ source principal read-only
 
-# Per family: the admin flags that make every table writable, the query answering them, and the
-# per-table query with one boolean column per privilege in TABLE_PRIVILEGES. Every value is a
-# question about the principal; nothing here can change the source. Families without an entry
-# are reported `unverified`, never `ok`.
-_ROLE_FLAGS = {"sqlserver": ("sysadmin", "db_owner", "ALTER ANY DATABASE"), "postgres": ("superuser",)}
+# Per family: the admin flags and role memberships that make every table writable (directly or by
+# granting/impersonating one's way to it), the query answering them, the per-table query with one
+# boolean column per privilege in TABLE_PRIVILEGES, and the `indirect` queries, each returning
+# (object, privilege) rows for a write path that bypasses table grants: IMPERSONATE on a visible
+# login/user, EXECUTE on any procedure in the source database (every proc is assumed to write),
+# EXECUTE on a SECURITY DEFINER or explicitly-granted function in an in-scope schema. Every value
+# is a question about the principal; nothing here can change the source. Families without an
+# entry are reported `unverified`, never `ok`.
+_SRV_ROLES = ("sysadmin", "securityadmin", "serveradmin", "dbcreator", "bulkadmin")
+_DB_ROLES = ("db_owner", "db_ddladmin", "db_datawriter", "db_securityadmin")
+_SRV_PERMS = ("CONTROL SERVER", "ALTER ANY DATABASE", "IMPERSONATE ANY LOGIN", "ALTER ANY LOGIN")
+_PG_ATTRS = ("rolsuper", "rolcreaterole", "rolcreatedb", "rolbypassrls")
+_PG_ROLES = ("pg_write_server_files", "pg_execute_server_program")
+_ROLE_FLAGS = {"sqlserver": _SRV_ROLES + _DB_ROLES + _SRV_PERMS, "postgres": _PG_ATTRS + _PG_ROLES}
 _TABLE_PRIVILEGES = {"sqlserver": ("INSERT", "UPDATE", "DELETE", "ALTER"),
                      "postgres": ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "CREATE on schema")}
 _PRIVILEGE_QUERIES = {
     "sqlserver": {
-        "roles": "SELECT IS_SRVROLEMEMBER('sysadmin'), IS_MEMBER('db_owner'), "
-                 "HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER ANY DATABASE')",
+        "roles": "SELECT " + ", ".join([*(f"IS_SRVROLEMEMBER('{r}')" for r in _SRV_ROLES),
+                                          *(f"IS_MEMBER('{r}')" for r in _DB_ROLES),
+                                          *(f"HAS_PERMS_BY_NAME(NULL, NULL, '{p}')" for p in _SRV_PERMS)]),
         "table": "SELECT " + ", ".join(f"HAS_PERMS_BY_NAME(?, 'OBJECT', '{p}')" for p in _TABLE_PRIVILEGES["sqlserver"]),
+        "indirect": (
+            ("SELECT 'LOGIN ' + name, 'IMPERSONATE' FROM sys.server_principals WHERE type IN ('S', 'U', 'C', 'K') "
+             "AND name <> SUSER_SNAME() AND HAS_PERMS_BY_NAME(name, 'LOGIN', 'IMPERSONATE') = 1"),
+            ("SELECT 'USER ' + name, 'IMPERSONATE' FROM sys.database_principals WHERE type IN ('S', 'U', 'C', 'K', 'E', 'X') "
+             "AND name <> USER_NAME() AND HAS_PERMS_BY_NAME(name, 'USER', 'IMPERSONATE') = 1"),
+            ("SELECT QUOTENAME(s.name) + '.' + QUOTENAME(o.name), 'EXECUTE' FROM sys.objects o "
+             "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN ('P', 'PC', 'X') AND o.is_ms_shipped = 0 "
+             "AND HAS_PERMS_BY_NAME(QUOTENAME(s.name) + '.' + QUOTENAME(o.name), 'OBJECT', 'EXECUTE') = 1 ORDER BY 1")),
         "read_only": None,
     },
     "postgres": {
-        "roles": "SELECT rolsuper FROM pg_roles WHERE rolname = current_user",
+        "roles": "SELECT " + ", ".join([*_PG_ATTRS, *(f"pg_has_role(current_user, '{r}', 'MEMBER')" for r in _PG_ROLES)])
+                 + " FROM pg_roles WHERE rolname = current_user",
         "table": "SELECT " + ", ".join(f"has_table_privilege(%s, '{p}')" for p in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"))
                  + ", has_schema_privilege(%s, 'CREATE')",
+        "functions": "SELECT n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', "
+                     "'EXECUTE' FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = ANY(%s) "
+                     "AND (p.prosecdef OR p.proacl IS NOT NULL) AND has_function_privilege(p.oid, 'EXECUTE') ORDER BY 1",
+        "members": "SELECT r.rolname FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid "
+                   "JOIN pg_roles me ON me.oid = m.member WHERE me.rolname = current_user ORDER BY 1",
+        "as_role": "SELECT has_table_privilege(%s, %s, 'INSERT,UPDATE,DELETE,TRUNCATE'), has_schema_privilege(%s, %s, 'CREATE')",
         "read_only": "SELECT current_setting('transaction_read_only')",
     },
 }
@@ -563,18 +588,40 @@ _ADVISORY = ("driver-level read-only (SQL Server readonly=True, Postgres default
              "a hint the server may ignore; only the principal's grants stop writes")
 
 
+def _schema(table: str) -> str:
+    return table.rsplit(".", 1)[0] if "." in table else "public"
+
+
 def _table_params(family: str, table: str) -> tuple:
     if family == "sqlserver":
         return (table,) * 4
-    return (table,) * 4 + (table.rsplit(".", 1)[0] if "." in table else "public",)
+    return (table,) * 4 + (_schema(table),)
+
+
+def _indirect_writes(cur, q: dict, family: str, tables: list[str]) -> list[str]:
+    """`object: privilege` for every write path that is not a grant on an in-scope table."""
+    found: list[str] = []
+    for sql in q.get("indirect", ()):
+        found += [f"{obj}: {priv}" for obj, priv in cur.execute(sql).fetchall()]
+    if family == "postgres":
+        schemas = list(dict.fromkeys(_schema(t) for t in tables))
+        found += [f"{obj}: {priv}" for obj, priv in cur.execute(q["functions"], (schemas,)).fetchall()]
+        for (role,) in cur.execute(q["members"]).fetchall():  # one level: what SET ROLE <role> would unlock
+            for t in tables:
+                write, create = cur.execute(q["as_role"], (role, t, role, _schema(t))).fetchall()[0]
+                found += [f"SET ROLE {role}: {t} {w}" for w, held in (("write", write), ("CREATE on schema", create)) if held]
+    return found
 
 
 def check_source_principal(tables: list[str], family: str, source_secret: str | None, connect=None) -> Check:
-    """The principal behind --source-secret must not be able to write any in-scope source object:
-    no admin role and no INSERT/UPDATE/DELETE/ALTER (TRUNCATE, schema CREATE on Postgres) on any
-    table the resolved mappings read. This is the control the guard's docstring defers to for
-    clients the hook cannot read into; `readonly=True` on the connection is advisory and is
-    reported as such in `stats`. A failure names object and privilege, never the credential."""
+    """The principal behind --source-secret must not be able to write any in-scope source object,
+    directly or through indirection: no admin role or server permission, no INSERT/UPDATE/DELETE/
+    ALTER (TRUNCATE, schema CREATE on Postgres) on any table the resolved mappings read, no
+    IMPERSONATE, no EXECUTE on a procedure (or SECURITY DEFINER / explicitly-granted function) and
+    no SET ROLE-able membership that would unlock a write. This is the control the guard's
+    docstring defers to for clients the hook cannot read into; `readonly=True` on the connection
+    is advisory and is reported as such in `stats`. A failure names object and privilege, never
+    the credential."""
     cid = "source_principal_read_only"
     q = _PRIVILEGE_QUERIES.get(family)
     if q is None:
@@ -587,7 +634,8 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
     dsn = os.environ.get(source_secret)
     if not dsn:
         return Check(cid, "fail", f"source secret {source_secret} is not set in the environment")
-    data: dict = {"family": family, "tables": tables, "roles": [], "writable": {}, "unresolved": [], "stats": ""}
+    data: dict = {"family": family, "tables": tables, "roles": [], "writable": {}, "indirect": [], "unresolved": [],
+                  "stats": ""}
     try:
         conn = (connect or _READ_ONLY_CONNECT[family])(dsn)
         try:
@@ -605,19 +653,22 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
                     data["unresolved"].append(t)
                 elif held := [p for p, v in zip(_TABLE_PRIVILEGES[family], row) if v]:
                     data["writable"][t] = held
+            data["indirect"] = _indirect_writes(cur, q, family, tables)
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
         return Check(cid, "fail", f"source query failed: {_redact(str(e))}", data)
-    can_write = [f"role {r}" for r in data["roles"]] + [f"{t}: {', '.join(p)}" for t, p in data["writable"].items()]
+    can_write = ([f"role {r}" for r in data["roles"]] + [f"{t}: {', '.join(p)}" for t, p in data["writable"].items()]
+                 + data["indirect"])
     if can_write:
-        return Check(cid, "fail", f"{family}: the source principal can write in scope ({'; '.join(can_write)}); the "
+        shown = "; ".join(can_write[:6]) + (f"; +{len(can_write) - 6} more in data" if len(can_write) > 6 else "")
+        return Check(cid, "fail", f"{family}: the source principal can write in scope ({shown}); the "
                      f"factory needs a SELECT-only principal, and {_ADVISORY}", data)
     if data["unresolved"]:
         return Check(cid, "unverified", f"{family}: privileges could not be evaluated for {data['unresolved']} (object "
                      "not found or not visible to this principal); nothing is proven about them", data)
-    return Check(cid, "ok", f"{family}: no admin role and no write privilege on {len(tables)} in-scope table(s); "
-                 f"{data['stats']}", data)
+    return Check(cid, "ok", f"{family}: no admin role, no write privilege on {len(tables)} in-scope table(s), no "
+                 f"IMPERSONATE/EXECUTE/SET ROLE path to one; {data['stats']}", data)
 
 
 def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str | None,

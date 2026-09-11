@@ -611,12 +611,17 @@ def test_run_includes_delete_evidence_and_a_failed_check_blocks(tmp_path, monkey
 
 class FakePrivConn:
     """A source seen through the doctor's privilege queries. `roles` are the principal's server or
-    database-wide flags (sysadmin, db_owner, alter_any_database; superuser for Postgres),
-    `writable` maps a table to the write privileges it holds, `absent` tables cannot be resolved.
+    database-wide flags and role memberships, named as the query names them (sysadmin, db_owner,
+    ALTER ANY DATABASE, CONTROL SERVER; rolsuper, pg_write_server_files for Postgres); `writable` maps a
+    table to the write privileges it holds; `absent` tables cannot be resolved. Indirection: `impersonate`
+    lists principals the principal may IMPERSONATE, `execute` the procedures/functions it may EXECUTE,
+    `set_role` maps a Postgres role it is a member of to the write it would gain via SET ROLE.
     Records every statement so a test can prove the check only ever asked questions."""
 
-    def __init__(self, *, roles=(), writable=None, absent=(), read_only="on"):
+    def __init__(self, *, roles=(), writable=None, absent=(), read_only="on", impersonate=(), execute=(),
+                 set_role=None):
         self.roles, self.writable, self.absent, self.read_only = set(roles), writable or {}, set(absent), read_only
+        self.impersonate, self.execute_on, self.set_role = list(impersonate), list(execute), set_role or {}
         self.statements: list[tuple[str, tuple]] = []
         self.closed = False
 
@@ -627,13 +632,28 @@ class FakePrivConn:
         self.statements.append((sql, params))
         low, args = sql.lower(), tuple(params[0]) if params else ()
         if "is_srvrolemember" in low:
-            self._rows = [tuple(int(r in self.roles) for r in ("sysadmin", "db_owner", "alter_any_database"))]
+            names = re.findall(r"IS_SRVROLEMEMBER\('(\w+)'\)|IS_MEMBER\('(\w+)'\)|HAS_PERMS_BY_NAME\(NULL, NULL, '([A-Z ]+)'\)", sql)
+            self._rows = [tuple(int("".join(n) in self.roles) for n in names)]
+        elif "sys.server_principals" in low or "sys.database_principals" in low:
+            kind = "LOGIN" if "server_principals" in low else "USER"
+            self._rows = [(f"{kind} {p.split(' ', 1)[1]}", "IMPERSONATE") for p in self.impersonate
+                          if p.startswith(kind.lower())]
+        elif "sys.objects" in low:
+            self._rows = [(p, "EXECUTE") for p in self.execute_on]
         elif "has_perms_by_name" in low:
             t = args[0]
             self._rows = [(None,) * 4 if t in self.absent else
                           tuple(int(p in self.writable.get(t, ())) for p in ("INSERT", "UPDATE", "DELETE", "ALTER"))]
-        elif "rolsuper" in low:
-            self._rows = [("superuser" in self.roles,)]
+        elif "rolsuper" in low and "pg_auth_members" not in low:
+            names = re.findall(r"\b(rolsuper|rolcreaterole|rolcreatedb|rolbypassrls)\b|pg_has_role\(current_user, '(\w+)'", sql)
+            self._rows = [tuple("".join(n) in self.roles for n in names)]
+        elif "pg_auth_members" in low:
+            self._rows = [(r,) for r in self.set_role]
+        elif "pg_proc" in low:
+            self._rows = [(f, "EXECUTE") for f in self.execute_on]
+        elif "has_table_privilege" in low and len(args) == 4:  # (role, table, role, schema): the SET ROLE walk
+            role, t = args[0], args[1]
+            self._rows = [(t in self.set_role.get(role, ()), False)]
         elif "has_table_privilege" in low:
             t = args[0]
             if t in self.absent:
@@ -675,14 +695,53 @@ def test_sqlserver_select_only_principal_is_ok_and_the_row_says_readonly_is_advi
     assert all(p in perms[0][0] for p in ("'INSERT'", "'UPDATE'", "'DELETE'", "'ALTER'"))
     assert any("IS_SRVROLEMEMBER('sysadmin')" in s and "IS_MEMBER('db_owner')" in s
                and "HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER ANY DATABASE')" in s for s, _ in conn.statements)
+    assert c.data["indirect"] == []
+
+
+def test_sqlserver_indirection_queries_ask_the_effective_permission_on_every_visible_principal_and_proc(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    conn = FakePrivConn()
+    doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    sql = "\n".join(s for s, _ in conn.statements)
+    for flag in ("CONTROL SERVER", "IMPERSONATE ANY LOGIN", "ALTER ANY LOGIN", "ALTER ANY DATABASE"):
+        assert f"HAS_PERMS_BY_NAME(NULL, NULL, '{flag}')" in sql
+    for role in ("securityadmin", "serveradmin", "dbcreator", "bulkadmin"):
+        assert f"IS_SRVROLEMEMBER('{role}')" in sql
+    for role in ("db_owner", "db_ddladmin", "db_datawriter", "db_securityadmin"):
+        assert f"IS_MEMBER('{role}')" in sql
+    assert "sys.server_principals" in sql and "'LOGIN', 'IMPERSONATE'" in sql
+    assert "sys.database_principals" in sql and "'USER', 'IMPERSONATE'" in sql
+    assert "sys.objects" in sql and "'OBJECT', 'EXECUTE'" in sql and "is_ms_shipped = 0" in sql
+
+
+def test_many_executable_procs_are_counted_not_dumped(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "Driver=x")
+    procs = [f"[raw].[usp_{i}]" for i in range(12)]
+    c = doctor.check_source_principal(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: FakePrivConn(execute=procs))
+    assert c.status == "fail" and "[raw].[usp_0]: EXECUTE" in c.detail and "+6 more" in c.detail
+    assert c.data["indirect"] == [f"{p}: EXECUTE" for p in procs]
 
 
 @pytest.mark.parametrize("kw, needle", [
     ({"roles": ["sysadmin"]}, "sysadmin"),
     ({"roles": ["db_owner"]}, "db_owner"),
-    ({"roles": ["alter_any_database"]}, "ALTER ANY DATABASE"),
+    ({"roles": ["ALTER ANY DATABASE"]}, "ALTER ANY DATABASE"),
     ({"writable": {"raw.payments": ["INSERT", "DELETE"]}}, "raw.payments: INSERT, DELETE"),
     ({"writable": {"raw.loans": ["ALTER"]}}, "raw.loans: ALTER"),
+    # indirection: server/database control, impersonation, admin roles, and EXECUTE on any procedure
+    ({"roles": ["CONTROL SERVER"]}, "CONTROL SERVER"),
+    ({"roles": ["IMPERSONATE ANY LOGIN"]}, "IMPERSONATE ANY LOGIN"),
+    ({"roles": ["ALTER ANY LOGIN"]}, "ALTER ANY LOGIN"),
+    ({"roles": ["securityadmin"]}, "role securityadmin"),
+    ({"roles": ["serveradmin"]}, "role serveradmin"),
+    ({"roles": ["dbcreator"]}, "role dbcreator"),
+    ({"roles": ["bulkadmin"]}, "role bulkadmin"),
+    ({"roles": ["db_ddladmin"]}, "role db_ddladmin"),
+    ({"roles": ["db_datawriter"]}, "role db_datawriter"),
+    ({"roles": ["db_securityadmin"]}, "role db_securityadmin"),
+    ({"impersonate": ["login etl_admin"]}, "LOGIN etl_admin: IMPERSONATE"),
+    ({"impersonate": ["user dbo"]}, "USER dbo: IMPERSONATE"),
+    ({"execute": ["[raw].[usp_post_payment]"]}, "[raw].[usp_post_payment]: EXECUTE"),
 ])
 def test_sqlserver_principal_that_can_write_in_scope_fails_naming_object_and_privilege(monkeypatch, kw, needle):
     monkeypatch.setenv("LEGACY_ODBC", "Driver=x;PWD=never-printed")
@@ -703,13 +762,31 @@ def test_postgres_branches(monkeypatch):
     priv = [(s, a) for s, a in conn.statements if "has_table_privilege" in s]
     assert len(priv) == 1 and priv[0][1][0] == ("public.loans",) * 4 + ("public",)
     assert all(p in priv[0][0] for p in ("'INSERT'", "'UPDATE'", "'DELETE'", "'TRUNCATE'", "has_schema_privilege(%s, 'CREATE')"))
-    for kw, needle in (({"roles": ["superuser"]}, "superuser"),
+    for kw, needle in (({"roles": ["rolsuper"]}, "rolsuper"),
                        ({"writable": {"public.loans": ["TRUNCATE"]}}, "public.loans: TRUNCATE"),
                        ({"writable": {"public.loans": ["CREATE"]}}, "public.loans: CREATE on schema"),
-                       ({"absent": ["public.loans"]}, "does not exist")):
+                       ({"absent": ["public.loans"]}, "does not exist"),
+                       # indirection: role attributes, file/program roles, function EXECUTE, SET ROLE to a writer
+                       ({"roles": ["rolcreaterole"]}, "role rolcreaterole"),
+                       ({"roles": ["rolcreatedb"]}, "role rolcreatedb"),
+                       ({"roles": ["rolbypassrls"]}, "role rolbypassrls"),
+                       ({"roles": ["pg_write_server_files"]}, "role pg_write_server_files"),
+                       ({"roles": ["pg_execute_server_program"]}, "role pg_execute_server_program"),
+                       ({"execute": ["public.post_payment(integer)"]}, "public.post_payment(integer): EXECUTE"),
+                       ({"set_role": {"loader": ["public.loans"]}}, "SET ROLE loader: public.loans write")):
         c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC",
                                           connect=lambda dsn, kw=kw: FakePrivConn(**kw))
         assert c.status == "fail" and needle in c.detail, (kw, c.detail)
+    # a membership whose role holds no in-scope write is not a finding, but is still asked about per table
+    conn = FakePrivConn(set_role={"readers": []})
+    c = doctor.check_source_principal(["raw.loans", "raw.payments"], "postgres", "LAKEBASE_SRC", connect=lambda dsn: conn)
+    assert c.status == "ok", c.detail
+    walk = [a[0] for s, a in conn.statements if "has_table_privilege" in s and len(a[0]) == 4]
+    assert walk == [("readers", "raw.loans", "readers", "raw"), ("readers", "raw.payments", "readers", "raw")]
+    fn = [(s, a[0]) for s, a in conn.statements if "pg_proc" in s]
+    assert len(fn) == 1 and fn[0][1] == (["raw"],) and "prosecdef" in fn[0][0] and "has_function_privilege" in fn[0][0]
+    assert any("pg_has_role(current_user, 'pg_write_server_files', 'MEMBER')" in s and "rolbypassrls" in s
+               for s, _ in conn.statements)
 
 
 def test_default_connectors_open_read_only_the_way_each_driver_accepts(monkeypatch):
