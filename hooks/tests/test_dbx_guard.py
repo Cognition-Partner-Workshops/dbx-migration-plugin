@@ -64,8 +64,8 @@ def block(cmd: str, cfg=CFG):
     "databricks jobs list",
     "bteq <<'EOF'\n.LOGON tdprod.corp.example/svc_ro;\nSELECT COUNT(*) FROM sales.orders;\n.QUIT\nEOF",
     "docker exec -i sybase-fixture isql -Usa -Q 'SELECT TOP 5 * FROM dbo.loans'",
-    "psql -h localhost -d fixture -c \"CREATE TABLE loans (id int)\"",
-    "psql -h localhost -d fixture -c \"INSERT INTO loans VALUES (1)\"",
+    "psql -h localhost -d mig_cat -c \"CREATE TABLE loans (id int)\"",   # round 8: the database must be allowlisted too
+    "psql -h localhost -d mig_cat -c \"INSERT INTO loans VALUES (1)\"",
     "python3 -c \"print('DROP TABLE is a string in a test fixture name')\"",
     "grep -rn 'INSERT INTO' skills/ | head",
     "echo 'the updated_at column and the deleted flag' > notes.txt",

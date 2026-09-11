@@ -137,7 +137,7 @@ PROBES = [
     ("cat a write sql file (no client)", "cat w.sql", "approve"),
     ("python script with 'execute(' in test", "python3 -m pytest tests/test_execute.py", "approve"),
     ("sqlcmd read with string literal containing DROP", "sqlcmd -S tdprod.corp -Q \"SELECT * FROM t WHERE note = 'DROP TABLE x'\"", "approve"),
-    ("psql to allowlisted lakebase target write", "psql \"$LAKEBASE_MIGRATION_DSN\" -c 'INSERT INTO s.t VALUES (1)'", "approve"),
+    ("psql to allowlisted lakebase target write", "psql \"$LAKEBASE_MIGRATION_DSN\" -c 'INSERT INTO mig_cat.s.t VALUES (1)'", "approve"),   # round 8: qualified
     # the probe expected approve here; A7 says a write through a host the allowlist does not name fails closed
     ("psql to unknown DSN write (not in target_hosts)", "psql \"$SOME_DSN\" -c 'INSERT INTO s.t VALUES (1)'", "block"),
     ("docker compose up fixture", "docker compose up -d sqlserver-demo", "approve"),
@@ -152,7 +152,7 @@ PROBES = [
 # Second and third review probes (shapes not in the 108-row table), in a workspace whose allowlist
 # names `lakebase-host` and bundle target `migration`. `{ws}` is the workspace's absolute path.
 # Rows the review marked out of contract are pinned to the decision the design gives: Java/Perl/
-# make stay xfail, `git stash`/`git rebase` approve, `catalogs: ["*"]` is not a wildcard, warn mode
+# make stay xfail, `git rebase` approves (`git stash` blocks since round 8: it rewrites the working copy), `catalogs: ["*"]` is not a wildcard, warn mode
 # downgrades to approve-with-reason.
 ALLOWLIST2 = {
     "catalogs": ["mig_cat"],
@@ -393,14 +393,14 @@ PROBES2 = [
     ("bcp out (read, approve)", "bcp loans.raw.t out /tmp/x -S sqlserver-demo -c", "approve"),
     ("bcp in", "bcp loans.raw.t in /tmp/x -S sqlserver-demo -c", "block"),
     ("psql unknown host write", "psql -h 10.1.1.1 -c 'INSERT INTO t VALUES (1)'", "block"),
-    ("psql lakebase-host write (approve)", "psql -h lakebase-host -c 'INSERT INTO t VALUES (1)'", "approve"),
-    ("psql lakebase-host as URI (approve)", "psql postgresql://u@lakebase-host/db -c 'INSERT INTO t VALUES (1)'", "approve"),
-    ("psql PGHOST env target (approve)", "PGHOST=lakebase-host psql -c 'INSERT INTO t VALUES (1)'", "approve"),
+    ("psql lakebase-host write (approve)", "psql -h lakebase-host -d mig_cat -c 'INSERT INTO t VALUES (1)'", "approve"),   # round 8: database must resolve
+    ("psql lakebase-host as URI (approve)", "psql postgresql://u@lakebase-host/mig_cat -c 'INSERT INTO t VALUES (1)'", "approve"),
+    ("psql PGHOST env target (approve)", "PGHOST=lakebase-host psql -c 'INSERT INTO mig_cat.s.t VALUES (1)'", "approve"),
     ("psql PGHOST env legacy", "PGHOST=tdprod.corp psql -c 'INSERT INTO t VALUES (1)'", "block"),
     ("psql no host (default localhost) write", "psql -c 'INSERT INTO t VALUES (1)'", "block"),
     ("psql via service= DSN", "psql 'service=legacy' -c 'INSERT INTO t VALUES (1)'", "block"),
     ("psql host= keyword DSN legacy", "psql 'host=tdprod.corp dbname=x' -c 'INSERT INTO t VALUES (1)'", "block"),
-    ("psql host= keyword DSN target (approve)", "psql 'host=lakebase-host dbname=x' -c 'INSERT INTO t VALUES (1)'", "approve"),
+    ("psql host= keyword DSN target (approve)", "psql 'host=lakebase-host dbname=mig_cat' -c 'INSERT INTO t VALUES (1)'", "approve"),
     ("psql -d lakebase-host is a database, not a host", "psql -h 10.1.1.1 -d lakebase-host -c 'INSERT INTO t VALUES (1)'", "block"),
     ("sqlcmd -d lakebase-host is a database, not a host", "sqlcmd -S 10.1.1.1 -d lakebase-host -Q 'INSERT dbo.t VALUES (1)'", "block"),
     ("mysql positional database named like the host", "mysql -h 10.1.1.1 lakebase-host -e 'INSERT INTO t VALUES (1)'", "block"),
@@ -479,7 +479,7 @@ PROBES2 = [
     ("git -C ws log (approve)", "git -C {ws} log --oneline", "approve"),                                                # round 4
     ("git -C ws add .migration (approve)", "git -C {ws} add .migration/06_decisions.md", "approve"),                    # round 4
     ("git checkout branch (approve)", "git checkout -b feature/x", "approve"),
-    ("git stash (approve)", "git stash", "approve"),
+    ("git stash", "git stash", "block"),                                                                            # round 8: rewrites the working copy
     ("git reset --hard", "git reset --hard HEAD~1", "block"),
     ("git reset soft (approve)", "git reset HEAD~1", "approve"),
     ("git clean -fdx", "git clean -fdx", "block"),
@@ -762,8 +762,8 @@ def plugin(tmp_path_factory) -> Path:
     ("git -C plugin diff (approve)", "git -C {plugin} diff -- hooks/dbx_guard.py", "approve"),
     ("git -C plugin stash list (approve)", "git -C {plugin} stash list", "approve"),
     ("git -C plugin stash show (approve)", "git -C {plugin} stash show -p", "approve"),
-    ("git stash in the workspace (approve)", "git stash", "approve"),
-    ("git -C ws stash (approve)", "git -C {ws} stash", "approve"),
+    ("git stash in the workspace", "git stash", "block"),                                                           # round 8: rewrites the working copy
+    ("git -C ws stash", "git -C {ws} stash", "block"),                                                              # round 8
     # round 4: no `cwd` in the event -> a relative operand that could be the running guard blocks
     ("relative sed -i hooks/dbx_guard.py, no event cwd", "sed -i 's/a/b/' hooks/dbx_guard.py", "block"),
     ("relative ../hooks/dbx_guard.py, no event cwd", "sed -i 's/a/b/' ../hooks/dbx_guard.py", "block"),
@@ -978,6 +978,9 @@ FILES3 = {
     "sub/w.sql": "SELECT 1;\n",
     "sub/run.sh": "rm -f ../.migration/allowed_targets.json\nbteq <<EOF\n.LOGON legacy.corp/u,p\nDELETE FROM t;\nEOF\n",
     "run.sh": "echo benign\n",
+    "p.sql": "DELETE FROM prod.s.t;\n",
+    "m.sql": "DELETE FROM mig_cat.s.t;\n",
+    "sub/p.sql": "SELECT count(*) FROM prod.s.t;\n",    # the root's write script name, a read here
 }
 _GAP = " " * 120
 _COMMENT_GAP = "\n-- a long comment " + "x" * 80 + "\n"
@@ -1009,7 +1012,7 @@ PROBES3 = [
     ("F2 unset target DSN", "unset LAKEBASE_DSN", "block"),
     ("F2 reassign legacy DSN name", "export LEGACY_TD_DSN=x", "block"),
     ("F2 other variable (approve)", "export MY_DSN=x && echo ok", "approve"),
-    ("F2 psql via target DSN name (approve)", "psql \"$LAKEBASE_DSN\" -c 'DROP TABLE t'", "approve"),
+    ("F2 psql via target DSN name (approve)", "psql \"$LAKEBASE_DSN\" -c 'DROP TABLE mig_cat.s.t'", "approve"),   # round 8: qualified
     # F3: Databricks host reached through an alias variable
     ("F3 alias of DATABRICKS_HOST, POST", 'H=$DATABRICKS_HOST; curl -X POST "$H/api/2.1/jobs/create" -d \'{}\'', "block"),
     ("F3 alias of DATABRICKS_HOST braces, DELETE", 'H="${DATABRICKS_HOST}"; curl -X DELETE "$H/api/2.1/catalogs/prod"', "block"),
@@ -1057,12 +1060,12 @@ PROBES3 = [
     ("R1 sqlcmd -S twice", "sqlcmd -S lakebase-host -S evil.corp -Q 'DROP TABLE t'", "block"),
     ("R1 -h allowlisted + host= keyword", "psql -h lakebase-host 'host=evil.corp dbname=x' -c 'DROP TABLE t'", "block"),
     ("R1 DSN name + other -h", "psql \"$LAKEBASE_DSN\" -h evil.corp -c 'DROP TABLE t'", "block"),
-    ("R1 single allowlisted host (approve)", "psql -h lakebase-host -c 'DROP TABLE t'", "approve"),
-    ("R1 allowlisted host + -U var (approve)", "psql -h lakebase-host -U $PGUSER -d db -c 'DROP TABLE t'", "approve"),
-    ("R1 allowlisted host + db positional (approve)", "mysql -h lakebase-host mydb -e 'DROP TABLE t'", "approve"),
-    ("R1 URI allowlisted only (approve)", "psql 'postgresql://u@lakebase-host:5432/db' -c 'DROP TABLE t'", "approve"),
-    ("R1 sqlcmd allowlisted + -U -P vars (approve)", "sqlcmd -S lakebase-host -U $SQLUSER -P $SQLPASS -Q 'DROP TABLE t'", "approve"),
-    ("R1 host + port suffix (approve)", "sqlcmd -S lakebase-host,1433 -Q 'DROP TABLE t'", "approve"),
+    ("R1 single allowlisted host (approve)", "psql -h lakebase-host -c 'DROP TABLE mig_cat.s.t'", "approve"),   # round 8: writes below qualified / -d mig_cat
+    ("R1 allowlisted host + -U var (approve)", "psql -h lakebase-host -U $PGUSER -d mig_cat -c 'DROP TABLE t'", "approve"),
+    ("R1 allowlisted host + db positional (approve)", "mysql -h lakebase-host mydb -e 'DROP TABLE mig_cat.s.t'", "approve"),
+    ("R1 URI allowlisted only (approve)", "psql 'postgresql://u@lakebase-host:5432/mig_cat' -c 'DROP TABLE t'", "approve"),
+    ("R1 sqlcmd allowlisted + -U -P vars (approve)", "sqlcmd -S lakebase-host -U $SQLUSER -P $SQLPASS -d mig_cat -Q 'DROP TABLE t'", "approve"),
+    ("R1 host + port suffix (approve)", "sqlcmd -S lakebase-host,1433 -d mig_cat -Q 'DROP TABLE t'", "approve"),
     # R2: option-bearing wrappers around a client
     ("R2 nice -n 10 sqlcmd legacy write", "nice -n 10 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
     ("R2 timeout -s KILL 5 sqlcmd", "timeout -s KILL 5 sqlcmd -S legacy.corp -Q 'DROP TABLE t'", "block"),
@@ -1076,7 +1079,7 @@ PROBES3 = [
     ("R2 nice -n 10 curl POST dbx", "nice -n 10 curl -X POST $DATABRICKS_HOST/api/2.1/jobs/create -d '{}'", "block"),
     ("R2 nice -n 10 psql legacy read (approve)", "nice -n 10 psql -h legacy.corp -c 'SELECT 1'", "approve"),
     ("R2 timeout -s KILL 5 databricks read (approve)", "timeout -s KILL 5 databricks clusters list", "approve"),
-    ("R2 nice -n 10 psql target write (approve)", "nice -n 10 psql -h lakebase-host -c 'DROP TABLE t'", "approve"),
+    ("R2 nice -n 10 psql target write (approve)", "nice -n 10 psql -h lakebase-host -c 'DROP TABLE mig_cat.s.t'", "approve"),
     ("R2 which sqlcmd (approve)", "which sqlcmd psql", "approve"),
     ("R2 grep for a client name (approve)", "grep -rn sqlcmd docs/", "approve"),
     ("R2 man sqlcmd (approve)", "man sqlcmd", "approve"),
@@ -1158,9 +1161,71 @@ PROBES3 = [
     ("R1 -h ok --dbname=uri evil", "psql -h lakebase-host --dbname=postgresql://evil.corp/db -c 'DROP TABLE t'", "block"),
     ("R1 mysql -h ok -h evil", "mysql -h lakebase-host -h evil.corp -e 'DROP TABLE t'", "block"),
     ("R1 uri ok + -h evil", "psql postgresql://lakebase-host/db -h evil.corp -c 'DROP TABLE t'", "block"),
-    ("R1 -h ok, host in SQL comment (approve)", "psql -h lakebase-host -c 'INSERT INTO t VALUES (1) -- evil.corp'", "approve"),
-    ("R1 -h ok -d plain db name (approve)", "psql -h lakebase-host -d mydb -c 'DROP TABLE t'", "approve"),
-    ("R1 -h ok --dbname=conninfo same host (approve)", "psql -h lakebase-host --dbname='host=lakebase-host dbname=x' -c 'DROP TABLE t'", "approve"),
+    ("R1 -h ok, host in SQL comment (approve)", "psql -h lakebase-host -c 'INSERT INTO mig_cat.s.t VALUES (1) -- evil.corp'", "approve"),
+    ("R1 -h ok -d plain db name (approve)", "psql -h lakebase-host -d mig_cat -c 'DROP TABLE t'", "approve"),
+    ("R1 -h ok --dbname=conninfo same host (approve)", "psql -h lakebase-host --dbname='host=lakebase-host dbname=mig_cat' -c 'DROP TABLE t'", "approve"),
+    # G1 (class): target_hosts authorizes the host, catalogs the container -- a generic client's write on a target host
+    # must also resolve to an allowlisted catalog / database (three-part name, else -d/--dbname/URI/conninfo dbname)
+    ("G1 psql target host, three-part write to prod", "psql -h lakebase-host -c 'DELETE FROM prod.s.t'", "block"),
+    ("G1 psql target host, EXPLAIN ANALYZE over a prod write", "psql -h lakebase-host -c 'EXPLAIN ANALYZE DELETE FROM prod.s.t'", "block"),
+    ("G1 psql target host, DROP DATABASE prod", "psql -h lakebase-host -c 'DROP DATABASE prod'", "block"),
+    ("G1 psql target host, CREATE DATABASE mig_cat (container op)", "psql -h lakebase-host -c 'CREATE DATABASE mig_cat'", "block"),
+    ("G1 psql target host, GRANT ON DATABASE mig_cat", "psql -h lakebase-host -c 'GRANT ALL ON DATABASE mig_cat TO x'", "block"),
+    ("G1 psql target host, three-part write to mig_cat (approve)", "psql -h lakebase-host -c 'DELETE FROM mig_cat.s.t'", "approve"),
+    ("G1 sqlcmd target host, unqualified write, no db", "sqlcmd -S lakebase-host -Q 'DELETE FROM t'", "block"),
+    ("G1 mysql target host, unqualified write, no db", "mysql -h lakebase-host -e 'DELETE FROM t'", "block"),
+    ("G1 sqlcmd T-SQL INSERT without INTO, no db", "sqlcmd -S lakebase-host -Q 'INSERT dbo.t VALUES (1)'", "block"),
+    ("G1 sqlcmd T-SQL INSERT without INTO into prod", "sqlcmd -S lakebase-host -Q 'INSERT prod.dbo.t VALUES (1)'", "block"),
+    ("G1 sqlcmd T-SQL INSERT without INTO, -d mig_cat (approve)", "sqlcmd -S lakebase-host -d mig_cat -Q 'INSERT dbo.t VALUES (1)'", "approve"),
+    ("G1 psql -d mig_cat unqualified write (approve)", "psql -h lakebase-host -d mig_cat -c 'DELETE FROM t'", "approve"),
+    ("G1 psql -d prod unqualified write", "psql -h lakebase-host -d prod -c 'DELETE FROM t'", "block"),
+    ("G1 psql --dbname=mig_cat unqualified write (approve)", "psql -h lakebase-host --dbname=mig_cat -c 'DELETE FROM t'", "approve"),
+    ("G1 sqlcmd -d mig_cat unqualified write (approve)", "sqlcmd -S lakebase-host -d mig_cat -Q 'DELETE FROM t'", "approve"),
+    ("G1 psql URI db mig_cat unqualified write (approve)", "psql postgresql://lakebase-host/mig_cat -c 'DELETE FROM t'", "approve"),
+    ("G1 psql URI db prod unqualified write", "psql postgresql://lakebase-host/prod -c 'DELETE FROM t'", "block"),
+    ("G1 psql conninfo dbname=mig_cat unqualified write (approve)", "psql 'host=lakebase-host dbname=mig_cat' -c 'DELETE FROM t'", "approve"),
+    ("G1 psql conninfo dbname=prod unqualified write", "psql 'host=lakebase-host dbname=prod' -c 'DELETE FROM t'", "block"),
+    ("G1 psql -d mig_cat, three-part write to prod", "psql -h lakebase-host -d mig_cat -c 'DELETE FROM prod.s.t'", "block"),
+    ("G1 psql two db defaults, unqualified write", "psql -h lakebase-host -d mig_cat -c 'DELETE FROM t' 'dbname=prod'", "block"),
+    ("G1 psql -d mig_cat, read of prod (approve)", "psql -h lakebase-host -d mig_cat -c 'SELECT 1 FROM prod.s.t'", "approve"),
+    ("G1 psql -d mig_cat on an unlisted host", "psql -h evil.corp -d mig_cat -c 'DELETE FROM t'", "block"),
+    ("G1 psql -h ok -h evil -d mig_cat", "psql -h lakebase-host -h evil.corp -d mig_cat -c 'DELETE FROM t'", "block"),
+    ("G1 psql -d mig_cat -f write script to prod", "psql -h lakebase-host -d mig_cat -f p.sql", "block"),
+    ("G1 psql -d mig_cat -f write script to mig_cat (approve)", "psql -h lakebase-host -d mig_cat -f m.sql", "approve"),
+    # G2 (class): every Databricks SQL surface takes SQL, and `.sql` files, as positionals too
+    ("G2 dbx aitools query positional .sql write", "databricks experimental aitools tools query p.sql", "block"),
+    ("G2 dbx aitools query --file .sql write", "databricks experimental aitools tools query --file p.sql", "block"),
+    ("G2 dbx aitools query positional .sql missing", "databricks experimental aitools tools query nope.sql", "block"),
+    ("G2 dbx aitools query positional .sql allowlisted write (approve)", "databricks experimental aitools tools query m.sql", "approve"),
+    ("G2 dbx aitools query positional .sql read (approve)", "databricks experimental aitools tools query r.sql", "approve"),
+    ("G2 dbx aitools query positional SQL write", "databricks experimental aitools tools query 'DELETE FROM prod.s.t'", "block"),
+    ("G2 dbx sql execute positional SQL write", "databricks sql execute 'DELETE FROM prod.s.t'", "block"),
+    ("G2 dbx sql execute -e SQL write", "databricks sql execute -e 'DELETE FROM prod.s.t'", "block"),
+    ("G2 dbx sql execute positional .sql write", "databricks sql execute p.sql", "block"),
+    ("G2 dbx sql execute positional SQL allowlisted write (approve)", "databricks sql execute 'DELETE FROM mig_cat.s.t'", "approve"),
+    ("G2 dbx sql execute positional SQL read (approve)", "databricks sql execute 'SELECT 1 FROM prod.s.t'", "approve"),
+    ("G2 dbx sql execute --warehouse-id then positional write", "databricks sql execute --warehouse-id abc 'DELETE FROM prod.s.t'", "block"),
+    # G3 (class): git forms that rewrite the working copy in the workspace block like `git clean` / `reset --hard`
+    ("G3 git stash", "git stash", "block"),
+    ("G3 git stash -u", "git stash -u", "block"),
+    ("G3 git stash push", "git stash push", "block"),
+    ("G3 git stash push -m msg", "git stash push -m wip", "block"),
+    ("G3 git stash save", "git stash save wip", "block"),
+    ("G3 git -C ws stash", "git -C {ws} stash", "block"),
+    ("G3 git checkout -f main", "git checkout -f main", "block"),
+    ("G3 git checkout --force main", "git checkout --force main", "block"),
+    ("G3 git switch -f main", "git switch -f main", "block"),
+    ("G3 git switch --discard-changes main", "git switch --discard-changes main", "block"),
+    ("G3 git stash pop (approve)", "git stash pop", "approve"),
+    ("G3 git stash list (approve)", "git stash list", "approve"),
+    ("G3 git stash show (approve)", "git stash show -p", "approve"),
+    ("G3 git checkout main (approve)", "git checkout main", "approve"),
+    ("G3 git switch main (approve)", "git switch main", "approve"),
+    ("G3 git switch -c x (approve)", "git switch -c feature/x", "approve"),
+    ("G3 git reset mixed (approve)", "git reset HEAD~1", "approve"),
+    ("G3 git reset --soft (approve)", "git reset --soft HEAD~1", "approve"),
+    ("G3 git merge (approve)", "git merge main", "approve"),
+    ("G3 git pull (approve)", "git pull --rebase", "approve"),
 ]
 
 
@@ -1191,6 +1256,9 @@ def test_probe3(label: str, command: str, expected: str, workspace3: Path):
     ("F5 event cwd=sub: cd .. then read script (approve)", "sub", "cd .. && psql -h legacy.corp -f r.sql", "approve"),
     ("F5 event cwd=sub: cd .. then write script", "sub", "cd .. && psql -h legacy.corp -f w.sql", "block"),
     ("F5 event cwd=ws: read script (approve)", "ws", "psql -h legacy.corp -f r.sql", "approve"),
+    ("G2 event cwd=sub: dbx positional .sql resolves in sub (approve)", "sub", "databricks experimental aitools tools query p.sql", "approve"),
+    ("G2 event cwd=sub: dbx positional ../p.sql write", "sub", "databricks experimental aitools tools query ../p.sql", "block"),
+    ("G2 event cwd=sub: dbx sql execute positional ../p.sql write", "sub", "databricks sql execute ../p.sql", "block"),
 ], ids=lambda x: x if isinstance(x, str) and " " in x else None)
 def test_probe3_event_cwd(label: str, event_cwd: str, command: str, expected: str, workspace3: Path):
     cwd = {"ws": workspace3, "sub": workspace3 / "sub"}[event_cwd]

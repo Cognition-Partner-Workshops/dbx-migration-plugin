@@ -5,9 +5,10 @@ Reads a Devin PreToolUse event on stdin ({"tool_name", "tool_input": {"command"}
 `.migration/allowed_targets.json`, splits the shell command into simple commands and judges each by the program it runs:
 
 * `databricks` / `spark-sql` / `dbsqlcli`: an explicit read allowlist (`_DBX_READ`) passes; a mutation needs a securable in an
-  allowlisted catalog; SQL may write only to allowlisted catalogs (three-part names, `USE CATALOG`, `--catalog`); `catalogs: ["*"]`
-  is the catalog literally named `*`. REST (`curl`/`wget`/`http`) to a workspace host: GET without a body only. `bundle
-  deploy|run|destroy` and `dbt run|build|seed`: a literal `-t/--target` in `bundle_targets`, never a forbidden one.
+  allowlisted catalog; SQL (flags, positionals, `.sql` files) may write only to allowlisted catalogs (three-part names, `USE
+  CATALOG`, `--catalog`); `catalogs: ["*"]` is the catalog literally named `*`. REST (`curl`/`wget`/`http`) to a workspace
+  host: GET without a body only. `bundle deploy|run|destroy` and `dbt run|build|seed`: a literal `-t/--target` in
+  `bundle_targets`, never a forbidden one.
 * Identity: `auth login|configure|token|env`, `--profile`/`--host`, `DATABRICKS_*=` around a client, writes to the CLI's
   credential store (`.databrickscfg`, `~/.databricks/`, `~/.config/databricks/`) and reassignment of an allowlisted name block.
 * Legacy-only clients (bteq, sqlplus, ...) and generic SQL clients naming a `legacy_sources` entry: read shapes only
@@ -15,11 +16,13 @@ Reads a Devin PreToolUse event on stdin ({"tool_name", "tool_input": {"command"}
   `_SQL_DENY` (exclusive lock hints, `FOR UPDATE|SHARE`, `LOCKING ... FOR WRITE|EXCLUSIVE`, `SET TRANSACTION READ WRITE`);
   `_SQL_ALLOW` (`SET TRANSACTION ISOLATION LEVEL <any>` / `READ ONLY`) is the harness's consistency-window idiom. Loaders and
   migration tools always write. A generic client elsewhere may write only when every host / DSN candidate on the line
-  (`-h`/`-S`/`--host`, `PGHOST=`, positional or `-d` URI / conninfo) is a literal in `target_hosts`, and there is at least one.
+  (`-h`/`-S`/`--host`, `PGHOST=`, positional or `-d` URI / conninfo) is a literal in `target_hosts` (at least one), and the
+  write's catalog / database (three-part name, `USE CATALOG`, else the line's one `-d`/URI/conninfo database) is allowlisted.
 * Writes under `.migration/` (outside `recon/`, `waves/`) block, through every writer the guard models: redirects, `sed -i`,
-  `tee`, `cp/mv/rm/...`, git working-copy commands, in-place fixers, inline python/perl/ruby/node with a write call. The same
-  detection protects the running guard's own tree (`hooks.json`, `hooks/**`, symlinks resolved), where git is a read-only
-  allowlist (`_git_reads`); a checkout of this repo elsewhere is an ordinary development target.
+  `tee`, `cp/mv/rm/...`, git working-copy commands (`_GIT_DISCARDS` rewrite it wholesale and always block), in-place fixers,
+  inline python/perl/ruby/node with a write call. The same detection protects the running guard's own tree (`hooks.json`,
+  `hooks/**`, symlinks resolved), where git is a read-only allowlist (`_git_reads`); a checkout of this repo elsewhere is an
+  ordinary development target.
 * Python / `spark-submit`: a literal SQL string handed to `.execute(`, `.sql(`, `execute_statement(` is judged like a client's.
 
 Config: `catalogs` (required), `legacy_sources`, `guard_mode` (block | warn), `target_hosts`, `bundle_targets`,
@@ -59,16 +62,11 @@ _OBJ = r"TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE"
 # a write statement's verb phrase; the match ends where its target securable starts
 _WRITE = re.compile(
     rf"""(?:\b(?:
-        INSERT\s+(?:INTO|OVERWRITE)(?:\s+TABLE)?
+        INSERT(?:\s+(?:INTO|OVERWRITE))?(?:\s+TABLE)?(?=\s+[\w`"\[])
       | UPDATE\s+(?!STATISTICS\b|SET\b|OF\b)(?:TOP\s*\([^)]*\))?
-      | DELETE\s+FROM
-      | MERGE\s+(?:WITH\s+SCHEMA\s+EVOLUTION\s+)?INTO
-      | (?:TRUNCATE|REPLACE|RESTORE|REFRESH|REORG|ANALYZE)\s+TABLE
-      | (?:OPTIMIZE|VACUUM)(?:\s+TABLE)?
-      | REFRESH\s+MATERIALIZED\s+VIEW
-      | MSCK\s+REPAIR\s+TABLE
+      | DELETE\s+FROM | COPY\s+INTO | MERGE\s+(?:WITH\s+SCHEMA\s+EVOLUTION\s+)?INTO | MSCK\s+REPAIR\s+TABLE
+      | (?:TRUNCATE|REPLACE|RESTORE|REFRESH|REORG|ANALYZE)\s+TABLE | (?:OPTIMIZE|VACUUM)(?:\s+TABLE)? | REFRESH\s+MATERIALIZED\s+VIEW
       | SYNC\s+(?:AS\s+EXTERNAL\s+)?(?=(?:SCHEMA|TABLE)\b)(?:TABLE\s+)?
-      | COPY\s+INTO
       | CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+|EXTERNAL\s+|STREAMING\s+|MATERIALIZED\s+|LIVE\s+)*
         (?=(?:{_OBJ}|SCHEMA|DATABASE|CATALOG)\b)(?:(?:{_OBJ})\s+(?:IF\s+NOT\s+EXISTS\s+)?)?
       | (?:DROP|ALTER)\s+(?=(?:{_OBJ}|SCHEMA|DATABASE|CATALOG)\b)(?:(?:{_OBJ})\s+(?:IF\s+EXISTS\s+)?)?
@@ -78,17 +76,14 @@ _WRITE = re.compile(
       | (?:EXEC(?:UTE)?|CALL)\s+(?!IMMEDIATE\b)(?=(?:\[?[\w$]+\]?\.)+\[?[\w$]+)
     )
       | (?:^|(?<=[;\n]))\s*(?:EXEC(?:UTE)?|CALL)\s+(?!IMMEDIATE\b)(?=[\[@`\w])
-    )\s*""",
-    re.IGNORECASE | re.VERBOSE,
-)
-_TARGET = re.compile(rf"(?:(CATALOG|SCHEMA|DATABASE)\s+)?(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({_SEG})((?:\.{_SEG})*)(?![\w`.])",
-                     re.IGNORECASE)
+    )\s*""", re.IGNORECASE | re.VERBOSE)
+_TARGET = re.compile(rf"(?:(CATALOG|SCHEMA|DATABASE)\s+)?(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({_SEG})((?:\.{_SEG})*)(?![\w`.])", re.IGNORECASE)
 _USE_CATALOG = re.compile(rf"\bUSE\s+CATALOG\s+({_SEG})", re.IGNORECASE)
 _IDENTIFIER_LITERAL = re.compile(r"\bIDENTIFIER\s*\(\s*'([^']*)'\s*\)", re.IGNORECASE)
 _IDENTIFIER_DYNAMIC = re.compile(r"\bIDENTIFIER\s*\(", re.IGNORECASE)
 _EXEC_IMMEDIATE_DYNAMIC = re.compile(r"\bEXEC(?:UTE)?\s+IMMEDIATE\s+(?!')\S", re.IGNORECASE)
 _BUNDLE_TARGET = re.compile(r"(?:^|\s)(?:-t|--target)(?:=|\s+)(\S+)")
-_PERMISSION = re.compile(r"^\s*(?:GRANT|REVOKE|DENY)\b.*\bON\s+CATALOG\b|^\s*(?:CREATE|ALTER|DROP)\s+CATALOG\b", re.IGNORECASE | re.DOTALL)
+_PERMISSION = r"^\s*(?:GRANT|REVOKE|DENY)\b.*\bON\s+(?:{c})\b|^\s*(?:CREATE|ALTER|DROP)\s+(?:{c})\b"   # {c}: the container words
 
 _LEGACY_ONLY = ("bteq", "sqlplus", "sqlldr", "snowsql", "mload", "fastload", "fastexport", "tbuild", "tdload")
 _LOADERS = ("sqlldr", "mload", "fastload", "tbuild", "tdload")
@@ -164,8 +159,7 @@ _SQLCMD_DIRECTIVE = re.compile(r":(?:setvar|exit|quit|on\s+error|help|list\w*|re
 # read prefixes, peeled off so the statement behind them is judged on its own: `EXPLAIN [ANALYZE|...] [(opts)]` (ANALYZE
 # executes the statement) and Teradata's read lock modifier `LOCKING ROW|TABLE t|DATABASE d|VIEW v FOR ACCESS|READ [NOWAIT]`
 _SQL_PREFIX = re.compile(r"EXPLAIN\b(?:\s+(?:ANALYZE|VERBOSE|PLAN|EXTENDED|CODEGEN|COST|FORMATTED|QUERY\s+PLAN)\b|\s*\([^)]*\)|\s+FOR\b)*\s*"
-                         r"|LOCK(?:ING)?\s+(?:ROW|(?:TABLE|DATABASE|VIEW)\s+\S+)?\s*FOR\s+(?:ACCESS|READ)\b(?:\s+(?:NOWAIT|MODE))*\s*",
-                         re.IGNORECASE)
+                         r"|LOCK(?:ING)?\s+(?:ROW|(?:TABLE|DATABASE|VIEW)\s+\S+)?\s*FOR\s+(?:ACCESS|READ)\b(?:\s+(?:NOWAIT|MODE))*\s*", re.IGNORECASE)
 # lock / transaction tokens: `_SQL_ALLOW` is what `SET TRANSACTION` may say (the harness's consistency-window idiom);
 # `_SQL_DENY` holds or takes a lock on the source, opens a writable transaction or switches the session, and is never a
 # read (NOLOCK, READUNCOMMITTED, READPAST, READCOMMITTED, PAGLOCK alone, INDEX(...) are reads)
@@ -177,9 +171,8 @@ _SQL_DENY = re.compile(
     r"|^SET\s+(?:IDENTITY_INSERT|IMPLICIT_TRANSACTIONS|ROLE|SESSION\s+AUTHORIZATION)\b"
     r"|^SET\s+TRANSACTION\b(?!\s+" + _SQL_ALLOW + r"(?:\s*,?\s*" + _SQL_ALLOW + r")*\s*$)", re.IGNORECASE)
 _NON_READ_WORD = re.compile(
-    r"\b(?:INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|CREATE|ALTER|GRANT|REVOKE|DENY|EXEC(?:UTE)?|CALL|KILL|BACKUP|RESTORE|DBCC|"
-    r"WAITFOR|BEGIN|COMMIT|ROLLBACK|ENABLE|DISABLE|INTO|BULK|OPENROWSET|OPENQUERY|SHUTDOWN|RECONFIGURE|WRITETEXT|UPDATETEXT|"
-    r"sp_\w+|xp_\w+)\b", re.IGNORECASE)
+    r"\b(?:INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|CREATE|ALTER|GRANT|REVOKE|DENY|EXEC(?:UTE)?|CALL|KILL|BACKUP|RESTORE|DBCC|WAITFOR|"
+    r"BEGIN|COMMIT|ROLLBACK|ENABLE|DISABLE|INTO|BULK|OPENROWSET|OPENQUERY|SHUTDOWN|RECONFIGURE|WRITETEXT|UPDATETEXT|sp_\w+|xp_\w+)\b", re.IGNORECASE)
 # functions that mutate, disrupt or reach outside the source from inside a SELECT: sequences, backend
 # control, large objects, dblink, locks, sleeps, session config, Oracle DBMS_*/UTL_* packages, T-SQL
 # linked-server access. A statement calling one is not a read (denylist exception to the read grammar).
@@ -193,14 +186,13 @@ _SIDE_EFFECT_FN = re.compile(
 # NAME CATALOG`, `volumes create CATALOG SCHEMA NAME TYPE`)
 _UC_READ = {"list", "get", "exists"}
 _DBX_READ = {
-    "current-user": {"me"}, "catalogs": _UC_READ, "schemas": _UC_READ, "tables": _UC_READ, "volumes": _UC_READ,
-    "functions": _UC_READ, "metastores": _UC_READ, "external-locations": _UC_READ, "storage-credentials": _UC_READ,
-    "connections": _UC_READ, "grants": {"get", "get-effective"}, "jobs": {"list", "get", "list-runs", "get-run", "get-run-output"},
+    "current-user": {"me"}, "catalogs": _UC_READ, "schemas": _UC_READ, "tables": _UC_READ, "volumes": _UC_READ, "functions": _UC_READ,
+    "metastores": _UC_READ, "external-locations": _UC_READ, "storage-credentials": _UC_READ, "connections": _UC_READ,
+    "grants": {"get", "get-effective"}, "jobs": {"list", "get", "list-runs", "get-run", "get-run-output"},
     "pipelines": {"list", "get", "list-updates", "get-update", "list-pipeline-events"}, "warehouses": {"list", "get"},
     "clusters": {"list", "get", "events", "spark-versions", "list-node-types", "list-zones"},
     "workspace": {"list", "export", "get-status"}, "secrets": {"list-scopes", "list-secrets"},
-    "auth": {"describe", "profiles"}, "fs": {"ls", "cat", "head"}, "api": {"get"}, "bundle": {"validate", "summary"},
-}
+    "auth": {"describe", "profiles"}, "fs": {"ls", "cat", "head"}, "api": {"get"}, "bundle": {"validate", "summary"}}
 _TOKEN_PRINTERS = ("auth token", "auth env")   # print the bearer token into the session log
 # (catalog lifecycle and permissions -- `catalogs create|update|delete`, `grants update`, `schemas delete` -- are not
 # object writes inside an allowlisted catalog and stay blocked whatever the allowlist says)
@@ -244,7 +236,9 @@ _GUARD_FILE = Path(__file__).name
 _PATH_LITERAL = re.compile(r"['\"]((?:[~./$]|/)[^'\"\n]{0,300})['\"]")
 _GUARD_LITERAL = re.compile(r"['\"]((?:[^'\"\n/]*/)*(?:hooks(?:/[^'\"\n]*)?|hooks\.json|" + re.escape(_GUARD_FILE) + r"))['\"]")
 _OUTPUT_FLAGS = ("-o", "-O", "--output", "--out", "--out-file", "--output-file", "--outfile", "--file")
-_GIT_DESTRUCTIVE = ("--hard", "--merge", "--keep")
+# git forms that rewrite the whole working copy: the verb alone (`clean`), or with one of these flags / first operands
+_GIT_DISCARDS = {"clean": (), "reset": ("--hard", "--merge", "--keep"), "checkout": ("-f", "--force"),
+                 "switch": ("-f", "--force", "--discard-changes"), "stash": ("", "push", "save")}
 # git on the running guard's tree is an allowlist: only these sub-commands (and the list forms below) run there
 _GIT_READS = frozenset(("log", "diff", "status", "show", "fetch", "blame", "annotate", "describe", "grep", "shortlog", "reflog",
                         "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "cat-file", "for-each-ref", "show-ref",
@@ -705,12 +699,12 @@ def _flag_values(argv: list[str], flags: tuple[str, ...]) -> list[str]:
 
 
 def _sql_text(seg: _Seg, root: Path, extra: list[str] = ()) -> tuple[str, list[str]]:
-    """Every piece of SQL a client segment executes, joined, plus the script files it cannot read."""
-    parts = [*extra, *_flag_values(seg.argv, _SQL_VALUE_FLAGS), *seg.stdin, *seg.heredocs]
+    """Every piece of SQL a client segment executes (`extra`: positional SQL text or `.sql` files), joined, plus unreadable scripts."""
+    parts = [*(w for w in extra if not w.endswith(".sql")), *_flag_values(seg.argv, _SQL_VALUE_FLAGS), *seg.stdin, *seg.heredocs]
     if seg.herestring:
         parts.append(seg.herestring)
     unreadable = []
-    for f in seg.scripts:
+    for f in [*seg.scripts, *(w for w in extra if w.endswith(".sql"))]:
         body = _read_script(f, root, seg.at)
         (unreadable.append(f) if body is None else parts.append(body))
     return "\n;\n".join(parts), unreadable
@@ -822,8 +816,9 @@ def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
 
 
 def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
-    """A legacy-only client, or a generic one whose command names a legacy source, runs read shapes
-    only; a generic client elsewhere may write when every host candidate on the line is allowlisted."""
+    """A legacy-only client, or a generic one whose command names a legacy source, runs read shapes only; a generic
+    client elsewhere may write when every host candidate on the line is allowlisted and the write resolves to an
+    allowlisted catalog / database (default: the one database the line names by `-d`/`-D`/`--dbname`, URI, `dbname=`)."""
     base, tail = seg.argv0, " (legacy is read-only in every phase)"
     legacy, hits = base in _LEGACY_ONLY, _context(seg.text, cfg, legacy_only=True)
     if base in _LOADERS:
@@ -853,16 +848,22 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         violations.append(f"non-read statement through `{base}` to a host that is not a literal in target_hosts {cfg.target_hosts} "
                           f"(seen: {sorted(set(hosts))[:6]}; every host on the line must be listed, and an empty list blocks every "
                           f"write): `{bad[0]}`")
+    else:
+        line = " ".join(w for w in seg.argv[1:] if w not in set(_flag_values(seg.argv, _SQL_VALUE_FLAGS)) | set(seg.scripts))
+        dbs = {_norm(a or b or c) for a, b, c in re.findall(
+            r"(?i)(?<![-\w])dbname=([^;\s]+)|://[^/\s]*/([^/?\s;]+)|(?:^|\s)(?:-d|-D|--dbname|--database)[\s=]([^\s=]+)(?![^\s]*=)", line)}
+        violations += _catalog_violations(sql, cfg, dbs.pop() if len(dbs) == 1 else None, f"`{base}` client")
     return violations
 
 
-def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, in_dbx: bool) -> list[str]:
-    """Writes in Databricks SQL must target an allowlisted catalog: three-part name (or `CATALOG c` /
-    `SCHEMA c.s` right after the verb phrase; a qualified source further along -- CTAS, MERGE USING,
-    INSERT SELECT -- never counts), else the last `USE CATALOG` before the statement, else the
-    `--catalog` default; none of those resolves in a Databricks client -> block. Dynamic names
-    (`IDENTIFIER(<expr>)`, `EXECUTE IMMEDIATE <var>`) block."""
-    allowed = set(cfg.catalogs)
+def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, who: str) -> list[str]:
+    """Writes must target an allowlisted catalog: three-part name (or `CATALOG c` / `SCHEMA c.s` right after the verb
+    phrase; a qualified source further along -- CTAS, MERGE USING, INSERT SELECT -- never counts), else the last `USE
+    CATALOG` before the statement, else `default` (Databricks `--catalog`, a generic client's database); none resolving in
+    a client (`who`; '' for SQL quoted in program text, where nothing need resolve) -> block. A generic client's `DATABASE`
+    is a container too (Postgres / SQL Server). Dynamic names (`IDENTIFIER(<expr>)`, `EXECUTE IMMEDIATE <var>`) block."""
+    allowed, in_dbx = set(cfg.catalogs), who == "Databricks client"
+    cats = ("CATALOG", "DATABASE") if who and not in_dbx else ("CATALOG",)
     text = _sql_view(_IDENTIFIER_LITERAL.sub(r"\1", sql))
     violations = []
     if in_dbx and _EXEC_IMMEDIATE_DYNAMIC.search(text):
@@ -874,11 +875,11 @@ def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, in_dbx:
         use_cat = next((c for pos, c in reversed(use_cats) if pos < m.start()), default)
         t = _TARGET.match(text, m.end())
         kind, parts = ((t.group(1) or "").upper(), 1 + t.group(3).count(".")) if t else ("", 0)
-        cat = _norm(t.group(2)) if t and (kind == "CATALOG" or (kind and parts >= 2) or parts >= 3) else None
+        cat = _norm(t.group(2)) if t and (kind in cats or (kind and parts >= 2) or parts >= 3) else None
         head = stmt.strip().split("\n", 1)[0][:80]
         if _IDENTIFIER_DYNAMIC.search(stmt):
             violations.append(f"IDENTIFIER(<non-literal>) names the target of a write at run time: `{head}`")
-        elif in_dbx and _PERMISSION.match(stmt):
+        elif who and re.match(_PERMISSION.format(c="|".join(cats)), stmt, re.IGNORECASE | re.DOTALL):
             violations.append(f"catalog lifecycle / permission change `{head}`; the allowlist authorizes object writes inside a "
                               "catalog, never grants or the catalog itself (those happen at STOP E)")
         elif cat is not None:
@@ -887,9 +888,9 @@ def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, in_dbx:
         elif use_cat is not None:
             if use_cat not in allowed:
                 violations.append(f"write under USE CATALOG {use_cat!r} outside allowlist {sorted(allowed)}: `{head}`")
-        elif in_dbx:
-            violations.append(f"write with unresolvable catalog (not three-part qualified, no USE CATALOG) in a Databricks "
-                              f"command: `{head}`")
+        elif who:
+            violations.append(f"write with unresolvable catalog (not three-part qualified, no USE CATALOG, no database default) "
+                              f"through a {who}: `{head}`")
     return violations
 
 
@@ -912,12 +913,11 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                "is a forbidden target (forbidden_bundle_targets); production deploys happen only at STOP E"
                if t.lower() in cfg.forbidden_bundle_targets else "is not in the list (exact, case-sensitive)" if t not in cfg.bundle_targets else "")
         return [f"`{kind}` target {t!r} {bad}; allowed bundle_targets {cfg.bundle_targets} (empty = every deploy blocks)"] if bad else []
-    default = next(iter(_flag_values(seg.argv, ("--catalog",))), None)
     if (group, verb) == ("sql", "execute") or path[:4] == ["experimental", "aitools", "tools", "query"] or (
             not path and _flag_values(seg.argv, _SQL_VALUE_FLAGS)):
-        sql, unreadable = _sql_text(seg, root, [] if group == "sql" else [w for w in path[4:] if w != "--"])
+        sql, unreadable = _sql_text(seg, root, [w for w in path[4 if group == "experimental" else 2:] if w != "--"])   # positionals
         return ([_UNREADABLE.format(who="Databricks client", files=unreadable)] if unreadable else []) + _catalog_violations(
-            sql, cfg, _norm(default) if default else None, True)
+            sql, cfg, next(map(_norm, _flag_values(seg.argv, ("--catalog",))), None), "Databricks client")
     if group == "api" and verb != "get":
         m = _UC_PATH.search(" ".join(args))
         if m and _norm(m.group(1).split(".")[0]) in cfg.catalogs:
@@ -1033,7 +1033,7 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                 violations.append(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}` "
                                   "(legacy is read-only in every phase)")
         else:
-            violations += _catalog_violations(lit, cfg, None, False)
+            violations += _catalog_violations(lit, cfg, None, "")
     return violations
 
 
@@ -1150,8 +1150,8 @@ def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[tuple[st
     w = [(".", f"git {verb}", (), True, run_in)] if gargv and not _git_reads(gargv) else []
     if verb in ("clone", "init") or (verb == "worktree" and gops[:1] == ["add"]):
         w += [(o, f"git {verb}", _IN, True, at) for o in (gops[-1:] if verb != "worktree" else gops[1:2])]
-    if verb == "clean" or (verb == "reset" and any(x in gargv for x in _GIT_DESTRUCTIVE)):
-        out.append(f"`git {verb}` discards working-copy changes across the workspace, .migration/ included; revert a ledger only "
+    if verb in _GIT_DISCARDS and (not (x := _GIT_DISCARDS[verb]) or any(o in x for o in gargv[1:] + [(gops[:1] or [""])[0]])):
+        out.append(f"`git {verb}` rewrites the working copy across the workspace, .migration/ included; revert a ledger only "
                    "through a recorded decision")
     elif verb in ("checkout", "restore", "rm", "mv"):
         w += [(o, f"git {verb}", _ALL if verb in ("checkout", "restore") else _IN, False, at) for o in gops]

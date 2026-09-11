@@ -49,9 +49,9 @@ def test_new_keys_are_optional_and_normalised():
 # ---------------------------------------------------------------- A7 generic-client hosts
 
 @pytest.mark.parametrize("cmd", [
-    "psql -h fixture-host -d demo -c 'CREATE TABLE t (id int)'",
-    "sqlcmd -S fixture-host -Q 'INSERT dbo.t VALUES (1)'",
-    "psql \"$LAKEBASE_DSN\" -c 'INSERT INTO s.t VALUES (1)'",
+    "psql -h fixture-host -d mig_cat -c 'CREATE TABLE t (id int)'",   # round 8: host AND database must be allowlisted
+    "sqlcmd -S fixture-host -d mig_cat -Q 'INSERT dbo.t VALUES (1)'",
+    "psql \"$LAKEBASE_DSN\" -c 'INSERT INTO mig_cat.s.t VALUES (1)'",
     "psql -h 10.0.0.5 -c 'SELECT 1'",  # a read goes anywhere
     "mysql -h unknown -e 'SHOW TABLES'",
 ])
