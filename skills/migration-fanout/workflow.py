@@ -80,6 +80,7 @@ MANIFEST_SHA = hashlib.sha256(MANIFEST_TEXT.encode()).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
+BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")
 resume = os.environ.get("WAVE_RESUME") == "1"
 prior = None
 
@@ -279,24 +280,51 @@ def wave_base():
     return r.stdout.strip()
 
 
+def launch_base():
+    """The commit this run's ledger diffs are anchored at, persisted beside the manifest before the
+    doctor, any child or the verifier runs. A resume reuses it (the run may have stopped before writing
+    any result, after the verifier merged PRs): a base re-read then would contain the heads to be diffed."""
+    if resume:
+        try:
+            sha = BASE_SHA_PATH.read_text().strip()
+        except OSError:
+            raise SystemExit(f"no launch base at {BASE_SHA_PATH}; the ledger gate cannot resume without it, "
+                             "use WAVE_RERUN=1 for a fresh run") from None
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise SystemExit(f"{BASE_SHA_PATH} does not hold a commit sha; use WAVE_RERUN=1 for a fresh run")
+        return sha
+    sha = wave_base()
+    tmp = BASE_SHA_PATH.with_suffix(".base_sha.tmp")
+    tmp.write_text(sha + "\n")
+    os.replace(tmp, BASE_SHA_PATH)
+    return sha
+
+
 validate_manifest(MANIFEST)
-BASE_SHA = (prior.get("base_sha") if resume and isinstance(prior, dict) else None) or wave_base()
+BASE_SHA = launch_base()
 DOCTOR = fresh_doctor_report(MANIFEST)
 validate_manifest(MANIFEST, DOCTOR)
 
 
+def _git_paths(*args):
+    r = subprocess.run(["git", "-C", str(ROOT), "diff", "--name-only", "--no-renames", *args],
+                       check=True, capture_output=True, text=True, timeout=300)
+    return r.stdout.split()
+
+
 def ref_changed_paths(ref):
-    """Paths a ref on origin changes against the launch base, from git. None when git cannot answer, and
-    then no PASS stands. Callers pass refs the workflow built itself, never a name a child reported.
-    Renames are reported as delete + add so a ledger file moved under recon/ still names its old path."""
+    """(head sha, paths) a ref on origin changes against the launch base, from git. None when git cannot
+    answer, and then no PASS stands. Callers pass refs the workflow built itself, never a name a child
+    reported. Renames are reported as delete + add so a ledger file moved under recon/ still names its
+    old path."""
     git = ["git", "-C", str(ROOT)]
     try:
         subprocess.run(git + ["fetch", "-q", "origin", ref], check=True, capture_output=True, timeout=300)
-        r = subprocess.run(git + ["diff", "--name-only", "--no-renames", f"{BASE_SHA}...FETCH_HEAD"],
-                           check=True, capture_output=True, text=True, timeout=300)
+        head = subprocess.run(git + ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+                              check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+        return head, _git_paths(f"{BASE_SHA}...{head}")
     except (OSError, subprocess.SubprocessError):
         return None
-    return r.stdout.split()
 
 
 def pr_changed_paths(pr_url):
@@ -306,6 +334,25 @@ def pr_changed_paths(pr_url):
     if not m or m["repo"].lower() != REPO.lower():
         return None
     return ref_changed_paths(f"refs/pull/{m['n']}/head")
+
+
+def verifier_changed_paths(wave, passed):
+    """What the verifier itself changed on recon/wave-N. Its branch is diffed from the launch base, so
+    the PRs it merged are in it; a passed unit's evidence drops out only where the verifier's tree is
+    byte-identical to the gated PR head's, so a result.json it rewrote (or a head re-pushed after the
+    gate) stays and fails the wave. None when git cannot answer, or a passed batch has no gated head."""
+    got = ref_changed_paths(f"recon/wave-{wave}")
+    if got is None or not all(isinstance(p.get("pr_head"), str) for p in passed):
+        return None
+    head, paths = got
+    dirs = {p["pr_head"]: [f".migration/recon/{u}/" for u in p["units"]] for p in passed}
+    own = {p for p in paths if not p.startswith(tuple(d for ds in dirs.values() for d in ds))}
+    try:
+        for pr_head, ds in dirs.items():
+            own.update(_git_paths(pr_head, head, "--", *ds))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return sorted(own)
 
 
 def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
@@ -321,8 +368,7 @@ def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
 
 def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> list[str]:
     """Return verifier-output problems without reading files or mutating input. `observed` is what git
-    says the verifier's recon/wave-N branch changes against the launch base (None: it could not be
-    fetched or diffed); PRs the verifier merged are in it, so the passed units' own evidence is allowed."""
+    says the verifier itself changed on recon/wave-N (None: it could not be fetched or diffed)."""
     problems = []
     if not isinstance(verify, dict):
         return ["verifier output invalid: expected an object"]
@@ -372,9 +418,8 @@ def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> lis
     if wave is not None and observed is None:
         problems.append(f"verifier output invalid: branch recon/wave-{wave} not verifiable from git (fetch or diff "
                         "failed), ledger integrity unverified")
-    units = [u for p in passed for u in p.get("units", [])]
     problems += [f"verifier output invalid: ledger tampered, changed {p}"
-                 for p in ledger_violations(sorted({*changed, *(observed or [])}), units, wave)]
+                 for p in ledger_violations(sorted({*changed, *(observed or [])}), [], wave)]
     return problems
 
 WAVE = MANIFEST["wave"]
@@ -582,7 +627,10 @@ async def run_batch(batch, sem, breaker):
         # The ledger gate reads the PR's diff from git; the child's changed_paths can only add to it.
         reported = out.get("changed_paths")
         usable = isinstance(reported, list) and all(isinstance(p, str) for p in reported)
-        observed = pr_changed_paths(out.get("pr_url"))
+        gated = pr_changed_paths(out.get("pr_url"))
+        observed = gated[1] if gated else None
+        if gated:
+            out["pr_head"] = gated[0]
         tampered = ledger_violations(sorted({*(reported if usable else []), *(observed or [])}), batch["units"])
         if tampered:
             prefix = "PASS downgraded: " if out["status"] == "PASS" else ""
@@ -730,7 +778,7 @@ async def main():
             "Auto-merge is off for this wave; a human decides at wave close.")
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
-               "branch": r.get("branch", "")}
+               "branch": r.get("branch", ""), "pr_head": r.get("pr_head")}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
     verify = None
     if passed:
@@ -744,7 +792,7 @@ async def main():
     else:
         log("verify: skipped, no batch passed")
 
-    verify_problems = (validate_verify(verify, passed, auto_merge, WAVE, ref_changed_paths(f"recon/wave-{WAVE}"))
+    verify_problems = (validate_verify(verify, passed, auto_merge, WAVE, verifier_changed_paths(WAVE, passed))
                        if verify is not None else [])
     if verify_problems:
         if not isinstance(verify, dict):

@@ -46,7 +46,7 @@ def _batch_runtime():
         "WorkflowAgentError": RuntimeError,
         "child_prompt": lambda batch: batch,
         "log": lambda message: None,
-        "pr_changed_paths": lambda pr_url: [],
+        "pr_changed_paths": lambda pr_url: ("c" * 40, []),
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
@@ -449,14 +449,13 @@ def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_repo
     assert tampered == ["verifier output invalid: ledger tampered, changed .migration/allowed_targets.json"]
     unverifiable = validate_verify(ok, passed, False, wave=2, observed=None)
     assert len(unverifiable) == 1 and "recon/wave-2" in unverifiable[0] and "git" in unverifiable[0]
-    # the branch is diffed from the launch base, so PRs the verifier merged show up in it: the passed
-    # units' own evidence is theirs to have changed, anything else under .migration/ is not
-    merged = [".migration/recon/wave-2/report.md", "src/loans.sql", ".migration/recon/u/result.json"]
-    assert validate_verify(ok, passed, False, wave=2, observed=merged) == []
-    problems = validate_verify(ok, passed, False, wave=2, observed=[*merged, ".migration/recon/other/result.json"])
-    assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/other/result.json"]
+    # `observed` is what the verifier itself changed (verifier_changed_paths): a passed unit's evidence in
+    # it means the verifier rewrote it, which is not the verifier's to do
+    problems = validate_verify(ok, passed, False, wave=2,
+                               observed=[".migration/recon/wave-2/report.md", ".migration/recon/u/result.json"])
+    assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/u/result.json"]
     src = WORKFLOW.read_text()
-    assert 'validate_verify(verify, passed, auto_merge, WAVE, ref_changed_paths(f"recon/wave-{WAVE}"))' in src
+    assert 'validate_verify(verify, passed, auto_merge, WAVE, verifier_changed_paths(WAVE, passed))' in src
 
 
 # ---------------------------------------------------------------- capability contract vs the doctor's record (A3)
@@ -496,13 +495,15 @@ def _launch_ns(tmp_path, fake_run):
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
-                    and node.name in {"fresh_doctor_report", "pr_changed_paths", "ref_changed_paths", "wave_base"})
+                    and node.name in {"fresh_doctor_report", "pr_changed_paths", "ref_changed_paths", "wave_base",
+                                      "launch_base", "verifier_changed_paths", "_git_paths"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id == "PR_URL" for t in node.targets))]
     ns = {"json": json, "os": os, "re": re, "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
-          "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target",
+          "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target", "resume": False,
           "DOCTOR_PY": Path("/plugin/skills/factory-doctor/doctor.py"),
-          "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json"}
+          "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json",
+          "BASE_SHA_PATH": tmp_path / ".migration" / "waves" / "wave-1.base_sha"}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     ns["subprocess"] = type("S", (), {"run": staticmethod(fake_run), "SubprocessError": subprocess.SubprocessError,
                                         "CalledProcessError": subprocess.CalledProcessError})
@@ -569,17 +570,22 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
         calls.append(cmd)
         if cmd[3] == "fetch":
             return subprocess.CompletedProcess(cmd, 0)
+        if cmd[3] == "rev-parse":
+            return subprocess.CompletedProcess(cmd, 0, stdout="c" * 40 + "\n")
         return subprocess.CompletedProcess(cmd, 0, stdout="src/a.sql\n.migration/allowed_targets.json\n")
 
     ns = _launch_ns(tmp_path, fake_run)
-    assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == ["src/a.sql", ".migration/allowed_targets.json"]
+    # the gated head's sha comes back with the paths: the verifier's tree is later held to exactly it
+    assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == (
+        "c" * 40, ["src/a.sql", ".migration/allowed_targets.json"])
     # the host writes refs/pull/N/head; the child's branch name never reaches git
     assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "refs/pull/42/head"]
+    assert calls[1][3:] == ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]
     # --no-renames: a ledger file moved under an allowed recon/ path must still surface its old path.
     # The diff is anchored at the base SHA snapshotted at launch, not at origin/main: a PR already
     # merged into the base would otherwise be its own merge base and diff to nothing
-    assert calls[1][3:] == ["diff", "--name-only", "--no-renames", "b" * 40 + "...FETCH_HEAD"]
-    assert len(calls) == 2
+    assert calls[2][3:] == ["diff", "--name-only", "--no-renames", "b" * 40 + "..." + "c" * 40]
+    assert len(calls) == 3
     calls.clear()
     for url in ("https://github.com/other/repo/pull/42", "https://github.com/acme/dbx-target/pull/x",
                 "https://github.com/acme/dbx-target/pull/42/../../other/repo/pull/1", "", None, 42):
@@ -610,21 +616,74 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
 
     with pytest.raises(SystemExit, match="main"):
         _launch_ns(tmp_path, failing)["wave_base"]()
+    # a fresh launch persists the sha beside the manifest before the doctor, any child or the verifier runs
+    ns["BASE_SHA_PATH"].parent.mkdir(parents=True)
+    assert ns["launch_base"]() == "a" * 40
+    assert ns["BASE_SHA_PATH"].read_text() == "a" * 40 + "\n"
+    # a resume reuses it rather than re-reading a base the verifier has merged into (the run may have
+    # stopped before writing any result), and cannot run without it
+    calls.clear()
+    ns["resume"] = True
+    assert ns["launch_base"]() == "a" * 40 and calls == []
+    for bad in ("origin/main\n", ""):
+        ns["BASE_SHA_PATH"].write_text(bad)
+        with pytest.raises(SystemExit, match="WAVE_RERUN"):
+            ns["launch_base"]()
+    ns["BASE_SHA_PATH"].unlink()
+    with pytest.raises(SystemExit, match="WAVE_RERUN"):
+        ns["launch_base"]()
     src = WORKFLOW.read_text()
-    # taken right after the manifest is validated, before the doctor run and any child; a resumed run
-    # keeps the SHA its first launch recorded rather than re-reading a base the verifier has merged into
-    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = .*wave_base\(\)\n", src)
-    assert 'prior.get("base_sha")' in src and '"base_sha": BASE_SHA' in src
+    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = launch_base\(\)\nDOCTOR = ", src)
+    assert 'BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")' in src and '"base_sha": BASE_SHA' in src
+
+
+def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_it_merged(tmp_path):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[3] == "fetch":
+            return subprocess.CompletedProcess(cmd, 0)
+        if cmd[3] == "rev-parse":
+            return subprocess.CompletedProcess(cmd, 0, stdout="v" * 40 + "\n")
+        if "--" in cmd:  # the verifier tree against a gated PR head, restricted to that PR's unit evidence
+            return subprocess.CompletedProcess(cmd, 0, stdout=".migration/recon/u/result.json\n" if "1" * 40 in cmd else "")
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n".join([
+            ".migration/recon/wave-2/report.md", "src/loans.sql", ".migration/recon/u/result.json",
+            ".migration/recon/u/rows.csv", ".migration/recon/v/result.json", ".migration/03_recon_tolerances.json"]) + "\n")
+
+    ns = _launch_ns(tmp_path, fake_run)
+    passed = [{"batch": "b1", "units": ["u"], "pr_head": "1" * 40}, {"batch": "b2", "units": ["v"], "pr_head": "2" * 40}]
+    # merged evidence byte-identical to the gated PR head drops out; a rewritten result.json, the verifier's
+    # own report and anything else that reached the branch stay
+    assert ns["verifier_changed_paths"](2, passed) == [
+        ".migration/03_recon_tolerances.json", ".migration/recon/u/result.json", ".migration/recon/wave-2/report.md",
+        "src/loans.sql"]
+    assert calls[0][3:] == ["fetch", "-q", "origin", "recon/wave-2"]
+    assert calls[2][3:] == ["diff", "--name-only", "--no-renames", "b" * 40 + "..." + "v" * 40]
+    assert calls[3][3:] == ["diff", "--name-only", "--no-renames", "1" * 40, "v" * 40, "--", ".migration/recon/u/"]
+    assert calls[4][3:] == ["diff", "--name-only", "--no-renames", "2" * 40, "v" * 40, "--", ".migration/recon/v/"]
+    # a passed batch whose gated head is unknown, or a diff git cannot answer: unverifiable, no PASS stands
+    assert ns["verifier_changed_paths"](2, [{"batch": "b1", "units": ["u"]}]) is None
+
+    def failing(cmd, **kw):
+        raise subprocess.CalledProcessError(128, cmd)
+
+    assert _launch_ns(tmp_path, failing)["verifier_changed_paths"](2, passed) is None
 
 
 def test_git_observed_ledger_changes_beat_a_clean_self_report():
     ns = _batch_runtime()
     seen = []
-    ns["pr_changed_paths"] = lambda pr_url: seen.append(pr_url) or ["src/loans.sql", ".migration/03_recon_tolerances.json"]
+    ns["pr_changed_paths"] = lambda pr_url: seen.append(pr_url) or ("c" * 40, ["src/loans.sql", ".migration/03_recon_tolerances.json"])
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered"
     assert ".migration/03_recon_tolerances.json" in out["one_line_summary"]
     assert seen == ["https://example/pr/1"]  # the PR, not the branch the child names
+    assert out["pr_head"] == "c" * 40  # the gated head, for the verifier's tree to be held to
+    ns["pr_changed_paths"] = lambda pr_url: ("c" * 40, ["src/loans.sql"])
+    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
+    assert out["status"] == "PASS" and out["pr_head"] == "c" * 40
     ns["pr_changed_paths"] = lambda pr_url: None
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and "git" in out["one_line_summary"]
