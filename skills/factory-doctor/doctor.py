@@ -66,9 +66,10 @@ CAPABILITIES = ".migration/09_capabilities.json"
 # does not, `echo` prints a line and nothing else happens. Either way no Databricks call is made.
 # The nonce is issued per report and echoed in the guard's block reason, so `blocked:<nonce>` can
 # only be passed back by a session that saw the block.
+HOOK_PROBE_TOKEN = "__dbx_guard_probe__{nonce}"
 HOOK_PROBE_COMMAND = (
     "echo 'databricks experimental aitools tools query "
-    "\"DROP TABLE __dbx_guard_probe__{nonce}.x.y\"' # factory-doctor hook probe: expected BLOCKED"
+    f"\"DROP TABLE {HOOK_PROBE_TOKEN}.x.y\"' # factory-doctor hook probe: expected BLOCKED"
 )
 
 
@@ -203,17 +204,19 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str) -> list[Check]:
         return out
 
     # Functional check: feed the guard the probe event directly; it must block, and the reason must
-    # echo the probe token so a blanket deny cannot pass as the guard having read the command.
+    # echo the full probe token (prefix + nonce) so a blanket deny that hardcodes the prefix cannot
+    # pass as the guard having read the command.
+    token = HOOK_PROBE_TOKEN.format(nonce="self")
     event = json.dumps({"tool_name": "exec", "tool_input": {"command": HOOK_PROBE_COMMAND.format(nonce="self")}})
     try:
         r = subprocess.run([sys.executable, str(guard)], input=event, text=True, capture_output=True,
                            timeout=30, cwd=ws, env={**os.environ, "CLAUDE_PROJECT_DIR": str(ws)})
-        if r.returncode == 2 and '"block"' in r.stdout and "__dbx_guard_probe__" in r.stdout:
+        if r.returncode == 2 and '"block"' in r.stdout and token in r.stdout:
             out.append(Check("hook_guard_functional", "ok",
-                             "dbx_guard.py blocks the probe command when invoked directly and names __dbx_guard_probe__"))
+                             f"dbx_guard.py blocks the probe command when invoked directly and names {token}"))
         else:
             out.append(Check("hook_guard_functional", "fail",
-                             f"dbx_guard.py did not block the probe naming __dbx_guard_probe__ (rc={r.returncode}): "
+                             f"dbx_guard.py did not block the probe naming {token} (rc={r.returncode}): "
                              f"{_redact(r.stderr or r.stdout)}"))
     except subprocess.TimeoutExpired:
         out.append(Check("hook_guard_functional", "fail", "dbx_guard.py timed out on the probe"))

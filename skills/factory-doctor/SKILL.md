@@ -64,7 +64,7 @@ name, so the block message the platform shows is the only place the nonce can be
 | `allowlist_committed` | `.migration/allowed_targets.json` or `.migration/03_recon_tolerances.json` is not byte-equal to `git show HEAD:<path>`: the row names the file and its state (`modified since HEAD`, `untracked`, `missing`). A tolerance or catalog changes through a recorded decision and a commit, never on a working copy | `git` |
 | `allowlist_matches_contract` | the `--expect-catalogs` list (the wave's capability contract) differs from the allowlist's `catalogs`; `skipped` without the flag | `allowed_targets.json` |
 | `hooks_files` | `hooks.json` missing/malformed or does not register `hooks/dbx_guard.py` as `PreToolUse` | plugin root |
-| `hook_guard_functional` | the guard, invoked directly, fails to block the probe with a reason naming `__dbx_guard_probe__` (a blanket deny is not proof it read the command) | `hooks/dbx_guard.py` |
+| `hook_guard_functional` | the guard, invoked directly, fails to block the probe with a reason naming the full `__dbx_guard_probe__<nonce>` token the doctor sent (a blanket deny, even one that hardcodes the prefix, is not proof it read the command) | `hooks/dbx_guard.py` |
 | `hook_platform_loaded` | live probe ran unblocked; `unverified` until `--hook-probe-result blocked:<nonce>` repeats the nonce this workspace's last report issued (`data.probe_nonce`, `data.probe_command`) | this session |
 | `official_databricks_plugin` | `warn` if some routed official skills are missing on disk; `unverified` if none visible locally (they are platform-loaded via `requiredPlugins`) | `target-routing` |
 | `recon_harness` | `dbx-recon selftest` fails or the harness is not importable | `data-reconciliation` |

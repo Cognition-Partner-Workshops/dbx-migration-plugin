@@ -1058,16 +1058,17 @@ def test_hooks_json_registers_only_the_guard():
 
 def test_hook_guard_functional_requires_the_probe_token_in_the_block_reason(tmp_path):
     """rc=2 plus a generic block is not proof the guard read the probe: the reason must echo the
-    `__dbx_guard_probe__` token that only the probe command carries."""
+    full `__dbx_guard_probe__<nonce>` token the doctor sent (the bare prefix can be hardcoded)."""
     ws = make_workspace(tmp_path)
     fake_root = tmp_path / "plugin"
     (fake_root / "hooks").mkdir(parents=True)
     (fake_root / "hooks.json").write_text(json.dumps(
         {"PreToolUse": [{"matcher": "exec", "hooks": [{"command": "python hooks/dbx_guard.py"}]}]}))
     guard = fake_root / "hooks" / "dbx_guard.py"
-    guard.write_text('import sys; print(\'{"decision": "block", "reason": "generic deny"}\'); sys.exit(2)\n')
-    c = {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"]
-    assert c.status == "fail" and "__dbx_guard_probe__" in c.detail
+    for reason in ("generic deny", "__dbx_guard_probe__ is never allowed"):
+        guard.write_text(f'import sys; print(\'{{"decision": "block", "reason": "{reason}"}}\'); sys.exit(2)\n')
+        c = {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"]
+        assert c.status == "fail" and "__dbx_guard_probe__self" in c.detail, reason
     guard.write_text('import sys, json; cmd = json.load(sys.stdin)["tool_input"]["command"]\n'
                      'print(json.dumps({"decision": "block", "reason": "blocked: " + cmd})); sys.exit(2)\n')
     assert {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"].status == "ok"
