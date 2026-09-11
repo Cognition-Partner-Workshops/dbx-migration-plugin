@@ -13,7 +13,7 @@ being applied, the source credential can write, or the tolerances on disk are no
 
 ```bash
 python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role orchestrator|child] \
-    [--expect-identity <migration SP userName>] [--expect-catalogs a,b] \
+    [--expect-identity <migration SP userName>] [--expect-host <workspace URL>] [--expect-catalogs a,b] \
     [--hook-probe-result blocked:<nonce>|not-blocked] \
     [--unit <unit_id> ...] [--mapping <candidate mapping_spec.json> ...] \
     [--source-secret <ENV VAR NAME of the source DSN> [--source-family sqlserver|postgres|...] --param name=value ...]
@@ -73,7 +73,7 @@ name, so the block message the platform shows is the only place the nonce can be
 | `source_principal_read_only` | the `--source-secret` principal can write an in-scope source table, directly or through indirection. SQL Server: server roles `sysadmin`/`securityadmin`/`serveradmin`/`dbcreator`/`bulkadmin`, database roles `db_owner`/`db_ddladmin`/`db_datawriter`/`db_securityadmin`, `HAS_PERMS_BY_NAME(NULL,NULL,...)` for `CONTROL SERVER`/`ALTER ANY DATABASE`/`IMPERSONATE ANY LOGIN`/`ALTER ANY LOGIN`, `HAS_PERMS_BY_NAME(<table>,'OBJECT',INSERT\|UPDATE\|DELETE\|ALTER)`, a column-level `UPDATE` grant on any in-scope table (`fn_my_permissions(<table>,'OBJECT')`, which the table-level check does not see), `IMPERSONATE` on any login or user, and `EXECUTE` on any user stored procedure in the source database (every procedure is treated as writing). Postgres: `rolsuper`/`rolcreaterole`/`rolcreatedb`/`rolbypassrls`, membership in `pg_write_server_files`/`pg_execute_server_program`, `has_table_privilege(<table>,'INSERT,UPDATE,DELETE,TRUNCATE')`, `has_column_privilege(...,'INSERT'\|'UPDATE')` on any column of an in-scope table, `has_schema_privilege(<schema>,'CREATE')`, `EXECUTE` on a `SECURITY DEFINER` or explicitly granted function in an in-scope schema, and a membership path (every role `pg_has_role(current_user, <role>, ...)` reaches, nested memberships included; on Postgres 16+ only memberships that inherit or can `SET ROLE`, so a `SET FALSE, INHERIT FALSE` grant does not count) to a role holding either table or schema privilege. Tables come from the same mappings `delete_evidence` resolves. The row names the object and privilege, never the credential. `unverified` (also blocks `ready`) for Databricks/Teradata/Oracle/Redshift/Snowflake (no tested privilege query; check the source grants by hand), when the family cannot be inferred (pass `--source-family`), or when the connection fails; `skipped` only at setup, before a unit mapping exists. `stats` says whether the connection was opened read-only (`readonly=True` / `default_transaction_read_only`): that is a driver hint the server may ignore, so it never substitutes for the grant check | the source's own catalog views |
 | `databricks_cli` | CLI not on PATH | `databricks-core` |
 | `databricks_auth_kind` | `warn` unless OAuth M2M env (`DATABRICKS_HOST/CLIENT_ID/CLIENT_SECRET`) | `target-routing` auth rules |
-| `databricks_identity` | `current-user me` fails, differs from `--expect-identity`, or `auth describe` resolves no workspace host; `warn` if a human user (still blocks `ready`). `data` records `userName`, `service_principal`, `host`, copied to the report's `identity` | `07_access_checklist.md` |
+| `databricks_identity` | `current-user me` fails, differs from `--expect-identity`, `auth describe` resolves no workspace host, or that host is not `--expect-host` (compared without scheme, case or trailing slash); `warn` if a human user (still blocks `ready`). `data` records `userName`, `service_principal`, `host`, copied to the report's `identity` | `07_access_checklist.md` |
 | `databricks_warehouse` | `warn` if `aitools get-default-warehouse` resolves nothing | `databricks-core` |
 
 ## Where it runs in the factory
@@ -86,7 +86,7 @@ name, so the block message the platform shows is the only place the nonce can be
   `identity.userName`, `identity.host`, catalogs, `guard_mode` and `stop_mode`, and `workflow.py`
   compares them with `09_capabilities.json` before launching anything.
 - **Unit (`5-unit_migration` step 1)**: each child runs
-  `doctor.py --role child --expect-identity <userName from brief>` and does the hook probe before
+  `doctor.py --role child --expect-identity <userName from brief> --expect-host <host from brief>` and does the hook probe before
   converting anything. Any `fail` -> report `status=BLOCKED` with the check id; never proceed as a
   different identity or with hooks unverified.
 - **Verifier**: runs it the same way; a verifier that cannot prove its identity produces no verdict.

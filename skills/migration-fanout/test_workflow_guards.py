@@ -1,6 +1,7 @@
 import ast
 import asyncio
 from collections import Counter
+import hashlib
 import json
 import os
 import re
@@ -34,17 +35,18 @@ def _batch_runtime():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
-                or (isinstance(node, ast.FunctionDef) and node.name == "ledger_violations")
+                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id == "MERGE_EVIDENCE_MODES" for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
         "Counter": Counter,
+        "hashlib": hashlib,
         "REPLAYED": {},
         "CHILD_SCHEMA": {},
         "REPO": ".",
         "WorkflowAgentError": RuntimeError,
-        "child_prompt": lambda batch: batch,
+        "child_prompt": lambda batch: json.dumps(batch, sort_keys=True),
         "log": lambda message: None,
         "pr_changed_paths": lambda pr_url: ("c" * 40, []),
     }
@@ -83,6 +85,7 @@ def test_validate_manifest_rejects_invalid_positive_integer(value):
 
 
 CAPS = {"identity": "sp-1", "catalogs": ["mig"], "ready": True, "guard_mode": "block", "stop_mode": "soft"}
+HOST = "https://adb-1.azuredatabricks.net"
 
 
 def _caps(**changes):
@@ -91,7 +94,7 @@ def _caps(**changes):
 
 def _manifest(**extra):
     m = {"wave": 1, "repo": "repo", "child_macro": "child", "verify_macro": "verify",
-         "capabilities": CAPS,
+         "capabilities": _caps(host=HOST),
          "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
     m.update(extra)
     return m
@@ -166,6 +169,15 @@ def test_child_prompt_names_exactly_its_batch_units_for_the_doctor():
     assert "--role child --expect-identity sp-1 --unit loans --unit payments (exactly this batch" in text
     assert "--unit fees" not in text and "--mapping" not in text
     assert "mapping_spec.json itself" in text
+
+
+def test_child_brief_pins_the_contracts_workspace_host_for_the_doctor():
+    """The expected principal can resolve against another workspace from a child's own profile or env;
+    the brief makes the doctor compare the host the contract records, not only the identity."""
+    ns = _prompt_ns(_manifest())
+    assert f"--expect-host {HOST}" in ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+    odd = _prompt_ns(_manifest(capabilities=_caps(host="https://x.net/a b")))
+    assert "--expect-host 'https://x.net/a b'" in odd["child_prompt"](odd["MANIFEST"]["batches"][0])
 
 
 @pytest.mark.parametrize("manifest", [
@@ -287,6 +299,9 @@ def test_pass_without_pr_is_downgraded():
     assert output["failure_class"] == "missing_pr"
 
 
+BATCH = {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "b"}
+
+
 def _run_one(namespace, report):
     async def agent(prompt, **kwargs):
         return dict(report)
@@ -295,7 +310,7 @@ def _run_one(namespace, report):
 
     async def exercise():
         return await namespace["run_batch"](
-            {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "b"},
+            dict(BATCH),
             asyncio.Semaphore(1), namespace["Breaker"](3))
 
     return asyncio.run(exercise())
@@ -533,6 +548,9 @@ def test_fresh_doctor_report_reruns_the_doctor_with_this_sessions_hook_probe_onl
     # no probe result from the launching session: the doctor decides (hook row unverified, not ready)
     assert cmd[cmd.index("--hook-probe-result") + 1] == "unknown"
     assert cmd[cmd.index("--expect-identity") + 1] == "sp-1" and cmd[cmd.index("--expect-catalogs") + 1] == "mig"
+    assert cmd[cmd.index("--expect-host") + 1] == HOST
+    with pytest.raises(SystemExit, match="capabilities.host"):  # no host to hold anyone to: no doctor run, no wave
+        ns["fresh_doctor_report"](_manifest(capabilities=_caps()))
     assert cmd[cmd.index("--source-family") + 1] == "sqlserver" and cmd[cmd.index("--source-secret") + 1] == "LEGACY_ODBC"
     assert cmd[cmd.index("--param") + 1] == "db=loan_servicing" and "--no-databricks" not in cmd
     # the probe the launching session ran is passed through verbatim; the doctor checks the nonce
@@ -722,14 +740,24 @@ def test_git_observed_ledger_changes_beat_a_clean_self_report():
 def test_a_replayed_pass_keeps_the_gate_it_passed_in_the_run_being_resumed():
     """On a resume the finished child replays, but its PR has been merged by that run's verifier (or
     forked after other accepted units were), so re-diffing it now would attribute their evidence to it.
-    The recorded record is the workflow's own ledger: its gated head stands, git is not asked again."""
+    The recorded record is the workflow's own ledger: its gated head stands, git is not asked again,
+    but only for the same result: the runtime replays a finished agent for an unchanged prompt only, so
+    the record must carry the hash of the prompt it answered and name the same PR. A record from before
+    the brief changed, or naming another PR, describes a different child and its PR is gated afresh."""
     ns = _batch_runtime()
     ns["pr_changed_paths"] = lambda pr_url: pytest.fail("a replayed PASS must not be re-gated")
-    ns["REPLAYED"] = {"b": {"id": "b", "status": "PASS", "pr_head": "c" * 40}}
+    sha = ns["prompt_sha"](ns["child_prompt"](dict(BATCH)))
+    assert re.fullmatch(r"[0-9a-f]{16,}", sha) and sha != ns["prompt_sha"](ns["child_prompt"]({**BATCH, "brief": "b2"}))
+    same = {"id": "b", "status": "PASS", "pr_head": "c" * 40, "pr_url": "https://example/pr/1", "prompt_sha": sha}
+    ns["REPLAYED"] = {"b": same}
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "PASS" and out["pr_head"] == "c" * 40
-    # a replayed FAIL, or a PASS recorded before any head was gated, is gated like a new result
-    for record in ({"id": "b", "status": "FAIL", "pr_head": "c" * 40}, {"id": "b", "status": "PASS"}, "PASS"):
+    assert out["prompt_sha"] == sha  # every result records the prompt it answered, for the next resume
+    # a changed brief, another PR, a record without the binding, a replayed FAIL, or a PASS recorded
+    # before any head was gated, is gated like a new result
+    for record in ({**same, "prompt_sha": ns["prompt_sha"]("other brief")}, {**same, "pr_url": "https://example/pr/2"},
+                   {k: v for k, v in same.items() if k != "prompt_sha"}, {k: v for k, v in same.items() if k != "pr_url"},
+                   {**same, "status": "FAIL"}, {k: v for k, v in same.items() if k != "pr_head"}, "PASS"):
         ns["REPLAYED"] = {"b": record}
         ns["pr_changed_paths"] = lambda pr_url: ("d" * 40, [".migration/03_recon_tolerances.json"])
         out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))

@@ -8,7 +8,7 @@ environment variables that are set.
 
 Usage:
     python3 doctor.py [--workspace DIR] [--plugin-root DIR] [--role orchestrator|child]
-                      [--hook-probe-result blocked:<nonce>|not-blocked|unknown] [--expect-identity NAME]
+                      [--hook-probe-result blocked:<nonce>|not-blocked|unknown] [--expect-identity NAME] [--expect-host URL]
                       [--expect-catalogs A,B] [--no-databricks] [--unit ID ...]
                       [--mapping mapping_spec.json ...] [--source-secret NAME] [--source-family F]
                       [--param NAME=VALUE ...] [--out PATH]
@@ -765,7 +765,11 @@ def classify_identity(who: dict) -> tuple[str, bool]:
     return name, is_sp
 
 
-def check_databricks(expect_identity: str | None) -> list[Check]:
+def _norm_host(host: str) -> str:
+    return re.sub(r"^https?://", "", host.strip().lower()).rstrip("/")
+
+
+def check_databricks(expect_identity: str | None, expect_host: str | None = None) -> list[Check]:
     out: list[Check] = []
     cli = shutil.which("databricks")
     if not cli:
@@ -811,6 +815,8 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
     elif not host:
         status = "fail"
         detail += "; workspace host not resolved by `databricks auth describe`, so the wave manifest cannot pin children to it"
+    elif expect_host and _norm_host(str(host)) != _norm_host(expect_host):
+        status, detail = "fail", detail + f"; expected host {expect_host} (the capability contract's workspace)"
     elif not is_sp:
         status, detail = "warn", detail + "; unattended sessions must not run as a human identity"
     out.append(Check("databricks_identity", status, detail, data))
@@ -828,7 +834,8 @@ def check_databricks(expect_identity: str | None) -> list[Check]:
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
         no_databricks: bool, units: list[str] | None = None, mappings: list[Path] | None = None,
         source_secret: str | None = None, params: dict[str, str] | None = None,
-        expect_catalogs: list[str] | None = None, source_family: str | None = None) -> dict:
+        expect_catalogs: list[str] | None = None, source_family: str | None = None,
+        expect_host: str | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root),
                            check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs)]
     checks += check_hooks(plugin_root, ws, probe_result)
@@ -842,7 +849,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
-        checks += check_databricks(expect_identity)
+        checks += check_databricks(expect_identity, expect_host)
     counts: dict[str, int] = {}
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
@@ -873,6 +880,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="outcome of running the probe_command of the last report; the nonce is the one the "
                         "guard's block message named")
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
+    p.add_argument("--expect-host", help="workspace host the session must be authenticated against (the contract's)")
     p.add_argument("--expect-catalogs", metavar="A,B", type=lambda s: [c.strip() for c in s.split(",") if c.strip()],
                    help="catalogs the wave's capability contract names; must equal allowed_targets.json's")
     p.add_argument("--no-databricks", action="store_true",
@@ -901,7 +909,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
                  a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params,
-                 a.expect_catalogs, a.source_family)
+                 a.expect_catalogs, a.source_family, a.expect_host)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:

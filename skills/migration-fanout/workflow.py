@@ -122,6 +122,10 @@ REPLAYED = {
 } if resume and isinstance(prior, dict) else {}
 
 
+def prompt_sha(prompt):
+    return hashlib.sha256(prompt.encode()).hexdigest()[:16]
+
+
 # Verifier Tier 3 depth. sampled: Tier 1+2 plus a differently-seeded stratified Tier 3 (catches
 # a child that fabricated or misread results at a fraction of the cost). full: keyed full diff,
 # for units the plan flags cutover-critical (D4 external feed, finance). Never "threshold":
@@ -248,9 +252,13 @@ def fresh_doctor_report(m):
     session's shell can run: its outcome arrives in WAVE_HOOK_PROBE (blocked:<nonce> | not-blocked);
     nothing recorded earlier stands in for it, and the doctor checks the nonce."""
     caps, src, out = m["capabilities"], m.get("source") or {}, MANIFEST_PATH.with_suffix(".doctor.json")
+    if not isinstance(caps.get("host"), str) or not caps["host"]:
+        raise SystemExit("manifest 'capabilities.host' must be the workspace host 09_capabilities.json records "
+                         "(identity.host); the doctor and every child are held to it")
     cmd = [sys.executable, str(DOCTOR_PY), "--workspace", str(ROOT), "--out", str(out),
            "--hook-probe-result", os.environ.get("WAVE_HOOK_PROBE") or "unknown",
-           "--expect-identity", caps["identity"], "--expect-catalogs", ",".join(caps["catalogs"])]
+           "--expect-identity", caps["identity"], "--expect-host", caps["host"],
+           "--expect-catalogs", ",".join(caps["catalogs"])]
     if src:
         cmd += ["--source-family", src["family"], "--source-secret", src["secret"]]
         cmd += [a for k, v in src.get("params", {}).items() for a in ("--param", f"{k}={v}")]
@@ -546,6 +554,8 @@ def capability_block(units):
         f"Before converting anything run the factory-doctor skill with --role child "
         f"--expect-identity {caps['identity']} {unit_flags} (exactly this batch; the doctor resolves "
         "and verifies every unit's .migration/units/<unit_id>/mapping_spec.json itself), "
+        f"--expect-host {shlex.quote(caps['host'])} (the workspace the contract pins; the same principal "
+        "resolved against another workspace is a fail), "
         + (f"{source_flags} (the source the doctor checks for write access; the same secret your recon "
            "gate passes as --source-dsn-secret)" if source_flags else
            "--source-secret naming the secret your recon gate passes as --source-dsn-secret, and the "
@@ -615,12 +625,14 @@ async def run_batch(batch, sem, breaker):
             return {"status": "NOT_LAUNCHED", "recon_verdict": "NOT_RUN",
                     "one_line_summary": f"held back: breaker tripped on '{breaker.tripped_on}'"}
         log(f"launch {batch['id']} ({len(batch['units'])} units)")
+        prompt = child_prompt(batch)
         try:
-            out = await agent(child_prompt(batch), phase="migrate", schema=CHILD_SCHEMA,
+            out = await agent(prompt, phase="migrate", schema=CHILD_SCHEMA,
                               label=batch["id"], repos=[REPO])
         except WorkflowAgentError as e:
             out = {"status": "FAIL", "recon_verdict": "NOT_RUN", "failure_class": "session_died",
                    "one_line_summary": f"child session died: {e}"}
+        out["prompt_sha"] = prompt_sha(prompt)
         if (out["status"] == "PASS"
                 and (out["recon_verdict"] != "PASS"
                      or out.get("recon_mode") not in MERGE_EVIDENCE_MODES)):
@@ -637,11 +649,13 @@ async def run_batch(batch, sem, breaker):
                 "PASS downgraded: no PR URL/branch reported; " + out["one_line_summary"])
         # The ledger gate reads the PR's diff from git; the child's changed_paths can only add to it. A
         # replayed PASS keeps the head gated in the run being resumed: that run's verifier may have merged
-        # it since, and re-diffing it would attribute other accepted units to it.
+        # it since, and re-diffing it would attribute other accepted units to it. It is the same result
+        # only if it answered this prompt (the runtime replays unchanged prompts) and names the same PR.
         reported = out.get("changed_paths")
         usable = isinstance(reported, list) and all(isinstance(p, str) for p in reported)
         record = REPLAYED.get(batch["id"])
-        if isinstance(record, dict) and record.get("status") == "PASS" and isinstance(record.get("pr_head"), str):
+        if (isinstance(record, dict) and record.get("status") == "PASS" and isinstance(record.get("pr_head"), str)
+                and record.get("prompt_sha") == out["prompt_sha"] and record.get("pr_url") == out.get("pr_url")):
             gated = (record["pr_head"], [])
         else:
             gated = pr_changed_paths(out.get("pr_url"))

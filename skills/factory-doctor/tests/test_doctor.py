@@ -125,7 +125,7 @@ def test_cli_rejects_a_bare_blocked_claim(tmp_path):
 
 def test_human_identity_is_not_ready(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
-    monkeypatch.setattr(doctor, "check_databricks", lambda expect: [
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
         doctor.Check("databricks_cli", "ok", "v0.2"),
         doctor.Check("databricks_auth_kind", "warn", "pat (env)"),
         doctor.Check("databricks_identity", "warn", "authenticated as someone@example.com (user)"),
@@ -138,7 +138,7 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
 
 def test_service_principal_with_advisory_warns_is_ready(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
-    monkeypatch.setattr(doctor, "check_databricks", lambda expect: [
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
         doctor.Check("databricks_cli", "ok", "v0.2"),
         doctor.Check("databricks_auth_kind", "ok", "oauth-m2m (env)"),
         doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
@@ -1079,6 +1079,31 @@ def test_identity_row_records_the_verified_host_and_the_report_exposes_it(tmp_pa
     _fake_cli(monkeypatch, sp, {"status": "error"})
     checks = {c.id: c for c in doctor.check_databricks(None)}
     assert checks["databricks_identity"].status == "fail" and "host" in checks["databricks_identity"].detail
+
+
+def test_identity_row_fails_when_the_workspace_is_not_the_expected_host(tmp_path, monkeypatch):
+    """The expected principal can resolve against another workspace (a child's own profile or env):
+    the host is compared to --expect-host under one spelling rule, not merely required to be set."""
+    sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
+    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-2.azuredatabricks.net"}})
+
+    def row(host):
+        return {c.id: c for c in doctor.check_databricks(sp["userName"], host)}["databricks_identity"]
+
+    c = row("https://adb-1.azuredatabricks.net")
+    assert c.status == "fail" and "expected host https://adb-1.azuredatabricks.net" in c.detail
+    assert c.data["host"] == "https://adb-2.azuredatabricks.net"  # what was seen, for the report
+    for spelled in ("https://adb-2.azuredatabricks.net/", "HTTPS://ADB-2.azuredatabricks.net", " adb-2.azuredatabricks.net "):
+        assert row(spelled).status == "ok", spelled
+    assert row(None).status == "ok"
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", sp["userName"], False,
+                        expect_host="https://adb-1.azuredatabricks.net")
+    assert report["ready"] is False and "databricks_identity=fail" in report["blocking"]
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
+                        "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--expect-host", "h", "--out", "-"],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 1 and "unrecognized" not in r.stderr and "databricks_identity" in r.stdout
 
 
 # ------------------------------------------------------------------ hooks.json (post-hint cut)
