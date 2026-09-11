@@ -109,6 +109,45 @@ def test_bcp_out_is_a_read():
     approve("bcp dbo.t out data.csv -S tdprod.corp -c")
 
 
+@pytest.mark.parametrize("sql", [
+    "EXPLAIN ANALYZE DELETE FROM t", "EXPLAIN (ANALYZE, BUFFERS) INSERT INTO t VALUES (1)", "EXPLAIN DELETE FROM t",
+    "EXPLAIN ANALYZE VERBOSE UPDATE t SET a = 1", "explain analyze select 1; explain analyze delete from t",
+    "SELECT nextval('s')", "SELECT setval('s', 99)", "SELECT pg_terminate_backend(pid) FROM pg_stat_activity",
+    "SELECT pg_cancel_backend(1)", "SELECT pg_reload_conf()", "SELECT pg_rotate_logfile()", "SELECT lo_export(1, '/tmp/x')",
+    "SELECT lo_import('/etc/passwd')", "SELECT lo_unlink(1)", "SELECT dblink_exec('c', 'DELETE FROM t')",
+    "SELECT * FROM dblink('c', 'DELETE FROM t') AS t(a int)", "SELECT pg_advisory_lock(1)", "SELECT pg_try_advisory_xact_lock(1)",
+    "SELECT pg_sleep(600)", "SELECT set_config('x', 'y', false)", "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x').db.dbo.t",
+    "SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE t')", "SELECT * FROM OPENQUERY(lnk, 'DELETE t')",
+    "WITH x AS (SELECT nextval('s') AS n) SELECT n FROM x",
+])
+def test_side_effecting_functions_are_not_reads_on_legacy(sql):
+    v = block(f"psql -h tdprod.corp -c \"{sql}\"")
+    assert "read-only" in v.reason
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT s.NEXTVAL FROM dual", "SELECT dbms_lock.sleep(10) FROM dual", "SELECT sys.dbms_random.value() FROM dual",
+    "SELECT utl_inaddr.get_host_address('x') FROM dual", "SELECT dbms_xmlgen.getxml('SELECT 1') FROM dual",
+])
+def test_oracle_side_effecting_reads_block_through_sqlplus(sql):
+    block(f"sqlplus -s u/p@tdprod.corp <<'EOF'\n{sql};\nEOF")
+
+
+@pytest.mark.parametrize("sql", [
+    "EXPLAIN SELECT 1", "EXPLAIN ANALYZE SELECT 1", "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t", "EXPLAIN VERBOSE WITH x AS (SELECT 1) SELECT * FROM x",
+    "SELECT currval('s')", "SELECT lastval()", "SELECT nextval FROM t", "SELECT * FROM utl_file_log", "SELECT pg_backend_pid()",
+    "SELECT s.currval FROM dual", "SELECT * FROM dblink_status", "SELECT setval_reason FROM audit", "SELECT pg_advisory_locks_held FROM v",
+])
+def test_reads_that_only_look_like_side_effects_pass(sql):
+    approve(f"psql -h tdprod.corp -c \"{sql}\"")
+
+
+def test_side_effecting_functions_follow_the_host_rule_off_legacy():
+    block("psql -h somewhere.example -c \"SELECT nextval('s')\"")     # unknown host: a non-read needs target_hosts
+    approve("psql -h fixture-host -c \"SELECT nextval('s')\"")       # the allowlisted Lakebase target may be written
+    block("psql -h fixture-host -c 'EXPLAIN ANALYZE DELETE FROM t' -h tdprod.corp")
+
+
 def test_psql_meta_commands_that_read_pass():
     approve("psql \"$LEGACY_TD_DSN\" -c '\\dt' -c '\\d+ sales.orders'")
     block("psql \"$LEGACY_TD_DSN\" -c '\\copy t FROM x.csv'")
@@ -123,11 +162,19 @@ def test_psql_meta_commands_that_read_pass():
     "databricks bundle summary -t prod", "databricks fs ls dbfs:/Volumes/prod/s/v", "databricks jobs list-runs --job-id 1",
     "databricks jobs get-run 5", "databricks pipelines get 1", "databricks warehouses list", "databricks clusters get 1",
     "databricks workspace list /Shared", "databricks workspace export /Shared/x", "databricks workspace get-status /Shared/x",
-    "databricks secrets list-scopes", "databricks secrets list-secrets s", "databricks auth describe", "databricks auth env",
-    "databricks auth token", "databricks sql execute -e 'SELECT 1'", "databricks bundle validate",
+    "databricks secrets list-scopes", "databricks secrets list-secrets s", "databricks auth describe", "databricks auth profiles",
+    "databricks sql execute -e 'SELECT 1'", "databricks bundle validate",
 ])
 def test_databricks_read_shapes_pass(cmd):
     approve(cmd)
+
+
+def test_auth_commands_that_print_the_bearer_token_block():
+    # review round 3: `auth token` prints the cached token, `auth env` prints DATABRICKS_TOKEN (was pinned approve)
+    for cmd in ("databricks auth token", "databricks auth env", "databricks auth env -o json", "databricks auth token DEFAULT"):
+        assert "credential" in block(cmd).reason
+    assert "identity swap" in block("databricks auth env --profile demo").reason   # the profile flag is the earlier finding
+    approve("databricks auth describe")
 
 
 @pytest.mark.parametrize("cmd", [
@@ -248,6 +295,39 @@ def test_missing_bundle_targets_fails_closed():
 ])
 def test_identity_swaps_block(cmd):
     assert "identity" in block(cmd).reason
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo '[DEFAULT]\nhost = https://x\ntoken = y' > ~/.databrickscfg",
+    "printf '[DEFAULT]\\nhost=x\\n' >> $HOME/.databrickscfg",
+    "sed -i 's/^token.*/token = y/' ~/.databrickscfg",
+    "cp /tmp/x ~/.config/databricks/token-cache.json",
+    "cp /tmp/x ~/.databricks/token-cache.json",
+    "mv /tmp/cfg ${HOME}/.databrickscfg",
+    "tee ~/.databrickscfg < /tmp/x",
+    "install -m 600 /tmp/cfg ~/.databrickscfg",
+    "ln -sf /tmp/cfg ~/.databrickscfg",
+    "truncate -s0 ~/.databrickscfg",
+    "rm ~/.databrickscfg",
+    "rm -rf ~/.config/databricks",
+    "echo x > /tmp/.databrickscfg",
+    "python3 -c \"open('/home/u/.databrickscfg', 'w').write('[DEFAULT]')\"",
+    "python3 -c \"import shutil; shutil.copy('/tmp/x', '/home/u/.config/databricks/token-cache.json')\"",
+    "perl -pi -e 's/token/x/' ~/.databrickscfg",
+    "dd if=/tmp/x of=$HOME/.databrickscfg",
+    "cp /tmp/x ~/.databricks*",
+])
+def test_writes_to_the_databricks_config_files_are_identity_swaps(cmd):
+    assert "credential" in block(cmd).reason
+
+
+def test_reads_and_look_alikes_of_the_databricks_config_files_pass():
+    approve("ls -la ~/.config/databricks")
+    approve("grep -c token ~/.databrickscfg")
+    approve("echo x > databrickscfg.md")
+    approve("cp x ~/.config/databricks-notes/y")
+    approve("echo x > ~/.databricks-scratch/notes")
+    approve("databricks auth describe")
 
 
 def test_identity_variables_without_a_client_in_the_segment_are_not_the_guards_business():

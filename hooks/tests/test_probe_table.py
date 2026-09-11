@@ -5,6 +5,7 @@ Add a row to PROBES to pin a new shape. `xfail` marks rows the guard does not co
 (programs it cannot read into: JDBC, perl, make); the doctor's read-only-principal row owns them.
 """
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -260,8 +261,38 @@ PROBES2 = [
     ("export DATABRICKS_TOKEN alone", "export DATABRICKS_TOKEN=abc", "block"),
     ("DATABRICKS_AUTH_TYPE swap", "DATABRICKS_AUTH_TYPE=azure-cli databricks tables list mig_cat s", "block"),
     ("databricks configure --token", "databricks configure --token", "block"),
-    ("databricks auth token (approve)", "databricks auth token", "approve"),
+    ("databricks auth token", "databricks auth token", "block"),   # round 3: prints the bearer token (was approve)
+    ("databricks auth env", "databricks auth env", "block"),   # round 3: prints DATABRICKS_TOKEN
+    ("databricks auth describe (approve)", "databricks auth describe", "approve"),
     ("databricks auth token --profile x", "databricks auth token --profile x", "block"),
+    ("~/.databrickscfg redirect", "echo '[DEFAULT]\nhost = https://x\ntoken = y' > ~/.databrickscfg", "block"),
+    ("~/.databrickscfg sed -i", "sed -i 's/^token.*/token = y/' ~/.databrickscfg", "block"),
+    ("~/.config/databricks token cache cp", "cp /tmp/x ~/.config/databricks/token-cache.json", "block"),
+    ("~/.databricks token cache cp", "cp /tmp/x ~/.databricks/token-cache.json", "block"),
+    ("$HOME/.databrickscfg tee", "cat /tmp/x | tee $HOME/.databrickscfg", "block"),
+    (".databrickscfg in another dir", "echo x > /tmp/.databrickscfg", "block"),
+    ("~/.databrickscfg python write", "python3 -c \"open('/home/u/.databrickscfg', 'w').write('x')\"", "block"),
+    ("~/.databrickscfg read (approve)", "grep -c host ~/.databrickscfg", "approve"),
+    ("databrickscfg look-alike (approve)", "echo x > notes/databrickscfg.md", "approve"),
+    ("EXPLAIN ANALYZE DELETE on legacy", "psql -h tdprod.corp -c 'EXPLAIN ANALYZE DELETE FROM t'", "block"),
+    ("EXPLAIN (ANALYZE, BUFFERS) INSERT on legacy", "psql -h tdprod.corp -c 'EXPLAIN (ANALYZE, BUFFERS) INSERT INTO t VALUES (1)'", "block"),
+    ("EXPLAIN DELETE on legacy (pinned: block)", "psql -h tdprod.corp -c 'EXPLAIN DELETE FROM t'", "block"),
+    ("EXPLAIN ANALYZE SELECT on legacy (approve)", "psql -h tdprod.corp -c 'EXPLAIN ANALYZE SELECT * FROM t'", "approve"),
+    ("SELECT nextval on legacy", "psql -h tdprod.corp -c \"SELECT nextval('s')\"", "block"),
+    ("SELECT setval on legacy", "psql -h tdprod.corp -c \"SELECT setval('s', 99)\"", "block"),
+    ("SELECT pg_terminate_backend on legacy", "psql -h tdprod.corp -c 'SELECT pg_terminate_backend(pid) FROM pg_stat_activity'", "block"),
+    ("SELECT lo_export on legacy", "psql -h tdprod.corp -c \"SELECT lo_export(1, '/tmp/x')\"", "block"),
+    ("SELECT dblink_exec on legacy", "psql -h tdprod.corp -c \"SELECT dblink_exec('c', 'DELETE FROM t')\"", "block"),
+    ("SELECT pg_advisory_lock on legacy", "psql -h tdprod.corp -c 'SELECT pg_advisory_lock(1)'", "block"),
+    ("SELECT pg_sleep on legacy", "psql -h tdprod.corp -c 'SELECT pg_sleep(600)'", "block"),
+    ("sqlplus SELECT s.NEXTVAL heredoc", "sqlplus -s u/p@tdprod.corp <<'EOF'\nSELECT s.NEXTVAL FROM dual;\nEOF", "block"),
+    ("sqlplus dbms_ call heredoc", "sqlplus -s u/p@tdprod.corp <<'EOF'\nSELECT dbms_lock.sleep(10) FROM dual;\nEOF", "block"),
+    ("sqlcmd OPENROWSET (pinned)", "sqlcmd -S sqlserver-demo -Q \"SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE t')\"", "block"),
+    ("sqlcmd OPENQUERY (pinned)", "sqlcmd -S sqlserver-demo -Q \"SELECT * FROM OPENQUERY(lnk, 'DELETE t')\"", "block"),
+    ("sqlcmd OPENDATASOURCE", "sqlcmd -S sqlserver-demo -Q \"SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x').db.dbo.t\"", "block"),
+    ("SELECT currval on legacy (approve)", "psql -h tdprod.corp -c \"SELECT currval('s')\"", "approve"),
+    ("SELECT nextval on the allowlisted target (approve)", "psql -h lakebase-host -c \"SELECT nextval('s')\"", "approve"),
+    ("SELECT nextval on an unknown host", "psql -h 10.0.0.9 -c \"SELECT nextval('s')\"", "block"),
     ("echo of a token-shaped word then read (approve)", "echo DATABRICKS_TOKEN=x; databricks jobs list", "approve"),
     ("identity assignment on git, then read (approve)", "DATABRICKS_TOKEN=x git status; databricks jobs list", "approve"),
     ("identity assignment on git, later export", "DATABRICKS_TOKEN=x git status; export DATABRICKS_HOST=https://x; databricks jobs list", "block"),
@@ -658,3 +689,53 @@ def test_probe_sentinel_outside_a_migration_workspace_passes_through(tmp_path: P
     # the doctor runs the probe inside a workspace, where it must block; outside one nothing blocks
     r = run_hook("echo __dbx_guard_probe__zz", tmp_path)
     assert r.returncode == 0
+
+
+# ---------------------------------------------------------------- the running guard's own tree
+
+@pytest.fixture(scope="module")
+def plugin(tmp_path_factory) -> Path:
+    """A throwaway copy of the plugin tree (hooks.json + hooks/dbx_guard.py) that is the *running*
+    guard for these rows; the repo checkout is then an ordinary dev target."""
+    p = tmp_path_factory.mktemp("plugin")
+    (p / "hooks").mkdir()
+    shutil.copy(GUARD, p / "hooks" / "dbx_guard.py")
+    (p / "hooks.json").write_text("{}")
+    return p
+
+
+@pytest.mark.parametrize("label,command,expected", [
+    ("sed -i the running guard", "sed -i 's/block/approve/' {plugin}/hooks/dbx_guard.py", "block"),
+    ("redirect over hooks.json", "echo '{{}}' > {plugin}/hooks.json", "block"),
+    ("chmod 000 the running guard", "chmod 000 {plugin}/hooks/dbx_guard.py", "block"),
+    ("chmod 000 the plugin dir", "chmod 000 {plugin}", "block"),
+    ("rm the running guard", "rm {plugin}/hooks/dbx_guard.py", "block"),
+    ("rm -rf the plugin tree", "rm -rf {plugin}", "block"),
+    ("mv the hooks dir aside", "mv {plugin}/hooks {plugin}/hooks.off", "block"),
+    ("mv the plugin tree aside", "mv {plugin} /tmp/plugin.off", "block"),
+    ("cp over the running guard", "cp /tmp/x {plugin}/hooks/dbx_guard.py", "block"),
+    ("tee over the running guard", "echo x | tee {plugin}/hooks/dbx_guard.py", "block"),
+    ("python write to the running guard", "python3 -c \"open('{plugin}/hooks/dbx_guard.py', 'w').write('')\"", "block"),
+    ("cd into hooks then sed -i", "cd {plugin}/hooks && sed -i 's/a/b/' dbx_guard.py", "block"),
+    ("sed -i through a symlink to the plugin", "sed -i 's/a/b/' {ws}/plug/hooks/dbx_guard.py", "block"),
+    ("glob over the hooks dir", "rm {plugin}/hooks/*.py", "block"),
+    ("truncate the running guard", "truncate -s0 {plugin}/hooks/dbx_guard.py", "block"),
+    ("read the running guard (approve)", "cat {plugin}/hooks/dbx_guard.py", "approve"),
+    ("grep hooks.json (approve)", "grep -n dbx_guard {plugin}/hooks.json", "approve"),
+    ("run the running guard's tests (approve)", "python3 -m pytest {plugin}/hooks/tests -q", "approve"),
+    ("sed -i the repo checkout's guard (approve: dev target, not the running guard)", "sed -i 's/a/b/' {repo}/hooks/dbx_guard.py", "approve"),
+    ("redirect over the repo checkout's hooks.json (approve)", "echo '{{}}' > {repo}/hooks.json", "approve"),
+], ids=lambda x: x if isinstance(x, str) and " " in x else None)
+def test_running_guard_tree_is_tamper_proof(label: str, command: str, expected: str, plugin: Path, workspace2: Path):
+    link = workspace2 / "plug"
+    if not link.exists():
+        link.symlink_to(plugin)
+    command = command.format(plugin=plugin, ws=workspace2, repo=GUARD.parents[1])
+    event = {"tool_name": "exec", "tool_input": {"command": command}}
+    r = subprocess.run([sys.executable, str(plugin / "hooks" / "dbx_guard.py")], input=json.dumps(event), text=True, check=False,
+                       capture_output=True, cwd=workspace2, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(workspace2)})
+    decision = "block" if r.returncode == 2 else "approve"
+    assert r.returncode in (0, 2), r.stderr
+    assert decision == expected, f"{label}: {command!r} -> {decision} ({r.stdout})"
+    if expected == "block":
+        assert "guard" in json.loads(r.stdout)["reason"]

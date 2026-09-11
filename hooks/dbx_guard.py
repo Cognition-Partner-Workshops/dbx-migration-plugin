@@ -9,28 +9,38 @@ judges each by the program it runs:
 * `databricks`: an explicit read allowlist passes (`current-user me`, `<securable> list|get`, `sql
   execute`, `api get`, `bundle validate|summary`, `fs ls|cat|head`, `jobs|pipelines|warehouses|
   clusters list|get...`, `workspace list|export|get-status`, `secrets list-scopes|list-secrets`,
-  `auth describe|env|token`, `--version`, `-h`). A mutation passes only when the securable it names
-  sits in an allowlisted catalog (`tables delete mig_cat.s.t`, `fs rm dbfs:/Volumes/mig_cat/...`).
-  SQL handed to `sql execute` / `spark-sql` / `dbsqlcli` may write only to allowlisted catalogs:
-  three-part names, `USE CATALOG` / `--catalog` per segment; a write resolving to no catalog,
-  `IDENTIFIER(<non-literal>)` in a write and `EXECUTE IMMEDIATE <non-literal>` block.
+  `auth describe|profiles`, `--version`, `-h`; `auth token|env` print the bearer token and block). A
+  mutation passes only when the securable it names sits in an allowlisted catalog (`tables delete
+  mig_cat.s.t`, `fs rm dbfs:/Volumes/mig_cat/...`). SQL handed to `sql execute` / `spark-sql` /
+  `dbsqlcli` may write only to allowlisted catalogs: three-part names, `USE CATALOG` / `--catalog`
+  per segment; a write resolving to no catalog, `IDENTIFIER(<non-literal>)` in a write and
+  `EXECUTE IMMEDIATE <non-literal>` block.
 * `curl`/`wget`/`http` to `$DATABRICKS_HOST` or a *.databricks.com / *.azuredatabricks.net host:
   GET without a body only.
 * `databricks bundle deploy|run|destroy` and `dbt run|build|seed`: a literal `-t/--target` that is
   in `bundle_targets` and not in `forbidden_bundle_targets`.
 * Identity: `databricks auth login|configure`, `--profile/-p/--host`, and `DATABRICKS_TOKEN=`,
   `DATABRICKS_HOST=`, `DATABRICKS_CONFIG_PROFILE=`, `DATABRICKS_CLIENT_*=` (inline, `export`, `env`)
-  around a `databricks`, `dbx-recon` or `spark-sql` command block.
+  around a `databricks`, `dbx-recon` or `spark-sql` command block, as does any write to the CLI's
+  credential store (`.databrickscfg` anywhere, `~/.databricks/`, `~/.config/databricks/`).
 * Legacy-only clients (bteq, sqlplus, snowsql, fastexport) and generic SQL clients (sqlcmd, psql,
   mysql, isql, ...) whose command mentions a `legacy_sources` entry: every statement must be a read
-  shape (SELECT, WITH, SHOW, DESCRIBE, EXPLAIN, HELP, USE, DECLARE, SET <session option>, a client
-  directive) with no write keyword anywhere. Loaders (sqlldr, mload, fastload, tbuild, tdload,
+  shape (SELECT, WITH, SHOW, DESCRIBE, HELP, USE, DECLARE, SET <session option>, a client directive,
+  EXPLAIN of a read shape -- `EXPLAIN ANALYZE` executes its statement) with no write keyword anywhere
+  and none of the side-effecting functions a SELECT can smuggle (`_SIDE_EFFECT_FN`: nextval/setval,
+  pg_terminate/cancel_backend, pg_reload_conf, advisory locks, lo_*, dblink*, pg_sleep, set_config,
+  Oracle `.NEXTVAL`/DBMS_*/UTL_*, T-SQL OPENROWSET/OPENQUERY/OPENDATASOURCE/xp_*/sp_*): a denylist
+  exception to the read grammar, because they mutate, disrupt or reach outside the source while
+  the statement still starts with SELECT. Loaders (sqlldr, mload, fastload, tbuild, tdload,
   `bcp ... in`) always block. Generic clients elsewhere: a non-read statement needs a host or DSN
   name that is a literal in `target_hosts`; a variable, an IP, an unlisted name or an empty list
   blocks.
 * Any write under `.migration/` (redirects, `sed -i`, `tee`, `cp/mv/rm/rmdir/truncate/chmod/mkdir/
   touch`, `git checkout|restore|rm`, inline Python naming a `.migration/` path with a write call)
-  blocks, except under `.migration/recon/` and `.migration/waves/`. Reads stay approved.
+  blocks, except under `.migration/recon/` and `.migration/waves/`. Reads stay approved. The same
+  writer detection protects the running guard's own plugin tree (`hooks.json`, `hooks/**`, resolved
+  through symlinks) from edits, `chmod`, `rm`, `mv`; a checkout of this repo elsewhere is an ordinary
+  development target.
 * `python x.py` / `spark-submit x.py` / `python -c` / a Python heredoc: a literal SQL string handed
   to `.execute(`, `.sql(`, `execute_statement(` or `statement=` is judged like the clients above;
   anything else in a program approves, and an unreadable `spark-submit` script blocks. Programs
@@ -160,7 +170,10 @@ _SQL_OUT_PATH = re.compile(r"(?i)(?:\bTO\s+|\\[ow]\s+|:out\s+|\bSPOOL\s+|\bFILE\
 
 # read shapes: leading keyword, then no write keyword anywhere at statement level
 _READ_HEAD = ("SELECT", "WITH", "SET", "USE", "DECLARE")
-_DESCRIBE_HEAD = ("SHOW", "DESC", "DESCRIBE", "EXPLAIN", "HELP", "GO")
+_DESCRIBE_HEAD = ("SHOW", "DESC", "DESCRIBE", "HELP", "GO")
+# `EXPLAIN [ANALYZE|VERBOSE|...] [(options)] <statement>`: the statement is judged on its own (ANALYZE executes it)
+_EXPLAIN = re.compile(r"EXPLAIN\b(?:\s+(?:ANALYZE|VERBOSE|PLAN|EXTENDED|CODEGEN|COST|FORMATTED|QUERY\s+PLAN)\b|\s*\([^)]*\)|\s+FOR\b)*\s*",
+                      re.IGNORECASE)
 _SQLPLUS_DIRECTIVE = ("SPOOL", "PROMPT", "DEFINE", "COLUMN", "WHENEVER", "EXIT", "QUIT", "TTITLE", "BTITLE", "BREAK",
                       "COMPUTE", "TIMING", "REM", "REMARK", "PAUSE", "CLEAR")
 _DIRECTIVE_LINE = re.compile(r"^\s*(?:[.\\:@/]|GO\b|(?:" + "|".join(_SQLPLUS_DIRECTIVE) + r")\b)", re.IGNORECASE)
@@ -171,6 +184,13 @@ _NON_READ_WORD = re.compile(
     r"\b(?:INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|CREATE|ALTER|GRANT|REVOKE|DENY|EXEC(?:UTE)?|CALL|KILL|BACKUP|RESTORE|DBCC|"
     r"WAITFOR|BEGIN|COMMIT|ROLLBACK|ENABLE|DISABLE|INTO|BULK|OPENROWSET|OPENQUERY|SHUTDOWN|RECONFIGURE|WRITETEXT|UPDATETEXT|"
     r"sp_\w+|xp_\w+)\b", re.IGNORECASE)
+# functions that mutate, disrupt or reach outside the source from inside a SELECT: sequences, backend
+# control, large objects, dblink, locks, sleeps, session config, Oracle DBMS_*/UTL_* packages, T-SQL
+# linked-server access. A statement calling one is not a read (denylist exception to the read grammar).
+_SIDE_EFFECT_FN = re.compile(
+    r"\b(?:nextval|setval|set_config|pg_sleep(?:_for|_until)?|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|"
+    r"pg_rotate_logfile|pg_(?:try_)?advisory_\w*lock\w*|lo_(?:import|export|unlink|creat|create|put|truncate)|dblink\w*|"
+    r"(?:sys\.)?(?:dbms|utl)_\w+(?:\.\w+)*|opendatasource)\s*\(|\.NEXTVAL\b", re.IGNORECASE)
 
 # Databricks CLI: read verbs per command group; mutations that name a securable, with the index of
 # the positional carrying its catalog (`grants update SECURABLE_TYPE FULL_NAME`, `schemas create
@@ -183,8 +203,9 @@ _DBX_READ = {
     "pipelines": {"list", "get", "list-updates", "get-update", "list-pipeline-events"}, "warehouses": {"list", "get"},
     "clusters": {"list", "get", "events", "spark-versions", "list-node-types", "list-zones"},
     "workspace": {"list", "export", "get-status"}, "secrets": {"list-scopes", "list-secrets"},
-    "auth": {"describe", "env", "token", "profiles"}, "fs": {"ls", "cat", "head"}, "api": {"get"}, "bundle": {"validate", "summary"},
+    "auth": {"describe", "profiles"}, "fs": {"ls", "cat", "head"}, "api": {"get"}, "bundle": {"validate", "summary"},
 }
+_TOKEN_PRINTERS = ("auth token", "auth env")   # print the bearer token into the session log
 # (catalog lifecycle and permissions -- `catalogs create|update|delete`, `grants update`, `schemas delete` -- are not
 # object writes inside an allowlisted catalog and stay blocked whatever the allowlist says)
 _CLI_CATALOG_ARG = {"schemas create": 1, "schemas update": 0, "tables delete": 0, "volumes create": 0, "volumes delete": 0,
@@ -795,11 +816,14 @@ def _is_read(stmt: str) -> bool:
         return True
     m = re.match(r"[A-Za-z_]+", s)
     head = m.group(0).upper() if m else ""
+    if head == "EXPLAIN":
+        rest = s[_EXPLAIN.match(s).end():]
+        return not rest or _is_read(rest)
     if head in _DESCRIBE_HEAD or head in _SQLPLUS_DIRECTIVE:
         return True
     if head not in _READ_HEAD or (head == "SET" and _SET_DENY.match(s)):
         return False
-    return not _NON_READ_WORD.search(s)
+    return not (_NON_READ_WORD.search(s) or _SIDE_EFFECT_FN.search(s))
 
 
 def _non_read(seg: _Seg, sql: str) -> list[str]:
@@ -951,6 +975,8 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         return [(f"`databricks fs {verb}` with a remote path outside an allowlisted volume (dbfs:/Volumes/<catalog>/...; every "
                  f"remote end of a `cp`, no variables): {args}")]
     key = f"{group} {verb}"
+    if key in _TOKEN_PRINTERS:
+        return [f"`databricks {key}` prints the session's bearer token (credential exposure); `auth describe` shows the identity without it"]
     if key in ("catalogs create", "catalogs update", "catalogs delete", "schemas delete", "grants update", "grants delete"):
         return [(f"`databricks {key}` on {' '.join(args) or '<securable>'!r}: the allowlist authorizes object writes inside a "
                  "catalog, never catalog lifecycle or permissions (those happen at STOP E)")]
@@ -1031,6 +1057,10 @@ _READ_HEADS = frozenset(("cat", "less", "more", "head", "tail", "grep", "rg", "e
                          "dbx-recon", "databricks"))   # the two clients read the allowlist; their outputs go through --out / -o
 _WRITE_LAST_OPERAND = ("cp", "rsync", "install", "ln", "scp")
 _RECURSIVE_HEADS = ("rm", "chmod", "chown", "chgrp", "rsync", "chattr", "setfacl")
+# the Databricks CLI's identity store: `~/.databrickscfg` (any directory), `~/.databricks/` (token cache), `~/.config/databricks/`
+_IDENTITY_FILE = re.compile(r"(?:^|/)(?:\.databrickscfg|\.databricks(?:/.*)?|\.config/databricks(?:/.*)?)$")
+_GUARD_TREE = Path(os.path.realpath(__file__)).parent.parent   # the running plugin: hooks.json + hooks/**
+_PATH_LITERAL = re.compile(r"['\"]((?:[~./$]|/)[^'\"\n]{0,300})['\"]")
 _OUTPUT_FLAGS = ("-o", "-O", "--output", "--out", "--out-file", "--output-file", "--outfile", "--file")
 _GIT_DESTRUCTIVE = ("--hard", "--merge", "--keep")
 
@@ -1038,12 +1068,25 @@ _GIT_DESTRUCTIVE = ("--hard", "--merge", "--keep")
 def _touch(path: str, cwd: str, root: Path) -> str:
     """How a literal path relates to the protected part of `.migration/`: 'inside' (a protected entry,
     literally or through a glob / brace / `?` that could match one), 'self' (`.migration` itself),
-    'above' (`.`, `..`, `$PWD`, `~` or an absolute path at or above the workspace root), or ''."""
+    'above' (`.`, `..`, `$PWD`, `~` or an absolute path at or above the workspace root); failing that,
+    'identity' for the Databricks CLI's credential store, 'guard' / 'guard-above' for the running
+    guard's own tree (`_guard_touch`), or ''."""
     p = re.sub(r"\$\{?PWD\}?|\$\(pwd\)", ".", path)
     p = os.path.expanduser(re.sub(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", "*", p))   # a brace list could name anything in it
     if p in ("", "-") or p.isdigit():
         return ""
     p = os.path.normpath(p if p.startswith("/") else os.path.join(cwd, p))
+    return _touch_migration(p, root) or _touch_identity(p) or _guard_touch(p, root)
+
+
+def _touch_identity(p: str) -> str:
+    home = re.sub(r"\$\{?HOME\}?", "~", p)
+    name = p.rsplit("/", 1)[-1]
+    glob = name.startswith(".") and re.search(r"[*?\[]", name) and fnmatch.fnmatchcase(".databrickscfg", name)
+    return "identity" if _IDENTITY_FILE.search(home) or glob else ""
+
+
+def _touch_migration(p: str, root: Path) -> str:
     parts = [x for x in p.split("/") if x not in ("", ".")]
     for i, part in enumerate(parts):
         # a glob counts only at the top of the workspace, where the ledger lives; a literal `.migration` anywhere
@@ -1060,6 +1103,19 @@ def _touch(path: str, cwd: str, root: Path) -> str:
             return ""
         parts = [x for x in p.split("/") if x not in ("", ".")]
     return "above" if all(x == ".." for x in parts) else ""
+
+
+def _guard_touch(p: str, root: Path) -> str:
+    """How a normalised path relates to the running guard's own tree (symlinks resolved, a glob
+    component matched against the real names): 'guard' for `hooks.json` / `hooks/**`, 'guard-above'
+    for the plugin directory or an ancestor of it, '' otherwise."""
+    parts = os.path.realpath(p if p.startswith("/") else os.path.join(root, p)).strip("/").split("/")
+    tree = [*_GUARD_TREE.parts[1:], "hooks"]
+    for i, part in enumerate(parts[:len(tree)]):
+        if not (part == tree[i] or (re.search(r"[*?\[]", part) and fnmatch.fnmatchcase(tree[i], part))
+                or (i == len(tree) - 1 and (part == "hooks.json" or fnmatch.fnmatchcase("hooks.json", part)))):
+            return ""
+    return "guard" if len(parts) >= len(tree) else "guard-above"
 
 
 def _in_place(base: str, argv: list[str]) -> bool:
@@ -1096,10 +1152,17 @@ def _check_integrity(segs: list[_Seg], root: Path) -> list[str]:
     violations, cwd = [], ""
     all_kinds = ("inside", "self", "above")
 
-    def hit(path: str, how: str, kinds: tuple[str, ...] = ("inside", "self")) -> None:
-        if _touch(path, cwd, root) in kinds:
+    def hit(path: str, how: str, kinds: tuple[str, ...] = ("inside", "self"), destructive: bool = False) -> None:
+        kind = _touch(path, cwd, root)
+        if kind in kinds:
             violations.append(f"`{how}` writes `{path}` under .migration/ (only .migration/recon/ and .migration/waves/ are "
                               "written by commands; ledgers and the allowlist change only through a recorded decision)")
+        elif kind == "identity":
+            violations.append(f"`{how}` writes `{path}`, the Databricks CLI's credential store; the session runs as the "
+                              "doctor-verified migration principal only")
+        elif kind == "guard" or (kind == "guard-above" and (destructive or "above" in kinds)):
+            violations.append(f"`{how}` on `{path}` inside the running guard's plugin tree ({_GUARD_TREE}); the hook is never edited, "
+                              "disabled or removed from a session (a block is a finding to report)")
 
     for s in segs:
         base, argv = s.argv0, s.argv
@@ -1129,7 +1192,7 @@ def _check_integrity(segs: list[_Seg], root: Path) -> list[str]:
         elif _PYTHON.fullmatch(base) or base in ("perl", "ruby", "node") and not _in_place(base, argv):
             text = "\n".join([*_flag_values(argv, ("-c", "-e")), *s.heredocs, *s.stdin])
             if _PY_WRITE.search(text):
-                for p in _MIGRATION_PATH.findall(text):
+                for p in [*_MIGRATION_PATH.findall(text), *_PATH_LITERAL.findall(text)]:
                     hit(p, f"{base} script")
                 for m in _RMTREE.finditer(text):
                     hit(m.group(1) if m.group(1) is not None else ".", f"{base} rmtree", all_kinds)
@@ -1158,7 +1221,7 @@ def _check_integrity(segs: list[_Seg], root: Path) -> list[str]:
                 violations.append(f"`xargs {base}` on names listed from .migration/; ledgers and the allowlist change only through a "
                                   "recorded decision")
             for o in values[-1:] if base in _WRITE_LAST_OPERAND else values:
-                hit(o, base, all_kinds if recursive else ("inside", "self"))
+                hit(o, base, all_kinds if recursive else ("inside", "self"), destructive=base in ("mv", *_RECURSIVE_HEADS))
     return violations
 
 

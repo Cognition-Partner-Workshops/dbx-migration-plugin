@@ -101,9 +101,12 @@ through; everything else it recognises blocks. It is a no-op outside a workspace
 
 Always blocked regardless of config: `databricks` commands outside the read allowlist whose
 securable is not in `catalogs`, non-GET or bodied REST calls to a Databricks host, identity swaps
-(`auth login`, `--profile`, `DATABRICKS_TOKEN=`... around a Databricks client), writes under
-`.migration/` except `recon/` and `waves/`, and anything the guard cannot read (unreadable
-scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`). Python/JDBC/Spark programs are
+(`auth login`, `--profile`, `DATABRICKS_TOKEN=`... around a Databricks client, writes to
+`.databrickscfg` / `~/.databricks/` / `~/.config/databricks/`, `auth token|env` which print the
+token), `EXPLAIN ANALYZE <write>` and side-effecting functions (`nextval`, `pg_terminate_backend`,
+`dblink`, `DBMS_*`, `OPENROWSET`, ...) on a legacy source, writes under `.migration/` except
+`recon/` and `waves/`, edits to the running guard's own plugin tree, and anything the guard cannot
+read (unreadable scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`). Python/JDBC/Spark programs are
 only cheaply inspected for literal SQL; the factory-doctor's read-only-principal row is the control
 for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row there to pin a new shape.
 
