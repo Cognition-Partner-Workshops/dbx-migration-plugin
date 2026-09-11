@@ -1,6 +1,6 @@
 ---
 name: target-routing
-description: Routes every Databricks-side step of a migration to the official `databricks` plugin skill that owns it, and carries only the migration-specific deltas (unattended service-principal auth, isolated per-batch targets, PAUSED schedules, never-prod-from-a-child). Use whenever a playbook step touches Databricks: auth, SQL, pipelines, jobs, bundles, Unity Catalog, ingestion, Lakebase.
+description: "Routes every Databricks-side step of a migration to the official `databricks` plugin skill that owns it, and carries only the migration-specific deltas (unattended service-principal auth, isolated per-batch targets, PAUSED schedules, never-prod-from-a-child). Use whenever a playbook step touches Databricks: auth, SQL, pipelines, jobs, bundles, Unity Catalog, ingestion, Lakebase."
 ---
 
 # Target routing

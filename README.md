@@ -116,7 +116,8 @@ script or SQL file is read from the directory the command runs in (event `cwd`, 
 only cheaply inspected for literal SQL; the factory-doctor's read-only-principal row is the control
 for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row there to pin a new shape.
 
-The official `databricks` plugin is installed automatically as a dependency (tracking its default
-branch). To pin it, add `"ref"` or `"sha"` to the `requiredPlugins` entry in
-`.devin-plugin/plugin.json`. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
+The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
+`.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
+plugin to, or installation fails with "Conflicting version pins"; when the org bumps its pin, bump
+this one in the same change. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
 `databricks/databricks-agent-skills` explicitly; transitive dependencies are not exempt.
