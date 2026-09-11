@@ -691,8 +691,8 @@ async def run_batch(batch, sem, breaker):
                 + ", ledger integrity unverified; " + out["one_line_summary"])
         # a replayed failure of this class was counted by the run being resumed; a replayed PASS (or FAIL of
         # another class) that the gate fails now was not
-        if out["status"] != "PASS" and (record is None or (isinstance(record, dict)
-                                                           and record.get("failure_class") != out.get("failure_class"))):
+        if out["status"] != "PASS" and (record is None or (isinstance(record, dict) and (
+                record.get("status") == "PASS" or record.get("failure_class") != out.get("failure_class")))):
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
             f"{out['one_line_summary']}")

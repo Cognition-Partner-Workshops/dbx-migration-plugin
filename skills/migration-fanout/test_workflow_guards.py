@@ -853,6 +853,10 @@ def test_a_replayed_pass_that_fails_the_gate_now_is_a_new_failure_the_breaker_co
     # the PR still stands: PASS, nothing counted
     out, counted = run(passed, ("c" * 40, []), _pass(changed_paths=["src/a.sql"]))
     assert out["status"] == "PASS" and counted == {}
+    # a PASS record may carry the optional failure_class; it was still never counted
+    out, counted = run({**passed, "failure_class": "ledger_tampered"}, ("e" * 40, [".migration/allowed_targets.json"]),
+                       _pass(changed_paths=["src/a.sql"]))
+    assert out["failure_class"] == "ledger_tampered" and counted == {"ledger_tampered": 1}
     # a replayed FAIL is the failure the resumed run already counted, unless the gate now gives it another class
     failed = {**passed, "status": "FAIL", "failure_class": "recon_fail"}
     replayed = {"status": "FAIL", "recon_verdict": "FAIL", "failure_class": "recon_fail",
