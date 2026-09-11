@@ -15,9 +15,9 @@ Reads a Devin PreToolUse event on stdin ({"tool_name", "tool_input": {"command"}
   (`_READ_HEAD`, directives, `EXPLAIN` of a read, Teradata `LOCKING ... FOR ACCESS|READ`), none of `_SIDE_EFFECT_FN`, none of
   `_SQL_DENY` (exclusive lock hints, `FOR UPDATE|SHARE`, `LOCKING ... FOR WRITE|EXCLUSIVE`, `SET TRANSACTION READ WRITE`);
   `_SQL_ALLOW` (`SET TRANSACTION ISOLATION LEVEL <any>` / `READ ONLY`) is the harness's consistency-window idiom. Loaders and
-  migration tools always write. A generic client elsewhere may write only when every host / DSN candidate on the line
-  (`-h`/`-S`/`--host`, `PGHOST=`, positional or `-d` URI / conninfo) is a literal in `target_hosts` (at least one), and the
-  write's catalog / database (three-part name, `USE CATALOG`, else the line's one `-d`/URI/conninfo database) is allowlisted.
+  migration tools always write. A generic client elsewhere may write only when every host / DSN candidate (`-h`/`-S`/`--host`,
+  `PGHOST=`, URI / conninfo, reconnect meta-commands `\\c` `:connect` `connect`) is a literal in `target_hosts` (at least one) and
+  the write's catalog / database (three-part name, `USE [CATALOG|DATABASE] x`, else the one `-d`/URI/reconnect database) is listed.
 * Writes under `.migration/` (outside `recon/`, `waves/`) block, through every writer the guard models: redirects, `sed -i`,
   `tee`, `cp/mv/rm/...`, git working-copy commands (`_GIT_DISCARDS` rewrite it wholesale and always block), in-place fixers,
   inline python/perl/ruby/node with a write call. The same detection protects the running guard's own tree (`hooks.json`,
@@ -57,7 +57,7 @@ DEFAULT_FORBIDDEN_BUNDLE_TARGETS = ("prod", "production")
 PROBE_SENTINEL = "__dbx_guard_probe__"   # prefix of the doctor's HOOK_PROBE_COMMAND token; a command naming it always blocks
 _PROBE = re.compile(re.escape(PROBE_SENTINEL) + r"\w*")
 
-_SEG = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$-]*)"
+_SEG = r"(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$-]*)"   # one identifier part, quoted or bare
 _OBJ = r"TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE"
 # a write statement's verb phrase; the match ends where its target securable starts
 _WRITE = re.compile(
@@ -78,7 +78,7 @@ _WRITE = re.compile(
       | (?:^|(?<=[;\n]))\s*(?:EXEC(?:UTE)?|CALL)\s+(?!IMMEDIATE\b)(?=[\[@`\w])
     )\s*""", re.IGNORECASE | re.VERBOSE)
 _TARGET = re.compile(rf"(?:(CATALOG|SCHEMA|DATABASE)\s+)?(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({_SEG})((?:\.{_SEG})*)(?![\w`.])", re.IGNORECASE)
-_USE_CATALOG = re.compile(rf"\bUSE\s+CATALOG\s+({_SEG})", re.IGNORECASE)
+_USE_CATALOG = r"\bUSE\s+(?:(?:{c})\s+){opt}(?!SCHEMA\b)(" + _SEG + ")"   # {c}: the container words; {opt}: `?` where `USE x` switches too
 _IDENTIFIER_LITERAL = re.compile(r"\bIDENTIFIER\s*\(\s*'([^']*)'\s*\)", re.IGNORECASE)
 _IDENTIFIER_DYNAMIC = re.compile(r"\bIDENTIFIER\s*\(", re.IGNORECASE)
 _EXEC_IMMEDIATE_DYNAMIC = re.compile(r"\bEXEC(?:UTE)?\s+IMMEDIATE\s+(?!')\S", re.IGNORECASE)
@@ -136,6 +136,8 @@ _SCRIPT_FLAGS = ("-f", "-i", "--file", "--input")
 _HOST_FLAGS = ("-S", "-h", "-H", "--host", "--server", "--hostname", "--url", "-url")
 _HOST_ENV = ("PGHOST", "PGHOSTADDR", "PGSERVICE", "MYSQL_HOST", "SQLCMDSERVER")
 _DSN_POSITIONAL = ("isql", "usql", "pgloader")   # clients whose first positional is the DSN / URL, not a database name
+# reconnect meta-commands: psql `\c|\connect db [user [host]]` / conninfo / URI, mysql `connect|\r db [host]`, sqlcmd `:connect host`
+_RECONNECT = re.compile(r"(?im)^[ \t]*(\\c(?:onnect)?|connect|\\r|:connect)[ \t]+([^;\n]*)")
 _RUN_FILE = re.compile(r"(?<!\S)@(\S+)|^\s*\.RUN\s+FILE\s*=?\s*(\S+)", re.IGNORECASE | re.MULTILINE)
 _DYNAMIC_SQL_EXECUTOR = (r"(?:\bEXEC(?:UTE)?\s+IMMEDIATE|\bsp_executesql|\bEXEC(?:UTE)?\s*\(|"
                          r"\.(?:execute|executemany|sql|run_query|execute_statement)\s*\(|\bstatement\s*=)")
@@ -154,8 +156,8 @@ _DESCRIBE_HEAD = ("SHOW", "DESC", "DESCRIBE", "HELP", "GO")
 _SQLPLUS_DIRECTIVE = ("SPOOL", "PROMPT", "DEFINE", "COLUMN", "WHENEVER", "EXIT", "QUIT", "TTITLE", "BTITLE", "BREAK",
                       "COMPUTE", "TIMING", "REM", "REMARK", "PAUSE", "CLEAR")
 _DIRECTIVE_LINE = re.compile(r"^\s*(?:[.\\:@/]|GO\b|(?:" + "|".join(_SQLPLUS_DIRECTIVE) + r")\b)", re.IGNORECASE)
-_PSQL_META = re.compile(r"\\(?:d\S*|l\S*|x|q|\?|h\S*|timing|echo|pset|set|unset|conninfo|encoding|z|sf|sv|a|t|H|C|f)\b")
-_SQLCMD_DIRECTIVE = re.compile(r":(?:setvar|exit|quit|on\s+error|help|list\w*|reset|xml|error|out|perftrace)\b", re.IGNORECASE)
+_PSQL_META = re.compile(r"\\(?:d\S*|l\S*|x|q|\?|h\S*|timing|echo|pset|set|unset|c(?:onnect)?|conninfo|encoding|z|sf|sv|a|t|H|C|f)\b")
+_SQLCMD_DIRECTIVE = re.compile(r":(?:setvar|exit|quit|on\s+error|help|list\w*|reset|xml|error|out|perftrace|connect)\b", re.IGNORECASE)
 # read prefixes, peeled off so the statement behind them is judged on its own: `EXPLAIN [ANALYZE|...] [(opts)]` (ANALYZE
 # executes the statement) and Teradata's read lock modifier `LOCKING ROW|TABLE t|DATABASE d|VIEW v FOR ACCESS|READ [NOWAIT]`
 _SQL_PREFIX = re.compile(r"EXPLAIN\b(?:\s+(?:ANALYZE|VERBOSE|PLAN|EXTENDED|CODEGEN|COST|FORMATTED|QUERY\s+PLAN)\b|\s*\([^)]*\)|\s+FOR\b)*\s*"
@@ -298,7 +300,7 @@ class Verdict:
 
 
 def _norm(ident: str) -> str:
-    return ident.strip().strip("`").lower()
+    return ident.strip().strip('`"[]').lower()
 
 
 def find_config(start: Path) -> Path | None:
@@ -700,14 +702,13 @@ def _flag_values(argv: list[str], flags: tuple[str, ...]) -> list[str]:
 
 def _sql_text(seg: _Seg, root: Path, extra: list[str] = ()) -> tuple[str, list[str]]:
     """Every piece of SQL a client segment executes (`extra`: positional SQL text or `.sql` files), joined, plus unreadable scripts."""
-    parts = [*(w for w in extra if not w.endswith(".sql")), *_flag_values(seg.argv, _SQL_VALUE_FLAGS), *seg.stdin, *seg.heredocs]
-    if seg.herestring:
-        parts.append(seg.herestring)
+    parts = [" ".join(w for w in extra if not w.endswith(".sql")), *_flag_values(seg.argv, _SQL_VALUE_FLAGS), *seg.stdin, *seg.heredocs,
+             seg.herestring or ""]
     unreadable = []
     for f in [*seg.scripts, *(w for w in extra if w.endswith(".sql"))]:
         body = _read_script(f, root, seg.at)
         (unreadable.append(f) if body is None else parts.append(body))
-    return "\n;\n".join(parts), unreadable
+    return "\n;\n".join(filter(None, parts)), unreadable
 
 
 def _non_reads(sql: str) -> list[str]:
@@ -744,23 +745,20 @@ def _non_reads(sql: str) -> list[str]:
     return bad
 
 
-def _hosts(seg: _Seg) -> list[str]:
-    """Every host / DSN candidate of a generic client: each host flag and host variable, every URI and
-    conninfo host anywhere on the line (a positional, `-d`/`--dbname`), a bare `$VAR` that stands
-    where a DSN would (a positional, or a host flag's value), and the first positional for clients
-    whose positional is a DSN. A database name, a `-U $USER` value or a SQL argument is never a
-    host. A write is approved only when the list is non-empty and every candidate is allowlisted:
-    whichever of several hosts the client honours at run time is then a listed one."""
+def _hosts(seg: _Seg, recon: list[list[str]] = ()) -> list[str]:
+    """Every host / DSN candidate of a generic client: each host flag and host variable; every URI and conninfo host on
+    the line (a positional, `-d`/`--dbname`) or in a reconnect meta-command (`recon`, split `_RECONNECT` matches), plus the
+    words a reconnect names after its database; a bare `$VAR` where a DSN would stand; the first positional of `_DSN_POSITIONAL`
+    clients. A database name, `-U $USER` or a SQL argument is never a host; a write needs a non-empty, all-allowlisted list."""
     argv = seg.argv
     sql = set(_flag_values(argv, _SQL_VALUE_FLAGS)) | set(seg.scripts)
     out = list(_flag_values(argv, _HOST_FLAGS))
     out += [a.split("=", 1)[1] for a in seg.assigns if a.split("=", 1)[0] in _HOST_ENV]
-    if seg.argv0 in _DSN_POSITIONAL:
-        out += [w for w in argv[1:2] if not w.startswith("-") and w not in sql]
-    for i, w in enumerate(argv[1:], 1):
-        if re.fullmatch(r"\$\{?\w+\}?", w) and w not in sql and (not argv[i - 1].startswith("-") or argv[i - 1] in _HOST_FLAGS):
-            out.append(w)
-    joined = " ".join(w for w in argv[1:] if w not in sql)
+    out += [w for w in argv[1:2] if seg.argv0 in _DSN_POSITIONAL and not w.startswith("-") and w not in sql]
+    out += [w for i, w in enumerate(argv[1:], 1) if re.fullmatch(r"\$\{?\w+\}?", w) and w not in sql
+            and (not argv[i - 1].startswith("-") or argv[i - 1] in _HOST_FLAGS)]
+    out += [w for verb, *words in recon for w in words[0 if verb.lower() == ":connect" else 1:] if not re.search(r"=|://", w)]
+    joined = " ".join([*(w for w in argv[1:] if w not in sql), *itertools.chain.from_iterable(recon)])
     out += re.findall(r"://(?:[^@/\s]*@)?([^:/?\s;]+)", joined)
     out += re.findall(r"(?i)\b(?:host|hostaddr|server|data source|addr)=([^;\s]+)", joined)
     return [re.split(r"[,:\\]", re.sub(r"^(?:tcp|np|lpc):|^\$\{?(\w+)\}?$", r"\1", h, flags=re.IGNORECASE), 1)[0].lower()
@@ -816,9 +814,9 @@ def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
 
 
 def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
-    """A legacy-only client, or a generic one whose command names a legacy source, runs read shapes only; a generic
-    client elsewhere may write when every host candidate on the line is allowlisted and the write resolves to an
-    allowlisted catalog / database (default: the one database the line names by `-d`/`-D`/`--dbname`, URI, `dbname=`)."""
+    """A legacy-only client, or a generic one whose command names a legacy source, runs read shapes only; a generic client
+    elsewhere may write when every host candidate (line and reconnect meta-commands) is allowlisted and the write resolves to an
+    allowlisted catalog / database (default: the one database named by `-d`/`-D`/`--dbname`, URI, `dbname=` or a reconnect)."""
     base, tail = seg.argv0, " (legacy is read-only in every phase)"
     legacy, hits = base in _LEGACY_ONLY, _context(seg.text, cfg, legacy_only=True)
     if base in _LOADERS:
@@ -840,35 +838,37 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         bad.insert(0, f"script(s) {unreadable} the guard cannot read")
     if not bad:
         return violations
+    recon = [re.sub(r"(?<!\S)-(?:\w(?:\s+[^-\s]\S*)?|\S\S+)|['\"]", " ", f"{v} {a}").split() for v, a in _RECONNECT.findall(sql)]
     if legacy:
         violations.append(f"non-read statement through a legacy-only client `{base}`: `{bad[0]}`" + tail)
     elif hits:
         violations.append(f"non-read statement against legacy source {hits}: `{bad[0]}`" + tail)
-    elif not (hosts := _hosts(seg)) or not all(h in cfg.target_hosts for h in hosts):
+    elif not (hosts := _hosts(seg, recon)) or not all(h in cfg.target_hosts for h in hosts):
         violations.append(f"non-read statement through `{base}` to a host that is not a literal in target_hosts {cfg.target_hosts} "
-                          f"(seen: {sorted(set(hosts))[:6]}; every host on the line must be listed, and an empty list blocks every "
-                          f"write): `{bad[0]}`")
+                          f"(seen: {sorted(set(hosts))[:6]}; every host must be listed, an empty list blocks every write): `{bad[0]}`")
     else:
-        line = " ".join(w for w in seg.argv[1:] if w not in set(_flag_values(seg.argv, _SQL_VALUE_FLAGS)) | set(seg.scripts))
+        line = "\n".join([" ".join(w for w in seg.argv[1:] if w not in set(_flag_values(seg.argv, _SQL_VALUE_FLAGS)) | set(seg.scripts)),
+                          *map(" ".join, recon)])
         dbs = {_norm(a or b or c) for a, b, c in re.findall(
-            r"(?i)(?<![-\w])dbname=([^;\s]+)|://[^/\s]*/([^/?\s;]+)|(?:^|\s)(?:-d|-D|--dbname|--database)[\s=]([^\s=]+)(?![^\s]*=)", line)}
+            r"(?i)(?<![-\w])dbname=([^;\s]+)|://[^/\s]*/([^/?\s;]+)|(?:^|\s)(?:-d|-D|--dbname|--database|\\c(?:onnect)?|connect|\\r)"
+            r"[\s=](?!\S*(?:=|://))(\S+)", line)}
         violations += _catalog_violations(sql, cfg, dbs.pop() if len(dbs) == 1 else None, f"`{base}` client")
     return violations
 
 
 def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, who: str) -> list[str]:
-    """Writes must target an allowlisted catalog: three-part name (or `CATALOG c` / `SCHEMA c.s` right after the verb
-    phrase; a qualified source further along -- CTAS, MERGE USING, INSERT SELECT -- never counts), else the last `USE
-    CATALOG` before the statement, else `default` (Databricks `--catalog`, a generic client's database); none resolving in
-    a client (`who`; '' for SQL quoted in program text, where nothing need resolve) -> block. A generic client's `DATABASE`
-    is a container too (Postgres / SQL Server). Dynamic names (`IDENTIFIER(<expr>)`, `EXECUTE IMMEDIATE <var>`) block."""
+    """Writes must target an allowlisted catalog: three-part name (or `CATALOG c` / `SCHEMA c.s` right after the verb phrase;
+    a qualified source further along -- CTAS, MERGE USING, INSERT SELECT -- never counts), else the last `USE CATALOG` (generic
+    client: also `USE [DATABASE] x`) before the statement, else `default` (Databricks `--catalog`, a generic client's database);
+    none resolving in a client (`who`; '' for SQL quoted in program text) -> block, as do `IDENTIFIER(<expr>)` / `EXECUTE IMMEDIATE <var>`."""
     allowed, in_dbx = set(cfg.catalogs), who == "Databricks client"
     cats = ("CATALOG", "DATABASE") if who and not in_dbx else ("CATALOG",)
+    use = re.compile(_USE_CATALOG.format(c="|".join(cats), opt="?" * (len(cats) > 1)), re.IGNORECASE)
     text = _sql_view(_IDENTIFIER_LITERAL.sub(r"\1", sql))
     violations = []
     if in_dbx and _EXEC_IMMEDIATE_DYNAMIC.search(text):
         violations.append("EXECUTE IMMEDIATE on a non-literal; the statement is built at run time, so inline it as text")
-    use_cats = [(m.start(), _norm(m.group(1))) for m in _USE_CATALOG.finditer(text)]
+    use_cats = [(m.start(), _norm(m.group(1))) for m in use.finditer(text)]
     for m in _WRITE.finditer(text):
         end = text.find(";", m.end())
         stmt = text[m.start(): end if end != -1 else len(text)]
