@@ -26,20 +26,16 @@ from tests.loans import (
 UNTESTED_FAMILIES = ("redshift", "snowflake", "teradata", "oracle")
 
 
-@pytest.mark.parametrize("family", UNTESTED_FAMILIES)
-def test_untested_source_families_fail_fast_before_any_driver_is_touched(family, monkeypatch):
-    monkeypatch.delenv("SOURCE_DSN", raising=False)
-    with pytest.raises(NotImplementedError, match=f"^{family} source adapter is untested; see SKILL.md$"):
-        SOURCE_ADAPTERS[family]("SOURCE_DSN")
-
-
 def test_every_cli_family_is_either_live_tested_or_refused():
     assert set(SOURCE_FAMILIES) == set(SOURCE_ADAPTERS)
     assert set(SOURCE_FAMILIES) - set(UNTESTED_FAMILIES) == {"sqlserver", "postgres", "databricks"}
 
 
 @pytest.mark.parametrize("family", UNTESTED_FAMILIES)
-def test_cli_exits_cleanly_on_an_untested_family_without_touching_the_target(family, tmp_path, monkeypatch):
+def test_untested_source_families_fail_fast_before_any_driver_or_the_target_is_touched(family, tmp_path, monkeypatch):
+    monkeypatch.delenv("SOURCE_DSN", raising=False)
+    with pytest.raises(NotImplementedError, match=f"^{family} source adapter is untested; see SKILL.md$"):
+        SOURCE_ADAPTERS[family]("SOURCE_DSN")
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
@@ -69,7 +65,7 @@ def test_identifiers_that_are_not_one_name_are_refused(name):
         quote_ident(name, '"')
 
 
-def test_lakebase_target_validates_the_schema_before_it_connects(monkeypatch):
+def test_lakebase_target_validates_and_escapes_identifiers_before_it_connects(monkeypatch):
     psycopg = pytest.importorskip("psycopg")
     monkeypatch.setenv("T", "dsn-under-test")
     connects = []
@@ -77,6 +73,10 @@ def test_lakebase_target_validates_the_schema_before_it_connects(monkeypatch):
     with pytest.raises(ConfigError, match="invalid SQL identifier"):
         LakebaseTargetAdapter("T", "db", "public.loan_servicing")
     assert connects == []
+    target = LakebaseTargetAdapter("T", "db", 'loan"servicing')
+    assert target._q('lo"ans') == '"loan""servicing"."lo""ans"'
+    with pytest.raises(ConfigError, match="invalid SQL identifier"):
+        target._q("public.loans")
 
 
 def test_databricks_target_validates_catalog_and_schema_before_it_connects(monkeypatch):
@@ -85,17 +85,6 @@ def test_databricks_target_validates_catalog_and_schema_before_it_connects(monke
     with pytest.raises(ConfigError, match="invalid SQL identifier"):
         adapters.DatabricksTargetAdapter("D", "", "silver")
     assert connects == []
-
-
-
-def test_lakebase_target_qualifies_objects_with_escaped_identifiers(monkeypatch):
-    psycopg = pytest.importorskip("psycopg")
-    monkeypatch.setenv("T", "dsn-under-test")
-    monkeypatch.setattr(psycopg, "connect", lambda dsn: _db("db"))
-    target = LakebaseTargetAdapter("T", "db", 'loan"servicing')
-    assert target._q('lo"ans') == '"loan""servicing"."lo""ans"'
-    with pytest.raises(ConfigError, match="invalid SQL identifier"):
-        target._q("public.loans")
 
 
 def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkeypatch):
@@ -143,7 +132,6 @@ class _LiveTable:
                     return [(conn.token,)]
                 return [(conn.count, conn.max_wm)]
         return Cur()
-
 
 
 def test_a_write_between_the_marker_row_and_its_token_is_not_baked_into_the_baseline():
@@ -210,47 +198,46 @@ def test_sql_adapter_exclusion_capacity_counts_every_key_component():
     assert len(conn.executed) == statements   # never split into several statements
 
 
-def test_watermark_literal_carries_the_utc_offset_only_where_the_engine_needs_it():
-    hwm = dt.datetime(2026, 9, 8, 18, 43, 52, 164112, tzinfo=PLUS2)   # 16:43:52.164112 UTC
-    pg, generic = _PostgresLike(_StubConn()), _NoSnapshotAdapter(_StubConn())
+HWM = dt.datetime(2026, 9, 8, 18, 43, 52, 164112)  # noqa: DTZ001  naive = UTC by contract
+RV = _rowversion(2001)
+
+
+@pytest.mark.parametrize("engine, hwm, bound, strict", [
+    # a datetime bound starts at the next microsecond: an engine that stores more precision than
+    # the driver returns (datetime2(7)) would otherwise count every row sharing the applied
+    # microsecond as in flight; a counter is compared as it is
+    (None, HWM, "'2026-09-08 18:43:52.164113'", False),
+    (None, 41, "41", True),
+    (_PostgresLike, 41, "41", True),
+    (_NoSnapshotAdapter, 41, "41", True),
     # Postgres: a timestamptz column would read a bare literal in the session TimeZone
-    assert _newer_predicate("modified_at", hwm, pg.watermark_literal) == \
-        "modified_at >= '2026-09-08 16:43:52.164113+00:00'"
-    assert _applied_predicate("modified_at", hwm, pg.watermark_literal) == \
-        "(modified_at < '2026-09-08 16:43:52.164113+00:00' OR modified_at IS NULL)"
-    # SQL Server datetime rejects an offset, so the zone-less engines keep the bare UTC form
-    assert _newer_predicate("modified_date", hwm, generic.watermark_literal) == \
-        "modified_date >= '2026-09-08 16:43:52.164113'"
-    assert pg.watermark_literal(41) == generic.watermark_literal(41) == "41"
+    (_PostgresLike, HWM.replace(tzinfo=PLUS2), "'2026-09-08 16:43:52.164113+00:00'", False),
+    # SQL Server datetime rejects an offset, so the zone-less engines keep the bare UTC form...
+    (_NoSnapshotAdapter, HWM.replace(tzinfo=PLUS2), "'2026-09-08 16:43:52.164113'", False),
+    # ...and convert the literal to the column's type first: datetime (3.33 ms ticks) and
+    # smalldatetime (minutes) would round the next-microsecond bound back onto the watermark, so
+    # rows equal to the applied HWM would count as in flight and leave the tier 2 aggregates
+    (_SqlServerLike, HWM.replace(microsecond=167000), "CAST('2026-09-08 18:43:52.167001' AS datetime2(7))", False),
+    # a rowversion is a binary literal in the engine's own syntax; a bigint counter a plain number
+    (_SqlServerLike, RV, "0x00000000000007d1", True),
+    (_PostgresLike, RV, "'\\x00000000000007d1'::bytea", True),
+    (_SqlServerLike, 2001, "2001", True),
+])
+def test_in_flight_and_applied_predicates_render_the_bound_for_the_engine(engine, hwm, bound, strict):
+    render = {"render": engine(_StubConn()).watermark_literal} if engine else {}
+    newer, applied = (">", "<=") if strict else (">=", "<")
+    assert _newer_predicate("wm", hwm, **render) == f"wm {newer} {bound}"
+    assert _applied_predicate("wm", hwm, **render) == f"(wm {applied} {bound} OR wm IS NULL)"
 
 
-def test_sql_server_types_the_datetime_bound_so_coarse_columns_compare_exactly():
-    # a bare literal is converted to the column's type first: datetime (3.33 ms ticks) and
-    # smalldatetime (minutes) would round the next-microsecond bound back onto the watermark,
-    # so rows equal to the applied HWM would count as in flight and leave the tier 2 aggregates
-    hwm = dt.datetime(2026, 1, 1, 10, 0, 0, 167000)  # noqa: DTZ001  naive = UTC by contract
-    mssql = _SqlServerLike(_StubConn())
-    assert _newer_predicate("modified_date", hwm, mssql.watermark_literal) == \
-        "modified_date >= CAST('2026-01-01 10:00:00.167001' AS datetime2(7))"
-    assert _applied_predicate("modified_date", hwm, mssql.watermark_literal) == \
-        "(modified_date < CAST('2026-01-01 10:00:00.167001' AS datetime2(7)) OR modified_date IS NULL)"
-    assert mssql.watermark_literal(41) == "41"
+def test_literal_and_digest_shapes_outside_a_predicate():
+    mssql, base = _SqlServerLike(_StubConn()), _NoSnapshotAdapter(_StubConn())
+    assert mssql.watermark_literal(bytearray(RV)) == mssql.watermark_literal(memoryview(RV)) == "0x00000000000007d1"
     assert mssql.watermark_literal(dt.date(2026, 1, 1)) == "'2026-01-01'"
-
-
-def test_sql_server_renders_a_rowversion_bound_as_a_binary_literal():
-    rv = _rowversion(2001)
-    mssql, pg = _SqlServerLike(_StubConn()), _PostgresLike(_StubConn())
-    assert mssql.watermark_literal(rv) == "0x00000000000007d1"
-    assert _newer_predicate("rv", rv, mssql.watermark_literal) == "rv > 0x00000000000007d1"
-    assert _applied_predicate("rv", rv, mssql.watermark_literal) == \
-        "(rv <= 0x00000000000007d1 OR rv IS NULL)"
-    assert mssql.watermark_literal(bytearray(rv)) == mssql.watermark_literal(memoryview(rv))
-    # a bytea target column takes the same 8 bytes in Postgres syntax
-    assert pg.watermark_literal(rv) == "'\\x00000000000007d1'::bytea"
-    # a target that converted the counter to a bigint hands back a plain number
-    assert mssql.watermark_literal(2001) == "2001"
-
+    # only whole numbers (and datetimes) digest exactly: a fractional, binary or text key streams
+    digest, square = base._digest_sql("k", "integer")
+    assert digest == "CAST(k AS DECIMAL(38,0))" and "DECIMAL(38,6)" not in square
+    assert base._digest_sql("k", "number") is base._digest_sql("k", "binary") is base._digest_sql("k", "other") is None
 
 
 def _contiguous(n, width=2):

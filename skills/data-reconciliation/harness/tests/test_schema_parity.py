@@ -25,45 +25,68 @@ from tests.loans import (
 
 def test_schema_parity_findings_map_through_the_spec():
     loans, borrowers = _rows(6)
-    weak = SchemaFacts(primary_key=("loan_id",), unique=set(), foreign_keys=set(),
+    weak = SchemaFacts(primary_key=("loan_number",), unique=set(), foreign_keys=set(),
                        not_null={"loan_id"}, indexes=set(), check_count=0,
                        identity_columns={"loan_id"})
     source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=weak)
     result = _run(source, target)
     assert result["verdict"] == "FAIL"
     assert _codes(result, "schema_parity") == sorted([
-        "unique_missing", "foreign_key_missing", "not_null_missing", "not_null_missing",
+        "primary_key_mismatch", "unique_missing", "foreign_key_missing", "not_null_missing", "not_null_missing",
         "not_null_missing", "not_null_missing", "index_missing", "index_missing",
         "check_constraint_missing", "check_constraint_missing"])
     fk = next(f for f in _tier(result, "schema_parity")["findings"] if f["check"] == "foreign_key_missing")
     assert "borrowers" in fk["detail"]
 
 
-def test_index_covered_by_a_longer_target_index_is_parity():
+_UNMAPPED_TARGET_ONLY = {
+    "unique": TARGET_LOANS_FACTS.unique | {("servicer_ref",)},
+    "foreign_keys": TARGET_LOANS_FACTS.foreign_keys
+    | {(("servicer_id",), "loan_servicing.servicers", ("servicer_id",)),
+       # a mapped parent, but the local column is outside the mapping...
+       (("servicer_id",), "loan_servicing.borrowers", ("borrower_id",)),
+       # ...or the referenced column is: neither is provably target-only
+       (("loan_number",), "loan_servicing.borrowers", ("legacy_ref",))},
+    "not_null": TARGET_LOANS_FACTS.not_null | {"servicer_ref", "servicer_id"}}
+
+
+@pytest.mark.parametrize("src, tgt, stats", [
+    # a source index covered by a longer target index is parity
+    ({}, {}, {("loans", "target", "indexes"): [["borrower_id"], ["loan_status", "days_past_due", "loan_id"]]}),
+    # a source filtered index is reported for a manual check, not graded
+    ({"partial": {("days_past_due",)}}, {}, {
+        ("partial_indexes_unverified",): [
+            ("loans: source filtered index ('days_past_due',) carries a predicate the harness cannot "
+             "translate; confirm its target counterpart by hand")],
+        ("loans", "source", "partial"): [["days_past_due"]]}),
+    # a reader that only counts checks falls back to counts and says so
+    ({}, {"checks": set()}, {
+        ("check_predicates_unverified",): [
+            ("loans: 2 CHECK constraints on each side, but a catalog reader delivered counts only; "
+             "the predicates were not compared")],
+        ("loans", "source", "checks"): sorted(LOANS_FACTS.checks)}),
+    # loan_number is NOT NULL on both sides: no NULL key can ever exist, so the engines' NULL
+    # handling cannot disagree on a real row
+    ({"unique_nulls_equal": {("loan_number",)}}, {}, {("loans", "source", "unique_nulls_equal"): [["loan_number"]]}),
+    # target-only constraints on unmapped columns or out-of-scope tables are noted, not graded
+    ({}, _UNMAPPED_TARGET_ONLY, {
+        ("target_only_columns_unverified",): [
+            "loans: unique ('servicer_ref',) covers a column outside the mapping",
+            "loans: FK ('loan_number',) -> borrowers('legacy_ref',) covers a column outside the mapping",
+            "loans: FK ('servicer_id',) -> borrowers('borrower_id',) covers a column outside the mapping"],
+        ("foreign_keys_out_of_scope",): ["loans: target FK ('servicer_id',) -> loan_servicing.servicers"]}),
+])
+def test_schema_facts_the_harness_cannot_grade_are_noted_not_failed(src, tgt, stats):
     loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=_tightened(**tgt))
+    source.schema["dbo.loans"] = _facts(LOANS_FACTS, **src)
     result = _run(source, target)
     assert _codes(result, "schema_parity") == []
-    facts = _tier(result, "schema_parity")["stats"]["loans"]
-    assert facts["target"]["indexes"] == [["borrower_id"], ["loan_status", "days_past_due", "loan_id"]]
-
-
-def test_source_filtered_indexes_are_reported_for_a_manual_check_not_graded():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    source.schema["dbo.loans"] = SchemaFacts(
-        primary_key=LOANS_FACTS.primary_key, unique=set(LOANS_FACTS.unique),
-        foreign_keys=set(LOANS_FACTS.foreign_keys), not_null=set(LOANS_FACTS.not_null),
-        indexes=set(LOANS_FACTS.indexes), check_count=2, identity_columns={"loan_id"},
-        partial={("days_past_due",)})
-    result = _run(source, target)
-    assert _codes(result, "schema_parity") == []
-    parity = _tier(result, "schema_parity")
-    assert parity["stats"]["partial_indexes_unverified"] == [
-        ("loans: source filtered index ('days_past_due',) carries a predicate the harness cannot "
-         "translate; confirm its target counterpart by hand")]
-    assert parity["stats"]["loans"]["source"]["partial"] == [["days_past_due"]]
-
+    for path, expected in stats.items():
+        node = _tier(result, "schema_parity")["stats"]
+        for key in path:
+            node = node[key]
+        assert node == expected, path
 
 
 @pytest.mark.parametrize("src, tgt, code, needle", [
@@ -144,45 +167,45 @@ def _checks_run(src_checks, tgt_checks, tol=None):
     return _run(source, target, tol=tol) if tol else _run(source, target)
 
 
-def test_equal_check_counts_with_a_predicate_absent_from_the_target_fail_as_missing():
+BAL_SRC, BAL_TGT, BAL_FLIPPED = "([Current_Balance]>=(0))", "CHECK ((current_balance >= (0)::numeric))", "CHECK ((current_balance <= (0)::numeric))"
+ACCEPT_EXTRA = Tolerances("t1", accept_target_only_constraints=True)
+
+
+@pytest.mark.parametrize("src_checks, tgt_checks, tol, codes, needles, note", [
     # two on each side, but the target dropped the status rule and added a rule the source lacks
-    # spelled on a column the source rule does not mention: nothing on the target can be it
-    result = _checks_run(
-        ["([Current_Balance]>=(0))", "([Loan_Status]='AC' OR [Loan_Status]='FC')"],
-        ["CHECK ((current_balance >= (0)::numeric))", "CHECK ((current_balance >= (0)::numeric)) "])
-    # the second target text canonicalises to the same rule, so the target has one predicate
-    assert _codes(result, "schema_parity") == ["check_constraint_missing"]
-    f = _tier(result, "schema_parity")["findings"][0]
-    assert "([Loan_Status]='AC' OR [Loan_Status]='FC')" in f["detail"]
-    assert "canonical: loan_status in ('AC', 'FC')" in f["detail"]
-    assert result["merge_eligible"] is False
-
-
-def test_equal_check_counts_with_different_predicates_are_unverified_and_block_merge():
-    result = _checks_run(["([Current_Balance]>=(0))"], ["CHECK ((current_balance <= (0)::numeric))"])
-    assert _codes(result, "schema_parity") == ["check_constraint_unverified"]
-    detail = _tier(result, "schema_parity")["findings"][0]["detail"]
-    assert "canonical: current_balance >= 0" in detail and "canonical: current_balance <= 0" in detail
-    assert result["verdict"] == "FAIL" and result["merge_eligible"] is False
-    # accept_target_only_constraints is about extra rules, not about unproven equivalence
-    still = _checks_run(["([Current_Balance]>=(0))"], ["CHECK ((current_balance <= (0)::numeric))"],
-                        tol=Tolerances("t1", accept_target_only_constraints=True))
-    assert _codes(still, "schema_parity") == ["check_constraint_unverified"]
-    # the recorded hand comparison demotes the pair to a stat
-    accepted = _checks_run(["([Current_Balance]>=(0))"], ["CHECK ((current_balance <= (0)::numeric))"],
-                           tol=Tolerances("t1", accept_unverified_check_constraints=True))
-    assert accepted["verdict"] == "PASS" and accepted["merge_eligible"] is True
-    note = _tier(accepted, "schema_parity")["stats"]["accepted_unverified_check_constraints"]
-    assert len(note) == 1 and note[0].startswith("loans: 1 source CHECK(s) match no target CHECK")
-
-
-def test_dialect_specific_check_predicate_with_no_textual_match_is_unverified_not_passed():
-    result = _checks_run(["(datalength([Memo])<(100))"], ["CHECK ((octet_length(memo) < 100))"])
-    assert _codes(result, "schema_parity") == ["check_constraint_unverified"]
-    assert "dialect-specific construct" in _tier(result, "schema_parity")["findings"][0]["detail"]
-    # the same dialect spelling on both sides is a match, not a guess
-    same = _checks_run(["(datalength([Memo])<(100))"], ["CHECK ((datalength(memo) < 100))"])
-    assert _codes(same, "schema_parity") == []
+    # spelled on a column the source rule does not mention: nothing on the target can be it; the
+    # second target text canonicalises to the same rule, so the target has one predicate
+    ([BAL_SRC, "([Loan_Status]='AC' OR [Loan_Status]='FC')"], [BAL_TGT, BAL_TGT + " "], None,
+     ["check_constraint_missing"], ["([Loan_Status]='AC' OR [Loan_Status]='FC')", "canonical: loan_status in ('AC', 'FC')"], None),
+    # equal counts with different predicates are unverified and block merge...
+    ([BAL_SRC], [BAL_FLIPPED], None, ["check_constraint_unverified"],
+     ["canonical: current_balance >= 0", "canonical: current_balance <= 0"], None),
+    # ...accept_target_only_constraints is about extra rules, not about unproven equivalence...
+    ([BAL_SRC], [BAL_FLIPPED], ACCEPT_EXTRA, ["check_constraint_unverified"], [], None),
+    # ...only the recorded hand comparison demotes the pair to a stat
+    ([BAL_SRC], [BAL_FLIPPED], Tolerances("t1", accept_unverified_check_constraints=True), [], [],
+     ("accepted_unverified_check_constraints", "loans: 1 source CHECK(s) match no target CHECK")),
+    # a dialect-specific predicate with no textual match is unverified, not passed...
+    (["(datalength([Memo])<(100))"], ["CHECK ((octet_length(memo) < 100))"], None,
+     ["check_constraint_unverified"], ["dialect-specific construct"], None),
+    # ...while the same dialect spelling on both sides is a match, not a guess
+    (["(datalength([Memo])<(100))"], ["CHECK ((datalength(memo) < 100))"], None, [], [], None),
+    # a target-only predicate is a tightening under the existing decision knob
+    ([BAL_SRC], [BAL_TGT, "CHECK ((days_past_due >= 0))"], None, ["check_constraint_extra"], ["days_past_due >= 0"], None),
+    ([BAL_SRC], [BAL_TGT, "CHECK ((days_past_due >= 0))"], ACCEPT_EXTRA, [], [], None),
+])
+def test_check_predicates_are_matched_by_canonical_text_and_unmatched_pairs_block_merge(
+        src_checks, tgt_checks, tol, codes, needles, note):
+    result = _checks_run(src_checks, tgt_checks, tol)
+    assert _codes(result, "schema_parity") == codes
+    assert result["verdict"] == ("PASS" if not codes else "FAIL")
+    assert result["merge_eligible"] is (not codes)
+    if needles:
+        detail = _tier(result, "schema_parity")["findings"][0]["detail"]
+        assert all(n in detail for n in needles), detail
+    if note:
+        (line,) = _tier(result, "schema_parity")["stats"][note[0]]
+        assert line.startswith(note[1])
 
 
 def test_check_predicates_are_compared_through_the_column_mapping():
@@ -198,52 +221,6 @@ def test_check_predicates_are_compared_through_the_column_mapping():
     stale = _tightened(not_null=renamed_not_null)
     unmapped = _run(*_sides(loans, _renamed_rows(loans), borrowers, tgt_facts=stale)[:2], spec=_renamed_spec())
     assert _codes(unmapped, "schema_parity") == ["check_constraint_unverified"]
-
-
-def test_target_only_check_predicate_is_a_tightening_with_the_existing_decision_knob():
-    result = _checks_run(["([Current_Balance]>=(0))"],
-                         ["CHECK ((current_balance >= (0)::numeric))", "CHECK ((days_past_due >= 0))"])
-    assert _codes(result, "schema_parity") == ["check_constraint_extra"]
-    assert "days_past_due >= 0" in _tier(result, "schema_parity")["findings"][0]["detail"]
-    accepted = _checks_run(["([Current_Balance]>=(0))"],
-                           ["CHECK ((current_balance >= (0)::numeric))", "CHECK ((days_past_due >= 0))"],
-                           tol=Tolerances("t1", accept_target_only_constraints=True))
-    assert accepted["verdict"] == "PASS" and accepted["merge_eligible"] is True
-
-
-def test_a_reader_that_only_counts_checks_falls_back_to_counts_and_says_so():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
-                            tgt_facts=_tightened(checks=set()))
-    result = _run(source, target)
-    assert _codes(result, "schema_parity") == []
-    assert _tier(result, "schema_parity")["stats"]["check_predicates_unverified"] == [
-        ("loans: 2 CHECK constraints on each side, but a catalog reader delivered counts only; "
-         "the predicates were not compared")]
-    assert _tier(result, "schema_parity")["stats"]["loans"]["source"]["checks"] == sorted(LOANS_FACTS.checks)
-
-
-def test_target_only_constraints_on_unmapped_columns_or_out_of_scope_tables_are_noted_not_graded():
-    loans, borrowers = _rows(6)
-    facts = _tightened(
-        unique=TARGET_LOANS_FACTS.unique | {("servicer_ref",)},
-        foreign_keys=TARGET_LOANS_FACTS.foreign_keys
-        | {(("servicer_id",), "loan_servicing.servicers", ("servicer_id",)),
-           # a mapped parent, but the local column is outside the mapping...
-           (("servicer_id",), "loan_servicing.borrowers", ("borrower_id",)),
-           # ...or the referenced column is: neither is provably target-only
-           (("loan_number",), "loan_servicing.borrowers", ("legacy_ref",))},
-        not_null=TARGET_LOANS_FACTS.not_null | {"servicer_ref", "servicer_id"})
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=facts)
-    result = _run(source, target)
-    assert _codes(result, "schema_parity") == []
-    stats = _tier(result, "schema_parity")["stats"]
-    assert stats["target_only_columns_unverified"] == [
-        "loans: unique ('servicer_ref',) covers a column outside the mapping",
-        "loans: FK ('loan_number',) -> borrowers('legacy_ref',) covers a column outside the mapping",
-        "loans: FK ('servicer_id',) -> borrowers('borrower_id',) covers a column outside the mapping"]
-    assert stats["foreign_keys_out_of_scope"] == [
-        "loans: target FK ('servicer_id',) -> loan_servicing.servicers"]
 
 
 def _customer_facts(schema: str, fk_to: str | None = None) -> SchemaFacts:
@@ -367,14 +344,6 @@ def test_catalog_casing_never_changes_parity_on_a_renamed_target_column(renamed_
         assert "current_balance -> target balance_current is nullable" in parity["findings"][0]["detail"]
 
 
-def test_primary_key_mismatch_is_reported():
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
-                            tgt_facts=_tightened(primary_key=("loan_number",)))
-    result = _run(source, target)
-    assert "primary_key_mismatch" in _codes(result, "schema_parity")
-
-
 DESC_KEYS = [1000 - i for i in range(6)]
 
 
@@ -427,70 +396,60 @@ def test_unverifiable_schema_facts_warn_and_block_merge_eligibility():
     assert any(w.startswith("UNVERIFIED schema_parity") for w in result["warnings"])
 
 
+STATUS_A = _index_key_text("CREATE UNIQUE INDEX u ON dbo.loans USING btree (((status = 'A'::text)), loan_number)")
+STATUS_a = _index_key_text("CREATE UNIQUE INDEX u ON public.loans USING btree (((status = 'a'::text)), loan_number)")
 
-def test_expression_indexes_are_graded_not_dropped():
-    src = dataclasses.replace(LOANS_FACTS, expression_unique={"lower(loan_number)"},
-                              expression_indexes={"upper(loan_number)"})
+
+@pytest.mark.parametrize("src_unique, tgt_unique, tol, codes, needle, stats", [
     # target: same unique expression, plus a unique expression the source never had
-    tgt = dataclasses.replace(TARGET_LOANS_FACTS, expression_unique={"lower(loan_number)", "lower(name)"})
-    loans, borrowers = _rows(12)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
-    source.schema["dbo.loans"] = src
-    result = _run(source, target)
-    assert result["verdict"] == "FAIL"
-    t7 = _tier(result, "schema_parity")
-    assert _codes(result, "schema_parity") == ["expression_unique_extra"]
-    assert "lower(name)" in t7["findings"][0]["detail"]
-    assert t7["stats"]["expression_indexes_unverified"] == [
-        ("loans: source index on (upper(loan_number)) has no target index on (upper(loan_number)); "
-         "confirm the access path by hand")]
-    assert t7["stats"]["loans"]["source"]["expression_unique"] == ["lower(loan_number)"]
-    assert t7["stats"]["loans"]["target"]["expression_unique"] == ["lower(loan_number)", "lower(name)"]
+    ({"lower(loan_number)"}, {"lower(loan_number)", "lower(name)"}, None, ["expression_unique_extra"], "lower(name)", {
+        ("expression_indexes_unverified",): [
+            ("loans: source index on (upper(loan_number)) has no target index on (upper(loan_number)); "
+             "confirm the access path by hand")],
+        ("loans", "source", "expression_unique"): ["lower(loan_number)"],
+        ("loans", "target", "expression_unique"): ["lower(loan_number)", "lower(name)"]}),
     # the recorded decision for target-only constraints covers a target-only unique expression
-    result = _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))
-    assert result["verdict"] == "PASS", result
-    # a source unique expression the target lacks is always a defect
-    target.schema["loans"] = dataclasses.replace(TARGET_LOANS_FACTS, expression_unique=set())
-    result = _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))
-    assert _codes(result, "schema_parity") == ["expression_unique_missing"]
-
-
-def test_index_key_text_keeps_nested_calls_whole_and_drops_suffixes():
-    assert _index_key_text("CREATE UNIQUE INDEX u ON s.t USING btree (lower(email))") == "lower(email)"
-    assert _index_key_text("CREATE UNIQUE INDEX u ON s.t USING btree (lower(region)) WHERE active") == \
-        "lower(region)"
-    assert _index_key_text("CREATE INDEX i ON s.t USING btree (upper(region), id) INCLUDE (code)") == \
-        "upper(region), id"
-    assert _index_key_text("CREATE INDEX i ON s.t USING gin (to_tsvector('english'::regconfig, "
-                           "COALESCE(body, ''::text))) WITH (fastupdate=off)") == \
-        "to_tsvector('english'::regconfig, coalesce(body, ''::text))"
-
-
-def test_index_key_text_keeps_literal_and_quoted_identifier_case():
-    upper = _index_key_text("CREATE UNIQUE INDEX u ON s.t USING btree (((status = 'A'::text)), tenant_id)")
-    lower = _index_key_text("CREATE UNIQUE INDEX u ON s.t USING btree (((status = 'a'::text)), tenant_id)")
-    assert upper == "((status = 'A'::text)), tenant_id" and upper != lower
-    assert _index_key_text('CREATE INDEX i ON s.t USING btree (lower("Email"), UPPER("email"))') == \
-        'lower("Email"), upper("email")'
-    # parentheses and doubled quotes inside a literal never close the key list
-    assert _index_key_text("CREATE INDEX i ON s.t USING btree (COALESCE(note, 'n/a (''X'')'::text)) WHERE x") == \
-        "coalesce(note, 'n/a (''X'')'::text)"
-
-
-def test_expression_unique_literal_case_is_a_parity_finding():
+    ({"lower(loan_number)"}, {"lower(loan_number)", "lower(name)"}, ACCEPT_EXTRA, [], None, {}),
+    # a source unique expression the target lacks is always a defect...
+    ({"lower(loan_number)"}, set(), ACCEPT_EXTRA, ["expression_unique_missing"], None, {}),
+    # ...and so is one that differs only in the case of a literal
+    ({STATUS_A}, {STATUS_a}, ACCEPT_EXTRA, ["expression_unique_missing"], "'A'", {}),
+    ({STATUS_A}, {STATUS_A}, ACCEPT_EXTRA, [], None, {}),
+])
+def test_expression_indexes_are_graded_not_dropped(src_unique, tgt_unique, tol, codes, needle, stats):
     loans, borrowers = _rows(12)
-    src = dataclasses.replace(LOANS_FACTS, expression_unique={_index_key_text(
-        "CREATE UNIQUE INDEX u ON dbo.loans USING btree (((status = 'A'::text)), loan_number)")})
-    tgt = dataclasses.replace(TARGET_LOANS_FACTS, expression_unique={_index_key_text(
-        "CREATE UNIQUE INDEX u ON public.loans USING btree (((status = 'a'::text)), loan_number)")})
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt)
-    source.schema["dbo.loans"] = src
-    result = _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))
-    assert result["verdict"] == "FAIL"
-    assert _codes(result, "schema_parity") == ["expression_unique_missing"]
-    assert "'A'" in _tier(result, "schema_parity")["findings"][0]["detail"]
-    target.schema["loans"] = dataclasses.replace(TARGET_LOANS_FACTS, expression_unique=set(src.expression_unique))
-    assert _run(source, target, tol=Tolerances("t1", accept_target_only_constraints=True))["verdict"] == "PASS"
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers,
+                            tgt_facts=_tightened(expression_unique=tgt_unique))
+    source.schema["dbo.loans"] = _facts(LOANS_FACTS, expression_unique=src_unique,
+                                        expression_indexes={"upper(loan_number)"})
+    result = _run(source, target, tol=tol)
+    assert result["verdict"] == ("PASS" if not codes else "FAIL"), result
+    t7 = _tier(result, "schema_parity")
+    assert _codes(result, "schema_parity") == codes
+    if needle:
+        assert needle in t7["findings"][0]["detail"]
+    for path, expected in stats.items():
+        node = t7["stats"]
+        for key in path:
+            node = node[key]
+        assert node == expected, path
+
+
+@pytest.mark.parametrize("ddl, key", [
+    ("CREATE UNIQUE INDEX u ON s.t USING btree (lower(email))", "lower(email)"),
+    ("CREATE UNIQUE INDEX u ON s.t USING btree (lower(region)) WHERE active", "lower(region)"),
+    ("CREATE INDEX i ON s.t USING btree (upper(region), id) INCLUDE (code)", "upper(region), id"),
+    ("CREATE INDEX i ON s.t USING gin (to_tsvector('english'::regconfig, COALESCE(body, ''::text))) WITH (fastupdate=off)",
+     "to_tsvector('english'::regconfig, coalesce(body, ''::text))"),
+    # literal case and quoted-identifier case are kept; function names fold
+    ("CREATE UNIQUE INDEX u ON s.t USING btree (((status = 'A'::text)), tenant_id)", "((status = 'A'::text)), tenant_id"),
+    ("CREATE UNIQUE INDEX u ON s.t USING btree (((status = 'a'::text)), tenant_id)", "((status = 'a'::text)), tenant_id"),
+    ('CREATE INDEX i ON s.t USING btree (lower("Email"), UPPER("email"))', 'lower("Email"), upper("email")'),
+    # parentheses and doubled quotes inside a literal never close the key list
+    ("CREATE INDEX i ON s.t USING btree (COALESCE(note, 'n/a (''X'')'::text)) WHERE x", "coalesce(note, 'n/a (''X'')'::text)"),
+])
+def test_index_key_text_keeps_nested_calls_and_literal_case_whole_and_drops_suffixes(ddl, key):
+    assert _index_key_text(ddl) == key
 
 
 @pytest.mark.parametrize("expr_src, expr_tgt", [
@@ -610,14 +569,4 @@ def test_nullable_unique_keys_must_agree_on_how_nulls_compare(src, tgt, codes, a
     assert _codes(result, "schema_parity") == [c for c in codes if c not in accepted]
     assert result["verdict"] == "PASS" or codes != accepted
 
-
-def test_null_semantics_are_not_graded_while_every_key_column_is_not_null():
-    # loan_number is NOT NULL on both sides: no NULL key can ever exist, so the engines' NULL
-    # handling cannot disagree on a real row
-    loans, borrowers = _rows(6)
-    source, target = _sides(loans, [dict(r) for r in loans], borrowers)
-    source.schema["dbo.loans"] = _facts(LOANS_FACTS, unique_nulls_equal={("loan_number",)})
-    result = _run(source, target)
-    assert _codes(result, "schema_parity") == []
-    assert _tier(result, "schema_parity")["stats"]["loans"]["source"]["unique_nulls_equal"] == [["loan_number"]]
 

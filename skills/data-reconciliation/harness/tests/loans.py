@@ -41,15 +41,13 @@ LOANS_FACTS = SchemaFacts(
     checks={"([Current_Balance]>=(0))", "([Loan_Status]='FC' OR [Loan_Status]='DL' OR [Loan_Status]='AC')"},
     identity_columns={"loan_id"})
 
-TARGET_LOANS_FACTS = SchemaFacts(
-    primary_key=("loan_id",), unique={("loan_number",)},
+TARGET_LOANS_FACTS = dataclasses.replace(
+    LOANS_FACTS,
     foreign_keys={(("borrower_id",), "loan_servicing.borrowers", ("borrower_id",))},
-    not_null={"loan_id", "loan_number", "current_balance", "modified_date", "borrower_id"},
-    indexes={("borrower_id",), ("loan_status", "days_past_due", "loan_id")}, check_count=2,
+    indexes={("borrower_id",), ("loan_status", "days_past_due", "loan_id")},
     checks={"CHECK ((current_balance >= (0)::numeric))",
             ("CHECK (((loan_status)::text = ANY ((ARRAY['AC'::character varying, 'DL'::character varying, "
-             "'FC'::character varying])::text[])))")},
-    identity_columns={"loan_id"})
+             "'FC'::character varying])::text[])))")})
 
 BORROWER_FACTS = SchemaFacts(primary_key=("borrower_id",), not_null={"borrower_id"},
                              identity_columns={"borrower_id"})
@@ -102,26 +100,28 @@ def _rows(n: int = 12, keys=None) -> tuple[list[dict], list[dict]]:
     return loans, borrowers
 
 
-def _counter_rows(behind: int, step: int = 1):
-    """12 source rows versioned 1*step..12*step; the target lacks the last `behind` of them."""
-    loans, borrowers = _rows(12)
-    for i, r in enumerate(loans, 1):
-        r["version_no"] = i * step
-    tgt = [dict(r) for r in loans[:12 - behind]]
-    return loans, tgt, borrowers
-
-
 def _rowversion(n: int) -> bytes:
     """A SQL Server rowversion as pyodbc returns it: 8 bytes, unsigned big-endian."""
     return n.to_bytes(8, "big")
 
 
-def _rowversion_rows(behind: int):
-    loans, tgt, borrowers = _counter_rows(behind=behind, step=1)
-    for r in loans:
-        r["version_no"] = _rowversion(1000 + r["version_no"])
+def _counter_rows(behind: int, step: int = 1, rowversion: bool = False):
+    """12 source rows versioned 1*step..12*step (or rowversions 1001..1012); the target lacks
+    the last `behind` of them."""
+    loans, borrowers = _rows(12)
+    for i, r in enumerate(loans, 1):
+        r["version_no"] = _rowversion(1000 + i) if rowversion else i * step
     tgt = [dict(r) for r in loans[:12 - behind]]
     return loans, tgt, borrowers
+
+
+def _tgt(rows: list[dict], aware: bool = False, zone=PLUS2) -> list[dict]:
+    """The rows as the target holds them; `aware` renders the watermarks as a timestamptz
+    column would: the same instants on a +02:00 wall clock."""
+    if not aware:
+        return [dict(r) for r in rows]
+    return [dict(r, modified_date=r["modified_date"].replace(tzinfo=UTC).astimezone(zone))
+            for r in rows]
 
 
 def _sides(loans_src, loans_tgt, borrowers, *, src_seq=None, tgt_seq=None, tgt_facts=None):
@@ -148,10 +148,6 @@ def _tier(result, name):
 
 def _codes(result, name):
     return sorted(f["check"] for f in _tier(result, name)["findings"])
-
-
-def _details(result, name) -> dict[str, str]:
-    return {f["check"]: f["detail"] for f in _tier(result, name)["findings"]}
 
 
 class _StubConn:
