@@ -195,6 +195,21 @@ def test_sql_execute_catalog_flag_and_dynamic_sql():
     block("databricks sql execute -e \"INSERT INTO IDENTIFIER(concat('pr','od.s.t')) VALUES (1)\"")
 
 
+@pytest.mark.parametrize("cmd", [
+    "databricks sql execute -e \"-- note\nDROP TABLE prod.s.t\"",
+    "databricks sql execute -e '--\nINSERT INTO prod.s.t VALUES (1)'",
+    "sqlcmd -S legacy-prod -Q \"-- x\nDELETE dbo.t\"",
+    "sqlplus -s u/p@db <<'EOF'\n-- fix\nDELETE FROM t;\nEOF",
+])
+def test_sql_starting_with_a_comment_is_still_read(cmd):
+    block(cmd)
+
+
+def test_sql_starting_with_a_comment_that_only_reads_passes():
+    approve("databricks sql execute -e \"-- note\nSELECT 1\"")
+    approve("sqlcmd -S legacy-prod -Q \"-- x\nSELECT 1\"")
+
+
 # ---------------------------------------------------------------- A5 bundle / dbt targets
 
 @pytest.mark.parametrize("cmd", [

@@ -734,10 +734,15 @@ def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
 
 # ---------------------------------------------------------------- policy
 
+_FLAG_WORD = re.compile(r"-{1,2}[\w.-]+(?:=\S*)?")
+
+
 def _flag_values(argv: list[str], flags: tuple[str, ...]) -> list[str]:
+    """Values of `flags` in argv (`-e SQL`, `--file=x`). The next word is the value unless it is itself a
+    flag word; `-- a comment` or `--\\nDROP ...` is SQL, not a flag."""
     out = []
     for i, w in enumerate(argv[1:], 1):
-        if w in flags and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+        if w in flags and i + 1 < len(argv) and not _FLAG_WORD.fullmatch(argv[i + 1]):
             out.append(argv[i + 1])
         elif "=" in w and w.split("=", 1)[0] in flags:
             out.append(w.split("=", 1)[1])
@@ -918,7 +923,7 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         return []
     path, i = [], 0
     while i < len(argv):
-        if argv[i].startswith("-") and argv[i] != "--":
+        if argv[i] == "-" or _FLAG_WORD.fullmatch(argv[i]):
             i += 2 if argv[i] in _DBX_VALUE_FLAGS else 1
         else:
             path.append(argv[i])

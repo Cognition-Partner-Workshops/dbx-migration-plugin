@@ -290,6 +290,8 @@ PROBES2 = [
     ("aitools SELECT with UDF prod (approve)", Q + "'SELECT prod.s.f(1)'", "approve"),
     ("aitools leading comment then DELETE prod", Q + "$'-- cleanup\\nDELETE FROM prod.s.t'", "block"),
     ("aitools leading block comment then DROP prod", Q + "'/* cleanup */ DROP TABLE prod.s.t'", "block"),
+    ("aitools quoted leading comment then DROP prod", Q + "\"-- cleanup\nDROP TABLE prod.s.t\"", "block"),
+    ("aitools quoted leading comment then SELECT (approve)", Q + "\"-- cleanup\nSELECT 1\"", "approve"),
     ("dbx-recon mig_cat (approve)", "dbx-recon --mapping m.json --target-catalog mig_cat", "approve"),
     ("dbx-recon --target-catalog=prod", "dbx-recon --mapping m.json --target-catalog=prod", "block"),
     ("dbx-recon catalog from var", "dbx-recon --mapping m.json --target-catalog $CAT", "block"),
