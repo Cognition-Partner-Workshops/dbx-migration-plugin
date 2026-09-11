@@ -179,6 +179,7 @@ def test_a_stray_target_key_between_two_source_strata_is_counted():
     assert "(11,)" in pk["findings"][0]["detail"]
     assert pk["stats"]["loans"]["mismatched_ranges"] == 1
 
+
 @pytest.mark.parametrize("source_edit, target_edit, ahead, behind", [
     # loan 6 applied a second late, loan 8 a second early: the watermark total of the range is
     # unchanged, its sum of squares is not, so both rows are streamed and graded
@@ -431,6 +432,7 @@ def test_cdc_in_flight_max_rows_must_be_a_non_negative_integer(tmp_path, value):
     path.write_text(json.dumps({"version": "t1", "cdc_in_flight_max_rows": 3}))
     assert load_tolerances(path).cdc_in_flight_max_rows == 3
 
+
 @pytest.mark.parametrize("target_edit, lag_max_s, depth, verdict, cdc_codes", [
     # target applied everything up to loan 10; 11 and 12 are still in flight, beyond the bound
     ({11: None, 12: None}, 1, "sampled", "FAIL", ["cdc_lag_exceeded"]),
@@ -467,7 +469,6 @@ def test_a_counter_ahead_on_the_target_is_still_an_ordering_violation(rows, ahea
                   tol=Tolerances("t1", cdc_in_flight_max_rows=100))
     assert result["verdict"] == "FAIL"
     assert _codes(result, "cdc_lag_ordering") == ["row_ahead_of_source", "target_ahead_of_source"]
-
 
 
 def test_a_missing_key_older_than_the_applied_watermark_is_a_defect_even_with_lag():
