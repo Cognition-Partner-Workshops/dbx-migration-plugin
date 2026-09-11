@@ -166,7 +166,7 @@ _DYNAMIC_SQL_EXECUTOR = (r"(?:\bEXEC(?:UTE)?\s+IMMEDIATE|\bsp_executesql|\bEXEC(
 _DYNAMIC_SQL_CALLER = re.compile(_DYNAMIC_SQL_EXECUTOR + r"\s*N?\s*$", re.IGNORECASE)
 _PY_LITERAL = re.compile(_DYNAMIC_SQL_EXECUTOR + r"\s*[rbuf]*(['\"]{3}|['\"])(.*?)\1", re.IGNORECASE | re.DOTALL)
 _PY_WRITE = re.compile(r"""['"][wax]\+?['"]|\.write\w*\(|json\.dump\(|os\.(?:remove|unlink|rename|replace|chmod|rmdir|makedirs|mkdir)\(|"""
-                       r"""shutil\.|\.(?:unlink|rename|rmdir|mkdir|touch|chmod)\(""")
+                       r"""shutil\.|\.(?:unlink|rename|rmdir|mkdir|touch|chmod)\(|\bunlink\b|\bwriteFile\w*\(""")
 _MIGRATION_PATH = re.compile(r"[^\s'\"()]*\.migration(?:/[^\s'\"()]*)?")
 _RMTREE = re.compile(r"rmtree\(\s*(?:['\"]([^'\"]*)['\"]|(os\.getcwd\(\)|Path\.cwd\(\)|Path\(\s*(?:['\"]\.?['\"])?\s*\)))")
 _SQL_OUT_PATH = re.compile(r"(?i)(?:\bTO\s+|\\[ow]\s+|:out\s+|\bSPOOL\s+|\bFILE\s*=\s*)'?([^\s'\"]*\.migration(?:/[^\s'\"]*)?)")
@@ -1066,8 +1066,12 @@ _IDENTITY_FILE = re.compile(r"(?:^|/)(?:\.databrickscfg|\.databricks(?:/.*)?|\.c
 _GUARD_TREE = Path(os.path.realpath(__file__)).parent.parent   # the running plugin: hooks.json + hooks/**
 _GUARD_FILE = Path(__file__).name
 _PATH_LITERAL = re.compile(r"['\"]((?:[~./$]|/)[^'\"\n]{0,300})['\"]")
+_GUARD_LITERAL = re.compile(r"['\"]((?:[^'\"\n/]*/)*(?:hooks(?:/[^'\"\n]*)?|hooks\.json|" + re.escape(_GUARD_FILE) + r"))['\"]")
 _OUTPUT_FLAGS = ("-o", "-O", "--output", "--out", "--out-file", "--output-file", "--outfile", "--file")
 _GIT_DESTRUCTIVE = ("--hard", "--merge", "--keep")
+# every sub-command that can rewrite the working copy: on the running guard's tree they all replace the hook
+_GIT_REWRITERS = ("pull", "merge", "rebase", "cherry-pick", "revert", "am", "apply", "checkout", "switch", "restore",
+                  "reset", "stash", "clean", "rm", "mv")
 
 
 def _touch(path: str, cwd: str, root: Path) -> str:
@@ -1178,15 +1182,19 @@ def _git_globals(argv: list[str], cwd: str) -> tuple[str, list[str]]:
     working copy to, and the rest of argv starting at the sub-command."""
     i = 1
     while i < len(argv) and argv[i].startswith("-"):
-        w = argv[i]
-        if w == "-C" or w == "-c" or w in ("--git-dir", "--work-tree", "--namespace"):
-            if w == "-C" and i + 1 < len(argv):
-                cwd = os.path.normpath(argv[i + 1] if argv[i + 1].startswith("/") else os.path.join(cwd, argv[i + 1]))
+        w, d = argv[i], None
+        if w in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            if w in ("-C", "--work-tree") and i + 1 < len(argv):
+                d = argv[i + 1]
             i += 2
         else:
             if w.startswith("-C") and len(w) > 2:
-                cwd = os.path.normpath(w[2:] if w[2:].startswith("/") else os.path.join(cwd, w[2:]))
+                d = w[2:]
+            elif w.startswith("--work-tree="):
+                d = w.split("=", 1)[1]
             i += 1
+        if d:
+            cwd = os.path.normpath(d if d.startswith("/") else os.path.join(cwd, d))
     return cwd, argv[i:]
 
 
@@ -1227,15 +1235,14 @@ def _check_integrity(segs: list[_Seg], root: Path, cwd: str = "") -> list[str]:
         elif base == "git":
             at, gargv = _git_globals(argv, cwd)
             verb, gops = (gargv[0] if gargv else ""), [w for w in gargv[1:] if not w.startswith("-")]
+            if verb in _GIT_REWRITERS and not (verb == "stash" and gops[:1] in (["list"], ["show"])):
+                hit(".", f"git {verb}", (), destructive=True, at=at)   # rewrites the working copy: the guard tree only
             if verb == "clean" or (verb == "reset" and any(w in gargv for w in _GIT_DESTRUCTIVE)):
                 violations.append(f"`git {verb}` discards working-copy changes across the workspace, .migration/ included; "
                                   "revert a ledger only through a recorded decision")
-                hit(".", f"git {verb}", (), destructive=True, at=at)
             elif verb in ("checkout", "restore", "rm", "mv"):
                 for o in gops:
                     hit(o, f"git {verb}", all_kinds if verb in ("checkout", "restore") else ("inside", "self"), at=at)
-            elif verb == "stash" and gops[:1] not in (["list"], ["show"]):
-                hit(".", "git stash", (), destructive=True, at=at)   # rewrites the working copy: the guard tree only
             elif verb in ("apply", "am"):
                 violations += _patch_texts(s, gops + s.scripts, root, f"git {verb}")
         elif base == "patch":
@@ -1243,7 +1250,7 @@ def _check_integrity(segs: list[_Seg], root: Path, cwd: str = "") -> list[str]:
         elif _PYTHON.fullmatch(base) or base in ("perl", "ruby", "node") and not _in_place(base, argv):
             text = "\n".join([*_flag_values(argv, ("-c", "-e")), *s.heredocs, *s.stdin])
             if _PY_WRITE.search(text):
-                for p in [*_MIGRATION_PATH.findall(text), *_PATH_LITERAL.findall(text)]:
+                for p in [*_MIGRATION_PATH.findall(text), *_PATH_LITERAL.findall(text), *_GUARD_LITERAL.findall(text)]:
                     hit(p, f"{base} script")
                 for m in _RMTREE.finditer(text):
                     hit(m.group(1) if m.group(1) is not None else ".", f"{base} rmtree", all_kinds)
