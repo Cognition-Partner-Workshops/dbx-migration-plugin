@@ -72,10 +72,6 @@ if not MANIFEST_PATH.exists():
                      "plan playbook wrote, then re-run.")
 MANIFEST_TEXT = MANIFEST_PATH.read_text()
 MANIFEST = json.loads(MANIFEST_TEXT)
-DOCTOR_PATH = MANIFEST_PATH.parent.parent / "09_capabilities.json"
-if not DOCTOR_PATH.exists():
-    raise SystemExit(f"no factory-doctor report at {DOCTOR_PATH}; run the doctor before launching a wave")
-RECORDED = json.loads(DOCTOR_PATH.read_text())
 ROOT = MANIFEST_PATH.parent.parent.parent
 DOCTOR_PY = Path(__file__).resolve().parents[1] / "factory-doctor" / "doctor.py"
 BASE_BRANCH = MANIFEST.get("base_branch", "main")
@@ -138,6 +134,11 @@ STOP_MODES = ("hard", "soft")
 # A unit id is the one directory under .migration/recon/ its child may write, so it is a plain
 # name: no separators, no leading dot, and not the verifier's wave-N.
 UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
+# Manifest values that reach a command line (git refs here, the children's doctor flags): one plain
+# word, so nothing in them is ever an option, a range or a shell operator.
+WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+# A PR of this repo, as the host names it; its head is refs/pull/N/head, which only the host writes.
+PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
 
 
 def validate_manifest(m, doctor=None):
@@ -150,13 +151,23 @@ def validate_manifest(m, doctor=None):
             raise SystemExit(f"manifest is missing '{key}'")
     if not m["batches"]:
         raise SystemExit("manifest has no batches")
-    for key in ("width", "breaker_threshold", "child_minutes"):
+    for key in ("wave", "width", "breaker_threshold", "child_minutes"):
         if key in m and (isinstance(m[key], bool) or not isinstance(m[key], int) or m[key] <= 0):
             raise SystemExit(f"manifest key '{key}' must be a positive integer")
+    if "base_branch" in m and not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
+                                  and ".." not in m["base_branch"]):
+        raise SystemExit("manifest 'base_branch' must be a plain branch name (letters, digits, _ . / -)")
     ids = Counter(b.get("id") for b in m["batches"])
     dupes = [i for i, c in ids.items() if c > 1 or not i]
     if dupes:
         raise SystemExit(f"batch ids must be unique and non-empty: {dupes}")
+    owners = {}
+    for b in m["batches"]:
+        for u in b.get("units") or []:
+            owners.setdefault(u, []).append(b["id"])
+    shared = {u: bs for u, bs in owners.items() if len(bs) > 1}
+    if shared:
+        raise SystemExit(f"a unit id belongs to one batch (its child alone writes .migration/recon/<unit_id>/): {shared}")
     for b in m["batches"]:
         for key in ("units", "write_targets", "brief"):
             if not b.get(key):
@@ -168,11 +179,12 @@ def validate_manifest(m, doctor=None):
                              "(letters, digits, _ . -, not wave-*): the id names the only "
                              ".migration/recon/<unit_id>/ its child may write")
     src = m.get("source")
-    if src is not None and (not isinstance(src, dict)
-                            or not all(isinstance(src.get(k), str) and src[k] for k in ("family", "secret"))
-                            or not isinstance(src.get("params", {}), dict)):
-        raise SystemExit("manifest 'source' must be {family, secret (env var NAME of the DSN), params?}: what "
-                         "the doctor's source_principal_read_only row checks")
+    if src is not None and (not isinstance(src, dict) or not isinstance(src.get("params", {}), dict)
+                            or not all(isinstance(v, str) and WORD.fullmatch(v) for v in
+                                       (src.get("family"), src.get("secret"), *src.get("params", {}).keys(),
+                                        *src.get("params", {}).values()))):
+        raise SystemExit("manifest 'source' must be {family, secret (env var NAME of the DSN), params?}, every value "
+                         "one plain word (letters, digits, _ . / -): they become the doctor's command line")
     if "verify_depth" in m and m["verify_depth"] not in VERIFY_DEPTHS:
         raise SystemExit(f"manifest 'verify_depth' must be one of {VERIFY_DEPTHS}")
     for b in m["batches"]:
@@ -221,44 +233,55 @@ def validate_manifest(m, doctor=None):
                              "09_capabilities.json; copy the doctor's values, never edit them")
 
 
-def fresh_doctor_report(recorded, m):
-    """09_capabilities.json is a file anyone can edit, so a wave launches from a doctor run made now,
-    written to <manifest>.doctor.json: identity, host, allowlist, tolerances, stop_mode and the
-    source principal are re-verified. Only the platform hook probe, which a shell has to run, is
-    carried over, and only by the nonce the recorded report says was blocked (the doctor rejects
-    any other)."""
-    hook = next((c for c in recorded.get("checks", []) if c.get("id") == "hook_platform_loaded"), {})
-    nonce = (hook.get("data") or {}).get("probe_nonce") if hook.get("status") == "ok" else None
+def fresh_doctor_report(m):
+    """.migration/09_capabilities.json is a file anyone can edit, so a wave launches from a doctor run
+    made now, written to <manifest>.doctor.json: identity, host, allowlist, tolerances, stop_mode and
+    the source principal are re-verified. The platform hook probe is the one thing only the launching
+    session's shell can run: its outcome arrives in WAVE_HOOK_PROBE (blocked:<nonce> | not-blocked);
+    nothing recorded earlier stands in for it, and the doctor checks the nonce."""
     caps, src, out = m["capabilities"], m.get("source") or {}, MANIFEST_PATH.with_suffix(".doctor.json")
     cmd = [sys.executable, str(DOCTOR_PY), "--workspace", str(ROOT), "--out", str(out),
-           "--hook-probe-result", f"blocked:{nonce}" if nonce else "unknown",
+           "--hook-probe-result", os.environ.get("WAVE_HOOK_PROBE") or "unknown",
            "--expect-identity", caps["identity"], "--expect-catalogs", ",".join(caps["catalogs"])]
     if src:
         cmd += ["--source-family", src["family"], "--source-secret", src["secret"]]
         cmd += [a for k, v in src.get("params", {}).items() for a in ("--param", f"{k}={v}")]
-    subprocess.run(cmd, check=False, timeout=900)
+    out.unlink(missing_ok=True)
+    rc = subprocess.run(cmd, check=False, timeout=900).returncode
     try:
-        return json.loads(out.read_text())
+        report = json.loads(out.read_text()) if rc in (0, 1) else None
     except (OSError, ValueError):
-        raise SystemExit(f"the factory-doctor wrote no report at {out}; fix the doctor before launching") from None
+        report = None
+    if report is None:
+        raise SystemExit(f"the factory-doctor did not write a report at {out} (rc={rc}); fix the doctor before launching")
+    return report
 
 
 validate_manifest(MANIFEST)
-DOCTOR = fresh_doctor_report(RECORDED, MANIFEST)
+DOCTOR = fresh_doctor_report(MANIFEST)
 validate_manifest(MANIFEST, DOCTOR)
 
 
-def pr_changed_paths(branch):
-    """What the PR really changes, from git rather than from the child's report: fetch its branch and
-    diff it against the base. None when git cannot answer, and then no PASS stands."""
+def ref_changed_paths(ref):
+    """Paths a ref on origin changes against the base, from git. None when git cannot answer, and then
+    no PASS stands. Callers pass refs the workflow built itself, never a name a child reported."""
     git = ["git", "-C", str(ROOT)]
     try:
-        subprocess.run(git + ["fetch", "-q", "origin", branch], check=True, capture_output=True, timeout=300)
-        r = subprocess.run(git + ["diff", "--name-only", f"origin/{BASE_BRANCH}...origin/{branch}"],
+        subprocess.run(git + ["fetch", "-q", "origin", ref], check=True, capture_output=True, timeout=300)
+        r = subprocess.run(git + ["diff", "--name-only", f"origin/{BASE_BRANCH}...FETCH_HEAD"],
                            check=True, capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout.split()
+
+
+def pr_changed_paths(pr_url):
+    """What the PR really changes: the head the host holds for that PR of this repo (refs/pull/N/head),
+    so the branch name in the child's report never selects what is inspected."""
+    m = PR_URL.fullmatch(pr_url) if isinstance(pr_url, str) else None
+    if not m or m["repo"].lower() != REPO.lower():
+        return None
+    return ref_changed_paths(f"refs/pull/{m['n']}/head")
 
 
 def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
@@ -272,8 +295,9 @@ def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
             if p.startswith(".migration/") and not p.startswith(allowed)]
 
 
-def validate_verify(verify, passed, auto_merge, wave=None) -> list[str]:
-    """Return verifier-output problems without reading files or mutating input."""
+def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> list[str]:
+    """Return verifier-output problems without reading files or mutating input. `observed` is what git
+    says the verifier's recon/wave-N branch changes (None: it could not be fetched or diffed)."""
     problems = []
     if not isinstance(verify, dict):
         return ["verifier output invalid: expected an object"]
@@ -319,9 +343,12 @@ def validate_verify(verify, passed, auto_merge, wave=None) -> list[str]:
     changed = verify.get("changed_paths")
     if not isinstance(changed, list) or not all(isinstance(p, str) for p in changed):
         problems.append("verifier output invalid: changed_paths must be a list of paths (git diff --name-only)")
-    else:
-        problems += [f"verifier output invalid: ledger tampered, changed {p}"
-                     for p in ledger_violations(changed, [], wave)]
+        changed = []
+    if wave is not None and observed is None:
+        problems.append(f"verifier output invalid: branch recon/wave-{wave} not verifiable from git (fetch or diff "
+                        "failed), ledger integrity unverified")
+    problems += [f"verifier output invalid: ledger tampered, changed {p}"
+                 for p in ledger_violations(sorted({*changed, *(observed or [])}), [], wave)]
     return problems
 
 WAVE = MANIFEST["wave"]
@@ -529,7 +556,7 @@ async def run_batch(batch, sem, breaker):
         # The ledger gate reads the PR's diff from git; the child's changed_paths can only add to it.
         reported = out.get("changed_paths")
         usable = isinstance(reported, list) and all(isinstance(p, str) for p in reported)
-        observed = pr_changed_paths(out["branch"]) if out.get("branch") else None
+        observed = pr_changed_paths(out.get("pr_url"))
         tampered = ledger_violations(sorted({*(reported if usable else []), *(observed or [])}), batch["units"])
         if tampered:
             prefix = "PASS downgraded: " if out["status"] == "PASS" else ""
@@ -541,7 +568,7 @@ async def run_batch(batch, sem, breaker):
             out["failure_class"] = "ledger_tampered"
             out["one_line_summary"] = (
                 "PASS downgraded: changed_paths "
-                + ("not reported" if not usable else "not verifiable from git (fetch or diff of the PR branch failed)")
+                + ("not reported" if not usable else "not verifiable from git (not a PR of this repo, or its fetch or diff failed)")
                 + ", ledger integrity unverified; " + out["one_line_summary"])
         if out["status"] != "PASS" and batch["id"] not in REPLAYED:
             breaker.record(out.get("failure_class") or "unclassified")
@@ -691,7 +718,8 @@ async def main():
     else:
         log("verify: skipped, no batch passed")
 
-    verify_problems = validate_verify(verify, passed, auto_merge, WAVE) if verify is not None else []
+    verify_problems = (validate_verify(verify, passed, auto_merge, WAVE, ref_changed_paths(f"recon/wave-{WAVE}"))
+                       if verify is not None else [])
     if verify_problems:
         if not isinstance(verify, dict):
             verify = {"wave_verdict": "FAIL", "unit_verdicts": {}, "findings": []}

