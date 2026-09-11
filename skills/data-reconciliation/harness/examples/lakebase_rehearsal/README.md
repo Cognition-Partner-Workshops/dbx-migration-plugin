@@ -6,10 +6,11 @@ accounts, 597 modifications), read-only via an `ApplicationIntent=ReadOnly` DSN.
 Postgres database standing in for a Lakebase migration branch (same wire protocol, same
 `psycopg` adapter, same `REPEATABLE READ` window).
 
-The fixture (mapping, target DDL, loader, canonicalization, four defect-injection scripts and
-the repair script) lives with the estate it describes:
+The fixture (mapping, target DDL, loader, canonicalization, the six `inject_*.sql` scripts named
+below, `repair_target.sql` and `restore_source_deletes.sql`) lives with the estate it describes:
 `Cognition-Partner-Workshops/ts-tsql-sybase-legacy-db` under `rehearsals/lakebase/`, with the
-run commands. Only the tolerance record is kept here, as the OLTP example to copy:
+run commands; every `inject_*.sql` below is `rehearsals/lakebase/<file>` there. Only the
+tolerance record is kept here, as the OLTP example to copy:
 
 - `tolerances.json`: zero numeric tolerance, `cdc_lag_max_s: 60`, `pk_set_ranges: 16`, and
   `accept_target_only_constraints: true` (the recorded decision that the target's added

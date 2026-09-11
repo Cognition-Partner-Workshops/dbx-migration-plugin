@@ -53,9 +53,9 @@ OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines"
                    "databricks-lakebase")
 M2M_VARS = ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET")
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
-DRIVERS = {"databricks": "databricks.sql", "redshift": "psycopg2", "snowflake": "snowflake.connector",
-           "teradata": "teradatasql", "oracle": "oracledb", "sqlserver": "pyodbc", "postgres": "psycopg"}
-SOURCE_FAMILIES = tuple(sorted(k for k in DRIVERS if k != "databricks"))
+# The adapters the harness can actually run (its other families fail fast, so no driver is probed for them).
+DRIVERS = {"databricks": "databricks.sql", "sqlserver": "pyodbc", "postgres": "psycopg"}
+SOURCE_FAMILIES = ("oracle", "postgres", "redshift", "snowflake", "sqlserver", "teradata")
 # The committed wave contract: the guard and the harness read the working copy, so a working copy
 # that differs from HEAD is a contract nobody reviewed.
 LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")

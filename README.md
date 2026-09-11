@@ -1,7 +1,7 @@
 # dbx-migration-factory (Devin plugin)
 
 Private, installable Devin plugin for Databricks migrations: source-dialect skills (Redshift,
-Teradata BTEQ, Informatica XML), reconciliation and prediction-parity harnesses, a Lakebridge
+Teradata BTEQ, Informatica XML), a reconciliation harness, a Lakebridge
 wrapper, enforcement hooks, a preflight doctor, always-on guardrail rules, and a bootstrap skill
 that imports the DBX playbook chain into the org.
 

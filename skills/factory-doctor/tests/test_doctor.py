@@ -166,14 +166,13 @@ def test_driver_probe_requires_full_module(monkeypatch):
 
 
 def test_driver_probe_names_match_adapter_imports():
-    """Each probe module is the one the harness adapter actually imports (Lakebase is psycopg 3,
-    Redshift is psycopg2); a wrong name would report a working environment as missing a driver."""
+    """The probed modules are exactly the ones the harness adapter lazily imports (Lakebase is
+    psycopg 3); a wrong or stale name would report a working environment as missing a driver."""
     adapters = (PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness" / "recon" / "adapters.py").read_text()
     imported = set(re.findall(r"^\s+import ([A-Za-z_][\w.]*)  # lazy", adapters, re.MULTILINE))
     imported |= {f"{a}.{b}" for a, b in re.findall(r"^\s+from ([\w.]+) import (\w+)  # lazy", adapters, re.MULTILINE)}
-    for engine, module in doctor.DRIVERS.items():
-        assert module in imported, f"{engine}: doctor probes {module}, adapters never import it"
-    assert doctor.DRIVERS["postgres"] == "psycopg" and doctor.DRIVERS["redshift"] == "psycopg2"
+    assert set(doctor.DRIVERS.values()) == imported
+    assert doctor.DRIVERS["postgres"] == "psycopg"
 
 
 def test_not_blocked_probe_fails(tmp_path):

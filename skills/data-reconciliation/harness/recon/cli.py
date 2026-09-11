@@ -19,9 +19,15 @@ import uuid as uuid_mod
 from pathlib import Path
 
 from . import canon, engine, report  # noqa: F401
-from .config import (CanonRule, ConfigError, READ_ONLY_SQL_KEYWORDS,
-                     load_canon_rules, load_mapping_spec, load_tolerances,
-                     validate_identifier)
+from .config import (
+    READ_ONLY_SQL_KEYWORDS,
+    CanonRule,
+    ConfigError,
+    load_canon_rules,
+    load_mapping_spec,
+    load_tolerances,
+    validate_identifier,
+)
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
 
@@ -239,7 +245,10 @@ def main(argv: list[str] | None = None) -> int:
         TargetIdentityError,
     )
 
-    source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
+    try:
+        source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
+    except NotImplementedError as exc:  # an untested family: refused before any connection
+        raise SystemExit(f"--family {args.family}: {exc}") from None
     if args.target_kind == "lakebase":
         # --target-catalog names the Lakebase database; the adapter refuses a DSN that lands
         # anywhere else, so the allowlist binds the connection and not just the label

@@ -7,7 +7,6 @@ import time
 import uuid
 
 import pytest
-
 from recon.adapters import SqlServerSourceAdapter
 from recon.transactional import _applied_predicate, _newer_predicate, _successor
 from recon.watermarks import in_form_of, instant

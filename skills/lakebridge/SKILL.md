@@ -42,7 +42,7 @@ databricks labs lakebridge transpile --input-source <unit dir> --output-folder <
 | `mssql` (SQL Server, Azure SQL, RDS) | DBSQL | DBSQL | SparkSQL | `tsql-ssis` (child session; Sybase ASE has no dialect flag, treat as `mssql` with the ASE delta list) |
 | `teradata` | DBSQL | — | SparkSQL | `teradata-bteq` |
 | `oracle` | DBSQL | — | SparkSQL | `oracle-plsql` (child session) |
-| `redshift` | DBSQL (experimental) | — | SparkSQL | `redshift-sql` |
+| `redshift` | DBSQL (experimental) | — | SparkSQL | `redshift-sql` (stub) |
 | `snowflake` | — | DBSQL | SparkSQL | none yet |
 | `synapse` | DBSQL | DBSQL | SparkSQL | none yet |
 | `netezza` | DBSQL | — | SparkSQL | none yet |
