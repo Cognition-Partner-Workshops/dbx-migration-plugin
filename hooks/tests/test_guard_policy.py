@@ -11,7 +11,7 @@ import pytest
 HOOKS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HOOKS))
 
-import dbx_guard as g  # noqa: E402
+import dbx_guard as g
 
 CFG = g.GuardConfig.from_dict({
     "catalogs": ["mig_cat"],
@@ -288,7 +288,7 @@ def test_wrappers_are_read_through():
 
 def test_doctor_probe_command_blocks_via_subprocess(tmp_path: Path):
     sys.path.insert(0, str(HOOKS.parent / "skills" / "factory-doctor"))
-    import doctor  # noqa: E402
+    import doctor
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"]}))
     event = {"tool_name": "exec", "tool_input": {"command": doctor.HOOK_PROBE_COMMAND}}
