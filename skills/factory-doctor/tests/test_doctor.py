@@ -614,15 +614,16 @@ class FakePrivConn:
     ALTER ANY DATABASE, CONTROL SERVER; rolsuper, pg_write_server_files for Postgres); `writable` maps a
     table to the write privileges it holds; `absent` tables cannot be resolved. Indirection: `impersonate`
     lists principals the principal may IMPERSONATE, `execute` the procedures/functions it may EXECUTE,
-    `set_role` maps a Postgres role it is a member of to the write it would gain via SET ROLE; `columns` maps a
-    table to {column: [privileges]} granted at column level only (invisible to the table-level query).
+    `set_role` maps a Postgres role it is a member of (directly or through `direct`, the roles it was granted
+    itself, when given) to the write it would gain via SET ROLE; `columns` maps a table to {column: [privileges]}
+    granted at column level only (invisible to the table-level query).
     Records every statement so a test can prove the check only ever asked questions."""
 
     def __init__(self, *, roles=(), writable=None, absent=(), read_only="on", impersonate=(), execute=(),
-                 set_role=None, columns=None):
+                 set_role=None, columns=None, direct=None):
         self.roles, self.writable, self.absent, self.read_only = set(roles), writable or {}, set(absent), read_only
         self.impersonate, self.execute_on, self.set_role = list(impersonate), list(execute), set_role or {}
-        self.columns = columns or {}
+        self.columns, self.direct = columns or {}, list(self.set_role if direct is None else direct)
         self.statements: list[tuple[str, tuple]] = []
         self.closed = False
 
@@ -650,8 +651,10 @@ class FakePrivConn:
         elif "rolsuper" in low and "pg_auth_members" not in low:
             names = re.findall(r"\b(rolsuper|rolcreaterole|rolcreatedb|rolbypassrls)\b|pg_has_role\(current_user, '(\w+)'", sql)
             self._rows = [tuple("".join(n) in self.roles for n in names)]
-        elif "pg_auth_members" in low:
-            self._rows = [(r,) for r in self.set_role]
+        elif "pg_auth_members" in low:  # direct memberships only
+            self._rows = [(r,) for r in self.direct]
+        elif "pg_has_role(current_user, oid, 'member')" in low:  # transitive: every role SET ROLE can reach
+            self._rows = [(r,) for r in sorted({*self.direct, *self.set_role})]
         elif "pg_proc" in low:
             self._rows = [(f, "EXECUTE") for f in self.execute_on]
         elif "has_table_privilege" in low and len(args) == 4:  # (role, table, role, schema): the SET ROLE walk
@@ -793,6 +796,8 @@ def test_postgres_branches(monkeypatch):
                        ({"roles": ["pg_execute_server_program"]}, "role pg_execute_server_program"),
                        ({"execute": ["public.post_payment(integer)"]}, "public.post_payment(integer): EXECUTE"),
                        ({"set_role": {"loader": ["public.loans"]}}, "SET ROLE loader: public.loans write"),
+                       # nested: granted only `etl`, which is itself a member of the writer `loader`
+                       ({"set_role": {"loader": ["public.loans"]}, "direct": ["etl"]}, "SET ROLE loader: public.loans write"),
                        ({"columns": {"public.loans": {"balance": ["INSERT", "UPDATE"]}}},
                         "public.loans: INSERT on column balance, UPDATE on column balance")):
         c = doctor.check_source_principal(["public.loans"], "postgres", "LAKEBASE_SRC",
@@ -804,6 +809,9 @@ def test_postgres_branches(monkeypatch):
     assert c.status == "ok", c.detail
     walk = [a[0] for s, a in conn.statements if s.startswith("SELECT has_table_privilege") and len(a[0]) == 4]
     assert walk == [("readers", "raw.loans", "readers", "raw"), ("readers", "raw.payments", "readers", "raw")]
+    # the membership list is transitive (pg_has_role MEMBER), not one hop of pg_auth_members
+    assert not any("pg_auth_members" in s for s, _ in conn.statements)
+    assert any("pg_has_role(current_user, oid, 'MEMBER')" in s and "rolname <> current_user" in s for s, _ in conn.statements)
     fn = [(s, a[0]) for s, a in conn.statements if "pg_proc" in s]
     assert len(fn) == 1 and fn[0][1] == (["raw"],) and "prosecdef" in fn[0][0] and "has_function_privilege" in fn[0][0]
     # column grants: one query per table over pg_attribute, excluding what the table-level grant already covers
