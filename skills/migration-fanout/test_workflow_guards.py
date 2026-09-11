@@ -565,7 +565,8 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == ["src/a.sql", ".migration/allowed_targets.json"]
     # the host writes refs/pull/N/head; the child's branch name never reaches git
     assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "refs/pull/42/head"]
-    assert calls[1][3:] == ["diff", "--name-only", "origin/main...FETCH_HEAD"]
+    # --no-renames: a ledger file moved under an allowed recon/ path must still surface its old path
+    assert calls[1][3:] == ["diff", "--name-only", "--no-renames", "origin/main...FETCH_HEAD"]
     calls.clear()
     for url in ("https://github.com/other/repo/pull/42", "https://github.com/acme/dbx-target/pull/x",
                 "https://github.com/acme/dbx-target/pull/42/../../other/repo/pull/1", "", None, 42):

@@ -264,11 +264,12 @@ validate_manifest(MANIFEST, DOCTOR)
 
 def ref_changed_paths(ref):
     """Paths a ref on origin changes against the base, from git. None when git cannot answer, and then
-    no PASS stands. Callers pass refs the workflow built itself, never a name a child reported."""
+    no PASS stands. Callers pass refs the workflow built itself, never a name a child reported.
+    Renames are reported as delete + add so a ledger file moved under recon/ still names its old path."""
     git = ["git", "-C", str(ROOT)]
     try:
         subprocess.run(git + ["fetch", "-q", "origin", ref], check=True, capture_output=True, timeout=300)
-        r = subprocess.run(git + ["diff", "--name-only", f"origin/{BASE_BRANCH}...FETCH_HEAD"],
+        r = subprocess.run(git + ["diff", "--name-only", "--no-renames", f"origin/{BASE_BRANCH}...FETCH_HEAD"],
                            check=True, capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.SubprocessError):
         return None

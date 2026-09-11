@@ -269,8 +269,14 @@ def check_allowlist_committed(ws: Path) -> Check:
                  states)
 
 
+def _norm_catalog(name) -> str:
+    """The guard's identifier rule (dbx_guard._norm): trimmed, unquoted, case-folded."""
+    return str(name).strip().strip("`").lower()
+
+
 def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None) -> Check:
-    """The catalogs the plan/brief's capability contract names must be exactly the allowlist's."""
+    """The catalogs the plan/brief's capability contract names must be exactly the allowlist's,
+    compared under the guard's normalization so an accepted spelling never blocks a wave."""
     if expect_catalogs is None:
         return Check("allowlist_matches_contract", "skipped",
                      "no --expect-catalogs given (the catalogs in the wave's capability contract); nothing to compare")
@@ -279,10 +285,12 @@ def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None
         cats = json.loads(p.read_text()).get("catalogs")
     except (OSError, ValueError, AttributeError) as e:
         return Check("allowlist_matches_contract", "fail", f"{p.name} unreadable: {_redact(str(e))}")
-    data = {"expected": list(expect_catalogs), "allowlist": cats}
-    if not isinstance(cats, list) or sorted(cats) != sorted(expect_catalogs):
+    expected = [_norm_catalog(c) for c in expect_catalogs]
+    cats = [_norm_catalog(c) for c in cats] if isinstance(cats, list) else cats
+    data = {"expected": expected, "allowlist": cats}
+    if not isinstance(cats, list) or sorted(cats) != sorted(expected):
         return Check("allowlist_matches_contract", "fail",
-                     f"allowlist catalogs {cats} differ from the contract's {list(expect_catalogs)}; a catalog is "
+                     f"allowlist catalogs {cats} differ from the contract's {expected}; a catalog is "
                      "added by a recorded decision and a new doctor run, never by editing either side", data)
     return Check("allowlist_matches_contract", "ok", f"allowlist catalogs match the contract: {cats}", data)
 
