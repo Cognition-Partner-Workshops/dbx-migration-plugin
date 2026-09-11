@@ -10,7 +10,6 @@ HOOKS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HOOKS))
 
 import dbx_guard as g  # noqa: E402
-import dbx_post_hint as h  # noqa: E402
 
 CFG = g.GuardConfig.from_dict({
     "catalogs": ["mig_cat"],
@@ -826,50 +825,8 @@ def test_main_tolerates_garbage_input(tmp_path: Path):
     assert r.returncode == 0
 
 
-# ---------------------------------------------------------------- PostToolUse hint
-
-@pytest.mark.parametrize("text,kind", [
-    ("Error: PERMISSION_DENIED: User does not have USE CATALOG on Catalog 'prod_cat'.", "databricks-scope"),
-    ("Error: default auth: cannot configure default credentials", "databricks-auth"),
-    ("Error: Invalid access token.", "databricks-auth"),
-    ("ORA-01031: insufficient privileges", "legacy-readonly"),
-    ("ERROR: cannot execute INSERT in a read-only transaction", "legacy-readonly"),
-    ("Msg 229, Level 14, State 5: The INSERT permission was denied", "legacy-readonly"),
-    ("All good, 42 rows", None),
-])
-def test_post_hint_classify(text, kind):
-    assert h.classify(text) == kind
-
-
-def test_post_hint_emits_additional_context(tmp_path: Path):
-    ev = {"tool_name": "exec", "tool_input": {"command": "databricks jobs list"},
-          "tool_response": {"success": False, "output": "", "error": "Error: PERMISSION_DENIED: User does not have USE CATALOG"}}
-    r = _run(ev, tmp_path, script="dbx_post_hint.py")
-    assert r.returncode == 0
-    out = json.loads(r.stdout)
-    assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
-    assert "D10" in out["hookSpecificOutput"]["additionalContext"]
-
-
-def test_post_hint_silent_on_success(tmp_path: Path):
-    ev = {"tool_name": "exec", "tool_input": {"command": "ls"}, "tool_response": {"success": True, "output": "a b c", "error": None}}
-    r = _run(ev, tmp_path, script="dbx_post_hint.py")
-    assert r.returncode == 0 and r.stdout.strip() == ""
-
-
-def test_post_hint_silent_when_a_successful_command_merely_mentions_an_error(tmp_path: Path):
-    ev = {"tool_name": "exec", "tool_input": {"command": "grep PERMISSION_DENIED run.log"},
-          "tool_response": {"success": True, "output": "run.log:12 PERMISSION_DENIED: User does not have USE CATALOG", "error": ""}}
-    r = _run(ev, tmp_path, script="dbx_post_hint.py")
-    assert r.returncode == 0 and r.stdout.strip() == ""
-    ev["tool_response"].pop("success")  # no success flag: the text decides
-    r = _run(ev, tmp_path, script="dbx_post_hint.py")
-    assert "D10" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
-
-
-def test_hooks_json_registers_both_scripts():
+def test_hooks_json_registers_the_guard():
     data = json.loads((HOOKS.parent / "hooks.json").read_text())
     pre = data["PreToolUse"][0]["hooks"][0]["command"]
-    post = data["PostToolUse"][0]["hooks"][0]["command"]
-    assert "hooks/dbx_guard.py" in pre and "hooks/dbx_post_hint.py" in post
+    assert "hooks/dbx_guard.py" in pre and "PostToolUse" not in data
     assert data["PreToolUse"][0]["matcher"] == "exec"

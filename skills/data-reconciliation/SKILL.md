@@ -23,7 +23,7 @@ dbx-recon selftest                                                              
 
 dbx-recon run \
   --unit <unit_id> \
-  --family redshift|snowflake|teradata|oracle|sqlserver|databricks \
+  --family sqlserver|postgres|databricks \
   --mapping .migration/units/<unit_id>/mapping_spec.json \
   --tolerances .migration/03_recon_tolerances.json \
   --canonicalization skills/<source>-sql/canonicalization.json \
@@ -42,6 +42,15 @@ file's `full_diff_row_threshold` decides per table), `sampled` (always the strat
 independent verifier's default, with a different `--seed` from the child's), `full` (always the
 keyed full diff; what the wave manifest's `verify_depth: full` pins for cutover-critical units).
 The depth is recorded in `result.json` and the summary.
+
+`--family` names the source adapter. Only families rehearsed against a real engine may run:
+
+| Family | Status |
+|---|---|
+| `sqlserver` (pyodbc, `[sqlserver]` extra) | live-tested: SQL Server 2022 -> Lakebase rehearsal |
+| `postgres` (psycopg, `[lakebase]` extra) | live-tested: Postgres source and Lakebase target |
+| `databricks` (`[databricks]` extra) | live-tested: Delta target and Databricks-to-Databricks source |
+| `redshift`, `snowflake`, `teradata`, `oracle` | **untested**: the adapter raises `NotImplementedError("<family> source adapter is untested; see SKILL.md")` before any connection. Reconcile these through Lakehouse Federation (`--family databricks`) or land an adapter with a rehearsal first. |
 
 ```bash
 dbx-recon estimate --mapping <mapping_spec.json> --tolerances .migration/03_recon_tolerances.json \

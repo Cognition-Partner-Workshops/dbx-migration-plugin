@@ -93,7 +93,7 @@ THIS PLAYBOOK  ->  .migration/00_context.md          engagement facts, topology,
                    .migration/06_decisions.md        decision log with dates, owners, and provenance (`user:<id>` or `default-accepted`)
                    .migration/07_access_checklist.md D10 items, status, fired requests
                    .migration/allowed_targets.json   write-scope contract read by dbx-recon and the PreToolUse guard
-                   .migration/09_capabilities.json   factory-doctor output: identity, harness, hooks, stop_mode
+                   .migration/09_capabilities.json   factory-doctor output: identity + host, harness, hooks, source principal, stop_mode
 ```
 
 ### What's Needed From User
@@ -118,7 +118,7 @@ THIS PLAYBOOK  ->  .migration/00_context.md          engagement facts, topology,
     "target_hosts": ["LAKEBASE_MIGRATION_DSN"], "bundle_targets": ["migration"]}
    ```
 
-   Adding a catalog, host or target later is a decision, never an edit. Then run the `factory-doctor` preflight and commit its `09_capabilities.json`; a red row on identity, harness, or hook loading is a D10, not something to work around.
+   Adding a catalog, host or target later is a decision, never an edit. Then run the `factory-doctor` preflight with `--source-secret <the legacy DSN's env var name>` (the doctor proves that principal cannot write: `source_principal_read_only`; a DSN that can write is a D10 for a SELECT-only login, never an argument that `readonly=True` is enough) and commit its `09_capabilities.json`; a red row on identity, harness, hook loading, source principal, or an uncommitted allowlist/tolerance file (`allowlist_committed`) is a D10, not something to work around.
 8. Commit the workspace, then **STOP A (per stop_mode, once for the whole playbook)**: attach the target-state document, the tolerance record, and the access checklist; walk the PROPOSED target-state fields surface by surface and the PROPOSED tolerances; resolve per `stop_mode` (a soft default-accept records the PROPOSED values as the approved ones). Do not proceed with BLOCKED items unacknowledged; the user may accept a metadata-only phase 0 explicitly.
 
 ### Specifications

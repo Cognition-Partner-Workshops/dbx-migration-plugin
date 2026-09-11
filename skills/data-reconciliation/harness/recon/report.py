@@ -67,8 +67,8 @@ def render_report(result: dict) -> str:
         "",
         f"- **Verdict: {result['verdict']}**",
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
-        f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
-        "(fixture/continuous evidence never merges)",
+        (f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
+         "(fixture/continuous evidence never merges)"),
         f"- Mapping version: `{result['mapping_version']}`",
         f"- Tolerance version: `{result['tolerance_version']}`",
         f"- Seed: `{result.get('seed', 0)}`" + (f" | Params: `{result['params']}`"
@@ -119,8 +119,8 @@ def render_summary(result: dict) -> str:
         f"# Recon summary: `{result['unit']}` - **{result['verdict']}**",
         "",
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
-        f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
-        "(fixture/continuous evidence never merges)",
+        (f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
+         "(fixture/continuous evidence never merges)"),
         f"- Mapping `{result['mapping_version']}` / tolerances `{result['tolerance_version']}`"
         f" / seed `{result.get('seed', 0)}` / depth `{result.get('depth', 'threshold')}`"
         + (f" / params `{result['params']}`" if result.get("params") else ""),
