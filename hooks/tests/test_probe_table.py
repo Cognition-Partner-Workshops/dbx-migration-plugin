@@ -820,6 +820,52 @@ def plugin(tmp_path_factory) -> Path:
     ("python -c write elsewhere (approve)", "python3 -c \"open('src/app.py', 'w').write('')\"", "approve"),
     ("python -c write to a lookalike (approve)", "python3 -c \"open('hooks-doc/readme.md', 'w').write('')\"", "approve"),
     ("python -c write to the repo checkout's guard (approve)", "python3 -c \"open('{repo}/hooks/dbx_guard.py', 'a')\"", "approve"),
+    # round 6: on the guard tree git is an allowlist of read-only sub-commands; every other sub-command blocks there
+    ("git -C plugin worktree add", "git -C {plugin} worktree add /tmp/w", "block"),
+    ("git -C plugin submodule update", "git -C {plugin} submodule update --init", "block"),
+    ("git -C plugin filter-branch", "git -C {plugin} filter-branch --tree-filter 'rm -f hooks/dbx_guard.py' HEAD", "block"),
+    ("git -C plugin read-tree -u -m", "git -C {plugin} read-tree -u -m HEAD~1", "block"),
+    ("git -C plugin checkout-index -f -a", "git -C {plugin} checkout-index -f -a", "block"),
+    ("git -C plugin sparse-checkout set", "git -C {plugin} sparse-checkout set src", "block"),
+    ("git -C plugin bisect start", "git -C {plugin} bisect start", "block"),
+    ("git -C plugin commit", "git -C {plugin} commit -am 'x'", "block"),
+    ("git -C plugin init", "git -C {plugin} init", "block"),
+    ("git -C plugin tag <name>", "git -C {plugin} tag v9", "block"),
+    ("git -C plugin branch -D", "git -C {plugin} branch -D main", "block"),
+    ("git -C plugin remote add", "git -C {plugin} remote add evil https://x/y.git", "block"),
+    ("git -C plugin config core.hooksPath", "git -C {plugin} config core.hooksPath /tmp/h", "block"),
+    ("git clone into plugin/hooks", "git clone https://x/y.git {plugin}/hooks", "block"),
+    ("git clone over the plugin", "git clone https://x/y.git {plugin}", "block"),
+    ("git clone into .migration", "git clone https://x/y.git .migration/vendor", "block"),
+    ("env -C plugin git pull", "env -C {plugin} git pull", "block"),
+    ("GIT_WORK_TREE=plugin git pull", "GIT_WORK_TREE={plugin} GIT_DIR={plugin}/.git git pull", "block"),
+    ("GIT_DIR=plugin/.git git checkout", "GIT_DIR={plugin}/.git git checkout main", "block"),
+    ("git --git-dir=plugin/.git checkout", "git --git-dir={plugin}/.git checkout main", "block"),
+    ("git --git-dir plugin/.git pull", "git --git-dir {plugin}/.git pull", "block"),
+    ("git -C plugin worktree list (approve)", "git -C {plugin} worktree list", "approve"),
+    ("git -C plugin submodule status (approve)", "git -C {plugin} submodule status", "approve"),
+    ("git -C plugin rev-parse (approve)", "git -C {plugin} rev-parse HEAD", "approve"),
+    ("git -C plugin ls-files (approve)", "git -C {plugin} ls-files hooks", "approve"),
+    ("git -C plugin cat-file (approve)", "git -C {plugin} cat-file -p HEAD:hooks.json", "approve"),
+    ("git -C plugin tag -l (approve)", "git -C {plugin} tag -l 'v*'", "approve"),
+    ("git -C plugin remote -v (approve)", "git -C {plugin} remote -v", "approve"),
+    ("git -C plugin config --get (approve)", "git -C {plugin} config --get core.hooksPath", "approve"),
+    ("git -C plugin grep (approve)", "git -C {plugin} grep -n block -- hooks/", "approve"),
+    ("git -C plugin describe (approve)", "git -C {plugin} describe --tags", "approve"),
+    ("git -C plugin reflog (approve)", "git -C {plugin} reflog -5", "approve"),
+    ("git clone into the workspace (approve)", "git clone https://x/y.git vendor/y", "approve"),
+    ("git worktree add from the workspace (approve)", "git worktree add /tmp/w feature", "approve"),
+    ("git submodule update in the workspace (approve)", "git submodule update --init", "approve"),
+    ("git checkout -b in the workspace (approve)", "git checkout -b feature/x", "approve"),
+    ("git -C ws commit (approve)", "git -C {ws} commit -am 'x'", "approve"),
+    ("env -C ws git pull (approve)", "env -C {ws} git pull", "approve"),
+    ("GIT_DIR=ws/.git git pull (approve)", "GIT_DIR={ws}/.git git pull", "approve"),
+    # round 6: perl open-for-write modes are writer calls
+    ("perl -e open '>' hooks/dbx_guard.py, no event cwd", "perl -e \"open(F,'>','hooks/dbx_guard.py')\"", "block"),
+    ("perl -e open '>>' hooks.json, no event cwd", "perl -e 'open(my $fh, \">>\", \"hooks.json\")'", "block"),
+    ("perl -e open '>' the running guard by absolute path", "perl -e \"open(F,'>','{plugin}/hooks/dbx_guard.py')\"", "block"),
+    ("perl -e open '>' elsewhere (approve)", "perl -e \"open(F,'>','src/out.txt')\"", "approve"),
+    ("perl -e open '<' the guard (approve)", "perl -e \"open(F,'<','hooks/dbx_guard.py'); print <F>\"", "approve"),
 ], ids=lambda x: x if isinstance(x, str) and " " in x else None)
 def test_running_guard_tree_is_tamper_proof(label: str, command: str, expected: str, plugin: Path, workspace2: Path):
     _assert_plugin(label, command, expected, plugin, workspace2, event_cwd=None)
@@ -857,6 +903,15 @@ def test_running_guard_tree_is_tamper_proof(label: str, command: str, expected: 
     ("cwd=ws: git pull (approve)", "ws", "git pull", "approve"),
     ("cwd=ws: git checkout <branch> (approve)", "ws", "git checkout main", "approve"),
     ("cwd=ws: python -c open('hooks/dbx_guard.py','w') is not the running guard (approve)", "ws", "python3 -c \"open('hooks/dbx_guard.py', 'w')\"", "approve"),
+    # round 6
+    ("cwd=plugin: git worktree add", "plugin", "git worktree add /tmp/w", "block"),
+    ("cwd=plugin: git submodule update", "plugin", "git submodule update --init", "block"),
+    ("cwd=plugin: git commit", "plugin", "git commit -am x", "block"),
+    ("cwd=plugin/hooks: perl open '>' dbx_guard.py", "hooks", "perl -e \"open(F,'>','dbx_guard.py')\"", "block"),
+    ("cwd=plugin: git rev-parse (approve)", "plugin", "git rev-parse HEAD", "approve"),
+    ("cwd=plugin: git worktree list (approve)", "plugin", "git worktree list", "approve"),
+    ("cwd=ws: git worktree add (approve)", "ws", "git worktree add /tmp/w", "approve"),
+    ("cwd=ws: git commit (approve)", "ws", "git commit -am x", "approve"),
 ], ids=lambda x: x if isinstance(x, str) and " " in x else None)
 def test_event_cwd_resolves_relative_operands(label: str, event_cwd: str, command: str, expected: str, plugin: Path, workspace2: Path):
     (workspace2 / "src").mkdir(exist_ok=True)
@@ -864,7 +919,30 @@ def test_event_cwd_resolves_relative_operands(label: str, event_cwd: str, comman
     _assert_plugin(label, command, expected, plugin, workspace2, event_cwd=str(cwd))
 
 
-def _assert_plugin(label: str, command: str, expected: str, plugin: Path, ws: Path, event_cwd: str | None) -> None:
+@pytest.mark.parametrize("label,process_cwd,command,expected", [
+    # round 6: no `cwd` in the event -> the guard process's own working directory is where git runs
+    ("proc cwd=plugin: git pull", "plugin", "git pull", "block"),
+    ("proc cwd=plugin: git checkout <branch>", "plugin", "git checkout main", "block"),
+    ("proc cwd=plugin: git reset --hard", "plugin", "git reset --hard", "block"),
+    ("proc cwd=plugin/hooks: git merge", "hooks", "git merge origin/main", "block"),
+    ("proc cwd=plugin/hooks: cd .. then git pull", "hooks", "cd .. && git pull", "block"),
+    ("proc cwd=plugin: git worktree add", "plugin", "git worktree add /tmp/w", "block"),
+    ("proc cwd=plugin: perl open '>' hooks/dbx_guard.py", "plugin", "perl -e \"open(F,'>','hooks/dbx_guard.py')\"", "block"),
+    ("proc cwd=plugin: git status (approve)", "plugin", "git status", "approve"),
+    ("proc cwd=plugin: git log (approve)", "plugin", "git log --oneline -3", "approve"),
+    ("proc cwd=plugin: git diff (approve)", "plugin", "git diff", "approve"),
+    ("proc cwd=plugin: git fetch (approve)", "plugin", "git fetch", "approve"),
+    ("proc cwd=ws: git pull (approve)", "ws", "git pull", "approve"),
+    ("proc cwd=ws: git checkout <branch> (approve)", "ws", "git checkout main", "approve"),
+    ("proc cwd=ws: cd plugin then git pull", "ws", "cd {plugin} && git pull", "block"),
+], ids=lambda x: x if isinstance(x, str) and " " in x else None)
+def test_process_cwd_is_the_fallback_git_dir(label: str, process_cwd: str, command: str, expected: str, plugin: Path, workspace2: Path):
+    cwd = {"plugin": plugin, "hooks": plugin / "hooks", "ws": workspace2}[process_cwd]
+    _assert_plugin(label, command, expected, plugin, workspace2, event_cwd=None, process_cwd=cwd)
+
+
+def _assert_plugin(label: str, command: str, expected: str, plugin: Path, ws: Path, event_cwd: str | None,
+                   process_cwd: Path | None = None) -> None:
     link = ws / "plug"
     if not link.exists():
         link.symlink_to(plugin)
@@ -873,7 +951,7 @@ def _assert_plugin(label: str, command: str, expected: str, plugin: Path, ws: Pa
     if event_cwd is not None:
         event["cwd"] = event_cwd
     r = subprocess.run([sys.executable, str(plugin / "hooks" / "dbx_guard.py")], input=json.dumps(event), text=True, check=False,
-                       capture_output=True, cwd=ws, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(ws)})
+                       capture_output=True, cwd=process_cwd or ws, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(ws)})
     decision = "block" if r.returncode == 2 else "approve"
     assert r.returncode in (0, 2), r.stderr
     assert decision == expected, f"{label}: {command!r} -> {decision} ({r.stdout})"
