@@ -201,16 +201,19 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str) -> list[Check]:
         out.append(Check("hooks_files", "fail", f"hooks.json malformed: {e!r}"))
         return out
 
-    # Functional check: feed the guard the probe event directly; it must block.
+    # Functional check: feed the guard the probe event directly; it must block, and the reason must
+    # echo the probe token so a blanket deny cannot pass as the guard having read the command.
     event = json.dumps({"tool_name": "exec", "tool_input": {"command": HOOK_PROBE_COMMAND.format(nonce="self")}})
     try:
         r = subprocess.run([sys.executable, str(guard)], input=event, text=True, capture_output=True,
                            timeout=30, cwd=ws, env={**os.environ, "CLAUDE_PROJECT_DIR": str(ws)})
-        if r.returncode == 2 and '"block"' in r.stdout:
-            out.append(Check("hook_guard_functional", "ok", "dbx_guard.py blocks the probe command when invoked directly"))
+        if r.returncode == 2 and '"block"' in r.stdout and "__dbx_guard_probe__" in r.stdout:
+            out.append(Check("hook_guard_functional", "ok",
+                             "dbx_guard.py blocks the probe command when invoked directly and names __dbx_guard_probe__"))
         else:
             out.append(Check("hook_guard_functional", "fail",
-                             f"dbx_guard.py did not block the probe (rc={r.returncode}): {_redact(r.stderr or r.stdout)}"))
+                             f"dbx_guard.py did not block the probe naming __dbx_guard_probe__ (rc={r.returncode}): "
+                             f"{_redact(r.stderr or r.stdout)}"))
     except subprocess.TimeoutExpired:
         out.append(Check("hook_guard_functional", "fail", "dbx_guard.py timed out on the probe"))
 
