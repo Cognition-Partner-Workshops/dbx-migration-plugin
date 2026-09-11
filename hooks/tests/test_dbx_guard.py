@@ -813,6 +813,36 @@ def test_main_noop_outside_migration_workspace(tmp_path: Path):
     assert r.returncode == 0 and r.stdout.strip() == ""
 
 
+def _run_hosted(event: dict, home: Path):
+    """The hosted-session shape: hook process in `/`, project dir `/`, the command's directory only in `tool_input.workdir`."""
+    return subprocess.run(
+        [sys.executable, str(HOOKS / "dbx_guard.py")], input=json.dumps(event), text=True, capture_output=True, cwd="/",
+        env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": "/", "DEVIN_PROJECT_DIR": "/", "HOME": str(home)},
+    )
+
+
+LEGACY_DELETE = "sqlcmd -S legacy-sql.corp -d loans -Q \"DELETE FROM dbo.loans WHERE status = 'closed'\""
+
+
+def test_main_hosted_workdir_locates_the_workspace(tmp_path: Path):
+    ws = tmp_path / "repo"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]}))
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": LEGACY_DELETE, "workdir": str(ws)}}, tmp_path / "elsewhere")
+    assert r.returncode == 2 and "legacy-sql.corp" in json.loads(r.stdout.strip().splitlines()[-1])["reason"]
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": "sqlcmd -S legacy-sql.corp -d loans -Q \"SELECT COUNT(*) FROM dbo.loans\"", "workdir": str(ws)}}, tmp_path)
+    assert r.returncode == 0 and r.stdout.strip() == ""
+
+
+def test_main_hosted_without_workdir_falls_back_to_home(tmp_path: Path, tmp_path_factory):
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]}))
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": LEGACY_DELETE}}, tmp_path)
+    assert r.returncode == 2
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": LEGACY_DELETE}}, tmp_path_factory.mktemp("no-workspace"))
+    assert r.returncode == 0
+
+
 def test_main_blocks_when_allowlist_is_broken(tmp_path: Path):
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text("{not json")
