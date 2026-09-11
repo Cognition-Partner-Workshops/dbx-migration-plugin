@@ -23,6 +23,8 @@ ACCEPTED = [
     "hire_date < DATE '2026-01-01' AND ts <= TIMESTAMP '2026-01-01 00:00:00'",
     # date / timestamp are columns unless they introduce a typed string literal
     "date >= DATE '2026-01-01' AND timestamp IS NOT NULL AND t.date < timestamp",
+    # reserved words and punctuation inside [..] / ".." are one identifier, never a statement
+    '[Select; From] = 1 AND "drop table x" IS NULL',
     "  status = 'A'  ",
 ]
 
