@@ -5,7 +5,7 @@ description: Preflight for a DBX migration workspace. Verifies the Databricks CL
 
 # factory-doctor
 
-Seventeen checks, one JSON, no warehouse spend. The point is to find out *before* fifty children
+Nineteen checks, one JSON, no warehouse spend. The point is to find out *before* fifty children
 launch that the session is a human identity, the harness is not installed, the hooks are not
 being applied, the source credential can write, or the tolerances on disk are not the committed ones.
 
@@ -16,7 +16,8 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--expect-identity <migration SP userName>] [--expect-host <workspace URL>] [--expect-catalogs a,b] \
     [--hook-probe-result blocked:<nonce>|not-blocked] \
     [--unit <unit_id> ...] [--mapping <candidate mapping_spec.json> ...] \
-    [--source-secret <ENV VAR NAME of the source DSN> [--source-family sqlserver|postgres|...] --param name=value ...]
+    [--source-secret <ENV VAR NAME of the source DSN> [--source-family sqlserver|postgres|...] --param name=value ...] \
+    [--lakebase-project NAME --lakebase-parent-branch NAME] [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME]
 # --role child: one --unit per unit in the batch brief (the doctor resolves and checks
 # .migration/units/<id>/mapping_spec.json itself); an orchestrator checks every unit mapping in the
 # workspace. --source-secret/--param: the same values the recon run will get. --expect-catalogs: the
@@ -38,8 +39,8 @@ refuses a manifest whose identity, host, catalogs, guard_mode or stop_mode diffe
 
 Devin runs plugin hooks fail-open: if `hooks.json` is not loaded, nothing tells the session. The
 doctor therefore reports `hook_platform_loaded: unverified` until you prove it, and the proof is
-not your word: each report issues a fresh 8-hex `probe_nonce` and embeds it in the probe's catalog
-name, so the block message the platform shows is the only place the nonce can be read from.
+not your word: each report issues a fresh 8-hex nonce for the direct guard check, while the platform
+probe's pending nonce is persisted in `.migration/.hook_probe_nonce` and reused until accepted.
 
 1. Run, in the session shell, exactly the `probe_command` printed in that row of the report the
    doctor just wrote. It is an `echo` whose *text* looks like a Databricks write to
@@ -47,8 +48,8 @@ name, so the block message the platform shows is the only place the nonce can be
    whatever happens.
 2. If the shell tool refuses it with a `dbx-migration-factory guard` reason naming
    `__dbx_guard_probe__<nonce>`, hooks are live: re-run the doctor with
-   `--hook-probe-result blocked:<nonce>`. A nonce the last report did not issue (typed, stale, or
-   from another workspace) keeps the row `unverified` and issues a new one; a bare `blocked` is a
+   `--hook-probe-result blocked:<nonce>`. A nonce that does not match the pending nonce keeps the row
+   `unverified`; a bare `blocked` is a
    CLI error.
 3. If it prints the line, hooks are **not** applied in this session: re-run with
    `--hook-probe-result not-blocked`, which fails the run. Register a D10 (plugin not installed at
@@ -65,7 +66,9 @@ name, so the block message the platform shows is the only place the nonce can be
 | `allowlist_matches_contract` | the `--expect-catalogs` list (the wave's capability contract) differs from the allowlist's `catalogs`; `skipped` without the flag | `allowed_targets.json` |
 | `hooks_files` | `hooks.json` missing/malformed or does not register `hooks/dbx_guard.py` as `PreToolUse` | plugin root |
 | `hook_guard_functional` | the guard, invoked directly, fails to block the probe with a reason naming the full `__dbx_guard_probe__<nonce>` token the doctor sent, with a nonce fresh per run (a blanket deny, even one that hardcodes the prefix or a token seen before, is not proof it read the command) | `hooks/dbx_guard.py` |
-| `hook_platform_loaded` | live probe ran unblocked; `unverified` until `--hook-probe-result blocked:<nonce>` repeats the nonce this workspace's last report issued (`data.probe_nonce`, `data.probe_command`) | this session |
+| `hook_platform_loaded` | live probe ran unblocked; `unverified` until `--hook-probe-result blocked:<nonce>` repeats the pending nonce (`data.probe_nonce`, `data.probe_command`) | this session |
+| `lakebase_branch_create` | optional Lakebase project/parent branch probe cannot create and delete a one-hour child branch | Lakebase project permissions and parent expiry |
+| `lakebase_target_grants` | optional Lakebase DSN role lacks database or requested schema `CREATE` | Postgres privileges |
 | `official_databricks_plugin` | `warn` if some routed official skills are missing on disk; `unverified` if none visible locally (they are platform-loaded via `requiredPlugins`) | `target-routing` |
 | `recon_harness` | `dbx-recon selftest` fails or the harness is not importable | `data-reconciliation` |
 | `recon_drivers` | `warn` if `databricks-sql-connector` is missing (live/snapshot recon impossible) | harness `pyproject.toml` extras |

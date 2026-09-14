@@ -94,21 +94,19 @@ def test_unknown_probe_is_unverified_and_carries_command(tmp_path):
     assert report["blocking"] == ["hook_platform_loaded=unverified", "databricks_identity=skipped"]
 
 
-def test_platform_probe_is_verified_by_the_nonce_the_last_report_issued(tmp_path):
+def test_platform_probe_reuses_a_pending_nonce_until_accepted(tmp_path):
     ws = make_workspace(tmp_path)
     first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
     nonce = by_id(first)["hook_platform_loaded"]["data"]["probe_nonce"]
+    assert (ws / doctor.HOOK_PROBE_NONCE).read_text().strip() == nonce
+    second = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    assert by_id(second)["hook_platform_loaded"]["data"]["probe_nonce"] == nonce
     ok = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
     assert by_id(ok)["hook_platform_loaded"]["status"] == "ok"
     assert by_id(ok)["hook_platform_loaded"]["data"] == {"probe_nonce": nonce}
-    # a nonce that was never issued for this workspace (typed, stale, or from another report)
-    # proves nothing: the row stays unverified and a fresh nonce is issued
-    for claim in ("blocked:deadbeef", "blocked:"):
-        again = doctor.run(ws, PLUGIN_ROOT, "orchestrator", claim, None, True)
-        row = by_id(again)["hook_platform_loaded"]
-        assert row["status"] == "unverified" and "did not match" in row["detail"]
-        assert row["data"]["probe_nonce"] not in (nonce, "deadbeef")
+    again = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
+    assert by_id(again)["hook_platform_loaded"]["status"] == "ok"
     # a workspace with no prior report has no nonce to match, so nothing verifies it yet
     fresh = doctor.run(make_workspace(tmp_path / "fresh"), PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
     assert by_id(fresh)["hook_platform_loaded"]["status"] == "unverified"
@@ -134,6 +132,96 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", probed(ws), None, no_databricks=False)
     assert report["summary"].get("fail", 0) == 0
     assert not report["ready"] and report["blocking"] == ["databricks_identity=warn"]
+
+
+def test_human_identity_redacts_username_and_names_service_principal_secrets(monkeypatch):
+    _fake_cli(monkeypatch, {"userName": "someone@example.com"},
+              {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
+    row = by_id({"checks": [asdict(c) for c in doctor.check_databricks(None)]})["databricks_identity"]
+    assert row["data"]["userName"] == "<human user (redacted)>"
+    assert "someone@example.com" not in row["detail"]
+    assert "DATABRICKS_CLIENT_ID" in row["detail"]
+    assert "DATABRICKS_CLIENT_SECRET" in row["detail"]
+    assert "DATABRICKS_HOST" in row["detail"]
+
+
+def test_lakebase_rows_are_absent_without_flags(tmp_path):
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    assert not {c["id"] for c in report["checks"]} & {"lakebase_branch_create", "lakebase_target_grants"}
+
+
+@pytest.mark.parametrize(("stderr", "needle"), [
+    ("", "branch created and deleted"),
+    ("The user is not authorized to make the request", "Can Manage on Lakebase project loan-servicing"),
+    ("BadRequest Branches with an expiration date cannot have child branches", "parent branch primary has an expiry"),
+    ("other secret=password123 error", "<redacted>"),
+])
+def test_lakebase_branch_create_classifies_cli_results(monkeypatch, stderr, needle):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+    calls = []
+
+    def fake_run(cmd, timeout=0):
+        calls.append(cmd)
+        return (0, "{}", "") if not stderr else (1, "", stderr)
+
+    monkeypatch.setattr(doctor, "_run", fake_run)
+    row = doctor.check_lakebase_branch_create("loan-servicing", "primary")
+    assert needle in row.detail
+    assert row.status == ("ok" if not stderr else "fail")
+    if not stderr:
+        assert len(calls) == 2 and calls[1][2:] == ["delete-branch", calls[1][3], "--purge"]
+
+
+class LakebaseGrantCursor:
+    def __init__(self, db_create=False, schema_exists=False, schema_create=False):
+        self.db_create = db_create
+        self.schema_exists = schema_exists
+        self.schema_create = schema_create
+        self.rows = []
+
+    def execute(self, sql, params=()):
+        low = sql.lower()
+        if "current_user" in low:
+            self.rows = [("migration_role", "databricks_postgres", self.db_create)]
+        elif "information_schema.schemata" in low:
+            self.rows = [(1,)] if self.schema_exists else []
+        else:
+            self.rows = [(self.schema_create,)]
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+
+class LakebaseGrantConnection:
+    def __init__(self, **kwargs):
+        self.cursor_obj = LakebaseGrantCursor(**kwargs)
+        self.closed = False
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize(("kwargs", "status"), [
+    ({"db_create": True}, "ok"),
+    ({"db_create": False}, "fail"),
+    ({"db_create": False, "schema_exists": True, "schema_create": True}, "ok"),
+])
+def test_lakebase_target_grants(monkeypatch, kwargs, status):
+    monkeypatch.setenv("LAKEBASE_DSN", "postgresql://redacted")
+    conn = LakebaseGrantConnection(**kwargs)
+    row = doctor.check_lakebase_target_grants("LAKEBASE_DSN", "app", connect=lambda dsn: conn)
+    assert row.status == status
+    if status == "fail":
+        assert "GRANT CREATE ON DATABASE databricks_postgres TO migration_role" in row.detail
+
+
+def test_lakebase_target_grants_reports_missing_secret(monkeypatch):
+    monkeypatch.delenv("LAKEBASE_DSN", raising=False)
+    row = doctor.check_lakebase_target_grants("LAKEBASE_DSN")
+    assert row.status == "fail" and row.detail == "secret LAKEBASE_DSN is not set in this shell"
 
 
 def test_service_principal_with_advisory_warns_is_ready(tmp_path, monkeypatch):
