@@ -17,7 +17,8 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--hook-probe-result blocked:<nonce>|not-blocked] \
     [--unit <unit_id> ...] [--mapping <candidate mapping_spec.json> ...] \
     [--source-secret <ENV VAR NAME of the source DSN> [--source-family sqlserver|postgres|...] --param name=value ...] \
-    [--lakebase-project NAME --lakebase-parent-branch NAME] [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME]
+    [--lakebase-project NAME --lakebase-parent-branch NAME] [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] \
+    [--analytical-schema CATALOG.SCHEMA]
 # --role child: one --unit per unit in the batch brief (the doctor resolves and checks
 # .migration/units/<id>/mapping_spec.json itself); an orchestrator checks every unit mapping in the
 # workspace. --source-secret/--param: the same values the recon run will get. --expect-catalogs: the
@@ -69,6 +70,7 @@ probe's pending nonce is persisted in `.migration/.hook_probe_nonce` and reused 
 | `hook_platform_loaded` | live probe unblocked or nonce unverified | this session |
 | `lakebase_branch_create` | optional branch probe failed | Lakebase project permissions and parent expiry |
 | `lakebase_target_grants` | optional DSN role lacks CREATE | Postgres privileges |
+| `analytical_target_grants` | optional analytical schema: principal neither owns it nor has USE SCHEMA/CREATE TABLE/MODIFY/SELECT | Unity Catalog grants on the promotion schema |
 | `official_databricks_plugin` | routed official skills are missing/unverified | `target-routing` |
 | `recon_harness` | harness self-test/import failed | `data-reconciliation` |
 | `recon_drivers` | required driver missing | harness extras |
@@ -89,3 +91,5 @@ Reference details and factory placement: [references/checks.md](references/check
 - Never edit `09_capabilities.json` by hand; it is doctor output, and a child does not commit it.
 - A source DSN that *can* write is a `fail` even if every write is opened `readonly=True`: the
   read-only guarantee is the principal's grants, verified here, not a driver flag.
+- `--analytical-schema CATALOG.SCHEMA` checks the promotion schema; a red row's `detail` is the
+  ready-to-paste `GRANT` statement or statements for the D10 request.

@@ -55,6 +55,14 @@ Optional Lakebase project/parent branch probe cannot create and delete a one-hou
 
 Optional Lakebase DSN role lacks database or requested schema `CREATE`.
 
+### `analytical_target_grants`
+
+The optional Unity Catalog promotion-schema check is `ok` when the schema does not exist (setup
+creates it owned by the migration principal) or when the principal owns it. If the schema exists
+under another owner and the principal lacks `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, `MODIFY`,
+or `SELECT`, the row is red and its `detail` contains the exact `GRANT` statement or statements
+to paste into the D10 request.
+
 ### `source_principal_read_only`
 
 The `--source-secret` principal can write an in-scope source table, directly or through indirection. SQL Server and Postgres privilege checks include server, database, table, column, schema, role-membership, procedure, and CDC capture permissions; the row names the object and privilege, never the credential. `unverified` also blocks `ready` when the family is unsupported, cannot be inferred, or the connection fails. Driver read-only hints never substitute for grant checks.
@@ -81,6 +89,7 @@ The detailed privilege and remediation text remains here so the invocation contr
 | `hook_platform_loaded` | live probe ran unblocked; `unverified` until `--hook-probe-result blocked:<nonce>` repeats the pending nonce (`data.probe_nonce`, `data.probe_command`) | this session |
 | `lakebase_branch_create` | optional Lakebase project/parent branch probe cannot create and delete a one-hour child branch | Lakebase project permissions and parent expiry |
 | `lakebase_target_grants` | optional Lakebase DSN role lacks database or requested schema `CREATE` | Postgres privileges |
+| `analytical_target_grants` | optional promotion schema is absent/owned or lacks required Unity Catalog privileges | Unity Catalog grants on the promotion schema |
 | `official_databricks_plugin` | `warn` if some routed official skills are missing on disk; `unverified` if none visible locally (they are platform-loaded via `requiredPlugins`) | `target-routing` |
 | `recon_harness` | `dbx-recon selftest` fails or the harness is not importable | `data-reconciliation` |
 | `recon_drivers` | `warn` if `databricks-sql-connector` is missing (live/snapshot recon impossible) | harness `pyproject.toml` extras |

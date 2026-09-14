@@ -12,7 +12,8 @@ Usage:
                       [--expect-catalogs A,B] [--no-databricks] [--unit ID ...]
                       [--mapping mapping_spec.json ...] [--source-secret NAME] [--source-family F]
                       [--param NAME=VALUE ...] [--lakebase-project NAME] [--lakebase-parent-branch NAME]
-                      [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] [--out PATH]
+                      [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME]
+                      [--analytical-schema CATALOG.SCHEMA] [--out PATH]
 
 Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere, every security
 control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`,
@@ -943,6 +944,144 @@ def check_lakebase_target_grants(dsn_name: str, schema: str | None = None, conne
             conn.close()
 
 
+def _effective_privileges(payload) -> set[str]:
+    """Extract privilege names from effective assignments or non-effective grant payloads."""
+    found: set[str] = set()
+
+    def add(value) -> None:
+        if isinstance(value, str):
+            found.add(value.upper())
+        elif isinstance(value, dict):
+            privilege = value.get("privilege")
+            if isinstance(privilege, str):
+                found.add(privilege.upper())
+
+    if isinstance(payload, dict):
+        assignments = payload.get("privilege_assignments")
+        if isinstance(assignments, list):
+            for assignment in assignments:
+                if isinstance(assignment, dict):
+                    privileges = assignment.get("privileges", [])
+                    if isinstance(privileges, list):
+                        for privilege in privileges:
+                            add(privilege)
+        privileges = payload.get("privileges")
+        if isinstance(privileges, list):
+            for privilege in privileges:
+                add(privilege)
+    elif isinstance(payload, list):
+        for privilege in payload:
+            add(privilege)
+    return found
+
+
+def check_analytical_target_grants(full_name: str) -> Check:
+    """Check Unity Catalog privileges needed to create or write the promotion schema."""
+    cid = "analytical_target_grants"
+    if full_name.count(".") != 1 or any(not part for part in full_name.split(".")):
+        return Check(cid, "fail", "expected CATALOG.SCHEMA",
+                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+    catalog, schema = full_name.split(".", 1)
+    cli = shutil.which("databricks")
+    if not cli:
+        return Check(cid, "unverified",
+                     "databricks CLI not on PATH; install databricks-core and databricks-unity-catalog",
+                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+
+    rc, out, err = _run([cli, "current-user", "me", "--output", "json"])
+    if rc != 0:
+        return Check(cid, "fail", _redact(err or out),
+                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+    try:
+        current_user = json.loads(out)
+        principal = current_user.get("applicationId") or current_user.get("userName")
+    except (TypeError, ValueError, AttributeError):
+        return Check(cid, "fail", _redact(err or out),
+                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+    if not isinstance(principal, str) or not principal:
+        return Check(cid, "fail", "current-user response has no applicationId or userName",
+                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+
+    base_data = {"schema": full_name, "principal": principal, "owner": None, "exists": False, "missing": []}
+    rc, out, err = _run([cli, "schemas", "get", full_name, "--output", "json"])
+    if rc != 0:
+        low = err.lower()
+        absent = any(marker in low for marker in
+                     ("not found", "does not exist", "not_found", "schema_does_not_exist"))
+        if not absent:
+            return Check(cid, "fail", _redact(err or out), base_data)
+        rc, out, err = _run([cli, "grants", "get-effective", "catalog", catalog,
+                             "--principal", principal, "--output", "json"])
+        if rc != 0:
+            return Check(cid, "fail", _redact(err or out), base_data)
+        try:
+            privileges = _effective_privileges(json.loads(out))
+        except (TypeError, ValueError):
+            return Check(cid, "fail", _redact(err or out), base_data)
+        required = [("USE_CATALOG", "USE CATALOG"), ("CREATE_SCHEMA", "CREATE SCHEMA")]
+        missing = [name for name, _ in required if "ALL_PRIVILEGES" not in privileges and name not in privileges]
+        base_data["missing"] = missing
+        if missing:
+            display = ", ".join(label for name, label in required if name in missing)
+            return Check(cid, "fail",
+                         f"missing required privileges: GRANT {display} ON CATALOG {catalog} TO `{principal}`",
+                         base_data)
+        base_data["exists"] = False
+        return Check(cid, "ok",
+                     f"schema {full_name} does not exist; setup creates it owned by {principal} (no grants needed)",
+                     base_data)
+
+    try:
+        schema_payload = json.loads(out)
+        owner = schema_payload.get("owner")
+    except (TypeError, ValueError, AttributeError):
+        return Check(cid, "fail", _redact(err or out), base_data)
+    base_data["owner"] = owner
+    base_data["exists"] = True
+    if isinstance(owner, str) and owner.lower() == principal.lower():
+        base_data["owner"] = principal
+        return Check(cid, "ok", f"schema {full_name} is owned by {principal}", base_data)
+
+    rc, out, err = _run([cli, "grants", "get-effective", "schema", full_name,
+                         "--principal", principal, "--output", "json"])
+    if rc != 0:
+        return Check(cid, "fail", _redact(err or out), base_data)
+    try:
+        schema_privileges = _effective_privileges(json.loads(out))
+    except (TypeError, ValueError):
+        return Check(cid, "fail", _redact(err or out), base_data)
+    rc, out, err = _run([cli, "grants", "get-effective", "catalog", catalog,
+                         "--principal", principal, "--output", "json"])
+    if rc != 0:
+        return Check(cid, "fail", _redact(err or out), base_data)
+    try:
+        catalog_privileges = _effective_privileges(json.loads(out))
+    except (TypeError, ValueError):
+        return Check(cid, "fail", _redact(err or out), base_data)
+
+    schema_required = [("USE_SCHEMA", "USE SCHEMA"), ("CREATE_TABLE", "CREATE TABLE"),
+                       ("MODIFY", "MODIFY"), ("SELECT", "SELECT")]
+    missing_schema = [name for name, _ in schema_required
+                      if "ALL_PRIVILEGES" not in schema_privileges and name not in schema_privileges]
+    missing_catalog = [] if ("ALL_PRIVILEGES" in catalog_privileges or "USE_CATALOG" in catalog_privileges) else ["USE_CATALOG"]
+    missing = missing_catalog + missing_schema
+    base_data["missing"] = missing
+    if missing:
+        statements = []
+        if missing_catalog:
+            statements.append(f"GRANT USE CATALOG ON CATALOG {catalog} TO `{principal}`")
+        if missing_schema:
+            display = ", ".join(label for name, label in schema_required if name in missing_schema)
+            statements.append(f"GRANT {display} ON SCHEMA {full_name} TO `{principal}`")
+        owner_text = owner if owner is not None else "unknown"
+        return Check(cid, "fail", f"missing required privileges: {'; '.join(statements)}; owner is {owner_text}",
+                     base_data)
+    owner_text = owner if owner is not None else "unknown"
+    return Check(cid, "ok",
+                 f"principal {principal} can create and write tables in {full_name} (owner {owner_text})",
+                 base_data)
+
+
 # ------------------------------------------------------------------ main
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
@@ -951,7 +1090,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         expect_catalogs: list[str] | None = None, source_family: str | None = None,
         expect_host: str | None = None, lakebase_project: str | None = None,
         lakebase_parent_branch: str | None = None, lakebase_dsn: str | None = None,
-        lakebase_schema: str | None = None) -> dict:
+        lakebase_schema: str | None = None, analytical_schema: str | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root),
                            check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs)]
     checks += check_hooks(plugin_root, ws, probe_result)
@@ -974,6 +1113,9 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
             checks.append(check_lakebase_branch_create(lakebase_project, lakebase_parent_branch))
     if lakebase_dsn:
         checks.append(check_lakebase_target_grants(lakebase_dsn, lakebase_schema))
+    if analytical_schema:
+        checks.append(Check("analytical_target_grants", "skipped", "--no-databricks")
+                        if no_databricks else check_analytical_target_grants(analytical_schema))
     counts: dict[str, int] = {}
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
@@ -1023,6 +1165,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lakebase-dsn", metavar="ENV_VAR_NAME",
                    help="env var NAME holding the Lakebase DSN (value never printed)")
     p.add_argument("--lakebase-schema", help="optional Lakebase schema to check for CREATE")
+    p.add_argument("--analytical-schema", metavar="CATALOG.SCHEMA",
+                   help="analytical target schema to check the principal can create and write tables in (or owns)")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="mapping ${NAME} placeholder value, same rules and values as dbx-recon run --param")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
@@ -1039,7 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
                  a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params,
                  a.expect_catalogs, a.source_family, a.expect_host, a.lakebase_project,
-                 a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema)
+                 a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema, a.analytical_schema)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
