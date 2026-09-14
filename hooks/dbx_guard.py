@@ -544,11 +544,13 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
         if seg.bg != bg:                                      # a `&` list runs in a subshell: what it changes ends with it
             if bg:
                 at, alts, dirs = saved
+                before = [at] if at is not None else alts
             bg, saved = seg.bg, (at, list(alts), list(dirs))
         while len(scopes) < seg.sub:
             scopes.append((at, list(alts), list(dirs)))
-        while len(scopes) > seg.sub:
+        while len(scopes) > seg.sub:                          # `( ... ) || cd d`: the parent is where it was before the group
             at, alts, dirs = scopes.pop()
+            before = [at] if at is not None else alts
         seg.words = [w if not env or "$" not in w or "$" not in re.sub(r"\\.|'[^']*'?", "", r) else
                      _SHELL_VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group()), w) for w, r in zip(seg.words, seg.raw)]
         seg.argv, seg.ctx = _program(aliases.get(seg.args[0] if seg.args else "", seg.args[:1]) + seg.args[1:], seg.assigns)
@@ -575,7 +577,7 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                 [_join(p, args[0] if args else "~") for p in now]
             moved = list(dict.fromkeys(moved))
             at = moved[0] if len(moved) == 1 else None
-            alts = [] if at is not None else [p for p in moved if p is not None][:8]
+            alts = [] if at is not None else [p for p in moved if p is not None]
         elif seg.argv0 == "popd":
             at, alts = (dirs.pop() if dirs else None), []
         elif seg.argv0 == "alias":

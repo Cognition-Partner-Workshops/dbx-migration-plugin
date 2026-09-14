@@ -489,6 +489,10 @@ def test_run_dirs_follow_cd_with_shell_scope():
     # a `cd` behind `||` ran only if the left side failed: both directories stay possible, none is certain
     assert g._run_dirs("cd a || cd b; ls", "/w") == [P("/w"), P("/w/a"), None, P("/w/b")]
     assert g._run_dirs("false || cd /work/repo; sqlcmd -Q x", "/") == [P("/"), None, P("/work/repo")]
+    # a `||` after a subshell resumes from the parent's directory, and every possible directory is kept
+    assert g._run_dirs("(cd sub; false) || cd repo; sqlcmd -Q x", "/work") == [P("/work"), P("/work/sub"), None, P("/work/repo")]
+    many = g._run_dirs("false || cd a; false || cd b; false || cd c; false || cd repo; sqlcmd -Q x", "/work")
+    assert P("/work/repo") in many and P("/work/a/b/c/repo") in many and len(many) == 17   # 2**4 directories + None
 
 
 def test_subshell_cd_does_not_hide_the_workspace(tmp_path: Path):
