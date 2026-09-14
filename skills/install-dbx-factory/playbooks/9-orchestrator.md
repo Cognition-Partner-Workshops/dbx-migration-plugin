@@ -25,16 +25,7 @@ The distinctive job here, relative to serial migration orchestrators, is **manag
 ```
 
 ## Stop mode
-Every stop runs in one of two modes, recorded as `stop_mode` in `00_context.md` at intake:
-
-- **soft (default)**: post the stop as usual (one decision, recommended default, the exact reply that changes it, artifact links), wait **60 seconds** for a reply, then accept the recommended default and continue. A reply inside the window is applied exactly as in hard mode; a reply that arrives after the window is treated as a change request at the next stop, never silently dropped.
-- **hard**: post and block until a human replies. No timeout, no default.
-
-Precedence: the user can set `stop_mode: hard` for the whole engagement at intake, or name individual stops ("make STOP C hard"), recorded in the same file. **STOP E is always hard**, whatever `stop_mode` says, as is any stop whose recommended default would change tolerances, widen scope, or touch the legacy source; those need a human reply.
-
-Every stop, in either mode, writes one row to `06_decisions.md` with its provenance: `user:<message/event id>` when a human replied, or `default-accepted (soft, 60s, no reply)` when the window elapsed. Writing `user:` without a human reply is forbidden; accepting a default in hard mode is forbidden. The row is what the resume rule reads; the chat is not.
-
-Why soft is the default: in the runs that shaped this kit, human turnaround between stops was the largest single wall-clock component (up to two hours per run), and the stops were almost always answered with the recommended default. Soft mode keeps every stop visible and overridable while letting an unattended run finish; the provenance column keeps the record honest about which decisions a human actually made. Engagements with real change control set `stop_mode: hard` at intake.
+Process contract (stops, stop_mode, D1–D10, notifications, branch/merge, fan-out guards): read references/contract.md in the install-dbx-factory skill once per session; it is not restated here.
 
 `stop_mode` governs decision defaults, not merge authority. Soft mode default-accepts decisions, but merges require `auto_merge: true` set explicitly in the manifest by a decision recorded at STOP A; otherwise PASS PRs are held for the wave-close reply. Hard mode requires `auto_merge: false`. The same rule covers every PR the orchestrator owns outside a manifest (wave 0, wave-close, coexistence, cutover documents) and the small-wave path. Independently of mode, when the workflow itself disables merging after a write-target anomaly (overlap, undeclared target, missing target report) the affected PRs stay unmerged until a human resolves the halt; a soft default never clears a safety halt. A child's ESCALATE that carries a recommended answer is resolved with it after the 60-second window in soft mode (same provenance row) and waits for a reply in hard mode.
 
@@ -63,10 +54,7 @@ Why soft is the default: in the runs that shaped this kit, human turnaround betw
 10. **Ledger discipline.** Keep `05_progress.md`, `04_dependency_register.md` and `06_decisions.md` current after every step, so any resumed session or the next pipeline starts from fact rather than memory. The decision ledger with provenance also powers **ask-the-ledger**: a lead who asks "why does unit X quarantine 4%?" gets a cited answer (the D-entry, the originating unit, the PR that argued it) from any on-demand session reading `.migration/`, instead of re-reading the evidence corpus.
 
 ## Human stop points
-- **STOP A** target state + tolerances + access, **STOP B** pipeline choice, **STOP C** plan, decisions, width: all per `stop_mode`. **STOP D** per-wave review (notify). **STOP E** cutover (always blocking).
-- At every stop, attach the actual `.md` artifacts and state repo, path, branch. A chat summary is an addition, never a substitute.
-- **Every stop is a one-decision presentation**: recommended default stated, the exact approval sentence needed, and nothing that opens a discussion. Human turnaround between stops is the chain's biggest hidden wall-clock floor; a stop answerable in one minute gets answered in one hour; soft mode exists because of it.
-- Stops fire even when prior sessions produced the artifacts; a previous approval never carries over (in soft mode the re-fired stop still gets its 60-second window).
+Process contract (stops, stop_mode, D1–D10, notifications, branch/merge, fan-out guards): read references/contract.md in the install-dbx-factory skill once per session; it is not restated here.
 
 ## Specifications
 - Deliverable: a fully migrated, cut-over pipeline with the artifact set (inventory, analysis, plan, per-wave recon reports, parallel-run ledger, evidence pack, audit memo) committed to DOCS, every dependency closed or deferred-with-condition, and the PR set merged.

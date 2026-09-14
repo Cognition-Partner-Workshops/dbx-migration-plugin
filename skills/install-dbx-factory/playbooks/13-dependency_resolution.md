@@ -9,18 +9,7 @@ Dependencies, not conversion difficulty, are what make data migrations slow and 
 
 ## Taxonomy
 
-| Class | What it is | Typical decision options |
-|---|---|---|
-| D1 | intra-pipeline lineage edge | ordering constraint only; handled by wave order, no decision |
-| D2 | shared object used by 2+ pipelines | migrate once in wave 0; owner pipeline per the shared-object map |
-| D3 | upstream feed from a non-migrating system | federate for reads (default); managed ingestion via Lakeflow Connect (SQL Server CT/CDC gateway, Postgres/MySQL CDC, query-based Oracle/Teradata/SQL Server/PG/MySQL, foreign-catalog Snowflake/Redshift/Synapse/BigQuery) or Auto Loader for files; the connector choice, its source-side prerequisites, and cutover cadence are the contract |
-| D4 | downstream consumer of legacy output | re-point at cutover; dual-publish during coexistence; rebuild |
-| D5 | scheduler / orchestration dependency | replace with Lakeflow Jobs; keep external scheduler triggering Databricks; hybrid with completion signal |
-| D6 | shared table with non-migrated writers | dual-write window; legacy remains writer + federated read; documented deferral |
-| D7 | external hand-off (SFTP, queue, partner feed) | preserve format contract exactly; re-platform the transport at cutover |
-| D8 | security / governance contract | reproduce in UC (row filters, masks, grants) before any consumer re-points |
-| D9 | ML model / scoring consumer | prediction-parity gate (playbook 6, ML-SCORING step) per the profile before re-pointing |
-| D10 | environment / access dependency | fire the request now; track to closure; gates fan-out width |
+Process contract (stops, stop_mode, D1–D10, notifications, branch/merge, fan-out guards): read references/contract.md in the install-dbx-factory skill once per session; it is not restated here.
 
 ## What's Needed From User (decide mode)
 - A decision per entry, from the options the class admits, with the register's contract facts in front of them.
@@ -33,7 +22,7 @@ Dependencies, not conversion difficulty, are what make data migrations slow and 
 3. Append to the register as UNDECIDED with cites. Never decide here.
 
 **decide mode**
-4. Propose one decision per UNDECIDED entry (the safest option the class admits, usually the read-only or coexistence-preserving one) and present the whole table at STOP C. In hard mode walk each entry with the user; in soft mode the proposals are the stop's default and are default-accepted as a batch after the window unless a reply changes them. Record for each entry the decision, routing point (the single place traffic flips at cutover), cutover condition, decommission condition, owner, and provenance (`user:<id>` or `default-accepted`). A class with no safe proposal (anything that would write to the legacy source or change tolerances) has no default and waits for a human regardless of `stop_mode`.
+4. Propose one decision per UNDECIDED entry (the safest option the class admits, usually the read-only or coexistence-preserving one) and present the whole table at STOP C. Record for each entry the decision, routing point (the single place traffic flips at cutover), cutover condition, decommission condition, owner, and provenance (`user:<id>` or `default-accepted`). A class with no safe proposal (anything that would write to the legacy source or change tolerances) has no default and waits for a human regardless of `stop_mode`.
 5. **Fire every lead-time request immediately** (access, firewall, service principal, DBA/platform tickets, consumer-team notifications), and record what was fired, to whom, and the expected lead time. Requests fire at plan approval, not when the wave needs them.
 
 **implement mode**

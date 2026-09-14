@@ -29,6 +29,8 @@
 
 Everything below is the engineering detail behind that summary.
 
+Process contract (stops, stop_mode, D1–D10, notifications, branch/merge, fan-out guards): read references/contract.md in the install-dbx-factory skill once per session; it is not restated here.
+
 ## The chain
 
 ```
@@ -71,28 +73,6 @@ INTERNAL SUBROUTINE (never operator-invoked; called by 2, 3, 4 and 5)
 
 Migrating a whole estate means running the orchestrator once per pipeline, in the order the inventory recommends; independent pipelines may themselves run as parallel orchestrator sessions once the first pipeline has validated the target profiles.
 
-## What stops a bad day
-
-Each row is a way a migration goes wrong and the one thing in the kit that catches it. Nothing here needs a human watching.
-
-| If this happens | What catches it |
-|---|---|
-| A stop is skipped or an old approval is reused | Every stop is a row in the decisions file with a date. The orchestrator re-reads it on resume and re-asks if the inputs changed. |
-| A child gets an incomplete brief | It reports BLOCKED, does nothing, and the brief says which item was missing. It never guesses. |
-| Two children write the same table | The wave refuses to launch. If it only shows up afterwards, merges are held and the brief says so. |
-| The same wave is launched twice | The workflow refuses if the wave's result file already exists. Resume uses the run_id; redo needs an explicit flag. |
-| One mistake repeats across 20 children | Circuit breaker: 3 same-class failures and no new children launch. Fix once, resume, held-back batches run. |
-| A child keeps retrying a red recon | Hard cap of 3 full runs, then it reports FAIL with a one-word failure class. |
-| Children hammer the live source | Fixture first. Each child reads the real source once, inside the cap agreed at the first stop. |
-| A child grades its own homework | A separate session that wrote none of the code re-runs the harness. Only its PASS merges. |
-| Fixture PASS gets mistaken for done | The report says so in the verdict line. Only a live, snapshot or transactional PASS can merge. |
-| The source moved during the check | Live comparisons are timestamped and re-run on the source side to separate drift from a real defect. |
-| Someone loosens a tolerance to go green | Tolerance changes need a dated approval in the decisions file. Grading-only fixes are the one exception. |
-| A secret ends up in a PR or log | Everything takes secret names; values are read from the environment at run time and never printed. |
-| Work lands outside the migration area | Write targets come from the brief only. The migration catalog or cluster is the only place with write grants. |
-| Cutover runs by accident | It needs a customer-held principal Devin never has, plus a current approval. Children cannot do it. |
-| Too many messages | One message per stop, wave close, or halt. Never per child or per PR. The wave brief is ten lines. |
-
 ## Design principles
 
 1. **Target is constant, source varies.** Every engagement lands on the same target shape (Unity Catalog, Delta, Databricks SQL/PySpark, Lakeflow Jobs or Lakeflow Spark Declarative Pipelines, Declarative Automation Bundles; Lakebase for the operational track). How that target works today comes from the official `databricks` plugin via the `target-routing` skill; all source-stack specifics live in pluggable dialect skills, never in the playbooks.
@@ -123,39 +103,9 @@ Each row is a way a migration goes wrong and the one thing in the kit that catch
 | `13-dependency_resolution.md` | [DBX v1] Dependency Resolution (Register / Decide / Implement) | `!dbx_dependency_resolution` |
 | `14-front_door_oltp.md` | [DBX v1] Front Door: Operational Database Estate (Lakebase) | `!dbx_migrate_oltp` |
 | `00_intake_template.md` | (not a playbook: the pre-kickoff intake form the customer fills; consumed by the front doors) | n/a |
+| `references/contract.md` | (not a playbook: process contract read by every playbook) | n/a |
 
 The number prefix is reading order, not an execution requirement. `13-dependency_resolution.md` is an internal subroutine invoked from playbooks 2, 3, 4 and 5, never run in sequence and never presented on the operator surface.
-
-## Human stop points
-
-| Stop | When | Default | What the user decides |
-|---|---|---|---|
-| **A** | after pre-migration | per `stop_mode` (default soft) | target profiles per workload (and which are N/A), recon tolerances, access checklist status, repo topology |
-| **B** | after estate inventory | per `stop_mode` (default soft) | **which pipeline to migrate** (default: the inventory's recommendation), its scope boundary and exclusions |
-| **C** | after plan | per `stop_mode` (default soft) | analysis, plan, every dependency decision, fan-out width, wave gates, data target |
-| **D** | after each wave | notify | review the wave's PRs and recon evidence in batch; optionally pause the fan-out |
-| **E** | before cutover | blocking | sign-off, evidence, independent audit, cutover authorization |
-
-Stops fire even on resumed runs; approvals never carry over. Default `stop_mode` is soft (60-second window, then the recommended default, recorded as `default-accepted`); STOP E always blocks. At every stop, the full markdown artifacts are attached, not summarized.
-
-## Dependency taxonomy
-
-`!dbx_dependency_resolution` classifies every crossing into exactly one class:
-
-| Class | What it is |
-|---|---|
-| D1 | intra-pipeline lineage edge (ordering constraint, not a decision) |
-| D2 | shared object used by several pipelines (migrate once, first pipeline owns it) |
-| D3 | upstream feed owned by a system not migrating (federation or ingestion contract) |
-| D4 | downstream consumer (BI dashboard, report, extract, API) reading the legacy output |
-| D5 | scheduler / orchestration dependency (Control-M, Autosys, Airflow, cron) |
-| D6 | shared table written by both migrated and non-migrated writers |
-| D7 | external hand-off (SFTP drop, message queue, partner feed) |
-| D8 | security / governance contract (row-level security, PII masking, retention) |
-| D9 | ML model or scoring consumer of the data |
-| D10 | environment/access dependency (network path, service principal, sample data approval) |
-
-Each entry records the full contract, then a decision (federate / re-point / dual-write during coexistence / documented deferral), the routing point that flips traffic, the cutover and decommission condition, and the fired lead-time request. D10 entries fire at STOP A, because access requests routinely outlast the code work.
 
 ## Parallelization model
 
