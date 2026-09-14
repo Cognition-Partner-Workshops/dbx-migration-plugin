@@ -1142,8 +1142,8 @@ def main(stdin_text: str | None = None) -> int:
     try:
         cfg = load_config(root)
         if cfg is None:
-            root, cfg = _workspace_from_cd(command, here)
             cwd = cwd or here
+            root, cfg = _workspace_from_cd(command, cwd)
     except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
         verdict = Verdict("block", f"dbx-migration-factory guard: cannot read {CONFIG_REL}: {exc}")
     else:

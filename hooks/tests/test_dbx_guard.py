@@ -868,6 +868,15 @@ def test_main_hosted_cd_into_workspace_applies_its_allowlist(tmp_path: Path):
     assert r.returncode == 2 and "__dbx_guard_probe__abcd1234" in r.stderr
 
 
+def test_main_hosted_relative_cd_resolves_from_event_cwd(tmp_path: Path):
+    ws = tmp_path / "lead" / "repo"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]}))
+    event = {"tool_name": "exec", "cwd": str(tmp_path / "lead"), "tool_input": {"command": f"cd repo && {LEGACY_DELETE}"}}
+    r = _run_hosted(event, tmp_path / "home")
+    assert r.returncode == 2 and "legacy-sql.corp" in json.loads(r.stdout.strip().splitlines()[-1])["reason"]
+
+
 def test_main_hosted_cd_into_workspace_with_broken_allowlist_blocks(tmp_path: Path):
     ws = tmp_path / "repo"
     (ws / ".migration").mkdir(parents=True)
