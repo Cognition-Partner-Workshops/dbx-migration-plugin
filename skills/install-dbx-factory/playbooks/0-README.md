@@ -163,7 +163,7 @@ Each entry records the full contract, then a decision (federate / re-point / dua
 - Default fan-out width is 20 concurrent children, configurable at STOP C. Waves above the plan's threshold run through the `migration-fanout` workflow (shipped in the plugin) with structured outputs and resume; smaller waves are launched as one batch in-session, gathered once, and gated the same way. Nobody reviews children one at a time.
 - Each child self-grades with the `dbx-recon` CLI; the wave is then re-verified by one independent session and gated on `result.json`. Humans read the ten-line wave brief at STOP D and act only on exceptions.
 - Two runtime backstops guard the fan-out: children register write targets in the ledger before deploying (a collision halts launches: it means the lineage extraction missed an edge), and a circuit breaker pauses remaining launches when N children (default 3) report the same failure class, so a new systematic trap is fixed once, not twenty times.
-- Shared objects (D2) migrate in wave 0, serially, before any fan-out, so parallel children never collide on them.
+- Shared objects (D2) migrate in wave 0, serially, through migration-fanout with a `wave: 0`, `width: 1` manifest, not by hand, before later waves fan out, so parallel children never collide on them.
 - The first small wave (5-10 units) runs before full fan-out to tune the source-dialect skill and knowledge notes; every later session inherits the corrections.
 
 ## Deployment into a customer environment
