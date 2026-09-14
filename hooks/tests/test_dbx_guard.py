@@ -843,6 +843,46 @@ def test_main_hosted_without_workdir_falls_back_to_home(tmp_path: Path, tmp_path
     assert r.returncode == 0
 
 
+def test_main_hosted_cd_into_workspace_applies_its_allowlist(tmp_path: Path):
+    ws = tmp_path / "repo"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text(
+        json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]})
+    )
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": f"cd {ws} && {LEGACY_DELETE}"}}, tmp_path / "home")
+    assert r.returncode == 2 and "legacy-sql.corp" in json.loads(r.stdout.strip().splitlines()[-1])["reason"]
+    r = _run_hosted(
+        {"tool_name": "exec", "tool_input": {"command": f'cd {ws} && sqlcmd -S legacy-sql.corp -d loans -Q "SELECT COUNT(*) FROM dbo.loans"'}},
+        tmp_path / "home",
+    )
+    assert r.returncode == 0 and r.stdout.strip() == ""
+    r = _run_hosted(
+        {
+            "tool_name": "exec",
+            "tool_input": {
+                "command": f'''cd {ws} && echo 'databricks experimental aitools tools query "DROP TABLE __dbx_guard_probe__abcd1234.x.y"'''
+            },
+        },
+        tmp_path / "home",
+    )
+    assert r.returncode == 2 and "__dbx_guard_probe__abcd1234" in r.stderr
+
+
+def test_main_hosted_cd_into_workspace_with_broken_allowlist_blocks(tmp_path: Path):
+    ws = tmp_path / "repo"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text("{not json")
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": f"cd {ws} && git status"}}, tmp_path / "home")
+    assert r.returncode == 2 and "cannot read" in r.stderr
+
+
+def test_main_hosted_cd_outside_any_workspace_is_noop(tmp_path: Path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": f"cd {plain} && {LEGACY_DELETE}"}}, tmp_path / "home")
+    assert r.returncode == 0
+
+
 def test_main_blocks_when_allowlist_is_broken(tmp_path: Path):
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text("{not json")

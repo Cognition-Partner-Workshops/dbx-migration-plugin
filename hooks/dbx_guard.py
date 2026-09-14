@@ -10,7 +10,8 @@ client elsewhere writes when every host candidate is in `target_hosts` and the w
 Nothing writes `.migration/` or the running guard's tree (git there is the `_git_reads` allowlist). Scripts and SQL files are
 read in the command's effective directory (event cwd, cd / pushd / env -C / git -C); what the guard cannot read blocks where a
 client is involved. No `.migration/` up the tree approves everything, one without a readable allowlist blocks everything, the
-doctor's `__dbx_guard_probe__<nonce>` always blocks. `hooks/tests/test_probe_table.py` pins this policy; add a row first.
+workspace is also found through a leading `cd`/`pushd` in the command, and the doctor's `__dbx_guard_probe__<nonce>` always
+blocks. `hooks/tests/test_probe_table.py` pins this policy; add a row first.
 """
 from __future__ import annotations
 
@@ -1073,6 +1074,23 @@ def _cd_targets(cmd: str) -> list[str | None]:
     return [None if t == "-" or _expands(t) else os.path.expanduser(t) for t in targets]
 
 
+def _workspace_from_cd(command: str, here: str) -> tuple[Path, GuardConfig] | None:
+    """Find the first allowlisted workspace reached by the command's directory changes."""
+    directory = Path(here)
+    for target in _cd_targets(command):
+        if target is None:
+            break
+        directory = (directory / target).resolve()
+        try:
+            cfg = load_config(directory)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            exc.workspace_dir = directory
+            raise
+        if cfg is not None:
+            return directory, cfg
+    return None
+
+
 def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str = "", here: str = "") -> Verdict:
     """`evaluate` against the starting workspace and every workspace the command `cd`s into: a write must be allowed by each
     allowlist involved, and a client command moving to a directory the guard cannot resolve is not clearable."""
@@ -1121,14 +1139,21 @@ def main(stdin_text: str | None = None) -> int:
     if not isinstance(command, str) or not command.strip():
         return 0
     root, cwd, here = _dirs(event, tool_input)
+    workspace_from_cd = False
     try:
         cfg = load_config(root)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
-        verdict = Verdict("block", f"dbx-migration-factory guard: cannot read {CONFIG_REL}: {exc}")
-    else:
         if cfg is None:
-            return 0
-        verdict = evaluate_with_workdirs(command, cfg, root, cwd, here)
+            workspace = _workspace_from_cd(command, here)
+            if workspace is None:
+                return 0
+            root, cfg = workspace
+            workspace_from_cd = True
+    except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
+        directory = getattr(exc, "workspace_dir", None)
+        location = f" for {directory}" if directory is not None else ""
+        verdict = Verdict("block", f"dbx-migration-factory guard: cannot read {CONFIG_REL}{location}: {exc}")
+    else:
+        verdict = evaluate_with_workdirs(command, cfg, root, cwd or here if workspace_from_cd else cwd, here)
     if verdict.reason:
         print(json.dumps({"decision": verdict.decision, "reason": verdict.reason}))
     if verdict.decision == "block":
