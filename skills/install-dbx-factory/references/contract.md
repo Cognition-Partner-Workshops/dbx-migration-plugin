@@ -31,18 +31,18 @@ Why soft is the default: in the runs that shaped this kit, human turnaround betw
 
 `!dbx_dependency_resolution` classifies every crossing into exactly one class:
 
-| Class | What it is |
-|---|---|
-| D1 | intra-pipeline lineage edge (ordering constraint, not a decision) |
-| D2 | shared object used by several pipelines (migrate once, first pipeline owns it) |
-| D3 | upstream feed owned by a system not migrating (federation or ingestion contract) |
-| D4 | downstream consumer (BI dashboard, report, extract, API) reading the legacy output |
-| D5 | scheduler / orchestration dependency (Control-M, Autosys, Airflow, cron) |
-| D6 | shared table written by both migrated and non-migrated writers |
-| D7 | external hand-off (SFTP drop, message queue, partner feed) |
-| D8 | security / governance contract (row-level security, PII masking, retention) |
-| D9 | ML model or scoring consumer of the data |
-| D10 | environment/access dependency (network path, service principal, sample data approval) |
+| Class | What it is | Typical decision options |
+|---|---|---|
+| D1 | intra-pipeline lineage edge (ordering constraint, not a decision) | ordering constraint only; handled by wave order, no decision |
+| D2 | shared object used by several pipelines (migrate once, first pipeline owns it) | migrate once in wave 0; owner pipeline per the shared-object map |
+| D3 | upstream feed owned by a system not migrating (federation or ingestion contract) | federate for reads (default); managed ingestion via Lakeflow Connect (SQL Server CT/CDC gateway, Postgres/MySQL CDC, query-based Oracle/Teradata/SQL Server/PG/MySQL, foreign-catalog Snowflake/Redshift/Synapse/BigQuery) or Auto Loader for files; the connector choice, its source-side prerequisites, and cutover cadence are the contract |
+| D4 | downstream consumer (BI dashboard, report, extract, API) reading the legacy output | re-point at cutover; dual-publish during coexistence; rebuild |
+| D5 | scheduler / orchestration dependency (Control-M, Autosys, Airflow, cron) | replace with Lakeflow Jobs; keep external scheduler triggering Databricks; hybrid with completion signal |
+| D6 | shared table written by both migrated and non-migrated writers | dual-write window; legacy remains writer + federated read; documented deferral |
+| D7 | external hand-off (SFTP drop, message queue, partner feed) | preserve format contract exactly; re-platform the transport at cutover |
+| D8 | security / governance contract (row-level security, PII masking, retention) | reproduce in UC (row filters, masks, grants) before any consumer re-points |
+| D9 | ML model or scoring consumer of the data | prediction-parity gate (playbook 6, ML-SCORING step) per the profile before re-pointing |
+| D10 | environment/access dependency (network path, service principal, sample data approval) | fire the request now; track to closure; gates fan-out width |
 
 Each entry records the full contract, then a decision (federate / re-point / dual-write during coexistence / documented deferral), the routing point that flips traffic, the cutover and decommission condition, and the fired lead-time request. D10 entries fire at STOP A, because access requests routinely outlast the code work.
 
