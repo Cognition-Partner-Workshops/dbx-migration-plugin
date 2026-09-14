@@ -187,7 +187,9 @@ def test_human_identity_redacts_username_and_names_service_principal_secrets(mon
 
 def test_lakebase_rows_are_absent_without_flags(tmp_path):
     report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert not {c["id"] for c in report["checks"]} & {"lakebase_branch_create", "lakebase_target_grants"}
+    assert not {c["id"] for c in report["checks"]} & {
+        "lakebase_branch_create", "lakebase_target_grants", "analytical_target_grants"
+    }
 
 
 @pytest.mark.parametrize(("stderr", "needle"), [
@@ -293,6 +295,150 @@ def test_lakebase_target_grants_redacts_connection_error(monkeypatch):
     assert row.detail == ("connection to LAKEBASE_DSN failed (RuntimeError); "
                           "check the DSN secret and network path")
     assert "password123" not in row.detail
+
+
+def _analytical_cli(monkeypatch, *, schema_exists=True, owner="owner@example.com",
+                    catalog_privileges=("USE_CATALOG",), schema_privileges=("USE_SCHEMA",),
+                    schema_error="", catalog_owner=None, schema_grants_rc=0, schema_grants_err=""):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+
+    def fake_run(cmd, timeout=0):
+        operation = tuple(cmd[1:3])
+        if operation == ("current-user", "me"):
+            return 0, json.dumps({"applicationId": "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d"}), ""
+        if operation == ("schemas", "get"):
+            if schema_exists:
+                return 0, json.dumps({"owner": owner}), ""
+            return 1, "", schema_error or "SCHEMA_DOES_NOT_EXIST"
+        if operation == ("catalogs", "get"):
+            return 0, json.dumps({"owner": catalog_owner}), ""
+        if operation == ("grants", "get-effective"):
+            resource_type = cmd[3]
+            if resource_type == "schema" and schema_grants_rc:
+                return schema_grants_rc, "{}", schema_grants_err
+            privileges = schema_privileges if resource_type == "schema" else catalog_privileges
+            return 0, json.dumps({"privilege_assignments": [
+                {"principal": "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d",
+                 "privileges": [{"privilege": p} for p in privileges]}
+            ]}), ""
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(doctor, "_run", fake_run)
+
+
+def test_analytical_target_schema_absent_with_catalog_grants(monkeypatch):
+    _analytical_cli(monkeypatch, schema_exists=False, catalog_privileges=("USE_CATALOG", "CREATE_SCHEMA"))
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "ok"
+    assert "does not exist" in row.detail and "no grants needed" in row.detail
+    assert row.data == {
+        "schema": "tsql_demo.loan_servicing",
+        "principal": "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d",
+        "owner": None,
+        "catalog_owner": None,
+        "exists": False,
+        "missing": [],
+    }
+
+
+def test_analytical_target_schema_absent_missing_create_schema(monkeypatch):
+    _analytical_cli(monkeypatch, schema_exists=False, catalog_privileges=("USE_CATALOG",))
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "fail"
+    assert "GRANT CREATE SCHEMA ON CATALOG `tsql_demo` TO `2e90bc1d-e9a1-4703-8c48-ad28ebb1864d`" in row.detail
+    assert "USE CATALOG" not in row.detail
+
+
+def test_analytical_target_schema_unreadable_returns_schema_grants(monkeypatch):
+    _analytical_cli(
+        monkeypatch,
+        schema_exists=False,
+        schema_error=("Error: User does not have USE SCHEMA on Schema 'tsql_demo.default'. "
+                      "Host: https://workspace.example Auth type: oauth Next steps: grant access"),
+        schema_grants_rc=1,
+        schema_grants_err="permission denied",
+        catalog_privileges=("USE_CATALOG",),
+    )
+    row = doctor.check_analytical_target_grants("tsql_demo.default")
+    assert row.status == "fail"
+    assert "GRANT USE SCHEMA, CREATE TABLE, MODIFY, SELECT ON SCHEMA `tsql_demo`.`default` TO `" in row.detail
+    assert "owner is unknown" in row.detail
+
+
+def test_analytical_target_schema_absent_catalog_owner_has_implicit_privileges(monkeypatch):
+    principal = "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d"
+    _analytical_cli(monkeypatch, schema_exists=False, catalog_privileges=(), catalog_owner=principal)
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "ok"
+    assert row.data["catalog_owner"] == principal
+
+
+def test_analytical_target_schema_owned_by_principal(monkeypatch):
+    _analytical_cli(monkeypatch, owner="2E90BC1D-E9A1-4703-8C48-AD28EBB1864D",
+                    catalog_privileges=("USE_CATALOG",))
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "ok"
+    assert row.detail == ("schema tsql_demo.loan_servicing is owned by "
+                          "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d")
+    assert row.data["owner"] == row.data["principal"]
+
+
+def test_analytical_target_schema_owner_missing_catalog_use(monkeypatch):
+    _analytical_cli(monkeypatch, owner="2E90BC1D-E9A1-4703-8C48-AD28EBB1864D",
+                    catalog_privileges=(), catalog_owner="owner@example.com")
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "fail"
+    assert "GRANT USE CATALOG ON CATALOG `tsql_demo` TO `" in row.detail
+    assert row.data["missing"] == ["USE_CATALOG"]
+
+
+def test_analytical_target_schema_requires_all_non_owner_privileges(monkeypatch):
+    _analytical_cli(monkeypatch, schema_privileges=("USE_SCHEMA",), owner="owner@example.com")
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "fail"
+    assert "GRANT CREATE TABLE, MODIFY, SELECT ON SCHEMA `tsql_demo`.`loan_servicing` TO `" in row.detail
+    assert "owner is owner@example.com" in row.detail
+
+
+def test_analytical_target_schema_all_privileges_is_ok(monkeypatch):
+    _analytical_cli(monkeypatch, schema_privileges=("ALL_PRIVILEGES",))
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "ok"
+    assert "can create and write tables" in row.detail
+
+
+def test_analytical_target_schema_quotes_delimited_identifiers(monkeypatch):
+    _analytical_cli(monkeypatch, schema_privileges=("USE_SCHEMA",), owner="owner@example.com")
+    row = doctor.check_analytical_target_grants("migration-prod.loan-servicing")
+    assert row.status == "fail"
+    assert "ON SCHEMA `migration-prod`.`loan-servicing`" in row.detail
+
+
+def test_analytical_target_schema_requires_catalog_schema_shape(monkeypatch):
+    row = doctor.check_analytical_target_grants("tsql_demo")
+    assert row.status == "fail" and row.detail == "expected CATALOG.SCHEMA"
+
+
+def test_analytical_target_schema_redacts_cli_errors(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+
+    def fake_run(cmd, timeout=0):
+        if tuple(cmd[1:3]) == ("current-user", "me"):
+            return 1, "", "request failed password=secret-value-123456789"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(doctor, "_run", fake_run)
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "fail"
+    assert "<redacted>" in row.detail
+    assert "secret-value" not in row.detail
+
+
+def test_analytical_schema_is_skipped_offline(tmp_path):
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        analytical_schema="a.b")
+    row = by_id(report)["analytical_target_grants"]
+    assert row["status"] == "skipped" and row["detail"] == "--no-databricks"
 
 
 def test_service_principal_with_advisory_warns_is_ready(tmp_path, monkeypatch):

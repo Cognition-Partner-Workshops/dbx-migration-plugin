@@ -52,7 +52,9 @@ Analytical-track deltas (deploy/schedule, pipelines, governance): [references/an
 - Migration work writes only to the migration catalog recorded in `.migration/00_context.md`, and a
   child writes only to the targets in its brief (`.migration/allowed_targets.json` is the allowlist
   the enforcement hooks check). Per-batch isolated areas: `<catalog>.<schema>__wave<N>_<unit>` or a
-  batch-scoped schema, dropped and recreated idempotently.
+  batch-scoped schema, dropped and recreated idempotently. The promotion schema is created by the
+  migration principal at setup when absent, so it owns it; a pre-existing schema under another
+  owner needs the grants the factory doctor names.
 - Preserve legacy table/column names in like-for-like migrations even when ugly; renames break
   consumers and recon. Forced renames (reserved words, illegal characters) go in the unit's mapping
   table so recon joins on the mapping, not on name equality.

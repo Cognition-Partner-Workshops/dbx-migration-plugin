@@ -42,7 +42,7 @@ Why soft is the default: in the runs that shaped this kit, human turnaround betw
 | D7 | external hand-off (SFTP drop, message queue, partner feed) | preserve format contract exactly; re-platform the transport at cutover |
 | D8 | security / governance contract (row-level security, PII masking, retention) | reproduce in UC (row filters, masks, grants) before any consumer re-points |
 | D9 | ML model or scoring consumer of the data | prediction-parity gate (playbook 6, ML-SCORING step) per the profile before re-pointing |
-| D10 | environment/access dependency (network path, service principal, sample data approval) | fire the request now; track to closure; gates fan-out width |
+| D10 | environment/access dependency (network path, service principal, sample data approval) | fire the request now; track to closure; gates fan-out width; the fired request carries the exact command(s) or grant statement(s) and the one-line reply that closes it |
 
 Each entry records the full contract, then a decision (federate / re-point / dual-write during coexistence / documented deferral), the routing point that flips traffic, the cutover and decommission condition, and the fired lead-time request. D10 entries fire at STOP A, because access requests routinely outlast the code work.
 
