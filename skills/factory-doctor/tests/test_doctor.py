@@ -345,7 +345,7 @@ def test_analytical_target_schema_absent_missing_create_schema(monkeypatch):
     _analytical_cli(monkeypatch, schema_exists=False, catalog_privileges=("USE_CATALOG",))
     row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
     assert row.status == "fail"
-    assert "GRANT CREATE SCHEMA ON CATALOG tsql_demo TO `2e90bc1d-e9a1-4703-8c48-ad28ebb1864d`" in row.detail
+    assert "GRANT CREATE SCHEMA ON CATALOG `tsql_demo` TO `2e90bc1d-e9a1-4703-8c48-ad28ebb1864d`" in row.detail
     assert "USE CATALOG" not in row.detail
 
 
@@ -361,7 +361,7 @@ def test_analytical_target_schema_unreadable_returns_schema_grants(monkeypatch):
     )
     row = doctor.check_analytical_target_grants("tsql_demo.default")
     assert row.status == "fail"
-    assert "GRANT USE SCHEMA, CREATE TABLE, MODIFY, SELECT ON SCHEMA tsql_demo.default TO `" in row.detail
+    assert "GRANT USE SCHEMA, CREATE TABLE, MODIFY, SELECT ON SCHEMA `tsql_demo`.`default` TO `" in row.detail
     assert "owner is unknown" in row.detail
 
 
@@ -374,7 +374,8 @@ def test_analytical_target_schema_absent_catalog_owner_has_implicit_privileges(m
 
 
 def test_analytical_target_schema_owned_by_principal(monkeypatch):
-    _analytical_cli(monkeypatch, owner="2E90BC1D-E9A1-4703-8C48-AD28EBB1864D")
+    _analytical_cli(monkeypatch, owner="2E90BC1D-E9A1-4703-8C48-AD28EBB1864D",
+                    catalog_privileges=("USE_CATALOG",))
     row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
     assert row.status == "ok"
     assert row.detail == ("schema tsql_demo.loan_servicing is owned by "
@@ -382,11 +383,20 @@ def test_analytical_target_schema_owned_by_principal(monkeypatch):
     assert row.data["owner"] == row.data["principal"]
 
 
+def test_analytical_target_schema_owner_missing_catalog_use(monkeypatch):
+    _analytical_cli(monkeypatch, owner="2E90BC1D-E9A1-4703-8C48-AD28EBB1864D",
+                    catalog_privileges=(), catalog_owner="owner@example.com")
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "fail"
+    assert "GRANT USE CATALOG ON CATALOG `tsql_demo` TO `" in row.detail
+    assert row.data["missing"] == ["USE_CATALOG"]
+
+
 def test_analytical_target_schema_requires_all_non_owner_privileges(monkeypatch):
     _analytical_cli(monkeypatch, schema_privileges=("USE_SCHEMA",), owner="owner@example.com")
     row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
     assert row.status == "fail"
-    assert "GRANT CREATE TABLE, MODIFY, SELECT ON SCHEMA tsql_demo.loan_servicing TO `" in row.detail
+    assert "GRANT CREATE TABLE, MODIFY, SELECT ON SCHEMA `tsql_demo`.`loan_servicing` TO `" in row.detail
     assert "owner is owner@example.com" in row.detail
 
 
@@ -395,6 +405,13 @@ def test_analytical_target_schema_all_privileges_is_ok(monkeypatch):
     row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
     assert row.status == "ok"
     assert "can create and write tables" in row.detail
+
+
+def test_analytical_target_schema_quotes_delimited_identifiers(monkeypatch):
+    _analytical_cli(monkeypatch, schema_privileges=("USE_SCHEMA",), owner="owner@example.com")
+    row = doctor.check_analytical_target_grants("migration-prod.loan-servicing")
+    assert row.status == "fail"
+    assert "ON SCHEMA `migration-prod`.`loan-servicing`" in row.detail
 
 
 def test_analytical_target_schema_requires_catalog_schema_shape(monkeypatch):

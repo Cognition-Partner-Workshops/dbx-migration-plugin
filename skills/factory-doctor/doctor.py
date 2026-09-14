@@ -981,6 +981,26 @@ def _permission_error(text: str) -> bool:
                ("does not have", "permission_denied", "permission denied", "insufficient", "unauthorized"))
 
 
+def _sql_ident(name: str) -> str:
+    return f"`{name.replace('`', '``')}`"
+
+
+def _grant_statements(catalog: str, full_name: str, principal: str,
+                      missing_catalog: list[str], missing_schema: list[str]) -> str:
+    schema_required = [("USE_SCHEMA", "USE SCHEMA"), ("CREATE_TABLE", "CREATE TABLE"),
+                       ("MODIFY", "MODIFY"), ("SELECT", "SELECT")]
+    statements = []
+    if missing_catalog:
+        statements.append(f"GRANT USE CATALOG ON CATALOG {_sql_ident(catalog)} TO `{principal}`")
+    if missing_schema:
+        display = ", ".join(label for name, label in schema_required if name in missing_schema)
+        schema_catalog, schema_name = full_name.split(".", 1)
+        statements.append(
+            f"GRANT {display} ON SCHEMA {_sql_ident(schema_catalog)}.{_sql_ident(schema_name)} TO `{principal}`"
+        )
+    return "; ".join(statements)
+
+
 def _catalog_privileges(cli: str, catalog: str, principal: str) -> tuple[set[str] | None, str | None, str | None]:
     """Return catalog privileges, owner, and a redacted error when both lookups fail."""
     catalog_owner = None
@@ -1075,19 +1095,16 @@ def check_analytical_target_grants(full_name: str) -> Check:
             missing = ([name for name, _ in [("USE_CATALOG", "USE CATALOG")]
                         if "ALL_PRIVILEGES" not in privileges and name not in privileges] + missing_schema)
             base_data["missing"] = missing
-            statements = []
-            if "USE_CATALOG" in missing:
-                statements.append(f"GRANT USE CATALOG ON CATALOG {catalog} TO `{principal}`")
-            display = ", ".join(label for name, label in schema_required if name in missing_schema)
-            statements.append(f"GRANT {display} ON SCHEMA {full_name} TO `{principal}`")
+            statement = _grant_statements(catalog, full_name, principal,
+                                           ["USE_CATALOG"] if "USE_CATALOG" in missing else [], missing_schema)
             return Check(cid, "fail",
-                         f"missing required privileges: {'; '.join(statements)}; owner is unknown",
+                         f"missing required privileges: {statement}; owner is unknown",
                          base_data)
         base_data["missing"] = missing
         if missing:
             display = ", ".join(label for name, label in required if name in missing)
             return Check(cid, "fail",
-                         f"missing required privileges: GRANT {display} ON CATALOG {catalog} TO `{principal}`",
+                         f"missing required privileges: GRANT {display} ON CATALOG {_sql_ident(catalog)} TO `{principal}`",
                          base_data)
         base_data["exists"] = False
         return Check(cid, "ok",
@@ -1103,6 +1120,20 @@ def check_analytical_target_grants(full_name: str) -> Check:
     base_data["exists"] = True
     if isinstance(owner, str) and owner.lower() == principal.lower():
         base_data["owner"] = principal
+        catalog_privileges, catalog_owner, catalog_error = _catalog_privileges(cli, catalog, principal)
+        base_data["catalog_owner"] = catalog_owner
+        if catalog_error:
+            return Check(cid, "fail", catalog_error, base_data)
+        assert catalog_privileges is not None
+        missing_catalog = [] if (
+            "ALL_PRIVILEGES" in catalog_privileges or "USE_CATALOG" in catalog_privileges
+        ) else ["USE_CATALOG"]
+        base_data["missing"] = missing_catalog
+        if missing_catalog:
+            statement = _grant_statements(catalog, full_name, principal, missing_catalog, [])
+            return Check(cid, "fail",
+                         f"missing required privileges: {statement}; schema owned by {principal}",
+                         base_data)
         return Check(cid, "ok", f"schema {full_name} is owned by {principal}", base_data)
 
     rc, out, err = _run([cli, "grants", "get-effective", "schema", full_name,
@@ -1131,14 +1162,9 @@ def check_analytical_target_grants(full_name: str) -> Check:
     missing = missing_catalog + missing_schema
     base_data["missing"] = missing
     if missing:
-        statements = []
-        if missing_catalog:
-            statements.append(f"GRANT USE CATALOG ON CATALOG {catalog} TO `{principal}`")
-        if missing_schema:
-            display = ", ".join(label for name, label in schema_required if name in missing_schema)
-            statements.append(f"GRANT {display} ON SCHEMA {full_name} TO `{principal}`")
+        statement = _grant_statements(catalog, full_name, principal, missing_catalog, missing_schema)
         owner_text = owner if owner is not None else "unknown"
-        return Check(cid, "fail", f"missing required privileges: {'; '.join(statements)}; owner is {owner_text}",
+        return Check(cid, "fail", f"missing required privileges: {statement}; owner is {owner_text}",
                      base_data)
     owner_text = owner if owner is not None else "unknown"
     return Check(cid, "ok",
