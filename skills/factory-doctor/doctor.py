@@ -24,6 +24,7 @@ playbook to decide.
 from __future__ import annotations
 
 import argparse
+import calendar
 import importlib
 import importlib.util
 import json
@@ -63,6 +64,7 @@ SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", 
 LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
 CAPABILITIES = ".migration/09_capabilities.json"
 HOOK_PROBE_NONCE = ".migration/.hook_probe_nonce"
+HOOK_PROBE_NONCE_TTL = 8 * 60 * 60
 
 # Safe live probe: if the platform loads hooks.json, the guard blocks this before it runs; if it
 # does not, `echo` prints a line and nothing else happens. Either way no Databricks call is made.
@@ -182,17 +184,32 @@ def check_allowed_targets(ws: Path, plugin_root: Path) -> Check:
 
 def _issued_nonce(ws: Path) -> str | None:
     """The pending probe nonce for this workspace, falling back to the last report."""
+    def fresh(nonce, issued_at) -> str | None:
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{8}", nonce):
+            return None
+        try:
+            return nonce if time.time() - float(issued_at) <= HOOK_PROBE_NONCE_TTL else None
+        except (TypeError, ValueError):
+            return None
+
     try:
-        nonce = (ws / HOOK_PROBE_NONCE).read_text().strip()
-        if re.fullmatch(r"[0-9a-f]{8}", nonce):
-            return nonce
+        saved = (ws / HOOK_PROBE_NONCE).read_text().strip().split()
+        if len(saved) == 2:
+            nonce = fresh(saved[0], saved[1])
+            if nonce:
+                return nonce
     except OSError:
         pass
     try:
-        checks = json.loads((ws / CAPABILITIES).read_text()).get("checks", [])
-        nonce = next(c["data"].get("probe_nonce") for c in checks if c.get("id") == "hook_platform_loaded")
-        return nonce if re.fullmatch(r"[0-9a-f]{8}", nonce) else None
-    except (OSError, ValueError, StopIteration, AttributeError, KeyError):
+        report = json.loads((ws / CAPABILITIES).read_text())
+        checks = report.get("checks", [])
+        row = next(c for c in checks if c.get("id") == "hook_platform_loaded")
+        nonce = row.get("data", {}).get("probe_nonce")
+        generated_at = report.get("generated_at") or report.get("timestamp")
+        if isinstance(generated_at, str):
+            generated_at = calendar.timegm(time.strptime(generated_at, "%Y-%m-%dT%H:%M:%SZ"))
+        return fresh(nonce, generated_at)
+    except (OSError, ValueError, StopIteration, AttributeError, KeyError, TypeError, OverflowError):
         return None
 
 
@@ -245,7 +262,7 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str) -> list[Check]:
         nonce = issued or secrets.token_hex(4)
         if not issued:
             try:
-                (ws / HOOK_PROBE_NONCE).write_text(nonce + "\n")
+                (ws / HOOK_PROBE_NONCE).write_text(f"{nonce} {int(time.time())}\n")
             except OSError:
                 pass
         why = ("the nonce did not match the one this workspace's last report issued; "
@@ -884,7 +901,7 @@ def check_lakebase_target_grants(dsn_name: str, schema: str | None = None, conne
         try:
             import psycopg  # lazy: optional extra
         except ImportError:
-            return Check("lakebase_target_grants", "unverified",
+            return Check("lakebase_target_grants", "fail",
                          "psycopg is unavailable; install the postgres extra for data-reconciliation")
         connect = lambda dsn: psycopg.connect(dsn)
     conn = None
@@ -902,18 +919,25 @@ def check_lakebase_target_grants(dsn_name: str, schema: str | None = None, conne
             if schema_exists:
                 cur.execute("select has_schema_privilege(current_user, %s, 'CREATE')", (schema,))
                 schema_create = bool(cur.fetchone()[0])
-        if bool(db_create) or (schema_exists and schema_create):
-            return Check("lakebase_target_grants", "ok",
-                         f"role {role} can CREATE in database {database}" +
-                         (f" or schema {schema}" if schema_exists and schema_create else ""),
-                         {"role": role, "database": database, "schema": schema})
-        detail = f"missing required privilege: GRANT CREATE ON DATABASE {database} TO {role}"
         if schema and schema_exists:
-            detail += f" or GRANT CREATE ON SCHEMA {schema} TO {role}"
-        return Check("lakebase_target_grants", "fail", detail,
+            if not schema_create:
+                return Check("lakebase_target_grants", "fail",
+                             f"missing required privilege: GRANT CREATE ON SCHEMA {schema} TO {role}",
+                             {"role": role, "database": database, "schema": schema})
+            return Check("lakebase_target_grants", "ok",
+                         f"role {role} can CREATE in schema {schema}",
+                         {"role": role, "database": database, "schema": schema})
+        if bool(db_create):
+            return Check("lakebase_target_grants", "ok",
+                         f"role {role} can CREATE in database {database}",
+                         {"role": role, "database": database, "schema": schema})
+        return Check("lakebase_target_grants", "fail",
+                     f"missing required privilege: GRANT CREATE ON DATABASE {database} TO {role}",
                      {"role": role, "database": database, "schema": schema})
     except Exception as e:  # noqa: BLE001 - driver-specific connection errors
-        return Check("lakebase_target_grants", "fail", _redact(str(e)))
+        return Check("lakebase_target_grants", "fail",
+                     f"connection to {dsn_name} failed ({type(e).__name__}); "
+                     "check the DSN secret and network path")
     finally:
         if conn is not None and hasattr(conn, "close"):
             conn.close()

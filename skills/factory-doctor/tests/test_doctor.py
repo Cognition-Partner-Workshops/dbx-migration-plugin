@@ -99,7 +99,8 @@ def test_platform_probe_reuses_a_pending_nonce_until_accepted(tmp_path):
     first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
     nonce = by_id(first)["hook_platform_loaded"]["data"]["probe_nonce"]
-    assert (ws / doctor.HOOK_PROBE_NONCE).read_text().strip() == nonce
+    saved_nonce, issued_at = (ws / doctor.HOOK_PROBE_NONCE).read_text().strip().split()
+    assert saved_nonce == nonce and issued_at.isdigit()
     second = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
     assert by_id(second)["hook_platform_loaded"]["data"]["probe_nonce"] == nonce
     ok = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
@@ -110,6 +111,45 @@ def test_platform_probe_reuses_a_pending_nonce_until_accepted(tmp_path):
     # a workspace with no prior report has no nonce to match, so nothing verifies it yet
     fresh = doctor.run(make_workspace(tmp_path / "fresh"), PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
     assert by_id(fresh)["hook_platform_loaded"]["status"] == "unverified"
+
+
+def test_failed_hook_report_without_probe_nonce_does_not_crash(tmp_path):
+    ws = make_workspace(tmp_path)
+    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps({
+        "checks": [{"id": "hook_platform_loaded", "status": "fail", "data": {}}],
+    }))
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    row = by_id(report)["hook_platform_loaded"]
+    assert row["status"] == "unverified"
+    assert re.fullmatch(r"[0-9a-f]{8}", row["data"]["probe_nonce"])
+
+
+def test_expired_pending_nonce_is_not_accepted(tmp_path):
+    ws = make_workspace(tmp_path)
+    old_nonce = "deadbeef"
+    (ws / doctor.HOOK_PROBE_NONCE).write_text(
+        f"{old_nonce} {int(doctor.time.time()) - doctor.HOOK_PROBE_NONCE_TTL - 1}\n")
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{old_nonce}", None, True)
+    row = by_id(report)["hook_platform_loaded"]
+    assert row["status"] == "unverified"
+    assert row["data"]["probe_nonce"] != old_nonce
+    saved_nonce, issued_at = (ws / doctor.HOOK_PROBE_NONCE).read_text().strip().split()
+    assert saved_nonce == row["data"]["probe_nonce"] and issued_at.isdigit()
+
+
+def test_expired_report_nonce_is_not_accepted(tmp_path):
+    ws = make_workspace(tmp_path)
+    old_nonce = "deadbeef"
+    old_report = {
+        "generated_at": "2000-01-01T00:00:00Z",
+        "checks": [{"id": "hook_platform_loaded", "status": "unverified",
+                    "data": {"probe_nonce": old_nonce}}],
+    }
+    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(old_report))
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{old_nonce}", None, True)
+    row = by_id(report)["hook_platform_loaded"]
+    assert row["status"] == "unverified"
+    assert row["data"]["probe_nonce"] != old_nonce
 
 
 def test_cli_rejects_a_bare_blocked_claim(tmp_path):
@@ -181,10 +221,12 @@ class LakebaseGrantCursor:
 
     def execute(self, sql, params=()):
         low = sql.lower()
-        if "current_user" in low:
-            self.rows = [("migration_role", "databricks_postgres", self.db_create)]
-        elif "information_schema.schemata" in low:
+        if "information_schema.schemata" in low:
             self.rows = [(1,)] if self.schema_exists else []
+        elif "has_schema_privilege" in low:
+            self.rows = [(self.schema_create,)]
+        elif "current_user" in low:
+            self.rows = [("migration_role", "databricks_postgres", self.db_create)]
         else:
             self.rows = [(self.schema_create,)]
 
@@ -222,6 +264,35 @@ def test_lakebase_target_grants_reports_missing_secret(monkeypatch):
     monkeypatch.delenv("LAKEBASE_DSN", raising=False)
     row = doctor.check_lakebase_target_grants("LAKEBASE_DSN")
     assert row.status == "fail" and row.detail == "secret LAKEBASE_DSN is not set in this shell"
+
+
+def test_lakebase_target_grants_requires_psycopg(monkeypatch):
+    monkeypatch.setenv("LAKEBASE_DSN", "postgresql://redacted")
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    row = doctor.check_lakebase_target_grants("LAKEBASE_DSN")
+    assert row.status == "fail"
+    assert "psycopg is unavailable" in row.detail
+
+
+def test_lakebase_target_grants_requires_schema_create_when_schema_exists(monkeypatch):
+    monkeypatch.setenv("LAKEBASE_DSN", "postgresql://redacted")
+    conn = LakebaseGrantConnection(db_create=True, schema_exists=True, schema_create=False)
+    row = doctor.check_lakebase_target_grants("LAKEBASE_DSN", "app", connect=lambda dsn: conn)
+    assert row.status == "fail"
+    assert "GRANT CREATE ON SCHEMA app TO migration_role" in row.detail
+
+
+def test_lakebase_target_grants_redacts_connection_error(monkeypatch):
+    monkeypatch.setenv("LAKEBASE_DSN", "LAKEBASE_DSN_VALUE")
+
+    def connect(_dsn):
+        raise RuntimeError("postgresql://role:password123@db.example/target")
+
+    row = doctor.check_lakebase_target_grants("LAKEBASE_DSN", connect=connect)
+    assert row.status == "fail"
+    assert row.detail == ("connection to LAKEBASE_DSN failed (RuntimeError); "
+                          "check the DSN secret and network path")
+    assert "password123" not in row.detail
 
 
 def test_service_principal_with_advisory_warns_is_ready(tmp_path, monkeypatch):

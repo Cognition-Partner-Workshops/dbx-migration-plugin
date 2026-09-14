@@ -40,7 +40,7 @@ refuses a manifest whose identity, host, catalogs, guard_mode or stop_mode diffe
 Devin runs plugin hooks fail-open: if `hooks.json` is not loaded, nothing tells the session. The
 doctor therefore reports `hook_platform_loaded: unverified` until you prove it, and the proof is
 not your word: each report issues a fresh 8-hex nonce for the direct guard check, while the platform
-probe's pending nonce is persisted in `.migration/.hook_probe_nonce` and reused until accepted.
+probe's pending nonce is persisted in `.migration/.hook_probe_nonce` and reused for 8 hours until accepted.
 
 1. Run, in the session shell, exactly the `probe_command` printed in that row of the report the
    doctor just wrote. It is an `echo` whose *text* looks like a Databricks write to
