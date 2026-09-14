@@ -1074,8 +1074,9 @@ def _cd_targets(cmd: str) -> list[str | None]:
     return [None if t == "-" or _expands(t) else os.path.expanduser(t) for t in targets]
 
 
-def _workspace_from_cd(command: str, here: str) -> tuple[Path, GuardConfig] | None:
-    """Find the first allowlisted workspace reached by the command's directory changes."""
+def _workspace_from_cd(command: str, here: str) -> tuple[Path, GuardConfig | None]:
+    """The first workspace the command's `cd`/`pushd` chain reaches (resolved from `here`) and its allowlist; a broken
+    allowlist raises ValueError naming the directory."""
     directory = Path(here)
     for target in _cd_targets(command):
         if target is None:
@@ -1084,11 +1085,10 @@ def _workspace_from_cd(command: str, here: str) -> tuple[Path, GuardConfig] | No
         try:
             cfg = load_config(directory)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            exc.workspace_dir = directory
-            raise
+            raise ValueError(f"{exc} (workspace {directory})") from exc
         if cfg is not None:
             return directory, cfg
-    return None
+    return directory, None
 
 
 def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str = "", here: str = "") -> Verdict:
@@ -1139,21 +1139,17 @@ def main(stdin_text: str | None = None) -> int:
     if not isinstance(command, str) or not command.strip():
         return 0
     root, cwd, here = _dirs(event, tool_input)
-    workspace_from_cd = False
     try:
         cfg = load_config(root)
         if cfg is None:
-            workspace = _workspace_from_cd(command, here)
-            if workspace is None:
-                return 0
-            root, cfg = workspace
-            workspace_from_cd = True
+            root, cfg = _workspace_from_cd(command, here)
+            cwd = cwd or here
     except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
-        directory = getattr(exc, "workspace_dir", None)
-        location = f" for {directory}" if directory is not None else ""
-        verdict = Verdict("block", f"dbx-migration-factory guard: cannot read {CONFIG_REL}{location}: {exc}")
+        verdict = Verdict("block", f"dbx-migration-factory guard: cannot read {CONFIG_REL}: {exc}")
     else:
-        verdict = evaluate_with_workdirs(command, cfg, root, cwd or here if workspace_from_cd else cwd, here)
+        if cfg is None:
+            return 0
+        verdict = evaluate_with_workdirs(command, cfg, root, cwd, here)
     if verdict.reason:
         print(json.dumps({"decision": verdict.decision, "reason": verdict.reason}))
     if verdict.decision == "block":
