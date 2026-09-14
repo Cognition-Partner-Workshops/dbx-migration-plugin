@@ -13,19 +13,20 @@ What this script guarantees, so the orchestrator does not have to:
   - Children never edit shared ledger files. This script is the single writer of
     <manifest>.result.json and the ledger rows the orchestrator appends from it.
   - The verifier is a different session from every child. Only PRs the verifier marks
-    PASS are merged, and only if the manifest says auto_merge (true by default; hard stop_mode requires false).
+    PASS are merged, and only if the manifest says auto_merge (false by default; soft stop_mode
+    may set true by a recorded STOP A decision).
   - Re-running with the same run_id (also passed as WAVE_RUN_ID) replays finished children and only
     launches the rest.
 
 Manifest shape (written by the plan playbook, read here):
 {
-  "wave": 2,
+  "wave": 1,
   "repo": "github.com/acme/dbx-target",
   "child_macro": "!dbx_unit_migration",       # or "!mongo_unit_migration"
   "verify_macro": "!dbx_data_reconciliation", # or "!mongo_reconciliation"
   "width": 20,
   "breaker_threshold": 3,
-  "auto_merge": true,
+  "auto_merge": false,
   "child_minutes": 45,                        # soft time limit per child
   "verify_depth": "sampled",                  # optional; verifier Tier 3 depth for the wave:
                                               # sampled (default) | full. Per-batch "verify_depth"
@@ -43,7 +44,7 @@ Manifest shape (written by the plan playbook, read here):
   "source": {"family": "sqlserver",         # optional; the legacy source the doctor's
              "secret": "LEGACY_ODBC",         # source_principal_read_only row checks: engine, env var
              "params": {"db": "loans"}},      # NAME of the DSN, mapping ${params}. Passed to every
-  "base_branch": "main",                     # doctor run. base_branch: PR diffs are taken against it.
+  "base_branch": "migration/loan-servicing", # engagement feature branch; PR diffs are taken against it.
   "batches": [
     {"id": "w2-b01", "units": ["orders_load", "orders_dim"],
      "write_targets": ["mig.orders", "mig.orders_dim"],
@@ -51,6 +52,8 @@ Manifest shape (written by the plan playbook, read here):
      "brief": "...complete hand-off text for this batch..."}
   ]
 }
+
+Wave 0 uses the same workflow with `"wave": 0` and `"width": 1` for serial shared objects.
 """
 
 import asyncio
@@ -75,7 +78,7 @@ MANIFEST_TEXT = MANIFEST_PATH.read_text()
 MANIFEST = json.loads(MANIFEST_TEXT)
 ROOT = MANIFEST_PATH.parent.parent.parent
 DOCTOR_PY = Path(__file__).resolve().parents[1] / "factory-doctor" / "doctor.py"
-BASE_BRANCH = MANIFEST.get("base_branch", "main")
+BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_TEXT.encode()).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
@@ -157,17 +160,26 @@ def validate_manifest(m, doctor=None):
     report (.migration/09_capabilities.json) the capability contract must repeat what the doctor
     verified, field by field: a manifest cannot claim an identity, host or allowlist the doctor did
     not see."""
-    for key in ("wave", "repo", "child_macro", "verify_macro", "batches"):
+    for key in ("wave", "repo", "child_macro", "verify_macro", "batches", "base_branch"):
         if key not in m:
             raise SystemExit(f"manifest is missing '{key}'")
     if not m["batches"]:
         raise SystemExit("manifest has no batches")
-    for key in ("wave", "width", "breaker_threshold", "child_minutes"):
+    if (isinstance(m["wave"], bool) or not isinstance(m["wave"], int) or m["wave"] < 0):
+        raise SystemExit("manifest key 'wave' must be a non-negative integer")
+    for key in ("width", "breaker_threshold", "child_minutes"):
         if key in m and (isinstance(m[key], bool) or not isinstance(m[key], int) or m[key] <= 0):
             raise SystemExit(f"manifest key '{key}' must be a positive integer")
-    if "base_branch" in m and not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
-                                  and ".." not in m["base_branch"]):
+    if m["wave"] == 0 and m.get("width", 20) != 1:
+        raise SystemExit("wave 0 is the serial shared-objects wave: set width to 1")
+    if not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
+            and ".." not in m["base_branch"]):
         raise SystemExit("manifest 'base_branch' must be a plain branch name (letters, digits, _ . / -)")
+    if m["base_branch"] in ("main", "master") and not (
+            isinstance(m.get("trunk_base_decision"), str) and m["trunk_base_decision"].strip()):
+        raise SystemExit("base_branch 'main' is the trunk: migration ledgers and unit PRs land on the engagement "
+                         "feature branch; set base_branch to it, or record the decision in 06_decisions.md and put "
+                         "its row reference in 'trunk_base_decision'")
     ids = Counter(b.get("id") for b in m["batches"])
     dupes = [i for i, c in ids.items() if c > 1 or not i]
     if dupes:
@@ -219,7 +231,7 @@ def validate_manifest(m, doctor=None):
                          "did not pass; fix the D10 and re-run the doctor before launching a wave")
     if "auto_merge" in m and not isinstance(m["auto_merge"], bool):
         raise SystemExit("manifest 'auto_merge' must be a boolean")
-    if caps["stop_mode"] == "hard" and m.get("auto_merge", True):
+    if caps["stop_mode"] == "hard" and m.get("auto_merge", False):
         raise SystemExit("manifest 'auto_merge' must be false under capabilities.stop_mode 'hard': "
                          "merge authority stays with a human")
     if doctor is None:
@@ -460,7 +472,7 @@ REPO = MANIFEST["repo"]
 BATCHES = sorted(MANIFEST["batches"], key=lambda b: b["id"])
 WIDTH = int(MANIFEST.get("width", 20))
 BREAKER = int(MANIFEST.get("breaker_threshold", 3))
-AUTO_MERGE = bool(MANIFEST.get("auto_merge", True))
+AUTO_MERGE = bool(MANIFEST.get("auto_merge", False))
 CHILD_MINUTES = int(MANIFEST.get("child_minutes", 45))
 VERIFY_DEPTH = MANIFEST.get("verify_depth", "sampled")
 

@@ -80,7 +80,8 @@ def test_validate_manifest_rejects_invalid_positive_integer(value):
     validate_manifest = _functions()["validate_manifest"]
     manifest = {"wave": 1, "repo": "repo", "child_macro": "child",
                 "verify_macro": "verify", "batches": [{"id": "b", "units": ["u"],
-                "write_targets": ["t"], "brief": "brief"}], "width": value}
+                "write_targets": ["t"], "brief": "brief"}], "width": value,
+                "base_branch": "migration/loan-servicing"}
     with pytest.raises(SystemExit, match="width"):
         validate_manifest(manifest)
 
@@ -96,6 +97,7 @@ def _caps(**changes):
 def _manifest(**extra):
     m = {"wave": 1, "repo": "repo", "child_macro": "child", "verify_macro": "verify",
          "capabilities": _caps(host=HOST),
+         "base_branch": "migration/loan-servicing",
          "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
     m.update(extra)
     return m
@@ -133,7 +135,6 @@ def test_validate_manifest_rejects_missing_capabilities():
 
 
 @pytest.mark.parametrize("manifest", [
-    _manifest(capabilities=_caps(stop_mode="hard")),                    # auto_merge defaults to true
     _manifest(capabilities=_caps(stop_mode="hard"), auto_merge=True),
     _manifest(auto_merge="false"),
 ])
@@ -148,6 +149,24 @@ def test_validate_manifest_accepts_capability_contract():
     validate_manifest(_manifest())
     validate_manifest(_manifest(auto_merge=True))
     validate_manifest(_manifest(capabilities=_caps(stop_mode="hard", guard_mode="warn"), auto_merge=False))
+
+
+def test_validate_manifest_allows_serial_wave_zero_only():
+    validate_manifest = _functions()["validate_manifest"]
+    validate_manifest(_manifest(wave=0, width=1))
+    with pytest.raises(SystemExit, match="wave 0 is the serial shared-objects wave"):
+        validate_manifest(_manifest(wave=0, width=2))
+
+
+def test_validate_manifest_requires_feature_branch_or_recorded_trunk_decision():
+    validate_manifest = _functions()["validate_manifest"]
+    missing = _manifest()
+    del missing["base_branch"]
+    with pytest.raises(SystemExit, match="manifest is missing 'base_branch'"):
+        validate_manifest(missing)
+    with pytest.raises(SystemExit, match="base_branch 'main' is the trunk"):
+        validate_manifest(_manifest(base_branch="main"))
+    validate_manifest(_manifest(base_branch="main", trunk_base_decision="D-2026-001"))
 
 
 def test_child_prompt_embeds_capability_contract():

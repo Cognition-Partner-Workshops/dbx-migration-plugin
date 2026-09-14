@@ -11,7 +11,8 @@ Usage:
                       [--hook-probe-result blocked:<nonce>|not-blocked|unknown] [--expect-identity NAME] [--expect-host URL]
                       [--expect-catalogs A,B] [--no-databricks] [--unit ID ...]
                       [--mapping mapping_spec.json ...] [--source-secret NAME] [--source-family F]
-                      [--param NAME=VALUE ...] [--out PATH]
+                      [--param NAME=VALUE ...] [--lakebase-project NAME] [--lakebase-parent-branch NAME]
+                      [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] [--out PATH]
 
 Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere, every security
 control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`,
@@ -23,6 +24,7 @@ playbook to decide.
 from __future__ import annotations
 
 import argparse
+import calendar
 import importlib
 import importlib.util
 import json
@@ -61,6 +63,8 @@ SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", 
 # that differs from HEAD is a contract nobody reviewed.
 LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
 CAPABILITIES = ".migration/09_capabilities.json"
+HOOK_PROBE_NONCE = ".migration/.hook_probe_nonce"
+HOOK_PROBE_NONCE_TTL = 8 * 60 * 60
 
 # Safe live probe: if the platform loads hooks.json, the guard blocks this before it runs; if it
 # does not, `echo` prints a line and nothing else happens. Either way no Databricks call is made.
@@ -179,11 +183,33 @@ def check_allowed_targets(ws: Path, plugin_root: Path) -> Check:
 # ------------------------------------------------------------------ plugin / hooks / harness
 
 def _issued_nonce(ws: Path) -> str | None:
-    """The probe nonce the last report written for this workspace issued, if any."""
+    """The pending probe nonce for this workspace, falling back to the last report."""
+    def fresh(nonce, issued_at) -> str | None:
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{8}", nonce):
+            return None
+        try:
+            return nonce if time.time() - float(issued_at) <= HOOK_PROBE_NONCE_TTL else None
+        except (TypeError, ValueError):
+            return None
+
     try:
-        checks = json.loads((ws / CAPABILITIES).read_text()).get("checks", [])
-        return next(c["data"].get("probe_nonce") for c in checks if c.get("id") == "hook_platform_loaded")
-    except (OSError, ValueError, StopIteration, AttributeError, KeyError):
+        saved = (ws / HOOK_PROBE_NONCE).read_text().strip().split()
+        if len(saved) == 2:
+            nonce = fresh(saved[0], saved[1])
+            if nonce:
+                return nonce
+    except OSError:
+        pass
+    try:
+        report = json.loads((ws / CAPABILITIES).read_text())
+        checks = report.get("checks", [])
+        row = next(c for c in checks if c.get("id") == "hook_platform_loaded")
+        nonce = row.get("data", {}).get("probe_nonce")
+        generated_at = report.get("generated_at") or report.get("timestamp")
+        if isinstance(generated_at, str):
+            generated_at = calendar.timegm(time.strptime(generated_at, "%Y-%m-%dT%H:%M:%SZ"))
+        return fresh(nonce, generated_at)
+    except (OSError, ValueError, StopIteration, AttributeError, KeyError, TypeError, OverflowError):
         return None
 
 
@@ -233,7 +259,12 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str) -> list[Check]:
                          "live probe ran unblocked: hooks.json is not being applied in this session. Treat as a D10; "
                          "do not launch children until fixed (plugin not installed at org level, or hooks disabled)."))
     else:
-        nonce = secrets.token_hex(4)
+        nonce = issued or secrets.token_hex(4)
+        if not issued:
+            try:
+                (ws / HOOK_PROBE_NONCE).write_text(f"{nonce} {int(time.time())}\n")
+            except OSError:
+                pass
         why = ("the nonce did not match the one this workspace's last report issued; "
                if probe_result.startswith("blocked:") else "")
         out.append(Check("hook_platform_loaded", "unverified",
@@ -798,18 +829,24 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
         host = json.loads(desc)["details"]["host"] if rc == 0 else None
     except (ValueError, KeyError, TypeError):
         host = None
-    data = {"userName": name, "service_principal": is_sp, "host": host}
+    display_name = name if is_sp else "<human user (redacted)>"
+    data = {"userName": display_name, "service_principal": is_sp, "host": host}
     status = "ok"
-    detail = f"authenticated as {name} ({'service principal' if is_sp else 'user'}) on {host}"
+    detail = f"authenticated as {display_name} ({'service principal' if is_sp else 'user'}) on {host}"
     if expect_identity and str(name).lower() != expect_identity.lower():
-        status, detail = "fail", detail + f"; expected {expect_identity} (recorded in 07_access_checklist.md)"
+        expected_display = "<human user (redacted)>" if "@" in expect_identity else expect_identity
+        status, detail = "fail", detail + f"; expected {expected_display} (recorded in 07_access_checklist.md)"
     elif not host:
         status = "fail"
         detail += "; workspace host not resolved by `databricks auth describe`, so the wave manifest cannot pin children to it"
     elif expect_host and _norm_host(str(host)) != _norm_host(expect_host):
         status, detail = "fail", detail + f"; expected host {expect_host} (the capability contract's workspace)"
     elif not is_sp:
-        status, detail = "warn", detail + "; unattended sessions must not run as a human identity"
+        status, detail = "warn", detail + (
+            "; unattended sessions must not run as a human identity: provide "
+            "DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET (plus DATABRICKS_HOST) as named "
+            "secrets for the migration service principal, or record a waiver in 06_decisions.md"
+        )
     out.append(Check("databricks_identity", status, detail, data))
 
     rc, wh, err = _run([cli, "experimental", "aitools", "tools", "get-default-warehouse"], timeout=60)
@@ -820,13 +857,101 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
     return out
 
 
+def check_lakebase_branch_create(project: str, parent_branch: str) -> Check:
+    """Create and delete a short-lived branch to prove Lakebase project access."""
+    cli = shutil.which("databricks")
+    if not cli:
+        return Check("lakebase_branch_create", "unverified",
+                     "databricks CLI not on PATH; install databricks-core and databricks-lakebase")
+    branch = f"dbx-doctor-probe-{secrets.token_hex(4)}"
+    project_path = f"projects/{project}"
+    source = f"{project_path}/branches/{parent_branch}"
+    rc, out, err = _run(
+        [cli, "postgres", "create-branch", project_path, branch, "--json",
+         json.dumps({"spec": {"source_branch": source, "ttl": "3600s"}}), "--output", "json"],
+        timeout=300)
+    if rc != 0:
+        low = err.lower()
+        if "not authorized" in low:
+            detail = (f"migration principal is not authorized; grant the migration principal "
+                      f"Can Manage on Lakebase project {project}")
+        elif "expiration date cannot have child branches" in low:
+            detail = (f"parent branch {parent_branch} has an expiry; clear it "
+                      "(Lakebase project → branch → edit → remove expiration), TTLs belong on per-batch children")
+        else:
+            detail = _redact(err or out)
+        return Check("lakebase_branch_create", "fail", detail,
+                     {"project": project, "parent_branch": parent_branch})
+    delete_rc, delete_out, delete_err = _run(
+        [cli, "postgres", "delete-branch", f"{project_path}/branches/{branch}", "--purge"], timeout=300)
+    if delete_rc != 0:
+        return Check("lakebase_branch_create", "warn",
+                     f"branch {branch} was created but could not be deleted: "
+                     f"{_redact(delete_err or delete_out)}",
+                     {"project": project, "parent_branch": parent_branch, "branch": branch})
+    return Check("lakebase_branch_create", "ok", "branch created and deleted",
+                 {"project": project, "parent_branch": parent_branch, "branch": branch})
+
+
+def check_lakebase_target_grants(dsn_name: str, schema: str | None = None, connect=None) -> Check:
+    """Check CREATE on the configured Lakebase database or optional schema."""
+    if not os.environ.get(dsn_name):
+        return Check("lakebase_target_grants", "fail", f"secret {dsn_name} is not set in this shell")
+    if connect is None:
+        try:
+            import psycopg  # lazy: optional extra
+        except ImportError:
+            return Check("lakebase_target_grants", "fail",
+                         "psycopg is unavailable; install the postgres extra for data-reconciliation")
+        connect = lambda dsn: psycopg.connect(dsn)
+    conn = None
+    try:
+        conn = connect(os.environ[dsn_name])
+        cur = conn.cursor()
+        cur.execute("select current_user, current_database(), "
+                    "has_database_privilege(current_user, current_database(), 'CREATE')")
+        role, database, db_create = cur.fetchone()
+        schema_exists = False
+        schema_create = False
+        if schema:
+            cur.execute("select 1 from information_schema.schemata where schema_name=%s", (schema,))
+            schema_exists = cur.fetchone() is not None
+            if schema_exists:
+                cur.execute("select has_schema_privilege(current_user, %s, 'CREATE')", (schema,))
+                schema_create = bool(cur.fetchone()[0])
+        if schema and schema_exists:
+            if not schema_create:
+                return Check("lakebase_target_grants", "fail",
+                             f"missing required privilege: GRANT CREATE ON SCHEMA {schema} TO {role}",
+                             {"role": role, "database": database, "schema": schema})
+            return Check("lakebase_target_grants", "ok",
+                         f"role {role} can CREATE in schema {schema}",
+                         {"role": role, "database": database, "schema": schema})
+        if bool(db_create):
+            return Check("lakebase_target_grants", "ok",
+                         f"role {role} can CREATE in database {database}",
+                         {"role": role, "database": database, "schema": schema})
+        return Check("lakebase_target_grants", "fail",
+                     f"missing required privilege: GRANT CREATE ON DATABASE {database} TO {role}",
+                     {"role": role, "database": database, "schema": schema})
+    except Exception as e:  # noqa: BLE001 - driver-specific connection errors
+        return Check("lakebase_target_grants", "fail",
+                     f"connection to {dsn_name} failed ({type(e).__name__}); "
+                     "check the DSN secret and network path")
+    finally:
+        if conn is not None and hasattr(conn, "close"):
+            conn.close()
+
+
 # ------------------------------------------------------------------ main
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None,
         no_databricks: bool, units: list[str] | None = None, mappings: list[Path] | None = None,
         source_secret: str | None = None, params: dict[str, str] | None = None,
         expect_catalogs: list[str] | None = None, source_family: str | None = None,
-        expect_host: str | None = None) -> dict:
+        expect_host: str | None = None, lakebase_project: str | None = None,
+        lakebase_parent_branch: str | None = None, lakebase_dsn: str | None = None,
+        lakebase_schema: str | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root),
                            check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs)]
     checks += check_hooks(plugin_root, ws, probe_result)
@@ -841,6 +966,14 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
         checks += check_databricks(expect_identity, expect_host)
+    if lakebase_project or lakebase_parent_branch:
+        if not lakebase_project or not lakebase_parent_branch:
+            checks.append(Check("lakebase_branch_create", "fail",
+                                "--lakebase-project and --lakebase-parent-branch must be passed together"))
+        else:
+            checks.append(check_lakebase_branch_create(lakebase_project, lakebase_parent_branch))
+    if lakebase_dsn:
+        checks.append(check_lakebase_target_grants(lakebase_dsn, lakebase_schema))
     counts: dict[str, int] = {}
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
@@ -885,6 +1018,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
     p.add_argument("--source-family", choices=SOURCE_FAMILIES,
                    help="source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
+    p.add_argument("--lakebase-project", help="Lakebase project id for the branch-create preflight")
+    p.add_argument("--lakebase-parent-branch", help="Lakebase parent branch for the branch-create preflight")
+    p.add_argument("--lakebase-dsn", metavar="ENV_VAR_NAME",
+                   help="env var NAME holding the Lakebase DSN (value never printed)")
+    p.add_argument("--lakebase-schema", help="optional Lakebase schema to check for CREATE")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="mapping ${NAME} placeholder value, same rules and values as dbx-recon run --param")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
@@ -900,7 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
 
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
                  a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params,
-                 a.expect_catalogs, a.source_family, a.expect_host)
+                 a.expect_catalogs, a.source_family, a.expect_host, a.lakebase_project,
+                 a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
