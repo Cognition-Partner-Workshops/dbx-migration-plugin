@@ -351,9 +351,10 @@ class _Seg:
     scripts: list[str] = field(default_factory=list)   # files it executes
     ctx: str = ""                                      # text of the prefixes / wrapper (`ssh host`) it runs under
     at: str | None = ""                                # directory it runs in ('' the workspace root, None unresolvable)
+    alts: list[str] = field(default_factory=list)      # the directories it may run in when `at` is None because of `x || cd d`
     sub: int = 0                                       # how many `( )` subshells enclose it
     after: str = ""                                    # the operator before it (`&&`, `||`, `;`, ...; '' for the first command)
-    ends: str = ""                                     # the operator after it (`&`: it runs in the background, in a subshell)
+    bg: int = 0                                        # the `&`-terminated list it belongs to (runs in a subshell); 0 for none
 
     argv0 = property(lambda s: s.argv[0].rsplit("/", 1)[-1] if s.argv else "")
     heredocs = property(lambda s: [f for op, f in s.redirects() if op.endswith(("<<", "<<-"))])
@@ -377,20 +378,27 @@ def _commands(cmd: str) -> list[_Seg]:
     groups: list[tuple[int, list[_Seg]]] = []   # (index of the first member, stdin the group inherits)
     feed: list[_Seg] = []                        # what the next command's stdin receives
     closed: list[_Seg] = []                      # members of the group just closed
-    cur, i, sub, after = None, 0, 0, ""
+    lists: list[int] = [0]                       # index of the first member of the and/or list open at each group level
+    cur, i, sub, after, bgs = None, 0, 0, "", 0
     while i < len(toks):
         tok, n = toks[i], 1 + bool(_REDIRECT_OP.fullmatch(toks[i]))   # a redirection travels with its operand
         if n == 1 and tok == "\n" and cur is None and feed and not closed:
             pass                                        # a line break after `|` continues the pipeline
         elif n == 1 and tok in _SEPARATORS and (tok not in ("{", "}") or cur is None):
-            for c in closed or ([cur] if cur else []):
-                c.ends = c.ends or tok
+            if tok == "&":                              # `&` backgrounds the whole and/or list before it
+                bgs += 1
+                for c in out[lists[-1]:]:
+                    c.bg = c.bg or bgs
+            if tok in ("&", ";", "\n"):
+                lists[-1] = len(out)
             if tok in ("(", "{"):
                 groups.append((len(out), feed))
+                lists.append(len(out))
                 sub += tok == "("
             elif tok in (")", "}"):
                 start, feed = groups.pop() if groups else (0, [])
                 closed = out[start:]
+                lists = lists[:-1] or [0]
                 sub -= tok == ")" and sub > 0
             elif tok in ("|", "|&"):
                 producers = closed or ([cur] if cur else [])
@@ -528,12 +536,19 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
     env = dict(_ENV_DEFAULTS) if env is None else env
     out: list[_Seg] = []
     dirs: list[str | None] = []
-    scopes: list[tuple[str | None, list[str | None]]] = []   # (at, dirs) outside each open subshell
+    alts: list[str] = []                                      # the directories `at` may be when it is None after `x || cd d`
+    scopes: list[tuple[str | None, list[str], list[str | None]]] = []   # (at, alts, dirs) outside each open subshell
+    bg, saved = 0, (at, alts, dirs)                           # the background list being read and the state before it
+    before: list[str | None] = [at]                           # where the shell was before the previous command
     for seg in _commands(text):
+        if seg.bg != bg:                                      # a `&` list runs in a subshell: what it changes ends with it
+            if bg:
+                at, alts, dirs = saved
+            bg, saved = seg.bg, (at, list(alts), list(dirs))
         while len(scopes) < seg.sub:
-            scopes.append((at, list(dirs)))
+            scopes.append((at, list(alts), list(dirs)))
         while len(scopes) > seg.sub:
-            at, dirs = scopes.pop()
+            at, alts, dirs = scopes.pop()
         seg.words = [w if not env or "$" not in w or "$" not in re.sub(r"\\.|'[^']*'?", "", r) else
                      _SHELL_VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group()), w) for w, r in zip(seg.words, seg.raw)]
         seg.argv, seg.ctx = _program(aliases.get(seg.args[0] if seg.args else "", seg.args[:1]) + seg.args[1:], seg.assigns)
@@ -550,16 +565,22 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                 seg.stdin.extend(p.heredocs)
         seg.scripts = _scripts_of(seg, seg.argv + [w for op, f in seg.redirects() for w in (op, f)] if seg.ctx else None)
         seg.at = next((_join(at, a[4:]) for a in reversed(seg.assigns) if a.startswith("PWD=")), at)   # `env -C dir`: this command alone
-        if seg.argv0 in ("cd", "pushd", "popd") and seg.ends == "&":
-            pass   # a background command moves only its own subshell
-        elif seg.argv0 in ("cd", "pushd"):
+        seg.alts = list(alts)
+        now: list[str | None] = [at] if at is not None else alts
+        if seg.argv0 in ("cd", "pushd"):
             args = [w for w in seg.argv[1:] if not (w.startswith("-") and len(w) > 1)]
             dirs += [at] if seg.argv0 == "pushd" else []
-            at = None if seg.after == "||" else _join(at, args[0] if args else "~")   # `x || cd d`: whether it ran is unknown
+            # `x || cd d` runs only if `x` failed, leaving the shell where it was before `x`; whether it ran is unknown
+            moved = now + [_join(p, args[0] if args else "~") for p in before] if seg.after == "||" else \
+                [_join(p, args[0] if args else "~") for p in now]
+            moved = list(dict.fromkeys(moved))
+            at = moved[0] if len(moved) == 1 else None
+            alts = [] if at is not None else [p for p in moved if p is not None][:8]
         elif seg.argv0 == "popd":
-            at = dirs.pop() if dirs else None
+            at, alts = (dirs.pop() if dirs else None), []
         elif seg.argv0 == "alias":
             aliases.update((a.split("=", 1)[0], shlex.split(a.split("=", 1)[1])) for a in seg.argv[1:] if "=" in a)
+        before = now
         out.append(seg)
         if (nested := _shell_runs(seg)[0]) is not None and depth < 4:
             out.extend(_segments(nested, seg.ctx, depth + 1, env, seg.at))
@@ -1083,8 +1104,11 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
 
 def _run_dirs(cmd: str, start: str) -> list[Path | None]:
     """The distinct directories the command's simple commands run in, resolved from `start` and following `cd`/`pushd`/`popd`
-    with subshell scope; None for one the guard cannot resolve (`cd -`, a variable, a `cd` behind `||`)."""
-    dirs = [Path(s.at).resolve() if s.at else None if s.at is None else Path(start) for s in _segments(cmd, at=start)]
+    with subshell and background-list scope; None for one the guard cannot resolve (`cd -`, a variable), followed by the
+    directories it may be (`x || cd d`)."""
+    dirs: list[Path | None] = []
+    for s in _segments(cmd, at=start):
+        dirs += [Path(s.at).resolve() if s.at else None if s.at is None else Path(start)] + [Path(a).resolve() for a in s.alts]
     return list(dict.fromkeys(dirs))
 
 
