@@ -299,7 +299,7 @@ def test_lakebase_target_grants_redacts_connection_error(monkeypatch):
 
 def _analytical_cli(monkeypatch, *, schema_exists=True, owner="owner@example.com",
                     catalog_privileges=("USE_CATALOG",), schema_privileges=("USE_SCHEMA",),
-                    schema_error=""):
+                    schema_error="", catalog_owner=None, schema_grants_rc=0, schema_grants_err=""):
     monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
 
     def fake_run(cmd, timeout=0):
@@ -310,8 +310,12 @@ def _analytical_cli(monkeypatch, *, schema_exists=True, owner="owner@example.com
             if schema_exists:
                 return 0, json.dumps({"owner": owner}), ""
             return 1, "", schema_error or "SCHEMA_DOES_NOT_EXIST"
+        if operation == ("catalogs", "get"):
+            return 0, json.dumps({"owner": catalog_owner}), ""
         if operation == ("grants", "get-effective"):
             resource_type = cmd[3]
+            if resource_type == "schema" and schema_grants_rc:
+                return schema_grants_rc, "{}", schema_grants_err
             privileges = schema_privileges if resource_type == "schema" else catalog_privileges
             return 0, json.dumps({"privilege_assignments": [
                 {"principal": "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d",
@@ -331,6 +335,7 @@ def test_analytical_target_schema_absent_with_catalog_grants(monkeypatch):
         "schema": "tsql_demo.loan_servicing",
         "principal": "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d",
         "owner": None,
+        "catalog_owner": None,
         "exists": False,
         "missing": [],
     }
@@ -342,6 +347,30 @@ def test_analytical_target_schema_absent_missing_create_schema(monkeypatch):
     assert row.status == "fail"
     assert "GRANT CREATE SCHEMA ON CATALOG tsql_demo TO `2e90bc1d-e9a1-4703-8c48-ad28ebb1864d`" in row.detail
     assert "USE CATALOG" not in row.detail
+
+
+def test_analytical_target_schema_unreadable_returns_schema_grants(monkeypatch):
+    _analytical_cli(
+        monkeypatch,
+        schema_exists=False,
+        schema_error=("Error: User does not have USE SCHEMA on Schema 'tsql_demo.default'. "
+                      "Host: https://workspace.example Auth type: oauth Next steps: grant access"),
+        schema_grants_rc=1,
+        schema_grants_err="permission denied",
+        catalog_privileges=("USE_CATALOG",),
+    )
+    row = doctor.check_analytical_target_grants("tsql_demo.default")
+    assert row.status == "fail"
+    assert "GRANT USE SCHEMA, CREATE TABLE, MODIFY, SELECT ON SCHEMA tsql_demo.default TO `" in row.detail
+    assert "owner is unknown" in row.detail
+
+
+def test_analytical_target_schema_absent_catalog_owner_has_implicit_privileges(monkeypatch):
+    principal = "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d"
+    _analytical_cli(monkeypatch, schema_exists=False, catalog_privileges=(), catalog_owner=principal)
+    row = doctor.check_analytical_target_grants("tsql_demo.loan_servicing")
+    assert row.status == "ok"
+    assert row.data["catalog_owner"] == principal
 
 
 def test_analytical_target_schema_owned_by_principal(monkeypatch):

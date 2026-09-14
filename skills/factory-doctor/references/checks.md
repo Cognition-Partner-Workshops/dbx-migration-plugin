@@ -61,7 +61,8 @@ The optional Unity Catalog promotion-schema check is `ok` when the schema does n
 creates it owned by the migration principal) or when the principal owns it. If the schema exists
 under another owner and the principal lacks `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, `MODIFY`,
 or `SELECT`, the row is red and its `detail` contains the exact `GRANT` statement or statements
-to paste into the D10 request.
+to paste into the D10 request. An unreadable schema (no `USE SCHEMA`) is reported as the full
+schema grant with owner unknown.
 
 ### `source_principal_read_only`
 

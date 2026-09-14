@@ -975,51 +975,114 @@ def _effective_privileges(payload) -> set[str]:
     return found
 
 
+def _permission_error(text: str) -> bool:
+    low = text.lower()
+    return any(marker in low for marker in
+               ("does not have", "permission_denied", "permission denied", "insufficient", "unauthorized"))
+
+
+def _catalog_privileges(cli: str, catalog: str, principal: str) -> tuple[set[str] | None, str | None, str | None]:
+    """Return catalog privileges, owner, and a redacted error when both lookups fail."""
+    catalog_owner = None
+    rc, out, err = _run([cli, "catalogs", "get", catalog, "--output", "json"])
+    if rc == 0:
+        try:
+            catalog_owner = json.loads(out).get("owner")
+        except (TypeError, ValueError, AttributeError):
+            catalog_owner = None
+        if isinstance(catalog_owner, str) and catalog_owner.lower() == principal.lower():
+            return {"ALL_PRIVILEGES"}, catalog_owner, None
+
+    rc, out, err = _run([cli, "grants", "get-effective", "catalog", catalog,
+                         "--principal", principal, "--output", "json"])
+    if rc != 0:
+        return None, catalog_owner, _redact(err or out)
+    try:
+        return _effective_privileges(json.loads(out)), catalog_owner, None
+    except (TypeError, ValueError):
+        return None, catalog_owner, _redact(err or out)
+
+
 def check_analytical_target_grants(full_name: str) -> Check:
     """Check Unity Catalog privileges needed to create or write the promotion schema."""
     cid = "analytical_target_grants"
     if full_name.count(".") != 1 or any(not part for part in full_name.split(".")):
         return Check(cid, "fail", "expected CATALOG.SCHEMA",
-                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+                     {"schema": full_name, "principal": None, "owner": None, "catalog_owner": None,
+                      "exists": False, "missing": []})
     catalog, schema = full_name.split(".", 1)
     cli = shutil.which("databricks")
     if not cli:
         return Check(cid, "unverified",
                      "databricks CLI not on PATH; install databricks-core and databricks-unity-catalog",
-                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+                     {"schema": full_name, "principal": None, "owner": None, "catalog_owner": None,
+                      "exists": False, "missing": []})
 
     rc, out, err = _run([cli, "current-user", "me", "--output", "json"])
     if rc != 0:
         return Check(cid, "fail", _redact(err or out),
-                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+                     {"schema": full_name, "principal": None, "owner": None, "catalog_owner": None,
+                      "exists": False, "missing": []})
     try:
         current_user = json.loads(out)
         principal = current_user.get("applicationId") or current_user.get("userName")
     except (TypeError, ValueError, AttributeError):
         return Check(cid, "fail", _redact(err or out),
-                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+                     {"schema": full_name, "principal": None, "owner": None, "catalog_owner": None,
+                      "exists": False, "missing": []})
     if not isinstance(principal, str) or not principal:
         return Check(cid, "fail", "current-user response has no applicationId or userName",
-                     {"schema": full_name, "principal": None, "owner": None, "exists": False, "missing": []})
+                     {"schema": full_name, "principal": None, "owner": None, "catalog_owner": None,
+                      "exists": False, "missing": []})
 
-    base_data = {"schema": full_name, "principal": principal, "owner": None, "exists": False, "missing": []}
+    base_data = {"schema": full_name, "principal": principal, "owner": None, "catalog_owner": None,
+                 "exists": False, "missing": []}
     rc, out, err = _run([cli, "schemas", "get", full_name, "--output", "json"])
     if rc != 0:
         low = err.lower()
         absent = any(marker in low for marker in
                      ("not found", "does not exist", "not_found", "schema_does_not_exist"))
-        if not absent:
+        unreadable = _permission_error(err)
+        if not absent and not unreadable:
             return Check(cid, "fail", _redact(err or out), base_data)
-        rc, out, err = _run([cli, "grants", "get-effective", "catalog", catalog,
-                             "--principal", principal, "--output", "json"])
-        if rc != 0:
-            return Check(cid, "fail", _redact(err or out), base_data)
-        try:
-            privileges = _effective_privileges(json.loads(out))
-        except (TypeError, ValueError):
-            return Check(cid, "fail", _redact(err or out), base_data)
+        if unreadable:
+            base_data["exists"] = True
+            rc, out, err = _run([cli, "grants", "get-effective", "schema", full_name,
+                                 "--principal", principal, "--output", "json"])
+            if rc != 0 and (_permission_error(err) or out.strip() == "{}"):
+                schema_privileges = set()
+            elif rc != 0:
+                return Check(cid, "fail", _redact(err or out), base_data)
+            else:
+                try:
+                    schema_privileges = _effective_privileges(json.loads(out))
+                except (TypeError, ValueError):
+                    return Check(cid, "fail", _redact(err or out), base_data)
+        else:
+            schema_privileges = set()
+        privileges, catalog_owner, catalog_error = _catalog_privileges(cli, catalog, principal)
+        base_data["catalog_owner"] = catalog_owner
+        if catalog_error:
+            return Check(cid, "fail", catalog_error, base_data)
+        assert privileges is not None
         required = [("USE_CATALOG", "USE CATALOG"), ("CREATE_SCHEMA", "CREATE SCHEMA")]
         missing = [name for name, _ in required if "ALL_PRIVILEGES" not in privileges and name not in privileges]
+        if unreadable:
+            schema_required = [("USE_SCHEMA", "USE SCHEMA"), ("CREATE_TABLE", "CREATE TABLE"),
+                               ("MODIFY", "MODIFY"), ("SELECT", "SELECT")]
+            missing_schema = [name for name, _ in schema_required
+                              if "ALL_PRIVILEGES" not in schema_privileges and name not in schema_privileges]
+            missing = ([name for name, _ in [("USE_CATALOG", "USE CATALOG")]
+                        if "ALL_PRIVILEGES" not in privileges and name not in privileges] + missing_schema)
+            base_data["missing"] = missing
+            statements = []
+            if "USE_CATALOG" in missing:
+                statements.append(f"GRANT USE CATALOG ON CATALOG {catalog} TO `{principal}`")
+            display = ", ".join(label for name, label in schema_required if name in missing_schema)
+            statements.append(f"GRANT {display} ON SCHEMA {full_name} TO `{principal}`")
+            return Check(cid, "fail",
+                         f"missing required privileges: {'; '.join(statements)}; owner is unknown",
+                         base_data)
         base_data["missing"] = missing
         if missing:
             display = ", ".join(label for name, label in required if name in missing)
@@ -1045,19 +1108,20 @@ def check_analytical_target_grants(full_name: str) -> Check:
     rc, out, err = _run([cli, "grants", "get-effective", "schema", full_name,
                          "--principal", principal, "--output", "json"])
     if rc != 0:
-        return Check(cid, "fail", _redact(err or out), base_data)
-    try:
-        schema_privileges = _effective_privileges(json.loads(out))
-    except (TypeError, ValueError):
-        return Check(cid, "fail", _redact(err or out), base_data)
-    rc, out, err = _run([cli, "grants", "get-effective", "catalog", catalog,
-                         "--principal", principal, "--output", "json"])
-    if rc != 0:
-        return Check(cid, "fail", _redact(err or out), base_data)
-    try:
-        catalog_privileges = _effective_privileges(json.loads(out))
-    except (TypeError, ValueError):
-        return Check(cid, "fail", _redact(err or out), base_data)
+        if _permission_error(err) or out.strip() == "{}":
+            schema_privileges = set()
+        else:
+            return Check(cid, "fail", _redact(err or out), base_data)
+    else:
+        try:
+            schema_privileges = _effective_privileges(json.loads(out))
+        except (TypeError, ValueError):
+            return Check(cid, "fail", _redact(err or out), base_data)
+    catalog_privileges, catalog_owner, catalog_error = _catalog_privileges(cli, catalog, principal)
+    base_data["catalog_owner"] = catalog_owner
+    if catalog_error:
+        return Check(cid, "fail", catalog_error, base_data)
+    assert catalog_privileges is not None
 
     schema_required = [("USE_SCHEMA", "USE SCHEMA"), ("CREATE_TABLE", "CREATE TABLE"),
                        ("MODIFY", "MODIFY"), ("SELECT", "SELECT")]
