@@ -471,14 +471,28 @@ def _workspace(path: Path, catalogs: list[str]) -> Path:
     return path
 
 
-def test_cd_targets_are_resolved():
-    assert g._cd_targets("cd ../b && databricks x") == ["../b"]
-    assert g._cd_targets("pushd /tmp/w; git status; cd sub") == ["/tmp/w", "sub"]
-    assert g._cd_targets("cd -P '/tmp/w x'") == ["/tmp/w x"]
-    assert g._cd_targets("cd \"$(mktemp -d)\" && ls") == [None]
-    assert g._cd_targets("cd - && ls") == [None]
-    assert g._cd_targets("git status && echo cd") == []
-    assert g._cd_targets("cd $HOME/x") == [os.path.expandvars("$HOME/x")]
+def test_run_dirs_follow_cd_with_shell_scope():
+    P = Path
+    assert g._run_dirs("cd ../b && databricks x", "/w/a") == [P("/w/a"), P("/w/b")]
+    assert g._run_dirs("pushd /tmp/w; git status; cd sub; popd; ls", "/w") == [P("/w"), P("/tmp/w"), P("/tmp/w/sub")]
+    assert g._run_dirs("cd -P '/tmp/w x' && ls", "/w") == [P("/w"), P("/tmp/w x")]
+    assert g._run_dirs("cd \"$(mktemp -d)\" && ls", "/w") == [P("/w"), None]
+    assert g._run_dirs("cd - && ls", "/w") == [P("/w"), None]
+    assert g._run_dirs("git status && echo cd", "/w") == [P("/w")]
+    # a subshell's cd ends with the subshell; a background cd never reaches the parent
+    assert g._run_dirs("(cd /tmp); cd repo && sqlcmd -Q x", "/home/lead") == [P("/home/lead"), P("/home/lead/repo")]
+    assert g._run_dirs("(cd /tmp && ls) && ls", "/home/lead") == [P("/home/lead"), P("/tmp")]
+    assert g._run_dirs("cd /tmp & ls", "/home/lead") == [P("/home/lead")]
+    # whether a `cd` behind `||` ran is unknown
+    assert g._run_dirs("cd a || cd b; ls", "/w") == [P("/w"), P("/w/a"), None]
+
+
+def test_subshell_cd_does_not_hide_the_workspace(tmp_path: Path):
+    ws = _workspace(tmp_path / "repo", ["mig_cat"])
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]}))
+    root, cfg = g._workspace_from_cd(f"(cd /tmp); cd repo && {LEGACY_DELETE}", str(tmp_path))
+    assert root == ws and cfg is not None
+    assert g.evaluate_with_workdirs(f"(cd /tmp); cd repo && {LEGACY_DELETE}", cfg, ws, str(tmp_path)).decision == "block"
 
 
 def test_cd_into_another_workspace_applies_its_allowlist_too(tmp_path: Path):
