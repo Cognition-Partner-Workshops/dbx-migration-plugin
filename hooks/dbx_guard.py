@@ -128,7 +128,7 @@ _MIGRATION_PATH = re.compile(r"[^\s'\"()]*\.migration(?:/[^\s'\"()]*)?")
 _DECISION_ROW = re.compile(r"(?m)^\s*(?:\|\s*|#{1,6}\s*)?(D-[A-Za-z0-9][\w.-]*)\b")
 _DECISION_ID = re.compile(r"D-[A-Za-z0-9][\w.-]*")
 _WRITE_OBJECT = re.compile(
-    r"(?is)^\s*(?:DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|UPDATE|TRUNCATE(?:\s+TABLE)?|"
+    r"(?is)^\s*(?:DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|UPDATE(?:\s+TOP\s*\([^)]*\)(?:\s+PERCENT)?|\s+STATISTICS|\s+(?:ONLY|LOW_PRIORITY|IGNORE))*|TRUNCATE(?:\s+TABLE)?|"
     r"DROP\s+\w+(?:\s+IF\s+EXISTS)?|CREATE(?:\s+OR\s+REPLACE)?\s+(?:\w+\s+)*?"
     r"(?:TABLE|VIEW|INDEX|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
     r"ALTER\s+\w+|GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)"

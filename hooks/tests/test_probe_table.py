@@ -167,7 +167,7 @@ FILES2 = {
     "fix.sh": "cat /etc/hosts\n",
     "q.sql": "SELECT 1;\n",
     "capture_baseline.py": "import boto3\ns3 = boto3.client(\"s3\")\nprint(s3.list_buckets())\n",
-    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n",
+    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n| D-11 | 2026-01-05 | legacy_write_authorized: approved modifiers TOP and STATISTICS |\n",
     "d.patch": "--- a/.migration/allowed_targets.json\n+++ b/.migration/allowed_targets.json\n",
     "ok.patch": "--- a/notes.md\n+++ b/notes.md\n",
 }
@@ -700,6 +700,11 @@ PROBES2 = [
     ("R4 legacy write flag form is rejected", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD x INT' --decision D-7", "block"),
     ("R4 decision token inside SQL text is not a prefix", "sqlcmd -S tdprod.corp -Q 'DBX_DECISION=D-7 ALTER TABLE dbo.orders ADD x INT'", "block"),
     ("R4 decision token in SQL comment is not a prefix", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD x INT -- DBX_DECISION=D-7'", "block"),
+    ("R4 UPDATE TOP modifier row does not authorize TOP as object", "DBX_DECISION=D-11 sqlcmd -S tdprod.corp -Q 'UPDATE TOP (1) dbo.customers SET status=0'", "block"),
+    ("R4 UPDATE TOP modifier captures dbo.orders", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'UPDATE TOP (1) dbo.orders SET x=1'", "approve"),
+    ("R4 UPDATE STATISTICS modifier row does not authorize STATISTICS as object", "DBX_DECISION=D-11 sqlcmd -S tdprod.corp -Q 'UPDATE STATISTICS dbo.customers'", "block"),
+    ("R4 UPDATE STATISTICS modifier captures dbo.orders", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'UPDATE STATISTICS dbo.orders'", "approve"),
+    ("R4 DELETE TOP remains fail-closed without an object match", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'DELETE TOP (10) FROM dbo.orders'", "block"),
 ]
 
 
