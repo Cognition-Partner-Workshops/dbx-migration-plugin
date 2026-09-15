@@ -1448,6 +1448,7 @@ def test_wave_flag_writes_a_signed_record_beside_the_manifest(tmp_path):
     assert record["manifest_sha"] == doctor.manifest_sha(manifest_bytes)
     assert doctor.datetime.datetime.fromisoformat(record["signed_at"]).tzinfo is not None
     assert record["hook_probe"] == hook_probe
+    assert record["source"] == json.loads(manifest.read_text())["source"]
     assert doctor.wave_signature(record, manifest_bytes) == record["signature"]
     changed = {**record, "hook_probe": "unknown" if hook_probe != "unknown" else "not-blocked"}
     assert doctor.wave_signature(changed, manifest_bytes) != record["signature"]
@@ -1463,6 +1464,24 @@ def test_wave_flag_writes_a_signed_record_beside_the_manifest(tmp_path):
         capture_output=True, text=True, check=False,
     )
     assert json.loads(default_manifest.with_suffix(".doctor.json").read_text())["hook_probe"] == "unknown"
+
+
+def test_wave_rejects_explicit_source_settings(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({
+        "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
+        "source": {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
+    }))
+    result = subprocess.run(
+        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+         "--source-secret", "OTHER", "--wave", str(manifest)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 2
+    assert "--wave takes source settings from the manifest" in result.stderr
+    assert not manifest.with_suffix(".doctor.json").exists()
 
 
 def test_wave_signature_binds_the_manifest_bytes_and_identity():

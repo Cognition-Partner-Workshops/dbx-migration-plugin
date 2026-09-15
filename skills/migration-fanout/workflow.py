@@ -98,7 +98,7 @@ if RUN_ID is not None and (not isinstance(RUN_ID, str) or not RUN_ID.strip()):
     raise SystemExit(f"{POINTER_PATH} run_id must be the run_workflow run_id string or null")
 if RUN_ID is not None and MODE != "resume":
     raise SystemExit(f"{POINTER_PATH} run_id must be null unless mode is resume: run_workflow reports the run_id only once a fresh run starts; "
-                     f"record it in {MANIFEST_PATH.with_suffix('.run_id').name} afterwards")
+                     "record it in <manifest>.run_id afterwards")
 HOOK_PROBE_RESULT = POINTER.get("hook_probe")
 if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE_RESULT):
     raise SystemExit(f"{POINTER_PATH} hook_probe must be blocked:<nonce>, not-blocked or unknown (the probe run in the "
@@ -292,6 +292,9 @@ def validate_manifest(m, doctor=None):
         if got != want:
             raise SystemExit(f"manifest 'capabilities.{key}' is {got!r} but the doctor recorded {want!r} in "
                              "09_capabilities.json; copy the doctor's values, never edit them")
+    if doctor.get("source") != m.get("source"):
+        raise SystemExit("manifest 'source' differs from the source the doctor was signed for; "
+                         "re-run the doctor with --wave on this manifest")
 
 
 def wave_signature(body, manifest_bytes):

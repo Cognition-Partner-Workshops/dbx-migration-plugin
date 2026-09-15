@@ -1323,13 +1323,11 @@ def main(argv: list[str] | None = None) -> int:
             catalogs = caps.get("catalogs")
             a.expect_catalogs = catalogs if isinstance(catalogs, list) else None
         source = manifest.get("source")
-        if isinstance(source, dict):
-            if a.source_family is None:
-                a.source_family = source.get("family")
-            if a.source_secret is None:
-                a.source_secret = source.get("secret")
-            if not a.param:
-                a.param = [f"{k}={v}" for k, v in (source.get("params") or {}).items()]
+        if a.source_family is not None or a.source_secret is not None or a.param:
+            p.error("--wave takes source settings from the manifest; drop --source-family/--source-secret/--param")
+        a.source_family = source.get("family") if isinstance(source, dict) else None
+        a.source_secret = source.get("secret") if isinstance(source, dict) else None
+        a.param = [f"{k}={v}" for k, v in (source.get("params") or {}).items()] if isinstance(source, dict) else []
 
     params = None
     if a.param:
@@ -1354,7 +1352,8 @@ def main(argv: list[str] | None = None) -> int:
           + (f"  -> {out}" if str(out) != "-" else ""))
     if a.wave:
         a.wave.with_suffix(".doctor.json").write_text(json.dumps(
-            sign_wave_report({**report, "hook_probe": a.hook_probe_result}, manifest_bytes),
+            sign_wave_report({**report, "hook_probe": a.hook_probe_result, "source": manifest.get("source")},
+                             manifest_bytes),
             indent=2, sort_keys=True) + "\n")
     return 0 if report["ready"] else 1
 

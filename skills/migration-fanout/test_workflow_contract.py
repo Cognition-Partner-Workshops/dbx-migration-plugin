@@ -12,10 +12,11 @@ DOCTOR = Path(__file__).parents[1] / "factory-doctor" / "doctor.py"
 
 def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
-               doctor_hook_probe=None):
+               doctor_hook_probe=None, doctor_source=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
+    source = {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}}
     manifest = {
         "wave": 0,
         "width": 1,
@@ -23,6 +24,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         "child_macro": "child",
         "verify_macro": "verify",
         "base_branch": "migration/x",
+        "source": source,
         "capabilities": {
             "identity": "sp-1",
             "host": "https://adb-1.azuredatabricks.net",
@@ -39,6 +41,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     manifest_path.write_text(json.dumps(manifest))
     manifest_bytes = manifest_path.read_bytes()
     doctor_hook_probe = hook_probe if doctor_hook_probe is None else doctor_hook_probe
+    doctor_source = source if doctor_source is None else doctor_source
     if doctor:
         sys.path.insert(0, str(DOCTOR.parent))
         import doctor as doctor_module
@@ -55,6 +58,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                 {"id": "stop_mode", "status": "ok", "data": {"stop_mode": "soft"}},
             ],
             "hook_probe": doctor_hook_probe,
+            "source": doctor_source,
         }
         signed_at = None
         if tamper == "stale":
@@ -143,6 +147,8 @@ def test_start_launches_children_and_writes_the_result(tmp_path):
     ws2, cwd2 = _workspace(tmp_path / "second", run_id="wfr-x")
     proc2, calls2 = _run(cwd2, tmp_path / "second", [_pass_report()])
     assert proc2.returncode != 0
+    assert "Traceback" not in proc2.stderr
+    assert "run_id must be null unless mode is resume" in proc2.stderr
     assert not [c for c in calls2 if c["kind"] == "agent"]
     assert not (ws2 / ".migration/waves/wave-0.run_id").exists()
 
@@ -154,11 +160,13 @@ def test_pointer_above_the_cwd_names_the_workspace(tmp_path):
     assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
 
 
-@pytest.mark.parametrize("tamper", ["missing", "not_ready", "wrong_sha", "stale", "signature", "hook_probe"])
+@pytest.mark.parametrize("tamper", ["missing", "not_ready", "wrong_sha", "stale", "signature", "hook_probe", "source"])
 def test_invalid_doctor_record_launches_nothing(tmp_path, tamper):
     kwargs = {"tamper": tamper}
     if tamper == "hook_probe":
         kwargs.update(hook_probe="not-blocked", doctor_hook_probe="unknown")
+    if tamper == "source":
+        kwargs["doctor_source"] = {"family": "sqlserver", "secret": "OTHER_DSN", "params": {"db": "loans"}}
     ws, cwd = _workspace(tmp_path, **kwargs)
     proc, calls = _run(cwd, tmp_path, [_pass_report()])
     assert proc.returncode != 0

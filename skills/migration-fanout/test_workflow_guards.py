@@ -528,6 +528,9 @@ def test_validate_manifest_compares_the_contract_with_the_doctor_record():
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "ready": False})
     with pytest.raises(SystemExit, match="09_capabilities.json"):
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "identity": None})
+    source = {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}}
+    with pytest.raises(SystemExit, match="manifest 'source' differs"):
+        validate_manifest(_manifest(source=source), {**DOCTOR, "source": {**source, "secret": "OTHER_DSN"}})
 
 
 def test_workflow_launches_from_the_signed_doctor_record_not_the_editable_one():
