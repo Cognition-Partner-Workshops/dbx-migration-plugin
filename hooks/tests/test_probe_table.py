@@ -164,6 +164,9 @@ ALLOWLIST2 = {
 FILES2 = {
     "w.sql": "INSERT INTO prod.s.t SELECT 1;\n",
     "r.sql": "SELECT 1;\n",
+    "fix.sh": "cat /etc/hosts\n",
+    "q.sql": "SELECT 1;\n",
+    "capture_baseline.py": "import boto3\ns3 = boto3.client(\"s3\")\nprint(s3.list_buckets())\n",
     "d.patch": "--- a/.migration/allowed_targets.json\n+++ b/.migration/allowed_targets.json\n",
     "ok.patch": "--- a/notes.md\n+++ b/notes.md\n",
 }
@@ -590,11 +593,57 @@ PROBES2 = [
     ("sqlcmd stdin from cat read (approve)", "cat r.sql | sqlcmd -S sqlserver-demo", "approve"),
     ("sqlcmd stdin /dev/stdin nesting", "sqlcmd -S sqlserver-demo -i /dev/stdin < w.sql", "block"),
     ("tee into legacy client", "cat w.sql | tee log.txt | sqlcmd -S sqlserver-demo", "block"),
+    # --- remote execution wrappers
+    ("R3 ssh legacy host read payload", "ssh tdprod.corp 'cat /etc/hosts'", "approve"),
+    ("R3 ssh legacy host write payload", "ssh tdprod.corp 'sqlcmd -Q \"DELETE FROM dbo.t\"'", "block"),
+    ("R3 ssh legacy host remote script unreadable", "ssh tdprod.corp 'bash fix.sh'", "block"),
+    ("R3 ssh legacy host remote sql file unreadable", "ssh tdprod.corp 'psql -f q.sql'", "block"),
+    ("R3 ssh legacy host no payload", "ssh tdprod.corp", "block"),
+    ("R3 ssh legacy host variable payload", "ssh tdprod.corp \"$CMD\"", "block"),
+    ("R3 ssh non-legacy host remote script", "ssh buildbox 'bash fix.sh'", "approve"),
+    ("R3 ssh non-legacy host read", "ssh buildbox 'cat /etc/hosts'", "approve"),
+    ("R3 kubectl exec legacy pod read", "kubectl exec tdprod.corp -- cat /etc/hosts", "approve"),
+    ("R3 kubectl exec legacy pod write", "kubectl exec tdprod.corp -- sqlcmd -Q 'DELETE FROM dbo.t'", "block"),
+    ("R3 kubectl exec legacy pod remote script", "kubectl exec tdprod.corp -- bash fix.sh", "block"),
+    ("R3 kubectl exec non-legacy pod remote script", "kubectl exec app-pod -- bash fix.sh", "approve"),
+    ("R3 docker exec legacy container read", "docker exec sqlserver-demo cat /etc/hosts", "approve"),
+    ("R3 docker exec legacy container write", "docker exec sqlserver-demo sqlcmd -Q 'DELETE FROM dbo.t'", "block"),
+    ("R3 docker exec legacy container remote script", "docker exec sqlserver-demo bash fix.sh", "block"),
+    ("R3 docker exec non-legacy container remote script", "docker exec app bash fix.sh", "approve"),
+    ("R3 aws ssm legacy read", "aws ssm send-command --instance-ids tdprod.corp --document-name AWS-RunShellScript --parameters 'commands=[\"cat /etc/hosts\"]'", "approve"),
+    ("R3 aws ssm legacy sql read", "aws ssm send-command --instance-ids tdprod.corp --document-name AWS-RunShellScript --parameters 'commands=[\"sqlcmd -Q \\\"SELECT 1\\\"\"]'", "approve"),
+    ("R3 aws ssm legacy write", "aws ssm send-command --instance-ids tdprod.corp --document-name AWS-RunShellScript --parameters 'commands=[\"sqlcmd -Q \\\"DELETE FROM dbo.t\\\"\"]'", "block"),
+    ("R3 aws ssm legacy json parameters write", "aws ssm send-command --targets Key=tag:Name,Values=tdprod.corp --parameters '{\"commands\":[\"sqlcmd -Q \\\"DELETE FROM dbo.t\\\"\"]}'", "block"),
+    ("R3 aws ssm legacy remote script", "aws ssm send-command --instance-ids tdprod.corp --parameters 'commands=[\"bash /opt/fix.sh\"]'", "block"),
+    ("R3 aws ssm legacy parameters from file", "aws ssm send-command --instance-ids tdprod.corp --parameters file://params.json", "block"),
+    ("R3 aws ssm non-legacy read", "aws ssm send-command --instance-ids i-0abc --parameters 'commands=[\"cat /etc/hosts\"]'", "approve"),
+    ("R3 aws ssm non-legacy client write", "aws ssm send-command --instance-ids i-0abc --parameters 'commands=[\"sqlcmd -S other -Q \\\"DELETE FROM dbo.t\\\"\"]'", "block"),
+    ("R3 az run-command legacy read", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'cat /etc/hosts'", "approve"),
+    ("R3 az run-command legacy write", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'sqlcmd -Q \"DELETE FROM dbo.t\"'", "block"),
+    ("R3 az run-command legacy remote script", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'bash /opt/fix.sh'", "block"),
+    ("R3 az run-command legacy scripts from file", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts @fix.sh", "block"),
+    ("R3 az run-command non-legacy read", "az vm run-command invoke -g rg -n web01 --command-id RunShellScript --scripts 'cat /etc/hosts'", "approve"),
+    # --- shell loops and reserved words
+    ("R3 for loop read over .migration waves", "for f in .migration/waves/*.json; do cat \"$f\"; done", "approve"),
+    ("R3 for loop read over .migration units", "for f in .migration/units/*/tolerances.json; do cat \"$f\"; done", "approve"),
+    ("R3 for loop jq read over .migration units", "for u in .migration/units/*; do jq .id \"$u/mapping_spec.json\"; done", "approve"),
+    ("R3 for loop redirect write into .migration units", "for f in .migration/units/*/tolerances.json; do echo x > \"$f\"; done", "block"),
+    ("R3 for loop sed -i over .migration units", "for f in .migration/units/*/tolerances.json; do sed -i 's/a/b/' \"$f\"; done", "block"),
+    ("R3 for loop mv over .migration units", "for f in .migration/units/*/tolerances.json; do mv \"$f\" \"$f.bak\"; done", "block"),
+    ("R3 for loop rm over .migration units", "for f in .migration/units/*/tolerances.json; do rm \"$f\"; done", "block"),
+    ("R3 for loop tee into .migration units", "for f in .migration/units/*/tolerances.json; do echo x | tee \"$f\"; done", "block"),
+    ("R3 for loop rm over .migration ledger glob", "for f in .migration/0*.md; do rm \"$f\"; done", "block"),
+    ("R3 for loop over non-migration paths writes", "for f in build/*.json; do rm \"$f\"; done", "approve"),
+    ("R3 while loop body write into .migration", "while true; do rm .migration/units/x; done", "block"),
+    ("R3 if-then body write into .migration", "if true; then rm .migration/units/x; fi", "block"),
+    ("R3 for loop over legacy hosts read", "for h in tdprod.corp; do psql -h $h -c 'SELECT 1'; done", "approve"),
+    ("R3 for loop over legacy hosts write", "for h in tdprod.corp; do psql -h $h -c 'DROP TABLE t'; done", "block"),
 ]
 
 
 def _make_ws(tmp_path_factory, name: str, allowlist: dict, files: dict) -> Path:
-    ws = tmp_path_factory.mktemp(name)
+    ws = tmp_path_factory.mktemp(name) if hasattr(tmp_path_factory, "mktemp") else tmp_path_factory / name
+    ws.mkdir(parents=True, exist_ok=True)
     (ws / ".migration").mkdir()
     (ws / ".migration" / "allowed_targets.json").write_text(json.dumps(allowlist))
     for fname, body in files.items():
@@ -612,14 +661,16 @@ def workspace2(tmp_path_factory) -> Path:
     return _make_ws(tmp_path_factory, "probe2_ws", ALLOWLIST2, FILES2)
 
 
-def run_hook(command: str, ws: Path) -> subprocess.CompletedProcess:
+def run_hook(command: str, ws: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     event = {"tool_name": "exec", "tool_input": {"command": command}}
+    hook_env = {"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(ws)}
+    hook_env.update(env or {})
     return subprocess.run([sys.executable, str(GUARD)], input=json.dumps(event), text=True, capture_output=True, check=False,
-                          cwd=ws, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(ws)})
+                          cwd=ws, env=hook_env)
 
 
-def decide(command: str, ws: Path) -> tuple[str, str]:
-    r = run_hook(command, ws)
+def decide(command: str, ws: Path, env: dict[str, str] | None = None) -> tuple[str, str]:
+    r = run_hook(command, ws, env)
     out = json.loads(r.stdout) if r.stdout.strip() else {}
     if r.returncode == 2:
         assert out.get("decision") == "block", r.stdout
@@ -649,6 +700,52 @@ def test_table_covers_every_probe():
     assert len(PROBES) == 108
     assert sum(1 for p in PROBES if _row(p)[2] == "approve") == 21
     assert len({p[0] for p in PROBES2}) == len(PROBES2)
+
+
+@pytest.mark.parametrize("endpoints,command,env,expected,needle", [
+    (["AWS_ENDPOINT_URL"], "python3 capture_baseline.py", {}, "block", "AWS_ENDPOINT_URL"),
+    (["AWS_ENDPOINT_URL"], "python3 capture_baseline.py", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "approve", ""),
+    (["AWS_ENDPOINT_URL"], "aws s3 ls", {}, "block", "AWS_ENDPOINT_URL"),
+    (["AWS_ENDPOINT_URL"], "aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "approve", ""),
+    (["AWS_ENDPOINT_URL"], "python3 -c \"import boto3; boto3.client('s3').list_buckets()\"", {}, "block", "AWS_ENDPOINT_URL"),
+    (["AWS_ENDPOINT_URL"], "aws s3 cp x s3://bucket/x", {}, "block", "AWS_ENDPOINT_URL"),
+    (["AWS_ENDPOINT_URL"], "aws s3 ls", {}, "approve", ""),
+    (["AZURE_STORAGE_CONNECTION_STRING"], "aws s3 ls", {}, "approve", ""),
+    (["AZURE_STORAGE_CONNECTION_STRING"], "az storage blob list", {}, "block", "AZURE_STORAGE_CONNECTION_STRING"),
+    (["STORAGE_EMULATOR_HOST"], "gsutil ls gs://b", {}, "block", "STORAGE_EMULATOR_HOST"),
+    (["STORAGE_EMULATOR_HOST"], "aws s3 ls", {}, "approve", ""),
+])
+def test_fixture_cloud_escape(tmp_path: Path, endpoints, command, env, expected, needle):
+    allowlist = {**ALLOWLIST2, "run_mode": "fixture", "fixture_endpoints": endpoints}
+    if endpoints == ["AWS_ENDPOINT_URL"] and command == "aws s3 ls" and not env and expected == "approve":
+        allowlist.pop("run_mode")
+    ws = _make_ws(tmp_path, "fixture_ws", allowlist, FILES2)
+    decision, reason = decide(command, ws, env)
+    assert decision == expected, (command, decision, reason)
+    if needle:
+        assert needle in reason
+
+
+@pytest.mark.parametrize("body,needle", [
+    ({**ALLOWLIST2, "run_mode": "dev"}, "run_mode"),
+    ({**ALLOWLIST2, "fixture_endpoints": ["MY_VAR"]}, "fixture_endpoints"),
+])
+def test_invalid_fixture_manifest_fails_closed(tmp_path: Path, body, needle):
+    ws = _make_ws(tmp_path, "invalid_fixture_ws", body, FILES2)
+    decision, reason = decide("aws s3 ls", ws)
+    assert decision == "block" and needle in reason
+
+
+def test_fixture_cloud_reason_never_contains_endpoint_value(tmp_path: Path):
+    ws = _make_ws(tmp_path, "fixture_secret_ws", {
+        **ALLOWLIST2, "run_mode": "fixture",
+        "fixture_endpoints": ["AWS_ENDPOINT_URL", "AZURE_STORAGE_CONNECTION_STRING"],
+    }, FILES2)
+    value = "distinctive-endpoint-value"
+    result = run_hook("aws s3 ls; az storage blob list", ws, {"AWS_ENDPOINT_URL": value})
+    assert result.returncode == 2
+    assert value not in result.stdout + result.stderr
+    assert "AZURE_STORAGE_CONNECTION_STRING" in result.stdout
 
 
 # ---------------------------------------------------------------- the allowlist file itself

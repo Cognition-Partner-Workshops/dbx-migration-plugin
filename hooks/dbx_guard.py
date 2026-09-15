@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""PreToolUse guard for the DBX migration factory: recognise the client, allow known-read shapes, block the rest.
+"""PreToolUse guard for the DBX migration factory: recognise command and file-edit events, allow known-read shapes, block the rest.
 
-Reads a PreToolUse event ({"tool_input": {"command"}, "cwd"}), loads the nearest `.migration/allowed_targets.json` (`catalogs`
+Reads a PreToolUse event ({"tool_name": "exec", "tool_input": {"command"}, "cwd"}) or
+({"tool_name": "edit|write|MultiEdit", "tool_input": {"file_path", ...}, "cwd"}), loads the nearest `.migration/allowed_targets.json` (`catalogs`
 required; `legacy_sources`, `guard_mode` block|warn, `target_hosts`, `bundle_targets`, `forbidden_bundle_targets`; hosts and
 bundle targets fail closed when empty; Lakebase writes use allowlisted projects and branches and never target `production`) and judges every
 simple command by its program: Databricks clients pass `_DBX_READ`
@@ -11,7 +12,8 @@ client elsewhere writes when every host candidate is in `target_hosts` and the w
 Nothing writes `.migration/` or the running guard's tree (git there is the `_git_reads` allowlist). Scripts and SQL files are
 read in the command's effective directory (event cwd, cd / pushd / env -C / git -C); what the guard cannot read blocks where a
 client is involved. No `.migration/` up the tree approves everything, one without a readable allowlist blocks everything, the
-workspace is also found through a leading `cd`/`pushd` in the command, and the doctor's `__dbx_guard_probe__<nonce>` always
+ workspace is also found through a leading `cd`/`pushd` in the command, file edits protect `.migration/` except recon, waves and
+ added decision rows, and the doctor's `__dbx_guard_probe__<nonce>` always
 blocks. `hooks/tests/test_probe_table.py` pins this policy; add a row first.
 """
 from __future__ import annotations
@@ -78,7 +80,7 @@ _FIXERS = ("ruff", "black", "isort", "autopep8", "yapf", "autoflake")   # rewrit
 _DBT_RUNS = ("run", "build", "seed", "snapshot", "run-operation")
 # programs the guard has a rule for; any other head in front of a client word is an unmodelled wrapper
 _KNOWN = frozenset((*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC, *_REST_CLIENTS, *_SHELLS, *_DECLARERS, *_FIXERS, "dbt", "eval", "source",
-                    ".", "docker", "podman", "nerdctl", "kubectl", "perl", "ruby", "node", "java", "patch", "xargs"))
+                    ".", "docker", "podman", "nerdctl", "kubectl", "perl", "ruby", "node", "java", "patch", "xargs", "for", "select"))
 # modelled prefixes and their value-taking options; ssh / docker exec|run / kubectl exec also consume the host or container word
 _PREFIX_VALUE_FLAGS = {
     "sudo": ("-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D", "-T"), "doas": ("-u", "-C"), "nohup": (),
@@ -89,6 +91,7 @@ _PREFIX_VALUE_FLAGS = {
     "docker": ("-e", "--env", "-u", "--user", "-w", "--workdir", "--name", "-v", "--volume", "-p", "--publish", "--network",
                "--entrypoint", "--platform"), "kubectl": ("-c", "--container", "-n", "--namespace"),
 }
+_RESERVED_PREFIXES = frozenset(("do", "then", "else", "elif", "if", "while", "until", "!", "time"))
 _ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
 _ENV_DEFAULTS = {"HOME": "~", "TMPDIR": "/tmp"}
 _SHELL_VAR = re.compile(r"\$\{(\w+)\}|\$(\w+)")
@@ -97,7 +100,8 @@ _READERS = frozenset(("cat", "less", "more", "head", "tail", "grep", "rg", "egre
                       "file", "jq", "yq", "md5sum", "sha1sum", "sha256sum", "sort", "uniq", "cut", "tr", "awk", "gawk", "mawk", "sed",
                       "tree", "du", "echo", "printf", "test", "[", "[[", "cd", "pushd", "popd", "dirname", "basename", "realpath",
                       "readlink", "which", "type", "find", "tar", "unzip", "column", "nl", "od", "xxd", "strings", "pytest", "ruff",
-                      "true", "false", "sleep", "date", "env", "printenv", "set", "export", "unset", "dbx-recon", "databricks"))
+                      "true", "false", "sleep", "date", "env", "printenv", "set", "export", "unset", "for", "select", "dbx-recon",
+                      "databricks"))
 _INERT = _READERS | frozenset(("man", "info", "whereis", "whatis", "apt", "apt-get", "brew", "pip", "pip3", "yum", "dnf", "apk", "conda",
                                "mamba", "git", "help", "hash", "alias", "unalias", "complete", "apropos", "tldr", "locate", "ldd",
                                "pg_dump", "pg_dumpall", "mysqldump"))
@@ -119,9 +123,17 @@ _PY_LITERAL = re.compile(_DYNAMIC_SQL_EXECUTOR + r"\s*[rbuf]*(['\"]{3}|['\"])(.*
 _PY_WRITE = re.compile(r"""['"](?:[wax]\+?|\+?>>?|\+<)['"]|\.write\w*\(|json\.dump\(|os\.(?:remove|unlink|rename|replace|chmod|rmdir|makedirs|mkdir)\(|"""
                        r"""shutil\.|\.(?:unlink|rename|rmdir|mkdir|touch|chmod)\(|\bunlink\b|\bwriteFile\w*\(""")
 _MIGRATION_PATH = re.compile(r"[^\s'\"()]*\.migration(?:/[^\s'\"()]*)?")
+_DECISION_ROW = re.compile(r"(?m)^\s*(?:\|\s*|#{1,6}\s*)?(D-[A-Za-z0-9][\w.-]*)\b")
 _RMTREE = re.compile(r"rmtree\(\s*(?:['\"]([^'\"]*)['\"]|(os\.getcwd\(\)|Path\.cwd\(\)|Path\(\s*(?:['\"]\.?['\"])?\s*\)))")
 _SQL_OUT_PATH = re.compile(r"(?i)(?:\bTO\s+|\\[ow]\s+|:out\s+|\bSPOOL\s+|\bFILE\s*=\s*)'?([^\s'\"]*\.migration(?:/[^\s'\"]*)?)")
 _SQL_OPAQUE = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)|'(?:[^']|'')*(?:'|\Z)", re.DOTALL)
+_CLOUD_FAMILY = {
+    "aws": (("AWS_",), re.compile(r"(?<![\w.-])(?:aws|boto3|botocore|s3fs|awscli)(?![\w-])|\bs3://")),
+    "azure": (("AZURE_", "AZURITE_"), re.compile(r"(?<![\w.-])az(?![\w-])|azure[.-]storage|\babfss://")),
+    "gcp": (("GOOGLE_", "GCLOUD_", "GCS_", "CLOUDSDK_", "STORAGE_EMULATOR_HOST", "PUBSUB_EMULATOR_HOST",
+              "FIRESTORE_EMULATOR_HOST"),
+             re.compile(r"(?<![\w.-])(?:gcloud|gsutil)(?![\w-])|google[.-]cloud[.-]storage|\bgs://")),
+}
 
 # read shapes: leading keyword, then no write keyword anywhere in the statement
 _READ_HEAD = ("SELECT", "WITH", "SET", "USE", "DECLARE")
@@ -232,6 +244,8 @@ class GuardConfig:
     bundle_targets: list[str] = field(default_factory=list)
     lakebase_projects: list[str] = field(default_factory=list)
     lakebase_branches: list[str] = field(default_factory=list)
+    run_mode: str = "live"
+    fixture_endpoints: tuple[str, ...] = ()
     path: Path | None = None
 
     @classmethod
@@ -249,9 +263,20 @@ class GuardConfig:
         mode = str(data.get("guard_mode", "block")).lower()
         if mode not in ("block", "warn"):
             raise ValueError("'guard_mode' must be 'block' or 'warn'")
-        return cls([_norm(c) for c in catalogs], lists["legacy_sources"], mode, tuple(t.lower() for t in lists["forbidden_bundle_targets"]),
-                   [h.lower() for h in lists["target_hosts"]], lists["bundle_targets"], lists["lakebase_projects"],
-                   lists["lakebase_branches"], path)   # DAB / dbt targets compared exactly
+        run_mode = data.get("run_mode", "live")
+        if not isinstance(run_mode, str) or run_mode not in ("live", "fixture"):
+            raise ValueError("'run_mode' must be 'live' or 'fixture'")
+        endpoints = data.get("fixture_endpoints", [])
+        if not isinstance(endpoints, list) or not all(isinstance(v, str) for v in endpoints):
+            raise ValueError("'fixture_endpoints' must be a list of strings")
+        for endpoint in endpoints:
+            if not any(endpoint.startswith(prefix) for prefixes, _ in _CLOUD_FAMILY.values() for prefix in prefixes):
+                raise ValueError(f"fixture_endpoints: cannot tell the cloud family of {endpoint}")
+        return cls(catalogs=[_norm(c) for c in catalogs], legacy_sources=lists["legacy_sources"], mode=mode,
+                   forbidden_bundle_targets=tuple(t.lower() for t in lists["forbidden_bundle_targets"]),
+                   target_hosts=[h.lower() for h in lists["target_hosts"]], bundle_targets=lists["bundle_targets"],
+                   lakebase_projects=lists["lakebase_projects"], lakebase_branches=lists["lakebase_branches"],
+                   run_mode=run_mode, fixture_endpoints=tuple(endpoints), path=path)
 
 
 @dataclass
@@ -365,6 +390,7 @@ class _Seg:
     opaque: str | None = None                          # a piped producer whose output the guard cannot read
     scripts: list[str] = field(default_factory=list)   # files it executes
     ctx: str = ""                                      # text of the prefixes / wrapper (`ssh host`) it runs under
+    remote: str = ""                                   # remote execution wrapper, when the command runs outside this workspace
     at: str | None = ""                                # directory it runs in ('' the workspace root, None unresolvable)
     alts: list[str] = field(default_factory=list)      # the directories it may run in when `at` is None because of `x || cd d`
     sub: int = 0                                       # how many `( )` subshells enclose it
@@ -470,6 +496,52 @@ def _lakebase_field(verb: str, project: str | None, branch: str | None, cfg: Gua
     return []
 
 
+def _remote_payload(words: list[str]) -> str | None:
+    """Extract a literal AWS SSM or Azure Run Command script, or None when its payload is unreadable."""
+    if words[:3] == ["aws", "ssm", "send-command"]:
+        if "--cli-input-json" in words:
+            return None
+        params = next((words[i + 1] for i, w in enumerate(words[:-1]) if w == "--parameters"), None)
+        if params is None or params.startswith(("file://", "@")):
+            return None
+        if params.startswith("commands="):
+            value = params.split("=", 1)[1]
+            if value.startswith("["):
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    return None
+                return "\n".join(parsed) if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed) else None
+            if value.startswith('"') and value.endswith('"'):
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    return None
+                return parsed if isinstance(parsed, str) else None
+            return value
+        if params.startswith("{"):
+            try:
+                parsed = json.loads(params)
+            except json.JSONDecodeError:
+                return None
+            value = parsed.get("commands") if isinstance(parsed, dict) else None
+            return "\n".join(value) if isinstance(value, list) and all(isinstance(x, str) for x in value) else value if isinstance(value, str) else None
+        return None
+    if words[:4] == ["az", "vm", "run-command", "invoke"]:
+        if any(w.startswith("@") for w in words):
+            return None
+        scripts = []
+        try:
+            i = words.index("--scripts") + 1
+        except ValueError:
+            return None
+        while i < len(words) and not words[i].startswith("-"):
+            scripts.append(words[i])
+            i += 1
+        return "\n".join(scripts) if scripts else None
+    return None
+
+
 def _program(words: list[str], assigns: list[str]) -> tuple[list[str], str]:
     """(argv, prefix text): the words after `VAR=value` and the modelled prefixes (`_PREFIX_VALUE_FLAGS`, `docker exec|run`,
     `kubectl exec ... --`); `env -u X` is recorded as `X=`, `env -C d` as `PWD=d`; one quoted payload is a remote command line."""
@@ -480,7 +552,15 @@ def _program(words: list[str], assigns: list[str]) -> tuple[list[str], str]:
             assigns.append(words[i])
             i += 1
             continue
+        if w in _RESERVED_PREFIXES:
+            i += 1
+            continue
         w = "docker" if w in ("podman", "nerdctl") else w
+        if words[i:i + 3] == ["aws", "ssm", "send-command"] or words[i:i + 4] == ["az", "vm", "run-command", "invoke"]:
+            payload = _remote_payload(words[i:])
+            if payload is None:
+                return words, ""
+            return ["sh", "-c", payload], " ".join(words)
         if w == "docker":
             i += 1 + (words[i + 1:i + 2] == ["compose"])
             if words[i:i + 1] not in (["exec"], ["run"]):
@@ -602,8 +682,22 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                      _SHELL_VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group()), w) for w, r in zip(seg.words, seg.raw)]
         seg.argv, seg.ctx = _program(aliases.get(seg.args[0] if seg.args else "", seg.args[:1]) + seg.args[1:], seg.assigns)
         seg.ctx = " ".join(x for x in (ctx, seg.ctx) if x)
+        wrapper = seg.ctx.split()[:1]
+        seg.remote = wrapper[0] if wrapper and (
+            wrapper[0] in ("ssh", "aws", "az") or
+            wrapper[0] in ("docker", "podman", "nerdctl", "kubectl") and
+            any(w in seg.ctx.split() for w in ("exec", "run"))
+        ) else ""
+        if not seg.remote and seg.argv[:3] == ["aws", "ssm", "send-command"] or not seg.remote and seg.argv[:4] == [
+                "az", "vm", "run-command", "invoke"]:
+            seg.remote = seg.argv0
         env.update(a.split("=", 1) for a in (seg.assigns if not seg.argv else seg.argv[1:] if seg.argv0 in _DECLARERS else ())
                    if _ASSIGN.match(a))   # a bare or declared assignment persists for later commands
+        if seg.argv0 == "for" and seg.argv[2:3] == ["in"] and len(seg.argv) > 3:
+            values = seg.argv[3:]
+            value = next((w for w in values if _MIGRATION_PATH.search(w)), values[0])
+            if re.fullmatch(r"[A-Za-z_]\w*", seg.argv[1]):
+                env[seg.argv[1]] = value
         for p in seg.feeds:
             pargs, base = p.args, p.args[0].rsplit("/", 1)[-1] if p.args else ""
             if base not in ("cat", "echo", "printf", "tee") or _expands(" ".join(p.raw)):
@@ -963,16 +1057,25 @@ def _check_identity(segs: list[_Seg], cfg: GuardConfig | None = None) -> list[st
     return violations
 
 
-def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
-    """Literal SQL handed to an executor inside a program the command runs (`-c`, heredoc, script file)."""
+def _python_texts(seg: _Seg, root: Path) -> tuple[str, str | None]:
+    """Python source from `-c`, heredocs or a readable `.py` operand, plus an unreadable script name."""
     argv = seg.argv
     texts = [*_flag_values(argv, ("-c",)), *seg.heredocs]
+    unreadable = None
     if "-m" not in argv and not texts and (script := next((w for w in argv[1:] if w.endswith(".py")), None)):
         body = _read_script(script, root, seg.at)
-        if body is None and seg.argv0 == "spark-submit":
-            return [f"spark-submit script {script!r} cannot be read; the guard cannot clear a Spark job it cannot inspect"]
-        texts.append(body or "")
-    text = "\n".join(texts)
+        if body is None:
+            unreadable = script
+        else:
+            texts.append(body)
+    return "\n".join(texts), unreadable
+
+
+def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
+    """Literal SQL handed to an executor inside a program the command runs (`-c`, heredoc, script file)."""
+    text, unreadable = _python_texts(seg, root)
+    if unreadable and seg.argv0 == "spark-submit":
+        return [f"spark-submit script {unreadable!r} cannot be read; the guard cannot clear a Spark job it cannot inspect"]
     hits = _context(seg.text + " " + text, cfg, legacy_only=True)
     violations = []
     for m in _PY_LITERAL.finditer(text):
@@ -981,6 +1084,50 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         elif bad := _non_reads(m.group(2)):
             violations.append(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}` "
                               "(legacy is read-only in every phase)")
+    return violations
+
+
+def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
+    """Fixture mode blocks declared cloud families unless every declared endpoint variable is set; inert heads are ignored."""
+    if cfg.run_mode != "fixture" or not cfg.fixture_endpoints or seg.argv0 in _INERT:
+        return []
+    text = seg.text
+    if _PYTHON.fullmatch(seg.argv0):
+        pytext, _ = _python_texts(seg, root)
+        text += "\n" + pytext
+    violations = []
+    for family, (prefixes, pattern) in _CLOUD_FAMILY.items():
+        declared = [name for name in cfg.fixture_endpoints if any(name.startswith(prefix) for prefix in prefixes)]
+        match = pattern.search(text)
+        missing = [name for name in declared if not os.environ.get(name)]
+        if match and missing:
+            violations.append(f"run_mode is fixture and the command names {family} tooling (`{match.group()}`) but {missing} is unset "
+                              f"in the hook's environment; a fixture must fail closed rather than reach the live {family} account "
+                              "(declared in fixture_endpoints)")
+    return violations
+
+
+def _check_remote(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
+    """Legacy remote commands block interactive sessions, unreadable payloads and scripts that live on the remote host."""
+    violations = []
+    for seg in segs:
+        if not seg.remote:
+            continue
+        hits = _context(seg.text, cfg, legacy_only=True)
+        if not hits:
+            continue
+        if not seg.argv:
+            violations.append(f"`{seg.remote}` opens an interactive session on legacy source {hits}; the guard cannot read what would run")
+            continue
+        if seg.argv0 in ("aws", "az") and _remote_payload(seg.args) is None:
+            violations.append(f"remote `{seg.argv0}` payload cannot be read (file://, @file, --cli-input-json); the guard cannot clear a "
+                              "remote command it cannot read")
+            continue
+        file = _shell_runs(seg)[1]
+        if seg.scripts or file or (_PYTHON.fullmatch(seg.argv0) and any(w.endswith(".py") for w in seg.argv[1:])):
+            name = file or (seg.scripts[0] if seg.scripts else next(w for w in seg.argv[1:] if w.endswith(".py")))
+            violations.append(f"remote command `{seg.argv0}` runs `{name}` on legacy host {hits}; a script on the remote host cannot be "
+                              "read by the guard (run the statements inline)")
     return violations
 
 
@@ -1184,8 +1331,9 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
         violations.append(f"`{m.group()}` is the factory-doctor's hook probe; it always blocks so the doctor can tell the "
                           "hook is loaded without touching Databricks")
     segs, found = _analyse(command, cfg, root, at=cwd)
-    violations += found + _check_identity(segs, cfg) + _check_integrity(segs, root, here)
+    violations += found + _check_identity(segs, cfg) + _check_integrity(segs, root, here) + _check_remote(segs, cfg)
     for seg in segs:
+        violations += _check_fixture(seg, cfg, root)
         base = seg.argv0
         if base == "databricks" or (base == "dbt" and seg.argv[1:2] and seg.argv[1] in _DBT_RUNS):
             violations += _check_databricks(seg, cfg, root)
@@ -1203,6 +1351,47 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
         elif _PYTHON.fullmatch(base):
             violations += _check_python(seg, cfg, root)
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
+
+
+def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd: str) -> Verdict:
+    """File-edit tools may write recon, waves, source files and only newly added decision rows."""
+    file_path = tool_input.get("file_path")
+    if not isinstance(file_path, str) or not file_path:
+        return Verdict.of([], cfg)
+    new = tool_input.get("content") or tool_input.get("new_string") or "\n".join(
+        e.get("new_string", "") for e in tool_input.get("edits", []) if isinstance(e, dict)
+    )
+    if tool == "MultiEdit":
+        old = "\n".join(e.get("old_string", "") for e in tool_input.get("edits", []) if isinstance(e, dict))
+    else:
+        old = tool_input.get("old_string", "")
+    if tool == "write" and not old:
+        path = Path(file_path) if os.path.isabs(file_path) else Path(cwd or root) / file_path
+        try:
+            old = path.read_text(errors="replace")
+        except OSError:
+            old = ""
+    kind = _touch(file_path, cwd or "", root)
+    violations = []
+    decision = False
+    if kind in ("inside", "self"):
+        path = Path(file_path) if os.path.isabs(file_path) else Path(cwd or root) / file_path
+        try:
+            rel = path.resolve().relative_to(root.resolve())
+        except ValueError:
+            rel = Path(file_path)
+        decision = rel.as_posix() == ".migration/06_decisions.md" and len(_DECISION_ROW.findall(new)) > len(_DECISION_ROW.findall(old))
+        if not decision:
+            violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
+                              ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
+                              "decision — 06_decisions.md accepts only an added `D-<id>` row)")
+    elif kind == "identity":
+        violations.append(f"file-edit tool `{tool}` writes `{file_path}`, the Databricks CLI's credential store; the session runs as the "
+                          "doctor-verified migration principal only")
+    elif kind == "guard" or kind == "guard-above":
+        violations.append(f"file-edit tool `{tool}` on `{file_path}` inside the running guard's plugin tree ({_GUARD_TREE}); the hook is "
+                          "never edited, disabled or removed from a session (a block is a finding to report)")
+    return Verdict.of(violations, cfg)
 
 
 def _run_dirs(cmd: str, start: str) -> list[Path | None]:
@@ -1280,12 +1469,15 @@ def main(stdin_text: str | None = None) -> int:
         return 0
     tool_input = event.get("tool_input") or {} if isinstance(event, dict) else {}
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    if not isinstance(command, str) or not command.strip():
+    file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+    if (not isinstance(command, str) or not command.strip()) and (not isinstance(file_path, str) or not file_path):
         return 0
     root, cwd, here = _dirs(event, tool_input)
     try:
         cfg = load_config(root)
-        if cfg is None:
+        if cfg is None and isinstance(file_path, str) and os.path.isabs(file_path):
+            cfg = load_config(Path(file_path).parent)
+        if cfg is None and isinstance(command, str) and command.strip():
             cwd = cwd or here
             root, cfg = _workspace_from_cd(command, cwd)
     except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
@@ -1293,7 +1485,9 @@ def main(stdin_text: str | None = None) -> int:
     else:
         if cfg is None:
             return 0
-        verdict = evaluate_with_workdirs(command, cfg, root, cwd, here)
+        verdict = evaluate_edit(event.get("tool_name", ""), tool_input, cfg, root, cwd) if (
+            not isinstance(command, str) or not command.strip()
+        ) else evaluate_with_workdirs(command, cfg, root, cwd, here)
     if verdict.reason:
         print(json.dumps({"decision": verdict.decision, "reason": verdict.reason}))
     if verdict.decision == "block":
