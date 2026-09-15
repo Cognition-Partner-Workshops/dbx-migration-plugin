@@ -391,6 +391,7 @@ class _Seg:
     scripts: list[str] = field(default_factory=list)   # files it executes
     ctx: str = ""                                      # text of the prefixes / wrapper (`ssh host`) it runs under
     remote: str = ""                                   # remote execution wrapper, when the command runs outside this workspace
+    env: dict[str, str] = field(default_factory=dict)  # environment inherited by this command after shell assignments and unset
     at: str | None = ""                                # directory it runs in ('' the workspace root, None unresolvable)
     alts: list[str] = field(default_factory=list)      # the directories it may run in when `at` is None because of `x || cd d`
     sub: int = 0                                       # how many `( )` subshells enclose it
@@ -694,11 +695,13 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
             seg.remote = seg.argv0
         env.update(a.split("=", 1) for a in (seg.assigns if not seg.argv else seg.argv[1:] if seg.argv0 in _DECLARERS else ())
                    if _ASSIGN.match(a))   # a bare or declared assignment persists for later commands
+        if seg.argv0 == "unset":
+            env.update((name, "") for name in seg.argv[1:] if re.fullmatch(r"[A-Za-z_]\w*", name))
+        seg.env = dict(env)
         if seg.argv0 == "for" and seg.argv[2:3] == ["in"] and len(seg.argv) > 3:
             values = seg.argv[3:]
-            value = next((w for w in values if _MIGRATION_PATH.search(w)), values[0])
             if re.fullmatch(r"[A-Za-z_]\w*", seg.argv[1]):
-                env[seg.argv[1]] = value
+                env[seg.argv[1]] = " ".join(values)
         for p in seg.feeds:
             pargs, base = p.args, p.args[0].rsplit("/", 1)[-1] if p.args else ""
             if base not in ("cat", "echo", "printf", "tee") or _expands(" ".join(p.raw)):
@@ -816,7 +819,8 @@ def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
             violations.append(f"unrecognised wrapper `{base}` in front of client `{wrapped[0]}`; the guard has no rule for `{base}`, so "
                               "it cannot tell how or where the client would run (run the client directly)")
         for i, (r, w, prev) in enumerate(zip(s.raw, s.words, ["", *s.words])):   # an expansion inside what is (or looks like) SQL
-            if (prev in _SQL_VALUE_FLAGS or w.split("=", 1)[0] in _SQL_VALUE_FLAGS or re.search(r"[\s;]", w) or (
+            if (prev in _SQL_VALUE_FLAGS or w.split("=", 1)[0] in _SQL_VALUE_FLAGS or
+                    (re.search(r"[\s;]", w) and prev not in _HOST_FLAGS) or (
                     i >= 2 and s.words[i - 2] == "tools" and prev == "query")) and _expands(r) and not _REDIRECT_OP.fullmatch(prev):
                 violations.append(f"shell expansion inside the SQL argument `{r[:60]}`; expand it in the command text so the guard can "
                                   "read the statement")
@@ -1100,10 +1104,11 @@ def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     for family, (prefixes, pattern) in _CLOUD_FAMILY.items():
         declared = [name for name in cfg.fixture_endpoints if any(name.startswith(prefix) for prefix in prefixes)]
         match = pattern.search(text)
-        missing = [name for name in declared if not os.environ.get(name)]
+        effective = {**os.environ, **seg.env, **dict(a.split("=", 1) for a in seg.assigns if _ASSIGN.match(a))}
+        missing = [name for name in declared if not effective.get(name)]
         if match and missing:
             violations.append(f"run_mode is fixture and the command names {family} tooling (`{match.group()}`) but {missing} is unset "
-                              f"in the hook's environment; a fixture must fail closed rather than reach the live {family} account "
+                              f"for this command; a fixture must fail closed rather than reach the live {family} account "
                               "(declared in fixture_endpoints)")
     return violations
 
@@ -1131,6 +1136,22 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
             name = file or (seg.scripts[0] if seg.scripts else next(w for w in seg.argv[1:] if w.endswith(".py")))
             violations.append(f"remote command `{seg.argv0}` runs `{name}` on legacy host {hits}; a script on the remote host cannot be "
                               "read by the guard (run the statements inline)")
+            continue
+        base = seg.argv0
+        modelled = (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC, *_REST_CLIENTS)
+        read_shape = base in _READERS
+        if base == "sed" and any(w in ("-i", "--in-place") for w in seg.argv[1:]):
+            read_shape = False
+        if base == "tar" and any(re.search(r"^-.*[cxru]", w) for w in seg.argv[1:]):
+            read_shape = False
+        if base == "find" and any(w in ("-delete", "-exec", "-ok") for w in seg.argv[1:]):
+            read_shape = False
+        if base in ("unzip", "tee"):
+            read_shape = False
+        if (base not in modelled and not _PYTHON.fullmatch(base) and base not in _SHELLS
+                and (not read_shape or any(op.startswith(">") for op, _ in seg.redirects()))):
+            violations.append(f"remote command `{base}` on legacy host {hits} is not a read shape the guard models; "
+                              "legacy hosts are read-only")
     return violations
 
 

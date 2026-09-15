@@ -618,6 +618,11 @@ PROBES2 = [
     ("R3 aws ssm legacy parameters from file", "aws ssm send-command --instance-ids tdprod.corp --parameters file://params.json", "block"),
     ("R3 aws ssm non-legacy read", "aws ssm send-command --instance-ids i-0abc --parameters 'commands=[\"cat /etc/hosts\"]'", "approve"),
     ("R3 aws ssm non-legacy client write", "aws ssm send-command --instance-ids i-0abc --parameters 'commands=[\"sqlcmd -S other -Q \\\"DELETE FROM dbo.t\\\"\"]'", "block"),
+    ("R3 aws ssm legacy inline rm", "aws ssm send-command --instance-ids tdprod.corp --parameters 'commands=[\"rm /opt/legacy/job.sh\"]'", "block"),
+    ("R3 ssh legacy inline sed", "ssh tdprod.corp 'sed -i s/a/b/ x.conf'", "block"),
+    ("R3 ssh legacy read redirect", "ssh tdprod.corp 'cat /etc/hosts > /tmp/out'", "block"),
+    ("R3 ssh legacy read shape", "ssh tdprod.corp 'cat /etc/hosts'", "approve"),
+    ("R3 ssh non-legacy inline rm", "ssh other.host 'rm x'", "approve"),
     ("R3 az run-command legacy read", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'cat /etc/hosts'", "approve"),
     ("R3 az run-command legacy write", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'sqlcmd -Q \"DELETE FROM dbo.t\"'", "block"),
     ("R3 az run-command legacy remote script", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'bash /opt/fix.sh'", "block"),
@@ -638,6 +643,9 @@ PROBES2 = [
     ("R3 if-then body write into .migration", "if true; then rm .migration/units/x; fi", "block"),
     ("R3 for loop over legacy hosts read", "for h in tdprod.corp; do psql -h $h -c 'SELECT 1'; done", "approve"),
     ("R3 for loop over legacy hosts write", "for h in tdprod.corp; do psql -h $h -c 'DROP TABLE t'; done", "block"),
+    ("R3 for loop write checks every host", "for h in lakebase-host tdprod.corp; do psql -h \"$h\" -d mig -c 'DROP TABLE t'; done", "block"),
+    ("R3 for loop read checks every host", "for h in tdprod.corp other.corp; do psql -h $h -c 'SELECT 1'; done", "approve"),
+    ("R3 for loop reads multiple migration paths", "for f in .migration/waves/a.json .migration/waves/b.json; do cat \"$f\"; done", "approve"),
 ]
 
 
@@ -754,6 +762,20 @@ def test_fixture_cloud_reason_never_contains_endpoint_value(tmp_path: Path):
     assert result.returncode == 2
     assert value not in result.stdout + result.stderr
     assert "AZURE_STORAGE_CONNECTION_STRING" in result.stdout
+
+
+@pytest.mark.parametrize("command,env,expected", [
+    ("env -u AWS_ENDPOINT_URL aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "block"),
+    ("AWS_ENDPOINT_URL= aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "block"),
+    ("unset AWS_ENDPOINT_URL; aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "block"),
+    ("AWS_ENDPOINT_URL=http://localhost:9000 aws s3 ls", {}, "approve"),
+])
+def test_fixture_endpoint_environment_is_command_local(tmp_path: Path, command, env, expected):
+    ws = _make_tmp_ws(tmp_path, "fixture_command_env_ws", {
+        **ALLOWLIST2, "run_mode": "fixture", "fixture_endpoints": ["AWS_ENDPOINT_URL"],
+    }, FILES2)
+    decision, _ = decide(command, ws, env)
+    assert decision == expected
 
 
 # ---------------------------------------------------------------- the allowlist file itself
