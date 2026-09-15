@@ -1295,18 +1295,29 @@ DBX_TABLES = ["mig.raw.loans", "mig.raw.payments"]
 DBX_READ_GRANTS = {"mig": ["USE_CATALOG"], "mig.raw": ["USE_SCHEMA"],
                    "mig.raw.loans": ["SELECT"], "mig.raw.payments": ["SELECT"]}
 DBX_PRINCIPAL = "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d"
+DBX_SECRET = json.dumps({"server_hostname": "adb-source.example", "http_path": "/sql/1.0/warehouses/x",
+                         "access_token": "test-source-token"})
 
 
 def _dbx_source_cli(monkeypatch, *, grants, owners=None, groups=(), fail_op=None):
-    """A databricks CLI for the source-principal check: `current-user me` answers an applicationId
-    in `groups`, `catalogs|schemas|tables get` the owners dict, `grants get-effective` the per-name
-    grants dict (one assignment carried through a GROUP, the way inherited grants arrive). Returns
-    every command asked so a test can prove which securables were queried."""
+    """A databricks CLI bound to the --source-secret credential, not the session env: every call
+    must arrive with env carrying the secret's host/token and no inherited DATABRICKS_* auth.
+    `current-user me` answers an applicationId in `groups`, `catalogs|schemas|tables get` the
+    owners dict (default owner@example.com, since a missing owner is now unverified), `grants
+    get-effective` the per-name grants dict (one assignment carried through a GROUP, the way
+    inherited grants arrive). Returns every command asked."""
     asked = []
+    monkeypatch.setenv("SRC_DBX", DBX_SECRET)
     monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
 
-    def fake_run(cmd, timeout=0):
+    def fake_run(cmd, timeout=0, env=None):
         asked.append(cmd)
+        assert env is not None, cmd
+        assert env["DATABRICKS_TOKEN"] == "test-source-token"
+        assert env["DATABRICKS_HOST"] == "https://adb-source.example"
+        for inherited in ("DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET",
+                          "DATABRICKS_CONFIG_PROFILE"):
+            assert inherited not in env
         op = tuple(cmd[1:3])
         if op == fail_op:
             return 1, "", "Error: default auth: cannot configure default credentials token=never-printed"
@@ -1314,7 +1325,7 @@ def _dbx_source_cli(monkeypatch, *, grants, owners=None, groups=(), fail_op=None
             return 0, json.dumps({"applicationId": DBX_PRINCIPAL,
                                   "groups": [{"display": g} for g in groups]}), ""
         if op in (("catalogs", "get"), ("schemas", "get"), ("tables", "get")):
-            return 0, json.dumps({"owner": (owners or {}).get(cmd[3])}), ""
+            return 0, json.dumps({"owner": (owners or {}).get(cmd[3], "owner@example.com")}), ""
         if op == ("grants", "get-effective"):
             return 0, json.dumps({"privilege_assignments": [
                 {"principal": DBX_PRINCIPAL, "inherited_from_type": "GROUP",
@@ -1325,11 +1336,24 @@ def _dbx_source_cli(monkeypatch, *, grants, owners=None, groups=(), fail_op=None
     return asked
 
 
+def test_databricks_source_principal_needs_and_parses_the_secret(monkeypatch):
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
+    assert c.status == "fail" and "--source-secret" in c.detail
+    monkeypatch.delenv("SRC_DBX", raising=False)
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    assert c.status == "fail" and "SRC_DBX" in c.detail and "not set" in c.detail
+    monkeypatch.setenv("SRC_DBX", "token=never-printed")
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "JSON" in c.detail
+    assert "never-printed" not in json.dumps(asdict(c))
+
+
 def test_databricks_source_principal_ok_reads_every_securable(monkeypatch):
     asked = _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)  # CLI auth: no --source-secret
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
     assert c.status == "ok", c.detail
-    assert c.data["principal"] == DBX_PRINCIPAL and c.data["writable"] == {}
+    assert c.data["principal"] == DBX_PRINCIPAL and c.data["host"] == "adb-source.example"
+    assert c.data["writable"] == {} and "test-source-token" not in json.dumps(asdict(c))
     effective = [cmd[3:5] for cmd in asked if cmd[1:3] == ["grants", "get-effective"]]
     assert effective == [["catalog", "mig"], ["schema", "mig.raw"],
                          ["table", "mig.raw.loans"], ["table", "mig.raw.payments"]]
@@ -1338,7 +1362,7 @@ def test_databricks_source_principal_ok_reads_every_securable(monkeypatch):
 def test_databricks_source_principal_fails_on_write_privilege(monkeypatch):
     grants = dict(DBX_READ_GRANTS, **{"mig.raw.payments": ["SELECT", "MODIFY"]})
     _dbx_source_cli(monkeypatch, grants=grants)
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
     assert c.status == "fail" and "mig.raw.payments: MODIFY" in c.detail
     assert c.data["writable"]["mig.raw.payments"] == ["MODIFY"]
 
@@ -1346,7 +1370,7 @@ def test_databricks_source_principal_fails_on_write_privilege(monkeypatch):
 def test_databricks_source_principal_fails_on_group_ownership(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, owners={"mig.raw": "data_engineers"},
                     groups=("data_engineers",))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
     assert c.status == "fail" and "mig.raw: OWNER" in c.detail
     assert c.data["writable"]["mig.raw"] == ["OWNER"]
 
@@ -1354,23 +1378,30 @@ def test_databricks_source_principal_fails_on_group_ownership(monkeypatch):
 def test_databricks_source_principal_fails_on_inherited_write_grant(monkeypatch):
     grants = dict(DBX_READ_GRANTS, **{"mig.raw": ["USE_SCHEMA", "ALL_PRIVILEGES"]})
     _dbx_source_cli(monkeypatch, grants=grants, groups=("data_engineers",))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
     assert c.status == "fail" and "mig.raw: ALL_PRIVILEGES" in c.detail
 
 
 def test_databricks_source_principal_unverified_on_cli_error(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, fail_op=("grants", "get-effective"))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
     assert c.status == "unverified" and "get-effective" in c.detail
     assert "never-printed" not in json.dumps(asdict(c))
     monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
     assert c.status == "unverified" and "CLI" in c.detail
+
+
+def test_databricks_source_principal_unverified_when_owner_is_unknown(monkeypatch):
+    _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, fail_op=("schemas", "get"))
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "schemas get mig.raw" in c.detail
+    assert "never-printed" not in json.dumps(asdict(c))
 
 
 def test_databricks_source_principal_two_part_names_are_unresolved(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
-    c = doctor.check_source_principal(["raw.loans"], "databricks", None)
+    c = doctor.check_source_principal(["raw.loans"], "databricks", "SRC_DBX")
     assert c.status == "unverified" and c.data["unresolved"] == ["raw.loans"]
 
 
