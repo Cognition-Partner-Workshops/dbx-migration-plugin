@@ -18,7 +18,7 @@ This step is idempotent — it is both the initial import and the re-sync after 
 2. For each repo playbook, in the README table order, compute the sha256 of the file bytes. Then:
    - No live playbook has the macro: `{"action":"create","title":<README title>,"content":<file body verbatim>,"macro":<macro>}`.
    - The live `content` differs byte-for-byte from the file: `{"action":"update","playbook_id":<id>,"title":<README title>,"content":<file body>,"macro":<macro>}` (v3 update is full-replace, so always pass title+content+macro). Never edit, summarize, or re-wrap a body.
-   - Identical: no call.
+   - Identical: no call. If the tool returned the live `content` truncated (the `get` output is capped, and every playbook here is longer than the cap), you cannot prove identity: treat it as differing and update — the update is a full replace of the same bytes, so it is harmless when nothing changed.
    Pass long content via a `file:///` path — the `devin_mcp` tool substitutes it.
 3. After the loop, write `.migration/playbooks.lock.json` in the engagement workspace:
    `{"<macro>": {"sha256": "<hex>", "repo_file": "<file name>", "installed_at": "<UTC ISO-8601 of this run>"}}`
