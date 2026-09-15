@@ -824,6 +824,12 @@ def _non_reads(sql: str) -> list[str]:
     return bad
 
 
+def _write_objects(statements: list[str]) -> list[str]:
+    """The normalized object names matched by the write statements."""
+    return [re.sub(r'["`\[\]]', "", match.group(1))
+            for statement in statements if (match := _WRITE_OBJECT.match(statement))]
+
+
 def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None, str | None]:
     """The decision token, and the missing condition when its ledger row cannot authorize every write."""
     flags = _flag_values(seg.argv, ("--decision",))
@@ -843,11 +849,11 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
         return decision_id, f"`{decision_id}` is not a row in .migration/06_decisions.md"
     if "legacy_write_authorized" not in row.lower():
         return decision_id, f"row `{decision_id}` does not contain `legacy_write_authorized`"
-    for statement in statements:
-        match = _WRITE_OBJECT.match(statement)
-        if not match:
-            return decision_id, f"cannot tell which object `{statement[:60]}` writes"
-        obj = re.sub(r'["`\[\]]', "", match.group(1))
+    objects = _write_objects(statements)
+    if len(objects) != len(statements):
+        statement = next(statement for statement in statements if not _WRITE_OBJECT.match(statement))
+        return decision_id, f"cannot tell which object `{statement[:60]}` writes"
+    for obj in objects:
         if obj.lower() not in row.lower():
             return decision_id, f"row `{decision_id}` does not name `{obj}`"
     return decision_id, None
@@ -935,32 +941,17 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     if not bad:
         return violations
     recon = [re.sub(r"(?<!\S)-(?:\w(?:\s+[^-\s]\S*)?|\S\S+)|['\"]", " ", f"{v} {a}").split() for v, a in _RECONNECT.findall(sql)]
-    if legacy:
-        violation = f"non-read statement through a legacy-only client `{base}`: `{bad[0]}`"
-        if not unreadable and not seg.opaque and base not in _WRITERS and not (base == "bcp" and "in" in seg.argv[1:4]) and non_reads:
-            did, missing = _decision(seg, non_reads, root)
-            if missing is None:
-                objects = ", ".join(re.sub(r'["`\[\]]', "", _WRITE_OBJECT.match(stmt).group(1))
-                                    for stmt in non_reads if _WRITE_OBJECT.match(stmt))
-                violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {objects} "
-                                  "(legacy_write_authorized row in .migration/06_decisions.md)")
-            else:
-                violations.append(violation + f"; a recorded decision would allow it, but {missing}" + tail)
+    if legacy or hits:
+        violation = (f"non-read statement through a legacy-only client `{base}`" if legacy
+                     else f"non-read statement against legacy source {hits}") + f": `{bad[0]}`"
+        plain = non_reads and not unreadable and not seg.opaque and base not in _WRITERS and not (
+            base == "bcp" and "in" in seg.argv[1:4])
+        did, missing = _decision(seg, non_reads, root) if plain else (None, "the statement is not a readable SQL write")
+        if missing is None:
+            violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {', '.join(_write_objects(non_reads))} "
+                              "(legacy_write_authorized row in .migration/06_decisions.md)")
         else:
-            violations.append(violation + tail)
-    elif hits:
-        violation = f"non-read statement against legacy source {hits}: `{bad[0]}`"
-        if not unreadable and not seg.opaque and base not in _WRITERS and not (base == "bcp" and "in" in seg.argv[1:4]) and non_reads:
-            did, missing = _decision(seg, non_reads, root)
-            if missing is None:
-                objects = ", ".join(re.sub(r'["`\[\]]', "", _WRITE_OBJECT.match(stmt).group(1))
-                                    for stmt in non_reads if _WRITE_OBJECT.match(stmt))
-                violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {objects} "
-                                  "(legacy_write_authorized row in .migration/06_decisions.md)")
-            else:
-                violations.append(violation + f"; a recorded decision would allow it, but {missing}" + tail)
-        else:
-            violations.append(violation + tail)
+            violations.append(f"{violation}; a recorded decision would allow it, but {missing}{tail}")
     elif not (hosts := _hosts(seg, recon)) or not all(h in cfg.target_hosts for h in hosts):
         violations.append(f"non-read statement through `{base}` to a host that is not a literal in target_hosts {cfg.target_hosts} "
                           f"(seen: {sorted(set(hosts))[:6]}; every host must be listed, an empty list blocks every write): `{bad[0]}`")
