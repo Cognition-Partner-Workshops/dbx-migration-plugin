@@ -27,6 +27,16 @@ def _make_ws(tmp_path: Path) -> Path:
     return ws
 
 
+def _make_nested_ws(tmp_path: Path) -> Path:
+    ws = tmp_path / "project"
+    sub = ws / "sub"
+    (sub / ".migration" / "recon" / "u1").mkdir(parents=True)
+    (sub / ".migration" / "waves").mkdir()
+    (sub / ".migration" / "allowed_targets.json").write_text(json.dumps(ALLOWLIST))
+    (sub / ".migration" / "06_decisions.md").write_text("# Decisions\n")
+    return ws
+
+
 def run_hook(tool: str, tool_input: dict, ws: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     event = {"tool_name": tool, "tool_input": tool_input, "cwd": str(ws)}
     hook_env = {"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(ws)}
@@ -70,6 +80,20 @@ def test_edit_outside_workspace_passes(tmp_path):
     ws = tmp_path / "outside"
     ws.mkdir()
     assert decide("write", {"file_path": str(ws / "notes.md"), "content": "x"}, ws) == "approve"
+
+
+def test_nested_workspace_edit_falls_back_to_file_config(tmp_path):
+    ws = _make_nested_ws(tmp_path)
+    decisions = ws / "sub" / ".migration" / "06_decisions.md"
+    allowlist = ws / "sub" / ".migration" / "allowed_targets.json"
+    added = run_hook("edit", {
+        "file_path": str(decisions),
+        "old_string": "# Decisions\n",
+        "new_string": "| D-8 | 2026-01-01 | accept tolerances |\n",
+    }, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
+    blocked = run_hook("write", {"file_path": str(allowlist), "content": "{}"}, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
+    assert added.returncode == 0
+    assert blocked.returncode == 2
 
 
 def test_hooks_json_has_exec_then_edit_matcher():

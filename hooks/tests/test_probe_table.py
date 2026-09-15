@@ -642,12 +642,22 @@ PROBES2 = [
 
 
 def _make_ws(tmp_path_factory, name: str, allowlist: dict, files: dict) -> Path:
-    ws = tmp_path_factory.mktemp(name) if hasattr(tmp_path_factory, "mktemp") else tmp_path_factory / name
-    ws.mkdir(parents=True, exist_ok=True)
+    ws = tmp_path_factory.mktemp(name)
     (ws / ".migration").mkdir()
     (ws / ".migration" / "allowed_targets.json").write_text(json.dumps(allowlist))
     for fname, body in files.items():
         (ws / fname).write_text(body)
+    return ws
+
+
+def _make_tmp_ws(tmp_path: Path, name: str, allowlist: dict, files: dict) -> Path:
+    ws = tmp_path / name
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps(allowlist))
+    for fname, body in files.items():
+        path = ws / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
     return ws
 
 
@@ -702,24 +712,22 @@ def test_table_covers_every_probe():
     assert len({p[0] for p in PROBES2}) == len(PROBES2)
 
 
-@pytest.mark.parametrize("endpoints,command,env,expected,needle", [
-    (["AWS_ENDPOINT_URL"], "python3 capture_baseline.py", {}, "block", "AWS_ENDPOINT_URL"),
-    (["AWS_ENDPOINT_URL"], "python3 capture_baseline.py", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "approve", ""),
-    (["AWS_ENDPOINT_URL"], "aws s3 ls", {}, "block", "AWS_ENDPOINT_URL"),
-    (["AWS_ENDPOINT_URL"], "aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "approve", ""),
-    (["AWS_ENDPOINT_URL"], "python3 -c \"import boto3; boto3.client('s3').list_buckets()\"", {}, "block", "AWS_ENDPOINT_URL"),
-    (["AWS_ENDPOINT_URL"], "aws s3 cp x s3://bucket/x", {}, "block", "AWS_ENDPOINT_URL"),
-    (["AWS_ENDPOINT_URL"], "aws s3 ls", {}, "approve", ""),
-    (["AZURE_STORAGE_CONNECTION_STRING"], "aws s3 ls", {}, "approve", ""),
-    (["AZURE_STORAGE_CONNECTION_STRING"], "az storage blob list", {}, "block", "AZURE_STORAGE_CONNECTION_STRING"),
-    (["STORAGE_EMULATOR_HOST"], "gsutil ls gs://b", {}, "block", "STORAGE_EMULATOR_HOST"),
-    (["STORAGE_EMULATOR_HOST"], "aws s3 ls", {}, "approve", ""),
+@pytest.mark.parametrize("run_mode,endpoints,command,env,expected,needle", [
+    ("fixture", ["AWS_ENDPOINT_URL"], "python3 capture_baseline.py", {}, "block", "AWS_ENDPOINT_URL"),
+    ("fixture", ["AWS_ENDPOINT_URL"], "python3 capture_baseline.py", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "approve", ""),
+    ("fixture", ["AWS_ENDPOINT_URL"], "aws s3 ls", {}, "block", "AWS_ENDPOINT_URL"),
+    ("fixture", ["AWS_ENDPOINT_URL"], "aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "approve", ""),
+    ("fixture", ["AWS_ENDPOINT_URL"], "python3 -c \"import boto3; boto3.client('s3').list_buckets()\"", {}, "block", "AWS_ENDPOINT_URL"),
+    ("fixture", ["AWS_ENDPOINT_URL"], "aws s3 cp x s3://bucket/x", {}, "block", "AWS_ENDPOINT_URL"),
+    ("live", ["AWS_ENDPOINT_URL"], "aws s3 ls", {}, "approve", ""),
+    ("fixture", ["AZURE_STORAGE_CONNECTION_STRING"], "aws s3 ls", {}, "approve", ""),
+    ("fixture", ["AZURE_STORAGE_CONNECTION_STRING"], "az storage blob list", {}, "block", "AZURE_STORAGE_CONNECTION_STRING"),
+    ("fixture", ["STORAGE_EMULATOR_HOST"], "gsutil ls gs://b", {}, "block", "STORAGE_EMULATOR_HOST"),
+    ("fixture", ["STORAGE_EMULATOR_HOST"], "aws s3 ls", {}, "approve", ""),
 ])
-def test_fixture_cloud_escape(tmp_path: Path, endpoints, command, env, expected, needle):
-    allowlist = {**ALLOWLIST2, "run_mode": "fixture", "fixture_endpoints": endpoints}
-    if endpoints == ["AWS_ENDPOINT_URL"] and command == "aws s3 ls" and not env and expected == "approve":
-        allowlist.pop("run_mode")
-    ws = _make_ws(tmp_path, "fixture_ws", allowlist, FILES2)
+def test_fixture_cloud_escape(tmp_path: Path, run_mode, endpoints, command, env, expected, needle):
+    allowlist = {**ALLOWLIST2, "run_mode": run_mode, "fixture_endpoints": endpoints}
+    ws = _make_tmp_ws(tmp_path, "fixture_ws", allowlist, FILES2)
     decision, reason = decide(command, ws, env)
     assert decision == expected, (command, decision, reason)
     if needle:
@@ -731,13 +739,13 @@ def test_fixture_cloud_escape(tmp_path: Path, endpoints, command, env, expected,
     ({**ALLOWLIST2, "fixture_endpoints": ["MY_VAR"]}, "fixture_endpoints"),
 ])
 def test_invalid_fixture_manifest_fails_closed(tmp_path: Path, body, needle):
-    ws = _make_ws(tmp_path, "invalid_fixture_ws", body, FILES2)
+    ws = _make_tmp_ws(tmp_path, "invalid_fixture_ws", body, FILES2)
     decision, reason = decide("aws s3 ls", ws)
     assert decision == "block" and needle in reason
 
 
 def test_fixture_cloud_reason_never_contains_endpoint_value(tmp_path: Path):
-    ws = _make_ws(tmp_path, "fixture_secret_ws", {
+    ws = _make_tmp_ws(tmp_path, "fixture_secret_ws", {
         **ALLOWLIST2, "run_mode": "fixture",
         "fixture_endpoints": ["AWS_ENDPOINT_URL", "AZURE_STORAGE_CONNECTION_STRING"],
     }, FILES2)

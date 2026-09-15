@@ -11,10 +11,10 @@ identity is never changed. Legacy-only clients and generic clients naming a lega
 client elsewhere writes when every host candidate is in `target_hosts` and the write resolves to a listed catalog / database.
 Nothing writes `.migration/` or the running guard's tree (git there is the `_git_reads` allowlist). Scripts and SQL files are
 read in the command's effective directory (event cwd, cd / pushd / env -C / git -C); what the guard cannot read blocks where a
-client is involved. No `.migration/` up the tree approves everything, one without a readable allowlist blocks everything, the
- workspace is also found through a leading `cd`/`pushd` in the command, file edits protect `.migration/` except recon, waves and
- added decision rows, and the doctor's `__dbx_guard_probe__<nonce>` always
-blocks. `hooks/tests/test_probe_table.py` pins this policy; add a row first.
+client is involved. No `.migration/` up the tree approves everything, one without a readable allowlist blocks everything, and the
+workspace is also found through a leading `cd`/`pushd` in the command. File edits protect `.migration/` except recon, waves and
+added decision rows; the doctor's `__dbx_guard_probe__<nonce>` always blocks. `hooks/tests/test_probe_table.py` pins this policy;
+add a row first.
 """
 from __future__ import annotations
 
@@ -497,7 +497,8 @@ def _lakebase_field(verb: str, project: str | None, branch: str | None, cfg: Gua
 
 
 def _remote_payload(words: list[str]) -> str | None:
-    """Extract a literal AWS SSM or Azure Run Command script, or None when its payload is unreadable."""
+    """The literal command line an `aws ssm send-command` / `az vm run-command invoke` would run, or None when it is not on the line
+    (`file://`, `@file`, `--cli-input-json`)."""
     if words[:3] == ["aws", "ssm", "send-command"]:
         if "--cli-input-json" in words:
             return None
@@ -1108,7 +1109,9 @@ def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
 
 
 def _check_remote(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
-    """Legacy remote commands block interactive sessions, unreadable payloads and scripts that live on the remote host."""
+    """A remote execution (`ssh`, `docker|kubectl exec`, `aws ssm send-command`, `az vm run-command invoke`) naming a legacy source
+    is read like a direct command; what would run only on the remote host (an interactive session, a script or SQL file there, a
+    payload from a file) blocks."""
     violations = []
     for seg in segs:
         if not seg.remote:
@@ -1375,12 +1378,7 @@ def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd
     violations = []
     decision = False
     if kind in ("inside", "self"):
-        path = Path(file_path) if os.path.isabs(file_path) else Path(cwd or root) / file_path
-        try:
-            rel = path.resolve().relative_to(root.resolve())
-        except ValueError:
-            rel = Path(file_path)
-        decision = rel.as_posix() == ".migration/06_decisions.md" and len(_DECISION_ROW.findall(new)) > len(_DECISION_ROW.findall(old))
+        decision = Path(file_path).name == "06_decisions.md" and len(_DECISION_ROW.findall(new)) > len(_DECISION_ROW.findall(old))
         if not decision:
             violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
                               ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
