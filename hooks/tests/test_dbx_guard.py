@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -471,14 +472,54 @@ def _workspace(path: Path, catalogs: list[str]) -> Path:
     return path
 
 
-def test_cd_targets_are_resolved():
-    assert g._cd_targets("cd ../b && databricks x") == ["../b"]
-    assert g._cd_targets("pushd /tmp/w; git status; cd sub") == ["/tmp/w", "sub"]
-    assert g._cd_targets("cd -P '/tmp/w x'") == ["/tmp/w x"]
-    assert g._cd_targets("cd \"$(mktemp -d)\" && ls") == [None]
-    assert g._cd_targets("cd - && ls") == [None]
-    assert g._cd_targets("git status && echo cd") == []
-    assert g._cd_targets("cd $HOME/x") == [os.path.expandvars("$HOME/x")]
+def test_run_dirs_follow_cd_with_shell_scope():
+    P = Path
+    assert g._run_dirs("cd ../b && databricks x", "/w/a") == [P("/w/a"), P("/w/b")]
+    assert g._run_dirs("pushd /tmp/w; git status; cd sub; popd; ls", "/w") == [P("/w"), P("/tmp/w"), P("/tmp/w/sub")]
+    assert g._run_dirs("cd -P '/tmp/w x' && ls", "/w") == [P("/w"), P("/tmp/w x")]
+    assert g._run_dirs("cd \"$(mktemp -d)\" && ls", "/w") == [P("/w"), None]
+    assert g._run_dirs("cd - && ls", "/w") == [P("/w"), None]
+    assert g._run_dirs("git status && echo cd", "/w") == [P("/w")]
+    # a subshell's cd ends with the subshell; a backgrounded and/or list never moves the parent
+    assert g._run_dirs("(cd /tmp); cd repo && sqlcmd -Q x", "/home/lead") == [P("/home/lead"), P("/home/lead/repo")]
+    assert g._run_dirs("(cd /tmp && ls) && ls", "/home/lead") == [P("/home/lead"), P("/tmp")]
+    assert g._run_dirs("cd /tmp & ls", "/home/lead") == [P("/home/lead")]
+    assert g._run_dirs("cd /work/b && true & bteq < run.sql", "/work/a") == [P("/work/a"), P("/work/b")]
+    segs = g._segments("cd /work/b && true & bteq < run.sql", at="/work/a")
+    assert [s.at for s in segs] == ["/work/a", "/work/b", "/work/a"]
+    # a `cd` behind `||` ran only if the left side failed: both directories stay possible, none is certain
+    assert g._run_dirs("cd a || cd b; ls", "/w") == [P("/w"), P("/w/a"), None, P("/w/b")]
+    assert g._run_dirs("false || cd /work/repo; sqlcmd -Q x", "/") == [P("/"), None, P("/work/repo")]
+    # a `||` after a subshell resumes from the parent's directory, and every possible directory is kept
+    assert g._run_dirs("(cd sub; false) || cd repo; sqlcmd -Q x", "/work") == [P("/work"), P("/work/sub"), None, P("/work/repo")]
+    many = g._run_dirs("false || cd a; false || cd b; false || cd c; false || cd repo; sqlcmd -Q x", "/work")
+    assert P("/work/repo") in many and P("/work/a/b/c/repo") in many and len(many) == 17   # 2**4 directories + None
+
+
+def test_too_many_possible_directories_fails_closed(tmp_path: Path):
+    chain = "; ".join(f"false || cd d{i}" for i in range(20)) + "; sqlcmd -S legacy-sql.corp -Q 'select 1'"
+    t = time.monotonic()
+    segs = g._segments(chain, at="/work")
+    assert time.monotonic() - t < 2 and segs[-1].lost and segs[-1].at is None and segs[-1].alts == []
+    assert len(g._run_dirs(chain, "/work")) <= 2 * g._MAX_ALTS + 2
+    with pytest.raises(ValueError, match="possible working directories"):
+        g._workspace_from_cd(chain, "/work")
+    ws = _workspace(tmp_path / "ws", ["mig_cat"])
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]}))
+    v = g.evaluate_with_workdirs(chain, g.load_config(ws), ws, str(ws))
+    assert v.decision == "block" and any("possible working directories" in x for x in v.violations)
+
+
+def test_subshell_cd_does_not_hide_the_workspace(tmp_path: Path):
+    ws = _workspace(tmp_path / "repo", ["mig_cat"])
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]}))
+    root, cfg = g._workspace_from_cd(f"(cd /tmp); cd repo && {LEGACY_DELETE}", str(tmp_path))
+    assert root == ws and cfg is not None
+    assert g.evaluate_with_workdirs(f"(cd /tmp); cd repo && {LEGACY_DELETE}", cfg, ws, str(tmp_path)).decision == "block"
+    root, cfg = g._workspace_from_cd(f"false || cd {ws}; {LEGACY_DELETE}", "/")
+    assert root == ws and cfg is not None
+    v = g.evaluate_with_workdirs(f"false || cd {ws}; {LEGACY_DELETE}", cfg, ws, "/")
+    assert v.decision == "block" and any("cannot resolve" in x for x in v.violations)
 
 
 def test_cd_into_another_workspace_applies_its_allowlist_too(tmp_path: Path):
@@ -840,6 +881,55 @@ def test_main_hosted_without_workdir_falls_back_to_home(tmp_path: Path, tmp_path
     r = _run_hosted({"tool_name": "exec", "tool_input": {"command": LEGACY_DELETE}}, tmp_path)
     assert r.returncode == 2
     r = _run_hosted({"tool_name": "exec", "tool_input": {"command": LEGACY_DELETE}}, tmp_path_factory.mktemp("no-workspace"))
+    assert r.returncode == 0
+
+
+def test_main_hosted_cd_into_workspace_applies_its_allowlist(tmp_path: Path):
+    ws = tmp_path / "repo"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text(
+        json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]})
+    )
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": f"cd {ws} && {LEGACY_DELETE}"}}, tmp_path / "home")
+    assert r.returncode == 2 and "legacy-sql.corp" in json.loads(r.stdout.strip().splitlines()[-1])["reason"]
+    r = _run_hosted(
+        {"tool_name": "exec", "tool_input": {"command": f'cd {ws} && sqlcmd -S legacy-sql.corp -d loans -Q "SELECT COUNT(*) FROM dbo.loans"'}},
+        tmp_path / "home",
+    )
+    assert r.returncode == 0 and r.stdout.strip() == ""
+    r = _run_hosted(
+        {
+            "tool_name": "exec",
+            "tool_input": {
+                "command": f'''cd {ws} && echo 'databricks experimental aitools tools query "DROP TABLE __dbx_guard_probe__abcd1234.x.y"'''
+            },
+        },
+        tmp_path / "home",
+    )
+    assert r.returncode == 2 and "__dbx_guard_probe__abcd1234" in r.stderr
+
+
+def test_main_hosted_relative_cd_resolves_from_event_cwd(tmp_path: Path):
+    ws = tmp_path / "lead" / "repo"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]}))
+    event = {"tool_name": "exec", "cwd": str(tmp_path / "lead"), "tool_input": {"command": f"cd repo && {LEGACY_DELETE}"}}
+    r = _run_hosted(event, tmp_path / "home")
+    assert r.returncode == 2 and "legacy-sql.corp" in json.loads(r.stdout.strip().splitlines()[-1])["reason"]
+
+
+def test_main_hosted_cd_into_workspace_with_broken_allowlist_blocks(tmp_path: Path):
+    ws = tmp_path / "repo"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text("{not json")
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": f"cd {ws} && git status"}}, tmp_path / "home")
+    assert r.returncode == 2 and "cannot read" in r.stderr
+
+
+def test_main_hosted_cd_outside_any_workspace_is_noop(tmp_path: Path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    r = _run_hosted({"tool_name": "exec", "tool_input": {"command": f"cd {plain} && {LEGACY_DELETE}"}}, tmp_path / "home")
     assert r.returncode == 0
 
 

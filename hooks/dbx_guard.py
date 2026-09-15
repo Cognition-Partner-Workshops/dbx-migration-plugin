@@ -10,7 +10,8 @@ client elsewhere writes when every host candidate is in `target_hosts` and the w
 Nothing writes `.migration/` or the running guard's tree (git there is the `_git_reads` allowlist). Scripts and SQL files are
 read in the command's effective directory (event cwd, cd / pushd / env -C / git -C); what the guard cannot read blocks where a
 client is involved. No `.migration/` up the tree approves everything, one without a readable allowlist blocks everything, the
-doctor's `__dbx_guard_probe__<nonce>` always blocks. `hooks/tests/test_probe_table.py` pins this policy; add a row first.
+workspace is also found through a leading `cd`/`pushd` in the command, and the doctor's `__dbx_guard_probe__<nonce>` always
+blocks. `hooks/tests/test_probe_table.py` pins this policy; add a row first.
 """
 from __future__ import annotations
 
@@ -350,6 +351,11 @@ class _Seg:
     scripts: list[str] = field(default_factory=list)   # files it executes
     ctx: str = ""                                      # text of the prefixes / wrapper (`ssh host`) it runs under
     at: str | None = ""                                # directory it runs in ('' the workspace root, None unresolvable)
+    alts: list[str] = field(default_factory=list)      # the directories it may run in when `at` is None because of `x || cd d`
+    sub: int = 0                                       # how many `( )` subshells enclose it
+    after: str = ""                                    # the operator before it (`&&`, `||`, `;`, ...; '' for the first command)
+    bg: int = 0                                        # the `&`-terminated list it belongs to (runs in a subshell); 0 for none
+    lost: bool = False                                 # the possible directories overflowed _MAX_ALTS and were dropped
 
     argv0 = property(lambda s: s.argv[0].rsplit("/", 1)[-1] if s.argv else "")
     heredocs = property(lambda s: [f for op, f in s.redirects() if op.endswith(("<<", "<<-"))])
@@ -365,6 +371,9 @@ class _Seg:
         return self.raw[self.words.index(word)] if word in self.words else word
 
 
+_MAX_ALTS = 64   # possible directories tracked through `x || cd d` chains before the guard gives up resolving them
+
+
 def _commands(cmd: str) -> list[_Seg]:
     """Simple commands split at operators, group delimiters and line breaks; what a `|` feeds reaches every member of a group
     on its right, and a redirection after `)`/`}` is repeated on every member of the group it closes (fail closed)."""
@@ -373,26 +382,37 @@ def _commands(cmd: str) -> list[_Seg]:
     groups: list[tuple[int, list[_Seg]]] = []   # (index of the first member, stdin the group inherits)
     feed: list[_Seg] = []                        # what the next command's stdin receives
     closed: list[_Seg] = []                      # members of the group just closed
-    cur, i = None, 0
+    lists: list[int] = [0]                       # index of the first member of the and/or list open at each group level
+    cur, i, sub, after, bgs = None, 0, 0, "", 0
     while i < len(toks):
         tok, n = toks[i], 1 + bool(_REDIRECT_OP.fullmatch(toks[i]))   # a redirection travels with its operand
         if n == 1 and tok == "\n" and cur is None and feed and not closed:
             pass                                        # a line break after `|` continues the pipeline
         elif n == 1 and tok in _SEPARATORS and (tok not in ("{", "}") or cur is None):
+            if tok == "&":                              # `&` backgrounds the whole and/or list before it
+                bgs += 1
+                for c in out[lists[-1]:]:
+                    c.bg = c.bg or bgs
+            if tok in ("&", ";", "\n"):
+                lists[-1] = len(out)
             if tok in ("(", "{"):
                 groups.append((len(out), feed))
+                lists.append(len(out))
+                sub += tok == "("
             elif tok in (")", "}"):
                 start, feed = groups.pop() if groups else (0, [])
                 closed = out[start:]
+                lists = lists[:-1] or [0]
+                sub -= tok == ")" and sub > 0
             elif tok in ("|", "|&"):
                 producers = closed or ([cur] if cur else [])
                 feed, closed = producers + [f for p in producers for f in p.feeds], []
             else:
                 feed, closed = (groups[-1][1] if groups else []), []
-            cur = None
+            cur, after = None, tok if tok not in ("(", "{") else after
         else:
             if cur is None and (n == 1 or not closed):
-                cur, closed = _Seg(feeds=list(feed)), []
+                cur, closed = _Seg(feeds=list(feed), sub=sub, after=after), []
                 out.append(cur)
             for c in closed if cur is None else [cur]:
                 c.words.extend(toks[i:i + n])
@@ -520,7 +540,22 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
     env = dict(_ENV_DEFAULTS) if env is None else env
     out: list[_Seg] = []
     dirs: list[str | None] = []
+    alts: list[str] = []                                      # the directories `at` may be when it is None after `x || cd d`
+    scopes: list[tuple[str | None, list[str], list[str | None]]] = []   # (at, alts, dirs) outside each open subshell
+    bg, saved = 0, (at, alts, dirs)                           # the background list being read and the state before it
+    before: list[str | None] = [at]                           # where the shell was before the previous command
+    lost = False
     for seg in _commands(text):
+        if seg.bg != bg:                                      # a `&` list runs in a subshell: what it changes ends with it
+            if bg:
+                at, alts, dirs = saved
+                before = [at] if at is not None else alts
+            bg, saved = seg.bg, (at, list(alts), list(dirs))
+        while len(scopes) < seg.sub:
+            scopes.append((at, list(alts), list(dirs)))
+        while len(scopes) > seg.sub:                          # `( ... ) || cd d`: the parent is where it was before the group
+            at, alts, dirs = scopes.pop()
+            before = [at] if at is not None else alts
         seg.words = [w if not env or "$" not in w or "$" not in re.sub(r"\\.|'[^']*'?", "", r) else
                      _SHELL_VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group()), w) for w, r in zip(seg.words, seg.raw)]
         seg.argv, seg.ctx = _program(aliases.get(seg.args[0] if seg.args else "", seg.args[:1]) + seg.args[1:], seg.assigns)
@@ -537,14 +572,24 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                 seg.stdin.extend(p.heredocs)
         seg.scripts = _scripts_of(seg, seg.argv + [w for op, f in seg.redirects() for w in (op, f)] if seg.ctx else None)
         seg.at = next((_join(at, a[4:]) for a in reversed(seg.assigns) if a.startswith("PWD=")), at)   # `env -C dir`: this command alone
+        seg.alts, seg.lost = list(alts), lost
+        now: list[str | None] = [at] if at is not None else alts
         if seg.argv0 in ("cd", "pushd"):
             args = [w for w in seg.argv[1:] if not (w.startswith("-") and len(w) > 1)]
             dirs += [at] if seg.argv0 == "pushd" else []
-            at = _join(at, args[0] if args else "~")
+            # `x || cd d` runs only if `x` failed, leaving the shell where it was before `x`; whether it ran is unknown
+            moved = now + [_join(p, args[0] if args else "~") for p in before] if seg.after == "||" else \
+                [_join(p, args[0] if args else "~") for p in now]
+            moved = list(dict.fromkeys(moved))
+            at = moved[0] if len(moved) == 1 else None
+            alts = [] if at is not None else [p for p in moved if p is not None]
+            if len(alts) > _MAX_ALTS:                         # too many to enumerate: unresolvable from here on
+                alts, lost = [], True
         elif seg.argv0 == "popd":
-            at = dirs.pop() if dirs else None
+            at, alts = (dirs.pop() if dirs else None), []
         elif seg.argv0 == "alias":
             aliases.update((a.split("=", 1)[0], shlex.split(a.split("=", 1)[1])) for a in seg.argv[1:] if "=" in a)
+        before = now
         out.append(seg)
         if (nested := _shell_runs(seg)[0]) is not None and depth < 4:
             out.extend(_segments(nested, seg.ctx, depth + 1, env, seg.at))
@@ -1066,11 +1111,34 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 
-def _cd_targets(cmd: str) -> list[str | None]:
-    """Directories the command changes into (`cd d`, `pushd d`), in order; None for one the guard cannot resolve (`cd -`, a variable)."""
-    targets = [os.path.expandvars(next((w for w in s.argv[1:] if not (w.startswith("-") and len(w) > 1)), "~"))
-               for s in _segments(cmd) if s.argv0 in ("cd", "pushd")]
-    return [None if t == "-" or _expands(t) else os.path.expanduser(t) for t in targets]
+def _run_dirs(cmd: str, start: str) -> list[Path | None]:
+    """The distinct directories the command's simple commands run in, resolved from `start` and following `cd`/`pushd`/`popd`
+    with subshell and background-list scope; None for one the guard cannot resolve (`cd -`, a variable), followed by the
+    directories it may be (`x || cd d`)."""
+    dirs: list[Path | None] = []
+    for s in _segments(cmd, at=start):
+        dirs += [Path(s.at).resolve() if s.at else None if s.at is None else Path(start)] + [Path(a).resolve() for a in s.alts]
+    return list(dict.fromkeys(dirs))
+
+
+def _workspace_from_cd(command: str, start: str) -> tuple[Path, GuardConfig | None]:
+    """The first workspace the command's commands run in (its `cd`/`pushd` chain resolved from `start`) and its allowlist; a
+    broken allowlist raises ValueError naming the directory, as does a command with more possible directories than the guard
+    tracks (fail closed)."""
+    directory = Path(start)
+    if any(s.lost for s in _segments(command, at=start)):
+        raise ValueError(f"command has more than {_MAX_ALTS} possible working directories; the allowlist in force is unknown")
+    for d in _run_dirs(command, start):
+        if d is None:
+            continue
+        directory = d
+        try:
+            cfg = load_config(directory)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{exc} (workspace {directory})") from exc
+        if cfg is not None:
+            return directory, cfg
+    return directory, None
 
 
 def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str = "", here: str = "") -> Verdict:
@@ -1079,22 +1147,22 @@ def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str 
     first = evaluate(command, cfg, root, cwd, here)
     violations = first.violations or ([first.reason] if first.decision == "block" else [])
     seen = {cfg.path}
-    cwd = Path(cwd) if cwd else root
-    for target in _cd_targets(command):
-        if target is None:
+    if any(s.lost for s in _segments(command, at=cwd or str(root))):
+        violations.append(f"command has more than {_MAX_ALTS} possible working directories; the allowlist in force is unknown")
+    for d in _run_dirs(command, cwd or str(root)):
+        if d is None:
             if _context(command, cfg):
                 violations.append("command changes to a directory the guard cannot resolve before running a Databricks or "
                                   "legacy client; the allowlist in force there is unknown")
-            break
-        cwd = (cwd / target).resolve()
+            continue
         try:
-            other = load_config(cwd)
+            other = load_config(d)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            violations.append(f"cannot read {CONFIG_REL} for {cwd}: {exc}")
+            violations.append(f"cannot read {CONFIG_REL} for {d}: {exc}")
             continue
         if other is not None and other.path not in seen:
             seen.add(other.path)
-            violations += [f"[{other.path}] {x}" for x in evaluate(command, other, cwd).violations]
+            violations += [f"[{other.path}] {x}" for x in evaluate(command, other, d).violations]
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 
@@ -1123,6 +1191,9 @@ def main(stdin_text: str | None = None) -> int:
     root, cwd, here = _dirs(event, tool_input)
     try:
         cfg = load_config(root)
+        if cfg is None:
+            cwd = cwd or here
+            root, cfg = _workspace_from_cd(command, cwd)
     except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
         verdict = Verdict("block", f"dbx-migration-factory guard: cannot read {CONFIG_REL}: {exc}")
     else:

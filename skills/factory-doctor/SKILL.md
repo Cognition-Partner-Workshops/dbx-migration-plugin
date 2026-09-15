@@ -46,7 +46,9 @@ probe's pending nonce is persisted in `.migration/.hook_probe_nonce` and reused 
 1. Run, in the session shell, exactly the `probe_command` printed in that row of the report the
    doctor just wrote. It is an `echo` whose *text* looks like a Databricks write to
    `__dbx_guard_probe__<nonce>`, a catalog that is not allowlisted; it makes no Databricks call
-   whatever happens.
+   whatever happens. Run the probe with the shell tool's working directory set to the workspace, or
+   prefixed with `cd <workspace> &&`; a bare probe run from elsewhere finds no allowlist and is not a
+   valid result.
 2. If the shell tool refuses it with a `dbx-migration-factory guard` reason naming
    `__dbx_guard_probe__<nonce>`, hooks are live: re-run the doctor with
    `--hook-probe-result blocked:<nonce>`. A nonce that does not match the pending nonce keeps the row
