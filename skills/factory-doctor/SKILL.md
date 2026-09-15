@@ -5,7 +5,7 @@ description: Preflight for a DBX migration workspace. Verifies the Databricks CL
 
 # factory-doctor
 
-Nineteen checks, one JSON, no warehouse spend. The point is to find out *before* fifty children
+Twenty checks, one JSON, no warehouse spend. The point is to find out *before* fifty children
 launch that the session is a human identity, the harness is not installed, the hooks are not
 being applied, the source credential can write, or the tolerances on disk are not the committed ones.
 
@@ -70,6 +70,7 @@ probe's pending nonce is persisted in `.migration/.hook_probe_nonce` and reused 
 | `allowed_targets` | allowlist invalid or rejected | `hooks/dbx_guard.py` |
 | `allowlist_committed` | allowlist/tolerances differ from HEAD | `git` |
 | `allowlist_matches_contract` | catalogs differ from the wave contract | `allowed_targets.json` |
+| `playbooks_in_sync` | installed playbooks differ from repo files, or the lock is missing | `.migration/playbooks.lock.json` |
 | `hooks_files` | hook registration missing or malformed | plugin root |
 | `hook_guard_functional` | probe is not blocked by the guard | `hooks/dbx_guard.py` |
 | `hook_platform_loaded` | live probe unblocked or nonce unverified | this session |
@@ -110,3 +111,7 @@ Reference details and factory placement: [references/checks.md](references/check
   matches a `06_decisions.md` line containing the id, `source_principal_read_only` and `attested`
   (rejected for families that have a query — Databricks included); `unverified` for the other
   families, and it blocks `ready`.
+- `playbooks_in_sync` compares `.migration/playbooks.lock.json` against the repo playbook files
+  (sha256 each): a stale, missing or unknown macro, or a playbook file absent from the 0-README
+  Files table, fails the row. Re-running `install-dbx-factory` is the only fix; at setup (before
+  the lock exists) the row is `skipped` with the warning that the live library is unverified.

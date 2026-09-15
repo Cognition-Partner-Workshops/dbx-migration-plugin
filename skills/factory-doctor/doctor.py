@@ -67,6 +67,7 @@ SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", 
 # that differs from HEAD is a contract nobody reviewed.
 LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
 CAPABILITIES = ".migration/09_capabilities.json"
+PLAYBOOKS_LOCK = ".migration/playbooks.lock.json"
 HOOK_PROBE_NONCE = ".migration/.hook_probe_nonce"
 HOOK_PROBE_NONCE_TTL = 8 * 60 * 60
 
@@ -364,6 +365,72 @@ def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None
                      f"allowlist catalogs {cats} differ from the contract's {expected}; a catalog is "
                      "added by a recorded decision and a new doctor run, never by editing either side", data)
     return Check("allowlist_matches_contract", "ok", f"allowlist catalogs match the contract: {cats}", data)
+
+
+# Files in the playbooks dir that are documentation, not importable playbooks (the README itself
+# and the pre-kickoff intake form the front doors consume).
+_NOT_PLAYBOOKS = frozenset({"0-README.md", "00_intake_template.md"})
+_README_MACRO_ROW = re.compile(r"\|\s*`([^`]+\.md)`\s*\|[^|]*\|\s*`(![\w]+)`\s*\|")
+
+
+def _repo_playbooks(plugin_root: Path) -> dict[str, tuple[str, str]]:
+    """macro -> (repo_file, sha256 of the file bytes). Macros come from the Files table in
+    playbooks/0-README.md: rows `| `<file>` | <title> | `!<macro>` |`."""
+    playbooks = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
+    macros: dict[str, tuple[str, str]] = {}
+    readme = playbooks / "0-README.md"
+    if readme.is_file():
+        for line in readme.read_text().splitlines():
+            m = _README_MACRO_ROW.match(line)
+            if not m:
+                continue
+            p = playbooks / m.group(1)
+            if p.is_file() and p.name not in _NOT_PLAYBOOKS:
+                macros[m.group(2)] = (p.name, hashlib.sha256(p.read_bytes()).hexdigest())
+    return macros
+
+
+def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str) -> Check:
+    """The playbooks installed in the org library, proven against the repo copies the wave contract
+    was reviewed from: install-dbx-factory records each macro's file sha256 in the lock it writes;
+    any drift means a live playbook is not the reviewed one."""
+    cid = "playbooks_in_sync"
+    lock = ws / PLAYBOOKS_LOCK
+    if not lock.is_file():
+        if role == "setup":
+            return Check(cid, "skipped", f"no {PLAYBOOKS_LOCK} yet; install-dbx-factory writes it "
+                         "(warning: live playbooks unverified)", {"lock": PLAYBOOKS_LOCK})
+        return Check(cid, "fail", f"no {PLAYBOOKS_LOCK}: the playbooks installed in the org library "
+                     "are unverified; run install-dbx-factory", {"lock": PLAYBOOKS_LOCK})
+    try:
+        lock_data = json.loads(lock.read_text())
+    except (OSError, ValueError) as e:
+        return Check(cid, "fail", f"{PLAYBOOKS_LOCK} unreadable: {_redact(str(e))}", {"lock": PLAYBOOKS_LOCK})
+    if not isinstance(lock_data, dict):
+        return Check(cid, "fail", f"{PLAYBOOKS_LOCK} is not a JSON object", {"lock": PLAYBOOKS_LOCK})
+    repo = _repo_playbooks(plugin_root)
+    data: dict = {"stale": [], "missing": [], "unknown": [], "unlisted": [], "checked": len(repo)}
+    for macro, (_repo_file, sha) in repo.items():
+        entry = lock_data.get(macro)
+        if entry is None:
+            data["missing"].append(macro)
+        elif not isinstance(entry, dict) or entry.get("sha256") != sha:
+            data["stale"].append(macro)
+    data["unknown"] = sorted(m for m in lock_data if m not in repo)
+    repo_files = {f for f, _sha in repo.values()}
+    playbooks_dir = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
+    data["unlisted"] = sorted(p.name for p in playbooks_dir.glob("*.md")
+                              if p.name not in _NOT_PLAYBOOKS and p.name not in repo_files)
+    findings = [f"{k}: {', '.join(v)}" for k, v in
+                (("stale", data["stale"]), ("missing", data["missing"]), ("unknown", data["unknown"])) if v]
+    if data["unlisted"]:
+        findings.append(f"not in the 0-README Files table: {', '.join(data['unlisted'])}")
+    if findings:
+        return Check(cid, "fail", "; ".join(findings) + " — re-run install-dbx-factory", data)
+    installed = [e.get("installed_at") for e in lock_data.values()
+                 if isinstance(e, dict) and e.get("installed_at")]
+    return Check(cid, "ok", f"{len(repo)} playbooks match {PLAYBOOKS_LOCK}",
+                 {"checked": len(repo), "installed_at": max(installed) if installed else None})
 
 
 def check_official_plugin(plugin_root: Path) -> Check:
@@ -1375,7 +1442,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         lakebase_schema: str | None = None, analytical_schema: str | None = None,
         source_attested: str | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root),
-                           check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs)]
+                           check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs),
+                           check_playbooks_in_sync(ws, plugin_root, role)]
     checks += check_hooks(plugin_root, ws, probe_result)
     checks.append(check_official_plugin(plugin_root))
     checks.append(check_harness(plugin_root))
