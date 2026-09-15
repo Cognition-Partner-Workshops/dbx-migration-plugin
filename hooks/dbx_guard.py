@@ -355,6 +355,7 @@ class _Seg:
     sub: int = 0                                       # how many `( )` subshells enclose it
     after: str = ""                                    # the operator before it (`&&`, `||`, `;`, ...; '' for the first command)
     bg: int = 0                                        # the `&`-terminated list it belongs to (runs in a subshell); 0 for none
+    lost: bool = False                                 # the possible directories overflowed _MAX_ALTS and were dropped
 
     argv0 = property(lambda s: s.argv[0].rsplit("/", 1)[-1] if s.argv else "")
     heredocs = property(lambda s: [f for op, f in s.redirects() if op.endswith(("<<", "<<-"))])
@@ -368,6 +369,9 @@ class _Seg:
 
     def raw_of(self, word: str) -> str:
         return self.raw[self.words.index(word)] if word in self.words else word
+
+
+_MAX_ALTS = 64   # possible directories tracked through `x || cd d` chains before the guard gives up resolving them
 
 
 def _commands(cmd: str) -> list[_Seg]:
@@ -540,6 +544,7 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
     scopes: list[tuple[str | None, list[str], list[str | None]]] = []   # (at, alts, dirs) outside each open subshell
     bg, saved = 0, (at, alts, dirs)                           # the background list being read and the state before it
     before: list[str | None] = [at]                           # where the shell was before the previous command
+    lost = False
     for seg in _commands(text):
         if seg.bg != bg:                                      # a `&` list runs in a subshell: what it changes ends with it
             if bg:
@@ -567,7 +572,7 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                 seg.stdin.extend(p.heredocs)
         seg.scripts = _scripts_of(seg, seg.argv + [w for op, f in seg.redirects() for w in (op, f)] if seg.ctx else None)
         seg.at = next((_join(at, a[4:]) for a in reversed(seg.assigns) if a.startswith("PWD=")), at)   # `env -C dir`: this command alone
-        seg.alts = list(alts)
+        seg.alts, seg.lost = list(alts), lost
         now: list[str | None] = [at] if at is not None else alts
         if seg.argv0 in ("cd", "pushd"):
             args = [w for w in seg.argv[1:] if not (w.startswith("-") and len(w) > 1)]
@@ -578,6 +583,8 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
             moved = list(dict.fromkeys(moved))
             at = moved[0] if len(moved) == 1 else None
             alts = [] if at is not None else [p for p in moved if p is not None]
+            if len(alts) > _MAX_ALTS:                         # too many to enumerate: unresolvable from here on
+                alts, lost = [], True
         elif seg.argv0 == "popd":
             at, alts = (dirs.pop() if dirs else None), []
         elif seg.argv0 == "alias":
@@ -1116,8 +1123,11 @@ def _run_dirs(cmd: str, start: str) -> list[Path | None]:
 
 def _workspace_from_cd(command: str, start: str) -> tuple[Path, GuardConfig | None]:
     """The first workspace the command's commands run in (its `cd`/`pushd` chain resolved from `start`) and its allowlist; a
-    broken allowlist raises ValueError naming the directory."""
+    broken allowlist raises ValueError naming the directory, as does a command with more possible directories than the guard
+    tracks (fail closed)."""
     directory = Path(start)
+    if any(s.lost for s in _segments(command, at=start)):
+        raise ValueError(f"command has more than {_MAX_ALTS} possible working directories; the allowlist in force is unknown")
     for d in _run_dirs(command, start):
         if d is None:
             continue
@@ -1137,6 +1147,8 @@ def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str 
     first = evaluate(command, cfg, root, cwd, here)
     violations = first.violations or ([first.reason] if first.decision == "block" else [])
     seen = {cfg.path}
+    if any(s.lost for s in _segments(command, at=cwd or str(root))):
+        violations.append(f"command has more than {_MAX_ALTS} possible working directories; the allowlist in force is unknown")
     for d in _run_dirs(command, cwd or str(root)):
         if d is None:
             if _context(command, cfg):

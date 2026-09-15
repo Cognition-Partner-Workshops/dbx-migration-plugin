@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -493,6 +494,20 @@ def test_run_dirs_follow_cd_with_shell_scope():
     assert g._run_dirs("(cd sub; false) || cd repo; sqlcmd -Q x", "/work") == [P("/work"), P("/work/sub"), None, P("/work/repo")]
     many = g._run_dirs("false || cd a; false || cd b; false || cd c; false || cd repo; sqlcmd -Q x", "/work")
     assert P("/work/repo") in many and P("/work/a/b/c/repo") in many and len(many) == 17   # 2**4 directories + None
+
+
+def test_too_many_possible_directories_fails_closed(tmp_path: Path):
+    chain = "; ".join(f"false || cd d{i}" for i in range(20)) + "; sqlcmd -S legacy-sql.corp -Q 'select 1'"
+    t = time.monotonic()
+    segs = g._segments(chain, at="/work")
+    assert time.monotonic() - t < 2 and segs[-1].lost and segs[-1].at is None and segs[-1].alts == []
+    assert len(g._run_dirs(chain, "/work")) <= 2 * g._MAX_ALTS + 2
+    with pytest.raises(ValueError, match="possible working directories"):
+        g._workspace_from_cd(chain, "/work")
+    ws = _workspace(tmp_path / "ws", ["mig_cat"])
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["legacy-sql.corp"]}))
+    v = g.evaluate_with_workdirs(chain, g.load_config(ws), ws, str(ws))
+    assert v.decision == "block" and any("possible working directories" in x for x in v.violations)
 
 
 def test_subshell_cd_does_not_hide_the_workspace(tmp_path: Path):
