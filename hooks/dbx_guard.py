@@ -837,8 +837,7 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
             json_text = " ".join(json_args)
             if _expands(json_text):
                 return [f"`databricks postgres {verb}` JSON payload must be literal (fail closed)"]
-            text = getattr(seg, "text", " ".join(seg.argv))
-            for match in _LAKEBASE_REFERENCE.finditer(text):
+            for match in _LAKEBASE_REFERENCE.finditer(seg.text):
                 if violation := _lakebase_scope(verb, *match.groups(), cfg):
                     return violation
         return []
