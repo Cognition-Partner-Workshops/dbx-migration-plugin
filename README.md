@@ -87,6 +87,8 @@ through; everything else it recognises blocks. It is a no-op outside a workspace
   "guard_mode": "block",
   "target_hosts": ["fixture-host", "LAKEBASE_MIGRATION_DSN"],
   "bundle_targets": ["migration", "dev"],
+  "lakebase_projects": ["loan-servicing-mig"],
+  "lakebase_branches": ["mig-*"],
   "forbidden_bundle_targets": ["prod", "production"]
 }
 ```
@@ -98,6 +100,8 @@ through; everything else it recognises blocks. It is a no-op outside a workspace
 | `guard_mode` | no | `block` (default) or `warn` (approve with the reason attached). |
 | `target_hosts` | no | hosts / DSN names a generic SQL client (`psql`, `sqlcmd`, `isql`, `mysql`, ...) may run a non-read statement against. Every host candidate on the line (`-h`/`-S`/`--host`, `PGHOST=`, a positional or `-d` URI / conninfo) or in the script's reconnect meta-commands (psql `\c db user host`, `\c 'host=...'`, sqlcmd `:connect host`, mysql `connect db host`) must be a literal in the list, and there must be at least one; the write's container must still be in `catalogs`. **Missing or empty: every generic-client write blocks.** |
 | `bundle_targets` | no | targets `databricks bundle deploy\|run\|destroy` and `dbt run\|build\|seed` may use with a literal `-t/--target`. **Missing or empty: every deploy blocks.** |
+| `lakebase_projects` | no | Lakebase (Autoscaling Postgres) project ids a `databricks postgres` resource write (branch / endpoint / database / role / CDF) may target, under any branch except `production`; project lifecycle always blocks; `create-catalog` / `create-synced-table` are held to `catalogs`; reads and `generate-database-credential` pass. **Missing or empty: every Lakebase write blocks.** |
+| `lakebase_branches` | no | `fnmatch` globs for Lakebase branch ids that resource writes and branch references in Postgres catalog/synced-table JSON may target; `production` is always blocked. **Missing or empty: any non-`production` branch is allowed.** |
 | `forbidden_bundle_targets` | no | extra denylist on top of `bundle_targets`; default `["prod", "production"]`. |
 
 Always blocked regardless of config: `databricks` commands outside the read allowlist whose

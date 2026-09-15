@@ -3,7 +3,8 @@
 
 Reads a PreToolUse event ({"tool_input": {"command"}, "cwd"}), loads the nearest `.migration/allowed_targets.json` (`catalogs`
 required; `legacy_sources`, `guard_mode` block|warn, `target_hosts`, `bundle_targets`, `forbidden_bundle_targets`; hosts and
-bundle targets fail closed when empty) and judges every simple command by its program: Databricks clients pass `_DBX_READ`
+bundle targets fail closed when empty; Lakebase writes use allowlisted projects and branches and never target `production`) and judges every
+simple command by its program: Databricks clients pass `_DBX_READ`
 shapes and mutate only allowlisted securables; REST to a workspace host is GET without a body; deploys need a listed target;
 identity is never changed. Legacy-only clients and generic clients naming a legacy source run read shapes only; a generic
 client elsewhere writes when every host candidate is in `target_hosts` and the write resolves to a listed catalog / database.
@@ -159,12 +160,22 @@ _DBX_READ = {
     "grants": {"get", "get-effective"}, "jobs": {"list", "get", "list-runs", "get-run", "get-run-output"},
     "pipelines": {"list", "get", "list-updates", "get-update", "list-pipeline-events"}, "warehouses": {"list", "get"},
     "clusters": {"list", "get", "events", "spark-versions", "list-node-types", "list-zones"},
-    "workspace": {"list", "export", "get-status"}, "secrets": {"list-scopes", "list-secrets"},
+    "workspace": {"list", "export", "get-status"}, "secrets": {"list-scopes", "list-secrets"}, "postgres": {
+        "list-branches", "list-cdf-configs", "list-cdf-statuses", "list-databases", "list-endpoints", "list-projects",
+        "list-roles", "get-branch", "get-catalog", "get-cdf-config", "get-cdf-status", "get-database", "get-endpoint",
+        "get-operation", "get-project", "get-role", "get-synced-table", "generate-database-credential"},
     "auth": {"describe", "profiles"}, "fs": {"ls", "cat", "head"}, "api": {"get"}, "bundle": {"validate", "summary"}}
 _TOKEN_PRINTERS = ("auth token", "auth env")   # print the bearer token into the session log
-_LIFECYCLE = ("catalogs create", "catalogs update", "catalogs delete", "schemas delete", "grants update", "grants delete")
+_LIFECYCLE = ("catalogs create", "catalogs update", "catalogs delete", "schemas delete", "grants update", "grants delete",
+              "postgres create-project", "postgres delete-project", "postgres undelete-project", "postgres update-project")
 _CLI_CATALOG_ARG = {"schemas create": 1, "schemas update": 0, "tables delete": 0, "volumes create": 0, "volumes delete": 0,
-                    "volumes update": 0, "functions delete": 0, "functions update": 0}
+                    "volumes update": 0, "functions delete": 0, "functions update": 0, "postgres create-catalog": 0,
+                    "postgres delete-catalog": 0, "postgres create-synced-table": 0, "postgres delete-synced-table": 0}
+_LAKEBASE_RESOURCE = re.compile(r"^projects/([^/\s]+)(?:/branches/([^/\s]+))?(?:/.*)?$")
+_LAKEBASE_REFERENCE = re.compile(r"""projects/([^/\s"']+)(?:/branches/([^/\s"']+))?""")
+_LAKEBASE_WRITE = {"create-branch", "delete-branch", "update-branch", "create-endpoint", "delete-endpoint", "update-endpoint",
+                   "create-database", "delete-database", "update-database", "create-role", "delete-role", "update-role",
+                   "create-cdf-config", "delete-cdf-config"}
 _DBX_VALUE_FLAGS = {"-o", "--output", "--log-level", "--log-file", "--log-format", "--progress-format", "-t", "--target", "-p",
                     "--profile", "--host", "--warehouse-id", "--catalog", "--schema", "--format", "--wait-timeout", "--json",
                     "--var", "--file", "--language", "--string-value", "--bytes-value", "-e", "--statement", "--query"}
@@ -219,6 +230,8 @@ class GuardConfig:
     forbidden_bundle_targets: tuple[str, ...] = DEFAULT_FORBIDDEN_BUNDLE_TARGETS
     target_hosts: list[str] = field(default_factory=list)
     bundle_targets: list[str] = field(default_factory=list)
+    lakebase_projects: list[str] = field(default_factory=list)
+    lakebase_branches: list[str] = field(default_factory=list)
     path: Path | None = None
 
     @classmethod
@@ -227,16 +240,18 @@ class GuardConfig:
         if not isinstance(catalogs, list) or not catalogs:
             raise ValueError("allowed_targets.json must contain a non-empty 'catalogs' list")
         lists = {}
-        for key in ("legacy_sources", "forbidden_bundle_targets", "target_hosts", "bundle_targets"):
+        for key in ("legacy_sources", "forbidden_bundle_targets", "target_hosts", "bundle_targets", "lakebase_projects", "lakebase_branches"):
             value = data.get(key, list(DEFAULT_FORBIDDEN_BUNDLE_TARGETS) if key == "forbidden_bundle_targets" else [])
             if not isinstance(value, list):
                 raise ValueError(f"'{key}' must be a list")
             lists[key] = [str(x).strip() for x in value if str(x).strip()]
+        lists["lakebase_projects"] = [p.removeprefix("projects/") for p in lists["lakebase_projects"]]
         mode = str(data.get("guard_mode", "block")).lower()
         if mode not in ("block", "warn"):
             raise ValueError("'guard_mode' must be 'block' or 'warn'")
         return cls([_norm(c) for c in catalogs], lists["legacy_sources"], mode, tuple(t.lower() for t in lists["forbidden_bundle_targets"]),
-                   [h.lower() for h in lists["target_hosts"]], lists["bundle_targets"], path)   # DAB / dbt targets compared exactly
+                   [h.lower() for h in lists["target_hosts"]], lists["bundle_targets"], lists["lakebase_projects"],
+                   lists["lakebase_branches"], path)   # DAB / dbt targets compared exactly
 
 
 @dataclass
@@ -426,6 +441,33 @@ def _expands(text: str, subst: bool = False) -> bool:
     live = re.sub(r"\\.|'[^']*'?", lambda m: " " * len(m.group()), text, flags=re.DOTALL)
     return any(not re.fullmatch(r"[\w$-]+", m.group(1)) for m in re.finditer(r"`([^`]*)`", live)) or (
         bool(re.search(r"\$\(|(?<![\w])[<>]\(", live)) if subst else "$" in live)
+
+
+def _lakebase_scope(verb: str, project: str, branch: str | None, cfg: GuardConfig) -> list[str]:
+    if project not in cfg.lakebase_projects:
+        return [f"`databricks postgres {verb}` targets Lakebase project {project!r} outside allowed lakebase_projects "
+                f"{cfg.lakebase_projects} (empty = every Lakebase write blocks)"]
+    if branch == "production":
+        return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project {project}; migration sessions "
+                "write only per-batch branches (production is repointed at STOP E)"]
+    if branch is not None and cfg.lakebase_branches and not any(fnmatch.fnmatchcase(branch, pattern)
+                                                                for pattern in cfg.lakebase_branches):
+        return [f"`databricks postgres {verb}` on branch {branch!r} of Lakebase project {project}; allowed lakebase_branches "
+                f"{cfg.lakebase_branches}"]
+    return []
+
+
+def _lakebase_field(verb: str, project: str | None, branch: str | None, cfg: GuardConfig) -> list[str]:
+    if project is not None:
+        return _lakebase_scope(verb, project, branch, cfg)
+    if branch == "production":
+        return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project ?; migration sessions "
+                "write only per-batch branches (production is repointed at STOP E)"]
+    if branch is not None and cfg.lakebase_branches and not any(fnmatch.fnmatchcase(branch, pattern)
+                                                                for pattern in cfg.lakebase_branches):
+        return [f"`databricks postgres {verb}` on branch {branch!r} of Lakebase project ?; allowed lakebase_branches "
+                f"{cfg.lakebase_branches}"]
+    return []
 
 
 def _program(words: list[str], assigns: list[str]) -> tuple[list[str], str]:
@@ -768,7 +810,8 @@ def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, who: st
 
 def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     """The Databricks CLI (`_DBX_READ` shapes pass; a mutation needs an allowlisted securable) and the deploys --
-    `databricks bundle deploy|run|destroy`, `dbt run|build|...` -- whose literal `-t/--target` must be in `bundle_targets`."""
+    `databricks bundle deploy|run|destroy`, `dbt run|build|...` -- whose literal `-t/--target` must be in `bundle_targets`;
+    Lakebase writes are scoped by project and never target `production`."""
     argv, base = seg.argv[1:], seg.argv0
     if base == "databricks" and any(w in ("--version", "-v", "-h", "--help", "version", "help") for w in argv):
         return []
@@ -803,10 +846,61 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         return [f"`databricks {key}` prints the session's bearer token (credential exposure); `auth describe` shows the identity without it"]
     if key in _LIFECYCLE:
         return [(f"`databricks {key}` on {' '.join(args) or '<securable>'!r}: the allowlist authorizes object writes inside a "
-                 "catalog, never catalog lifecycle or permissions (those happen at STOP E)")]
+                 "catalog / Lakebase-project lifecycle or permissions (those happen at STOP E)")]
     if key in _CLI_CATALOG_ARG:
         name = (args + ["", ""])[_CLI_CATALOG_ARG[key]]
-        return [] if name and _norm(name.split(".")[0]) in cfg.catalogs else [f"CLI mutation of securable {name!r} outside allowlist {sorted(cfg.catalogs)}"]
+        if not name or _norm(name.split(".")[0]) not in cfg.catalogs:
+            return [f"CLI mutation of securable {name!r} outside allowlist {sorted(cfg.catalogs)}"]
+        if group == "postgres":
+            json_raw = [seg.raw_of(argv[n + 1]) for n, w in enumerate(argv[:-1]) if w == "--json"]
+            json_vals = [argv[n + 1] for n, w in enumerate(argv[:-1]) if w == "--json"]
+            json_raw += [seg.raw_of(w) for w in argv if w.startswith("--json=")]
+            json_vals += [w.removeprefix("--json=") for w in argv if w.startswith("--json=")]
+            if _expands(" ".join(json_raw)) or any(value.startswith("@") for value in json_vals):
+                return [f"`databricks postgres {verb}` JSON payload must be literal (fail closed): no expansion, no `@file`"]
+            def walk_fields(value):
+                if isinstance(value, dict):
+                    for key_name, child in value.items():
+                        if isinstance(child, str):
+                            key_lower = str(key_name).lower()
+                            if "project" in key_lower:
+                                if violation := _lakebase_field(verb, child.removeprefix("projects/").split("/")[0], None, cfg):
+                                    return violation
+                            elif "branch" in key_lower and not key_lower.startswith("source"):
+                                project, branch = None, child
+                                if "branches/" in child:
+                                    match = _LAKEBASE_REFERENCE.search(child)
+                                    project, branch = match.groups() if match else (None, None)
+                                if violation := _lakebase_field(verb, project, branch, cfg):
+                                    return violation
+                        if violation := walk_fields(child):
+                            return violation
+                elif isinstance(value, list):
+                    for child in value:
+                        if violation := walk_fields(child):
+                            return violation
+                return []
+            for json_value in json_vals:
+                try:
+                    parsed = json.loads(json_value)
+                except json.JSONDecodeError:
+                    return [f"`databricks postgres {verb}` JSON payload is not parseable JSON (fail closed)"]
+                if violation := walk_fields(parsed):
+                    return violation
+            for match in _LAKEBASE_REFERENCE.finditer(seg.text):
+                if violation := _lakebase_scope(verb, *match.groups(), cfg):
+                    return violation
+        return []
+    if group == "postgres" and verb in _LAKEBASE_WRITE:
+        if not args or _expands(args[0]) or not (match := _LAKEBASE_RESOURCE.fullmatch(args[0])):
+            return [f"`databricks postgres {verb}` requires a literal projects/<project> resource path; allowed lakebase_projects "
+                    f"{cfg.lakebase_projects} (empty = every Lakebase write blocks)"]
+        project, branch = match.groups()
+        if verb == "create-branch":
+            if len(args) <= 1 or _expands(args[1]):
+                return ["`databricks postgres create-branch` needs a literal branch id (fail closed)"]
+            branch = args[1]
+        return _lakebase_scope(verb, project, branch, cfg)
     if verb in _DBX_READ.get(group, ()):
         return []
     return [f"`databricks {group} {verb}`".rstrip() + " is not in the guard's read allowlist (fail closed); reads are "

@@ -1373,6 +1373,18 @@ def _fake_cli(monkeypatch, me, describe):
     monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/databricks")
 
 
+def test_auth_kind_fails_on_conflicting_pat_and_m2m_env(monkeypatch):
+    _fake_cli(monkeypatch, {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"},
+              {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
+    monkeypatch.setenv("DATABRICKS_TOKEN", "token")
+    for name in doctor.M2M_VARS:
+        monkeypatch.setenv(name, name.lower())
+    row = {c.id: c for c in doctor.check_databricks(None)}["databricks_auth_kind"]
+    assert row.status == "fail"
+    assert row.data["auth_kind"] == "conflict (env)"
+    assert "DATABRICKS_TOKEN" in row.detail
+
+
 def test_identity_row_records_the_verified_host_and_the_report_exposes_it(tmp_path, monkeypatch):
     sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
     _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
