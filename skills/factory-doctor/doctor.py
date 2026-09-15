@@ -830,8 +830,9 @@ def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
     if not ledger.is_file():
         return Check(cid, "fail", f"{family}: ledger .migration/06_decisions.md not found",
                      {"decision": decision})
+    named = re.compile(rf"(?<![\w-]){re.escape(decision)}(?![\w-])")
     for line in ledger.read_text().splitlines():
-        if decision in line and "source_principal_read_only" in line and "attested" in line:
+        if named.search(line) and "source_principal_read_only" in line and "attested" in line:
             return Check(cid, "attested", f"{family}: source principal read-only attested by decision "
                          f"{decision} in .migration/06_decisions.md (no principal to query)",
                          {"decision": decision, "family": family, "tables": tables})

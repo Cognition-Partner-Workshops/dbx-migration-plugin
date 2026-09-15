@@ -1400,6 +1400,12 @@ def test_source_attested_fails_without_a_matching_ledger_line(tmp_path):
     row = by_id(report)["source_principal_read_only"]
     assert row["status"] == "fail" and "D-99" in row["detail"]
     assert "source_principal_read_only=fail" in report["blocking"]
+    # a decision id is a whole token: D-9 does not match the D-99 line, nor D-990 a D-99 one
+    _attest(ws, "D-990 | source_principal_read_only attested: static export\n")
+    for wrong in ("D-9", "D-99"):
+        report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                            source_family="teradata", source_attested=wrong)
+        assert by_id(report)["source_principal_read_only"]["status"] == "fail", wrong
 
 
 def test_source_attested_is_rejected_for_families_with_a_privilege_query(tmp_path, monkeypatch):
