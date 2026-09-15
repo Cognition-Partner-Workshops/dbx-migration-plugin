@@ -14,16 +14,16 @@ The 14 playbook bodies are in this skill's `playbooks/` directory (find the skil
 
 This step is idempotent — it is both the initial import and the re-sync after a plugin update, and it converges the live library to the repo files byte-for-byte:
 
-1. List the live library: call the builtin `devin_playbook_manage` (via the `devin_mcp` tool: `command="call_tool"`, `tool_name="devin_playbook_manage"`) with `{"action":"list","first":200}`; follow the `after`/end_cursor pagination until exhausted. Build macro -> {playbook_id, title, content}.
+1. List the live library: call the builtin `devin_playbook_manage` (via the `devin_mcp` tool: `command="call_tool"`, `tool_name="devin_playbook_manage"`) with `{"action":"list","first":200}`; follow the `after`/end_cursor pagination until exhausted. Group the records by macro. A repo macro with more than one live record is a halt: stop before any create/update, do not write the lock, and report every duplicate `playbook_id` for the operator to remove — the platform does not say which duplicate a `!macro` resolves to, so updating one of them proves nothing. Only then build macro -> {playbook_id, title, content}.
 2. For each repo playbook, in the README table order, compute the sha256 of the file bytes. Then:
    - No live playbook has the macro: `{"action":"create","title":<README title>,"content":<file body verbatim>,"macro":<macro>}`.
    - The live `content` differs byte-for-byte from the file: `{"action":"update","playbook_id":<id>,"title":<README title>,"content":<file body>,"macro":<macro>}` (v3 update is full-replace, so always pass title+content+macro). Never edit, summarize, or re-wrap a body.
    - Identical: no call. If the tool returned the live `content` truncated (the `get` output is capped, and every playbook here is longer than the cap), you cannot prove identity: treat it as differing and update — the update is a full replace of the same bytes, so it is harmless when nothing changed.
    Pass long content via a `file:///` path — the `devin_mcp` tool substitutes it.
-3. After the loop, write `.migration/playbooks.lock.json` in the engagement workspace:
+3. After the loop, build the lock data in memory only:
    `{"<macro>": {"sha256": "<hex>", "repo_file": "<file name>", "installed_at": "<UTC ISO-8601 of this run>"}}`
-   for every playbook — created, updated, or unchanged (`installed_at` is this run for all, so the lock is the record of the last confirmed sync) — sorted keys, 2-space indent; commit it with the workspace. `factory-doctor`'s `playbooks_in_sync` row compares this lock to the repo files, and re-running this skill is the only fix for a red row.
-4. If any create/update needs an approval that is not granted: stop, do NOT write the lock, and report the exact stale macros — never bypass.
+   for every playbook — created, updated, or unchanged (`installed_at` is this run for all, so the lock is the record of the last confirmed sync). Do not write it yet: `.migration/playbooks.lock.json` is written in Step 3 only after the live re-read confirms every macro. `factory-doctor`'s `playbooks_in_sync` row compares this lock to the repo files, and re-running this skill is the only fix for a red row.
+4. If any create/update needs an approval that is not granted, or fails: stop, do NOT write the lock, delete any pre-existing `.migration/playbooks.lock.json` (a stale receipt must not survive a failed sync), and report the exact stale macros — never bypass.
 
 If the builtin playbook tools are unavailable or lack permission, fall back to the Playbooks REST API (`POST /v3/playbooks` for org scope) with a service-user key the user provides, and if that is also unavailable, attach the playbook files to a message and ask the user to import them via the UI. Never silently skip a playbook.
 
@@ -39,7 +39,7 @@ Use your environment-config tools to submit this as a blueprint suggestion for t
 
 ## Step 3: Verify and report
 
-1. List org playbooks again (`devin_playbook_manage {"action":"list"}`) and confirm all 14 macros resolve and every macro's live content hash equals the sha256 recorded in `.migration/playbooks.lock.json`.
+1. List org playbooks again (`devin_playbook_manage {"action":"list"}`, then `get` per macro) and confirm every one of the 14 macros resolves to exactly one record whose live content hashes to the sha256 in the in-memory lock data; when `get` returns the content capped, the macro passes only if this run's create/update for it returned success (a full replace of the repo bytes) and the returned prefix matches the file. Only when all 14 pass, write `.migration/playbooks.lock.json` (sorted keys, 2-space indent) and commit it with the workspace. If any macro fails, do not write the lock, delete any pre-existing one, and report the failing macros.
 2. Report to the user: playbooks created/updated/unchanged (with macros), lock written, blueprint suggestion status, and the one-line operator guide: start an engagement with `!dbx_migrate_etl`, `!dbx_migrate_warehouse`, `!dbx_migrate_code`, or `!dbx_migrate_oltp`, then answer the five approval stops.
 
 ## Forbidden
