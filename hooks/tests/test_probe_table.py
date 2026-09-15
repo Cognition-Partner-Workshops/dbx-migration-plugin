@@ -698,6 +698,8 @@ PROBES2 = [
     ("R4 legacy read with decision token still approves", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'SELECT 1'", "approve"),
     ("R4 decision token on unreadable legacy script", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -i missing.sql", "block"),
     ("R4 legacy write flag form is rejected", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD x INT' --decision D-7", "block"),
+    ("R4 decision token inside SQL text is not a prefix", "sqlcmd -S tdprod.corp -Q 'DBX_DECISION=D-7 ALTER TABLE dbo.orders ADD x INT'", "block"),
+    ("R4 decision token in SQL comment is not a prefix", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD x INT -- DBX_DECISION=D-7'", "block"),
 ]
 
 
