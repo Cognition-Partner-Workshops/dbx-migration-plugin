@@ -392,6 +392,7 @@ class _Seg:
     ctx: str = ""                                      # text of the prefixes / wrapper (`ssh host`) it runs under
     remote: str = ""                                   # remote execution wrapper, when the command runs outside this workspace
     env: dict[str, str] = field(default_factory=dict)  # environment inherited by this command after shell assignments and unset
+    loops: frozenset[str] = frozenset()                 # values joined from a shell loop binding
     at: str | None = ""                                # directory it runs in ('' the workspace root, None unresolvable)
     alts: list[str] = field(default_factory=list)      # the directories it may run in when `at` is None because of `x || cd d`
     sub: int = 0                                       # how many `( )` subshells enclose it
@@ -662,23 +663,28 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
     the directory it runs in (`at`, moved by `cd`/`pushd`/`popd`, `env -C` for its own command only)."""
     aliases: dict[str, list[str]] = {}
     env = dict(_ENV_DEFAULTS) if env is None else env
+    loops: set[str] = set()
     out: list[_Seg] = []
     dirs: list[str | None] = []
     alts: list[str] = []                                      # the directories `at` may be when it is None after `x || cd d`
-    scopes: list[tuple[str | None, list[str], list[str | None]]] = []   # (at, alts, dirs) outside each open subshell
-    bg, saved = 0, (at, alts, dirs)                           # the background list being read and the state before it
+    scopes: list[tuple[str | None, list[str], list[str | None], dict[str, str]]] = []   # state outside each open subshell
+    bg, saved = 0, (at, alts, dirs, dict(env))                # the background list being read and the state before it
     before: list[str | None] = [at]                           # where the shell was before the previous command
     lost = False
     for seg in _commands(text):
         if seg.bg != bg:                                      # a `&` list runs in a subshell: what it changes ends with it
             if bg:
-                at, alts, dirs = saved
+                at, alts, dirs, saved_env = saved
+                env.clear()
+                env.update(saved_env)
                 before = [at] if at is not None else alts
-            bg, saved = seg.bg, (at, list(alts), list(dirs))
+            bg, saved = seg.bg, (at, list(alts), list(dirs), dict(env))
         while len(scopes) < seg.sub:
-            scopes.append((at, list(alts), list(dirs)))
+            scopes.append((at, list(alts), list(dirs), dict(env)))
         while len(scopes) > seg.sub:                          # `( ... ) || cd d`: the parent is where it was before the group
-            at, alts, dirs = scopes.pop()
+            at, alts, dirs, saved_env = scopes.pop()
+            env.clear()
+            env.update(saved_env)
             before = [at] if at is not None else alts
         seg.words = [w if not env or "$" not in w or "$" not in re.sub(r"\\.|'[^']*'?", "", r) else
                      _SHELL_VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group()), w) for w, r in zip(seg.words, seg.raw)]
@@ -697,11 +703,14 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                    if _ASSIGN.match(a))   # a bare or declared assignment persists for later commands
         if seg.argv0 == "unset":
             env.update((name, "") for name in seg.argv[1:] if re.fullmatch(r"[A-Za-z_]\w*", name))
-        seg.env = dict(env)
         if seg.argv0 == "for" and seg.argv[2:3] == ["in"] and len(seg.argv) > 3:
             values = seg.argv[3:]
             if re.fullmatch(r"[A-Za-z_]\w*", seg.argv[1]):
-                env[seg.argv[1]] = " ".join(values)
+                joined = " ".join(values)
+                env[seg.argv[1]] = joined
+                loops.add(joined)
+        seg.env = dict(env)
+        seg.loops = frozenset(loops)
         for p in seg.feeds:
             pargs, base = p.args, p.args[0].rsplit("/", 1)[-1] if p.args else ""
             if base not in ("cat", "echo", "printf", "tee") or _expands(" ".join(p.raw)):
@@ -788,8 +797,9 @@ def _hosts(seg: _Seg, recon: list[list[str]] = ()) -> list[str]:
     joined = " ".join([*(w for w in argv[1:] if w not in sql), *itertools.chain.from_iterable(recon)])
     out += re.findall(r"://(?:[^@/\s]*@)?([^:/?\s;]+)", joined)
     out += re.findall(r"(?i)\b(?:host|hostaddr|server|data source|addr)=([^;\s]+)", joined)
+    expanded = [part for h in out for part in (h.split() if h in seg.loops else [h])]
     return [re.split(r"[,:\\]", re.sub(r"^(?:tcp|np|lpc):|^\$\{?(\w+)\}?$", r"\1", h, flags=re.IGNORECASE), 1)[0].lower()
-            for h in out if h]
+            for h in expanded if h]
 
 
 def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
@@ -1113,7 +1123,7 @@ def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     return violations
 
 
-def _check_remote(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
+def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
     """A remote execution (`ssh`, `docker|kubectl exec`, `aws ssm send-command`, `az vm run-command invoke`) naming a legacy source
     is read like a direct command; what would run only on the remote host (an interactive session, a script or SQL file there, a
     payload from a file) blocks."""
@@ -1138,6 +1148,41 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
                               "read by the guard (run the statements inline)")
             continue
         base = seg.argv0
+        if any(op.startswith(">") for op, _ in seg.redirects()):
+            violations.append(f"remote command `{base}` on legacy host {hits} redirects output to a file on the legacy host; "
+                              "legacy hosts are read-only")
+            continue
+        if _PYTHON.fullmatch(base):
+            text, _ = _python_texts(seg, root)
+            if _PY_WRITE.search(text) or re.search(r"\bsubprocess\b|\bos\.(?:system|popen|exec\w*|spawn\w*)\s*\(", text):
+                violations.append(f"remote python `{base}` on legacy host {hits} contains a write or subprocess; legacy hosts are read-only")
+            continue
+        if base in _REST_CLIENTS:
+            flags = ("-o", "--output", "-O", "--remote-name", "--remote-name-all", "--output-document", "-D",
+                     "--dump-header", "-c", "--cookie-jar", "-d", "--download")
+            words = seg.argv[1:]
+            output = bool(_flag_values(seg.argv, flags)) or any(w in flags for w in words)
+            stdout = any(w in ("-O-", "--output-document=-") or
+                         w == "-O" and i + 1 < len(words) and words[i + 1] == "-" or
+                         re.fullmatch(r"-[A-Za-z]*O-", w)
+                         for i, w in enumerate(words))
+            if base == "wget" and not stdout:
+                output = True
+            if output:
+                violations.append(f"remote client `{base}` on legacy host {hits} writes output to a file; legacy hosts are read-only")
+            continue
+        sql_client = base in (*_LEGACY_ONLY, *_GENERIC, "spark-sql", "dbsqlcli")
+        if sql_client:
+            flags = ("-o", "--output", "-L", "--log-file", "--tee")
+            words = seg.argv[1:]
+            output = bool(_flag_values(seg.argv, flags)) or any(w in flags for w in words)
+            output = output or (base == "bcp" and any(w in ("out", "queryout") for w in seg.argv[1:4]))
+            sql, _ = _sql_text(seg, root)
+            output = output or bool(re.search(r"(?im)(?:^|[\s;])(?::out|SPOOL(?!\s+OFF\b)|\.EXPORT)\s+\S", sql))
+            if output:
+                violations.append(f"remote client `{base}` on legacy host {hits} writes query output to a file on the legacy host; "
+                                  "legacy hosts are read-only")
+                continue
         modelled = (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC, *_REST_CLIENTS)
         read_shape = base in _READERS
         if base == "sed" and any(w in ("-i", "--in-place") for w in seg.argv[1:]):
@@ -1149,7 +1194,7 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
         if base in ("unzip", "tee"):
             read_shape = False
         if (base not in modelled and not _PYTHON.fullmatch(base) and base not in _SHELLS
-                and (not read_shape or any(op.startswith(">") for op, _ in seg.redirects()))):
+                and not read_shape):
             violations.append(f"remote command `{base}` on legacy host {hits} is not a read shape the guard models; "
                               "legacy hosts are read-only")
     return violations
@@ -1355,7 +1400,7 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
         violations.append(f"`{m.group()}` is the factory-doctor's hook probe; it always blocks so the doctor can tell the "
                           "hook is loaded without touching Databricks")
     segs, found = _analyse(command, cfg, root, at=cwd)
-    violations += found + _check_identity(segs, cfg) + _check_integrity(segs, root, here) + _check_remote(segs, cfg)
+    violations += found + _check_identity(segs, cfg) + _check_integrity(segs, root, here) + _check_remote(segs, cfg, root)
     for seg in segs:
         violations += _check_fixture(seg, cfg, root)
         base = seg.argv0

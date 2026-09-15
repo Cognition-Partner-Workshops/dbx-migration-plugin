@@ -158,7 +158,7 @@ ALLOWLIST2 = {
     "catalogs": ["mig_cat"],
     "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp", "sqlserver-demo"],
     "guard_mode": "block",
-    "target_hosts": ["lakebase-host"],
+    "target_hosts": ["lakebase-host", "lakebase-peer"],
     "bundle_targets": ["migration"],
 }
 FILES2 = {
@@ -623,6 +623,19 @@ PROBES2 = [
     ("R3 ssh legacy read redirect", "ssh tdprod.corp 'cat /etc/hosts > /tmp/out'", "block"),
     ("R3 ssh legacy read shape", "ssh tdprod.corp 'cat /etc/hosts'", "approve"),
     ("R3 ssh non-legacy inline rm", "ssh other.host 'rm x'", "approve"),
+    ("R4 ssh legacy python file write", "ssh tdprod.corp 'python -c \"open(\\\"/opt/legacy/job.sh\\\", \\\"w\\\").write(\\\"x\\\")\"'", "block"),
+    ("R4 ssh legacy python file read", "ssh tdprod.corp 'python -c \"print(open(\\\"/opt/legacy/job.sh\\\").read())\"'", "approve"),
+    ("R4 ssh legacy python subprocess", "ssh tdprod.corp 'python -c \"import subprocess; subprocess.run([\\\"rm\\\", \\\"/opt/legacy/job.sh\\\"] )\"'", "block"),
+    ("R4 ssh legacy curl output file", "ssh tdprod.corp 'curl -o /tmp/x https://example.invalid/'", "block"),
+    ("R4 ssh legacy curl stdout", "ssh tdprod.corp 'curl -s https://example.invalid/'", "approve"),
+    ("R4 ssh legacy wget output file", "ssh tdprod.corp 'wget https://example.invalid/f'", "block"),
+    ("R4 ssh legacy wget stdout", "ssh tdprod.corp 'wget -qO- https://example.invalid/f'", "approve"),
+    ("R4 ssh legacy sqlcmd output file", "ssh tdprod.corp \"sqlcmd -S localhost -Q 'SELECT 1' -o /tmp/out.txt\"", "block"),
+    ("R4 ssh legacy sqlcmd out directive", "ssh tdprod.corp \"sqlcmd -S localhost -Q ':out /tmp/o.txt SELECT 1'\"", "block"),
+    ("R4 ssh legacy sqlplus spool", "ssh tdprod.corp \"sqlplus -s u/p <<EOF\nSPOOL /tmp/out.lst\nSELECT 1 FROM dual;\nSPOOL OFF\nEOF\"", "block"),
+    ("R4 ssh legacy bcp output file", "ssh tdprod.corp 'bcp db.dbo.t out /tmp/t.dat -S localhost -T'", "block"),
+    ("R4 ssh legacy psql output redirect", "ssh tdprod.corp \"psql -h localhost -c 'SELECT 1' > /tmp/out\"", "block"),
+    ("R4 ssh legacy psql stdout", "ssh tdprod.corp \"psql -h localhost -c 'SELECT 1'\"", "approve"),
     ("R3 az run-command legacy read", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'cat /etc/hosts'", "approve"),
     ("R3 az run-command legacy write", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'sqlcmd -Q \"DELETE FROM dbo.t\"'", "block"),
     ("R3 az run-command legacy remote script", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'bash /opt/fix.sh'", "block"),
@@ -646,6 +659,9 @@ PROBES2 = [
     ("R3 for loop write checks every host", "for h in lakebase-host tdprod.corp; do psql -h \"$h\" -d mig -c 'DROP TABLE t'; done", "block"),
     ("R3 for loop read checks every host", "for h in tdprod.corp other.corp; do psql -h $h -c 'SELECT 1'; done", "approve"),
     ("R3 for loop reads multiple migration paths", "for f in .migration/waves/a.json .migration/waves/b.json; do cat \"$f\"; done", "approve"),
+    ("R4 for loop write over allowlisted hosts", "for h in lakebase-host lakebase-peer; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "approve"),
+    ("R4 for loop read over allowlisted hosts", "for h in lakebase-host lakebase-peer; do psql -h \"$h\" -d mig_cat -c 'SELECT 1'; done", "approve"),
+    ("R4 for loop write over unknown host", "for h in lakebase-host unknown-host.example; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "block"),
 ]
 
 
@@ -769,6 +785,10 @@ def test_fixture_cloud_reason_never_contains_endpoint_value(tmp_path: Path):
     ("AWS_ENDPOINT_URL= aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "block"),
     ("unset AWS_ENDPOINT_URL; aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "block"),
     ("AWS_ENDPOINT_URL=http://localhost:9000 aws s3 ls", {}, "approve"),
+    ("(unset AWS_ENDPOINT_URL); aws s3 ls", {"AWS_ENDPOINT_URL": "http://localhost:9000"}, "approve"),
+    ("(export AWS_ENDPOINT_URL=http://localhost:9000); aws s3 ls", {}, "block"),
+    ("(export AWS_ENDPOINT_URL=http://localhost:9000; aws s3 ls)", {}, "approve"),
+    ("export AWS_ENDPOINT_URL=http://localhost:9000 & aws s3 ls", {}, "block"),
 ])
 def test_fixture_endpoint_environment_is_command_local(tmp_path: Path, command, env, expected):
     ws = _make_tmp_ws(tmp_path, "fixture_command_env_ws", {
