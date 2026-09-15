@@ -1,7 +1,9 @@
 import ast
 import asyncio
 from collections import Counter
+import datetime
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -14,6 +16,10 @@ import pytest
 
 
 WORKFLOW = Path(__file__).with_name("workflow.py")
+
+
+async def _stop_register_workflow(_meta):
+    raise RuntimeError("stop")
 
 
 def _functions():
@@ -360,23 +366,26 @@ def test_prompts_name_every_merge_evidence_mode():
     assert "Fixture evidence is never PASS" in child
 
 
-def test_first_run_requires_wave_run_id():
+def test_first_run_records_the_pointer_run_id_when_given(tmp_path):
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "main"]
     namespace = {
         "resume": False,
-        "os": os,
-        "RUN_ID_PATH": Path(".migration/waves/wave-1.run_id"),
+        "RUN_ID": "wfr-1",
+        "RUN_ID_PATH": tmp_path / "w.run_id",
+        "META": {},
+        "register_workflow": _stop_register_workflow,
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
-    old = os.environ.pop("WAVE_RUN_ID", None)
-    try:
-        with pytest.raises(SystemExit, match="WAVE_RUN_ID is required on the first run"):
-            asyncio.run(namespace["main"]())
-    finally:
-        if old is not None:
-            os.environ["WAVE_RUN_ID"] = old
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(namespace["main"]())
+    assert (tmp_path / "w.run_id").read_text() == "wfr-1\n"
+    (tmp_path / "w.run_id").unlink()
+    namespace["RUN_ID"] = None
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(namespace["main"]())
+    assert not (tmp_path / "w.run_id").exists()
 
 
 # ---------------------------------------------------------------- ledger gate (changed_paths)
@@ -520,85 +529,67 @@ def test_validate_manifest_compares_the_contract_with_the_doctor_record():
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "identity": None})
 
 
-def test_workflow_launches_from_a_fresh_doctor_run_not_the_editable_record():
+def test_workflow_launches_from_the_signed_doctor_record_not_the_editable_one():
     src = WORKFLOW.read_text()
-    assert "RECORDED" not in src and "DOCTOR = fresh_doctor_report(MANIFEST)" in src
-    assert "validate_manifest(MANIFEST, DOCTOR)" in src
+    assert "RECORDED" not in src
+    assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)" in src
+    assert "if not SMOKE:\n    validate_manifest(MANIFEST, DOCTOR)" in src
+    assert "fresh_doctor_report" not in src and "DOCTOR_PY" not in src
 
 
-def _launch_ns(tmp_path, fake_run):
+def _launch_ns(tmp_path, fake_run=None):
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
-                    and node.name in {"fresh_doctor_report", "pr_changed_paths", "ref_changed_paths", "wave_base",
-                                      "launch_base", "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate"})
+                    and node.name in {"signed_doctor_report", "wave_signature", "pr_changed_paths",
+                                      "ref_changed_paths", "wave_base", "launch_base",
+                                      "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id == "PR_URL" for t in node.targets))]
-    ns = {"json": json, "os": os, "re": re, "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
+    ns = {"datetime": datetime, "hashlib": hashlib, "hmac": hmac, "json": json, "os": os, "re": re,
+          "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
           "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target", "resume": False,
-          "DOCTOR_PY": Path("/plugin/skills/factory-doctor/doctor.py"),
           "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json",
-          "BASE_SHA_PATH": tmp_path / ".migration" / "waves" / "wave-1.base_sha"}
+          "BASE_SHA_PATH": tmp_path / ".migration" / "waves" / "wave-1.base_sha",
+          "DOCTOR_MAX_AGE": datetime.timedelta(minutes=15)}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
-    ns["subprocess"] = type("S", (), {"run": staticmethod(fake_run), "SubprocessError": subprocess.SubprocessError,
-                                        "CalledProcessError": subprocess.CalledProcessError})
+    if fake_run is not None:
+        ns["subprocess"] = type("S", (), {"run": staticmethod(fake_run), "SubprocessError": subprocess.SubprocessError,
+                                            "CalledProcessError": subprocess.CalledProcessError})
     return ns
 
 
-def _doctor_writer(calls, fresh, rc=1):
-    def fake_run(cmd, **kw):
-        calls.append(cmd)
-        Path(cmd[cmd.index("--out") + 1]).parent.mkdir(parents=True, exist_ok=True)
-        Path(cmd[cmd.index("--out") + 1]).write_text(json.dumps(fresh))
-        return subprocess.CompletedProcess(cmd, rc)
-    return fake_run
+def test_signed_doctor_report_gate(tmp_path):
+    sys.path.insert(0, str(WORKFLOW.parents[1] / "factory-doctor"))
+    import doctor
 
-
-def test_fresh_doctor_report_reruns_the_doctor_with_this_sessions_hook_probe_only(tmp_path, monkeypatch):
-    calls = []
-    fresh = {"ready": True, "identity": {"userName": "sp-1", "host": "h"}, "checks": []}
-    ns = _launch_ns(tmp_path, _doctor_writer(calls, fresh))
-    manifest = _manifest(source={"family": "sqlserver", "secret": "LEGACY_ODBC", "params": {"db": "loan_servicing"}})
-    monkeypatch.delenv("WAVE_HOOK_PROBE", raising=False)
-    assert ns["fresh_doctor_report"](manifest) == fresh
-    cmd = calls[0]
-    assert cmd[:2] == [sys.executable, str(ns["DOCTOR_PY"])]
-    assert cmd[cmd.index("--workspace") + 1] == str(tmp_path)
-    assert cmd[cmd.index("--out") + 1] == str(tmp_path / ".migration" / "waves" / "wave-1.doctor.json")
-    # no probe result from the launching session: the doctor decides (hook row unverified, not ready)
-    assert cmd[cmd.index("--hook-probe-result") + 1] == "unknown"
-    assert cmd[cmd.index("--expect-identity") + 1] == "sp-1" and cmd[cmd.index("--expect-catalogs") + 1] == "mig"
-    assert cmd[cmd.index("--expect-host") + 1] == HOST
-    with pytest.raises(SystemExit, match="capabilities.host"):  # no host to hold anyone to: no doctor run, no wave
-        ns["fresh_doctor_report"](_manifest(capabilities=_caps()))
-    assert cmd[cmd.index("--source-family") + 1] == "sqlserver" and cmd[cmd.index("--source-secret") + 1] == "LEGACY_ODBC"
-    assert cmd[cmd.index("--param") + 1] == "db=loan_servicing" and "--no-databricks" not in cmd
-    # the probe the launching session ran is passed through verbatim; the doctor checks the nonce
-    monkeypatch.setenv("WAVE_HOOK_PROBE", "blocked:ab12cd34")
-    ns["fresh_doctor_report"](_manifest())
-    assert calls[-1][calls[-1].index("--hook-probe-result") + 1] == "blocked:ab12cd34" and "--source-family" not in calls[-1]
-
-
-def test_fresh_doctor_report_refuses_to_launch_without_a_report(tmp_path):
-    ns = _launch_ns(tmp_path, lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1))
-    with pytest.raises(SystemExit, match="doctor"):
-        ns["fresh_doctor_report"](_manifest())
-
-
-def test_fresh_doctor_report_never_reads_a_stale_report(tmp_path):
-    stale = tmp_path / ".migration" / "waves" / "wave-1.doctor.json"
-    stale.parent.mkdir(parents=True)
-    stale.write_text(json.dumps({"ready": True, "identity": {"userName": "sp-1", "host": "h"}, "checks": []}))
-    # the doctor crashes (or rejects its arguments) before writing: the old ready report must not stand
-    for rc in (2, 1):
-        ns = _launch_ns(tmp_path, lambda cmd, rc=rc, **kw: subprocess.CompletedProcess(cmd, rc))
-        with pytest.raises(SystemExit, match="doctor"):
-            ns["fresh_doctor_report"](_manifest())
-        assert not stale.exists()
-    # a written report with an exit code other than ready (0) / not ready (1) is an argument error or crash
-    ns = _launch_ns(tmp_path, _doctor_writer([], {"ready": True}, rc=2))
-    with pytest.raises(SystemExit, match="doctor"):
-        ns["fresh_doctor_report"](_manifest())
+    manifest_bytes = b'{"wave": 1}'
+    report = {"ready": True, "identity": {"userName": "sp-1", "host": "h"}, "checks": []}
+    signed = doctor.sign_wave_report(report, manifest_bytes, signed_at="2026-01-01T00:00:00+00:00")
+    path = tmp_path / "wave-1.doctor.json"
+    path.write_text(json.dumps(signed))
+    ns = _launch_ns(tmp_path)
+    assert ns["signed_doctor_report"](path, manifest_bytes,
+                                      now=datetime.datetime(2026, 1, 1, 0, 1, tzinfo=datetime.timezone.utc)) == signed
+    cases = [
+        (None, manifest_bytes, "no doctor record"),
+        (signed, b'{"wave": 2}', "another manifest"),
+        (doctor.sign_wave_report(report, manifest_bytes, signed_at="2025-12-31T23:44:00+00:00"),
+         manifest_bytes, "more than"),
+        ({**signed, "signature": "0" * len(signed["signature"])}, manifest_bytes, "does not verify"),
+        ({**signed, "signed_at": "2025-12-31T23:59:00+00:00"},
+         manifest_bytes, "does not verify"),
+        ({**signed, "ready": False}, manifest_bytes, "does not verify"),
+    ]
+    for value, mb, match in cases:
+        if value is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(json.dumps(value))
+        with pytest.raises(SystemExit, match=match):
+            ns["signed_doctor_report"](path, mb,
+                                       now=datetime.datetime(2026, 1, 1, 0, 1, tzinfo=datetime.timezone.utc))
+    assert ns["wave_signature"](signed, manifest_bytes) == doctor.wave_signature(signed, manifest_bytes)
 
 
 def _git_fake(calls, head, merged, paths):
@@ -729,13 +720,13 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
     assert ns["launch_base"]() == "a" * 40 and calls == []
     for bad in ("origin/main\n", ""):
         ns["BASE_SHA_PATH"].write_text(bad)
-        with pytest.raises(SystemExit, match="WAVE_RERUN"):
+        with pytest.raises(SystemExit, match="mode: rerun"):
             ns["launch_base"]()
     ns["BASE_SHA_PATH"].unlink()
-    with pytest.raises(SystemExit, match="WAVE_RERUN"):
+    with pytest.raises(SystemExit, match="mode: rerun"):
         ns["launch_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = launch_base\(\)\nDOCTOR = ", src)
+    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = launch_base\(\)\nDOCTOR = signed_doctor_report", src)
     assert 'BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")' in src and '"base_sha": BASE_SHA' in src
 
 
