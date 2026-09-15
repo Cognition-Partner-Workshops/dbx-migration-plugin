@@ -1824,11 +1824,11 @@ def test_playbooks_in_sync_lock_missing_and_role(tmp_path):
 def test_playbooks_in_sync_malformed_entry_fails_not_crashes(tmp_path):
     ws = make_workspace(tmp_path, with_lock=False)
     entries = _lock(ws)
-    entries["!dbx_migrate_plan"]["installed_at"] = 1
+    entries["!dbx_migration_plan"]["installed_at"] = 1
     (ws / doctor.PLAYBOOKS_LOCK).write_text(json.dumps(entries))
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and c.data["malformed"] == ["!dbx_migrate_plan"]
-    assert "malformed: !dbx_migrate_plan" in c.detail and "install-dbx-factory" in c.detail
+    assert c.status == "fail" and c.data["malformed"] == ["!dbx_migration_plan"]
+    assert "malformed: !dbx_migration_plan" in c.detail and "install-dbx-factory" in c.detail
 
 
 def test_playbooks_in_sync_unlisted_repo_file_is_a_finding(tmp_path, monkeypatch):
