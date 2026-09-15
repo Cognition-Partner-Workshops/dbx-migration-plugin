@@ -216,14 +216,10 @@ _IN_PLACE = {"sed": (re.compile(r"-[nEersuz]*i.*"), re.compile(r"--in-place.*"))
 
 
 def _mutates(base: str, argv: list[str]) -> bool:
-    inplace = any(rx.fullmatch(w) for w in argv[1:] for rx in _IN_PLACE.get(base, ())) and not any(
-        w in ("--check", "--diff") for w in argv
-    )
-    fixer = base in _FIXERS and inplace
-    return fixer or inplace or (
-        base == "find" and any(w in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls") or w.startswith("-fprint")
-                              for w in argv[1:])
-    )
+    """Whether the head rewrites its operands: an `_IN_PLACE` flag (not `--check`/`--diff`), or a `find` action."""
+    inplace = any(rx.fullmatch(w) for w in argv[1:] for rx in _IN_PLACE.get(base, ())) and not any(w in ("--check", "--diff") for w in argv)
+    return inplace or base == "find" and any(w in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls") or w.startswith("-fprint")
+                                             for w in argv[1:])
 
 
 _IDENTITY_FILE = re.compile(r"(?:^|/)(?:\.databrickscfg|\.databricks(?:/.*)?|\.config/databricks(?:/.*)?)$")
