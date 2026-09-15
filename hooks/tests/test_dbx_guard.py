@@ -115,6 +115,10 @@ def test_lakebase_commands_allowed(cmd):
     ("""databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"database": "projects/loan-mig/branches/production/databases/app"}}'""",
      "production"),
     ("""databricks postgres create-catalog mig_cat --json '{"branch": "projects/loan-mig/branches/production"}'""", "production"),
+    ("""databricks postgres create-catalog mig_cat --json='{"branch": "projects/loan-mig/branches/production"}'""", "production"),
+    ("databricks postgres create-catalog mig_cat --json @spec.json", "@file"),
+    ("databricks postgres create-synced-table mig_cat.oltp.loans --json=@spec.json", "@file"),
+    ("databricks postgres create-synced-table mig_cat.oltp.loans --json \"$SPEC\"", "literal"),
 ])
 def test_lakebase_commands_blocked(cmd, needle):
     assert needle in block(cmd, LB_CFG).reason

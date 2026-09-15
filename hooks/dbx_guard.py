@@ -834,9 +834,10 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
             return [f"CLI mutation of securable {name!r} outside allowlist {sorted(cfg.catalogs)}"]
         if group == "postgres":
             json_args = [seg.raw_of(argv[n + 1]) for n, w in enumerate(argv[:-1]) if w == "--json"]
+            json_args += [seg.raw_of(w) for w in argv if w.startswith("--json=")]
             json_text = " ".join(json_args)
-            if _expands(json_text):
-                return [f"`databricks postgres {verb}` JSON payload must be literal (fail closed)"]
+            if _expands(json_text) or any(a.lstrip("'\"").removeprefix("--json=").lstrip("'\"").startswith("@") for a in json_args):
+                return [f"`databricks postgres {verb}` JSON payload must be literal (fail closed): no expansion, no `@file`"]
             for match in _LAKEBASE_REFERENCE.finditer(seg.text):
                 if violation := _lakebase_scope(verb, *match.groups(), cfg):
                     return violation
