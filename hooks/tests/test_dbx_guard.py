@@ -91,6 +91,7 @@ def test_allowed(cmd):
     "databricks postgres create-endpoint projects/loan-mig/branches/w0-b1 ep --json '{}'",
     "databricks postgres create-catalog mig_cat --json '{}'",
     "databricks postgres create-synced-table mig_cat.oltp.loans --json '{}'",
+    """databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"database": "projects/loan-mig/branches/w0-b1/databases/app"}}'""",
 ])
 def test_lakebase_commands_allowed(cmd):
     approve(cmd, LB_CFG)
@@ -99,6 +100,8 @@ def test_lakebase_commands_allowed(cmd):
 @pytest.mark.parametrize(("cmd", "needle"), [
     ("databricks postgres create-branch projects/other w0-b1", "other"),
     ("databricks postgres create-branch projects/loan-mig production", "production"),
+    ("databricks postgres create-branch projects/loan-mig $B", "literal branch id"),
+    ("databricks postgres create-branch projects/loan-mig", "literal branch id"),
     ("databricks postgres delete-branch projects/loan-mig/branches/production", "production"),
     ("databricks postgres create-endpoint projects/loan-mig/branches/production ep", "production"),
     ("databricks postgres create-branch projects/$P w0", "lakebase_projects"),
@@ -106,6 +109,12 @@ def test_lakebase_commands_allowed(cmd):
     ("databricks postgres delete-project projects/loan-mig", "lifecycle"),
     ("databricks postgres create-catalog prod_cat --json '{}'", "prod_cat"),
     ("databricks postgres create-synced-table prod_cat.s.t --json '{}'", "prod_cat"),
+    ("databricks postgres frobnicate projects/loan-mig", "not in the guard's read allowlist"),
+    ("""databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"database": "projects/other/branches/w0-b1/databases/app"}}'""",
+     "other"),
+    ("""databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"database": "projects/loan-mig/branches/production/databases/app"}}'""",
+     "production"),
+    ("""databricks postgres create-catalog mig_cat --json '{"branch": "projects/loan-mig/branches/production"}'""", "production"),
 ])
 def test_lakebase_commands_blocked(cmd, needle):
     assert needle in block(cmd, LB_CFG).reason

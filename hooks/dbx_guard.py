@@ -172,6 +172,10 @@ _CLI_CATALOG_ARG = {"schemas create": 1, "schemas update": 0, "tables delete": 0
                     "volumes update": 0, "functions delete": 0, "functions update": 0, "postgres create-catalog": 0,
                     "postgres delete-catalog": 0, "postgres create-synced-table": 0, "postgres delete-synced-table": 0}
 _LAKEBASE_RESOURCE = re.compile(r"^projects/([^/\s]+)(?:/branches/([^/\s]+))?(?:/.*)?$")
+_LAKEBASE_REFERENCE = re.compile(r"""projects/([^/\s"']+)(?:/branches/([^/\s"']+))?""")
+_LAKEBASE_WRITE = {"create-branch", "delete-branch", "update-branch", "create-endpoint", "delete-endpoint", "update-endpoint",
+                   "create-database", "delete-database", "update-database", "create-role", "delete-role", "update-role",
+                   "create-cdf-config", "delete-cdf-config"}
 _DBX_VALUE_FLAGS = {"-o", "--output", "--log-level", "--log-file", "--log-format", "--progress-format", "-t", "--target", "-p",
                     "--profile", "--host", "--warehouse-id", "--catalog", "--schema", "--format", "--wait-timeout", "--json",
                     "--var", "--file", "--language", "--string-value", "--bytes-value", "-e", "--statement", "--query"}
@@ -435,6 +439,16 @@ def _expands(text: str, subst: bool = False) -> bool:
     live = re.sub(r"\\.|'[^']*'?", lambda m: " " * len(m.group()), text, flags=re.DOTALL)
     return any(not re.fullmatch(r"[\w$-]+", m.group(1)) for m in re.finditer(r"`([^`]*)`", live)) or (
         bool(re.search(r"\$\(|(?<![\w])[<>]\(", live)) if subst else "$" in live)
+
+
+def _lakebase_scope(verb: str, project: str, branch: str | None, cfg: GuardConfig) -> list[str]:
+    if project not in cfg.lakebase_projects:
+        return [f"`databricks postgres {verb}` targets Lakebase project {project!r} outside allowed lakebase_projects "
+                f"{cfg.lakebase_projects} (empty = every Lakebase write blocks)"]
+    if branch == "production":
+        return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project {project}; migration sessions "
+                "write only per-batch branches (production is repointed at STOP E)"]
+    return []
 
 
 def _program(words: list[str], assigns: list[str]) -> tuple[list[str], str]:
@@ -816,20 +830,28 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                  "catalog / Lakebase-project lifecycle or permissions (those happen at STOP E)")]
     if key in _CLI_CATALOG_ARG:
         name = (args + ["", ""])[_CLI_CATALOG_ARG[key]]
-        return [] if name and _norm(name.split(".")[0]) in cfg.catalogs else [f"CLI mutation of securable {name!r} outside allowlist {sorted(cfg.catalogs)}"]
-    if group == "postgres" and verb not in _DBX_READ.get(group, ()):
+        if not name or _norm(name.split(".")[0]) not in cfg.catalogs:
+            return [f"CLI mutation of securable {name!r} outside allowlist {sorted(cfg.catalogs)}"]
+        if group == "postgres":
+            json_args = [seg.raw_of(argv[n + 1]) for n, w in enumerate(argv[:-1]) if w == "--json"]
+            json_text = " ".join(json_args)
+            if _expands(json_text):
+                return [f"`databricks postgres {verb}` JSON payload must be literal (fail closed)"]
+            text = getattr(seg, "text", " ".join(seg.argv))
+            for match in _LAKEBASE_REFERENCE.finditer(text):
+                if violation := _lakebase_scope(verb, *match.groups(), cfg):
+                    return violation
+        return []
+    if group == "postgres" and verb in _LAKEBASE_WRITE:
         if not args or _expands(args[0]) or not (match := _LAKEBASE_RESOURCE.fullmatch(args[0])):
             return [f"`databricks postgres {verb}` requires a literal projects/<project> resource path; allowed lakebase_projects "
                     f"{cfg.lakebase_projects} (empty = every Lakebase write blocks)"]
         project, branch = match.groups()
-        if project not in cfg.lakebase_projects:
-            return [f"`databricks postgres {verb}` targets Lakebase project {project!r} outside allowed lakebase_projects "
-                    f"{cfg.lakebase_projects} (empty = every Lakebase write blocks)"]
-        target_branch = args[1] if verb == "create-branch" and len(args) > 1 else branch
-        if target_branch == "production":
-            return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project {project}; migration sessions "
-                    "write only per-batch branches (production is repointed at STOP E)"]
-        return []
+        if verb == "create-branch":
+            if len(args) <= 1 or _expands(args[1]):
+                return ["`databricks postgres create-branch` needs a literal branch id (fail closed)"]
+            branch = args[1]
+        return _lakebase_scope(verb, project, branch, cfg)
     if verb in _DBX_READ.get(group, ()):
         return []
     return [f"`databricks {group} {verb}`".rstrip() + " is not in the guard's read allowlist (fail closed); reads are "
