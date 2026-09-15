@@ -1433,9 +1433,10 @@ def test_wave_flag_writes_a_signed_record_beside_the_manifest(tmp_path):
         "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
         "source": {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
     }))
+    hook_probe = probed(ws)
     result = subprocess.run(
         [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
-         "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+         "--hook-probe-result", hook_probe, "--wave", str(manifest)],
         capture_output=True, text=True, check=False,
     )
     assert result.returncode == 1
@@ -1446,8 +1447,22 @@ def test_wave_flag_writes_a_signed_record_beside_the_manifest(tmp_path):
     assert record["ready"] is False
     assert record["manifest_sha"] == doctor.manifest_sha(manifest_bytes)
     assert doctor.datetime.datetime.fromisoformat(record["signed_at"]).tzinfo is not None
+    assert record["hook_probe"] == hook_probe
     assert doctor.wave_signature(record, manifest_bytes) == record["signature"]
+    changed = {**record, "hook_probe": "unknown" if hook_probe != "unknown" else "not-blocked"}
+    assert doctor.wave_signature(changed, manifest_bytes) != record["signature"]
     assert next(c for c in record["checks"] if c["id"] == "allowlist_matches_contract")
+
+    default_ws = make_workspace(tmp_path / "default")
+    default_manifest = default_ws / ".migration" / "waves" / "wave-1.json"
+    default_manifest.parent.mkdir()
+    default_manifest.write_text(manifest.read_text())
+    subprocess.run(
+        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(default_ws), "--no-databricks",
+         "--wave", str(default_manifest)],
+        capture_output=True, text=True, check=False,
+    )
+    assert json.loads(default_manifest.with_suffix(".doctor.json").read_text())["hook_probe"] == "unknown"
 
 
 def test_wave_signature_binds_the_manifest_bytes_and_identity():

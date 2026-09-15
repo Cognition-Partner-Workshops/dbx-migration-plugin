@@ -96,6 +96,9 @@ MODE = POINTER["mode"]
 RUN_ID = POINTER.get("run_id")
 if RUN_ID is not None and (not isinstance(RUN_ID, str) or not RUN_ID.strip()):
     raise SystemExit(f"{POINTER_PATH} run_id must be the run_workflow run_id string or null")
+if RUN_ID is not None and MODE != "resume":
+    raise SystemExit(f"{POINTER_PATH} run_id must be null unless mode is resume: run_workflow reports the run_id only once a fresh run starts; "
+                     f"record it in {MANIFEST_PATH.with_suffix('.run_id').name} afterwards")
 HOOK_PROBE_RESULT = POINTER.get("hook_probe")
 if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE_RESULT):
     raise SystemExit(f"{POINTER_PATH} hook_probe must be blocked:<nonce>, not-blocked or unknown (the probe run in the "
@@ -329,6 +332,9 @@ def signed_doctor_report(path, manifest_bytes, now=None):
     if not isinstance(report.get("signature"), str) or not hmac.compare_digest(
             report["signature"], wave_signature(report, manifest_bytes)):
         raise SystemExit(f"{path} signature does not verify: the record was edited after the doctor wrote it; re-run the doctor")
+    if report.get("hook_probe") != HOOK_PROBE_RESULT:
+        raise SystemExit(f"{path} was signed for hook_probe {report.get('hook_probe')!r} but current.json says "
+                         f"{HOOK_PROBE_RESULT!r}; give the doctor and the pointer the same probe result")
     return report
 
 
@@ -848,10 +854,8 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
 
 
 async def main():
-    if not resume and RUN_ID:
-        run_id_tmp = RUN_ID_PATH.with_suffix(".run_id.tmp")
-        run_id_tmp.write_text(RUN_ID + "\n")
-        run_id_tmp.replace(RUN_ID_PATH)
+    if not resume:
+        RUN_ID_PATH.unlink(missing_ok=True)
     await register_workflow(META)
     check_write_targets(BATCHES)
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}")

@@ -1351,7 +1351,8 @@ def main(argv: list[str] | None = None) -> int:
           + (f"  -> {out}" if str(out) != "-" else ""))
     if a.wave:
         a.wave.with_suffix(".doctor.json").write_text(json.dumps(
-            sign_wave_report(report, manifest_bytes), indent=2, sort_keys=True) + "\n")
+            sign_wave_report({**report, "hook_probe": a.hook_probe_result}, manifest_bytes),
+            indent=2, sort_keys=True) + "\n")
     return 0 if report["ready"] else 1
 
 

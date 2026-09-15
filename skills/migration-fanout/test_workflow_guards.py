@@ -366,23 +366,24 @@ def test_prompts_name_every_merge_evidence_mode():
     assert "Fixture evidence is never PASS" in child
 
 
-def test_first_run_records_the_pointer_run_id_when_given(tmp_path):
+def test_fresh_runs_reject_a_pointer_run_id_and_clear_the_stale_run_record(tmp_path):
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "main"]
+    source = WORKFLOW.read_text()
+    assert "RUN_ID is not None and MODE != \"resume\"" in source
+    main_source = ast.get_source_segment(source, selected[0])
+    assert "RUN_ID_PATH.unlink(missing_ok=True)" in main_source
+    assert "write_text(RUN_ID" not in main_source
     namespace = {
         "resume": False,
-        "RUN_ID": "wfr-1",
+        "RUN_ID": None,
         "RUN_ID_PATH": tmp_path / "w.run_id",
         "META": {},
         "register_workflow": _stop_register_workflow,
     }
+    (tmp_path / "w.run_id").write_text("stale\n")
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
-    with pytest.raises(RuntimeError, match="stop"):
-        asyncio.run(namespace["main"]())
-    assert (tmp_path / "w.run_id").read_text() == "wfr-1\n"
-    (tmp_path / "w.run_id").unlink()
-    namespace["RUN_ID"] = None
     with pytest.raises(RuntimeError, match="stop"):
         asyncio.run(namespace["main"]())
     assert not (tmp_path / "w.run_id").exists()
@@ -551,7 +552,8 @@ def _launch_ns(tmp_path, fake_run=None):
           "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target", "resume": False,
           "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json",
           "BASE_SHA_PATH": tmp_path / ".migration" / "waves" / "wave-1.base_sha",
-          "DOCTOR_MAX_AGE": datetime.timedelta(minutes=15)}
+          "DOCTOR_MAX_AGE": datetime.timedelta(minutes=15),
+          "HOOK_PROBE_RESULT": "blocked:0123abcd"}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     if fake_run is not None:
         ns["subprocess"] = type("S", (), {"run": staticmethod(fake_run), "SubprocessError": subprocess.SubprocessError,
@@ -564,7 +566,8 @@ def test_signed_doctor_report_gate(tmp_path):
     import doctor
 
     manifest_bytes = b'{"wave": 1}'
-    report = {"ready": True, "identity": {"userName": "sp-1", "host": "h"}, "checks": []}
+    report = {"ready": True, "identity": {"userName": "sp-1", "host": "h"},
+              "hook_probe": "blocked:0123abcd", "checks": []}
     signed = doctor.sign_wave_report(report, manifest_bytes, signed_at="2026-01-01T00:00:00+00:00")
     path = tmp_path / "wave-1.doctor.json"
     path.write_text(json.dumps(signed))

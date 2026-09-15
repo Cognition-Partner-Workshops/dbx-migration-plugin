@@ -11,7 +11,8 @@ DOCTOR = Path(__file__).parents[1] / "factory-doctor" / "doctor.py"
 
 
 def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
-               pointer_at=None, smoke=False):
+               pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
+               doctor_hook_probe=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -37,6 +38,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     manifest_path = waves / "wave-0.json"
     manifest_path.write_text(json.dumps(manifest))
     manifest_bytes = manifest_path.read_bytes()
+    doctor_hook_probe = hook_probe if doctor_hook_probe is None else doctor_hook_probe
     if doctor:
         sys.path.insert(0, str(DOCTOR.parent))
         import doctor as doctor_module
@@ -52,6 +54,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                  "data": {"catalogs": ["mig"], "guard_mode": "block"}},
                 {"id": "stop_mode", "status": "ok", "data": {"stop_mode": "soft"}},
             ],
+            "hook_probe": doctor_hook_probe,
         }
         signed_at = None
         if tamper == "stale":
@@ -79,7 +82,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     pointer_dir = pointer_root / ".migration" / "waves"
     pointer_dir.mkdir(parents=True, exist_ok=True)
     pointer = {"manifest": "wave-0.json", "mode": mode, "run_id": run_id,
-               "hook_probe": "blocked:0123abcd"}
+               "hook_probe": hook_probe}
     if pointer_at == "home":
         pointer["workspace"] = str(ws)
     (pointer_dir / "current.json").write_text(json.dumps(pointer))
@@ -137,7 +140,10 @@ def test_start_launches_children_and_writes_the_result(tmp_path):
     assert result["hook_probe"] == "blocked:0123abcd"
     assert (ws / ".migration/waves/wave-0.brief.md").exists()
     assert not (ws / ".migration/waves/wave-0.run_id").exists()
-    ws2, _ = _workspace(tmp_path / "second", run_id="wfr-x")
+    ws2, cwd2 = _workspace(tmp_path / "second", run_id="wfr-x")
+    proc2, calls2 = _run(cwd2, tmp_path / "second", [_pass_report()])
+    assert proc2.returncode != 0
+    assert not [c for c in calls2 if c["kind"] == "agent"]
     assert not (ws2 / ".migration/waves/wave-0.run_id").exists()
 
 
@@ -148,9 +154,12 @@ def test_pointer_above_the_cwd_names_the_workspace(tmp_path):
     assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
 
 
-@pytest.mark.parametrize("tamper", ["missing", "not_ready", "wrong_sha", "stale", "signature"])
+@pytest.mark.parametrize("tamper", ["missing", "not_ready", "wrong_sha", "stale", "signature", "hook_probe"])
 def test_invalid_doctor_record_launches_nothing(tmp_path, tamper):
-    ws, cwd = _workspace(tmp_path, tamper=tamper)
+    kwargs = {"tamper": tamper}
+    if tamper == "hook_probe":
+        kwargs.update(hook_probe="not-blocked", doctor_hook_probe="unknown")
+    ws, cwd = _workspace(tmp_path, **kwargs)
     proc, calls = _run(cwd, tmp_path, [_pass_report()])
     assert proc.returncode != 0
     assert not [c for c in calls if c["kind"] == "agent"]
@@ -185,6 +194,15 @@ def test_start_refuses_a_halted_result_and_resume_needs_the_recorded_run_id(tmp_
     waves.joinpath("wave-0.run_id").write_text("wfr-a\n")
     proc, _ = _run(cwd, tmp_path, [_pass_report()])
     assert proc.returncode != 0
+
+    ws, cwd = _workspace(tmp_path / "rerun", mode="rerun")
+    waves = ws / ".migration/waves"
+    waves.joinpath("wave-0.result.json").write_text(json.dumps(
+        {"closed": False, "run_id": "wfr-old", "base_sha": "a" * 40}))
+    waves.joinpath("wave-0.run_id").write_text("wfr-old\n")
+    proc, _ = _run(cwd, tmp_path / "rerun", [_pass_report()])
+    assert proc.returncode == 0
+    assert not waves.joinpath("wave-0.run_id").exists()
 
 
 def test_script_reads_no_environment_and_no_file_path():
