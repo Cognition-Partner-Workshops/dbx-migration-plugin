@@ -172,14 +172,6 @@ _CLI_CATALOG_ARG = {"schemas create": 1, "schemas update": 0, "tables delete": 0
                     "volumes update": 0, "functions delete": 0, "functions update": 0, "postgres create-catalog": 0,
                     "postgres delete-catalog": 0, "postgres create-synced-table": 0, "postgres delete-synced-table": 0}
 _LAKEBASE_RESOURCE = re.compile(r"^projects/([^/\s]+)(?:/branches/([^/\s]+))?(?:/.*)?$")
-# postgres resource-write verbs the guard understands, mapped to the index of a literal branch positional that lives
-# outside the resource path (create-branch NAME BRANCH); other writes carry their branch in the projects/.../branches/...
-# path (index None). A verb absent here is unknown and fails closed -- new mutating verbs never inherit the project check.
-_LAKEBASE_WRITE = {"create-branch": 1, "delete-branch": None, "update-branch": None, "create-endpoint": None,
-                   "delete-endpoint": None, "update-endpoint": None, "create-database": None, "delete-database": None,
-                   "create-role": None, "delete-role": None, "update-role": None, "create-cdf-config": None,
-                   "delete-cdf-config": None, "update-cdf-config": None, "start-cdf": None, "stop-cdf": None}
-_LAKEBASE_PROD = re.compile(r"branches/production\b")   # a production branch named anywhere (positional or --json payload)
 _LAKEBASE_REFERENCE = re.compile(r"""projects/([^/\s"']+)(?:/branches/([^/\s"']+))?""")
 _LAKEBASE_WRITE = {"create-branch", "delete-branch", "update-branch", "create-endpoint", "delete-endpoint", "update-endpoint",
                    "create-database", "delete-database", "update-database", "create-role", "delete-role", "update-role",
