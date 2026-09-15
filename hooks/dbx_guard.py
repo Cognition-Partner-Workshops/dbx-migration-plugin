@@ -457,6 +457,19 @@ def _lakebase_scope(verb: str, project: str, branch: str | None, cfg: GuardConfi
     return []
 
 
+def _lakebase_field(verb: str, project: str | None, branch: str | None, cfg: GuardConfig) -> list[str]:
+    if project is not None:
+        return _lakebase_scope(verb, project, branch, cfg)
+    if branch == "production":
+        return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project ?; migration sessions "
+                "write only per-batch branches (production is repointed at STOP E)"]
+    if branch is not None and cfg.lakebase_branches and not any(fnmatch.fnmatchcase(branch, pattern)
+                                                                for pattern in cfg.lakebase_branches):
+        return [f"`databricks postgres {verb}` on branch {branch!r} of Lakebase project ?; allowed lakebase_branches "
+                f"{cfg.lakebase_branches}"]
+    return []
+
+
 def _program(words: list[str], assigns: list[str]) -> tuple[list[str], str]:
     """(argv, prefix text): the words after `VAR=value` and the modelled prefixes (`_PREFIX_VALUE_FLAGS`, `docker exec|run`,
     `kubectl exec ... --`); `env -u X` is recorded as `X=`, `env -C d` as `PWD=d`; one quoted payload is a remote command line."""
@@ -845,6 +858,35 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
             json_vals += [w.removeprefix("--json=") for w in argv if w.startswith("--json=")]
             if _expands(" ".join(json_raw)) or any(value.startswith("@") for value in json_vals):
                 return [f"`databricks postgres {verb}` JSON payload must be literal (fail closed): no expansion, no `@file`"]
+            def walk_fields(value):
+                if isinstance(value, dict):
+                    for key_name, child in value.items():
+                        if isinstance(child, str):
+                            key_lower = str(key_name).lower()
+                            if "project" in key_lower:
+                                if violation := _lakebase_field(verb, child.removeprefix("projects/").split("/")[0], None, cfg):
+                                    return violation
+                            elif "branch" in key_lower and not key_lower.startswith("source"):
+                                project, branch = None, child
+                                if "branches/" in child:
+                                    match = _LAKEBASE_REFERENCE.search(child)
+                                    project, branch = match.groups() if match else (None, None)
+                                if violation := _lakebase_field(verb, project, branch, cfg):
+                                    return violation
+                        if violation := walk_fields(child):
+                            return violation
+                elif isinstance(value, list):
+                    for child in value:
+                        if violation := walk_fields(child):
+                            return violation
+                return []
+            for json_value in json_vals:
+                try:
+                    parsed = json.loads(json_value)
+                except json.JSONDecodeError:
+                    return [f"`databricks postgres {verb}` JSON payload is not parseable JSON (fail closed)"]
+                if violation := walk_fields(parsed):
+                    return violation
             for match in _LAKEBASE_REFERENCE.finditer(seg.text):
                 if violation := _lakebase_scope(verb, *match.groups(), cfg):
                     return violation
