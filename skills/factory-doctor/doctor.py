@@ -81,7 +81,7 @@ HOOK_PROBE_COMMAND = (
 @dataclass
 class Check:
     id: str
-    status: str  # ok | fail | warn | unverified | skipped
+    status: str  # ok | fail | warn | unverified | skipped | attested
     detail: str
     data: dict = field(default_factory=dict)
 
@@ -688,10 +688,13 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
     is advisory and is reported as such in `stats`. A failure names object and privilege, never
     the credential."""
     cid = "source_principal_read_only"
+    if family == "databricks":
+        return _check_databricks_source_principal(tables)
     q = _PRIVILEGE_QUERIES.get(family)
     if q is None:
-        return Check(cid, "unverified", f"{family}: no privilege query implemented for this family (untested), so the "
-                     "source principal's write privileges are unknown; confirm SELECT-only grants by hand and record it",
+        return Check(cid, "unverified", f"{family}: no privilege query implemented for this family, so the "
+                     "source principal's write privileges are unknown; confirm SELECT-only grants by hand and "
+                     "record the decision in .migration/06_decisions.md, then pass --source-attested D-<id>",
                      {"family": family, "tables": tables})
     if not source_secret:
         return Check(cid, "fail", f"{family} source with {len(tables)} in-scope table(s); pass --source-secret NAME "
@@ -738,9 +741,108 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
                  f"IMPERSONATE/EXECUTE/SET ROLE path to one; {data['stats']}", data)
 
 
+# Effective-grant privileges that only read. Anything else the CLI reports on an in-scope
+# securable (MODIFY, WRITE_FILES, CREATE_*, OWN, ALL_PRIVILEGES, MANAGE, APPLY_TAG, EXECUTE, or
+# something new) is a write path: the check fails closed.
+_DBX_READ_PRIVILEGES = frozenset({"SELECT", "USE_CATALOG", "USE_SCHEMA", "BROWSE", "READ_VOLUME"})
+_DBX_GET_COMMAND = {"catalog": "catalogs", "schema": "schemas", "table": "tables"}
+
+
+def _check_databricks_source_principal(tables: list[str]) -> Check:
+    """The databricks family source principal is the CLI's own identity (`current-user me`, an
+    applicationId or userName): `grants get-effective` on every in-scope catalog, schema and table
+    (effective grants already include group memberships), plus ownership of each, direct or through
+    a group. No --source-secret: CLI auth is the credential."""
+    cid = "source_principal_read_only"
+    data: dict = {"family": "databricks", "tables": tables, "writable": {}, "unresolved": []}
+    cli = shutil.which("databricks")
+    if not cli:
+        return Check(cid, "unverified", "databricks: databricks CLI not on PATH, so the source "
+                     "principal's grants could not be read", data)
+    rc, out, err = _run([cli, "current-user", "me", "--output", "json"])
+    try:
+        who = json.loads(out) if rc == 0 else {}
+        principal = who.get("applicationId") or who.get("userName")
+        groups = {g["display"] for g in who.get("groups", []) if isinstance(g, dict)
+                  and isinstance(g.get("display"), str)}
+    except (TypeError, ValueError, AttributeError):
+        principal, groups = None, set()
+    if not isinstance(principal, str) or not principal:
+        return Check(cid, "unverified", f"databricks: current-user me failed: {_redact(err or out)}", data)
+    data["principal"] = principal
+    securables: dict[tuple[str, str], None] = {}
+    for t in tables:
+        parts = t.split(".")
+        if len(parts) != 3 or not all(parts):
+            data["unresolved"].append(t)
+            continue
+        securables.setdefault(("catalog", parts[0]))
+        securables.setdefault(("schema", f"{parts[0]}.{parts[1]}"))
+        securables.setdefault(("table", t))
+    for kind, name in securables:
+        rc, out, _ = _run([cli, _DBX_GET_COMMAND[kind], "get", name, "--output", "json"])
+        owner = None
+        if rc == 0:
+            try:
+                owner = json.loads(out).get("owner")
+            except (TypeError, ValueError, AttributeError):
+                owner = None
+        if isinstance(owner, str) and (owner.lower() == principal.lower() or owner in groups):
+            data["writable"].setdefault(name, []).append("OWNER")
+        rc, out, err = _run([cli, "grants", "get-effective", kind, name,
+                             "--principal", principal, "--output", "json"])
+        privileges = None
+        if rc == 0:
+            try:
+                privileges = _effective_privileges(json.loads(out))
+            except (TypeError, ValueError):
+                privileges = None
+        if privileges is None:
+            return Check(cid, "unverified", f"databricks: grants get-effective {kind} {name} failed: "
+                         f"{_redact(err or out)}", data)
+        offending = sorted(privileges - _DBX_READ_PRIVILEGES)
+        if offending:
+            data["writable"][name] = data["writable"].get(name, []) + offending
+    if data["writable"]:
+        can_write = [f"{name}: {', '.join(privs)}" for name, privs in data["writable"].items()]
+        shown = "; ".join(can_write[:6]) + (f"; +{len(can_write) - 6} more in data" if len(can_write) > 6 else "")
+        return Check(cid, "fail", f"databricks: the source principal can write in scope ({shown}); the "
+                     "factory needs a SELECT-only principal", data)
+    if data["unresolved"]:
+        return Check(cid, "unverified", f"databricks: privileges could not be evaluated for "
+                     f"{data['unresolved']}: in-scope tables need 3-part catalog.schema.table names", data)
+    return Check(cid, "ok", f"databricks: {principal} holds only read privileges "
+                 "(SELECT/USE_CATALOG/USE_SCHEMA/BROWSE/READ_VOLUME) on "
+                 f"{len(tables)} in-scope table(s), their schemas and catalogs; no ownership", data)
+
+
+def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
+    """--source-attested D-<id>: a ledger decision standing in for a privilege query the family
+    does not have (files in object storage, a read-only share, a static dump — no principal to
+    query). The decision's line must name the check and the attestation; a family with a query
+    runs the query instead."""
+    cid = "source_principal_read_only"
+    if family == "databricks" or family in _PRIVILEGE_QUERIES:
+        return Check(cid, "fail", f"{family}: --source-attested {decision} rejected, this family has a "
+                     "privilege query: run the query instead (drop --source-attested)",
+                     {"family": family, "decision": decision})
+    ledger = ws / ".migration" / "06_decisions.md"
+    if not ledger.is_file():
+        return Check(cid, "fail", f"{family}: ledger .migration/06_decisions.md not found",
+                     {"decision": decision})
+    for line in ledger.read_text().splitlines():
+        if decision in line and "source_principal_read_only" in line and "attested" in line:
+            return Check(cid, "attested", f"{family}: source principal read-only attested by decision "
+                         f"{decision} in .migration/06_decisions.md (no principal to query)",
+                         {"decision": decision, "family": family, "tables": tables})
+    return Check(cid, "fail", f"{family}: decision {decision} is not in .migration/06_decisions.md with "
+                 "'source_principal_read_only' and 'attested' in its line; record the attestation in the "
+                 "ledger first", {"decision": decision})
+
+
 def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str | None,
-                               source_family: str | None, plugin_root: Path, params: dict[str, str] | None = None
-                               ) -> Check:
+                               source_family: str | None, plugin_root: Path, params: dict[str, str] | None = None,
+                               attested: str | None = None) -> Check:
     """Every source table the resolved mappings read (root tables and embedded child tables), against
     --source-family, or the family the mappings' delete_evidence kind implies."""
     cid = "source_principal_read_only"
@@ -766,6 +868,8 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
     if not family:
         return Check(cid, "unverified", "source family not declared: pass --source-family "
                      f"{'|'.join(SOURCE_FAMILIES)} so the principal's privileges can be checked", {"tables": list(tables)})
+    if attested:
+        return _attested(ws, attested, family, list(tables))
     return check_source_principal(list(tables), family, source_secret)
 
 
@@ -1189,7 +1293,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         expect_catalogs: list[str] | None = None, source_family: str | None = None,
         expect_host: str | None = None, lakebase_project: str | None = None,
         lakebase_parent_branch: str | None = None, lakebase_dsn: str | None = None,
-        lakebase_schema: str | None = None, analytical_schema: str | None = None) -> dict:
+        lakebase_schema: str | None = None, analytical_schema: str | None = None,
+        source_attested: str | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root),
                            check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs)]
     checks += check_hooks(plugin_root, ws, probe_result)
@@ -1199,7 +1304,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     checks.append(check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
                                             params=params))
     checks.append(check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
-                                             plugin_root, params=params))
+                                             plugin_root, params=params, attested=source_attested))
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -1259,6 +1364,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
     p.add_argument("--source-family", choices=SOURCE_FAMILIES,
                    help="source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
+    p.add_argument("--source-attested", metavar="D-<id>",
+                   help="decision id in .migration/06_decisions.md attesting the source has no principal to query "
+                        "(files in object storage, a read-only share, a static dump); rejected for families with a "
+                        "privilege query")
     p.add_argument("--lakebase-project", help="Lakebase project id for the branch-create preflight")
     p.add_argument("--lakebase-parent-branch", help="Lakebase parent branch for the branch-create preflight")
     p.add_argument("--lakebase-dsn", metavar="ENV_VAR_NAME",
@@ -1282,7 +1391,8 @@ def main(argv: list[str] | None = None) -> int:
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result,
                  a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params,
                  a.expect_catalogs, a.source_family, a.expect_host, a.lakebase_project,
-                 a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema, a.analytical_schema)
+                 a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema, a.analytical_schema,
+                 source_attested=a.source_attested)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:

@@ -1330,7 +1330,7 @@ def test_databricks_source_principal_ok_reads_every_securable(monkeypatch):
     c = doctor.check_source_principal(DBX_TABLES, "databricks", None)  # CLI auth: no --source-secret
     assert c.status == "ok", c.detail
     assert c.data["principal"] == DBX_PRINCIPAL and c.data["writable"] == {}
-    effective = [cmd[3:] for cmd in asked if cmd[1:3] == ["grants", "get-effective"]]
+    effective = [cmd[3:5] for cmd in asked if cmd[1:3] == ["grants", "get-effective"]]
     assert effective == [["catalog", "mig"], ["schema", "mig.raw"],
                          ["table", "mig.raw.loans"], ["table", "mig.raw.payments"]]
 
