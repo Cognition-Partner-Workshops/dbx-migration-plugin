@@ -106,7 +106,10 @@ def manifest_sha(manifest_bytes: bytes) -> str:
 def wave_signature(body: dict, manifest_bytes: bytes) -> str:
     """HMAC over the canonical doctor record. Key = manifest bytes + the identity the doctor saw, so a
     record cannot be moved to another manifest or another principal. Tamper-evident, not tamper-proof:
-    .migration/ is review-protected, and this closes the 'edited 09_capabilities.json' hole, nothing more."""
+    .migration/ is review-protected, and this closes the 'edited 09_capabilities.json' hole, nothing more.
+    The key is derivable on purpose: the workflow sandbox holds no secret to verify one with, and a key
+    carried in the manifest is writable by the same session that writes this record, so the gate against
+    a lying orchestrator is each child's own --expect-identity doctor run plus PR review, not this HMAC."""
     ident = body.get("identity") or {}
     key = hashlib.sha256(manifest_bytes + str(ident.get("userName") or "").encode()
                          + str(ident.get("host") or "").encode()).digest()

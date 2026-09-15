@@ -307,7 +307,9 @@ def wave_signature(body, manifest_bytes):
 def signed_doctor_report(path, manifest_bytes, now=None):
     """The doctor ran in the orchestrator's shell (credentials live there, not here) and left a record
     signed over these manifest bytes. Missing, stale (>15 min), for another manifest, or not verifying: no wave.
-    Tamper-evident only; .migration/ is review-protected."""
+    Tamper-evident only; .migration/ is review-protected. The key is derivable on purpose: this sandbox holds no
+    secret to verify one with, so the signature binds manifest, freshness and contents, and the gate against a lying
+    orchestrator is each child's own --expect-identity doctor run plus PR review."""
     try:
         report = json.loads(path.read_text())
     except OSError:
