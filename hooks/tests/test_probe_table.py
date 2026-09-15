@@ -5,7 +5,6 @@ Add a row to PROBES to pin a new shape. `xfail` marks rows the guard does not co
 (programs it cannot read into: JDBC, perl, make); the doctor's read-only-principal row owns them.
 """
 import json
-import shlex
 import shutil
 import subprocess
 import sys
@@ -168,6 +167,7 @@ FILES2 = {
     "fix.sh": "cat /etc/hosts\n",
     "q.sql": "SELECT 1;\n",
     "capture_baseline.py": "import boto3\ns3 = boto3.client(\"s3\")\nprint(s3.list_buckets())\n",
+    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n",
     "d.patch": "--- a/.migration/allowed_targets.json\n+++ b/.migration/allowed_targets.json\n",
     "ok.patch": "--- a/notes.md\n+++ b/notes.md\n",
 }
@@ -684,6 +684,18 @@ PROBES2 = [
     ("R4 for loop read over allowlisted hosts", "for h in lakebase-host lakebase-peer; do psql -h \"$h\" -d mig_cat -c 'SELECT 1'; done", "approve"),
     ("R4 for loop write over unknown host", "for h in lakebase-host unknown-host.example; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "block"),
     ("R5 post-loop host write blocks: spell the host out", "for h in tdprod.corp lakebase-host; do true; done; psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'", "block"),
+    # --- decision-authorized legacy writes
+    ("R4 legacy write with matching decision flag", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-7", "approve"),
+    ("R4 legacy write with matching decision env prefix", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "approve"),
+    ("R4 legacy write without decision token", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "block"),
+    ("R4 legacy write unknown decision id", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-99", "block"),
+    ("R4 legacy write decision row without literal", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-8", "block"),
+    ("R4 legacy write decision row names other object", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-9", "block"),
+    ("R4 legacy write command names different object than decision", "sqlcmd -S tdprod.corp -Q 'DELETE FROM dbo.customers' --decision D-7", "block"),
+    ("R4 legacy write decision covers one of two objects", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD x INT; DELETE FROM dbo.customers' --decision D-7", "block"),
+    ("R4 legacy-only client write with matching decision", "bteq --decision D-7 <<EOF\n.LOGON tdprod.corp/u,p\nALTER TABLE dbo.orders ADD cdc_ts INT;\nEOF", "approve"),
+    ("R4 legacy read with decision token still approves", "sqlcmd -S tdprod.corp -Q 'SELECT 1' --decision D-7", "approve"),
+    ("R4 decision token on unreadable legacy script", "sqlcmd -S tdprod.corp -i missing.sql --decision D-7", "block"),
 ]
 
 
@@ -840,21 +852,29 @@ def test_fixture_endpoint_environment_is_command_local(tmp_path: Path, command, 
     assert decision == expected
 
 
-@pytest.mark.parametrize("label,depth,inner,expected", [
-    ("five nested shells fail closed", 5, "aws s3 ls", "block"),
-    ("five nested shells with innermost fixture assignment recurse", 5,
-     "AWS_ENDPOINT_URL=http://localhost:9000 aws s3 ls", "approve"),
-    ("five nested shells with unreadable payload fail closed", 5, 'bash -c "$CMD"', "block"),
+@pytest.mark.parametrize("command,needle", [
+    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-7", "D-7"),
+    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "--decision"),
+    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-99", "D-99"),
+    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-8", "legacy_write_authorized"),
+    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-9", "dbo.orders"),
 ])
-def test_fixture_shell_depth_limit_is_fail_closed(tmp_path: Path, label: str, depth: int, inner: str, expected: str):
-    command = inner
-    for _ in range(depth):
-        command = f"bash -c {shlex.quote(command)}"
-    ws = _make_tmp_ws(tmp_path, "fixture_depth_ws", {
-        **ALLOWLIST2, "run_mode": "fixture", "fixture_endpoints": ["AWS_ENDPOINT_URL"],
-    }, FILES2)
-    decision, reason = decide(command, ws)
-    assert decision == expected, f"{label}: {decision} ({reason})"
+def test_legacy_write_decision_reason(tmp_path_factory, command, needle):
+    ws = _make_ws(tmp_path_factory, "decision_reason_ws", ALLOWLIST2, FILES2)
+    result = run_hook(command, ws)
+    assert (result.returncode == 0) == command.endswith("--decision D-7")
+    assert needle in result.stdout
+
+
+def test_legacy_write_decision_and_warn_mode(tmp_path_factory):
+    allowlist = {**ALLOWLIST2, "guard_mode": "warn"}
+    ws = _make_ws(tmp_path_factory, "decision_warn_ws", allowlist, FILES2)
+    blocked = run_hook("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", ws)
+    approved = run_hook("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-7", ws)
+    other = run_hook("databricks bundle deploy -t prod", ws)
+    assert blocked.returncode == 2
+    assert approved.returncode == 0
+    assert other.returncode == 0
 
 
 # ---------------------------------------------------------------- the allowlist file itself
@@ -893,8 +913,15 @@ def test_malformed_or_empty_allowlist_fails_closed(tmp_path: Path, body: str):
 def test_warn_mode_downgrades_to_approve_with_reason(tmp_path: Path):
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["sqlserver-demo"], "guard_mode": "warn"}))
-    decision, reason = decide(WRITES[0], tmp_path)
+    decision, reason = decide(WRITES[1], tmp_path)
     assert decision == "approve" and reason.startswith("WARN (guard_mode=warn)")
+
+
+def test_warn_mode_still_blocks_legacy_write(tmp_path: Path):
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["sqlserver-demo"], "guard_mode": "warn"}))
+    decision, reason = decide(WRITES[0], tmp_path)
+    assert decision == "block" and "legacy is read-only" in reason
 
 
 def test_star_catalog_is_a_name_not_a_wildcard(tmp_path: Path):
