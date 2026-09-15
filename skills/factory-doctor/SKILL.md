@@ -12,7 +12,7 @@ being applied, the source credential can write, or the tolerances on disk are no
 ## Run
 
 ```bash
-python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role orchestrator|child] \
+python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role orchestrator|child|setup] \
     [--expect-identity <migration SP userName>] [--expect-host <workspace URL>] [--expect-catalogs a,b] \
     [--hook-probe-result blocked:<nonce>|not-blocked] \
     [--unit <unit_id> ...] [--mapping <candidate mapping_spec.json> ...] \
@@ -22,7 +22,9 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--analytical-schema CATALOG.SCHEMA]
 # --role child: one --unit per unit in the batch brief (the doctor resolves and checks
 # .migration/units/<id>/mapping_spec.json itself); an orchestrator checks every unit mapping in the
-# workspace. --source-secret/--param: the same values the recon run will get. --expect-catalogs: the
+# workspace. --role setup: the setup step of 1-migration_setup runs with it; there a missing
+# playbooks.lock.json is `skipped` (a warning), not `fail`.
+# --source-secret/--param: the same values the recon run will get. --expect-catalogs: the
 # catalogs the wave's capability contract names. --source-attested D-<id>: a decision in
 # .migration/06_decisions.md attesting the source has no principal to query (files in object
 # storage, a read-only share, a static dump); only for families without a privilege query.
@@ -114,4 +116,5 @@ Reference details and factory placement: [references/checks.md](references/check
 - `playbooks_in_sync` compares `.migration/playbooks.lock.json` against the repo playbook files
   (sha256 each): a stale, missing or unknown macro, or a playbook file absent from the 0-README
   Files table, fails the row. Re-running `install-dbx-factory` is the only fix; at setup (before
-  the lock exists) the row is `skipped` with the warning that the live library is unverified.
+  the lock exists, `--role setup`) the row is `skipped` with the warning that the live library is
+  unverified. The row proves the repo matches the last sync receipt, not live org state.

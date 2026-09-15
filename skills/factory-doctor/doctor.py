@@ -409,12 +409,16 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str) -> Check:
     if not isinstance(lock_data, dict):
         return Check(cid, "fail", f"{PLAYBOOKS_LOCK} is not a JSON object", {"lock": PLAYBOOKS_LOCK})
     repo = _repo_playbooks(plugin_root)
-    data: dict = {"stale": [], "missing": [], "unknown": [], "unlisted": [], "checked": len(repo)}
+    data: dict = {"malformed": [], "stale": [], "missing": [], "unknown": [], "unlisted": [],
+                  "checked": len(repo)}
     for macro, (_repo_file, sha) in repo.items():
         entry = lock_data.get(macro)
         if entry is None:
             data["missing"].append(macro)
-        elif not isinstance(entry, dict) or entry.get("sha256") != sha:
+        elif not isinstance(entry, dict) or not all(
+                isinstance(entry.get(k), str) for k in ("sha256", "repo_file", "installed_at")):
+            data["malformed"].append(macro)
+        elif entry["sha256"] != sha:
             data["stale"].append(macro)
     data["unknown"] = sorted(m for m in lock_data if m not in repo)
     repo_files = {f for f, _sha in repo.values()}
@@ -422,15 +426,18 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str) -> Check:
     data["unlisted"] = sorted(p.name for p in playbooks_dir.glob("*.md")
                               if p.name not in _NOT_PLAYBOOKS and p.name not in repo_files)
     findings = [f"{k}: {', '.join(v)}" for k, v in
-                (("stale", data["stale"]), ("missing", data["missing"]), ("unknown", data["unknown"])) if v]
+                (("malformed", data["malformed"]), ("stale", data["stale"]),
+                 ("missing", data["missing"]), ("unknown", data["unknown"])) if v]
     if data["unlisted"]:
         findings.append(f"not in the 0-README Files table: {', '.join(data['unlisted'])}")
     if findings:
         return Check(cid, "fail", "; ".join(findings) + " — re-run install-dbx-factory", data)
-    installed = [e.get("installed_at") for e in lock_data.values()
-                 if isinstance(e, dict) and e.get("installed_at")]
-    return Check(cid, "ok", f"{len(repo)} playbooks match {PLAYBOOKS_LOCK}",
-                 {"checked": len(repo), "installed_at": max(installed) if installed else None})
+    installed = [e["installed_at"] for e in lock_data.values()
+                 if isinstance(e, dict) and isinstance(e.get("installed_at"), str)]
+    installed_at = max(installed) if installed else "unknown"
+    return Check(cid, "ok", f"{len(repo)} playbooks match the lock written at the last "
+                 f"install-dbx-factory sync ({installed_at})",
+                 {"checked": len(repo), "installed_at": installed_at if installed else None})
 
 
 def check_official_plugin(plugin_root: Path) -> Check:
@@ -1492,7 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--workspace", type=Path, default=Path.cwd())
     p.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parents[2])
-    p.add_argument("--role", choices=("orchestrator", "child"), default="orchestrator")
+    p.add_argument("--role", choices=("orchestrator", "child", "setup"), default="orchestrator")
     p.add_argument("--wave", type=Path,
                    help="wave manifest; also writes <manifest>.doctor.json, the signed record the fan-out workflow launches from")
     p.add_argument("--hook-probe-result", default="unknown", metavar="blocked:<nonce>|not-blocked|unknown",
