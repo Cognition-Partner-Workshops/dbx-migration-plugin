@@ -167,7 +167,7 @@ FILES2 = {
     "fix.sh": "cat /etc/hosts\n",
     "q.sql": "SELECT 1;\n",
     "capture_baseline.py": "import boto3\ns3 = boto3.client(\"s3\")\nprint(s3.list_buckets())\n",
-    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n",
+    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n",
     "d.patch": "--- a/.migration/allowed_targets.json\n+++ b/.migration/allowed_targets.json\n",
     "ok.patch": "--- a/notes.md\n+++ b/notes.md\n",
 }
@@ -685,17 +685,19 @@ PROBES2 = [
     ("R4 for loop write over unknown host", "for h in lakebase-host unknown-host.example; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "block"),
     ("R5 post-loop host write blocks: spell the host out", "for h in tdprod.corp lakebase-host; do true; done; psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'", "block"),
     # --- decision-authorized legacy writes
-    ("R4 legacy write with matching decision flag", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-7", "approve"),
     ("R4 legacy write with matching decision env prefix", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "approve"),
     ("R4 legacy write without decision token", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "block"),
-    ("R4 legacy write unknown decision id", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-99", "block"),
-    ("R4 legacy write decision row without literal", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-8", "block"),
-    ("R4 legacy write decision row names other object", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-9", "block"),
-    ("R4 legacy write command names different object than decision", "sqlcmd -S tdprod.corp -Q 'DELETE FROM dbo.customers' --decision D-7", "block"),
-    ("R4 legacy write decision covers one of two objects", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD x INT; DELETE FROM dbo.customers' --decision D-7", "block"),
-    ("R4 legacy-only client write with matching decision", "bteq --decision D-7 <<EOF\n.LOGON tdprod.corp/u,p\nALTER TABLE dbo.orders ADD cdc_ts INT;\nEOF", "approve"),
-    ("R4 legacy read with decision token still approves", "sqlcmd -S tdprod.corp -Q 'SELECT 1' --decision D-7", "approve"),
-    ("R4 decision token on unreadable legacy script", "sqlcmd -S tdprod.corp -i missing.sql --decision D-7", "block"),
+    ("R4 legacy write unknown decision id", "DBX_DECISION=D-99 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "block"),
+    ("R4 legacy write decision row without literal", "DBX_DECISION=D-8 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "block"),
+    ("R4 legacy write decision row names other object", "DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "block"),
+    ("R4 legacy write object prefix is not covered", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'DELETE FROM dbo.orders_archive'", "block"),
+    ("R4 legacy write object suffix is not covered", "DBX_DECISION=D-10 sqlcmd -S tdprod.corp -Q 'DELETE FROM dbo.orders'", "block"),
+    ("R4 legacy write command names different object than decision", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'DELETE FROM dbo.customers'", "block"),
+    ("R4 legacy write decision covers one of two objects", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD x INT; DELETE FROM dbo.customers'", "block"),
+    ("R4 legacy-only client write with matching decision", "DBX_DECISION=D-7 bteq <<EOF\n.LOGON tdprod.corp/u,p\nALTER TABLE dbo.orders ADD cdc_ts INT;\nEOF", "approve"),
+    ("R4 legacy read with decision token still approves", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'SELECT 1'", "approve"),
+    ("R4 decision token on unreadable legacy script", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -i missing.sql", "block"),
+    ("R4 legacy write flag form is rejected", "sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD x INT' --decision D-7", "block"),
 ]
 
 
@@ -852,17 +854,19 @@ def test_fixture_endpoint_environment_is_command_local(tmp_path: Path, command, 
     assert decision == expected
 
 
-@pytest.mark.parametrize("command,needle", [
-    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-7", "D-7"),
-    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", "--decision"),
-    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-99", "D-99"),
-    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-8", "legacy_write_authorized"),
-    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-9", "dbo.orders"),
+@pytest.mark.parametrize("command,expected,needle", [
+    ("DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", True, "D-7"),
+    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "DBX_DECISION=D-<id>"),
+    ("DBX_DECISION=D-99 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "D-99"),
+    ("DBX_DECISION=D-8 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "legacy_write_authorized"),
+    ("DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "dbo.orders"),
+    ("DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'DELETE FROM dbo.orders_archive'", False, "does not name `dbo.orders_archive`"),
+    ("DBX_DECISION=D-10 sqlcmd -S tdprod.corp -Q 'DELETE FROM dbo.orders'", False, "does not name `dbo.orders`"),
 ])
-def test_legacy_write_decision_reason(tmp_path_factory, command, needle):
+def test_legacy_write_decision_reason(tmp_path_factory, command, expected, needle):
     ws = _make_ws(tmp_path_factory, "decision_reason_ws", ALLOWLIST2, FILES2)
     result = run_hook(command, ws)
-    assert (result.returncode == 0) == command.endswith("--decision D-7")
+    assert (result.returncode == 0) == expected
     assert needle in result.stdout
 
 
@@ -870,7 +874,7 @@ def test_legacy_write_decision_and_warn_mode(tmp_path_factory):
     allowlist = {**ALLOWLIST2, "guard_mode": "warn"}
     ws = _make_ws(tmp_path_factory, "decision_warn_ws", allowlist, FILES2)
     blocked = run_hook("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", ws)
-    approved = run_hook("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2' --decision D-7", ws)
+    approved = run_hook("DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", ws)
     other = run_hook("databricks bundle deploy -t prod", ws)
     assert blocked.returncode == 2
     assert approved.returncode == 0

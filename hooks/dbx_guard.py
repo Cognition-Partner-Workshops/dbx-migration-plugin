@@ -9,7 +9,7 @@ simple command by its program: Databricks clients pass `_DBX_READ`
 shapes and mutate only allowlisted securables; REST to a workspace host is GET without a body; deploys need a listed target;
 identity is never changed. Legacy-only clients and generic clients naming a legacy source run read shapes only; a generic
 client elsewhere writes when every host candidate is in `target_hosts` and the write resolves to a listed catalog / database. A
-legacy write approves only with `--decision D-<id>` / `DBX_DECISION=D-<id>` matching a `legacy_write_authorized` row in
+legacy write approves only with `DBX_DECISION=D-<id>` matching a `legacy_write_authorized` row in
 `06_decisions.md` that names the object; warn mode never downgrades a legacy write.
 Nothing writes `.migration/` or the running guard's tree (git there is the `_git_reads` allowlist). Scripts and SQL files are
 read in the command's effective directory (event cwd, cd / pushd / env -C / git -C); what the guard cannot read blocks where a
@@ -832,11 +832,9 @@ def _write_objects(statements: list[str]) -> list[str]:
 
 def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None, str | None]:
     """The decision token, and the missing condition when its ledger row cannot authorize every write."""
-    flags = _flag_values(seg.argv, ("--decision",))
     decision_id = next((a.split("=", 1)[1] for a in reversed(seg.assigns) if a.startswith("DBX_DECISION=")), None)
-    decision_id = flags[-1] if flags else decision_id
     if not decision_id:
-        return None, "no `--decision D-<id>` / `DBX_DECISION=D-<id>` on the command"
+        return None, "no `DBX_DECISION=D-<id>` prefix on the command"
     if not _DECISION_ID.fullmatch(decision_id):
         return decision_id, f"`{decision_id}` is not a row in .migration/06_decisions.md"
     try:
@@ -854,7 +852,7 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
         statement = next(statement for statement in statements if not _WRITE_OBJECT.match(statement))
         return decision_id, f"cannot tell which object `{statement[:60]}` writes"
     for obj in objects:
-        if obj.lower() not in row.lower():
+        if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", row, re.IGNORECASE):
             return decision_id, f"row `{decision_id}` does not name `{obj}`"
     return decision_id, None
 
