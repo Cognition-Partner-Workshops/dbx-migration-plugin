@@ -132,7 +132,7 @@ _CLOUD_FAMILY = {
     "azure": (("AZURE_", "AZURITE_"), re.compile(r"(?<![\w.-])az(?![\w-])|azure[.-]storage|\babfss://")),
     "gcp": (("GOOGLE_", "GCLOUD_", "GCS_", "CLOUDSDK_", "STORAGE_EMULATOR_HOST", "PUBSUB_EMULATOR_HOST",
               "FIRESTORE_EMULATOR_HOST"),
-             re.compile(r"(?<![\w.-])(?:gcloud|gsutil)(?![\w-])|google[.-]cloud[.-]storage|\bgs://")),
+             re.compile(r"(?<![\w.-])(?:gcloud|gsutil)(?![\w-])|google(?:[.-]cloud[.-]storage|\.cloud\s+import\s+storage)|\bgs://")),
 }
 
 # read shapes: leading keyword, then no write keyword anywhere in the statement
@@ -565,7 +565,10 @@ def _program(words: list[str], assigns: list[str]) -> tuple[list[str], str]:
                 return words, ""
             return ["sh", "-c", payload], " ".join(words)
         if w == "docker":
-            i += 1 + (words[i + 1:i + 2] == ["compose"])
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 1 if "=" in words[i] or words[i] in ("-D", "--debug", "--tls", "--tlsverify") else 2
+            i += words[i:i + 1] == ["compose"]
             if words[i:i + 1] not in (["exec"], ["run"]):
                 return words, ""
         elif w == "kubectl" and words[i + 1:i + 2] == ["exec"]:
@@ -1148,7 +1151,8 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
                               "read by the guard (run the statements inline)")
             continue
         base = seg.argv0
-        if any(op.startswith(">") for op, _ in seg.redirects()):
+        if any(">" in op and not (op.endswith("&") and re.fullmatch(r"\d+|-", f))
+               for op, f in seg.redirects()):
             violations.append(f"remote command `{base}` on legacy host {hits} redirects output to a file on the legacy host; "
                               "legacy hosts are read-only")
             continue
@@ -1161,7 +1165,19 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
             flags = ("-o", "--output", "-O", "--remote-name", "--remote-name-all", "--output-document", "-D",
                      "--dump-header", "-c", "--cookie-jar", "-d", "--download")
             words = seg.argv[1:]
+            if base == "curl":
+                flags = tuple(flag for flag in flags if flag not in ("-d", "--download"))
             output = bool(_flag_values(seg.argv, flags)) or any(w in flags for w in words)
+            if base == "curl":
+                for word in words:
+                    if match := re.match(r"^-[A-Za-z]+", word):
+                        walked = match.group()[1:]
+                        for letter in walked:
+                            if letter in _CURL_VALUE_SHORT:
+                                output = output or letter in "oODc"
+                                break
+            elif base in ("http", "https", "xh"):
+                output = output or any(w.startswith(("-o", "-d")) and len(w) > 2 for w in words)
             stdout = any(w in ("-O-", "--output-document=-") or
                          w == "-O" and i + 1 < len(words) and words[i + 1] == "-" or
                          re.fullmatch(r"-[A-Za-z]*O-", w)
