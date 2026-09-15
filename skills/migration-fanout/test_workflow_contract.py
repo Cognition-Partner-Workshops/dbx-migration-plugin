@@ -63,7 +63,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         if tamper == "wrong_sha":
             manifest_path.write_bytes(manifest_bytes + b"x")
         if tamper == "signature":
-            record["signature"] = "0" + record["signature"][1:]
+            record["signature"] = ("0" if record["signature"][0] != "0" else "1") + record["signature"][1:]
         if tamper != "missing":
             waves.joinpath("wave-0.doctor.json").write_text(json.dumps(record))
     origin = tmp_path / "origin.git"
@@ -193,3 +193,14 @@ def test_script_reads_no_environment_and_no_file_path():
     assert "__file__" not in src
     assert "import os" not in src
     assert "W" + "AVE_" not in src
+
+
+def test_docs_describe_the_pointer_and_doctor_wave_steps():
+    skill = (WORKFLOW.parent / "SKILL.md").read_text()
+    orchestrator = (WORKFLOW.parents[1] / "install-dbx-factory" / "playbooks" / "9-orchestrator.md").read_text()
+    for doc in (skill, orchestrator):
+        assert "current.json" in doc
+        assert "--wave" in doc
+        assert "run_id" in doc
+        assert '"workspace"' in doc or "workspace" in doc
+        assert "W" + "AVE_" not in doc
