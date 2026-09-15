@@ -1,9 +1,10 @@
 """Migration fan-out workflow: run one wave of unit-migration children, then one
 independent verifier, and write the wave result the orchestrator gates on.
 
-Run with the `run_workflow` tool. Set WAVE_MANIFEST (env var) to the wave file the plan
-wrote, e.g. .migration/waves/wave-2.json. Same script for every kit: the manifest names
-the child playbook macro, so nothing here is DBX- or Mongo-specific.
+Run with the `run_workflow` tool. The orchestrator writes `.migration/waves/current.json`
+at or above the sandbox cwd; it names the wave manifest and workspace when the pointer does
+not live in the workspace. Same script for every kit: the manifest names the child playbook
+macro, so nothing here is DBX- or Mongo-specific.
 
 What this script guarantees, so the orchestrator does not have to:
   - Two batches in the same wave never share a write target (checked BEFORE launch).
@@ -15,8 +16,8 @@ What this script guarantees, so the orchestrator does not have to:
   - The verifier is a different session from every child. Only PRs the verifier marks
     PASS are merged, and only if the manifest says auto_merge (false by default; soft stop_mode
     may set true by a recorded STOP A decision).
-  - Re-running with the same run_id (also passed as WAVE_RUN_ID) replays finished children and only
-    launches the rest.
+  - Re-running with the same run_id in the pointer replays finished children and only launches
+    the rest.
 
 Manifest shape (written by the plan playbook, read here):
 {
@@ -51,43 +52,82 @@ Manifest shape (written by the plan playbook, read here):
      "verify_depth": "full",                  # optional per-batch override
      "brief": "...complete hand-off text for this batch..."}
   ]
+  "smoke": true                              # only valid for wave 0, width 1, mode smoke
 }
 
 Wave 0 uses the same workflow with `"wave": 0` and `"width": 1` for serial shared objects.
 """
 
 import asyncio
+import datetime
 import hashlib
+import hmac
 import json
-import os
 import re
 import shlex
 import subprocess
-import sys
 from collections import Counter
 from pathlib import Path
 
-WAVES_DIR = Path(".migration/waves").resolve()
-MANIFEST_PATH = Path(os.environ.get("WAVE_MANIFEST", ".migration/waves/wave-1.json")).resolve()
-if MANIFEST_PATH.suffix != ".json" or not MANIFEST_PATH.is_relative_to(WAVES_DIR):
-    raise SystemExit(f"WAVE_MANIFEST must be a .json file inside {WAVES_DIR}")
+POINTER_REL = Path(".migration/waves/current.json")
+MODES = ("start", "resume", "rerun", "smoke")
+HOOK_PROBE = re.compile(r"blocked:[0-9a-f]{8}|not-blocked|unknown")
+DOCTOR_MAX_AGE = datetime.timedelta(minutes=15)
+
+
+def find_pointer(start):
+    """The sandbox gives this script one thing: its cwd (the session's home directory, not the workspace).
+    The orchestrator writes .migration/waves/current.json at or above that cwd; `workspace` inside it
+    names the repo when the pointer does not live in it."""
+    for d in (start, *start.parents):
+        if (d / POINTER_REL).is_file():
+            return d / POINTER_REL
+    raise SystemExit(f"no {POINTER_REL} at or above {start}; write the orchestrator pointer, then re-run")
+
+
+POINTER_PATH = find_pointer(Path.cwd().resolve())
+try:
+    POINTER = json.loads(POINTER_PATH.read_text())
+except ValueError as e:
+    raise SystemExit(f"{POINTER_PATH} is not valid JSON: {e}") from None
+if not isinstance(POINTER, dict) or POINTER.get("mode") not in MODES or not isinstance(POINTER.get("manifest"), str):
+    raise SystemExit(f"{POINTER_PATH} must be {{manifest: 'wave-N.json', mode: start|resume|rerun|smoke, run_id, hook_probe, workspace?}}")
+MODE = POINTER["mode"]
+RUN_ID = POINTER.get("run_id")
+if RUN_ID is not None and (not isinstance(RUN_ID, str) or not RUN_ID.strip()):
+    raise SystemExit(f"{POINTER_PATH} run_id must be the run_workflow run_id string or null")
+if RUN_ID is not None and MODE != "resume":
+    raise SystemExit(f"{POINTER_PATH} run_id must be null unless mode is resume: run_workflow reports the run_id only once a fresh run starts; "
+                     "record it in <manifest>.run_id afterwards")
+HOOK_PROBE_RESULT = POINTER.get("hook_probe")
+if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE_RESULT):
+    raise SystemExit(f"{POINTER_PATH} hook_probe must be blocked:<nonce>, not-blocked or unknown (the probe run in the "
+                     "orchestrator's shell; the doctor was given the same value)")
+ROOT = Path(POINTER["workspace"]).resolve() if isinstance(POINTER.get("workspace"), str) else POINTER_PATH.parents[2]
+WAVES_DIR = ROOT / ".migration" / "waves"
+MANIFEST_PATH = (WAVES_DIR / POINTER["manifest"]).resolve()
+if MANIFEST_PATH.suffix != ".json" or MANIFEST_PATH.parent != WAVES_DIR.resolve() or MANIFEST_PATH.name.endswith((".result.json", ".doctor.json")):
+    raise SystemExit(f"{POINTER_PATH} manifest must be the plain file name of a wave manifest inside {WAVES_DIR}")
 if not MANIFEST_PATH.exists():
-    raise SystemExit(f"no wave manifest at {MANIFEST_PATH}. Set WAVE_MANIFEST to the file the "
-                     "plan playbook wrote, then re-run.")
-MANIFEST_TEXT = MANIFEST_PATH.read_text()
-MANIFEST = json.loads(MANIFEST_TEXT)
-ROOT = MANIFEST_PATH.parent.parent.parent
-DOCTOR_PY = Path(__file__).resolve().parents[1] / "factory-doctor" / "doctor.py"
+    raise SystemExit(f"no wave manifest at {MANIFEST_PATH}; the plan playbook writes it, then re-run")
+MANIFEST_BYTES = MANIFEST_PATH.read_bytes()
+MANIFEST = json.loads(MANIFEST_BYTES)
 BASE_BRANCH = MANIFEST.get("base_branch", "")
-MANIFEST_SHA = hashlib.sha256(MANIFEST_TEXT.encode()).hexdigest()[:12]
+MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
 BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")
-resume = os.environ.get("WAVE_RESUME") == "1"
+DOCTOR_PATH = MANIFEST_PATH.with_suffix(".doctor.json")
+resume = MODE == "resume"
+SMOKE = MODE == "smoke"
+if SMOKE and not (MANIFEST.get("smoke") is True and MANIFEST.get("wave") == 0 and MANIFEST.get("width") == 1):
+    raise SystemExit("mode smoke exercises the runner only: it needs a manifest with smoke: true, wave: 0, width: 1")
+if not SMOKE and MANIFEST.get("smoke") is True:
+    raise SystemExit("a smoke manifest never runs a real wave")
 prior = None
 
-if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
+if RESULT_PATH.exists() and MODE != "rerun":
     try:
         prior = json.loads(RESULT_PATH.read_text())
         if not isinstance(prior, dict):
@@ -95,29 +135,28 @@ if RESULT_PATH.exists() and os.environ.get("WAVE_RERUN") != "1":
     except ValueError:
         if not resume:
             raise SystemExit(f"{RESULT_PATH} is not valid JSON (interrupted write?). Inspect it; to resume "
-                             "the same run set WAVE_RESUME=1 with the recorded run_id, or set WAVE_RERUN=1 "
+                             "the same run set mode: resume with the recorded run_id, or set mode: rerun "
                              "to redo the wave.") from None
     else:
         if prior.get("closed"):
             raise SystemExit(f"{RESULT_PATH} says wave {prior.get('wave')} closed clean. To redo it on "
-                             "purpose, set WAVE_RERUN=1.")
+                             "purpose, set mode: rerun.")
         if not resume:
-            raise SystemExit(f"{RESULT_PATH} records a halted or failed run. To continue it, re-run with the "
-                             "recorded run_id AND WAVE_RESUME=1 (finished children replay). To redo the wave "
-                             "from scratch, set WAVE_RERUN=1.")
+            raise SystemExit(f"{RESULT_PATH} records a halted or failed run. To continue it, set mode: resume "
+                             "with the recorded run_id (finished children replay). To redo the wave from "
+                             "scratch, set mode: rerun.")
 if resume:
-    run_id = os.environ.get("WAVE_RUN_ID")
-    if not run_id:
-        raise SystemExit("WAVE_RESUME=1 requires WAVE_RUN_ID; pass the recorded run_id")
+    if not RUN_ID:
+        raise SystemExit("mode resume requires run_id in current.json; pass the recorded run_id")
     if not RUN_ID_PATH.exists():
-        raise SystemExit(f"no run record at {RUN_ID_PATH}; cannot verify WAVE_RUN_ID belongs to this wave "
-                         "— use WAVE_RERUN=1 for a fresh run")
-    if RUN_ID_PATH.read_text().strip() != run_id:
-        raise SystemExit(f"WAVE_RUN_ID does not match {RUN_ID_PATH}; pass the recorded run_id to "
-                         "run_workflow and WAVE_RUN_ID, or WAVE_RERUN=1 for a fresh run")
-    if isinstance(prior, dict) and prior.get("run_id") and prior["run_id"] != run_id:
-        raise SystemExit(f"WAVE_RUN_ID does not match prior result at {RESULT_PATH}; pass the recorded "
-                         "run_id to run_workflow and WAVE_RUN_ID, or WAVE_RERUN=1 for a fresh run")
+        raise SystemExit(f"no run record at {RUN_ID_PATH}; cannot verify the pointer run_id belongs to this wave "
+                         "— set mode: rerun for a fresh run")
+    if RUN_ID_PATH.read_text().strip() != RUN_ID:
+        raise SystemExit(f"run_id does not match {RUN_ID_PATH}; pass the recorded run_id in current.json, "
+                         "or set mode: rerun for a fresh run")
+    if isinstance(prior, dict) and prior.get("run_id") and prior["run_id"] != RUN_ID:
+        raise SystemExit(f"run_id does not match prior result at {RESULT_PATH}; pass the recorded run_id in "
+                         "current.json, or set mode: rerun for a fresh run")
 
 REPLAYED = {
     b["id"]: b for b in (prior or {}).get("batches", [])
@@ -253,33 +292,54 @@ def validate_manifest(m, doctor=None):
         if got != want:
             raise SystemExit(f"manifest 'capabilities.{key}' is {got!r} but the doctor recorded {want!r} in "
                              "09_capabilities.json; copy the doctor's values, never edit them")
+    if doctor.get("source") != m.get("source"):
+        raise SystemExit("manifest 'source' differs from the source the doctor was signed for; "
+                         "re-run the doctor with --wave on this manifest")
 
 
-def fresh_doctor_report(m):
-    """.migration/09_capabilities.json is a file anyone can edit, so a wave launches from a doctor run
-    made now, written to <manifest>.doctor.json: identity, host, allowlist, tolerances, stop_mode and
-    the source principal are re-verified. The platform hook probe is the one thing only the launching
-    session's shell can run: its outcome arrives in WAVE_HOOK_PROBE (blocked:<nonce> | not-blocked);
-    nothing recorded earlier stands in for it, and the doctor checks the nonce."""
-    caps, src, out = m["capabilities"], m.get("source") or {}, MANIFEST_PATH.with_suffix(".doctor.json")
-    if not isinstance(caps.get("host"), str) or not caps["host"]:
-        raise SystemExit("manifest 'capabilities.host' must be the workspace host 09_capabilities.json records "
-                         "(identity.host); the doctor and every child are held to it")
-    cmd = [sys.executable, str(DOCTOR_PY), "--workspace", str(ROOT), "--out", str(out),
-           "--hook-probe-result", os.environ.get("WAVE_HOOK_PROBE") or "unknown",
-           "--expect-identity", caps["identity"], "--expect-host", caps["host"],
-           "--expect-catalogs", ",".join(caps["catalogs"])]
-    if src:
-        cmd += ["--source-family", src["family"], "--source-secret", src["secret"]]
-        cmd += [a for k, v in src.get("params", {}).items() for a in ("--param", f"{k}={v}")]
-    out.unlink(missing_ok=True)
-    rc = subprocess.run(cmd, check=False, timeout=900).returncode
+def wave_signature(body, manifest_bytes):
+    # same canonicalisation as factory-doctor's sign_wave_report: sorted keys, compact separators, HMAC-SHA256
+    ident = body.get("identity") or {}
+    key = hashlib.sha256(manifest_bytes + str(ident.get("userName") or "").encode()
+                         + str(ident.get("host") or "").encode()).digest()
+    message = json.dumps({k: v for k, v in body.items() if k != "signature"},
+                         sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(key, message, "sha256").hexdigest()
+
+
+def signed_doctor_report(path, manifest_bytes, now=None):
+    """The doctor ran in the orchestrator's shell (credentials live there, not here) and left a record
+    signed over these manifest bytes. Missing, stale (>15 min), for another manifest, or not verifying: no wave.
+    Tamper-evident only; .migration/ is review-protected. The key is derivable on purpose: this sandbox holds no
+    secret to verify one with, so the signature binds manifest, freshness and contents, and the gate against a lying
+    orchestrator is each child's own --expect-identity doctor run plus PR review."""
     try:
-        report = json.loads(out.read_text()) if rc in (0, 1) else None
-    except (OSError, ValueError):
-        report = None
-    if report is None:
-        raise SystemExit(f"the factory-doctor did not write a report at {out} (rc={rc}); fix the doctor before launching")
+        report = json.loads(path.read_text())
+    except OSError:
+        raise SystemExit(f"no doctor record at {path}; run factory-doctor with --wave {path.with_suffix('.json').name} "
+                         "in the orchestrator's shell, then re-run") from None
+    except ValueError as e:
+        raise SystemExit(f"{path} is not valid JSON: {e}") from None
+    if not isinstance(report, dict):
+        raise SystemExit(f"{path} is not a doctor record")
+    if report.get("manifest_sha") != hashlib.sha256(manifest_bytes).hexdigest()[:12]:
+        raise SystemExit(f"{path} was signed for another manifest (sha {report.get('manifest_sha')}); re-run the doctor with --wave")
+    try:
+        signed_at = datetime.datetime.fromisoformat(str(report.get("signed_at")))
+    except ValueError:
+        raise SystemExit(f"{path} has no valid signed_at") from None
+    if signed_at.tzinfo is None:
+        raise SystemExit(f"{path} signed_at must carry a UTC offset")
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if not (datetime.timedelta(0) <= now - signed_at <= DOCTOR_MAX_AGE):
+        raise SystemExit(f"{path} was signed at {report['signed_at']}, more than {DOCTOR_MAX_AGE} ago (or in the future); "
+                         "re-run the doctor with --wave so the wave launches from a current preflight")
+    if not isinstance(report.get("signature"), str) or not hmac.compare_digest(
+            report["signature"], wave_signature(report, manifest_bytes)):
+        raise SystemExit(f"{path} signature does not verify: the record was edited after the doctor wrote it; re-run the doctor")
+    if report.get("hook_probe") != HOOK_PROBE_RESULT:
+        raise SystemExit(f"{path} was signed for hook_probe {report.get('hook_probe')!r} but current.json says "
+                         f"{HOOK_PROBE_RESULT!r}; give the doctor and the pointer the same probe result")
     return report
 
 
@@ -310,21 +370,22 @@ def launch_base():
             sha = BASE_SHA_PATH.read_text().strip()
         except OSError:
             raise SystemExit(f"no launch base at {BASE_SHA_PATH}; the ledger gate cannot resume without it, "
-                             "use WAVE_RERUN=1 for a fresh run") from None
+                             "set mode: rerun for a fresh run") from None
         if not re.fullmatch(r"[0-9a-f]{40}", sha):
-            raise SystemExit(f"{BASE_SHA_PATH} does not hold a commit sha; use WAVE_RERUN=1 for a fresh run")
+            raise SystemExit(f"{BASE_SHA_PATH} does not hold a commit sha; set mode: rerun for a fresh run")
         return sha
     sha = wave_base()
     tmp = BASE_SHA_PATH.with_suffix(".base_sha.tmp")
     tmp.write_text(sha + "\n")
-    os.replace(tmp, BASE_SHA_PATH)
+    tmp.replace(BASE_SHA_PATH)
     return sha
 
 
 validate_manifest(MANIFEST)
 BASE_SHA = launch_base()
-DOCTOR = fresh_doctor_report(MANIFEST)
-validate_manifest(MANIFEST, DOCTOR)
+DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
+if not SMOKE:
+    validate_manifest(MANIFEST, DOCTOR)
 
 
 def _git_paths(*args):
@@ -481,7 +542,7 @@ def batch_verify_depth(batch) -> str:
     return batch.get("verify_depth", VERIFY_DEPTH)
 
 META = {
-    "name": f"migration-wave-{WAVE}",
+    "name": f"smoke-wave-{WAVE}" if SMOKE else f"migration-wave-{WAVE}",
     "description": f"Wave {WAVE}: {len(BATCHES)} unit batches in parallel, then one independent verifier",
     "phases": [
         {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
@@ -794,18 +855,12 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
               for b, r in zip(BATCHES, results)]
     brief_tmp = BRIEF_PATH.with_suffix(".brief.md.tmp")
     brief_tmp.write_text("\n".join(lines) + "\n")
-    os.replace(brief_tmp, BRIEF_PATH)
+    brief_tmp.replace(BRIEF_PATH)
 
 
 async def main():
     if not resume:
-        run_id = os.environ.get("WAVE_RUN_ID")
-        if not run_id:
-            raise SystemExit("WAVE_RUN_ID is required on the first run so the wave can be resumed "
-                             "(pass the run_workflow run_id)")
-        run_id_tmp = RUN_ID_PATH.with_suffix(".run_id.tmp")
-        run_id_tmp.write_text(run_id + "\n")
-        os.replace(run_id_tmp, RUN_ID_PATH)
+        RUN_ID_PATH.unlink(missing_ok=True)
     await register_workflow(META)
     check_write_targets(BATCHES)
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}")
@@ -867,7 +922,8 @@ async def main():
     result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
     result_tmp.write_text(json.dumps({
         "wave": WAVE, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
-        "run_id": os.environ.get("WAVE_RUN_ID"), "base_sha": BASE_SHA,
+        "run_id": RUN_ID, "base_sha": BASE_SHA, "mode": MODE,
+        "hook_probe": HOOK_PROBE_RESULT, "doctor_signed_at": DOCTOR.get("signed_at"),
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
         "closed": closed,
         "write_target_overlaps": surprises,
@@ -876,7 +932,7 @@ async def main():
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
         "verify": verify,
     }, indent=2, sort_keys=True) + "\n")
-    os.replace(result_tmp, RESULT_PATH)
+    result_tmp.replace(RESULT_PATH)
     write_brief(results, verify, surprises, undeclared, unreported, auto_merge)
     log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")

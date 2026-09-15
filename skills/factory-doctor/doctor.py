@@ -7,7 +7,7 @@ identity/metadata calls only. Secret *values* are never read or printed; only th
 environment variables that are set.
 
 Usage:
-    python3 doctor.py [--workspace DIR] [--plugin-root DIR] [--role orchestrator|child]
+    python3 doctor.py [--workspace DIR] [--plugin-root DIR] [--role orchestrator|child] [--wave MANIFEST]
                       [--hook-probe-result blocked:<nonce>|not-blocked|unknown] [--expect-identity NAME] [--expect-host URL]
                       [--expect-catalogs A,B] [--no-databricks] [--unit ID ...]
                       [--mapping mapping_spec.json ...] [--source-secret NAME] [--source-family F]
@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import datetime
+import hashlib
+import hmac
 import importlib
 import importlib.util
 import json
@@ -94,6 +97,33 @@ def _run(cmd: list[str], timeout: int = 60, cwd: Path | None = None) -> tuple[in
         return 127, "", f"{cmd[0]}: not found"
     except subprocess.TimeoutExpired:
         return 124, "", f"{' '.join(cmd[:3])}: timed out after {timeout}s"
+
+
+def manifest_sha(manifest_bytes: bytes) -> str:
+    return hashlib.sha256(manifest_bytes).hexdigest()[:12]
+
+
+def wave_signature(body: dict, manifest_bytes: bytes) -> str:
+    """HMAC over the canonical doctor record. Key = manifest bytes + the identity the doctor saw, so a
+    record cannot be moved to another manifest or another principal. Tamper-evident, not tamper-proof:
+    .migration/ is review-protected, and this closes the 'edited 09_capabilities.json' hole, nothing more.
+    The key is derivable on purpose: the workflow sandbox holds no secret to verify one with, and a key
+    carried in the manifest is writable by the same session that writes this record, so the gate against
+    a lying orchestrator is each child's own --expect-identity doctor run plus PR review, not this HMAC."""
+    ident = body.get("identity") or {}
+    key = hashlib.sha256(manifest_bytes + str(ident.get("userName") or "").encode()
+                         + str(ident.get("host") or "").encode()).digest()
+    message = json.dumps({k: v for k, v in body.items() if k != "signature"},
+                         sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(key, message, "sha256").hexdigest()
+
+
+def sign_wave_report(report: dict, manifest_bytes: bytes, signed_at: str | None = None) -> dict:
+    body = {k: v for k, v in report.items() if k != "signature"}
+    body["manifest_sha"] = manifest_sha(manifest_bytes)
+    body["signed_at"] = signed_at or datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    body["signature"] = wave_signature(body, manifest_bytes)
+    return body
 
 
 _SECRET_ASSIGNMENT = re.compile(
@@ -1241,6 +1271,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workspace", type=Path, default=Path.cwd())
     p.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parents[2])
     p.add_argument("--role", choices=("orchestrator", "child"), default="orchestrator")
+    p.add_argument("--wave", type=Path,
+                   help="wave manifest; also writes <manifest>.doctor.json, the signed record the fan-out workflow launches from")
     p.add_argument("--hook-probe-result", default="unknown", metavar="blocked:<nonce>|not-blocked|unknown",
                    help="outcome of running the probe_command of the last report; the nonce is the one the "
                         "guard's block message named")
@@ -1273,6 +1305,30 @@ def main(argv: list[str] | None = None) -> int:
     if a.hook_probe_result == "blocked":
         p.error("--hook-probe-result blocked:<nonce> is required: the nonce the guard's block message named for the probe_command "
                 "of the last report")
+    manifest_bytes = None
+    if a.wave:
+        try:
+            manifest_bytes = a.wave.read_bytes()
+            manifest = json.loads(manifest_bytes)
+        except (OSError, ValueError) as e:
+            p.error(f"cannot read wave manifest {a.wave}: {e}")
+        caps = manifest.get("capabilities") if isinstance(manifest, dict) else None
+        if not isinstance(caps, dict):
+            p.error(f"wave manifest {a.wave} has no capabilities object")
+        if a.expect_identity is None:
+            a.expect_identity = caps.get("identity")
+        if a.expect_host is None:
+            a.expect_host = caps.get("host")
+        if a.expect_catalogs is None:
+            catalogs = caps.get("catalogs")
+            a.expect_catalogs = catalogs if isinstance(catalogs, list) else None
+        source = manifest.get("source")
+        if a.source_family is not None or a.source_secret is not None or a.param:
+            p.error("--wave takes source settings from the manifest; drop --source-family/--source-secret/--param")
+        a.source_family = source.get("family") if isinstance(source, dict) else None
+        a.source_secret = source.get("secret") if isinstance(source, dict) else None
+        a.param = [f"{k}={v}" for k, v in (source.get("params") or {}).items()] if isinstance(source, dict) else []
+
     params = None
     if a.param:
         sys.path.insert(0, str(a.plugin_root.resolve() / "skills" / "data-reconciliation" / "harness"))
@@ -1294,6 +1350,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nready={report['ready']} {report['summary']}"
           + (f" blocking={report['blocking']}" if report["blocking"] else "")
           + (f"  -> {out}" if str(out) != "-" else ""))
+    if a.wave:
+        a.wave.with_suffix(".doctor.json").write_text(json.dumps(
+            sign_wave_report({**report, "hook_probe": a.hook_probe_result, "source": manifest.get("source")},
+                             manifest_bytes),
+            indent=2, sort_keys=True) + "\n")
     return 0 if report["ready"] else 1
 
 
