@@ -135,6 +135,12 @@ _WRITE_OBJECT = re.compile(
 )
 _AUTHORIZED = "authorized: decision "
 _LEGACY_TAIL = " (legacy is read-only in every phase)"
+
+
+class _Legacy(str):
+    """A violation on a legacy source; never downgraded by warn mode."""
+
+
 _RMTREE = re.compile(r"rmtree\(\s*(?:['\"]([^'\"]*)['\"]|(os\.getcwd\(\)|Path\.cwd\(\)|Path\(\s*(?:['\"]\.?['\"])?\s*\)))")
 _SQL_OUT_PATH = re.compile(r"(?i)(?:\bTO\s+|\\[ow]\s+|:out\s+|\bSPOOL\s+|\bFILE\s*=\s*)'?([^\s'\"]*\.migration(?:/[^\s'\"]*)?)")
 _SQL_OPAQUE = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)|'(?:[^']|'')*(?:'|\Z)", re.DOTALL)
@@ -315,7 +321,7 @@ class Verdict:
             return cls("approve", reason, violations)
         reason = ("dbx-migration-factory guard: " + "; ".join(violations) + ". Fix the command or, if the target is legitimate, add "
                   "it to .migration/allowed_targets.json via a recorded decision (.migration/06_decisions.md); never work around the guard.")
-        if cfg.mode == "warn" and not any(v.endswith(_LEGACY_TAIL) for v in real):
+        if cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
             return cls("approve", "WARN (guard_mode=warn): " + reason, violations)
         return cls("block", reason, violations)
 
@@ -851,6 +857,9 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
     if len(objects) != len(statements):
         statement = next(statement for statement in statements if not _WRITE_OBJECT.match(statement))
         return decision_id, f"cannot tell which object `{statement[:60]}` writes"
+    for obj, statement in zip(objects, statements):
+        if obj.startswith("$") or obj.endswith("$") or re.search(r"[$:&@]\{?\(", statement):
+            return decision_id, f"`{obj}` is a run-time substitution; the decision must name the literal object"
     for obj in objects:
         if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", row, re.IGNORECASE):
             return decision_id, f"row `{decision_id}` does not name `{obj}`"
@@ -926,14 +935,14 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     base, tail = seg.argv0, _LEGACY_TAIL
     legacy, hits = base in _LEGACY_ONLY, _context(seg.text, cfg, legacy_only=True)
     if base in _LOADERS:
-        return [f"`{base}` is a loader: nothing but reads ever runs against a legacy source" + tail]
+        return [_Legacy(f"`{base}` is a loader: nothing but reads ever runs against a legacy source" + tail)]
     sql, unreadable = _sql_text(seg, root, [seg.argv[1]] if base == "bcp" and len(seg.argv) > 2 and "queryout" in seg.argv[2:4] else [])
     non_reads = _non_reads(sql)
     bad = [b.split("\n", 1)[0][:80] for b in [
         *([f"stdin from `{seg.opaque}`, a program or expansion the guard cannot read"] if seg.opaque else []),
         *([f"{base} (a migration tool: every run writes its target)"] if base in _WRITERS else []),
         *(["bcp ... in (loader)"] if base == "bcp" and "in" in seg.argv[1:4] else []), *non_reads]]
-    violations = [_UNREADABLE.format(who="legacy client", files=unreadable) + tail] if unreadable and (legacy or hits) else []
+    violations = [_Legacy(_UNREADABLE.format(who="legacy client", files=unreadable) + tail)] if unreadable and (legacy or hits) else []
     if unreadable and not violations:
         bad.insert(0, f"script(s) {unreadable} the guard cannot read")
     if not bad:
@@ -949,7 +958,7 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
             violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {', '.join(_write_objects(non_reads))} "
                               "(legacy_write_authorized row in .migration/06_decisions.md)")
         else:
-            violations.append(f"{violation}; a recorded decision would allow it, but {missing}{tail}")
+            violations.append(_Legacy(f"{violation}; a recorded decision would allow it, but {missing}{tail}"))
     elif not (hosts := _hosts(seg, recon)) or not all(h in cfg.target_hosts for h in hosts):
         violations.append(f"non-read statement through `{base}` to a host that is not a literal in target_hosts {cfg.target_hosts} "
                           f"(seen: {sorted(set(hosts))[:6]}; every host must be listed, an empty list blocks every write): `{bad[0]}`")
@@ -1139,17 +1148,17 @@ def _check_identity(segs: list[_Seg], cfg: GuardConfig | None = None) -> list[st
         names = [a.split("=", 1)[0] for a in s.assigns] + ([w.split("=", 1)[0] for w in s.argv[1:] if not w.startswith("-")] if persistent else [])
         for n in names:
             if n.lower() in trusted:
-                violations.append(f"`{n}` is a name the allowlist trusts (target_hosts / legacy_sources); "
-                                  f"{'unsetting' if s.argv0 == 'unset' else 'assigning'} it would make that name stand for a different "
-                                  "endpoint" + tail)
+                violations.append(_Legacy(f"`{n}` is a name the allowlist trusts (target_hosts / legacy_sources); "
+                                          f"{'unsetting' if s.argv0 == 'unset' else 'assigning'} it would make that name stand for a different "
+                                          "endpoint" + tail))
             elif _IDENTITY_VAR.match(n) and (client or persistent):
-                violations.append(f"identity swap: `{n}=` {'around `' + s.argv0 + '`' if client else 'changed for the session'}" + tail)
+                violations.append(_Legacy(f"identity swap: `{n}=` {'around `' + s.argv0 + '`' if client else 'changed for the session'}" + tail))
             elif n in _CONFIG_HOME_VAR and client:
-                violations.append(f"identity swap: `{n}=` moves the Databricks config lookup around `{s.argv0}`" + tail)
+                violations.append(_Legacy(f"identity swap: `{n}=` moves the Databricks config lookup around `{s.argv0}`" + tail))
         if client and s.argv0 != "spark-sql":
             flags = [w for w in s.argv[1:] if w in ("--profile", "-p", "--host") or w.startswith(("--profile=", "--host="))]
             if flags or s.argv[1:3] == ["auth", "login"] or s.argv[1:2] == ["configure"]:
-                violations.append(f"identity swap through `{s.argv0} {' '.join(flags or s.argv[1:3])}`" + tail)
+                violations.append(_Legacy(f"identity swap through `{s.argv0} {' '.join(flags or s.argv[1:3])}`" + tail))
     return violations
 
 
@@ -1178,8 +1187,8 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         if not hits:
             violations += _catalog_violations(m.group(2), cfg, None, "")
         elif bad := _non_reads(m.group(2)):
-            violations.append(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}` "
-                              + _LEGACY_TAIL)
+            violations.append(_Legacy(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}` "
+                                     + _LEGACY_TAIL))
     return violations
 
 
@@ -1310,7 +1319,7 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
                 and not read_shape):
             violations.append(f"remote command `{base}` on legacy host {hits} is not a read shape the guard models; "
                               "legacy hosts are read-only")
-    return violations
+    return [_Legacy(v) for v in violations]
 
 
 # ---------------------------------------------------------------- writes: .migration/, the credential store, the running guard

@@ -705,6 +705,17 @@ PROBES2 = [
     ("R4 UPDATE STATISTICS modifier row does not authorize STATISTICS as object", "DBX_DECISION=D-11 sqlcmd -S tdprod.corp -Q 'UPDATE STATISTICS dbo.customers'", "block"),
     ("R4 UPDATE STATISTICS modifier captures dbo.orders", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'UPDATE STATISTICS dbo.orders'", "approve"),
     ("R4 DELETE TOP remains fail-closed without an object match", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'DELETE TOP (10) FROM dbo.orders'", "block"),
+    ("R4 decision runtime substitution unquoted", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE $(TABLE) SET x=1'", "block"),
+    ("R4 decision runtime substitution quoted", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE \"$(TABLE)\" SET x=1'", "block"),
+    ("R4 decision runtime substitution braced", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE ${TABLE} SET x=1'", "block"),
+    ("R4 decision literal object remains authorized", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'UPDATE dbo.orders SET x=1'", "approve"),
+]
+
+WARN_PROBES = [
+    ("warn legacy remote mutation", "ssh tdprod.corp 'rm /etc/legacy.conf'", "block"),
+    ("warn legacy remote redirect", "ssh tdprod.corp 'cat x 2>/tmp/e'", "block"),
+    ("warn legacy remote in-place", "ssh tdprod.corp 'sed -i s/a/b/ x'", "block"),
+    ("warn non-legacy violation", "databricks bundle deploy -t prod", "approve"),
 ]
 
 
@@ -886,6 +897,25 @@ def test_legacy_write_decision_and_warn_mode(tmp_path_factory):
     assert blocked.returncode == 2
     assert approved.returncode == 0
     assert other.returncode == 0
+
+
+@pytest.mark.parametrize("label,command,expected", WARN_PROBES, ids=[p[0] for p in WARN_PROBES])
+def test_warn_mode_probe_rows(label: str, command: str, expected: str, tmp_path_factory):
+    ws = _make_ws(tmp_path_factory, "warn_probe_ws", {**ALLOWLIST2, "guard_mode": "warn"}, FILES2)
+    result = run_hook(command, ws)
+    decision = "approve" if result.returncode == 0 else "block"
+    assert decision == expected, f"{label}: {decision} ({result.stdout})"
+
+
+def test_warn_mode_remote_violation_is_legacy_marker(tmp_path_factory):
+    sys.path.insert(0, str(GUARD.parent))
+    import dbx_guard
+    sys.path.pop(0)
+
+    ws = _make_ws(tmp_path_factory, "warn_marker_ws", {**ALLOWLIST2, "guard_mode": "warn"}, FILES2)
+    cfg = dbx_guard.load_config(ws)
+    violations = dbx_guard._check_remote(dbx_guard._segments("ssh tdprod.corp 'rm /etc/legacy.conf'"), cfg, ws)
+    assert violations and all(isinstance(v, dbx_guard._Legacy) for v in violations)
 
 
 # ---------------------------------------------------------------- the allowlist file itself
