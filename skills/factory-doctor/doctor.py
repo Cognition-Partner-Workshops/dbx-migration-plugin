@@ -86,9 +86,10 @@ class Check:
     data: dict = field(default_factory=dict)
 
 
-def _run(cmd: list[str], timeout: int = 60, cwd: Path | None = None) -> tuple[int, str, str]:
+def _run(cmd: list[str], timeout: int = 60, cwd: Path | None = None,
+         env: dict | None = None) -> tuple[int, str, str]:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env)
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
         return 127, "", f"{cmd[0]}: not found"
@@ -689,7 +690,7 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
     the credential."""
     cid = "source_principal_read_only"
     if family == "databricks":
-        return _check_databricks_source_principal(tables)
+        return _check_databricks_source_principal(tables, source_secret)
     q = _PRIVILEGE_QUERIES.get(family)
     if q is None:
         return Check(cid, "unverified", f"{family}: no privilege query implemented for this family, so the "
@@ -748,18 +749,40 @@ _DBX_READ_PRIVILEGES = frozenset({"SELECT", "USE_CATALOG", "USE_SCHEMA", "BROWSE
 _DBX_GET_COMMAND = {"catalog": "catalogs", "schema": "schemas", "table": "tables"}
 
 
-def _check_databricks_source_principal(tables: list[str]) -> Check:
-    """The databricks family source principal is the CLI's own identity (`current-user me`, an
-    applicationId or userName): `grants get-effective` on every in-scope catalog, schema and table
-    (effective grants already include group memberships), plus ownership of each, direct or through
-    a group. No --source-secret: CLI auth is the credential."""
+def _check_databricks_source_principal(tables: list[str], source_secret: str | None) -> Check:
+    """The databricks family source principal is the one behind --source-secret — the
+    {server_hostname, http_path, access_token} JSON the recon adapter opens — resolved as the
+    `current-user me` (applicationId or userName) that token authenticates as on that host.
+    `grants get-effective` on every in-scope catalog, schema and table (effective grants already
+    include group memberships), plus ownership of each, direct or through a group."""
     cid = "source_principal_read_only"
     data: dict = {"family": "databricks", "tables": tables, "writable": {}, "unresolved": []}
+    if not source_secret:
+        return Check(cid, "fail", f"databricks source with {len(tables)} in-scope table(s); pass "
+                     "--source-secret NAME (env var holding the source DSN) so the principal's "
+                     "write privileges can be checked", data)
+    secret = os.environ.get(source_secret)
+    if not secret:
+        return Check(cid, "fail", f"source secret {source_secret} is not set in the environment", data)
+    try:
+        cfg = json.loads(secret)
+        host, token = cfg["server_hostname"], cfg["access_token"]
+    except (TypeError, ValueError, KeyError):
+        host = token = None
+    if not isinstance(host, str) or not isinstance(token, str):
+        return Check(cid, "unverified", f"databricks: secret {source_secret} is not the "
+                     "{server_hostname,http_path,access_token} JSON the recon adapter uses", data)
+    data["host"] = host
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET", "DATABRICKS_CONFIG_PROFILE",
+                        "DATABRICKS_TOKEN", "DATABRICKS_HOST")}
+    env["DATABRICKS_HOST"] = host if "://" in host else f"https://{host}"
+    env["DATABRICKS_TOKEN"] = token
     cli = shutil.which("databricks")
     if not cli:
         return Check(cid, "unverified", "databricks: databricks CLI not on PATH, so the source "
                      "principal's grants could not be read", data)
-    rc, out, err = _run([cli, "current-user", "me", "--output", "json"])
+    rc, out, err = _run([cli, "current-user", "me", "--output", "json"], env=env)
     try:
         who = json.loads(out) if rc == 0 else {}
         principal = who.get("applicationId") or who.get("userName")
@@ -780,17 +803,21 @@ def _check_databricks_source_principal(tables: list[str]) -> Check:
         securables.setdefault(("schema", f"{parts[0]}.{parts[1]}"))
         securables.setdefault(("table", t))
     for kind, name in securables:
-        rc, out, _ = _run([cli, _DBX_GET_COMMAND[kind], "get", name, "--output", "json"])
+        rc, out, err = _run([cli, _DBX_GET_COMMAND[kind], "get", name, "--output", "json"], env=env)
         owner = None
         if rc == 0:
             try:
-                owner = json.loads(out).get("owner")
-            except (TypeError, ValueError, AttributeError):
+                payload = json.loads(out)
+                owner = payload.get("owner") if isinstance(payload, dict) else None
+            except (TypeError, ValueError):
                 owner = None
-        if isinstance(owner, str) and (owner.lower() == principal.lower() or owner in groups):
+        if not isinstance(owner, str):
+            return Check(cid, "unverified", f"databricks: {_DBX_GET_COMMAND[kind]} get {name} "
+                         f"failed: {_redact(err or out)}", data)
+        if owner.lower() == principal.lower() or owner in groups:
             data["writable"].setdefault(name, []).append("OWNER")
         rc, out, err = _run([cli, "grants", "get-effective", kind, name,
-                             "--principal", principal, "--output", "json"])
+                             "--principal", principal, "--output", "json"], env=env)
         privileges = None
         if rc == 0:
             try:
