@@ -446,8 +446,8 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str,
     data["live_stale"] = []
     age_min = None
     if not live.is_file():
-        if role == "orchestrator":
-            findings.append(f"no {LIVE_PLAYBOOKS}: export the live library with "
+        if role == "orchestrator" or live_playbooks is not None:
+            findings.append(f"no {live if live_playbooks else LIVE_PLAYBOOKS}: export the live library with "
                             "devin_playbook_manage right before the doctor (see 9-orchestrator)")
     else:
         age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromtimestamp(

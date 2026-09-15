@@ -1954,3 +1954,9 @@ def test_playbooks_in_sync_cli_live_playbooks_flag(tmp_path):
                        capture_output=True, text=True, check=False)
     row = next(l for l in r.stdout.splitlines() if "playbooks_in_sync" in l)
     assert row.startswith("ok"), r.stdout
+
+
+def test_playbooks_in_sync_explicit_live_path_must_exist(tmp_path):
+    ws = make_workspace(tmp_path)
+    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child", tmp_path / "nowhere.json")
+    assert c.status == "fail" and "nowhere.json" in c.detail
