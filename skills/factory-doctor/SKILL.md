@@ -100,9 +100,12 @@ Reference details and factory placement: [references/checks.md](references/check
   ready-to-paste `GRANT` statement or statements for the D10 request.
 - `source_principal_read_only` statuses: `ok` when a privilege query or the Databricks CLI proves
   read-only; for `--source-family databricks` the check runs as the `--source-secret` credential
-  (the `{server_hostname,http_path,access_token}` JSON the recon adapter uses) and reads
-  `grants get-effective` on every in-scope catalog/schema/table on that host (ownership, direct
-  or via a group, counts) and fails on any privilege outside
+  (the `{server_hostname,http_path,access_token}` JSON the recon adapter uses, in a subprocess
+  env carrying only that host, that token and `DATABRICKS_AUTH_TYPE=pat` — no inherited
+  `DATABRICKS_*` variables) and reads `grants get-effective` on every in-scope
+  catalog/schema/table on that host (ownership, direct or via a group, counts; a response
+  without a well-formed `privilege_assignments` list is `unverified`) and fails on any
+  privilege outside
   SELECT/USE_CATALOG/USE_SCHEMA/BROWSE/READ_VOLUME; `attested` when `--source-attested D-<id>`
   matches a `06_decisions.md` line containing the id, `source_principal_read_only` and `attested`
   (rejected for families that have a query — Databricks included); `unverified` for the other

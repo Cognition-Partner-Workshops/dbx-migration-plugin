@@ -773,11 +773,10 @@ def _check_databricks_source_principal(tables: list[str], source_secret: str | N
         return Check(cid, "unverified", f"databricks: secret {source_secret} is not the "
                      "{server_hostname,http_path,access_token} JSON the recon adapter uses", data)
     data["host"] = host
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET", "DATABRICKS_CONFIG_PROFILE",
-                        "DATABRICKS_TOKEN", "DATABRICKS_HOST")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("DATABRICKS_")}
     env["DATABRICKS_HOST"] = host if "://" in host else f"https://{host}"
     env["DATABRICKS_TOKEN"] = token
+    env["DATABRICKS_AUTH_TYPE"] = "pat"
     cli = shutil.which("databricks")
     if not cli:
         return Check(cid, "unverified", "databricks: databricks CLI not on PATH, so the source "
@@ -818,15 +817,16 @@ def _check_databricks_source_principal(tables: list[str], source_secret: str | N
             data["writable"].setdefault(name, []).append("OWNER")
         rc, out, err = _run([cli, "grants", "get-effective", kind, name,
                              "--principal", principal, "--output", "json"], env=env)
-        privileges = None
-        if rc == 0:
-            try:
-                privileges = _effective_privileges(json.loads(out))
-            except (TypeError, ValueError):
-                privileges = None
+        if rc != 0:
+            return Check(cid, "unverified", f"databricks: grants get-effective {kind} {name} "
+                         f"failed: {_redact(err or out)}", data)
+        try:
+            privileges = _effective_privileges_strict(json.loads(out))
+        except (TypeError, ValueError):
+            privileges = None
         if privileges is None:
-            return Check(cid, "unverified", f"databricks: grants get-effective {kind} {name} failed: "
-                         f"{_redact(err or out)}", data)
+            return Check(cid, "unverified", f"databricks: grants get-effective {kind} {name} "
+                         "returned no privilege_assignments", data)
         offending = sorted(privileges - _DBX_READ_PRIVILEGES)
         if offending:
             data["writable"][name] = data["writable"].get(name, []) + offending
@@ -1113,6 +1113,27 @@ def _effective_privileges(payload) -> set[str]:
     elif isinstance(payload, list):
         for privilege in payload:
             add(privilege)
+    return found
+
+
+def _effective_privileges_strict(payload) -> set[str] | None:
+    """None unless the payload is exactly a get-effective grants response: a dict with a
+    `privilege_assignments` list where every assignment is a dict whose `privileges` is a
+    list of strings. An empty assignments list is valid (empty set). Anything else means
+    the grants could not be read and must not pass as read-only."""
+    if not isinstance(payload, dict):
+        return None
+    assignments = payload.get("privilege_assignments")
+    if not isinstance(assignments, list):
+        return None
+    found: set[str] = set()
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            return None
+        privileges = assignment.get("privileges")
+        if not isinstance(privileges, list) or not all(isinstance(p, str) for p in privileges):
+            return None
+        found.update(p.upper() for p in privileges)
     return found
 
 
