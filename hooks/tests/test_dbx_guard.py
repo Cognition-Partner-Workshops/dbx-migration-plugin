@@ -25,6 +25,14 @@ LB_CFG = g.GuardConfig.from_dict({
     "bundle_targets": ["migration"],
     "lakebase_projects": ["projects/loan-mig"],
 })
+LB2_CFG = g.GuardConfig.from_dict({
+    "catalogs": ["mig_cat"],
+    "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp.example", "legacy-prod"],
+    "target_hosts": ["localhost"],
+    "bundle_targets": ["migration"],
+    "lakebase_projects": ["projects/loan-mig"],
+    "lakebase_branches": ["mig-*"],
+})
 
 
 def approve(cmd: str, cfg=CFG):
@@ -118,6 +126,8 @@ def test_lakebase_commands_allowed(cmd):
     ("""databricks postgres create-catalog mig_cat --json='{"branch": "projects/loan-mig/branches/production"}'""", "production"),
     ("databricks postgres create-catalog mig_cat --json @spec.json", "@file"),
     ("databricks postgres create-synced-table mig_cat.oltp.loans --json=@spec.json", "@file"),
+    (r"databricks postgres create-catalog mig_cat --json \@spec.json", "@file"),
+    ("databricks postgres create-catalog mig_cat --json='@spec.json'", "@file"),
     ("databricks postgres create-synced-table mig_cat.oltp.loans --json \"$SPEC\"", "literal"),
 ])
 def test_lakebase_commands_blocked(cmd, needle):
@@ -128,6 +138,27 @@ def test_lakebase_writes_require_an_allowlisted_project():
     assert "empty = every Lakebase write blocks" in block(
         "databricks postgres create-branch projects/loan-mig w0-b1").reason
     approve("databricks postgres list-projects")
+
+
+@pytest.mark.parametrize("cmd", [
+    "databricks postgres create-branch projects/loan-mig mig-w0-b1 --json '{}'",
+    "databricks postgres delete-branch projects/loan-mig/branches/mig-w0-b1",
+    "databricks postgres get-branch projects/loan-mig/branches/w0-b1",
+    """databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"database": "projects/loan-mig/branches/mig-w0/databases/app"}}'""",
+])
+def test_lakebase_branch_globs_allow_matching_writes_and_reads(cmd):
+    approve(cmd, LB2_CFG)
+
+
+@pytest.mark.parametrize(("cmd", "needle"), [
+    ("databricks postgres create-branch projects/loan-mig w0-b1", "lakebase_branches"),
+    ("databricks postgres create-endpoint projects/loan-mig/branches/w0-b1 ep", "lakebase_branches"),
+    ("databricks postgres create-branch projects/loan-mig production", "production"),
+    ("""databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"database": "projects/loan-mig/branches/w0-b1/databases/app"}}'""",
+     "lakebase_branches"),
+])
+def test_lakebase_branch_globs_block_nonmatching_writes(cmd, needle):
+    assert needle in block(cmd, LB2_CFG).reason
 
 
 # SQL-shaped text that no client executes is prose: it must not trip the catalog allowlist

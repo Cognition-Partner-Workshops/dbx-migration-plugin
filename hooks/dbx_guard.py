@@ -3,7 +3,7 @@
 
 Reads a PreToolUse event ({"tool_input": {"command"}, "cwd"}), loads the nearest `.migration/allowed_targets.json` (`catalogs`
 required; `legacy_sources`, `guard_mode` block|warn, `target_hosts`, `bundle_targets`, `forbidden_bundle_targets`; hosts and
-bundle targets fail closed when empty; Lakebase writes use allowlisted projects and never target `production`) and judges every
+bundle targets fail closed when empty; Lakebase writes use allowlisted projects and branches and never target `production`) and judges every
 simple command by its program: Databricks clients pass `_DBX_READ`
 shapes and mutate only allowlisted securables; REST to a workspace host is GET without a body; deploys need a listed target;
 identity is never changed. Legacy-only clients and generic clients naming a legacy source run read shapes only; a generic
@@ -231,6 +231,7 @@ class GuardConfig:
     target_hosts: list[str] = field(default_factory=list)
     bundle_targets: list[str] = field(default_factory=list)
     lakebase_projects: list[str] = field(default_factory=list)
+    lakebase_branches: list[str] = field(default_factory=list)
     path: Path | None = None
 
     @classmethod
@@ -239,7 +240,7 @@ class GuardConfig:
         if not isinstance(catalogs, list) or not catalogs:
             raise ValueError("allowed_targets.json must contain a non-empty 'catalogs' list")
         lists = {}
-        for key in ("legacy_sources", "forbidden_bundle_targets", "target_hosts", "bundle_targets", "lakebase_projects"):
+        for key in ("legacy_sources", "forbidden_bundle_targets", "target_hosts", "bundle_targets", "lakebase_projects", "lakebase_branches"):
             value = data.get(key, list(DEFAULT_FORBIDDEN_BUNDLE_TARGETS) if key == "forbidden_bundle_targets" else [])
             if not isinstance(value, list):
                 raise ValueError(f"'{key}' must be a list")
@@ -249,7 +250,8 @@ class GuardConfig:
         if mode not in ("block", "warn"):
             raise ValueError("'guard_mode' must be 'block' or 'warn'")
         return cls([_norm(c) for c in catalogs], lists["legacy_sources"], mode, tuple(t.lower() for t in lists["forbidden_bundle_targets"]),
-                   [h.lower() for h in lists["target_hosts"]], lists["bundle_targets"], lists["lakebase_projects"], path)   # DAB / dbt targets compared exactly
+                   [h.lower() for h in lists["target_hosts"]], lists["bundle_targets"], lists["lakebase_projects"],
+                   lists["lakebase_branches"], path)   # DAB / dbt targets compared exactly
 
 
 @dataclass
@@ -448,6 +450,10 @@ def _lakebase_scope(verb: str, project: str, branch: str | None, cfg: GuardConfi
     if branch == "production":
         return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project {project}; migration sessions "
                 "write only per-batch branches (production is repointed at STOP E)"]
+    if branch is not None and cfg.lakebase_branches and not any(fnmatch.fnmatchcase(branch, pattern)
+                                                                for pattern in cfg.lakebase_branches):
+        return [f"`databricks postgres {verb}` on branch {branch!r} of Lakebase project {project}; allowed lakebase_branches "
+                f"{cfg.lakebase_branches}"]
     return []
 
 
@@ -833,10 +839,11 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         if not name or _norm(name.split(".")[0]) not in cfg.catalogs:
             return [f"CLI mutation of securable {name!r} outside allowlist {sorted(cfg.catalogs)}"]
         if group == "postgres":
-            json_args = [seg.raw_of(argv[n + 1]) for n, w in enumerate(argv[:-1]) if w == "--json"]
-            json_args += [seg.raw_of(w) for w in argv if w.startswith("--json=")]
-            json_text = " ".join(json_args)
-            if _expands(json_text) or any(a.lstrip("'\"").removeprefix("--json=").lstrip("'\"").startswith("@") for a in json_args):
+            json_raw = [seg.raw_of(argv[n + 1]) for n, w in enumerate(argv[:-1]) if w == "--json"]
+            json_vals = [argv[n + 1] for n, w in enumerate(argv[:-1]) if w == "--json"]
+            json_raw += [seg.raw_of(w) for w in argv if w.startswith("--json=")]
+            json_vals += [w.removeprefix("--json=") for w in argv if w.startswith("--json=")]
+            if _expands(" ".join(json_raw)) or any(value.startswith("@") for value in json_vals):
                 return [f"`databricks postgres {verb}` JSON payload must be literal (fail closed): no expansion, no `@file`"]
             for match in _LAKEBASE_REFERENCE.finditer(seg.text):
                 if violation := _lakebase_scope(verb, *match.groups(), cfg):
