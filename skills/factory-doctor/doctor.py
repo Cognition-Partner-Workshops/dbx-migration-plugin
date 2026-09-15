@@ -803,7 +803,9 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
 
     set_vars = [v for v in M2M_VARS if os.environ.get(v)]
     profile = os.environ.get("DATABRICKS_CONFIG_PROFILE")
-    if len(set_vars) == len(M2M_VARS):
+    if os.environ.get("DATABRICKS_TOKEN") and len(set_vars) == len(M2M_VARS):
+        auth_kind = "conflict (env)"
+    elif len(set_vars) == len(M2M_VARS):
         auth_kind = "oauth-m2m (env)"
     elif os.environ.get("DATABRICKS_TOKEN"):
         auth_kind = "pat (env)"
@@ -811,9 +813,16 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
         auth_kind = f"profile {profile}"
     else:
         auth_kind = "unknown (CLI default chain)"
-    out.append(Check("databricks_auth_kind", "ok" if auth_kind.startswith("oauth-m2m") else "warn",
-                     f"auth: {auth_kind}; migration sessions should run as the migration service principal via "
-                     f"DATABRICKS_CLIENT_ID/SECRET from named secrets", {"auth_kind": auth_kind, "env_set": set_vars}))
+    if auth_kind == "conflict (env)":
+        detail = ("auth: conflicting env — DATABRICKS_TOKEN is set beside DATABRICKS_CLIENT_ID/SECRET; the CLI refuses "
+                  "('more than one authorization method') and the guard blocks unsetting or overriding them per command; "
+                  "remove DATABRICKS_TOKEN (and a foreign DATABRICKS_HOST) from the org/session environment")
+        status = "fail"
+    else:
+        detail = (f"auth: {auth_kind}; migration sessions should run as the migration service principal via "
+                  f"DATABRICKS_CLIENT_ID/SECRET from named secrets")
+        status = "ok" if auth_kind.startswith("oauth-m2m") else "warn"
+    out.append(Check("databricks_auth_kind", status, detail, {"auth_kind": auth_kind, "env_set": set_vars}))
 
     rc, me, err = _run([cli, "current-user", "me", "--output", "json"], timeout=60)
     if rc != 0:

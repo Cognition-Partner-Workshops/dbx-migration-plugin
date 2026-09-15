@@ -18,6 +18,13 @@ CFG = g.GuardConfig.from_dict({
     "target_hosts": ["localhost"],
     "bundle_targets": ["migration"],
 })
+LB_CFG = g.GuardConfig.from_dict({
+    "catalogs": ["mig_cat"],
+    "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp.example", "legacy-prod"],
+    "target_hosts": ["localhost"],
+    "bundle_targets": ["migration"],
+    "lakebase_projects": ["projects/loan-mig"],
+})
 
 
 def approve(cmd: str, cfg=CFG):
@@ -73,6 +80,41 @@ def block(cmd: str, cfg=CFG):
 ])
 def test_allowed(cmd):
     approve(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "databricks postgres list-branches projects/loan-mig",
+    "databricks postgres get-branch projects/loan-mig/branches/production",
+    "databricks postgres generate-database-credential projects/loan-mig/branches/w0-b1/endpoints/ep --output json",
+    """databricks postgres create-branch projects/loan-mig w0-b1 --json '{"spec": {"source_branch": "projects/loan-mig/branches/production", "ttl": "3600s"}}'""",
+    "databricks postgres delete-branch projects/loan-mig/branches/w0-b1 --purge",
+    "databricks postgres create-endpoint projects/loan-mig/branches/w0-b1 ep --json '{}'",
+    "databricks postgres create-catalog mig_cat --json '{}'",
+    "databricks postgres create-synced-table mig_cat.oltp.loans --json '{}'",
+])
+def test_lakebase_commands_allowed(cmd):
+    approve(cmd, LB_CFG)
+
+
+@pytest.mark.parametrize(("cmd", "needle"), [
+    ("databricks postgres create-branch projects/other w0-b1", "other"),
+    ("databricks postgres create-branch projects/loan-mig production", "production"),
+    ("databricks postgres delete-branch projects/loan-mig/branches/production", "production"),
+    ("databricks postgres create-endpoint projects/loan-mig/branches/production ep", "production"),
+    ("databricks postgres create-branch projects/$P w0", "lakebase_projects"),
+    ("databricks postgres create-project --json '{}'", "lifecycle"),
+    ("databricks postgres delete-project projects/loan-mig", "lifecycle"),
+    ("databricks postgres create-catalog prod_cat --json '{}'", "prod_cat"),
+    ("databricks postgres create-synced-table prod_cat.s.t --json '{}'", "prod_cat"),
+])
+def test_lakebase_commands_blocked(cmd, needle):
+    assert needle in block(cmd, LB_CFG).reason
+
+
+def test_lakebase_writes_require_an_allowlisted_project():
+    assert "empty = every Lakebase write blocks" in block(
+        "databricks postgres create-branch projects/loan-mig w0-b1").reason
+    approve("databricks postgres list-projects")
 
 
 # SQL-shaped text that no client executes is prose: it must not trip the catalog allowlist
