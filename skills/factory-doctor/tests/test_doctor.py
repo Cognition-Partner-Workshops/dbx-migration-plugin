@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import subprocess
@@ -22,8 +23,10 @@ def _git(ws: Path, *args: str) -> str:
                           check=True, capture_output=True, text=True).stdout
 
 
-def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), commit=True):
-    """A setup-complete workspace, committed as the setup playbook leaves it before STOP A."""
+def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), commit=True,
+                   with_lock=True):
+    """A setup-complete workspace, committed as the setup playbook leaves it before STOP A,
+    with the playbook lock install-dbx-factory leaves after its sync."""
     mig = tmp_path / ".migration"
     mig.mkdir(parents=True)
     for f in doctor.REQUIRED_FILES:
@@ -36,11 +39,27 @@ def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), c
             mig.joinpath(f).write_text(f"# context\n\nstop_mode: {stop_mode}\n")
         else:
             mig.joinpath(f).write_text(f"# {f}\n")
+    if with_lock:
+        _lock(tmp_path)
     _git(tmp_path, "init", "-q")
     if commit:
         _git(tmp_path, "add", "-A")
         _git(tmp_path, "commit", "-qm", "setup")
     return tmp_path
+
+
+def _lock(ws: Path, overrides=None, drop=()):
+    """The .migration/playbooks.lock.json install-dbx-factory writes after a sync: every repo
+    playbook's sha256 plus this run's installed_at."""
+    entries = {m: {"sha256": sha, "repo_file": f, "installed_at": "2026-01-01T00:00:00Z"}
+               for m, (f, sha) in doctor._repo_playbooks(PLUGIN_ROOT).items()}
+    for macro, sha in (overrides or {}).items():
+        entries.setdefault(macro, {"repo_file": "gone.md", "installed_at": "2026-01-01T00:00:00Z"})
+        entries[macro]["sha256"] = sha
+    for macro in drop:
+        entries.pop(macro, None)
+    (ws / doctor.PLAYBOOKS_LOCK).write_text(json.dumps(entries, indent=2, sort_keys=True))
+    return entries
 
 
 def by_id(report):
@@ -1739,3 +1758,69 @@ def test_hook_guard_functional_requires_the_probe_token_in_the_block_reason(tmp_
         guard.write_text(f'import sys; print(\'{{"decision": "block", "reason": "{reason}"}}\'); sys.exit(2)\n')
         c = {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"]
         assert c.status == "fail" and "__dbx_guard_probe__" in c.detail, reason
+
+
+# ------------------------------------------------------------------ playbooks in sync
+
+PLAYBOOKS_DIR = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
+
+
+def test_repo_playbooks_keys_are_macros_only():
+    repo = doctor._repo_playbooks(PLUGIN_ROOT)
+    assert all(m.startswith("!") for m in repo)
+    assert "0-README.md" not in repo and "00_intake_template.md" not in repo
+    assert "!dbx_migrate_pipeline" in repo
+    assert len(repo) >= 14
+
+
+def test_playbooks_in_sync_ok(tmp_path):
+    ws = make_workspace(tmp_path)
+    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
+    expected = {m for m, (f, _sha) in doctor._repo_playbooks(PLUGIN_ROOT).items()}
+    on_disk = {p.name for p in PLAYBOOKS_DIR.glob("*.md")} - doctor._NOT_PLAYBOOKS
+    assert {f for f, _ in doctor._repo_playbooks(PLUGIN_ROOT).values()} == on_disk
+    sha = hashlib.sha256((PLAYBOOKS_DIR / "9-orchestrator.md").read_bytes()).hexdigest()
+    assert doctor._repo_playbooks(PLUGIN_ROOT)["!dbx_migrate_pipeline"] == ("9-orchestrator.md", sha)
+    assert c.status == "ok" and c.data["checked"] == len(expected) >= 14
+    assert c.data["installed_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_playbooks_in_sync_fails_on_stale_missing_and_unknown(tmp_path):
+    ws = make_workspace(tmp_path, with_lock=False)
+    _lock(ws, overrides={"!dbx_migrate_pipeline": "0" * 64})
+    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
+    assert c.status == "fail"
+    assert "!dbx_migrate_pipeline" in c.detail and "install-dbx-factory" in c.detail
+    assert c.data["stale"] == ["!dbx_migrate_pipeline"]
+    ws = make_workspace(tmp_path / "missing", with_lock=False)
+    _lock(ws, drop=("!dbx_migrate_oltp",))
+    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child")
+    assert c.status == "fail" and c.data["missing"] == ["!dbx_migrate_oltp"]
+    ws = make_workspace(tmp_path / "unknown", with_lock=False)
+    _lock(ws, overrides={"!dbx_gone": "f" * 64})
+    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
+    assert c.status == "fail" and c.data["unknown"] == ["!dbx_gone"]
+
+
+def test_playbooks_in_sync_lock_missing_and_role(tmp_path):
+    ws = make_workspace(tmp_path, with_lock=False)
+    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "setup").status == "skipped"
+    report = doctor.run(ws, PLUGIN_ROOT, "setup", "blocked", None, True)
+    assert by_id(report)["playbooks_in_sync"]["status"] == "skipped"
+    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
+    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
+    assert c.status == "fail" and "install-dbx-factory" in c.detail
+    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child").status == "fail"
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    assert "playbooks_in_sync=fail" in report["blocking"]
+
+
+def test_playbooks_in_sync_unlisted_repo_file_is_a_finding(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    stray = PLAYBOOKS_DIR / "15-unlisted.md"
+    stray.write_text("# stray\n")
+    try:
+        c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
+    finally:
+        stray.unlink()
+    assert c.status == "fail" and "15-unlisted.md" in c.detail and "0-README" in c.detail
