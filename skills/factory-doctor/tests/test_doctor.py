@@ -1783,6 +1783,7 @@ def test_playbooks_in_sync_ok(tmp_path):
     assert doctor._repo_playbooks(PLUGIN_ROOT)["!dbx_migrate_pipeline"] == ("9-orchestrator.md", sha)
     assert c.status == "ok" and c.data["checked"] == len(expected) >= 14
     assert c.data["installed_at"] == "2026-01-01T00:00:00Z"
+    assert "last install-dbx-factory sync (2026-01-01T00:00:00Z)" in c.detail
 
 
 def test_playbooks_in_sync_fails_on_stale_missing_and_unknown(tmp_path):
@@ -1808,11 +1809,26 @@ def test_playbooks_in_sync_lock_missing_and_role(tmp_path):
     report = doctor.run(ws, PLUGIN_ROOT, "setup", "blocked", None, True)
     assert by_id(report)["playbooks_in_sync"]["status"] == "skipped"
     assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
+                        "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--role", "setup",
+                        "--out", "-"], capture_output=True, text=True, check=False)
+    row = next(l for l in r.stdout.splitlines() if "playbooks_in_sync" in l)
+    assert row.startswith("skipped"), r.stdout
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
     assert c.status == "fail" and "install-dbx-factory" in c.detail
     assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child").status == "fail"
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
     assert "playbooks_in_sync=fail" in report["blocking"]
+
+
+def test_playbooks_in_sync_malformed_entry_fails_not_crashes(tmp_path):
+    ws = make_workspace(tmp_path, with_lock=False)
+    entries = _lock(ws)
+    entries["!dbx_migrate_plan"]["installed_at"] = 1
+    (ws / doctor.PLAYBOOKS_LOCK).write_text(json.dumps(entries))
+    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
+    assert c.status == "fail" and c.data["malformed"] == ["!dbx_migrate_plan"]
+    assert "malformed: !dbx_migrate_plan" in c.detail and "install-dbx-factory" in c.detail
 
 
 def test_playbooks_in_sync_unlisted_repo_file_is_a_finding(tmp_path, monkeypatch):
