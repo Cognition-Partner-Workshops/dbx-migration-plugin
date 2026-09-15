@@ -647,6 +647,13 @@ PROBES2 = [
     ("R4 ssh legacy bcp output file", "ssh tdprod.corp 'bcp db.dbo.t out /tmp/t.dat -S localhost -T'", "block"),
     ("R4 ssh legacy psql output redirect", "ssh tdprod.corp \"psql -h localhost -c 'SELECT 1' > /tmp/out\"", "block"),
     ("R4 ssh legacy psql stdout", "ssh tdprod.corp \"psql -h localhost -c 'SELECT 1'\"", "approve"),
+    ("R4 ssh legacy sed backup in place", "ssh tdprod.corp 'sed -i.bak s/a/b/ x.conf'", "block"),
+    ("R4 ssh legacy sed attached in place", "ssh tdprod.corp 'sed --in-place=.bak s/a/b/ x.conf'", "block"),
+    ("R4 ssh legacy sed read", "ssh tdprod.corp 'sed -n 1p x.conf'", "approve"),
+    ("R4 ssh legacy find execdir", "ssh tdprod.corp 'find /opt -name \"*.log\" -execdir rm {} \\;'", "block"),
+    ("R4 ssh legacy find read", "ssh tdprod.corp 'find /opt -name \"*.log\"'", "approve"),
+    ("R4 ssh legacy ruff fix", "ssh tdprod.corp 'ruff --fix app.py'", "block"),
+    ("R4 ssh legacy ruff check", "ssh tdprod.corp 'ruff check app.py'", "approve"),
     ("R3 az run-command legacy read", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'cat /etc/hosts'", "approve"),
     ("R3 az run-command legacy write", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'sqlcmd -Q \"DELETE FROM dbo.t\"'", "block"),
     ("R3 az run-command legacy remote script", "az vm run-command invoke -g rg -n tdprod.corp --command-id RunShellScript --scripts 'bash /opt/fix.sh'", "block"),
@@ -673,6 +680,8 @@ PROBES2 = [
     ("R4 for loop write over allowlisted hosts", "for h in lakebase-host lakebase-peer; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "approve"),
     ("R4 for loop read over allowlisted hosts", "for h in lakebase-host lakebase-peer; do psql -h \"$h\" -d mig_cat -c 'SELECT 1'; done", "approve"),
     ("R4 for loop write over unknown host", "for h in lakebase-host unknown-host.example; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "block"),
+    ("R4 loop final allowlisted host write", "for h in tdprod.corp lakebase-host; do true; done; psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'", "approve"),
+    ("R4 loop final legacy host write", "for h in lakebase-host tdprod.corp; do true; done; psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'", "block"),
 ]
 
 
@@ -802,6 +811,9 @@ def test_fixture_cloud_reason_never_contains_endpoint_value(tmp_path: Path):
     ("(export AWS_ENDPOINT_URL=http://localhost:9000); aws s3 ls", {}, "block"),
     ("(export AWS_ENDPOINT_URL=http://localhost:9000; aws s3 ls)", {}, "approve"),
     ("export AWS_ENDPOINT_URL=http://localhost:9000 & aws s3 ls", {}, "block"),
+    ("bash -c 'AWS_ENDPOINT_URL=http://localhost:9000 aws s3 ls'", {}, "approve"),
+    ("bash -c 'aws s3 ls'", {}, "block"),
+    ("bash -c \"aws s3 ls $BUCKET\"", {}, "block"),
 ])
 def test_fixture_endpoint_environment_is_command_local(tmp_path: Path, command, env, expected):
     ws = _make_tmp_ws(tmp_path, "fixture_command_env_ws", {

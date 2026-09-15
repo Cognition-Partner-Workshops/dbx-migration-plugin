@@ -213,6 +213,19 @@ _DESTRUCTIVE = ("mv", "truncate", "dd", "shred", *_WRITE_LAST_OPERAND, *_RECURSI
 _IN_PLACE = {"sed": (re.compile(r"-[nEersuz]*i.*"), re.compile(r"--in-place.*")), "perl": (re.compile(r"-[a-zA-Z]*i.*"),),
              "awk": (re.compile(r"(?:--?)?inplace"),), "gawk": (re.compile(r"(?:--?)?inplace"),), "mawk": (re.compile(r"(?:--?)?inplace"),),
              "ruff": (re.compile(r"--fix|--fix-only|--unsafe-fixes|format"),)}
+
+
+def _mutates(base: str, argv: list[str]) -> bool:
+    inplace = any(rx.fullmatch(w) for w in argv[1:] for rx in _IN_PLACE.get(base, ())) and not any(
+        w in ("--check", "--diff") for w in argv
+    )
+    fixer = base in _FIXERS and inplace
+    return fixer or inplace or (
+        base == "find" and any(w in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls") or w.startswith("-fprint")
+                              for w in argv[1:])
+    )
+
+
 _IDENTITY_FILE = re.compile(r"(?:^|/)(?:\.databrickscfg|\.databricks(?:/.*)?|\.config/databricks(?:/.*)?)$")
 _GUARD_TREE = Path(os.path.realpath(__file__)).parent.parent   # the running plugin
 _GUARD_FILE = Path(__file__).name
@@ -671,6 +684,7 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
     dirs: list[str | None] = []
     alts: list[str] = []                                      # the directories `at` may be when it is None after `x || cd d`
     scopes: list[tuple[str | None, list[str], list[str | None], dict[str, str]]] = []   # state outside each open subshell
+    loop_stack: list[tuple[str, str, str]] = []
     bg, saved = 0, (at, alts, dirs, dict(env))                # the background list being read and the state before it
     before: list[str | None] = [at]                           # where the shell was before the previous command
     lost = False
@@ -712,6 +726,11 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                 joined = " ".join(values)
                 env[seg.argv[1]] = joined
                 loops.add(joined)
+                loop_stack.append((seg.argv[1], values[-1], joined))
+        elif seg.argv0 == "done" and loop_stack:
+            var, last, joined = loop_stack.pop()
+            env[var] = last
+            loops.discard(joined)
         seg.env = dict(env)
         seg.loops = frozenset(loops)
         for p in seg.feeds:
@@ -1109,6 +1128,10 @@ def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     """Fixture mode blocks declared cloud families unless every declared endpoint variable is set; inert heads are ignored."""
     if cfg.run_mode != "fixture" or not cfg.fixture_endpoints or seg.argv0 in _INERT:
         return []
+    if seg.argv0 in _SHELLS or seg.argv0 == "eval":
+        text, _, _ = _shell_runs(seg)
+        if text is not None:
+            return []
     text = seg.text
     if _PYTHON.fullmatch(seg.argv0):
         pytext, _ = _python_texts(seg, root)
@@ -1200,12 +1223,8 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
                                   "legacy hosts are read-only")
                 continue
         modelled = (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC, *_REST_CLIENTS)
-        read_shape = base in _READERS
-        if base == "sed" and any(w in ("-i", "--in-place") for w in seg.argv[1:]):
-            read_shape = False
+        read_shape = base in _READERS and not _mutates(base, seg.argv)
         if base == "tar" and any(re.search(r"^-.*[cxru]", w) for w in seg.argv[1:]):
-            read_shape = False
-        if base == "find" and any(w in ("-delete", "-exec", "-ok") for w in seg.argv[1:]):
             read_shape = False
         if base in ("unzip", "tee"):
             read_shape = False
@@ -1333,7 +1352,7 @@ def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[tuple[str, s
     base, argv, at = s.argv0, s.argv, s.at
     ops = [w for w in argv[1:] if not w.startswith("-")]
     values = ops + [w.split("=", 1)[1] for w in argv[1:] if "=" in w]   # `dd of=`, `--output=`
-    inplace = any(rx.fullmatch(w) for w in argv[1:] for rx in _IN_PLACE.get(base, ())) and not any(w in ("--check", "--diff") for w in argv)
+    inplace = _mutates(base, argv)
     w = [(f, f"{op} {f}", _IN, False, at) for op, f in s.redirects() if ">" in op]
     w += [(v, f"{base} {flag}", _IN, False, at) for flag, v in itertools.pairwise(argv) if flag in _OUTPUT_FLAGS]
     if base == "git":
@@ -1346,7 +1365,7 @@ def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[tuple[str, s
             w += [(p, f"{base} script", _IN, False, at)
                   for p in [*_MIGRATION_PATH.findall(text), *_PATH_LITERAL.findall(text), *_GUARD_LITERAL.findall(text)]]
             w += [(m.group(1) if m.group(1) is not None else ".", f"{base} rmtree", _ALL, False, at) for m in _RMTREE.finditer(text)]
-    elif base == "find" and any(x in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls") or x.startswith("-fprint") for x in argv):
+    elif base == "find" and _mutates(base, argv):
         w += [(o, "find with an action", _ALL, False, at) for o in ops]
     elif base in ("tar", "bsdtar") and (any(re.match(r"-?[a-zA-Z]*x", x) for x in argv[1:2]) or "--extract" in argv or "--get" in argv):
         w += [(d, f"{base} extract into", _ALL, False, at) for d in _flag_values(argv, ("-C", "--directory")) or ["."]]
