@@ -19,7 +19,7 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--source-secret <ENV VAR NAME of the source DSN> [--source-family sqlserver|postgres|...] --param name=value ...] \
     [--source-attested D-<id>] \
     [--lakebase-project NAME --lakebase-parent-branch NAME] [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] \
-    [--analytical-schema CATALOG.SCHEMA]
+    [--analytical-schema CATALOG.SCHEMA] [--live-playbooks PATH]
 # --role child: one --unit per unit in the batch brief (the doctor resolves and checks
 # .migration/units/<id>/mapping_spec.json itself); an orchestrator checks every unit mapping in the
 # workspace. --role setup: the setup step of 1-migration_setup runs with it; there a missing
@@ -72,7 +72,7 @@ probe's pending nonce is persisted in `.migration/.hook_probe_nonce` and reused 
 | `allowed_targets` | allowlist invalid or rejected | `hooks/dbx_guard.py` |
 | `allowlist_committed` | allowlist/tolerances differ from HEAD | `git` |
 | `allowlist_matches_contract` | catalogs differ from the wave contract | `allowed_targets.json` |
-| `playbooks_in_sync` | installed playbooks differ from repo files, or the lock is missing | `.migration/playbooks.lock.json` |
+| `playbooks_in_sync` | installed playbooks differ from repo files, the lock is missing, or (orchestrator) the live export is missing/stale/mismatched/duplicated | `.migration/playbooks.lock.json`, `.migration/live_playbooks.json` |
 | `hooks_files` | hook registration missing or malformed | plugin root |
 | `hook_guard_functional` | probe is not blocked by the guard | `hooks/dbx_guard.py` |
 | `hook_platform_loaded` | live probe unblocked or nonce unverified | this session |
@@ -117,4 +117,7 @@ Reference details and factory placement: [references/checks.md](references/check
   (sha256 each): a stale, missing or unknown macro, or a playbook file absent from the 0-README
   Files table, fails the row. Re-running `install-dbx-factory` is the only fix; at setup (before
   the lock exists, `--role setup`) the row is `skipped` with the warning that the live library is
-  unverified. The row proves the repo matches the last sync receipt, not live org state.
+  unverified. With `.migration/live_playbooks.json` present (required under `--role orchestrator`,
+  rejected after 15 minutes; written per run and gitignored) the row also compares each live
+  playbook body against the repo file and fails on a mismatched, missing or duplicate macro —
+  `ok` there proves live == repo, not just repo == last sync receipt.
