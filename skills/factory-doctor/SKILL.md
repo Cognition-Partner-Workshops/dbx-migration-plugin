@@ -17,18 +17,21 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--hook-probe-result blocked:<nonce>|not-blocked] \
     [--unit <unit_id> ...] [--mapping <candidate mapping_spec.json> ...] \
     [--source-secret <ENV VAR NAME of the source DSN> [--source-family sqlserver|postgres|...] --param name=value ...] \
+    [--source-attested D-<id>] \
     [--lakebase-project NAME --lakebase-parent-branch NAME] [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] \
     [--analytical-schema CATALOG.SCHEMA]
 # --role child: one --unit per unit in the batch brief (the doctor resolves and checks
 # .migration/units/<id>/mapping_spec.json itself); an orchestrator checks every unit mapping in the
 # workspace. --source-secret/--param: the same values the recon run will get. --expect-catalogs: the
-# catalogs the wave's capability contract names.
+# catalogs the wave's capability contract names. --source-attested D-<id>: a decision in
+# .migration/06_decisions.md attesting the source has no principal to query (files in object
+# storage, a read-only share, a static dump); only for families without a privilege query.
 ```
 
 Writes `.migration/09_capabilities.json` and prints one line per check. Exit 0 = `ready`.
 `ready` needs no `fail` anywhere *and* the three security controls (`hook_guard_functional`,
-`hook_platform_loaded`, `databricks_identity`) at `ok`, *and* `source_principal_read_only` not
-`unverified` once a unit mapping exists: an `unverified` probe, a human identity or a source
+`hook_platform_loaded`, `databricks_identity`) at `ok`, *and* `source_principal_read_only` at `ok`
+or `attested` once a unit mapping exists: an `unverified` probe, a human identity or a source
 principal whose grants could not be read leaves `ready: false` with the offending ids in
 `blocking`. Other `warn`/`unverified` rows are advisory. `--no-databricks` skips CLI/identity
 checks for offline use; the report it writes is never `ready` (identity `skipped` stays in
@@ -77,7 +80,7 @@ probe's pending nonce is persisted in `.migration/.hook_probe_nonce` and reused 
 | `recon_harness` | harness self-test/import failed | `data-reconciliation` |
 | `recon_drivers` | required driver missing | harness extras |
 | `delete_evidence` | CDC evidence is missing or unusable | `data-reconciliation` |
-| `source_principal_read_only` | source principal can write or grants are unverified | source catalog views |
+| `source_principal_read_only` | source principal can write, or grants unverified and not attested | source catalog views / `databricks grants get-effective` / `06_decisions.md` |
 | `databricks_cli` | CLI is not on PATH | `databricks-core` |
 | `databricks_auth_kind` | OAuth M2M env is absent | `target-routing` auth rules |
 | `databricks_identity` | identity/host is invalid or human | `07_access_checklist.md` |
@@ -95,3 +98,15 @@ Reference details and factory placement: [references/checks.md](references/check
   read-only guarantee is the principal's grants, verified here, not a driver flag.
 - `--analytical-schema CATALOG.SCHEMA` checks the promotion schema; a red row's `detail` is the
   ready-to-paste `GRANT` statement or statements for the D10 request.
+- `source_principal_read_only` statuses: `ok` when a privilege query or the Databricks CLI proves
+  read-only; for `--source-family databricks` the check runs as the `--source-secret` credential
+  (the `{server_hostname,http_path,access_token}` JSON the recon adapter uses, in a subprocess
+  env carrying only that host, that token and `DATABRICKS_AUTH_TYPE=pat` — no inherited
+  `DATABRICKS_*` variables) and reads `grants get-effective` on every in-scope
+  catalog/schema/table on that host (ownership, direct or via a group, counts; a response
+  without a well-formed `privilege_assignments` list is `unverified`) and fails on any
+  privilege outside
+  SELECT/USE_CATALOG/USE_SCHEMA/BROWSE/READ_VOLUME; `attested` when `--source-attested D-<id>`
+  matches a `06_decisions.md` line containing the id, `source_principal_read_only` and `attested`
+  (rejected for families that have a query — Databricks included); `unverified` for the other
+  families, and it blocks `ready`.

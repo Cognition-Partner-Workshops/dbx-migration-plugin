@@ -1263,20 +1263,22 @@ def test_run_resolves_the_in_scope_tables_from_the_same_mappings_as_delete_evide
 
 def test_cli_source_family_choices_and_help(tmp_path):
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--help"], capture_output=True, text=True, check=True)
-    assert "--source-family" in r.stdout and "--expect-catalogs" in r.stdout and "blocked:<nonce>" in r.stdout
+    assert "--source-family" in r.stdout and "--source-attested" in r.stdout \
+        and "--expect-catalogs" in r.stdout and "blocked:<nonce>" in r.stdout
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(make_workspace(tmp_path)),
                         "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--source-family", "mysql"],
                        capture_output=True, text=True, check=False)
     assert r.returncode == 2 and "--source-family" in r.stderr
 
 
-def test_source_families_are_the_harness_families_and_databricks_is_unverified(tmp_path, monkeypatch):
+def test_source_families_are_the_harness_families_and_databricks_without_cli_is_unverified(tmp_path, monkeypatch):
     """The doctor accepts exactly the families `dbx-recon run --family` accepts (a Databricks-to-Databricks
     unit is one); a family without a tested privilege query is `unverified` and blocks, never `ok`."""
     cli = (PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness" / "recon" / "cli.py").read_text()
     families = re.search(r"^SOURCE_FAMILIES = \((.*)\)$", cli, re.MULTILINE).group(1)
     assert set(doctor.SOURCE_FAMILIES) == set(re.findall(r'"(\w+)"', families)) and "databricks" in doctor.SOURCE_FAMILIES
     monkeypatch.setenv("SRC_DBX", "token=never-printed")
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
     c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
     assert c.status == "unverified" and "databricks" in c.detail and "never-printed" not in json.dumps(asdict(c))
     ws = make_workspace(tmp_path)
@@ -1284,6 +1286,213 @@ def test_source_families_are_the_harness_families_and_databricks_is_unverified(t
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_secret="SRC_DBX",
                         source_family="databricks")
     assert by_id(report)["source_principal_read_only"]["status"] == "unverified"
+    assert "source_principal_read_only=unverified" in report["blocking"] and report["ready"] is False
+
+
+# ------------------------------------------------------------------ databricks source principal + attested
+
+DBX_TABLES = ["mig.raw.loans", "mig.raw.payments"]
+DBX_READ_GRANTS = {"mig": ["USE_CATALOG"], "mig.raw": ["USE_SCHEMA"],
+                   "mig.raw.loans": ["SELECT"], "mig.raw.payments": ["SELECT"]}
+DBX_PRINCIPAL = "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d"
+DBX_SECRET = json.dumps({"server_hostname": "adb-source.example", "http_path": "/sql/1.0/warehouses/x",
+                         "access_token": "test-source-token"})
+
+
+def _dbx_source_cli(monkeypatch, *, grants, owners=None, groups=(), fail_op=None,
+                    raw_get_effective=None):
+    """A databricks CLI bound to the --source-secret credential, not the session env: every call
+    must arrive with env carrying only the secret's host/token plus auth-type pat — every other
+    DATABRICKS_* variable set in the session must not reach the subprocess. `current-user me`
+    answers an applicationId in `groups`, `catalogs|schemas|tables get` the owners dict (default
+    owner@example.com, since a missing owner is now unverified), `grants get-effective` the
+    per-name grants dict (one assignment carried through a GROUP, the way inherited grants
+    arrive); `raw_get_effective` overrides the payload per securable for malformed-JSON cases.
+    Returns every command asked."""
+    asked = []
+    monkeypatch.setenv("SRC_DBX", DBX_SECRET)
+    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "oauth-m2m")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "inherited-client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "inherited-secret")
+    monkeypatch.setenv("DATABRICKS_ACCOUNT_ID", "inherited-account")
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "inherited-profile")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://wrong-workspace.example")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "inherited-token")
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+
+    def fake_run(cmd, timeout=0, env=None):
+        asked.append(cmd)
+        assert env is not None, cmd
+        dbx = {k for k in env if k.startswith("DATABRICKS_")}
+        assert dbx == {"DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_AUTH_TYPE"}, cmd
+        assert env["DATABRICKS_TOKEN"] == "test-source-token"
+        assert env["DATABRICKS_HOST"] == "https://adb-source.example"
+        assert env["DATABRICKS_AUTH_TYPE"] == "pat"
+        op = tuple(cmd[1:3])
+        if op == fail_op:
+            return 1, "", "Error: default auth: cannot configure default credentials token=never-printed"
+        if op == ("current-user", "me"):
+            return 0, json.dumps({"applicationId": DBX_PRINCIPAL,
+                                  "groups": [{"display": g} for g in groups]}), ""
+        if op in (("catalogs", "get"), ("schemas", "get"), ("tables", "get")):
+            return 0, json.dumps({"owner": (owners or {}).get(cmd[3], "owner@example.com")}), ""
+        if op == ("grants", "get-effective"):
+            if raw_get_effective and cmd[4] in raw_get_effective:
+                return 0, json.dumps(raw_get_effective[cmd[4]]), ""
+            return 0, json.dumps({"privilege_assignments": [
+                {"principal": DBX_PRINCIPAL, "inherited_from_type": "GROUP",
+                 "privileges": grants.get(cmd[4], [])}]}), ""
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(doctor, "_run", fake_run)
+    return asked
+
+
+def test_databricks_source_principal_needs_and_parses_the_secret(monkeypatch):
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
+    assert c.status == "fail" and "--source-secret" in c.detail
+    monkeypatch.delenv("SRC_DBX", raising=False)
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    assert c.status == "fail" and "SRC_DBX" in c.detail and "not set" in c.detail
+    monkeypatch.setenv("SRC_DBX", "token=never-printed")
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "JSON" in c.detail
+    assert "never-printed" not in json.dumps(asdict(c))
+
+
+def test_databricks_source_principal_ok_reads_every_securable(monkeypatch):
+    asked = _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    assert c.status == "ok", c.detail
+    assert c.data["principal"] == DBX_PRINCIPAL and c.data["host"] == "adb-source.example"
+    assert c.data["writable"] == {} and "test-source-token" not in json.dumps(asdict(c))
+    effective = [cmd[3:5] for cmd in asked if cmd[1:3] == ["grants", "get-effective"]]
+    assert effective == [["catalog", "mig"], ["schema", "mig.raw"],
+                         ["table", "mig.raw.loans"], ["table", "mig.raw.payments"]]
+
+
+def test_databricks_source_principal_fails_on_write_privilege(monkeypatch):
+    grants = dict(DBX_READ_GRANTS, **{"mig.raw.payments": ["SELECT", "MODIFY"]})
+    _dbx_source_cli(monkeypatch, grants=grants)
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    assert c.status == "fail" and "mig.raw.payments: MODIFY" in c.detail
+    assert c.data["writable"]["mig.raw.payments"] == ["MODIFY"]
+
+
+def test_databricks_source_principal_fails_on_group_ownership(monkeypatch):
+    _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, owners={"mig.raw": "data_engineers"},
+                    groups=("data_engineers",))
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "fail" and "mig.raw: OWNER" in c.detail
+    assert c.data["writable"]["mig.raw"] == ["OWNER"]
+
+
+def test_databricks_source_principal_fails_on_inherited_write_grant(monkeypatch):
+    grants = dict(DBX_READ_GRANTS, **{"mig.raw": ["USE_SCHEMA", "ALL_PRIVILEGES"]})
+    _dbx_source_cli(monkeypatch, grants=grants, groups=("data_engineers",))
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "fail" and "mig.raw: ALL_PRIVILEGES" in c.detail
+
+
+def test_databricks_source_principal_unverified_on_cli_error(monkeypatch):
+    _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, fail_op=("grants", "get-effective"))
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "get-effective" in c.detail
+    assert "never-printed" not in json.dumps(asdict(c))
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "CLI" in c.detail
+
+
+def test_databricks_source_principal_unverified_when_owner_is_unknown(monkeypatch):
+    _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, fail_op=("schemas", "get"))
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "schemas get mig.raw" in c.detail
+    assert "never-printed" not in json.dumps(asdict(c))
+
+
+def test_databricks_source_principal_unverified_on_malformed_grants_payload(monkeypatch):
+    _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, raw_get_effective={"mig": {}})
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "catalog mig" in c.detail
+    assert "no privilege_assignments" in c.detail
+
+
+def test_databricks_source_principal_empty_assignments_are_read_only(monkeypatch):
+    _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS,
+                    raw_get_effective={name: {"privilege_assignments": []}
+                                       for name in ("mig", "mig.raw", "mig.raw.loans")})
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "ok", c.detail
+
+
+def test_databricks_source_principal_unverified_on_string_privileges(monkeypatch):
+    _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS,
+                    raw_get_effective={"mig.raw.loans": {"privilege_assignments": [
+                        {"principal": DBX_PRINCIPAL, "privileges": "SELECT"}]}})
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "unverified" and "table mig.raw.loans" in c.detail
+    assert "no privilege_assignments" in c.detail
+
+
+def test_databricks_source_principal_two_part_names_are_unresolved(monkeypatch):
+    _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
+    c = doctor.check_source_principal(["raw.loans"], "databricks", "SRC_DBX")
+    assert c.status == "unverified" and c.data["unresolved"] == ["raw.loans"]
+
+
+def _attest(ws, line):
+    p = ws / ".migration" / "06_decisions.md"
+    p.write_text(p.read_text() + line)
+
+
+def test_source_attested_reports_attested_and_does_not_block(tmp_path):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal\n")
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_family="teradata", source_attested="D-7")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "attested" and row["data"]["decision"] == "D-7"
+    assert not [b for b in report["blocking"] if b.startswith("source_principal_read_only")]
+    assert report["blocking"] == ["hook_platform_loaded=unverified", "databricks_identity=skipped"]
+
+
+def test_source_attested_fails_without_a_matching_ledger_line(tmp_path):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    _attest(ws, "D-99 | source_principal_read_only: grants confirmed SELECT-only by hand\n")
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_family="teradata", source_attested="D-99")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "D-99" in row["detail"]
+    assert "source_principal_read_only=fail" in report["blocking"]
+    # a decision id is a whole token: D-9 does not match the D-99 line, nor D-990 a D-99 one
+    _attest(ws, "D-990 | source_principal_read_only attested: static export\n")
+    for wrong in ("D-9", "D-99"):
+        report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                            source_family="teradata", source_attested=wrong)
+        assert by_id(report)["source_principal_read_only"]["status"] == "fail", wrong
+
+
+def test_source_attested_is_rejected_for_families_with_a_privilege_query(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor, "check_source_principal", lambda *a, **k: pytest.fail("must not connect"))
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal\n")
+    for family in ("postgres", "databricks"):
+        report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                            source_family=family, source_attested="D-7")
+        row = by_id(report)["source_principal_read_only"]
+        assert row["status"] == "fail" and "run the query instead" in row["detail"], family
+
+
+def test_source_principal_unsupported_family_stays_unverified_and_blocking(tmp_path):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_family="teradata")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "unverified" and "--source-attested" in row["detail"]
     assert "source_principal_read_only=unverified" in report["blocking"] and report["ready"] is False
 
 
