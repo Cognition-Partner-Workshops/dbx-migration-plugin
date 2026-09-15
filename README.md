@@ -89,6 +89,8 @@ through; everything else it recognises blocks. It is a no-op outside a workspace
   "bundle_targets": ["migration", "dev"],
   "lakebase_projects": ["loan-servicing-mig"],
   "lakebase_branches": ["mig-*"],
+  "run_mode": "live",
+  "fixture_endpoints": ["AWS_ENDPOINT_URL"],
   "forbidden_bundle_targets": ["prod", "production"]
 }
 ```
@@ -102,6 +104,8 @@ through; everything else it recognises blocks. It is a no-op outside a workspace
 | `bundle_targets` | no | targets `databricks bundle deploy\|run\|destroy` and `dbt run\|build\|seed` may use with a literal `-t/--target`. **Missing or empty: every deploy blocks.** |
 | `lakebase_projects` | no | Lakebase (Autoscaling Postgres) project ids a `databricks postgres` resource write (branch / endpoint / database / role / CDF) may target, under any branch except `production`; project lifecycle always blocks; `create-catalog` / `create-synced-table` are held to `catalogs`; reads and `generate-database-credential` pass. **Missing or empty: every Lakebase write blocks.** |
 | `lakebase_branches` | no | `fnmatch` globs for Lakebase branch ids that resource writes and branch references in Postgres catalog/synced-table JSON may target; `production` is always blocked. **Missing or empty: any non-`production` branch is allowed.** |
+| `run_mode` | no | `live` (default) or `fixture`; in fixture mode, naming a declared cloud family's CLI, SDK or URI scheme blocks unless every declared variable for that family is set in the hook environment. |
+| `fixture_endpoints` | no | Environment variable names whose family is identified by `AWS_`, `AZURE_`/`AZURITE_`, or `GOOGLE_`/`GCLOUD_`/`GCS_`/emulator prefixes, for example `["AWS_ENDPOINT_URL"]`. |
 | `forbidden_bundle_targets` | no | extra denylist on top of `bundle_targets`; default `["prod", "production"]`. |
 
 Always blocked regardless of config: `databricks` commands outside the read allowlist whose
@@ -115,10 +119,16 @@ ISOLATION LEVEL <any>` / `READ ONLY`, `NOLOCK`-style hints and Teradata `LOCKING
 `recon/` and `waves/` (including the git forms that rewrite the whole working copy: `stash [push|save]`, `checkout|switch -f`, `reset
 --hard|--merge|--keep`, `clean`, `restore .`), edits to the running guard's own plugin tree, a program the guard has no rule for in front of a SQL
 client (`strace`, `chroot`, `firejail`, ...; `env`, `nice`, `nohup`, `timeout`, `sudo`, `ssh host`, `docker exec|run`, `kubectl exec` are modelled), and anything the guard cannot
-read (unreadable scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`, a relative script after a `cd` it cannot resolve). Every relative
+read (unreadable scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`, a relative script after a `cd` it cannot resolve). Remote executions on a legacy source through
+`ssh`, `docker exec`, `kubectl exec`, `aws ssm send-command`, or `az vm run-command invoke` are read through like direct commands and block for remote scripts or unreadable payloads. Every relative
 script or SQL file is read from the directory the command runs in (event `cwd`, `cd`, `pushd`, `env -C`, `git -C`). Python/JDBC/Spark programs are
 only cheaply inspected for literal SQL; the factory-doctor's read-only-principal row is the control
 for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row there to pin a new shape.
+
+**File-edit tools.** `hooks.json` has a second PreToolUse matcher, `^(edit|write|MultiEdit)$`, over the event's
+`tool_name`; the guard reads `tool_input.file_path` and its new content. It blocks writes under `.migration/` except
+`recon/` and `waves/`, and permits `06_decisions.md` only when the edit adds a `D-<id>` row. This covers only file-edit
+tools the platform routes through PreToolUse under those names.
 
 The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
 `.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
