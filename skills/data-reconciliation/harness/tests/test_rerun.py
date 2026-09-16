@@ -139,13 +139,26 @@ def test_source_digest_binds_the_job_files_content_and_names(tmp_path):
 def test_the_prior_shape_comes_from_the_previous_proof_or_a_declared_old_shape(tmp_path):
     proof = tmp_path / "rerun_proof.json"
     proof.write_text(json.dumps({"unit": "u", "shape": OLD_SHAPE, "shape_digest": shape_digest(PRIOR)}))
-    assert load_prior(proof, "u") == PRIOR
+    assert load_prior(proof, "u", proof=True) == PRIOR
     shape = tmp_path / "old_shape.json"
     shape.write_text(json.dumps(OLD_SHAPE))
-    assert load_prior(shape, "u") == PRIOR
+    assert load_prior(shape, "u", proof=False) == PRIOR
     proof.write_text(json.dumps({"unit": "u", "shape": None, "shape_digest": None}))
     with pytest.raises(ConfigError, match="fresh leg failed"):
-        load_prior(proof, "u")
+        load_prior(proof, "u", proof=True)
+
+
+def test_each_prior_option_takes_only_its_own_artifact_type(tmp_path):
+    """--prior-proof must be a rerun proof and --prior-shape a bare shape: a raw shape handed in as
+    the proof would skip the unit and digest checks, so neither file is accepted under the other flag."""
+    shape = tmp_path / "old_shape.json"
+    shape.write_text(json.dumps(OLD_SHAPE))
+    with pytest.raises(ConfigError, match="not a rerun proof"):
+        load_prior(shape, "u", proof=True)
+    proof = tmp_path / "rerun_proof.json"
+    proof.write_text(json.dumps({"unit": "u", "shape": OLD_SHAPE, "shape_digest": shape_digest(PRIOR)}))
+    with pytest.raises(ConfigError, match="rerun proof, not a declared shape"):
+        load_prior(proof, "u", proof=False)
 
 
 def test_a_prior_proof_must_be_this_units_and_carry_the_shape_it_digested(tmp_path):
@@ -154,13 +167,13 @@ def test_a_prior_proof_must_be_this_units_and_carry_the_shape_it_digested(tmp_pa
     proof = tmp_path / "rerun_proof.json"
     proof.write_text(json.dumps({"unit": "other", "shape": OLD_SHAPE, "shape_digest": shape_digest(PRIOR)}))
     with pytest.raises(ConfigError, match="unit 'other', not 'u'"):
-        load_prior(proof, "u")
+        load_prior(proof, "u", proof=True)
     proof.write_text(json.dumps({"unit": "u", "shape": OLD_SHAPE, "shape_digest": shape_digest(NEW_SHAPE)}))
     with pytest.raises(ConfigError, match="shape_digest"):
-        load_prior(proof, "u")
+        load_prior(proof, "u", proof=True)
     proof.write_text(json.dumps({"unit": "u", "shape": OLD_SHAPE}))
     with pytest.raises(ConfigError, match="shape_digest"):
-        load_prior(proof, "u")
+        load_prior(proof, "u", proof=True)
 
 
 # ---- grading ----------------------------------------------------------------------------------
