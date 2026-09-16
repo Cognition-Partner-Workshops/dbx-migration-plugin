@@ -486,6 +486,13 @@ def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> lis
     if not isinstance(verdicts, dict):
         problems.append("verifier output invalid: unit_verdicts must be a dict")
         verdicts = {}
+    else:
+        # a verifier may key single-unit batches by the unit id instead of the batch id;
+        # remap unless the batch id is also present (a collision the checks below must see)
+        unit_to_batch = {u: p["batch"] for p in passed
+                         if len(p.get("units") or []) == 1 for u in p["units"]}
+        verdicts = {(unit_to_batch[k] if k in unit_to_batch and unit_to_batch[k] not in verdicts
+                     else k): v for k, v in verdicts.items()}
     missing = sorted(expected - set(verdicts))
     extra = sorted(set(verdicts) - expected)
     if missing:
@@ -576,7 +583,8 @@ VERIFY_SCHEMA = {
     "type": "object",
     "properties": {
         "wave_verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
-        "unit_verdicts": {"type": "object"},
+        "unit_verdicts": {"type": "object",
+                          "description": "keyed by batch id exactly as listed in the prompt (e.g. w1-orders), value PASS or FAIL"},
         "merged_prs": {"type": "array", "items": {"type": "string"}},
         "findings": {"type": "array", "items": {"type": "string"}},
         "report_path": {"type": "string"},
@@ -662,7 +670,8 @@ def verify_prompt(passed, auto_merge):
         "Merge every PR you mark PASS and list it in merged_prs, even if another unit in the wave failed; "
         "failed units are reopened next launch."
         if auto_merge else
-        "Do not merge anything; return per-unit verdicts. The orchestrator surfaces the PASS PRs in the "
+        "Do not merge anything; return unit_verdicts keyed by batch id (the `batch` field of each "
+        "entry above), value PASS or FAIL. The orchestrator surfaces the PASS PRs in the "
         "wave brief, merges them at wave close (or records the human's decision in the kit's decision log "
         "under .migration/), "
         "and the next wave does not launch until that is done.")
