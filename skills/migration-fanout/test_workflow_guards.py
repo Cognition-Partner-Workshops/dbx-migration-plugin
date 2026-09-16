@@ -482,6 +482,40 @@ def test_check_dependencies_halts_when_the_analysis_writes_nothing_the_batch_dec
               _deps(u=[_routine("app.read_only", reads=["src.x"])]))
 
 
+READ_ONLY = _routine("app.read_only", reads=["src.x"])
+
+
+def test_read_only_batch_may_declare_no_targets_only_when_every_unit_is_analysed_and_writes_nothing():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-3", "units": ["u"], "write_targets": [], "brief": "b"}
+    check([b], _deps(u=[READ_ONLY]))
+    check([{**b, "units": ["u", "v"]}], _deps(u=[READ_ONLY], v=[_routine("app.v", reads=["src.y"])]))
+    with pytest.raises(SystemExit, match=r"b-3.*write_targets.*analysis"):
+        check([b], _deps())
+    with pytest.raises(SystemExit, match=r"b-3.*write_targets.*analysis"):
+        check([{**b, "units": ["u", "v"]}], _deps(u=[READ_ONLY]))
+    with pytest.raises(SystemExit, match=r"b-3.*missing.*mig\.run_log"):
+        check([b], _deps(u=[LOG]))
+
+
+def test_check_dependencies_with_an_unanalysed_unit_checks_only_missing_tables():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-4", "units": ["u", "v"], "write_targets": ["mig.ledger", "mig.run_log", "mig.v_only"], "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]))
+    with pytest.raises(SystemExit, match=r"b-4.*missing.*mig\.run_log") as e:
+        check([{**b, "write_targets": ["mig.ledger", "mig.v_only"]}], _deps(u=[CLOSE, LOG]))
+    assert "mig.v_only" not in str(e.value)
+    with pytest.raises(SystemExit, match=r"b-4.*extra.*mig\.v_only"):
+        check([b], _deps(u=[CLOSE, LOG], v=[READ_ONLY]))
+
+
+def test_check_dependencies_compares_targets_as_one_case_insensitive_identity():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["`MIG`.`Ledger`", " mig.RUN_LOG "], "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]))
+    assert _functions()["transitive_writes"]([_routine("a", writes=['"MIG"."T"', "mig.t"])]) == {"mig.t"}
+
+
 def test_check_dependencies_halts_on_an_uncovered_callee_naming_the_unit():
     check = _functions()["check_dependencies"]
     with pytest.raises(SystemExit, match=r"u.*app\.close_period.*app\.log_run"):

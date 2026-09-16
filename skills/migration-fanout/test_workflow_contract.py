@@ -27,7 +27,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
-               other_waves=None, mappings=None, namespace=None, dependencies=None):
+               other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",)):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -64,7 +64,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "stop_mode": stop_mode,
             "ready": True,
         },
-        "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief",
+        "batches": [{"id": "b-1", "units": list(units), "write_targets": list(write_targets), "brief": "brief",
                      "gates": gates if gates is not None else [GATE]}],
     }
     if namespace is not None:
@@ -555,6 +555,19 @@ def test_declared_write_targets_must_equal_the_call_graphs_transitive_writes(tmp
     ws, cwd = _workspace(tmp_path / "same", dependencies={"u": _analysis("MIG.T")})
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "same", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+
+def test_read_only_batch_declares_no_targets_only_with_an_analysis_that_writes_nothing(tmp_path):
+    ws, cwd = _workspace(tmp_path / "bare", write_targets=())
+    proc, calls = _run(cwd, tmp_path / "bare", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "b-1" in proc.stderr and "write_targets" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "ro", write_targets=(), dependencies={"u": _analysis()})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "ro", [_pass_report(pr, write_targets=[]), _verify_report()])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
 

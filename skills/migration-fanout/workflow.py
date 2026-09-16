@@ -425,10 +425,13 @@ def validate_manifest(m, doctor=None):
         raise SystemExit(f"batch ids must be unique and non-empty: {dupes}")
     owners = {}
     for b in m["batches"]:
-        for key in ("units", "write_targets", "brief"):
+        for key in ("units", "brief"):
             if not b.get(key):
-                raise SystemExit(f"batch {b['id']} is missing '{key}' (a child with no brief or "
-                                 "no declared write targets cannot be launched safely)")
+                raise SystemExit(f"batch {b['id']} is missing '{key}' (a child with no brief cannot be launched safely)")
+        if not isinstance(b.get("write_targets"), list) or not all(isinstance(t, str) and t.strip()
+                                                                    for t in b["write_targets"]):
+            raise SystemExit(f"batch {b['id']} needs 'write_targets', a list of table names (empty only for a batch "
+                             "whose dependency analysis writes nothing)")
         if "verify_depth" in b and b["verify_depth"] not in VERIFY_DEPTHS:
             raise SystemExit(f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
         bad = [u for u in b["units"] if not isinstance(u, str) or not UNIT_ID.fullmatch(u)]
@@ -1299,7 +1302,7 @@ def transitive_writes(routines):
             continue
         seen.add(name)
         r = by_name[name]
-        writes.update(t.casefold() for t in r["writes"])
+        writes.update(target_key(t) for t in r["writes"])
         for callee in r["calls"]:
             if callee.casefold() not in by_name:
                 raise SystemExit(f"routine {r['routine']} calls {callee}, which the dependency analysis does not cover, "
@@ -1311,10 +1314,19 @@ def transitive_writes(routines):
 def check_dependencies(batches, analysis=None):
     """Where a unit ships a dependency analysis, the batch's declared write_targets must equal the
     call graph's transitive writes. A table the code writes but the plan did not declare escapes the
-    collision check; a declared table nothing writes hides a dropped step. Either halts."""
+    collision check; a declared table nothing writes hides a dropped step. Either halts. With a unit
+    the dialect did not analyse in the batch only the first check is possible (its targets are
+    indistinguishable from extras). No declared targets is allowed only when every unit is analysed
+    and the graph writes nothing."""
     analysis = unit_dependencies if analysis is None else analysis
     for b in batches:
-        routines = [r for u in b["units"] for r in analysis(u) or []]
+        by_unit = {u: analysis(u) for u in b["units"]}
+        complete = all(rows is not None for rows in by_unit.values())
+        if not b["write_targets"] and not complete:
+            raise SystemExit(f"batch {b['id']} declares no write_targets, which only a dependency analysis for every "
+                             f"unit ({', '.join(u for u, rows in by_unit.items() if rows is None)}) that writes "
+                             "nothing can justify. Fix the wave plan, then re-run.")
+        routines = [r for rows in by_unit.values() for r in rows or []]
         if not routines:
             continue
         where = f"batch {b['id']} (units {', '.join(b['units'])})"
@@ -1326,11 +1338,12 @@ def check_dependencies(batches, analysis=None):
             actual = transitive_writes(routines)
         except SystemExit as e:
             raise SystemExit(f"{where}: {e}") from None
-        declared = {t.casefold() for t in b["write_targets"]}
-        if actual != declared:
+        declared = {target_key(t) for t in b["write_targets"]}
+        extra = sorted(declared - actual) if complete else []
+        if actual - declared or extra:
             raise SystemExit(f"batch {b['id']}: declared write_targets differ from the call graph's transitive writes; "
                              f"missing from the declaration: {sorted(actual - declared) or '-'}; "
-                             f"extra in the declaration: {sorted(declared - actual) or '-'}. Fix the wave plan, then re-run.")
+                             f"extra in the declaration: {extra or '-'}. Fix the wave plan, then re-run.")
 
 
 def child_prompt(batch):
@@ -1666,15 +1679,16 @@ async def main():
     breaker = Breaker(BREAKER)
     results = await asyncio.gather(*(run_batch(b, sem, breaker) for b in BATCHES))
 
-    reported = Counter(t for r in results for t in r.get("write_targets", []))
-    surprises = [t for t, c in reported.items() if c > 1]
+    reported = Counter(t for r in results for t in {target_key(t) for t in r.get("write_targets", [])})
+    surprises = sorted(t for t, c in reported.items() if c > 1)
     undeclared = {}
     for b, r in zip(BATCHES, results):
-        extra = sorted(set(r.get("write_targets", [])) - set(b["write_targets"]))
+        declared = {target_key(t) for t in b["write_targets"]}
+        extra = sorted({t for t in r.get("write_targets", []) if target_key(t) not in declared})
         if extra:
             undeclared[b["id"]] = extra
     unreported = [b["id"] for b, r in zip(BATCHES, results)
-                  if r["status"] == "PASS" and not r.get("write_targets")]
+                  if r["status"] == "PASS" and b["write_targets"] and not r.get("write_targets")]
     auto_merge = AUTO_MERGE
     if surprises:
         auto_merge = False
