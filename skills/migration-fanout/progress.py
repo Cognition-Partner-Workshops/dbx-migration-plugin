@@ -35,19 +35,30 @@ def _wave(result: dict, path: Path):
 
 def _manifest_units(path: Path) -> dict:
     manifest_path = path.with_name(path.name[:-len(_RESULT_SUFFIX)] + ".json")
-    if not manifest_path.exists():
-        return {}
+    if not manifest_path.is_file():
+        raise ValueError(f"{manifest_path}: manifest is missing")
     try:
         manifest = json.loads(manifest_path.read_text())
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("batches"), list):
-        return {}
-    return {
-        batch.get("id"): batch["units"]
-        for batch in manifest["batches"]
-        if isinstance(batch, dict) and isinstance(batch.get("units"), list)
-    }
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{manifest_path}: manifest is unreadable") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{manifest_path}: manifest is not an object")
+    batches = manifest.get("batches")
+    if not isinstance(batches, list):
+        raise ValueError(f"{manifest_path}: manifest batches is not a list")
+    units = {}
+    for batch in batches:
+        if not isinstance(batch, dict):
+            raise ValueError(f"{manifest_path}: manifest batch is not an object")
+        batch_id = batch.get("id")
+        batch_units = batch.get("units")
+        if batch_units is None:
+            continue
+        if not isinstance(batch_units, list):
+            raise ValueError(f"{manifest_path}: manifest batch {batch_id!r} units is not a list")
+        if isinstance(batch_id, str):
+            units[batch_id] = batch_units
+    return units
 
 
 def render_progress(mig: Path) -> str:
@@ -65,7 +76,9 @@ def render_progress(mig: Path) -> str:
     rows = []
     for result, path in results:
         wave = _wave(result, path)
-        manifest_units = _manifest_units(path)
+        if "batches" in result and not isinstance(result["batches"], list):
+            raise ValueError(f"{path}: result batches is not a list")
+        manifest_units = None
         for batch in result.get("batches", []):
             if not isinstance(batch, dict):
                 continue
@@ -74,7 +87,18 @@ def render_progress(mig: Path) -> str:
                 if isinstance(cost, dict) else ""
             units = batch.get("units")
             if not isinstance(units, list):
-                units = manifest_units.get(batch.get("id"), [])
+                if manifest_units is None:
+                    try:
+                        manifest_units = _manifest_units(path)
+                    except ValueError:
+                        raise ValueError(
+                            f"{path}: batch {batch.get('id')!r} has no units and no readable manifest entry"
+                        ) from None
+                units = manifest_units.get(batch.get("id"))
+                if not isinstance(units, list):
+                    raise ValueError(
+                        f"{path}: batch {batch.get('id')!r} has no units and no readable manifest entry"
+                    )
             for unit in units:
                 rows.append((
                     wave,
