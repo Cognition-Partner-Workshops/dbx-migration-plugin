@@ -293,11 +293,13 @@ def load_runs(path: Path, repo: Path = Path(".")) -> list[dict]:
     """Read run records and stamp each with `record`, its path inside `repo` (never what the file
     says about itself); a file outside the repository, or reached through a symlink, can be nobody's
     committed evidence and is refused before it is read."""
+    if ".." in Path(path).parts:
+        raise ConfigError(f"{path}: has a .. component; a symlink before it would leave the repository unseen")
     files = sorted(path.glob("*.run.json")) if path.is_dir() else [path]
-    root = Path(repo).resolve()
+    root = Path(os.path.abspath(repo))
     runs = []
     for f in files:
-        rel = Path(os.path.relpath(Path(os.path.abspath(f)), root))
+        rel = Path(os.path.relpath(os.path.abspath(f), root))
         if ".." in rel.parts:
             raise ConfigError(f"{f}: is outside the repository {root}")
         node = root
