@@ -579,19 +579,20 @@ def test_not_blocked_probe_fails(tmp_path):
     assert by_id(report)["hook_guard"]["status"] == "fail"
 
 
-def test_missing_files_and_stop_mode_fail(tmp_path):
-    ws = make_workspace(tmp_path, omit=("05_progress.md",))
+def test_generated_and_folded_files_are_not_required(tmp_path):
+    ws = make_workspace(tmp_path, omit=("02_glossary.md", "05_progress.md"))
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "ok"
     (ws / ".migration" / "00_context.md").write_text("# no mode here\n")
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert c["workspace"]["status"] == "fail" and "05_progress.md" in c["workspace"]["data"]["missing"]
     assert sub_by_id({"checks": [c["workspace"]]}, "workspace")["stop_mode"]["status"] == "fail"
 
 
-def test_setup_outputs_glossary_and_tolerances_json_are_required(tmp_path):
-    ws = make_workspace(tmp_path, omit=("02_glossary.md", "03_recon_tolerances.json"))
+def test_setup_outputs_tolerances_json_is_required(tmp_path):
+    ws = make_workspace(tmp_path, omit=("03_recon_tolerances.json",))
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
     assert c["workspace"]["status"] == "fail"
-    assert c["workspace"]["data"]["missing"] == ["02_glossary.md", "03_recon_tolerances.json"]
+    assert c["workspace"]["data"]["missing"] == ["03_recon_tolerances.json"]
 
 
 @pytest.mark.parametrize("who, expected", [
