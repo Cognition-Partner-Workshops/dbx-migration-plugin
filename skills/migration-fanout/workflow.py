@@ -273,18 +273,22 @@ def override_decision(decision_id, units, ledger, word="merge_override"):
 
 
 def declared_gates_sha(batches):
-    declared = {b["id"]: [[g["id"], g["kind"]] for g in b["gates"]] for b in batches}
+    """What STOP C approved: per batch, the units and the gate id/kind list. Status and evidence move as
+    gates pass; a unit or gate swapped under the approval changes the hash."""
+    declared = {b["id"]: [sorted(b["units"]), [[g["id"], g["kind"]] for g in b["gates"]]] for b in batches}
     return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def gates_approved(sha, ledger):
     """Whether a human's STOP C row of the ledger records this gate list: a D-<n> line with user:<id>
-    provenance saying `gates_sha <sha>`. The manifest alone cannot vouch for itself (editing the gates and
-    recomputing the hash there satisfies the manifest check)."""
+    provenance naming STOP C and saying `gates_sha <sha>`. The manifest alone cannot vouch for itself
+    (editing the gates and recomputing the hash there satisfies the manifest check), and a human row
+    about something else that happens to quote the hash is not the plan approval."""
     if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
         return False
+    stop_c = re.compile(r"(?<![A-Za-z0-9_.-])stop c(?![A-Za-z0-9_.-])", re.I)
     words = re.compile(rf"(?<![A-Za-z0-9_.-])gates_sha(?![A-Za-z0-9_.-]).*(?<![A-Za-z0-9_.-]){sha}(?![A-Za-z0-9_.-])")
-    return any(DECISION_ID.search(line) and HUMAN_PROVENANCE.search(line) and words.search(line)
+    return any(DECISION_ID.search(line) and HUMAN_PROVENANCE.search(line) and stop_c.search(line) and words.search(line)
                for line in ledger.splitlines())
 
 

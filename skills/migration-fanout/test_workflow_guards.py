@@ -178,10 +178,13 @@ def test_gates_sha_is_approved_only_by_a_human_stop_c_row():
                    f"| D-3 | user:evt-9 STOP C {sha} |\n",                              # the value without its name
                    f"| D-3 | user:evt-9 STOP C gates_sha {sha}0 |\n",                   # not the exact value
                    f"| user:evt-9 STOP C gates_sha {sha} |\n",                          # no decision id
-                   f"| D-3 | user: STOP C gates_sha {sha} |\n"):                        # user: without an id
+                   f"| D-3 | user: STOP C gates_sha {sha} |\n",                         # user: without an id
+                   f"| D-3 | user:evt-9 wave-2 gates_sha {sha} |\n",                    # not a STOP C row
+                   f"| D-3 | user:evt-9 STOP CD gates_sha {sha} |\n"):
         assert not gates_approved(sha, ledger), ledger
-    assert not gates_approved(None, f"| D-3 | user:evt-9 gates_sha {sha} |\n")
-    assert not gates_approved(sha[:-1], f"| D-3 | user:evt-9 gates_sha {sha[:-1]} |\n")
+    assert gates_approved(sha, f"| D-3 | user:evt-9 stop c: gates_sha {sha} |\n")
+    assert not gates_approved(None, f"| D-3 | user:evt-9 STOP C gates_sha {sha} |\n")
+    assert not gates_approved(sha[:-1], f"| D-3 | user:evt-9 STOP C gates_sha {sha[:-1]} |\n")
 
 
 def test_declared_gate_list_is_hashed_into_the_manifest():
@@ -199,8 +202,10 @@ def test_declared_gate_list_is_hashed_into_the_manifest():
     passed = [{**b, "gates": [{**g, "status": "passed", "evidence": "x"} for g in b["gates"]]} for b in m["batches"]]
     assert sha(passed) == good
     validate_manifest({**m, "batches": passed})
-    # a gate swapped for another kind, renamed, dropped or added is a halt
+    # a gate swapped for another kind, renamed, dropped or added is a halt; so is a unit swapped under the gates
     for changed in ([{**b, "gates": [{**g, "kind": "custom"} for g in b["gates"]]} for b in m["batches"]],
+                    [{**b, "units": ["other_unit"]} for b in m["batches"]],
+                    [{**b, "units": b["units"] + ["extra_unit"]} for b in m["batches"]],
                     [{**b, "gates": [{**g, "id": "g-other"} for g in b["gates"]]} for b in m["batches"]],
                     [{**b, "gates": b["gates"] + [{**GATE, "id": "g-extra"}]} for b in m["batches"]]):
         assert sha(changed) != good

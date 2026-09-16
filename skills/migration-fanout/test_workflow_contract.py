@@ -13,8 +13,8 @@ GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": "
 
 
 def _gates_sha(batches):
-    """The recipe the plan playbook documents: sha256 of the sorted {batch id: [[gate id, kind], ...]} map."""
-    declared = {b["id"]: [[g["id"], g["kind"]] for g in b["gates"]] for b in batches}
+    """The recipe the fanout skill documents: sha256 of the sorted {batch id: [[units], [[gate id, kind], ...]]} map."""
+    declared = {b["id"]: [sorted(b["units"]), [[g["id"], g["kind"]] for g in b["gates"]]] for b in batches}
     return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -196,10 +196,11 @@ def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_le
     "| D-2 | default-accepted (soft, 60s) STOP C gates_sha {sha} |\n",       # not a human's row
     "| D-2 | user:U0 STOP C gates_sha {other} |\n",                          # a different approved list
     "| D-2 | user:U0 STOP C {sha} |\n",                                      # the hash without its name
+    "| D-2 | user:U0 tolerance note, gates_sha {sha} |\n",                   # a human row that is not STOP C
 ])
 def test_gates_sha_must_be_the_one_a_human_approved_in_the_ledger(tmp_path, ledger):
     ws, cwd = _workspace(tmp_path, stop_c=False)
-    sha = _gates_sha([{"id": "b-1", "gates": [GATE]}])
+    sha = _gates_sha([{"id": "b-1", "units": ["u-1"], "gates": [GATE]}])
     if ledger is not None:
         (ws / ".migration" / "06_decisions.md").write_text(ledger.format(sha=sha, other="0" * 64))
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
@@ -236,9 +237,10 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
 
-def test_gate_list_changed_after_stop_c_halts_before_launch(tmp_path):
-    ws, cwd = _workspace(tmp_path, gates=[{**GATE, "kind": "custom"}], gates_sha=_gates_sha(
-        [{"id": "b-1", "gates": [GATE]}]))
+@pytest.mark.parametrize("changed", [{"gates": [{**GATE, "kind": "custom"}]}, {"units": ("other_unit",)}])
+def test_gate_list_changed_after_stop_c_halts_before_launch(tmp_path, changed):
+    approved = [{"id": "b-1", "units": ["u"], "gates": [GATE]}]
+    ws, cwd = _workspace(tmp_path, gates_sha=_gates_sha(approved), **changed)
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0 and "gates_sha" in proc.stderr and "STOP C" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
