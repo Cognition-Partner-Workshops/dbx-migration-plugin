@@ -585,7 +585,7 @@ def test_generated_and_folded_files_are_not_required(tmp_path):
     assert c["workspace"]["status"] == "ok"
     (ws / ".migration" / "00_context.md").write_text("# no mode here\n")
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert c["stop_mode"]["status"] == "fail"
+    assert sub_by_id({"checks": [c["workspace"]]}, "workspace")["stop_mode"]["status"] == "fail"
 
 
 def test_setup_outputs_tolerances_json_is_required(tmp_path):
