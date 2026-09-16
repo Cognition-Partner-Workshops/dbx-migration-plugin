@@ -255,26 +255,33 @@ def test_preflight_halts_until_every_declared_sibling_pipeline_has_published_a_m
     branch yet is invisible to it; the manifest names the pipelines the plan split, and launch waits until each
     has a manifest on origin and the disk matches origin."""
     check = _functions()["check_pipelines_published"]
-    orders = json.dumps({"batches": [B1]})
+    pipelines = {"orders": 1, "payments": 1, "ledger": 1}
+    orders = json.dumps({"batches": [B1], "pipelines": pipelines})
     (tmp_path / "wave-orders-1.json").write_text(orders)
-    manifest = {"pipelines": ["orders", "payments", "ledger"]}
+    manifest = {"pipelines": pipelines}
     published = {"wave-orders-1.json": orders}
-    with pytest.raises(SystemExit, match=r"payments, ledger.*wave-<pipeline>-<N>\.json.*integration branch"):
+    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json, wave-payments-1\.json.*integration branch"):
         check(tmp_path, manifest, published)
-    payments = json.dumps({"batches": [B2]})
-    (tmp_path / "wave-payments-2.json").write_text(payments)
-    published["wave-payments-2.json"] = payments
-    published["wave-ledger-1.result.json"] = "{}"
-    with pytest.raises(SystemExit, match=r"ledger.*wave-<pipeline>-<N>\.json"):
+    payments = json.dumps({"batches": [B2], "pipelines": pipelines})
+    (tmp_path / "wave-payments-1.json").write_text(payments)
+    published["wave-payments-1.json"] = payments
+    published["wave-ledger-2.json"] = json.dumps({"batches": [], "pipelines": pipelines})   # past the count
+    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json"):
         check(tmp_path, manifest, published)
-    published["wave-ledger-1.json"] = json.dumps({"batches": []})
-    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json.*not on disk.*pull"):
-        check(tmp_path, manifest, published)
+    published["wave-ledger-1.json"] = json.dumps({"batches": [], "pipelines": pipelines})
     (tmp_path / "wave-ledger-1.json").write_text(published["wave-ledger-1.json"])
+    with pytest.raises(SystemExit, match=r"wave-ledger-2\.json.*plans disagree"):
+        check(tmp_path, manifest, published)
+    del published["wave-ledger-2.json"]
+    published["wave-payments-1.json"] = json.dumps(
+        {"batches": [B2], "pipelines": {"orders": 1, "payments": 1, "ledger": 2}})
+    with pytest.raises(SystemExit, match="plans disagree"):
+        check(tmp_path, manifest, published)
+    published["wave-payments-1.json"] = payments
     check(tmp_path, manifest, published)
     check(tmp_path, {}, published)
     with pytest.raises(SystemExit, match="billing"):
-        check(tmp_path, {"pipelines": ["orders", "billing"]}, published)
+        check(tmp_path, {"pipelines": {"orders": 1, "billing": 1}}, published)
 
 
 def test_preflight_halts_on_a_manifest_origin_does_not_hold_or_holds_differently(tmp_path):
@@ -290,29 +297,35 @@ def test_preflight_halts_on_a_manifest_origin_does_not_hold_or_holds_differently
     check(tmp_path, {}, {"wave-orders-1.json": json.dumps({"batches": [B1]})})
 
 
-@pytest.mark.parametrize("bad", ["orders", [], ["orders", "orders"], [""], ["orders/1"], [7], ["orders-1"]])
-def test_validate_manifest_rejects_a_pipelines_list_that_does_not_name_distinct_pipelines(bad):
+@pytest.mark.parametrize("bad", ["orders", [], {}, {"orders": 0}, {"orders": -1}, {"orders": True},
+                                 {"orders": "2"}, {"orders": None}, {"orders/1": 2}, {7: 2},
+                                 [["orders"]], [{"a": 1}]])
+def test_validate_manifest_rejects_a_pipelines_map_that_does_not_name_each_pipeline_and_its_wave_count(bad):
     validate = _functions()["validate_manifest"]
     with pytest.raises(SystemExit, match="'pipelines'"):
         validate({**_manifest(), "pipelines": bad})
-    validate({**_manifest(), "pipelines": ["orders", "payments_2"]})
+    validate({**_manifest(), "pipelines": {"orders": 1, "payments_2": 3}})
 
 
 def test_check_wave_tag_pins_the_file_name_number_to_the_manifest_wave():
     check = _functions()["check_wave_tag"]
     check("1", {"wave": 1})
-    check("payments-1", {"wave": 1, "pipelines": ["payments"]})
+    check("payments-1", {"wave": 1, "pipelines": {"payments": 1}})
     for tag, wave in [("2", 1), ("payments-1", 2), ("payments", 1)]:
         with pytest.raises(SystemExit, match="the wave number in the file name"):
-            check(tag, {"wave": wave, "pipelines": ["payments"]})
+            check(tag, {"wave": wave, "pipelines": {"payments": 2}})
 
 
 def test_check_wave_tag_requires_a_tagged_manifest_to_list_its_pipelines():
     check = _functions()["check_wave_tag"]
+    check("orders-1", {"wave": 1, "pipelines": {"orders": 2}})
+    check("orders-2", {"wave": 2, "pipelines": {"orders": 2}})
     with pytest.raises(SystemExit, match=r"wave-<pipeline>-<N>\.json.*pipelines"):
         check("orders-1", {"wave": 1})
     with pytest.raises(SystemExit, match="orders"):
-        check("orders-1", {"wave": 1, "pipelines": ["payments", "ledger"]})
+        check("orders-1", {"wave": 1, "pipelines": {"payments": 1, "ledger": 1}})
+    with pytest.raises(SystemExit, match="orders"):
+        check("orders-3", {"wave": 3, "pipelines": {"orders": 2}})
 
 
 @pytest.mark.parametrize("u2", [None, {"objects": []}, {"objects": [{"object": "mig.other", "target_where": "x = 1"}]}])

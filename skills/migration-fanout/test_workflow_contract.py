@@ -78,7 +78,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     if namespace is not None:
         manifest["target_namespace"] = namespace
     if pipelines is not None:
-        manifest["pipelines"] = list(pipelines)
+        manifest["pipelines"] = dict(pipelines)
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"], wave)
     manifest["stop_c"] = "D-2"
     ledger = f"| D-2 | 2026-01-05 | user:U0 | STOP C wave-{wave} gates_sha {manifest['gates_sha']} | plan approved |\n" if stop_c else ""
@@ -860,7 +860,7 @@ def test_pointer_above_the_cwd_names_the_workspace(tmp_path):
 
 
 def test_pipeline_manifest_tags_the_verifier_branch_and_workflow(tmp_path):
-    ws, cwd = _workspace(tmp_path, manifest_name="wave-p2-1.json", wave=1, pipelines=["p2"])
+    ws, cwd = _workspace(tmp_path, manifest_name="wave-p2-1.json", wave=1, pipelines={"p2": 1})
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
                     "HEAD:recon/wave-p2-1"], check=True)
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1"),
@@ -897,8 +897,14 @@ def test_a_pipeline_manifest_must_name_every_sibling_in_pipelines(tmp_path):
     assert not [c for c in calls if c["kind"] == "agent"]
 
     ws, cwd = _workspace(tmp_path / "foreign", manifest_name="wave-orders-1.json", wave=1,
-                         pipelines=["payments", "ledger"])
+                         pipelines={"payments": 1, "ledger": 1})
     proc, calls = _run(cwd, tmp_path / "foreign", [_pass_report()])
+    assert proc.returncode != 0 and "orders" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "over", manifest_name="wave-orders-3.json", wave=3,
+                         pipelines={"orders": 2})
+    proc, calls = _run(cwd, tmp_path / "over", [_pass_report()])
     assert proc.returncode != 0 and "orders" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 

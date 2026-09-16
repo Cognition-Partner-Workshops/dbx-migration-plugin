@@ -431,10 +431,12 @@ def validate_manifest(m, doctor=None):
                            or not all(isinstance(s, str) for s in m["secrets"])):
         raise SystemExit("wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
     pipelines = m.get("pipelines")
-    if "pipelines" in m and (not isinstance(pipelines, list) or not pipelines or len(set(pipelines)) != len(pipelines)
-                             or not all(isinstance(p, str) and PIPELINE_RE.fullmatch(p) for p in pipelines)):
-        raise SystemExit("manifest key 'pipelines' must list each distinct pipeline the plan split (letters, digits, '_'), "
-                         "the <pipeline> of its wave-<pipeline>-<N>.json manifests")
+    if "pipelines" in m and (not isinstance(pipelines, dict) or not pipelines
+                             or not all(isinstance(p, str) and PIPELINE_RE.fullmatch(p) for p in pipelines)
+                             or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0
+                                        for n in pipelines.values())):
+        raise SystemExit("manifest key 'pipelines' must map each pipeline the plan split (letters, digits, '_') to a "
+                         "positive wave count, the <pipeline>-<N> of its wave-<pipeline>-<N>.json manifests")
     if m["wave"] == 0 and m.get("width", 20) != 1:
         raise SystemExit("wave 0 is the serial shared-objects wave: set width to 1")
     if not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
@@ -845,7 +847,8 @@ def check_wave_tag(tag, manifest):
     if not last.isdigit() or int(last) != wave:
         raise SystemExit(f"wave-{tag}.json: the wave number in the file name must equal the manifest's 'wave' ({wave})")
     pipeline = tag.rsplit("-", 1)[0]
-    if pipeline != tag and pipeline not in manifest.get("pipelines", []):
+    count = manifest.get("pipelines", {}).get(pipeline) if pipeline != tag else None
+    if pipeline != tag and (not isinstance(count, int) or isinstance(count, bool) or count < int(last)):
         raise SystemExit(f"wave-{tag}.json: wave-<pipeline>-<N>.json manifests must list every sibling pipeline in "
                          f"'pipelines' (including {pipeline}): the planning barrier reads it")
 
@@ -870,21 +873,36 @@ def published_manifests():
 
 def check_pipelines_published(waves_dir, m, published=None):
     """The collision check sees only manifests on disk, so a sibling pipeline whose manifests have not landed on
-    the integration branch yet is invisible to it and both waves could launch on one target. The manifest names
-    every pipeline the plan split; launch waits until each has a manifest on origin's base branch and the
-    manifests on disk are exactly origin's (`published`, {name: text}; None skips that comparison)."""
+    the integration branch yet is invisible to it and both waves could launch on one target. The manifest maps
+    every pipeline the plan split to its wave count; launch waits until every numbered wave-<pipeline>-<N>.json
+    is on origin's base branch, every published sibling declares the same 'pipelines', and the manifests on disk
+    are exactly origin's (`published`, {name: text}; None skips that comparison)."""
     on_disk = {f.name: f.read_text() for f in waves_dir.glob("wave-*.json") if _is_manifest(f.name)}
     if published is not None:
         published = {n: t for n, t in published.items() if _is_manifest(n)}
     names = on_disk if published is None else published
-    missing = [p for p in m.get("pipelines", [])
-               if not any(re.fullmatch(rf"wave-{re.escape(p)}-\d+\.json", n) for n in names)]
+    pipelines = m.get("pipelines") or {}
+    expected = {f"wave-{p}-{k}.json" for p, n in pipelines.items()
+                if isinstance(n, int) and not isinstance(n, bool) for k in range(1, n + 1)}
+    missing = sorted(expected - set(names))
     if missing:
-        raise SystemExit(f"no manifest yet for pipeline(s) {', '.join(missing)}: every pipeline in 'pipelines' commits its "
-                         "wave-<pipeline>-<N>.json before any sibling launches; pull the integration branch and re-run, "
-                         "or wait for the planning barrier")
+        raise SystemExit(f"no manifest yet for {', '.join(missing)}: every pipeline in 'pipelines' commits its "
+                         "wave-<pipeline>-<N>.json before any sibling launches; pull the integration branch and "
+                         "re-run, or wait for the planning barrier")
+    listed = "|".join(re.escape(p) for p in pipelines)
+    extra = sorted(n for n in names if listed and re.fullmatch(rf"wave-(?:{listed})-\d+\.json", n)
+                   and n not in expected)
+    if extra:
+        raise SystemExit(f"{', '.join(extra)} is beyond the wave count in 'pipelines': the plans disagree")
     if published is None:
         return
+    for name in sorted(expected & set(published)):
+        try:
+            theirs = json.loads(published[name]).get("pipelines")
+        except ValueError:
+            theirs = None
+        if theirs != pipelines:
+            raise SystemExit(f"{name} declares a different 'pipelines': the plans disagree")
     for name, text in sorted(on_disk.items()):
         if name not in published:
             raise SystemExit(f"{name} is not on origin/{BASE_BRANCH}: commit and push every manifest before preflight so "
