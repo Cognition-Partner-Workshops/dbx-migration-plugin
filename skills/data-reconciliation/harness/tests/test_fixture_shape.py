@@ -47,11 +47,13 @@ def _source():
 
 
 def test_a_faithful_fixture_passes_and_records_what_was_read():
-    out = compare_fixture(SPEC, _source(), _source())
+    src = _source()
+    out = compare_fixture(SPEC, src, _source())
     assert out["status"] == "pass" and out["findings"] == []
     assert out["tables"]["app.orders"] == {"status": "pass", "shape": "checked",
                                            "cardinality": "checked"}
-    assert out["source_statements"] == 1 + 3  # one catalog read, one aggregate per column
+    assert out["source_statements"] == 1 + 3  # one catalog read, one profile per column
+    assert src.calls["column_profile"] == 3
 
 
 def test_column_name_type_and_nullability_gaps_are_findings():
@@ -117,7 +119,7 @@ def test_a_side_without_a_catalog_reader_is_unsupported_never_clean():
     out = compare_fixture(SPEC, src, _source())
     assert out["status"] == "unsupported"
     assert out["tables"]["app.orders"]["shape"] == "unsupported"
-    assert out["tables"]["app.orders"]["cardinality"] == "checked"
+    assert out["tables"]["app.orders"]["cardinality"] == "unsupported"
     assert "column_shape" in out["tables"]["app.orders"]["reason"]
 
 
@@ -151,6 +153,77 @@ def test_the_source_statement_cap_bounds_the_legacy_reads():
     assert out["status"] == "unsupported"
     with pytest.raises(ConfigError, match="cap"):
         compare_fixture(spec, src, fx, source_statement_cap=1)
+
+
+class TwoStatementSource(ShapedSource):
+    """A SQL-style side whose field_aggregates costs two statements (aggregate plus SUM probe)."""
+
+    def field_aggregates(self, table, column, where=None):
+        self._count("field_aggregates", statements=2)
+        return self._aggs(self._rows(table, where), [column], [column])[column]
+
+
+def test_cardinality_uses_one_statement_per_column_and_the_cap_counts_real_statements():
+    src, fx = TwoStatementSource({"app.orders": SOURCE_ROWS}, {"app.orders": SOURCE_SHAPE}), _source()
+    out = compare_fixture(SPEC, src, fx, source_statement_cap=4)
+    assert out["source_statements"] == 4 and src.statements == 4
+    assert src.calls["column_profile"] == 3 and src.calls["field_aggregates"] == 0
+    assert out["tables"]["app.orders"]["cardinality"] == "checked"
+
+
+class OvershootingSource(ShapedSource):
+    """An adapter that spends more statements than the check budgeted for a column."""
+
+    def column_profile(self, table, column, where=None):
+        self._count("column_profile", statements=2)
+        return super().column_profile(table, column, where)
+
+
+def test_an_adapter_that_overspends_the_cap_stops_the_source_reads_and_is_unsupported():
+    src = OvershootingSource({"app.orders": SOURCE_ROWS}, {"app.orders": SOURCE_SHAPE})
+    out = compare_fixture(SPEC, src, _source(), source_statement_cap=4)
+    # catalog read (1) + first profile (2) = 3; the second profile would need 1 but costs 2
+    # and is not issued once the counter shows the cap cannot hold it
+    assert src.statements <= 4 and out["source_statements"] == src.statements
+    assert out["tables"]["app.orders"]["cardinality"] == "unsupported"
+    assert "cap 4" in out["tables"]["app.orders"]["reason"]
+    assert out["status"] == "unsupported"
+
+
+def test_a_scoped_mapping_profiles_only_its_population():
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="orders", root_table="app.orders", key_source=["order_id"], key_target="order_id",
+        root_where="region = 'eu'", target_where="region = 'eu'",
+        fields=[FieldMapping("order_id", "order_id", "bigint", "long"),
+                FieldMapping("status", "status", "varchar(12)", "string")])])
+    shape = SOURCE_SHAPE[:2] + [{"name": "region", "type": "varchar(2)", "nullable": False}]
+    src_rows = [{"order_id": 1, "status": "new", "region": "eu"},
+                {"order_id": 2, "status": "new", "region": "eu"},
+                {"order_id": 3, "status": "paid", "region": "us"},
+                {"order_id": 4, "status": "shipped", "region": "us"}]
+    fx_rows = [r for r in src_rows if r["region"] == "eu"]
+    src = ShapedSource({"app.orders": src_rows}, {"app.orders": shape})
+    fx = ShapedSource({"app.orders": fx_rows}, {"app.orders": shape})
+    out = compare_fixture(spec, src, fx)
+    assert out["status"] == "pass" and out["findings"] == []  # eu has one status on both sides
+    out = compare_fixture(SPEC, src, ShapedSource({"app.orders": fx_rows}, {"app.orders": shape}))
+    assert [f["check"] for f in out["findings"]] == ["cardinality_collapsed"]  # unscoped: 3 vs 1
+
+
+def test_a_table_the_source_lacks_is_unsupported_and_not_aggregated():
+    src = ShapedSource({"app.orders": SOURCE_ROWS}, {"app.orders": []})
+    fx = _source()
+    out = compare_fixture(SPEC, src, fx)
+    assert out["status"] == "unsupported" and out["findings"] == []
+    assert out["tables"]["app.orders"] == {"status": "unsupported", "shape": "unsupported",
+                                           "cardinality": "unsupported",
+                                           "reason": "source no app.orders"}
+    assert src.calls["column_profile"] == 0 and fx.calls["column_profile"] == 0
+    # the same when only the source catalog reader is missing: nothing is aggregated blind
+    src = ShapedSource({}, None)
+    out = compare_fixture(SPEC, src, fx)
+    assert out["tables"]["app.orders"]["cardinality"] == "unsupported"
+    assert src.calls["column_profile"] == 0
 
 
 def test_findings_are_ordered_and_reference_the_unit_table():
@@ -274,6 +347,17 @@ def test_sqlserver_source_column_shape_reads_sys_columns_in_order():
     cur = conn.cursors[0]
     assert "sys.columns" in cur.sql and "ORDER BY c.column_id" in cur.sql
     assert cur.params == ("dbo", "Orders") and ad.statements == 1
+
+
+def test_sql_column_profile_is_one_scoped_statement_with_no_sum_probe():
+    from recon.adapters import SqlServerSourceAdapter
+    conn = _Conn([(10, 8, 1, 9, 3)])
+    ad = SqlServerSourceAdapter.__new__(SqlServerSourceAdapter)
+    ad._conn, ad.statements, ad.rows_fetched = conn, 0, 0
+    assert ad.column_profile("dbo.Orders", "status", "region = 'eu'") == {
+        "count": 10, "null_rate": 0.2, "distinct_count": 3}
+    assert ad.statements == 1 and len(conn.cursors) == 1
+    assert "WHERE region = 'eu'" in conn.cursors[0].sql and "SUM(" not in conn.cursors[0].sql
 
 
 def test_databricks_source_column_shape_reads_information_schema():

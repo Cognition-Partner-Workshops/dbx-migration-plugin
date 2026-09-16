@@ -399,6 +399,14 @@ class _SqlAdapterBase:
         out["sum"] = self.sum_probe(table, column, where)
         return out
 
+    def column_profile(self, table: str, column: str, where: str | None = None) -> dict[str, Any]:
+        """Count, null rate and distinct count in exactly one statement (no SUM probe), for
+        checks that budget source reads per column (recon.fixture_shape)."""
+        w = f" WHERE {where}" if where else ""
+        n, nonnull, _, _, dc = self._rows(AGG_SQL.format(col=column, table=table, where=w))[0]
+        return {"count": int(n), "null_rate": (int(n) - int(nonnull)) / int(n) if n else 0.0,
+                "distinct_count": int(dc)}
+
     def sum_probe(self, table: str, column: str, where: str | None = None) -> Any:
         w = f" WHERE {where}" if where else ""
         try:
@@ -1464,6 +1472,9 @@ class DatabricksTargetAdapter:
     def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
         return self._sql.field_aggregates(self._q(object), field_path, where)
 
+    def column_profile(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
+        return self._sql.column_profile(self._q(object), field_path, where)
+
     def sum_probe(self, object: str, field_path: str, where: str | None = None) -> Any:
         return self._sql.sum_probe(self._q(object), field_path, where)
 
@@ -1814,6 +1825,9 @@ class LakebaseTargetAdapter(_PostgresBase):
 
     def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
         return super().field_aggregates(self._q(object), field_path, where)
+
+    def column_profile(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
+        return super().column_profile(self._q(object), field_path, where)
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:

@@ -2,9 +2,10 @@
 
 Children develop against a fixture, so a fixture that merely has the tables (a column spelled
 differently, a looser type, every row in one status) lets a wrong conversion reach review. This
-compares, per mapped table, the source's observed column shape and a sample cardinality with the
-fixture's. Source reads are catalog queries plus one aggregate per mapped column, counted
-against a stated cap; nothing here writes. What could not be read is `unsupported`.
+compares, per mapped table, the source's observed column shape and a sample cardinality (within
+the object's `root_where`) with the fixture's. Source reads are catalog queries plus one profile
+statement per mapped column, counted against a stated cap on the adapter's own statement counter;
+nothing here writes. What could not be read is `unsupported`.
 
     check = {status: pass|fail|unsupported, findings: [...], tables: {root_table: {...}},
              source_statements: n}
@@ -65,10 +66,37 @@ def _compare_shape(table: str, mapped: list[str], src: dict, fix: dict) -> list[
     return out
 
 
-def _compare_cardinality(table: str, columns: list[str], source, fixture) -> list[dict]:
-    out, s_rows, f_rows = [], None, None
+class _Budget:
+    """The source statement cap, enforced at the source-read boundary on the adapter's own
+    counter: a read is issued only when one more statement fits, and the counter is re-read
+    after it so an adapter that spends more than one statement stops the reads too."""
+
+    def __init__(self, source, cap: int | None):
+        self.source, self.cap, self.start = source, cap, source.statements
+
+    @property
+    def used(self) -> int:
+        return self.source.statements - self.start
+
+    def fits(self, n: int = 1) -> bool:
+        return self.cap is None or self.used + n <= self.cap
+
+    def reason(self) -> str:
+        return f"source statement cap {self.cap} reached after {self.used} statements"
+
+
+def _compare_cardinality(table: str, columns: list[str], where: str | None, source, fixture,
+                         budget: _Budget) -> tuple[list[dict], str | None]:
+    """Findings, and the reason cardinality stopped short of the cap (None when every column
+    was profiled)."""
+    out = []
     for col in columns:
-        s, f = source.field_aggregates(table, col), fixture.field_aggregates(table, col)
+        if not budget.fits():
+            return out, budget.reason()
+        s = source.column_profile(table, col, where)
+        if not budget.fits(0):
+            return out, budget.reason() + f" (profiling {col} overspent it)"
+        f = fixture.column_profile(table, col, where)
         s_rows, f_rows = int(s["count"]), int(f["count"])
         if f_rows == 0:
             out.append(_find(table, "empty_fixture", f"source {s_rows} rows, fixture 0 rows"))
@@ -81,67 +109,67 @@ def _compare_cardinality(table: str, columns: list[str], source, fixture) -> lis
         if (s_null == 0.0) != (f_null == 0.0) or (s_null == 1.0) != (f_null == 1.0):
             out.append(_find(table, "null_profile",
                              f"source null rate {s_null:.1f}, fixture null rate {f_null:.1f}", col))
-    return out
+    return out, None
 
 
 def compare_fixture(spec: MappingSpec, source, fixture,
                     source_statement_cap: int | None = None) -> dict:
-    """Shapes first for every table (one source read each), then cardinality table by table
-    until the source cap is reached; tables past the cap are `unsupported`, never clean."""
+    """Shapes first for every table (one source read each), then cardinality table by table,
+    scoped by the object's `root_where`, until the source cap is reached; a table whose shape
+    could not be read on either side, or that lies past the cap, is `unsupported`, never clean."""
     if source_statement_cap is not None and source_statement_cap < len(spec.objects):
         raise ConfigError(f"source statement cap {source_statement_cap} is below the "
                           f"{len(spec.objects)} catalog reads the shapes need")
-    start = source.statements
+    budget = _Budget(source, source_statement_cap)
     findings: list[dict] = []
     tables: dict[str, dict] = {}
-    plans: dict[str, tuple[list[str], dict | None]] = {}
+    plans: dict[str, list[str] | None] = {}
     for obj in spec.objects:
         table = obj.root_table
         mapped = list(dict.fromkeys(f.source.lower() for f in obj.fields))
         row = {"status": "pass", "shape": "checked", "cardinality": "checked"}
         tables[table] = row
+        plans[table] = None
         fix = _shape(fixture, table)
         if isinstance(fix, str) and fix.startswith("no "):
             findings.append(_find(table, "table_missing", f"fixture has no {table}"))
             row.update(status="fail", shape="unsupported", cardinality="unsupported",
                        reason=f"fixture has no {table}")
-            plans[table] = (mapped, None)
             continue
         src = _shape(source, table)
         if isinstance(src, str) or isinstance(fix, str):
             reason = src if isinstance(src, str) else fix
-            row.update(status="unsupported", shape="unsupported",
+            row.update(status="unsupported", shape="unsupported", cardinality="unsupported",
                        reason=("source " if isinstance(src, str) else "fixture ") + reason)
-        else:
-            found = _compare_shape(table, mapped, src, fix)
-            findings.extend(found)
-            if found:
-                row["status"] = "fail"
-            # a column the fixture lacks is already a finding; aggregating it would only error
-            mapped = [c for c in mapped if c in fix]
-        plans[table] = (mapped, row)
-    for obj in spec.objects:
-        table = obj.root_table
-        mapped, row = plans[table]
-        if row is None:
             continue
-        used = source.statements - start
-        if source_statement_cap is not None and used + len(mapped) > source_statement_cap:
-            row["cardinality"] = "unsupported"
-            row.setdefault("reason", f"source statement cap {source_statement_cap} reached "
-                                     f"after {used} statements")
-            if row["status"] == "pass":
-                row["status"] = "unsupported"
-            continue
-        found = _compare_cardinality(table, mapped, source, fixture)
+        found = _compare_shape(table, mapped, src, fix)
         findings.extend(found)
         if found:
             row["status"] = "fail"
+        # a column the fixture lacks is already a finding; aggregating it would only error
+        plans[table] = [c for c in mapped if c in fix]
+    for obj in spec.objects:
+        table = obj.root_table
+        mapped, row = plans[table], tables[table]
+        if mapped is None:
+            continue
+        if not budget.fits(len(mapped)):
+            short = budget.reason()
+        else:
+            found, short = _compare_cardinality(table, mapped, obj.root_where, source, fixture, budget)
+            findings.extend(found)
+            if found:
+                row["status"] = "fail"
+        if short:
+            row["cardinality"] = "unsupported"
+            row.setdefault("reason", short)
+            if row["status"] == "pass":
+                row["status"] = "unsupported"
     statuses = {r["status"] for r in tables.values()}
     status = ("fail" if findings or "fail" in statuses
               else "unsupported" if "unsupported" in statuses else "pass")
     return {"status": status, "findings": findings, "tables": tables,
-            "source_statements": source.statements - start}
+            "source_statements": budget.used}
 
 
 def load_check(data: object, where: str) -> dict:

@@ -116,12 +116,14 @@ provenance warning and the run is not merge-eligible.
   --source-dsn-secret <NAME> --fixture-dsn-secret <NAME> --source-statement-cap <n> --out <dir>`
   compares the fixture copy with the real source per mapped table: column names, types (after
   the rerun proof's normalisation), nullability, and a sample cardinality (distinct count and
-  null rate per mapped column), not just that the table exists. `fixture_shape.json` carries
+  null rate per mapped column, within the object's `root_where`), not just that the table exists.
+  `fixture_shape.json` carries
   `{status: pass|fail|unsupported, findings: [{table, check, column?, detail}], tables,
   source_statements}`; checks are `table_missing`, `column_missing`, `column_extra`,
   `type_mismatch`, `nullable_mismatch`, `empty_fixture`, `cardinality_collapsed`,
-  `null_profile`. Source reads are catalog queries plus one aggregate per column, read-only and
-  counted against the cap: shapes first, then cardinality until the cap, and a table past it is
+  `null_profile`. Source reads are catalog queries plus one profile statement per column,
+  read-only and counted against the cap on the adapter's statement counter: shapes first, then
+  cardinality until the cap; a table past it, or whose shape either side could not read, is
   `unsupported` with the reason, never clean. The wave 0 manifest declares it as a `custom`
   gate with this file as evidence; a `fail` is a listed finding the child reports as `failed`,
   so wave 0 does not close and wave 1 is not launched on an unproven fixture.
