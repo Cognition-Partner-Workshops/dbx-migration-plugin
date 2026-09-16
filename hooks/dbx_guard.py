@@ -1141,18 +1141,19 @@ def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     for family, (prefixes, pattern) in _CLOUD_FAMILY.items():
         declared = [name for name in cfg.fixture_endpoints if any(name.startswith(prefix) for prefix in prefixes)]
         match = pattern.search(text)
-        command_values = dict(a.split("=", 1) for a in seg.assigns if _ASSIGN.match(a))
+        command_values: dict[str, str] = {}
+        for assignment in seg.assigns:
+            if _ASSIGN.match(assignment):
+                name, value = assignment.split("=", 1)
+                lookup = {**os.environ, **seg.env, **command_values}
+                command_values[name] = _SHELL_VAR.sub(
+                    lambda m: lookup.get(m.group(1) or m.group(2), m.group()), value)
         effective = {**os.environ, **seg.env, **command_values}
-        lookup = {**effective}
         for name in declared:
-            if name in effective:
-                value = effective[name]
-                for _ in range(len(lookup) + 1):
-                    resolved = _SHELL_VAR.sub(lambda m: lookup.get(m.group(1) or m.group(2), m.group()), value)
-                    if resolved == value:
-                        break
-                    value = resolved
-                effective[name] = value
+            if name in seg.env and name not in command_values:
+                lookup = {**os.environ, **{k: v for k, v in seg.env.items() if k != name}}
+                effective[name] = _SHELL_VAR.sub(
+                    lambda m: lookup.get(m.group(1) or m.group(2), m.group()), seg.env[name])
         missing = [name for name in declared if not effective.get(name)]
         unresolved = [name for name in declared if (name in command_values or name in seg.env)
                       and effective.get(name) and ("$" in effective[name] or "`" in effective[name])]
