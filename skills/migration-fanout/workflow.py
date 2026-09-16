@@ -1073,8 +1073,10 @@ PREDICATE_WORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "t
 
 def bounded_predicate(where):
     """Whether a target_where can bound the rows recon reads: it tokenizes under the harness's predicate
-    grammar and every top-level OR branch compares a target column. `1 = 1`, TRUE, a literal-only or
-    parameter-only comparison, or `col = x OR 1 = 1` selects the whole table and is no bound."""
+    grammar and parses the AND/OR/NOT/parenthesis structure. A comparison bounds when it names a target
+    column; an OR bounds only when every branch does, an AND when any operand does, at every depth, so
+    `1 = 1`, TRUE, a literal-only or parameter-only comparison, `col = x OR 1 = 1` and
+    `(col = x OR 1 = 1)` select the whole table and are no bound. Anything unparsable is no bound."""
     if not isinstance(where, str):
         return False
     tokens, pos = [], 0
@@ -1085,13 +1087,9 @@ def bounded_predicate(where):
         if m.lastgroup:
             tokens.append((m.lastgroup, m.group()))
         pos = m.end()
-    branches, depth = [[]], 0
-    for kind, text in tokens:
-        depth += (text == "(") - (text == ")")
-        if depth == 0 and kind == "word" and text.lower() == "or":
-            branches.append([])
-        else:
-            branches[-1].append((kind, text))
+
+    def keyword(i, *words):
+        return i < len(tokens) and tokens[i][0] == "word" and tokens[i][1].lower() in words
 
     def column(toks):
         return any(k == "word" and t.lower() not in PREDICATE_WORDS
@@ -1102,7 +1100,44 @@ def bounded_predicate(where):
         return any((k == "punct" and t not in "(),") or (k == "word" and t.lower() in ("is", "like", "in", "between"))
                    for k, t in toks)
 
-    return bool(tokens) and all(b and column(b) and compares(b) for b in branches)
+    def expr(i):  # -> (bounded, next index); raises ValueError on a malformed predicate
+        bounded, i = term(i)
+        while keyword(i, "or"):
+            b, i = term(i + 1)
+            bounded = bounded and b
+        return bounded, i
+
+    def term(i):
+        bounded, i = factor(i)
+        while keyword(i, "and"):
+            b, i = factor(i + 1)
+            bounded = bounded or b
+        return bounded, i
+
+    def factor(i):
+        if keyword(i, "not"):
+            return factor(i + 1)
+        if i < len(tokens) and tokens[i] == ("punct", "("):
+            bounded, i = expr(i + 1)
+            if i >= len(tokens) or tokens[i] != ("punct", ")"):
+                raise ValueError
+            return bounded, i + 1
+        start, depth = i, 0
+        while i < len(tokens) and not (depth == 0 and (keyword(i, "and", "or") or tokens[i] == ("punct", ")"))):
+            depth += (tokens[i] == ("punct", "(")) - (tokens[i] == ("punct", ")"))
+            if depth < 0:
+                raise ValueError
+            i += 1
+        atom = tokens[start:i]
+        if not atom or depth:
+            raise ValueError
+        return column(atom) and compares(atom), i
+
+    try:
+        bounded, end = expr(0)
+    except ValueError:
+        return False
+    return bounded and end == len(tokens)
 
 
 def bounded_readers(spec, table):

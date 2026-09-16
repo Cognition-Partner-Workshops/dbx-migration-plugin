@@ -220,7 +220,11 @@ def test_bare_mapping_object_reads_the_qualified_target_but_schemas_stay_distinc
 
 @pytest.mark.parametrize("where", ["1 = 1", "1=1", "'a' = 'a'", "TRUE", "NOT (1 = 2)", "${as_of} = ${as_of}",
                                    "DATE '2024-01-01' < DATE '2024-01-02'", "run_date = '${as_of}' OR 1 = 1",
-                                   "1 = 1 or (run_date = '${as_of}')", "x", "run_date = ; drop"])
+                                   "1 = 1 or (run_date = '${as_of}')", "x", "run_date = ; drop",
+                                   "(run_date = '${as_of}' OR 1 = 1)", "((run_date = '${as_of}') OR (1 = 1))",
+                                   "(unit_id = 'u1' OR 1 = 1) AND (1 = 1)", "NOT (run_date = '${as_of}' OR 1 = 1)",
+                                   "(unit_id = 'u1' AND 1 = 1) OR 1 = 1", "(run_date = '${as_of}'", "run_date = '${as_of}')",
+                                   "run_date = '${as_of}' OR", "AND run_date = '${as_of}'", "() OR run_date = '${as_of}'"])
 def test_target_where_that_names_no_target_column_is_not_a_bound(where):
     check = _functions()["check_write_targets"]
     spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
@@ -231,7 +235,9 @@ def test_target_where_that_names_no_target_column_is_not_a_bound(where):
 @pytest.mark.parametrize("where", ["run_date = '${as_of}'", "t.run_date = DATE '2024-01-01'", "batch_id IN (1, 2)",
                                    "unit_id = 'u1' AND 1 = 1", "(region = 'eu' OR region = 'us') AND run_id = ${run}",
                                    "[run date] = 1", '"Run"."Date" IS NOT NULL', "NOT deleted_at IS NULL",
-                                   "run_date BETWEEN '2024-01-01' AND '2024-01-31'"])
+                                   "run_date BETWEEN '2024-01-01' AND '2024-01-31'", "(run_date = '${as_of}' OR run_date IS NULL)",
+                                   "1 = 1 AND (region = 'eu' OR (region = 'us' AND 1 = 1))", "((run_date = '${as_of}'))",
+                                   "unit_id = 'u1' AND (region = 'eu' OR 1 = 1)"])
 def test_target_where_over_a_target_column_is_a_bound(where):
     check = _functions()["check_write_targets"]
     spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
