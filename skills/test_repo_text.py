@@ -10,6 +10,15 @@ def test_read_text_decodes_utf16_bom(tmp_path):
     assert read_text(path) == "legacy text"
 
 
+@pytest.mark.parametrize("encoding", ["utf-32-le", "utf-32-be"])
+def test_read_text_decodes_utf32_bom(tmp_path, encoding):
+    path = tmp_path / "utf32.txt"
+    path.write_bytes("legacy text".encode("utf-32"))
+    assert read_text(path) == "legacy text"
+    path.write_bytes(("\ufeff" + "legacy text").encode(encoding))
+    assert read_text(path) == "legacy text"
+
+
 def test_read_text_skips_nul_bytes(tmp_path):
     path = tmp_path / "binary.dat"
     path.write_bytes(b"header\x00payload")
