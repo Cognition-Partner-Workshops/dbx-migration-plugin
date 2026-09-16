@@ -5,6 +5,7 @@ Add a row to PROBES to pin a new shape. `xfail` marks rows the guard does not co
 (programs it cannot read into: JDBC, perl, make); the doctor's read-only-principal row owns them.
 """
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -167,7 +168,7 @@ FILES2 = {
     "fix.sh": "cat /etc/hosts\n",
     "q.sql": "SELECT 1;\n",
     "capture_baseline.py": "import boto3\ns3 = boto3.client(\"s3\")\nprint(s3.list_buckets())\n",
-    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n| D-11 | 2026-01-05 | legacy_write_authorized: approved modifiers TOP and STATISTICS |\n",
+    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n| D-11 | 2026-01-05 | legacy_write_authorized: approved modifiers TOP and STATISTICS |\n| D-12 | 2026-01-06 | legacy_write_authorized: approved DROP TABLE on dbo.orders and dbo.customers |\n",
     "d.patch": "--- a/.migration/allowed_targets.json\n+++ b/.migration/allowed_targets.json\n",
     "ok.patch": "--- a/notes.md\n+++ b/notes.md\n",
 }
@@ -705,6 +706,9 @@ PROBES2 = [
     ("R4 UPDATE STATISTICS modifier row does not authorize STATISTICS as object", "DBX_DECISION=D-11 sqlcmd -S tdprod.corp -Q 'UPDATE STATISTICS dbo.customers'", "block"),
     ("R4 UPDATE STATISTICS modifier captures dbo.orders", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'UPDATE STATISTICS dbo.orders'", "approve"),
     ("R4 DELETE TOP remains fail-closed without an object match", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'DELETE TOP (10) FROM dbo.orders'", "block"),
+    ("R5 multi-object DROP needs every object", "DBX_DECISION=D-7 psql -h tdprod.corp -c 'DROP TABLE dbo.orders, dbo.customers'", "block"),
+    ("R5 multi-object TRUNCATE needs every object", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'TRUNCATE TABLE dbo.orders, dbo.customers'", "block"),
+    ("R5 multi-object decision names every object", "DBX_DECISION=D-12 psql -h tdprod.corp -c 'DROP TABLE dbo.orders, dbo.customers'", "approve"),
     ("R4 decision runtime substitution unquoted", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE $(TABLE) SET x=1'", "block"),
     ("R4 decision runtime substitution quoted", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE \"$(TABLE)\" SET x=1'", "block"),
     ("R4 decision runtime substitution braced", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE ${TABLE} SET x=1'", "block"),
@@ -716,6 +720,7 @@ WARN_PROBES = [
     ("warn legacy remote redirect", "ssh tdprod.corp 'cat x 2>/tmp/e'", "block"),
     ("warn legacy remote in-place", "ssh tdprod.corp 'sed -i s/a/b/ x'", "block"),
     ("warn non-legacy violation", "databricks bundle deploy -t prod", "approve"),
+    ("warn identity violation", "databricks --profile admin tables list mig_cat s", "approve"),
 ]
 
 
@@ -872,6 +877,23 @@ def test_fixture_endpoint_environment_is_command_local(tmp_path: Path, command, 
     assert decision == expected
 
 
+@pytest.mark.parametrize("label,depth,inner,expected", [
+    ("five nested shells fail closed", 5, "aws s3 ls", "block"),
+    ("five nested shells with innermost fixture assignment recurse", 5,
+     "AWS_ENDPOINT_URL=http://localhost:9000 aws s3 ls", "approve"),
+    ("five nested shells with unreadable payload fail closed", 5, 'bash -c "$CMD"', "block"),
+])
+def test_fixture_shell_depth_limit_is_fail_closed(tmp_path: Path, label: str, depth: int, inner: str, expected: str):
+    command = inner
+    for _ in range(depth):
+        command = f"bash -c {shlex.quote(command)}"
+    ws = _make_tmp_ws(tmp_path, "fixture_depth_ws", {
+        **ALLOWLIST2, "run_mode": "fixture", "fixture_endpoints": ["AWS_ENDPOINT_URL"],
+    }, FILES2)
+    decision, reason = decide(command, ws)
+    assert decision == expected, f"{label}: {decision} ({reason})"
+
+
 @pytest.mark.parametrize("command,expected,needle", [
     ("DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", True, "D-7"),
     ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "DBX_DECISION=D-<id>"),
@@ -905,6 +927,8 @@ def test_warn_mode_probe_rows(label: str, command: str, expected: str, tmp_path_
     result = run_hook(command, ws)
     decision = "approve" if result.returncode == 0 else "block"
     assert decision == expected, f"{label}: {decision} ({result.stdout})"
+    if label == "warn identity violation":
+        assert "WARN (guard_mode=warn)" in result.stdout
 
 
 def test_warn_mode_remote_violation_is_legacy_marker(tmp_path_factory):

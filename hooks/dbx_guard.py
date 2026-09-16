@@ -133,6 +133,7 @@ _WRITE_OBJECT = re.compile(
     r"(?:TABLE|VIEW|INDEX|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
     r"ALTER\s+\w+|GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)"
 )
+_WRITE_OBJECT_NEXT = re.compile(r"\s*,\s*([\w.$\"\[\]`]+)")
 _AUTHORIZED = "authorized: decision "
 _LEGACY_TAIL = " (legacy is read-only in every phase)"
 
@@ -830,10 +831,18 @@ def _non_reads(sql: str) -> list[str]:
     return bad
 
 
-def _write_objects(statements: list[str]) -> list[str]:
+def _write_objects(statements: list[str]) -> list[list[str]]:
     """The normalized object names matched by the write statements."""
-    return [re.sub(r'["`\[\]]', "", match.group(1))
-            for statement in statements if (match := _WRITE_OBJECT.match(statement))]
+    objects = []
+    for statement in statements:
+        match = _WRITE_OBJECT.match(statement)
+        names = [re.sub(r'["`\[\]]', "", match.group(1))] if match else []
+        while match:
+            match = _WRITE_OBJECT_NEXT.match(statement, match.end())
+            if match:
+                names.append(re.sub(r'["`\[\]]', "", match.group(1)))
+        objects.append(names)
+    return objects
 
 
 def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None, str | None]:
@@ -854,15 +863,17 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
     if "legacy_write_authorized" not in row.lower():
         return decision_id, f"row `{decision_id}` does not contain `legacy_write_authorized`"
     objects = _write_objects(statements)
-    if len(objects) != len(statements):
+    if len(objects) != len(statements) or any(not names for names in objects):
         statement = next(statement for statement in statements if not _WRITE_OBJECT.match(statement))
         return decision_id, f"cannot tell which object `{statement[:60]}` writes"
-    for obj, statement in zip(objects, statements):
-        if obj.startswith("$") or obj.endswith("$") or re.search(r"[$:&@]\{?\(", statement):
-            return decision_id, f"`{obj}` is a run-time substitution; the decision must name the literal object"
-    for obj in objects:
-        if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", row, re.IGNORECASE):
-            return decision_id, f"row `{decision_id}` does not name `{obj}`"
+    for names, statement in zip(objects, statements):
+        for obj in names:
+            if obj.startswith("$") or obj.endswith("$") or re.search(r"[$:&@]\{?\(", statement):
+                return decision_id, f"`{obj}` is a run-time substitution; the decision must name the literal object"
+    for names in objects:
+        for obj in names:
+            if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", row, re.IGNORECASE):
+                return decision_id, f"row `{decision_id}` does not name `{obj}`"
     return decision_id, None
 
 
@@ -955,7 +966,8 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
             base == "bcp" and "in" in seg.argv[1:4])
         did, missing = _decision(seg, non_reads, root) if plain else (None, "the statement is not a readable SQL write")
         if missing is None:
-            violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {', '.join(_write_objects(non_reads))} "
+            objects = [obj for names in _write_objects(non_reads) for obj in names]
+            violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {', '.join(objects)} "
                               "(legacy_write_authorized row in .migration/06_decisions.md)")
         else:
             violations.append(_Legacy(f"{violation}; a recorded decision would allow it, but {missing}{tail}"))
@@ -1148,17 +1160,17 @@ def _check_identity(segs: list[_Seg], cfg: GuardConfig | None = None) -> list[st
         names = [a.split("=", 1)[0] for a in s.assigns] + ([w.split("=", 1)[0] for w in s.argv[1:] if not w.startswith("-")] if persistent else [])
         for n in names:
             if n.lower() in trusted:
-                violations.append(_Legacy(f"`{n}` is a name the allowlist trusts (target_hosts / legacy_sources); "
-                                          f"{'unsetting' if s.argv0 == 'unset' else 'assigning'} it would make that name stand for a different "
-                                          "endpoint" + tail))
+                violations.append(f"`{n}` is a name the allowlist trusts (target_hosts / legacy_sources); "
+                                  f"{'unsetting' if s.argv0 == 'unset' else 'assigning'} it would make that name stand for a different "
+                                  "endpoint" + tail)
             elif _IDENTITY_VAR.match(n) and (client or persistent):
-                violations.append(_Legacy(f"identity swap: `{n}=` {'around `' + s.argv0 + '`' if client else 'changed for the session'}" + tail))
+                violations.append(f"identity swap: `{n}=` {'around `' + s.argv0 + '`' if client else 'changed for the session'}" + tail)
             elif n in _CONFIG_HOME_VAR and client:
-                violations.append(_Legacy(f"identity swap: `{n}=` moves the Databricks config lookup around `{s.argv0}`" + tail))
+                violations.append(f"identity swap: `{n}=` moves the Databricks config lookup around `{s.argv0}`" + tail)
         if client and s.argv0 != "spark-sql":
             flags = [w for w in s.argv[1:] if w in ("--profile", "-p", "--host") or w.startswith(("--profile=", "--host="))]
             if flags or s.argv[1:3] == ["auth", "login"] or s.argv[1:2] == ["configure"]:
-                violations.append(_Legacy(f"identity swap through `{s.argv0} {' '.join(flags or s.argv[1:3])}`" + tail))
+                violations.append(f"identity swap through `{s.argv0} {' '.join(flags or s.argv[1:3])}`" + tail)
     return violations
 
 
