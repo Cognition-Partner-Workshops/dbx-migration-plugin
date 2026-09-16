@@ -56,8 +56,6 @@ def render_progress(mig: Path) -> str:
     for path in sorted(waves.glob("*.result.json")):
         try:
             result = json.loads(path.read_text())
-        except OSError:
-            raise
         except ValueError:
             raise ValueError(f"{path}: not a JSON object") from None
         if not isinstance(result, dict):
