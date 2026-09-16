@@ -82,7 +82,7 @@ def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source,
                seed: int, depth: str, mode: str, ops: list[dict] | None, run_source, run_target,
                ctx) -> list:
     if mode == "structural":
-        return [tier0_structural_parity(spec, tol, source, target)]
+        return [tier0_structural_parity(spec, tol, source, target, catalog_only=True)]
     tiers = [tier1_counts(spec, source, target, ctx=ctx)]
     if tiers[0].passed:
         # Tier 1 failures are load defects or mapping-spec violations; nothing else runs.

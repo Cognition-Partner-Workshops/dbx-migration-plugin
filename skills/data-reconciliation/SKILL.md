@@ -84,7 +84,8 @@ provenance warning and the run is not merge-eligible.
   scoped to the window that held and the target's applied CDC watermark; the summary names the
   isolation each side actually ran under.
 - `structural`: Tier 0 `structural_parity` only, both catalogs read and no row read on either
-  side. The independent verifier's run on a wave the manifest declares `degraded`; never merge
+  side — the identity frontier-vs-rows collision check needs source MIN/MAX, so it is not checked
+  here (`source_bounds` reports `unread`). The independent verifier's run on a wave the manifest declares `degraded`; never merge
   evidence: a clean run's `merge_block_reasons` is exactly `["mode"]` (no rerun proof applies, no
   row tier ran), and `estimate` counts only Tier 0's catalog statements per adapter
   (`CATALOG_STATEMENTS`), so `--family` is required in structural mode.

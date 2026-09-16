@@ -243,6 +243,52 @@ def test_structural_mode_runs_tier0_only_and_reads_no_source_rows():
     assert run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, bad)["verdict"] == "FAIL"
 
 
+def test_structural_mode_never_reads_identity_row_bounds():
+    """A degraded wave's structural run is catalog-only: the identity frontier-vs-rows collision
+    check needs source MIN/MAX, so `--mode structural` must not issue that row read at all."""
+    from recon.transactional import schema_parity
+    loans, borrowers = _rows(12)
+    kw = dict(schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+              sequences={("dbo.loans", "loan_id"): 13})
+    target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                        schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS},
+                        sequences={("loans", "loan_id"): 13})
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers}, **kw)
+    source.fail_on["field_aggregates"] = AssertionError("row read in structural mode")
+    result = run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, target)
+    assert [t["name"] for t in result["tiers"]] == ["structural_parity"]
+    assert result["merge_block_reasons"] == ["mode"]
+    assert source.calls["field_aggregates"] == 0
+
+    # the live tier-0 run still reads the bounds — catalog_only is a flag, not a removal
+    live_src = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers}, **kw)
+    t0 = schema_parity(0, "structural_parity", _spec(), Tolerances("t1"), live_src, target,
+                       strict=False)
+    assert live_src.calls["field_aggregates"] > 0
+
+
+def test_catalog_only_identity_note_marks_the_bounds_unread():
+    """catalog_only still runs the catalog-backed identity checks but reports the skipped row
+    read, and cannot raise the collision finding the bounds would carry."""
+    from recon.transactional import schema_parity
+    loans, borrowers = _rows(12)
+    # source identity next (7) is already past the target's (10): only the row-backed source
+    # max (12) would collide — the catalog-visible checks alone see nothing wrong
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 7})
+    target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                        schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS},
+                        sequences={("loans", "loan_id"): 10})
+    t0 = schema_parity(0, "structural_parity", _spec(), Tolerances("t1"), source, target,
+                       strict=False, catalog_only=True)
+    assert "sequence_behind_source" not in {f.check for f in t0.findings}
+    assert t0.stats["loans"]["identity"]["source_bounds"] == "unread"
+    live = schema_parity(0, "structural_parity", _spec(), Tolerances("t1"), source, target,
+                         strict=False)
+    assert "sequence_behind_source" in {f.check for f in live.findings}
+
+
 def test_structural_estimate_counts_each_adapters_catalog_reads():
     """`estimate --mode structural` describes the run it names: Tier 0's catalog statements per
     object and side from the adapters' own CATALOG_STATEMENTS (schema_facts per object,
