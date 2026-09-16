@@ -1563,7 +1563,7 @@ class _PostgresBase(_SqlAdapterBase):
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             f"WHERE n.nspname = %s AND c.relname = %s {kind}AND a.attnum > 0 AND NOT a.attisdropped "
             "ORDER BY a.attnum", (schema, name))
-        return [{"name": str(col).lower(), "type": normalize_type(dtype), "nullable": not notnull}
+        return [{"name": str(col), "type": normalize_type(dtype), "nullable": not notnull}
                 for col, dtype, notnull, _ in rows]
 
     def open_window(self) -> str:
