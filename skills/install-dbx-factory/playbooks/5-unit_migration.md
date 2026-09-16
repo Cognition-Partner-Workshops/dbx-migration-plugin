@@ -4,6 +4,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 
 ### Before conversion
 - [ ] Read the complete hand-off: units, profiles, dictionary, dependencies, targets, branch, gate, tolerances, and `.migration/` path.
+- [ ] Read the dialect skill's `SKILL.md` and `references/contract.md` fan-out guards before the first unit.
 - [ ] Run `factory-doctor --role child` with the capability contract, every unit, source secret/parameters, and hook probe; report BLOCKED on any failed check.
 - [ ] Confirm every write target is declared; never edit `.migration/` outside `.migration/recon/<unit_id>/`, `allowed_targets.json`, or the ledger.
 - [ ] Never edit `05_progress.md`; it is generated from wave results, and report every changed path in `result.json`.
@@ -15,6 +16,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 
 ### Reconcile
 - [ ] Run `dbx-recon` fixture-first with declared endpoints and fail closed when endpoints are missing; use one batched check window.
+- [ ] Fixture-first: develop against the fixture copy; read the real source once inside the legacy-query cap.
 - [ ] Check counts, aggregates, keyed diffs, report output, declared source volumes, populations, and idempotency evidence.
 - [ ] Launch heavy backfills/recon as jobs, record run IDs, and never babysit polling in-session.
 - [ ] On FAIL, capture evidence, fix converted code only, rerun only the failed check, and stop after three full runs.

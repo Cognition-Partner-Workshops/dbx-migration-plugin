@@ -10,6 +10,11 @@ Playbook: Independently verify one completed wave and publish its evidence for w
 7. Write a machine-readable report with mode, snapshot, populations, commands, counts, checksums, samples, failures, cap/cost, evidence paths, and finding codes. A result is PASS, FAIL, or DEGRADED with an explicit unverified-path register.
 8. Hand the report, PR list, and exceptions to the orchestrator for wave close; the orchestrator owns notification and merge decisions.
 
+## DEGRADED mode
+DEGRADED recon rules apply here: every comparison baseline has a snapshot manifest with source, extraction time, and row counts.
+Reports carry sample-coverage statistics and state that sample parity does not extrapolate to production distributions.
+Every DEGRADED report names the mode in its header and never borrows LIVE wording; a customer-run in-perimeter recon with the delivered harness is an entry criterion for STOP E.
+
 ## Specifications
 - Deliverable: independent wave report plus `dbx-recon` JSON and evidence ledger.
 - Validation: source and target are read-only to the verifier, checks are rerunnable, and a fresh session can reproduce the verdict.
