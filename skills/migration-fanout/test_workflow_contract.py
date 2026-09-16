@@ -1057,3 +1057,23 @@ def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tm
     assert proc.returncode != 0 and "doctor" in proc.stderr
     proc = run(tmp_path / "stopc", stop_c=False)
     assert proc.returncode != 0 and "gates_sha" in proc.stderr
+
+
+def test_the_playbooks_produce_the_pipeline_check_inputs_the_workflow_needs():
+    """The launch halts on what the planner and orchestrator omit, so the two playbooks that write the
+    manifest and the pointer must name `lakeflow_pipelines`/`serialized_pipelines` and `plugin`; and a
+    manifest shaped as 4-migration_plan.md says (every batch declares, `[]` when it updates none) is clean."""
+    playbooks = PLUGIN / "skills" / "install-dbx-factory" / "playbooks"
+    plan = (playbooks / "4-migration_plan.md").read_text()
+    assert "`lakeflow_pipelines`" in plan and "`serialized_pipelines`" in plan
+    orchestrator = (playbooks / "9-orchestrator.md").read_text()
+    assert "`plugin`" in orchestrator and "current.json" in orchestrator
+
+
+def test_a_pointer_with_the_plugin_root_and_declared_pipelines_launches(tmp_path):
+    ws, cwd = _workspace(tmp_path, recon={"u": True, "v": True}, manifest_name="wave-1.json", wave=1, width=2,
+                         lakeflow_pipelines=("p",), extra_batches=[_second_batch([])])
+    proc, calls = _run(cwd, tmp_path, [_pass_report(""), _pass_report("")])
+    assert proc.returncode == 0, proc.stderr
+    assert sorted(c["label"] for c in calls if c["kind"] == "agent") == ["b-1", "b-2"]
+    assert json.loads((ws / ".migration/waves/wave-1.result.json").read_text())["pipeline_order"] == {}
