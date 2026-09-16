@@ -119,7 +119,7 @@ It is the default recon and coexistence bridge whenever a JDBC path exists.
 Prefer the connector row when the engine has one and its D10 prerequisites close in time; build it via `target-routing` -> `databricks-lakeflow-connect`, destination the batch's isolated schema in the migration catalog, schedule PAUSED until STOP E, and count query-based polling against the legacy-query cap.
 The output is a machine-readable table of object, class, method, partition key, watermark rule, verification rule, and projected legacy-side cost, attached to the plan and each unit handoff.
 - Checkpoint each partition in a load ledger with id, row count, and aggregate checksum; resume from it, and drop and recopy any unverified partial partition.
-- Verify each partition with this harness's aggregate check.
+- Verify each partition against the source at copy time with this harness's aggregate check.
 - Share partition-copy parallelism with the legacy-query cap used by recon.
 - Run loads as checkpointed Databricks jobs: launch, record the run id in the ledger, verify later, and never poll in-session.
 - Customer DBA/platform owns CT/CDC enablement, connector DB user, and gateway path as D10 entries; never run `ALTER DATABASE` or `sp_cdc_enable_table`, and fall back to the hand-rolled row if prerequisites are open at wave launch.
