@@ -1491,6 +1491,33 @@ def test_dictionary_readable_probes_per_table_ddl_for_databricks(monkeypatch):
     assert c.status == "ok" and "trigger_census" not in {
         k for k, v in c.data.items() if v}
     assert any("SHOW CREATE TABLE cat.s.loans" in q for q in conn.statements)
+    assert any("{catalog}.information_schema" not in q and "cat.information_schema" in q
+               for q in conn.statements)
+
+
+def test_dictionary_readable_probes_each_catalog_once_for_databricks(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["a.s.loans", "a.s.fees", "b.s.loans"],
+                                         "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "ok"
+    cat_scoped = [q for q in conn.statements if "information_schema" in q]
+    per_catalog = [q for q in cat_scoped if ".information_schema" in q]
+    assert per_catalog and all(q.startswith("SELECT 1") for q in per_catalog)
+    assert sum("a.information_schema" in q for q in per_catalog) == 7
+    assert sum("b.information_schema" in q for q in per_catalog) == 7
+    assert sum("SHOW CREATE TABLE" in q for q in conn.statements) == 3
+
+
+def test_dictionary_readable_fails_on_a_two_part_databricks_table(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "s.loans" in c.detail and "catalog.schema.table" in c.detail
 
 
 def test_dictionary_readable_registers_a_databricks_connector():

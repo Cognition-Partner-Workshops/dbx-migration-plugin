@@ -1294,9 +1294,19 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
             for label, sql in views:
                 probes = [(None, sql)]
                 if "{" in sql:
-                    probes = [(t, sql.format(catalog=p_[0], schema=p_[1], table=p_[2]))
-                              for t in tables
-                              if len(p_ := t.replace("`", "").split(".")) == 3]
+                    parts = {}
+                    for t in tables:
+                        p_ = t.replace("`", "").split(".")
+                        if len(p_) != 3:
+                            return Check(cid, "fail", f"{t} is not catalog.schema.table; cannot "
+                                         "scope the dictionary probe", data)
+                        parts[t] = p_
+                    if "{schema}" in sql or "{table}" in sql:
+                        probes = [(t, sql.format(catalog=p_[0], schema=p_[1], table=p_[2]))
+                                  for t, p_ in parts.items()]
+                    else:  # {catalog} only: information_schema is catalog-scoped, probe per catalog
+                        probes = [(None, sql.format(catalog=c)) for c in
+                                  sorted({p_[0] for p_ in parts.values()})]
                 for table, probe in probes:
                     try:
                         cur.execute(probe).fetchall()
