@@ -508,7 +508,7 @@ def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_repo
 DOCTOR = {"schema": "dbx-migration-factory/capabilities/1", "ready": True,
           "identity": {"userName": "sp-1", "service_principal": True, "host": "https://adb-1.azuredatabricks.net"},
           "checks": [{"id": "allowed_targets", "status": "ok", "data": {"catalogs": ["mig"], "guard_mode": "block"}},
-                     {"id": "stop_mode", "status": "ok", "data": {"stop_mode": "soft"}}]}
+                     {"id": "workspace", "status": "ok", "data": {"stop_mode": "soft"}}]}
 
 
 def test_validate_manifest_compares_the_contract_with_the_doctor_record():
