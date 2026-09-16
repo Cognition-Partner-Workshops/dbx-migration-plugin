@@ -170,6 +170,18 @@ def test_render_progress_rejects_non_list_result_batches(tmp_path):
         render_progress(mig)
 
 
+def test_result_without_batches_raises(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "closed": True,
+        "manifest_sha": "x",
+    })
+
+    with pytest.raises(ValueError, match=r"wave-1\.result\.json: result batches is not a list"):
+        render_progress(mig)
+
+
 def test_render_progress_sorts_rows_and_lists_wave_status(tmp_path):
     mig = tmp_path / ".migration"
     _write_result(mig, "wave-2.result.json", {

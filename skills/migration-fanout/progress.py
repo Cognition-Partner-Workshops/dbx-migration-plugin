@@ -84,7 +84,7 @@ def render_progress(mig: Path) -> str:
     rows = []
     for result, path in results:
         wave = _wave(result, path)
-        if "batches" in result and not isinstance(result["batches"], list):
+        if not isinstance(result.get("batches"), list):
             raise ValueError(f"{path}: result batches is not a list")
         verify = result.get("verify")
         if verify is not None and not isinstance(verify, dict):
@@ -96,7 +96,7 @@ def render_progress(mig: Path) -> str:
         if merged_prs is not None and not isinstance(merged_prs, list):
             raise ValueError(f"{path}: verify merged_prs is not a list")
         manifest_units = None
-        for batch in result.get("batches", []):
+        for batch in result["batches"]:
             if not isinstance(batch, dict):
                 raise ValueError(f"{path}: result batch is not an object")
             batch_id = batch.get("id")
