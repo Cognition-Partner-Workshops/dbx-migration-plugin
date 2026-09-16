@@ -1383,6 +1383,28 @@ def test_a_merged_pr_the_base_since_reverted_is_not_a_merge(tmp_path):
     assert result["close"]["unmerged"][0]["reason"] == "reverted on origin/migration/x after the merge"
 
 
+def test_a_later_edit_beside_a_merged_change_keeps_it_merged(tmp_path):
+    """Another PR merged after this one edits the same file without undoing this PR's lines: the change is
+    still on the base tip, so the PR is merged and the wave closes (whole-file equality is not the test)."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    (ws / "x.sql").write_text("select 1\n")
+    subprocess.run(["git", "-C", str(ws), "add", "x.sql"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "x"], check=True)
+    pr = _push_pr(ws)
+    git = ["git", "-C", str(ws)]
+    (ws / "x.sql").write_text("select 1\nselect 2\n")
+    subprocess.run(git + ["commit", "-qam", "another unit's edit"], check=True)
+    later = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["reset", "-q", "--hard", "HEAD~1"], check=True)
+    close = _close_report(merged_prs=[pr])
+    close["__run__"] = [git + ["push", "-q", "origin", "HEAD:refs/heads/migration/x"],
+                        git + ["push", "-q", "origin", f"{later}:refs/heads/migration/x"]]
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+
+
 def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
     """Resume replays the PASS gated at head A; the PR has since moved to B (B merged, A's verdict stands
     for nothing): the wave cannot close over a commit it never gated."""

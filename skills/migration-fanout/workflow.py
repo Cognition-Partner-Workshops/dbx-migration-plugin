@@ -1627,13 +1627,52 @@ def validate_close(close, to_merge) -> list[str]:
     return problems
 
 
+def _contains(lines, part):
+    return not part or any(lines[i:i + len(part)] == part for i in range(len(lines) - len(part) + 1))
+
+
+def _tip_file(tip, path):
+    r = subprocess.run(["git", "-C", str(ROOT), "show", f"{tip}:{path}"],
+                       check=False, capture_output=True, text=True, timeout=300)
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+def _patch_on_tip(patch, tip) -> bool:
+    """Whether the base tip still carries every hunk of this patch (a `git diff -U1` text): each hunk's result
+    (its added lines with one line of context) is still contiguous in the tip's file, and no hunk that removed
+    lines has its old text back. A later PR editing elsewhere in the same file passes; a revert, or an
+    overwrite of the patched lines, does not. Files the diff calls binary must be byte-equal at the tip."""
+    path, lines, hunks = None, [], []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            path = line.split(" b/", 1)[1]
+            lines = _tip_file(tip, path)
+        elif line.startswith("Binary files "):
+            same = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", tip, "--", path],
+                                  check=False, capture_output=True, timeout=300).returncode
+            if same != 0:
+                return False
+        elif line.startswith("@@"):
+            hunks.append((lines, [], [], False))
+        elif hunks and line[:1] in (" ", "+", "-") and not line.startswith(("+++", "---")):
+            file_lines, new, old, removed = hunks[-1]
+            if line[0] != "-":
+                new.append(line[1:])
+            if line[0] != "+":
+                old.append(line[1:])
+            if line[0] == "-":
+                hunks[-1] = (file_lines, new, old, True)
+    return all(_contains(file_lines, new) and not (removed and _contains(file_lines, old))
+               for file_lines, new, old, removed in hunks)
+
+
 def proven_merged(to_merge):
     """({proven pr_url}, {pr_url: reason}) — a merge counts only when the PR head still equals the gated
-    head (a commit appended after verification is not the verified tree) and origin's base tip carries the
-    head's tree for the PR's paths: a merged head stays an ancestor after a revert, and a squash/rebase merge
-    leaves only the tree, so the tip's content on those paths is the proof either way (a historical match
-    the base later reverted is not the verified code). Whatever the close step reported or failed to report
-    is reconciled against git."""
+    head (a commit appended after verification is not the verified tree) and origin's base tip still carries
+    the PR's patch: a merged head stays an ancestor after a revert, and a squash/rebase merge leaves only the
+    tree, so the patch reverse-applying to the tip is the proof either way (a later PR editing the same file
+    beside it is fine; a historical match the base later reverted is not the verified code). Whatever the
+    close step reported or failed to report is reconciled against git."""
     proven, reasons = set(), {}
     try:
         tip = _base_tip()
@@ -1655,22 +1694,19 @@ def proven_merged(to_merge):
                                     check=False, capture_output=True, timeout=300).returncode
             if merged not in (0, 1):
                 raise subprocess.SubprocessError(f"merge-base rc={merged}")
-            paths = _git_paths(f"{BASE_SHA if merged == 0 else tip}...{head}")
-            if not paths:
+            patch = subprocess.run(git + ["diff", "-U1", "--no-renames", f"{BASE_SHA if merged == 0 else tip}...{head}"],
+                                   check=True, capture_output=True, text=True, timeout=300).stdout
+            if not patch:
                 if merged == 0:
                     proven.add(url)
                 else:
                     reasons[url] = "PR diff is empty"
                 continue
-            same = subprocess.run(git + ["diff", "--quiet", tip, head, "--", *paths],
-                                  check=False, capture_output=True, timeout=300).returncode
-            if same == 0:
+            if _patch_on_tip(patch, tip):
                 proven.add(url)
-            elif same == 1:
+            else:
                 reasons[url] = (f"reverted on origin/{BASE_BRANCH} after the merge" if merged == 0
                                 else f"head not on origin/{BASE_BRANCH}")
-            else:
-                raise subprocess.SubprocessError(f"diff rc={same}")
         except (OSError, subprocess.SubprocessError) as e:
             reasons[url] = f"merge proof failed ({e})"
     return proven, reasons
