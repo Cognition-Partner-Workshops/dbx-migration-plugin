@@ -2805,6 +2805,9 @@ def test_validate_resync_rejects_writes_and_objects_outside_the_listed_units():
     assert any("changed src/x.sql" in p for p in validate_resync({**ok, "changed_paths": ["src/x.sql"]}))
     assert any("sequences" in p for p in validate_resync({**ok, "sequences": [{"object": "s"}]}))
     assert any("status" in p for p in validate_resync({**ok, "status": "done"}))
+    failed = {"status": "failed", "sequences": [], "changed_paths": [], "one_line_summary": "setval exited 1"}
+    assert any("resync command failed" in p for p in validate_resync(failed))
+    assert validate_resync({**ok, "sequences": []}) == []
 
 
 def test_child_prompt_carries_the_resync_report_only_to_the_children_it_reruns():

@@ -1631,6 +1631,8 @@ def validate_resync(out) -> list[str]:
     problems = []
     if out.get("status") not in ("ok", "failed"):
         problems.append(f"resync output invalid: status {out.get('status')!r}")
+    elif out["status"] == "failed":
+        problems.append(f"resync command failed: {out.get('one_line_summary')}")
     rows = out.get("sequences")
     if (not isinstance(rows, list)
             or not all(isinstance(r, dict) and {"object", "before", "after"} <= set(r) for r in rows)):
@@ -2037,6 +2039,10 @@ async def main():
         resync = {"command": RESYNC["command"], "units": RESYNC["units"], "report": report, "problems": problems}
         for problem in problems:
             log(f"WARNING: {problem}")
+        if problems:
+            auto_merge = False
+            log("HALT: identity resync did not complete cleanly: " + "; ".join(problems)
+                + ". Auto-merge is off for this wave; a human decides at wave close.")
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),

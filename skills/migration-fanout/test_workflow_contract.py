@@ -1180,26 +1180,41 @@ def test_a_manifest_resync_runs_once_after_the_children_and_before_the_verifier(
     assert f"Awaiting manual merge: {pr2}" in brief
 
 
-def test_a_resync_that_wrote_files_or_died_is_a_recorded_problem_not_a_halt(tmp_path):
-    ws, cwd = _two_batch_workspace(tmp_path)
+def test_a_resync_that_wrote_files_or_died_is_a_recorded_problem_that_turns_auto_merge_off(tmp_path):
+    verify = {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+              "findings": [], "changed_paths": []}
+    ws, cwd = _two_batch_workspace(tmp_path, auto_merge=True)
     pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
     proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _pass2(pr2), _resync_report(changed_paths=["load/x.sql"]),
-                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
-                                        "findings": [], "changed_paths": []}])
+                                       dict(verify)])
     assert proc.returncode == 0, proc.stderr
     result = _result(ws)
     assert any("load/x.sql" in p for p in result["resync"]["problems"])
     assert result["verify"]["wave_verdict"] == "PASS"
     assert "load/x.sql" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert result["auto_merge"] is False
+    assert not [c for c in calls if str(c.get("label", "")).startswith("close")]
 
-    ws, cwd = _two_batch_workspace(tmp_path / "dead")
+    ws, cwd = _two_batch_workspace(tmp_path / "dead", auto_merge=True)
     pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
-    proc, calls = _run(cwd, tmp_path / "dead", [_pass_report(pr), _pass2(pr2), {"error": "boom"},
-                                                {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
-                                                 "findings": [], "changed_paths": []}])
+    proc, calls = _run(cwd, tmp_path / "dead", [_pass_report(pr), _pass2(pr2), {"error": "boom"}, dict(verify)])
     assert proc.returncode == 0, proc.stderr
     result = _result(ws)
     assert result["resync"]["report"] is None and any("boom" in p for p in result["resync"]["problems"])
+    assert "boom" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert result["auto_merge"] is False
+    assert not [c for c in calls if str(c.get("label", "")).startswith("close")]
+
+    ws, cwd = _two_batch_workspace(tmp_path / "failed", auto_merge=True)
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    proc, calls = _run(cwd, tmp_path / "failed", [_pass_report(pr), _pass2(pr2),
+                                                  _resync_report(status="failed"), dict(verify)])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert any("resync command failed" in p for p in result["resync"]["problems"])
+    assert "resync command failed" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert result["auto_merge"] is False
+    assert not [c for c in calls if str(c.get("label", "")).startswith("close")]
 
 
 def test_a_resume_after_a_resync_reruns_only_identity_failures_and_unreported_children(tmp_path):
