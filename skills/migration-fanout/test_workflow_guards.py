@@ -135,6 +135,29 @@ def test_validate_manifest_rejects_max_minutes_over_sixty():
         validate_manifest(m)
 
 
+@pytest.mark.parametrize("value", [0, True, "3", 1441])
+def test_validate_manifest_rejects_invalid_doctor_max_age(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="doctor_max_age"):
+        validate_manifest(_manifest(doctor_max_age=value))
+
+
+def test_validate_manifest_accepts_doctor_max_age():
+    _functions()["validate_manifest"](_manifest(doctor_max_age=15))
+
+
+@pytest.mark.parametrize("value", [1, "true", {"x": 1}])
+def test_validate_manifest_rejects_non_bool_degraded(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="degraded"):
+        validate_manifest(_manifest(degraded=value))
+
+
+def test_validate_manifest_accepts_degraded_bool():
+    _functions()["validate_manifest"](_manifest(degraded=True))
+    _functions()["validate_manifest"](_manifest(degraded=False))
+
+
 @pytest.mark.parametrize("bad", ["a/b", 7, {"scope": "key"}])
 def test_validate_manifest_rejects_non_list_secrets(bad):
     validate_manifest = _functions()["validate_manifest"]
@@ -1585,6 +1608,23 @@ def test_verifier_prompt_carries_per_batch_depth_defaulting_to_sampled():
 def test_child_prompt_asks_for_recon_cost():
     ns = _prompt_ns(_manifest())
     assert "recon_cost" in ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+
+
+def test_capability_block_points_children_at_the_signed_wave_doctor_record():
+    text = _prompt_ns(_manifest())["capability_block"](["u"])
+    assert "--reuse-record .migration/waves/wave-0.doctor.json" in text
+    assert "15" in text
+    text = _prompt_ns(_manifest(doctor_max_age=30))["capability_block"](["u"])
+    assert "doctor_max_age" in text and "30" in text
+
+
+def test_a_degraded_wave_runs_only_the_structural_tier_in_verify():
+    text = _prompt_ns(_manifest(degraded=True))["verify_prompt"](
+        [{"batch": "b", "units": ["u"], "pr_url": ""}], True)
+    assert "structural_parity" in text and "Tier 0" in text and "structural_drift" in text
+    text = _prompt_ns(_manifest())["verify_prompt"](
+        [{"batch": "b", "units": ["u"], "pr_url": ""}], True)
+    assert "structural_parity" not in text
 
 
 def test_cost_line_compares_estimate_with_summed_actuals():

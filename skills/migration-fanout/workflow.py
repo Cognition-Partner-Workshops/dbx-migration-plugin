@@ -34,6 +34,10 @@ Manifest shape (written by the plan playbook, read here):
   "breaker_threshold": 3,
   "auto_merge": false,
   "max_minutes": 45,                          # per-child session budget; a batch may override it
+  "doctor_max_age": 15,                        # optional; minutes a child may reuse the wave's signed
+                                              # .doctor.json source-side rows for (at most 1440)
+  "degraded": false,                           # optional; a true wave is verified at the structural tier
+                                              # only (no live source read)
   "verify_depth": "sampled",                  # optional; verifier Tier 3 depth for the wave:
                                               # sampled (default) | full. Per-batch "verify_depth"
                                               # overrides it (plan sets full on D4/finance-critical).
@@ -427,6 +431,12 @@ def validate_manifest(m, doctor=None):
     if "max_minutes" in m and (isinstance(m["max_minutes"], bool) or not isinstance(m["max_minutes"], int)
                               or not 0 < m["max_minutes"] <= 60):
         raise SystemExit("manifest key 'max_minutes' must be a positive integer of at most 60 minutes")
+    if "doctor_max_age" in m and (isinstance(m["doctor_max_age"], bool)
+                                 or not isinstance(m["doctor_max_age"], int)
+                                 or not 0 < m["doctor_max_age"] <= 1440):
+        raise SystemExit("manifest key 'doctor_max_age' must be a positive integer of at most 1440 minutes")
+    if "degraded" in m and not isinstance(m["degraded"], bool):
+        raise SystemExit("manifest key 'degraded' must be a boolean")
     if "secrets" in m and (not isinstance(m["secrets"], list)
                            or not all(isinstance(s, str) for s in m["secrets"])):
         raise SystemExit("wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
@@ -1708,6 +1718,10 @@ def capability_block(units):
         "and verifies every unit's .migration/units/<unit_id>/mapping_spec.json itself), "
         f"--expect-host {shlex.quote(caps['host'])} (the workspace the contract pins; the same principal "
         "resolved against another workspace is a fail), "
+        f"--reuse-record .migration/waves/wave-{TAG}.doctor.json when that file is in the checkout "
+        "(the orchestrator's signed record; the doctor reuses its source-side rows only if the record "
+        f"is fresher than doctor_max_age minutes — {MANIFEST.get('doctor_max_age', 15)} here — bound to "
+        "this manifest and signed for this identity, otherwise it runs in full), "
         + (f"{source_flags} (the source the doctor checks for write access; the same secret your recon "
            "gate passes as --source-dsn-secret)" if source_flags else
            "--source-secret naming the secret your recon gate passes as --source-dsn-secret, and the "
@@ -1747,7 +1761,13 @@ def verify_prompt(passed, auto_merge):
         "merge_eligible is false, and cite the decision id in findings. "
         f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
         "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
-        "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. Each batch lists "
+        "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. "
+        + ("This wave is declared DEGRADED (no live source read): for every batch run Tier 0 "
+           "`structural_parity` of the data-reconciliation skill against the target (the structural "
+           "tier: keys, constraints, indexes, triggers, identity columns, grants) instead of repeating "
+           "the child's snapshot row parity, and mark a unit FAIL with finding structural_drift if it "
+           "fails; do not re-run Tier 1-3. " if MANIFEST.get("degraded") is True else "")
+        + "Each batch lists "
         "its acceptance gates with the evidence the child gave; open the evidence of every passed gate and FAIL "
         "the unit if it does not show what the gate's kind requires. "
         "Sum result.json['cost'] over your runs into recon_cost.\n"
