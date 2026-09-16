@@ -323,14 +323,49 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
     assert proc.returncode != 0 and "{batch, pr_url, gates}" in proc.stderr
     runs = ws / ".migration/waves/wave-0.runs.jsonl"
     assert [json.loads(l)["mode"] for l in runs.read_text().splitlines()] == ["reserve"]  # unmet gates: the run stays open
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    clean = {"review_clean": True, "review_head": _PR_HEADS[pr]}
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed], **clean}])
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
-    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == []
+    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == [] and out["batches"]["b-1"]["review_waiver"] is None
     assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
     assert [(json.loads(l)["stop_c"], json.loads(l)["mode"]) for l in runs.read_text().splitlines()] == [("D-2", "reserve"), ("D-2", "gates")]
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed], **clean}])
     assert proc.returncode != 0 and "closed" in proc.stderr and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_gates_subcommand_applies_the_review_clean_rule_at_the_pr_head(tmp_path):
+    """A hand-gathered small wave is held to the same review-clean rule as a workflow child: review_clean=true
+    for review_head equal to the PR head git fetches, or a human's review_waived row naming the units."""
+    ws, cwd = _workspace(tmp_path, doctor=False,
+                         decisions="| D-5 | user:U1 | review_waived for u, the finding is a false positive |\n")
+    results = tmp_path / "results.json"
+    assert _workflow(cwd, "reserve").returncode == 0
+    pr = _push_pr(ws)
+    passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
+
+    def run(**report):
+        results.write_text(json.dumps([{"batch": "b-1", "pr_url": pr, "gates": [passed], **report}]))
+        proc = _workflow(cwd, "gates", str(results))
+        assert "Traceback" not in proc.stderr, proc.stderr
+        return proc.returncode, json.loads(proc.stdout)["batches"]["b-1"]
+
+    for dirty in ({}, {"review_clean": False, "review_head": _PR_HEADS[pr]}, {"review_clean": "yes", "review_head": _PR_HEADS[pr]},
+                  {"review_clean": True}, {"review_clean": True, "review_head": "d" * 40},
+                  {"review_clean": False, "review_waiver": {"decision_id": "D-4"}}):
+        rc, b = run(**dirty)
+        assert rc != 0 and len(b["unmet"]) == 1 and "review_waived" in b["unmet"][0] and b["review_waiver"] is None, dirty
+        assert ("is not the gated PR head" in b["unmet"][0]) == (dirty.get("review_clean") is True), dirty
+    rc, b = run(review_clean=True, review_head=_PR_HEADS[pr])
+    assert rc == 0 and b["unmet"] == [] and b["review_waiver"] is None
+
+    ws, cwd = _workspace(tmp_path / "waived", doctor=False,
+                         decisions="| D-5 | user:U1 | review_waived for u, the finding is a false positive |\n")
+    assert _workflow(cwd, "reserve").returncode == 0
+    pr = _push_pr(ws)
+    rc, b = run(review_clean=False, review_waiver={"decision_id": "D-5"})
+    assert rc == 0 and b["unmet"] == [] and b["review_waiver"] == {"decision_id": "D-5"}
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
 

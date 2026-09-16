@@ -734,11 +734,28 @@ def gate_outcomes(batch, reported, ledger, head):
     return list(declared.values()), unmet
 
 
+def review_outcome(report, units, ledger, head):
+    """The review-clean rule at a PR head, for a workflow child and a hand-gathered report alike: the report
+    says review_clean=true for review_head equal to the gated head, or a human's review_waived D-<n> row names
+    every unit. Returns (waiver, reason): the waiver row that carries a dirty review, or why the PASS falls."""
+    if report.get("review_clean") is True and report.get("review_head") == head:
+        return None, None
+    waiver = report.get("review_waiver")
+    decision = waiver.get("decision_id") if isinstance(waiver, dict) else None
+    if override_decision(decision, units, ledger, word="review_waived"):
+        return {"decision_id": decision}, None
+    why = ("Devin Review is not clean at the PR head" if report.get("review_clean") is not True else
+           f"review_head {report.get('review_head')!r} is not the gated PR head {head!r}")
+    return None, (f"{why} and no review_waived row {decision or 'D-<n>'} naming {', '.join(units)} is in "
+                  ".migration/06_decisions.md")
+
+
 def gates_command(path):
     """`workflow.py gates <results.json>`: the wave-close gate rule for a wave the orchestrator gathered by
     hand. The file holds the children's [{batch, pr_url, gates}] reports; every manifest batch must be in it
-    once, and passed evidence is checked at each PR's head as the workflow path does. Prints {closed, batches:
-    {id: {gates, unmet}}} and exits 1 unless every gate is passed or waived."""
+    once, and passed evidence and the review-clean rule are checked at each PR's head as the workflow path does.
+    Prints {closed, batches: {id: {gates, review_waiver, unmet}}} and exits 1 unless every gate is passed or
+    waived and every review is clean or waived."""
     try:
         reports = json.loads(Path(path).read_text())
     except (OSError, ValueError) as e:
@@ -755,7 +772,7 @@ def gates_command(path):
     ledger = decision_ledger()
     out = {}
     for b in sorted(MANIFEST["batches"], key=lambda b: b["id"]):
-        report = next((r for r in reports if r["batch"] == b["id"]), None)
+        report, waiver = next((r for r in reports if r["batch"] == b["id"]), None), None
         if report is None:
             gates, unmet = [dict(g, decision_id=g.get("decision_id")) for g in b["gates"]], [f"batch {b['id']} was not gathered"]
         else:
@@ -763,7 +780,10 @@ def gates_command(path):
             gates, unmet = gate_outcomes(b, report.get("gates"), ledger, head)
             if head is None:
                 unmet.append(f"{report['pr_url']} is not a PR of {MANIFEST['repo']} whose head git can fetch; no evidence stands")
-        out[b["id"]] = {"gates": gates, "unmet": unmet}
+            waiver, reason = review_outcome(report, b["units"], ledger, head)
+            if reason:
+                unmet.append(reason)
+        out[b["id"]] = {"gates": gates, "review_waiver": waiver, "unmet": unmet}
     closed = not any(v["unmet"] for v in out.values())
     print(json.dumps({"wave": MANIFEST["wave"], "tag": TAG, "closed": closed, "batches": out}, indent=2, sort_keys=True))
     return 0 if closed else 1
@@ -1967,23 +1987,15 @@ async def run_batch(batch, sem, breaker):
                     f"PASS downgraded: recon evidence is not merge_eligible=true for every unit ({why}) "
                     f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
                     ".migration/06_decisions.md; " + out["one_line_summary"])
-        if out["status"] == "PASS" and (out.get("review_clean") is not True
-                                       or out.get("review_head") != out.get("pr_head")):
-            waiver = out.get("review_waiver")
-            decision = waiver.get("decision_id") if isinstance(waiver, dict) else None
-            if override_decision(decision, batch["units"], decision_ledger(), word="review_waived"):
-                out["review_waiver"] = {"decision_id": decision}
-            else:
-                reason = ("Devin Review is not clean at the PR head"
-                          if out.get("review_clean") is not True else
-                          f"review_head {out.get('review_head')!r} is not the gated PR head {out.get('pr_head')!r}")
+        if out["status"] == "PASS":
+            waiver, reason = review_outcome(out, batch["units"], decision_ledger(), out["pr_head"])
+            if reason:
                 out["status"] = "FAIL"
                 out["failure_class"] = "review_open"
                 out.pop("review_waiver", None)
-                out["one_line_summary"] = (
-                    f"PASS downgraded: {reason} and no review_waived row "
-                    f"{decision or 'D-<n>'} naming {', '.join(batch['units'])} is in .migration/06_decisions.md; "
-                    + out["one_line_summary"])
+                out["one_line_summary"] = f"PASS downgraded: {reason}; " + out["one_line_summary"]
+            elif waiver:
+                out["review_waiver"] = waiver
         if out["status"] == "PASS":
             out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger(), out["pr_head"])
             if unmet:
