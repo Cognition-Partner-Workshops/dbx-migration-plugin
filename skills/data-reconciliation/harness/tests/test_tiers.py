@@ -58,6 +58,9 @@ def make_green():
             {"order_id": 2, "customer": {}, "total": 20.0, "items": [{"sku": "c"}]},
         ],
     })
+    from recon.adapters import SchemaFacts
+    source.schema["ORDERS"] = SchemaFacts(table="ORDERS", primary_key=("ORDER_ID",))
+    target.schema["orders"] = SchemaFacts(table="orders", primary_key=("order_id",))
     return source, target
 
 
@@ -210,15 +213,16 @@ def make_graded():
         {"order_id": 1, "items": [{"sku": "a", "qty": 2}, {"sku": "b", "qty": 1}]},
         {"order_id": 2, "items": [{"sku": "c", "qty": 5}]},
     ]})
+    from recon.adapters import SchemaFacts
+    source.schema["ORDERS"] = SchemaFacts(table="ORDERS", primary_key=("ORDER_ID",))
+    target.schema["orders"] = SchemaFacts(table="orders", primary_key=("order_id",))
     return source, target
 
 
 def test_embed_values_graded_green():
     result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, *make_graded())
     assert result["verdict"] == "PASS"
-    assert result["warnings"] == [
-        "UNVERIFIED structural_parity: structure unavailable: "
-        "orders: fake has no schema facts for ORDERS"]
+    assert result["warnings"] == []
     assert result["tiers"][3]["stats"]["embeds_graded"]["orders.items"] == 3
 
 
@@ -624,7 +628,7 @@ def test_snapshot_provenance_matching_is_merge_eligible():
                   "row_counts": {"ORDERS": 2}},
         source_family="oracle")
     assert result["verdict"] == "PASS"
-    assert result["merge_eligible"] is False  # snapshot fakes carry no dictionary
+    assert result["merge_eligible"] is True
 
 
 def test_composite_key_full_and_sampled_diff():
