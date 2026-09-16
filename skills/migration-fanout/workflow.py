@@ -1629,10 +1629,11 @@ def validate_close(close, to_merge) -> list[str]:
 
 def proven_merged(to_merge):
     """({proven pr_url}, {pr_url: reason}) — a merge counts only when the PR head still equals the gated
-    head (a commit appended after verification is not the verified tree) and that head is on origin's
-    base tip, directly or because the tip itself carries the head's tree for the PR's paths (a squash/rebase
-    merge nothing has since undone; a historical match the base later reverted is not the verified code).
-    Whatever the close step reported or failed to report is reconciled against git."""
+    head (a commit appended after verification is not the verified tree) and origin's base tip carries the
+    head's tree for the PR's paths: a merged head stays an ancestor after a revert, and a squash/rebase merge
+    leaves only the tree, so the tip's content on those paths is the proof either way (a historical match
+    the base later reverted is not the verified code). Whatever the close step reported or failed to report
+    is reconciled against git."""
     proven, reasons = set(), {}
     try:
         tip = _base_tip()
@@ -1652,25 +1653,22 @@ def proven_merged(to_merge):
         try:
             merged = subprocess.run(git + ["merge-base", "--is-ancestor", head, tip],
                                     check=False, capture_output=True, timeout=300).returncode
-            if merged == 0:
-                proven.add(url)
-                continue
-            if merged != 1:
+            if merged not in (0, 1):
                 raise subprocess.SubprocessError(f"merge-base rc={merged}")
-            mb = subprocess.run(git + ["merge-base", tip, head],
-                                check=True, capture_output=True, text=True, timeout=300).stdout.strip()
-            out = subprocess.run(git + ["diff", "--name-only", "-z", mb, head],
-                                 check=True, capture_output=True, text=True, timeout=300).stdout
-            paths = [q for q in out.split("\0") if q]
+            paths = _git_paths(f"{BASE_SHA if merged == 0 else tip}...{head}")
             if not paths:
-                reasons[url] = "PR diff is empty"
+                if merged == 0:
+                    proven.add(url)
+                else:
+                    reasons[url] = "PR diff is empty"
                 continue
             same = subprocess.run(git + ["diff", "--quiet", tip, head, "--", *paths],
                                   check=False, capture_output=True, timeout=300).returncode
             if same == 0:
                 proven.add(url)
             elif same == 1:
-                reasons[url] = f"head not on origin/{BASE_BRANCH}"
+                reasons[url] = (f"reverted on origin/{BASE_BRANCH} after the merge" if merged == 0
+                                else f"head not on origin/{BASE_BRANCH}")
             else:
                 raise subprocess.SubprocessError(f"diff rc={same}")
         except (OSError, subprocess.SubprocessError) as e:
