@@ -226,6 +226,31 @@ def _add_column(cols: list[dict], defn: str) -> None:
         cols.append(c)
 
 
+def _collapse_ws(stmt: str) -> str:
+    """Whitespace between tokens folded to one space; quoted literals and identifiers kept as
+    written, so two statements hash equal only when they say the same thing."""
+    out, quote, i, n = [], None, 0, len(stmt)
+    while i < n:
+        ch = stmt[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+        elif ch in "'\"`":
+            quote = ch
+            out.append(ch)
+            i += 1
+        elif ch.isspace():
+            while i < n and stmt[i].isspace():
+                i += 1
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out).strip()
+
+
 def declared_shape(sql: str) -> dict:
     """The shape the committed DDL leaves behind when every statement takes effect: CREATE TABLE
     column lists with ALTER TABLE ... ADD COLUMN(S) applied on top. Other statements (DML, the
@@ -234,7 +259,8 @@ def declared_shape(sql: str) -> dict:
     if_not_exists: list[str] = []
     altered: list[str] = []
     counts = {"create_table": 0, "alter_table": 0, "other": 0}
-    statements = [re.sub(r"\s+", " ", st).strip() for st in _split_top(_strip_comments(sql), ";", angle=False)]
+    statements = [_collapse_ws(st) for st in _split_top(_strip_comments(sql), ";", angle=False)]
+    created: set[str] = set()
     for stmt in statements:
         m = _CREATE.match(stmt)
         if m:
@@ -244,7 +270,15 @@ def declared_shape(sql: str) -> dict:
             if any(re.match(r"LIKE\b", d, re.IGNORECASE) for d in _split_top(body)):
                 raise ConfigError(f"CREATE TABLE {name} LIKE: the inherited columns are not in the DDL; "
                                   "pass --expected-shape instead")
-            tables[name] = _table_columns(body)
+            cols = _table_columns(body)
+            if name in created and m.group("replace"):
+                tables[name] = cols
+            elif name in created and not m.group("ine"):
+                raise ConfigError(f"{name} is created twice without OR REPLACE; the second CREATE TABLE "
+                                  "fails when run, so this DDL lands no shape to grade")
+            elif name not in created:
+                tables[name] = cols
+            created.add(name)
             counts["create_table"] += 1
             if m.group("ine") and name not in if_not_exists:
                 if_not_exists.append(name)
@@ -340,13 +374,39 @@ def load_record(path: Path, run: str) -> dict:
     return rec
 
 
-def _find_table(observed: dict[str, list[dict]], name: str) -> list[dict] | None:
+def _candidates(observed: dict[str, list[dict]], name: str) -> list[str]:
     if name in observed:
-        return observed[name]
+        return [name]
     tail = name.rsplit(".", 1)[-1]
-    hits = [cols for obs, cols in observed.items()
-            if obs.rsplit(".", 1)[-1] == tail and (obs.endswith(name) or name.endswith(obs))]
-    return hits[0] if len(hits) == 1 else None
+    return [obs for obs in observed
+            if obs.rsplit(".", 1)[-1] == tail and (obs.endswith("." + name) or name.endswith("." + obs))]
+
+
+def _resolve_tables(expected: dict[str, list[dict]], observed: dict[str, list[dict]]) -> dict[str, str | None]:
+    """Expected table -> the one observed table it names, one-to-one: exact names first, then a
+    trailing-name match when one side is less qualified. An observed table two expected tables
+    could both claim is a match for neither (`None`), never a shared observation."""
+    out: dict[str, str | None] = {}
+    taken: set[str] = set()
+    pending = {}
+    for table in expected:
+        if table in observed:
+            out[table] = table
+            taken.add(table)
+        else:
+            pending[table] = _candidates(observed, table)
+    for table, cands in pending.items():
+        free = [c for c in cands if c not in taken]
+        rivals = [t for t, cs in pending.items() if t != table and any(c in cs for c in free)]
+        out[table] = free[0] if len(free) == 1 and not rivals else None
+        if out[table]:
+            taken.add(out[table])
+    return out
+
+
+def _find_table(observed: dict[str, list[dict]], name: str) -> list[dict] | None:
+    hit = _resolve_tables({name: []}, observed)[name]
+    return observed[hit] if hit else None
 
 
 def _compare(run: str, expected: dict[str, list[dict]], observed: dict[str, list[dict]]) -> list[dict]:
@@ -354,11 +414,16 @@ def _compare(run: str, expected: dict[str, list[dict]], observed: dict[str, list
 
     def add(table, check, column, detail):
         findings.append({"run": run, "table": table, "check": check, "column": column, "detail": detail})
+    resolved = _resolve_tables(expected, observed)
     for table, want in expected.items():
-        got = _find_table(observed, table)
-        if got is None:
-            add(table, "table_missing", None, "not in the observed shape")
+        hit = resolved[table]
+        if hit is None:
+            cands = _candidates(observed, table)
+            add(table, "table_missing", None,
+                (f"observed {', '.join(cands)} is ambiguous: another declared table shares its name"
+                 if cands else "not in the observed shape"))
             continue
+        got = observed[hit]
         by_name = {c["name"]: c for c in got}
         want_names, got_names = [c["name"] for c in want], [c["name"] for c in got]
         if sorted(want_names) == sorted(got_names) and want_names != got_names:
