@@ -1,5 +1,6 @@
 """SQL adapter statements, identifiers, literals and the source-family registry, offline."""
 import datetime as dt
+import json
 
 import pytest
 from recon import adapters, cli
@@ -47,6 +48,14 @@ def test_untested_source_families_fail_fast_before_any_driver_or_the_target_is_t
                   "--canonicalization", "missing", "--mode", "fixture", "--source-dsn-secret", "SOURCE",
                   "--target-secret", "TARGET", "--target-catalog", "mig", "--target-schema", "s",
                   "--out", str(tmp_path / "out")])
+
+
+def test_families_reports_the_registry(capsys):
+    assert cli.main(["families"]) == 0
+    reg = json.loads(capsys.readouterr().out)
+    assert set(reg["untested"]) == set(UNTESTED_FAMILIES)
+    assert set(reg["live_tested"]) == {"sqlserver", "postgres", "databricks"}
+    assert all(f in SOURCE_ADAPTERS for f in reg["live_tested"] + reg["untested"])
 
 
 @pytest.mark.parametrize("name, quote, expected", [

@@ -564,16 +564,24 @@ def check_official_plugin(plugin_root: Path) -> Check:
     return Check("official_databricks_plugin", "ok", f"all {len(OFFICIAL_SKILLS)} routed official skills present", {"found": found})
 
 
-def check_harness(plugin_root: Path) -> Check:
+def _harness_command(plugin_root: Path) -> tuple[list[str], Path | None, str] | None:
+    """The harness this doctor grades: the installed dbx-recon first, else the checkout's
+    module. Both `recon_harness` and `recon_family_supported` must ask the same executable."""
     harness = plugin_root / "skills" / "data-reconciliation" / "harness"
     if shutil.which("dbx-recon"):
-        rc, out, err = _run(["dbx-recon", "selftest"])
-        how = "dbx-recon"
-    elif (harness / "recon" / "cli.py").exists():
-        rc, out, err = _run([sys.executable, "-m", "recon.cli", "selftest"], cwd=harness)
-        how = f"python -m recon.cli (cwd {harness})"
-    else:
+        return ["dbx-recon"], None, "dbx-recon"
+    if (harness / "recon" / "cli.py").exists():
+        return [sys.executable, "-m", "recon.cli"], harness, f"python -m recon.cli (cwd {harness})"
+    return None
+
+
+def check_harness(plugin_root: Path) -> Check:
+    cmd = _harness_command(plugin_root)
+    if cmd is None:
+        harness = plugin_root / "skills" / "data-reconciliation" / "harness"
         return Check("recon_harness", "fail", f"dbx-recon not on PATH and harness not at {harness}")
+    argv, cwd, how = cmd
+    rc, out, err = _run(argv + ["selftest"], **({"cwd": cwd} if cwd else {}))
     if rc == 0 and "PASS" in out:
         return Check("recon_harness", "ok", f"{out.strip()} via {how}")
     return Check("recon_harness", "fail", f"selftest rc={rc}: {_redact(err or out)}")
@@ -593,6 +601,43 @@ def check_drivers() -> Check:
     return Check("recon_drivers", status,
                  f"installed adapters: {have or 'none'}" + ("" if present["databricks"] else "; databricks-sql-connector missing, live/snapshot recon cannot run"),
                  {"drivers": present})
+
+
+def check_recon_family_supported(plugin_root: Path, source_family: str | None) -> Check:
+    """Whether the harness can reconcile the declared source family, asked of the same harness
+    `recon_harness` ran (dbx-recon on PATH, else the checkout). Deliberately not folded into
+    source_principal_read_only: attestation says the principal is read-only; this row says
+    whether we can reconcile the family."""
+    cid = "recon_family_supported"
+    if not source_family:
+        return Check(cid, "skipped", "no source family declared (--source-family, or source.family in the wave manifest)")
+    cmd = _harness_command(plugin_root)
+    if cmd is None:
+        return Check(cid, "fail", "cannot ask the harness which families it supports: dbx-recon "
+                     "not on PATH and no checkout harness", {"family": source_family})
+    argv, cwd, how = cmd
+    rc, out, err = _run(argv + ["families"], **({"cwd": cwd} if cwd else {}))
+    reg = None
+    if rc == 0:
+        try:
+            reg = json.loads(out)
+        except ValueError:
+            pass
+    if not isinstance(reg, dict) or not isinstance(reg.get("live_tested"), list) \
+            or not isinstance(reg.get("untested"), list) \
+            or not all(isinstance(f, str) for f in reg["live_tested"] + reg["untested"]):
+        return Check(cid, "fail", f"cannot ask the harness which families it supports "
+                     f"({how} families rc={rc}): {_redact(err or out)}", {"family": source_family})
+    live = sorted(reg["live_tested"])
+    data = {"family": source_family, "live_tested": live, "harness": how}
+    if source_family in reg["untested"]:
+        return Check(cid, "fail", f"{source_family}: the harness refuses this family (`dbx-recon run --family "
+                     f"{source_family}` exits before connecting). Attestation says the principal is read-only; this "
+                     f"row says whether we can reconcile the family, and today we cannot: live-tested families are "
+                     f"{live}; adding one is a live-tested adapter, never an attestation ({how})", data)
+    if source_family not in live:
+        return Check(cid, "fail", f"{source_family}: no source adapter in the harness; live-tested families: {live} ({how})", data)
+    return Check(cid, "ok", f"{source_family}: live-tested source adapter ({how})", data)
 
 
 # ------------------------------------------------------------------ delete evidence (source CDC)
@@ -1561,6 +1606,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         _merge("hook_guard", check_hooks(plugin_root, ws, probe_result)),
         check_official_plugin(plugin_root),
         _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
+        check_recon_family_supported(plugin_root, source_family),
         check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
                                   params=params),
         check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
