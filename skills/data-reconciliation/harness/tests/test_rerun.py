@@ -18,6 +18,7 @@ from recon.rerun import (
     load_record,
     load_shape,
     normalize_type,
+    rerun_gap,
 )
 from recon.tiers import TierResult
 
@@ -86,6 +87,24 @@ def test_declared_shape_handles_quoted_identifiers_and_inline_constraints():
     assert cols == [{"name": "id", "type": "bigint", "nullable": False},
                     {"name": "name", "type": "varchar(40)", "nullable": False},
                     {"name": "n", "type": "numeric(10,2)", "nullable": True}]
+
+
+def test_declared_shape_reads_nullability_only_from_top_level_clauses():
+    """Constraint words inside a literal, a comment or a bracketed expression are text, not
+    constraints: `DEFAULT 'NOT NULL'` leaves the column nullable."""
+    sql = """CREATE TABLE t (
+      note STRING DEFAULT 'NOT NULL',
+      hint STRING COMMENT 'the PRIMARY KEY of the old system',
+      flag STRING DEFAULT ('NOT NULL') NOT NULL,
+      n DECIMAL(10, 2) GENERATED ALWAYS AS (CASE WHEN note IS NOT NULL THEN 1 ELSE 0 END),
+      code VARCHAR(8) COMMENT 'x' NOT NULL
+    );"""
+    cols = {c["name"]: c for c in declared_shape(sql)["tables"]["t"]}
+    assert cols["note"] == {"name": "note", "type": "string", "nullable": True}
+    assert cols["hint"] == {"name": "hint", "type": "string", "nullable": True}
+    assert cols["flag"] == {"name": "flag", "type": "string", "nullable": False}
+    assert cols["n"] == {"name": "n", "type": "decimal(10,2)", "nullable": True}
+    assert cols["code"] == {"name": "code", "type": "varchar(8)", "nullable": False}
 
 
 def test_declared_shape_refuses_ddl_without_a_create_table():
@@ -303,6 +322,19 @@ def test_build_result_records_the_proof_and_blocks_on_rerun_gap():
     proof = {"fresh": "pass", "evolved": "unsupported", "passed": True, "findings": []}
     r = build_result("u", "live", "m1", "t1", [_ok()], rerun_proof=proof)
     assert r["merge_eligible"] is False and r["merge_block_reasons"] == ["rerun_unsupported"]
+
+
+def test_a_proof_with_findings_is_a_rerun_gap_whatever_its_legs_say():
+    """Belt and braces: check_proof rejects a `pass` leg that carries findings, and the merge
+    gate reads the findings too, so a contradictory artifact can never stay merge-eligible."""
+    proof = {"fresh": "pass", "evolved": "pass", "passed": True,
+             "findings": [{"run": "evolved", "table": "t", "check": "column_missing",
+                           "column": "c", "detail": "x"}]}
+    assert rerun_gap(proof) is True
+    r = build_result("u", "live", "m1", "t1", [_ok()], rerun_proof=proof)
+    assert r["merge_eligible"] is False and r["merge_block_reasons"] == ["rerun_gap"]
+    with pytest.raises(ConfigError, match="lists a finding"):
+        check_proof(dict(proof, unit="u", notes=[], evidence={"fresh": "a", "evolved": "b"}), "u", "x")
 
 
 def test_run_recon_carries_the_proof_into_result_json(tmp_path):

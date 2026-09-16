@@ -94,6 +94,29 @@ def _balanced(text: str, start: int) -> int:
     raise ConfigError("unbalanced parenthesis in CREATE TABLE")
 
 
+def _top_level(text: str) -> str:
+    """`text` with every quoted literal and bracketed group blanked to spaces (same length), so
+    keyword searches see only the top level and offsets still index the original."""
+    out, depth, quote = [], 0, None
+    for ch in text:
+        if quote:
+            out.append(" ")
+            if ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+            out.append(" ")
+        elif ch in "(<":
+            depth += 1
+            out.append(" ")
+        elif ch in ")>":
+            depth = max(depth - 1, 0)
+            out.append(" ")
+        else:
+            out.append(ch if depth == 0 else " ")
+    return "".join(out)
+
+
 def _column(defn: str) -> dict | None:
     if _CONSTRAINT_START.match(defn):
         return None
@@ -101,9 +124,10 @@ def _column(defn: str) -> dict | None:
     if not m:
         raise ConfigError(f"cannot read column definition: {defn[:60]!r}")
     name, rest = _ident(m.group(1)), m.group(2)
-    clause = _COLUMN_CLAUSE.search(rest)
+    top = _top_level(rest)
+    clause = _COLUMN_CLAUSE.search(top)
     type_text = rest[:clause.start()] if clause else rest
-    tail = rest[clause.start():] if clause else ""
+    tail = top[clause.start():] if clause else ""
     not_null = bool(re.search(r"\bNOT\s+NULL\b", tail, re.IGNORECASE)
                     or re.search(r"\bPRIMARY\s+KEY\b", tail, re.IGNORECASE))
     if not type_text.strip():
@@ -304,8 +328,9 @@ def grade_rerun(expected: dict, fresh: dict | None, evolved: dict | None) -> dic
 
 def rerun_gap(proof: dict | None) -> bool:
     """True when result.json must carry `rerun_gap`: a recorded proof whose fresh or evolved leg
-    failed. No proof is recorded as null, never as clean."""
-    return proof is not None and (proof.get("fresh") == "fail" or proof.get("evolved") == "fail")
+    failed, or that lists any finding at all. No proof is recorded as null, never as clean."""
+    return proof is not None and (proof.get("fresh") == "fail" or proof.get("evolved") == "fail"
+                                  or bool(proof.get("findings")))
 
 
 def rerun_unsupported(proof: dict | None) -> bool:
