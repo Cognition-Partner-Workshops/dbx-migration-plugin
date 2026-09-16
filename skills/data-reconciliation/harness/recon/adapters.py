@@ -15,7 +15,8 @@ import datetime as dt
 import json
 import os
 import re
-from collections.abc import Iterable
+import struct
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -89,6 +90,10 @@ class SchemaFacts:
     # (e.g. "lower(email)"); a unique one is a constraint the column-wise facts cannot see
     expression_unique: set[str] = field(default_factory=set)
     expression_indexes: set[str] = field(default_factory=set)
+    # relations that cannot carry NOT NULL (Postgres views and materialized views:
+    # pg_attribute.attnotnull is always false for them) set this False so tier 7 reports
+    # nullability as unverified instead of missing
+    declares_not_null: bool = True
 
 
 @dataclass(frozen=True)
@@ -123,9 +128,12 @@ class TargetAdapter(Protocol):
 @runtime_checkable
 class BatchAggregates(Protocol):
     """One statement per table for Tier 2 (the cost rule: one multi-metric statement, not one per
-    metric). `numeric` names the columns that also get a SUM."""
+    metric). `numeric` names the columns that also get a SUM; `unordered` names the
+    columns whose type has no ordering aggregate on an engine (bit, uuid): they report
+    count/null_rate/distinct_count and None for min/max."""
     def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
-                         where: str | None = None) -> dict[str, dict[str, Any]]: ...
+                         where: str | None = None,
+                         *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]: ...
 
 
 @runtime_checkable
@@ -136,7 +144,8 @@ class KeyExcludingAggregates(Protocol):
     caller grades nothing rather than split the aggregate across statements."""
     def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
                                    key_cols: list[str], exclude_keys: list[tuple],
-                                   where: str | None = None) -> dict[str, dict[str, Any]]: ...
+                                   where: str | None = None,
+                                   *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]: ...
     def exclusion_capacity(self, key_width: int) -> int: ...
 
 
@@ -396,9 +405,10 @@ class _SqlAdapterBase:
         raise NotImplementedError(f"{type(self).__name__} cannot read column types")
 
     def table_aggregates(self, table: str, columns: list[str], numeric: list[str],
-                         where: str | None = None) -> dict[str, dict[str, Any]]:
+                         where: str | None = None,
+                         *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
         w = f" WHERE {where}" if where else ""
-        return self._table_aggregates(table, columns, numeric, w, [])
+        return self._table_aggregates(table, columns, numeric, w, [], unordered)
 
     def exclusion_capacity(self, key_width: int) -> int:
         """The membership test binds one parameter per key component."""
@@ -406,7 +416,8 @@ class _SqlAdapterBase:
 
     def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
                                    key_cols: list[str], exclude_keys: list[tuple],
-                                   where: str | None = None) -> dict[str, dict[str, Any]]:
+                                   where: str | None = None,
+                                   *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
         if len(exclude_keys) > self.exclusion_capacity(len(key_cols)):
             raise ValueError(f"{len(exclude_keys)} keys x {len(key_cols)} columns exceed the "
                              f"{self.max_params}-parameter budget of one statement")
@@ -416,13 +427,18 @@ class _SqlAdapterBase:
         if exclude_keys:
             clauses.append("NOT " + self._keys_clause(key_cols, exclude_keys, values))
         w = " WHERE " + " AND ".join(clauses) if clauses else ""
-        return self._table_aggregates(table, columns, numeric, w, values)
+        return self._table_aggregates(table, columns, numeric, w, values, unordered)
 
     def _table_aggregates(self, table: str, columns: list[str], numeric: list[str],
-                          w: str, values: list[Any]) -> dict[str, dict[str, Any]]:
+                          w: str, values: list[Any],
+                          unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
         exprs = ["COUNT(*)"]
         for col in columns:
-            exprs += [f"COUNT({col})", f"MIN({col})", f"MAX({col})", f"COUNT(DISTINCT {col})"]
+            # unordered types (bit, uuid) have no MIN/MAX on the engines; NULLs keep the row
+            # layout identical so the column unpacks like any other
+            exprs += ([f"COUNT({col})", "NULL", "NULL", f"COUNT(DISTINCT {col})"]
+                      if col in unordered else
+                      [f"COUNT({col})", f"MIN({col})", f"MAX({col})", f"COUNT(DISTINCT {col})"])
             if col in numeric:
                 exprs.append(f"SUM({col})")
         row = list(self._rows(f"SELECT {', '.join(exprs)} FROM {table}{w}", self._params(values))[0])
@@ -852,6 +868,16 @@ def _index_key_text(indexdef: str) -> str:
     return normalize_sql_text(indexdef[start:])
 
 
+def _datetimeoffset_from_odbc(raw: bytes) -> dt.datetime:
+    """Decode the ODBC SQL_SS_TIMESTAMPOFFSET_STRUCT (SQL type -155) that pyodbc has no
+    converter for: six smallints (year..second), a uint32 fraction in nanoseconds, then
+    two smallints of timezone hour/minute east of UTC. Returns an aware datetime."""
+    year, month, day, hour, minute, second, fraction, tz_hour, tz_minute = \
+        struct.unpack("<6hI2h", raw)
+    return dt.datetime(year, month, day, hour, minute, second, fraction // 1000,
+                       tzinfo=dt.timezone(dt.timedelta(hours=tz_hour, minutes=tz_minute)))
+
+
 class SqlServerSourceAdapter(_SqlAdapterBase):
     """Secret value: an ODBC connection string. Also the Sybase ASE stand-in for the OLTP track
     (same T-SQL catalog shape through sys.* views on SQL Server; ASE itself has no snapshot
@@ -875,7 +901,9 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
 
     def __init__(self, dsn_secret: str):
         import pyodbc  # lazy: optional extra
-        super().__init__(pyodbc.connect(_secret(dsn_secret)))
+        conn = pyodbc.connect(_secret(dsn_secret))
+        conn.add_output_converter(-155, _datetimeoffset_from_odbc)
+        super().__init__(conn)
 
     def schema_facts(self, table: str) -> SchemaFacts:
         schema, name = _split_table(table, "dbo")
@@ -1080,8 +1108,10 @@ class DatabricksTargetAdapter:
         return self._prefix + quote_ident(object, "`")
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
-                         where: str | None = None) -> dict[str, dict[str, Any]]:
-        return self._sql.table_aggregates(self._q(object), columns, numeric, where)
+                         where: str | None = None,
+                         *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
+        return self._sql.table_aggregates(self._q(object), columns, numeric, where,
+                                          unordered=unordered)
 
     def target_row_count(self, object: str, where: str | None = None) -> int:
         return self._sql.row_count(self._q(object), where)
@@ -1238,13 +1268,16 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.indexes.add(tuple(entry["cols"]))
         rows = self._rows(
             "SELECT a.attname, a.attnotnull, a.attidentity <> '' OR "
-            "       pg_get_serial_sequence(%s, a.attname) IS NOT NULL "
+            "       pg_get_serial_sequence(%s, a.attname) IS NOT NULL, c.relkind "
             "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped",
             (f'"{schema}"."{name}"', schema, name))
-        for col, notnull, has_seq in rows:
-            if notnull:
+        for col, notnull, has_seq, relkind in rows:
+            if relkind in ("v", "m"):
+                # views cannot declare NOT NULL (attnotnull is always false for them)
+                facts.declares_not_null = False
+            elif notnull:
                 facts.not_null.add(col)
             if has_seq:
                 facts.identity_columns.add(col)
@@ -1270,9 +1303,11 @@ class _PostgresBase(_SqlAdapterBase):
 
     def table_aggregates_excluding(self, table: str, columns: list[str], numeric: list[str],
                                    key_cols: list[str], exclude_keys: list[tuple],
-                                   where: str | None = None) -> dict[str, dict[str, Any]]:
+                                   where: str | None = None,
+                                   *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
         if not exclude_keys:
-            return super().table_aggregates_excluding(table, columns, numeric, key_cols, [], where)
+            return super().table_aggregates_excluding(table, columns, numeric, key_cols, [],
+                                                      where, unordered=unordered)
         if len(exclude_keys) > self.exclusion_capacity(len(key_cols)):
             raise ValueError(f"{len(exclude_keys)} keys exceed the "
                              f"{self.ARRAY_EXCLUSION_CAPACITY}-key exclusion budget")
@@ -1292,7 +1327,7 @@ class _PostgresBase(_SqlAdapterBase):
         clauses.append(f"NOT EXISTS (SELECT 1 FROM unnest({', '.join(arrays)}) AS _x({names}) "
                        f"WHERE {match})")
         return self._table_aggregates(table, columns, numeric, " WHERE " + " AND ".join(clauses),
-                                      values)
+                                      values, unordered)
 
     def _server_version(self) -> int:
         if not hasattr(self, "_server_version_num"):
@@ -1404,14 +1439,17 @@ class LakebaseTargetAdapter(_PostgresBase):
         return super().field_aggregates(self._q(object), field_path, where)
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
-                         where: str | None = None) -> dict[str, dict[str, Any]]:
-        return super().table_aggregates(self._q(object), columns, numeric, where)
+                         where: str | None = None,
+                         *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
+        return super().table_aggregates(self._q(object), columns, numeric, where,
+                                        unordered=unordered)
 
     def table_aggregates_excluding(self, object: str, columns: list[str], numeric: list[str],
                                    key_cols: list[str], exclude_keys: list[tuple],
-                                   where: str | None = None) -> dict[str, dict[str, Any]]:
+                                   where: str | None = None,
+                                   *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
         return super().table_aggregates_excluding(self._q(object), columns, numeric, key_cols,
-                                                  exclude_keys, where)
+                                                  exclude_keys, where, unordered=unordered)
 
     def fetch_keyed(self, object: str, key_fields: list[str], fields: list[str],
                     where: str | None = None, keys: list[Any] | None = None) -> Iterable[dict[str, Any]]:
