@@ -624,8 +624,9 @@ def test_every_root_of_the_call_graph_is_a_declared_deploy_object():
 
 def test_same_named_roots_in_different_schemas_each_need_a_deploy_object_of_their_own():
     """Two entry points whose trailing names agree (`app.close` and `legacy.close`) are two deployed objects:
-    one deploy_objects row cannot stand for both, a row qualified like one of them is that one's, and a row
-    qualified like neither (`mig.other.close`) is nobody's; only a bare name under the namespace stands in."""
+    one deploy_objects row cannot stand for both, a row qualified like one of them is that one's, a row
+    qualified like neither (`mig.other.close`) is nobody's, and a bare `mig.close` stands in only for a root
+    whose trailing name no other root shares."""
     check = _functions()["check_dependencies"]
     roots = [_routine("app.close", writes=["mig.a"]), _routine("legacy.close", writes=["mig.b"])]
     b = {"id": "b-9", "units": ["u"], "write_targets": ["mig.a", "mig.b", "mig.close"], "deploy_objects": ["mig.close"], "brief": "b"}
@@ -633,8 +634,11 @@ def test_same_named_roots_in_different_schemas_each_need_a_deploy_object_of_thei
         check([b], _deps(u=roots), namespace="mig")
     check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.legacy.close"],
             "deploy_objects": ["mig.app.close", "mig.legacy.close"]}], _deps(u=roots), namespace="mig")
-    check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.close"],
-            "deploy_objects": ["mig.app.close", "mig.close"]}], _deps(u=roots), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*legacy\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.close"],
+                "deploy_objects": ["mig.app.close", "mig.close"]}], _deps(u=roots), namespace="mig")
+    check([{**b, "write_targets": ["mig.a", "mig.close"], "deploy_objects": ["mig.close"]}], _deps(u=[roots[0]]),
+          namespace="mig")
     with pytest.raises(SystemExit, match=r"b-9.*legacy\.close.*deploy_objects"):
         check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.other.close"],
                 "deploy_objects": ["mig.app.close", "mig.other.close"]}], _deps(u=roots), namespace="mig")
