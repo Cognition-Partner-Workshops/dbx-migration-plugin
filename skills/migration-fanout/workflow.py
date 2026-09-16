@@ -110,6 +110,8 @@ from pathlib import Path
 POINTER_REL = Path(".migration/waves/current.json")
 MODES = ("start", "resume", "rerun", "smoke")
 HOOK_PROBE = re.compile(r"blocked:[0-9a-f]{8}|not-blocked|unknown")
+TAG_RE = re.compile(r"[A-Za-z0-9_-]+")
+PIPELINE_RE = re.compile(r"[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*")
 DOCTOR_MAX_AGE = datetime.timedelta(minutes=15)
 
 
@@ -144,10 +146,15 @@ if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE
 ROOT = Path(POINTER["workspace"]).resolve() if isinstance(POINTER.get("workspace"), str) else POINTER_PATH.parents[2]
 WAVES_DIR = ROOT / ".migration" / "waves"
 MANIFEST_PATH = (WAVES_DIR / POINTER["manifest"]).resolve()
+if not (MANIFEST_PATH.name.startswith("wave-")
+        and TAG_RE.fullmatch(MANIFEST_PATH.stem[len("wave-"):] or "")):
+    raise SystemExit(f"{POINTER_PATH} manifest must be named wave-<N>.json or wave-<pipeline>-<N>.json "
+                     "so every sibling wave and pipeline sees it in the collision check")
 if MANIFEST_PATH.suffix != ".json" or MANIFEST_PATH.parent != WAVES_DIR.resolve() or MANIFEST_PATH.name.endswith((".result.json", ".doctor.json")):
     raise SystemExit(f"{POINTER_PATH} manifest must be the plain file name of a wave manifest inside {WAVES_DIR}")
 if not MANIFEST_PATH.exists():
     raise SystemExit(f"no wave manifest at {MANIFEST_PATH}; the plan playbook writes it, then re-run")
+TAG = MANIFEST_PATH.stem[len("wave-"):]
 MANIFEST_BYTES = MANIFEST_PATH.read_bytes()
 MANIFEST = json.loads(MANIFEST_BYTES)
 BASE_BRANCH = MANIFEST.get("base_branch", "")
@@ -423,6 +430,13 @@ def validate_manifest(m, doctor=None):
     if "secrets" in m and (not isinstance(m["secrets"], list)
                            or not all(isinstance(s, str) for s in m["secrets"])):
         raise SystemExit("wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
+    pipelines = m.get("pipelines")
+    if "pipelines" in m and (not isinstance(pipelines, dict) or not pipelines
+                             or not all(isinstance(p, str) and PIPELINE_RE.fullmatch(p) for p in pipelines)
+                             or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0
+                                        for n in pipelines.values())):
+        raise SystemExit("manifest key 'pipelines' must map each pipeline the plan split (letters, digits, '_') to a "
+                         "positive wave count, the <pipeline>-<N> of its wave-<pipeline>-<N>.json manifests")
     if m["wave"] == 0 and m.get("width", 20) != 1:
         raise SystemExit("wave 0 is the serial shared-objects wave: set width to 1")
     if not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
@@ -654,13 +668,20 @@ def pr_head(pr_url):
     m = PR_URL.fullmatch(pr_url) if isinstance(pr_url, str) else None
     if not m or m["repo"].lower() != MANIFEST["repo"].lower():
         return None
-    git = ["git", "-C", str(ROOT)]
     try:
-        subprocess.run(git + ["fetch", "-q", "origin", f"refs/pull/{m['n']}/head"], check=True, capture_output=True, timeout=300)
-        return subprocess.run(git + ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
-                              check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+        return fetch_ref(f"refs/pull/{m['n']}/head")
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def fetch_ref(ref):
+    """sha of `ref` on origin, fetched now into a ref only this wave writes: git's default fetch slot is one
+    per clone, and a sibling pipeline's fetch between the two commands would hand this wave another head."""
+    local = f"refs/migration/wave-{TAG}/{ref}"
+    git = ["git", "-C", str(ROOT)]
+    subprocess.run(git + ["fetch", "-q", "origin", f"+{ref}:{local}"], check=True, capture_output=True, timeout=300)
+    return subprocess.run(git + ["rev-parse", "--verify", f"{local}^{{commit}}"],
+                          check=True, capture_output=True, text=True, timeout=300).stdout.strip()
 
 
 def gate_outcomes(batch, reported, ledger, head):
@@ -741,7 +762,7 @@ def gates_command(path):
                 unmet.append(f"{report['pr_url']} is not a PR of {MANIFEST['repo']} whose head git can fetch; no evidence stands")
         out[b["id"]] = {"gates": gates, "unmet": unmet}
     closed = not any(v["unmet"] for v in out.values())
-    print(json.dumps({"wave": MANIFEST["wave"], "closed": closed, "batches": out}, indent=2, sort_keys=True))
+    print(json.dumps({"wave": MANIFEST["wave"], "tag": TAG, "closed": closed, "batches": out}, indent=2, sort_keys=True))
     return 0 if closed else 1
 
 
@@ -817,6 +838,84 @@ def hand_run_state():
     return state
 
 
+def check_wave_tag(tag, manifest):
+    """wave-<tag>.json's last '-' segment is the wave number it runs, so a file renamed or mis-numbered
+    cannot run under a wave the name does not declare; a pipeline tag must be listed in 'pipelines' so
+    the planning barrier reads the manifest."""
+    wave = manifest["wave"]
+    last = tag.rsplit("-", 1)[-1]
+    if not last.isdigit() or int(last) != wave:
+        raise SystemExit(f"wave-{tag}.json: the wave number in the file name must equal the manifest's 'wave' ({wave})")
+    pipeline = tag.rsplit("-", 1)[0]
+    count = manifest.get("pipelines", {}).get(pipeline) if pipeline != tag else None
+    if pipeline != tag and (not isinstance(count, int) or isinstance(count, bool) or count < int(last)):
+        raise SystemExit(f"wave-{tag}.json: wave-<pipeline>-<N>.json manifests must list every sibling pipeline in "
+                         f"'pipelines' (including {pipeline}): the planning barrier reads it")
+
+
+def _is_manifest(name):
+    return (name.startswith("wave-") and name.endswith(".json")
+            and TAG_RE.fullmatch(name[len("wave-"):-len(".json")]) is not None)
+
+
+def published_manifests():
+    """{name: text} of every manifest under .migration/waves/ on origin's base branch, now."""
+    git = ["git", "-C", str(ROOT)]
+    try:
+        tip = _base_tip()
+        names = subprocess.run(git + ["ls-tree", "--name-only", tip, ".migration/waves/"],
+                               check=True, capture_output=True, text=True, timeout=300).stdout.split()
+        return {Path(n).name: subprocess.run(git + ["show", f"{tip}:{n}"], check=True, capture_output=True, text=True,
+                                             timeout=300).stdout
+                for n in names if _is_manifest(Path(n).name)}
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SystemExit(f"cannot read the manifests on origin/{BASE_BRANCH} ({e}); the planning barrier needs them")
+
+
+def check_pipelines_published(waves_dir, m, published=None):
+    """The collision check sees only manifests on disk, so a sibling pipeline whose manifests have not landed on
+    the integration branch yet is invisible to it and both waves could launch on one target. The manifest maps
+    every pipeline the plan split to its wave count; launch waits until every numbered wave-<pipeline>-<N>.json
+    is on origin's base branch, every published sibling declares the same 'pipelines', and the manifests on disk
+    are exactly origin's (`published`, {name: text}; None skips that comparison)."""
+    on_disk = {f.name: f.read_text() for f in waves_dir.glob("wave-*.json") if _is_manifest(f.name)}
+    if published is not None:
+        published = {n: t for n, t in published.items() if _is_manifest(n)}
+    names = on_disk if published is None else published
+    pipelines = m.get("pipelines") or {}
+    expected = {f"wave-{p}-{k}.json" for p, n in pipelines.items()
+                if isinstance(n, int) and not isinstance(n, bool) for k in range(1, n + 1)}
+    missing = sorted(expected - set(names))
+    if missing:
+        raise SystemExit(f"no manifest yet for {', '.join(missing)}: every pipeline in 'pipelines' commits its "
+                         "wave-<pipeline>-<N>.json before any sibling launches; pull the integration branch and "
+                         "re-run, or wait for the planning barrier")
+    listed = "|".join(re.escape(p) for p in pipelines)
+    extra = sorted(n for n in names if listed and re.fullmatch(rf"wave-(?:{listed})-\d+\.json", n)
+                   and n not in expected)
+    if extra:
+        raise SystemExit(f"{', '.join(extra)} is beyond the wave count in 'pipelines': the plans disagree")
+    if published is None:
+        return
+    for name in sorted(expected & set(published)):
+        try:
+            theirs = json.loads(published[name])
+        except ValueError:
+            theirs = None
+        if not isinstance(theirs, dict) or theirs.get("pipelines") != pipelines:
+            raise SystemExit(f"{name} declares a different 'pipelines': the plans disagree")
+    for name, text in sorted(on_disk.items()):
+        if name not in published:
+            raise SystemExit(f"{name} is not on origin/{BASE_BRANCH}: commit and push every manifest before preflight so "
+                             "sibling pipelines see it")
+        if text != published[name]:
+            raise SystemExit(f"{name} differs from origin/{BASE_BRANCH}: commit and push the edit before preflight so "
+                             "sibling pipelines check the same manifest")
+    for name in sorted(set(published) - set(on_disk)):
+        raise SystemExit(f"{name} is on origin/{BASE_BRANCH} but not on disk: pull the integration branch before "
+                         "preflight so the collision check reads it")
+
+
 def other_wave_manifests(waves_dir, current):
     """{file name: {target_namespace, batches}} for every other wave-*.json in .migration/waves/: a bare
     write target means the table in the namespace of the manifest that declares it, so each wave's is kept
@@ -824,7 +923,7 @@ def other_wave_manifests(waves_dir, current):
     one that cannot be read halts."""
     out = {}
     for p in sorted(waves_dir.glob("wave-*.json")):
-        if p.name == current or p.name.endswith((".result.json", ".doctor.json")):
+        if p.name == current or not _is_manifest(p.name):
             continue
         try:
             m = json.loads(p.read_text())
@@ -1279,6 +1378,8 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
 
 if sys.argv[1:2] == ["reserve"]:
     validate_manifest(MANIFEST)
+    check_wave_tag(TAG, MANIFEST)
+    check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                         other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
                         namespace=MANIFEST.get("target_namespace", ""))
@@ -1289,6 +1390,7 @@ if sys.argv[1:2] == ["reserve"]:
     sys.exit(0)
 if sys.argv[1:2] == ["gates"]:
     validate_manifest(MANIFEST)
+    check_wave_tag(TAG, MANIFEST)
     state = hand_run_state()
     if state == "closed":
         raise SystemExit(f"{RUNS_PATH} records that the hand run under STOP C row {MANIFEST['stop_c']} closed already; a new "
@@ -1310,6 +1412,7 @@ if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
     raise spent_halt()
 PREFLIGHT = sys.argv[1:] == ["preflight"]
 validate_manifest(MANIFEST)
+check_wave_tag(TAG, MANIFEST)
 BASE_SHA = None if PREFLIGHT else launch_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
 if not SMOKE:
@@ -1331,9 +1434,7 @@ def ref_changed_paths(ref):
     add so a ledger file moved under recon/ still names its old path."""
     git = ["git", "-C", str(ROOT)]
     try:
-        subprocess.run(git + ["fetch", "-q", "origin", ref], check=True, capture_output=True, timeout=300)
-        head = subprocess.run(git + ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
-                              check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+        head = fetch_ref(ref)
         tip = _base_tip()
         merged = subprocess.run(git + ["merge-base", "--is-ancestor", head, tip],
                                 check=False, capture_output=True, timeout=300).returncode
@@ -1490,7 +1591,7 @@ def batch_max_minutes(batch) -> int:
     return int(batch.get("max_minutes", MAX_MINUTES))
 
 META = {
-    "name": f"smoke-wave-{WAVE}" if SMOKE else f"migration-wave-{WAVE}",
+    "name": f"smoke-wave-{TAG}" if SMOKE else f"migration-wave-{TAG}",
     "description": f"Wave {WAVE}: {len(BATCHES)} unit batches in parallel, then one independent verifier",
     "phases": [
         {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
@@ -1650,8 +1751,8 @@ def verify_prompt(passed, auto_merge):
         "its acceptance gates with the evidence the child gave; open the evidence of every passed gate and FAIL "
         "the unit if it does not show what the gate's kind requires. "
         "Sum result.json['cost'] over your runs into recon_cost.\n"
-        f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{WAVE}/report.md, "
-        f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
+        f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{TAG}/report.md, "
+        f"commit it on branch recon/wave-{TAG}, push, and give '<branch>:<path>' in "
         "report_path. Do not edit any other file under .migration/; report your branch's "
         "`git diff --name-only <base>...<head>` in changed_paths. Each finding is one plain "
         "sentence a lead can read without opening anything."
@@ -1882,6 +1983,7 @@ async def main():
     if not resume:
         RUN_ID_PATH.unlink(missing_ok=True)
     await register_workflow(META)
+    check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
                         namespace=MANIFEST.get("target_namespace", ""))
     check_dependencies(BATCHES, namespace=MANIFEST.get("target_namespace", ""))
@@ -1925,14 +2027,14 @@ async def main():
         log(f"verify: {len(passed)} batches to an independent session")
         try:
             verify = await agent(verify_prompt(passed, auto_merge), phase="verify", schema=VERIFY_SCHEMA,
-                                 label=f"verify-wave-{WAVE}", repos=[REPO])
+                                 label=f"verify-wave-{TAG}", repos=[REPO])
         except WorkflowAgentError as e:
             verify = {"wave_verdict": "FAIL", "unit_verdicts": {},
                       "findings": [f"verifier session died: {e}"]}
     else:
         log("verify: skipped, no batch passed")
 
-    verify_problems = (validate_verify(verify, passed, auto_merge, WAVE, verifier_changed_paths(WAVE, passed))
+    verify_problems = (validate_verify(verify, passed, auto_merge, TAG, verifier_changed_paths(TAG, passed))
                        if verify is not None else [])
     if verify_problems:
         if not isinstance(verify, dict):
@@ -1946,7 +2048,7 @@ async def main():
               and all(r["status"] == "PASS" for r in results))
     result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
     result_tmp.write_text(json.dumps({
-        "wave": WAVE, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
+        "wave": WAVE, "tag": TAG, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
         "run_id": RUN_ID, "base_sha": BASE_SHA, "mode": MODE, "stop_c": MANIFEST["stop_c"],
         "hook_probe": HOOK_PROBE_RESULT, "doctor_signed_at": DOCTOR.get("signed_at"),
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
@@ -1966,6 +2068,7 @@ async def main():
 
 
 if PREFLIGHT:  # `workflow.py preflight`: the launch checks for a wave launched by hand; writes nothing
+    check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
                         namespace=MANIFEST.get("target_namespace", ""))
     check_dependencies(BATCHES, namespace=MANIFEST.get("target_namespace", ""))

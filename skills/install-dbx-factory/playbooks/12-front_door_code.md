@@ -7,6 +7,7 @@ Playbook: Intake code, models, and prediction consumers before selecting migrati
 | Scope | inventory repositories, jobs, packages, secrets by name, inputs/outputs, schedules, tests, and runtime assumptions |
 | Dialect | route only to an installed optional dialect skill; never claim a skill exists because an adapter/Lakebridge flag exists |
 | Orchestration | invoke `!dbx_migrate_pipeline` in this session after intake and profile selection |
+| Pipelines | ask which pipelines share write targets or source objects; disjoint ones run as sibling orchestrator sessions after STOP A (rule in `9-orchestrator.md`) |
 | Allowlist | write `.migration/allowed_targets.json` (catalogs, legacy_sources) before any source probe; authorized legacy writes carry `DBX_DECISION=D-<id>` — see contract.md |
 
 ## Routing
