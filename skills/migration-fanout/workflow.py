@@ -898,10 +898,10 @@ def check_pipelines_published(waves_dir, m, published=None):
         return
     for name in sorted(expected & set(published)):
         try:
-            theirs = json.loads(published[name]).get("pipelines")
+            theirs = json.loads(published[name])
         except ValueError:
             theirs = None
-        if theirs != pipelines:
+        if not isinstance(theirs, dict) or theirs.get("pipelines") != pipelines:
             raise SystemExit(f"{name} declares a different 'pipelines': the plans disagree")
     for name, text in sorted(on_disk.items()):
         if name not in published:

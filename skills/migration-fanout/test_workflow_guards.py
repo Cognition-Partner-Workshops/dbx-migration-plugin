@@ -277,6 +277,10 @@ def test_preflight_halts_until_every_declared_sibling_pipeline_has_published_a_m
         {"batches": [B2], "pipelines": {"orders": 1, "payments": 1, "ledger": 2}})
     with pytest.raises(SystemExit, match="plans disagree"):
         check(tmp_path, manifest, published)
+    for junk in ("[]", "not json"):
+        published["wave-payments-1.json"] = junk
+        with pytest.raises(SystemExit, match="plans disagree"):
+            check(tmp_path, manifest, published)
     published["wave-payments-1.json"] = payments
     check(tmp_path, manifest, published)
     check(tmp_path, {}, published)
