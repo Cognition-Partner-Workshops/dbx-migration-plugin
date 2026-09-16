@@ -481,7 +481,14 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
     assert not [c for c in calls if c["kind"] == "agent"]
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
-    bounded = {"objects": [{**MAPPING["objects"][0], "root_where": "run_date = '${as_of}'",
+    tautology = {"objects": [{**MAPPING["objects"][0], "root_where": "1 = 1", "target_where": "1 = 1"}]}
+    ws, cwd = _workspace(tmp_path / "taut", other_waves={"wave-1.json": WAVE_1.replace("mig.t", "MIG.T")},
+                         mappings={"u": tautology})
+    proc, calls = _run(cwd, tmp_path / "taut", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "target_where" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    bounded = {"objects": [{**MAPPING["objects"][0], "object": "T", "root_where": "run_date = '${as_of}'",
                             "target_where": "run_date = '${as_of}'"}]}
     ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1}, mappings={"u": bounded})
     pr = _push_pr(ws)

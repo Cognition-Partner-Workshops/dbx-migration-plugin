@@ -1051,17 +1051,70 @@ def unit_mapping(unit):
         raise SystemExit(f"{p} is not valid JSON ({e})") from None
 
 
+def target_key(name):
+    """One identity for a table however a manifest or mapping spells it: trimmed, unquoted, case-folded
+    segments, so MIG.T, `mig`.`t` and mig.t are the same target while mig.t and other.t are not."""
+    return ".".join(re.sub(r'^[`"\[]|[`"\]]$', "", s.strip()).casefold() for s in str(name).strip().split("."))
+
+
+def reads_target(obj, table):
+    """A mapping object reads the target when it names it, or names its trailing segments (the harness
+    qualifies a bare object with the run's catalog and schema)."""
+    o, t = target_key(obj), target_key(table)
+    return bool(o) and (o == t or t.endswith("." + o))
+
+
+_SEGMENT = r'(?:[A-Za-z_][\w$]*|\[[^\]]+\]|"(?:[^"]|"")+"|`[^`]+`)'
+PREDICATE_TOKEN = re.compile(
+    r"\s+|(?P<string>'(?:[^']|'')*')|(?P<param>\$\{\w+\})|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    rf"|(?P<word>{_SEGMENT}(?:\.{_SEGMENT})*)|(?P<punct><>|!=|<=|>=|[=<>(),])")
+PREDICATE_WORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "true", "false"}
+
+
+def bounded_predicate(where):
+    """Whether a target_where can bound the rows recon reads: it tokenizes under the harness's predicate
+    grammar and every top-level OR branch compares a target column. `1 = 1`, TRUE, a literal-only or
+    parameter-only comparison, or `col = x OR 1 = 1` selects the whole table and is no bound."""
+    if not isinstance(where, str):
+        return False
+    tokens, pos = [], 0
+    while pos < len(where):
+        m = PREDICATE_TOKEN.match(where, pos)
+        if not m:
+            return False
+        if m.lastgroup:
+            tokens.append((m.lastgroup, m.group()))
+        pos = m.end()
+    branches, depth = [[]], 0
+    for kind, text in tokens:
+        depth += (text == "(") - (text == ")")
+        if depth == 0 and kind == "word" and text.lower() == "or":
+            branches.append([])
+        else:
+            branches[-1].append((kind, text))
+
+    def column(toks):
+        return any(k == "word" and t.lower() not in PREDICATE_WORDS
+                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")
+                   for i, (k, t) in enumerate(toks))
+
+    def compares(toks):
+        return any((k == "punct" and t not in "(),") or (k == "word" and t.lower() in ("is", "like", "in", "between"))
+                   for k, t in toks)
+
+    return bool(tokens) and all(b and column(b) and compares(b) for b in branches)
+
+
 def bounded_readers(spec, table):
-    """Whether every object in a mapping spec that reads `table` carries a non-empty target_where;
+    """Whether every object in a mapping spec that reads `table` carries a bounding target_where;
     None when the spec has no object for the table (or no object list at all)."""
     objects = spec.get("objects", spec.get("tables")) if isinstance(spec, dict) else None
     if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
         raise SystemExit("mapping spec 'objects' must be a list of object rows")
-    mine = [o for o in objects
-            if str(o.get("object") or o.get("target_table") or "").casefold() == table.casefold()]
+    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table)]
     if not mine:
         return None
-    return all(isinstance(o.get("target_where"), str) and o["target_where"].strip() for o in mine)
+    return all(bounded_predicate(o.get("target_where")) for o in mine)
 
 
 def check_write_targets(batches, other_waves, mapping=None):
@@ -1070,26 +1123,29 @@ def check_write_targets(batches, other_waves, mapping=None):
     undone by the later one's rows, so every mapping that reads it must be bounded (target_where to the
     unit's own partition or run date), or this wave does not launch."""
     mapping = unit_mapping if mapping is None else mapping
-    owners = {}
+    owners, spelled = {}, {}
     for b in batches:
         for t in b.get("write_targets", []):
-            if t in owners:
+            k = target_key(t)
+            if k in owners:
                 raise SystemExit(f"write-target collision before launch: '{t}' is claimed by "
-                                 f"{owners[t]} and {b['id']}. Fix the wave plan, then re-run.")
-            owners[t] = b["id"]
+                                 f"{owners[k]} and {b['id']}. Fix the wave plan, then re-run.")
+            owners[k], spelled[k] = b["id"], t
     elsewhere = {}
     for name, others in other_waves.items():
         for b in others:
             for t in b["write_targets"]:
-                elsewhere.setdefault(t, []).append((name, b))
-    for t, mine in owners.items():
-        if t not in elsewhere:
+                elsewhere.setdefault(target_key(t), []).append((name, b))
+    for k, mine in owners.items():
+        if k not in elsewhere:
             continue
+        t = spelled[k]
         batch = next(b for b in batches if b["id"] == mine)
-        shared = ", ".join(f"{name} {b['id']} (units {', '.join(b['units'])})" for name, b in elsewhere[t])
+        shared = ", ".join(f"{name} {b['id']} (units {', '.join(b['units'])})" for name, b in elsewhere[k])
         why = (f"shared write target '{t}' is written by {mine} in this wave and by {shared}; every mapping "
-               f"that reads it needs a non-empty target_where bounded to the unit's own partition or run date")
-        for wave, b in ((None, batch), *elsewhere[t]):
+               f"that reads it needs a target_where that compares a column of the table (the unit's own "
+               f"partition or run date; `1 = 1` and other predicates naming no column are no bound)")
+        for wave, b in ((None, batch), *elsewhere[k]):
             for u in b["units"]:
                 spec = mapping(u)
                 path = f".migration/units/{u}/mapping_spec.json"

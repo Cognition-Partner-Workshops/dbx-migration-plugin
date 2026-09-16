@@ -28,11 +28,12 @@ def _functions():
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
-                                      "unit_mapping", "bounded_readers"})
+                                      "unit_mapping", "bounded_readers", "target_key", "reads_target", "bounded_predicate"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
-                                                         "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED"}
+                                                         "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED", "_SEGMENT",
+                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent")}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
@@ -47,7 +48,8 @@ def _batch_runtime():
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
                                                                          "gate_outcomes", "ledger_waiver"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA", "DEFAULT_ACCEPTED"}
+                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
+                                                         "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS"}
                     for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
@@ -191,6 +193,49 @@ def test_shared_table_matches_tables_key_and_target_table_spelling():
     check([B1], {"wave-1.json": [B2]}, _specs(u1=legacy))
     with pytest.raises(SystemExit, match="target_where"):
         check([B1], {"wave-1.json": [B2]}, _specs(u1={"tables": [{"target_table": "MIG.T", "source_table": "dbo.t"}]}))
+
+
+def test_shared_table_is_the_same_table_whatever_its_case_or_quoting():
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"collision.*b-1.*b-2"):
+        check([B1, {**B2, "write_targets": ["MIG.T"]}], {}, _specs(u1=BOUNDED, u2=BOUNDED))
+    for other in ("MIG.T", "`mig`.`t`", " Mig.T "):
+        with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
+            check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=UNBOUNDED))
+        check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=BOUNDED))
+
+
+def test_bare_mapping_object_reads_the_qualified_target_but_schemas_stay_distinct():
+    check = _functions()["check_write_targets"]
+    bare = lambda where: {"objects": [{"object": "T", "root_table": "dbo.t", "key": ["id"], "target_where": where}]}
+    check([B1], {"wave-1.json": [B2]}, _specs(u1=bare("run_date = '${as_of}'")))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*target_where"):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1=bare("")))
+    with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1={"objects": [{"object": "other.t", "target_where": "id = 1"}]}))
+    with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1={"objects": [{"object": "ig.t", "target_where": "id = 1"}]}))
+    check([B1], {"wave-1.json": [{**B2, "write_targets": ["other.t"]}]}, _specs())
+
+
+@pytest.mark.parametrize("where", ["1 = 1", "1=1", "'a' = 'a'", "TRUE", "NOT (1 = 2)", "${as_of} = ${as_of}",
+                                   "DATE '2024-01-01' < DATE '2024-01-02'", "run_date = '${as_of}' OR 1 = 1",
+                                   "1 = 1 or (run_date = '${as_of}')", "x", "run_date = ; drop"])
+def test_target_where_that_names_no_target_column_is_not_a_bound(where):
+    check = _functions()["check_write_targets"]
+    spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1=spec))
+
+
+@pytest.mark.parametrize("where", ["run_date = '${as_of}'", "t.run_date = DATE '2024-01-01'", "batch_id IN (1, 2)",
+                                   "unit_id = 'u1' AND 1 = 1", "(region = 'eu' OR region = 'us') AND run_id = ${run}",
+                                   "[run date] = 1", '"Run"."Date" IS NOT NULL', "NOT deleted_at IS NULL",
+                                   "run_date BETWEEN '2024-01-01' AND '2024-01-31'"])
+def test_target_where_over_a_target_column_is_a_bound(where):
+    check = _functions()["check_write_targets"]
+    spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
+    check([B1], {"wave-1.json": [B2]}, _specs(u1=spec))
 
 
 def test_other_wave_manifests_reads_every_wave_but_the_current_and_fails_closed(tmp_path):
