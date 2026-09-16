@@ -274,8 +274,8 @@ def test_declared_gate_list_is_hashed_into_the_manifest():
         {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"])
 
 
-GATES_LEDGER = ("| D-12 | user:U1 waive g-w for u, export leg retired with the legacy feed |\n"
-                "| D-13 | user:U1 waive g-other for u |\n"
+GATES_LEDGER = ("| D-12 | user:U1 | waive g-w for u, export leg retired with the legacy feed |\n"
+                "| D-13 | user:U1 | waive g-other for u |\n"
                 f"| D-2 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n")
 
 
@@ -719,10 +719,10 @@ def test_pass_without_merge_evidence_is_downgraded(mode):
 
 # ---------------------------------------------------------------- merge authority (WS3.2)
 
-LEDGER = ("| D-6 | 2024-05-01 | user:U1 widen tolerance for orders_dim | \n"
-          "| D-7 | 2024-05-02 | user:U1 merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
-          "| D-8 | 2024-05-02 | default-accepted: merge_override for other_unit |\n"
-          "| D-70 | 2024-05-03 | user:U1 merge_override for u2 |\n")
+LEDGER = ("| D-6 | 2024-05-01 | user:U1 | widen tolerance for orders_dim | \n"
+          "| D-7 | 2024-05-02 | user:U1 | merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
+          "| D-8 | 2024-05-02 | default-accepted | merge_override for other_unit |\n"
+          "| D-70 | 2024-05-03 | user:U1 | merge_override for u2 |\n")
 
 
 def _ns_with_ledger(text=LEDGER):
@@ -788,12 +788,12 @@ def test_override_decision_row_must_name_every_unit_and_say_merge_override():
 
 def test_override_decision_row_names_units_in_its_text_not_in_its_metadata():
     override_decision = _batch_runtime()["override_decision"]
-    row = "| D-7 | 2024-05-02 | user:U1 merge_override for u |\n"
+    row = "| D-7 | 2024-05-02 | user:U1 | merge_override for u |\n"
     assert override_decision("D-7", ["u"], row)
     assert not override_decision("D-7", ["U1"], row)                 # the provenance id is not a unit
     assert not override_decision("D-7", ["2024-05-02"], row)         # nor the date
     assert not override_decision("D-7", ["u", "U1"], row)
-    assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 merge_override for u and v (feed gap) |")
+    assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 | merge_override for u and v (feed gap) |")
     # column order is the ledger author's: units before the marker count too
     assert override_decision("D-7", ["orders"], "| D-7 | units: orders | user:U1 | merge_override for an accepted feed gap |")
     assert override_decision("D-7", ["u", "v"], "| 2024-05-02T10:00:00Z | D-7 | u, v | user:U1 | merge_override |")
@@ -825,13 +825,29 @@ def test_override_decision_counts_a_unit_named_like_metadata_when_the_row_names_
     assert override_decision("D-9", ["default-accepted"], "| D-9 | user:evt-1 | merge_override for default-accepted |")
     assert not override_decision("D-9", ["D-7"], "| D-9 | D-7 | user:evt-1 | merge_override for u |")   # a cell that is only an id
     assert not override_decision("D-9", ["2026-09-16"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for u |")
-    assert not override_decision("D-9", ["evt-1"], "| D-9 | user:evt-1 merge_override for u |")
+    assert not override_decision("D-9", ["evt-1"], "| D-9 | user:evt-1 | merge_override for u |")
+
+
+def test_override_decision_provenance_is_a_cell_of_its_own_not_a_mention_in_the_text():
+    """Human provenance is the row's provenance cell, exactly `user:<id>`, as the STOP C row's is: a row whose
+    text mentions a user (default-accepted rows citing who asked, prose quoting an event id) is not a
+    human's decision, and a row with a default-accepted cell is the orchestrator's whatever else it says."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-7", ["u"], "| D-7 | 2024-05-02 | user:U1 merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted | merge_override for u, as user:U1 asked |")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted (soft) | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | D-7 user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | user:U1 said so | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 | user:U1 | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 |  user:U1  | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 | user:U1 | waive for u |", word="waive")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted | user:U1 waive for u |", word="waive")
 
 
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
     ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
-    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 merge_override for u, u2, u3 |\n"
+    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 | merge_override for u, u2, u3 |\n"
 
     def run(report):
         async def agent(prompt, **kwargs):
@@ -856,7 +872,7 @@ def test_override_decision_row_needs_human_provenance():
     assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "bot:"))
     assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "user"))
     assert not override_decision("D-7", ["u"], LEDGER.replace("user:U1", "user:"))      # user: with no event id
-    assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 merge", "user:a.b@x.io merge"))
+    assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 | merge", "user:a.b@x.io | merge"))
 
 
 def test_override_decision_marker_does_not_stand_in_for_a_unit_of_that_name():

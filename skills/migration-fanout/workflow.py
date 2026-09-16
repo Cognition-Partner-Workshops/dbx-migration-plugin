@@ -262,13 +262,14 @@ def ledger_rows(ledger):
 
 def override_decision(decision_id, units, ledger, word="merge_override"):
     """Whether the ledger holds the D-<n> row a human wrote for these units: the row whose id cell is that
-    id, with human provenance (`user:<id>`; a default-accepted row is the orchestrator's, not a human's),
-    the deciding word (merge_override past merge_eligible=false; waive for a gate) and the id of every
-    unit in the batch, in whatever column order the ledger keeps. Units are looked for in the row's text
-    cells only: a cell that is an id, a date or the provenance alone is about the row and is skipped, and
-    a provenance token inside a text cell is blanked, so none of those stands in for a unit the row did
-    not name, while a unit that happens to be called like one counts when the text names it; nor does
-    the deciding word stand in for a unit of that name (the row names it again)."""
+    id, whose provenance cell is a human's (exactly `user:<id>`, as the STOP C row's must be; a user
+    mentioned in the text is not the row's author, and a default-accepted cell makes the row the
+    orchestrator's), the deciding word (merge_override past merge_eligible=false; waive for a gate) and the
+    id of every unit in the batch, in whatever column order the ledger keeps. Units are looked for in the
+    row's text cells only: a cell that is an id, a date or the provenance alone is about the row and is
+    skipped, and a provenance token inside a text cell is blanked, so none of those stands in for a unit
+    the row did not name, while a unit that happens to be called like one counts when the text names it;
+    nor does the deciding word stand in for a unit of that name (the row names it again)."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
         return False
 
@@ -276,7 +277,8 @@ def override_decision(decision_id, units, ledger, word="merge_override"):
         return rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])"
 
     for row_id, cells in ledger_rows(ledger):
-        if row_id == decision_id and any(HUMAN_PROVENANCE.search(c) for c in cells):
+        if (row_id == decision_id and any(HUMAN_PROVENANCE.fullmatch(c) for c in cells)
+                and not any(DEFAULT_ACCEPTED.fullmatch(c) for c in cells)):
             text = " | ".join(HUMAN_PROVENANCE.sub(" ", c) for c in cells if not LEDGER_METADATA.fullmatch(c))
             need = Counter((word, *units))
             if all(len(re.findall(token(w), text)) >= n for w, n in need.items()):

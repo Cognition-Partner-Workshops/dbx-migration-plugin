@@ -180,7 +180,7 @@ def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_le
 
     waived = {"id": "g-export", "kind": "export_file", "status": "waived", "evidence": "", "decision_id": "D-4"}
     ws, cwd = _workspace(tmp_path / "waived", gates=[GATE, waived],
-                         decisions="| D-4 | user:U1 waive g-export for u, the downstream feed is retired |\n")
+                         decisions="| D-4 | user:U1 | waive g-export for u, the downstream feed is retired |\n")
     pr = _push_pr(ws)
     proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr), _verify_report()])
     assert proc.returncode == 0, proc.stderr
@@ -260,7 +260,7 @@ def test_a_default_accepted_stop_c_row_launches_only_a_soft_stop_mode_wave(tmp_p
 def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(tmp_path):
     ws, cwd = _workspace(tmp_path, doctor=False, gates=[GATE, {**GATE, "id": "g-w", "kind": "export_file",
                                                                  "status": "waived", "decision_id": "D-4"}],
-                         decisions="| D-4 | user:U1 waive g-w for u |\n")
+                         decisions="| D-4 | user:U1 | waive g-w for u |\n")
     results = tmp_path / "results.json"
 
     def run(reports):
@@ -473,7 +473,7 @@ def _verify_report(**extra):
 
 
 def test_merge_eligible_false_is_recorded_as_merged_only_by_a_ledger_override(tmp_path):
-    ledger = "| D-3 | user:U1 merge_override for u, watermark gap accepted |\n"
+    ledger = "| D-3 | user:U1 | merge_override for u, watermark gap accepted |\n"
     override = {"kind": "human_override", "decision_id": "D-3"}
     ws, cwd = _workspace(tmp_path, decisions=ledger)
     pr = _push_pr(ws)
@@ -488,7 +488,7 @@ def test_merge_eligible_false_is_recorded_as_merged_only_by_a_ledger_override(tm
     assert "D-3" in (ws / ".migration/waves/wave-0.brief.md").read_text()
     assert "D-3" in [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
 
-    ws, cwd = _workspace(tmp_path / "no_row", decisions="| D-3 | user:U1 widen tolerance for u |\n")
+    ws, cwd = _workspace(tmp_path / "no_row", decisions="| D-3 | user:U1 | widen tolerance for u |\n")
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "no_row", [_pass_report(pr, merge_eligible=False, merge_authority=override)])
     assert proc.returncode == 0, proc.stderr
@@ -513,7 +513,7 @@ def test_every_unit_of_the_batch_must_be_merge_eligible_in_its_own_result_json(t
     assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
     assert "u2" in batch["one_line_summary"] and "merge_authority" not in batch
 
-    ledger = "| D-3 | user:U1 merge_override for u, u2 |\n"
+    ledger = "| D-3 | user:U1 | merge_override for u, u2 |\n"
     override = {"kind": "human_override", "decision_id": "D-3"}
     ws, cwd = _workspace(tmp_path / "override", units=("u", "u2"), recon={"u": True, "u2": False}, decisions=ledger)
     pr = _push_pr(ws)
