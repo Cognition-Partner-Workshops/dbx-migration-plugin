@@ -273,7 +273,7 @@ def refresh_merged(mig: Path) -> None:
             capture_output=True,
             text=True,
         ).stdout.strip()
-        merged = dict(merged_record["merged"]) if merged_record is not None else {}
+        merged = {}
         for pr_url, pr_head in candidates:
             if _landed(repo, pr_head, f"origin/{base_branch}"):
                 merged[pr_url] = pr_head
