@@ -28,7 +28,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
                other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
-               deploy_objects=None):
+               deploy_objects=None, max_minutes=None, batch_max_minutes=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -70,6 +70,10 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     }
     if deploy_objects is not None:
         manifest["batches"][0]["deploy_objects"] = list(deploy_objects)
+    if max_minutes is not None:
+        manifest["max_minutes"] = max_minutes
+    if batch_max_minutes is not None:
+        manifest["batches"][0]["max_minutes"] = batch_max_minutes
     if namespace is not None:
         manifest["target_namespace"] = namespace
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
@@ -803,6 +807,33 @@ def test_start_launches_children_and_writes_the_result(tmp_path):
     assert "run_id must be null unless mode is resume" in proc2.stderr
     assert not [c for c in calls2 if c["kind"] == "agent"]
     assert not (ws2 / ".migration/waves/wave-0.run_id").exists()
+
+
+def _migrate_limit(calls):
+    register = [c for c in calls if c["kind"] == "register"][0]
+    return next(p for p in register["meta"]["phases"] if p["title"] == "migrate")["soft_time_limit_minutes"]
+
+
+def test_child_prompt_names_the_default_time_budget(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(), _verify_report()])
+    assert proc.returncode == 0
+    assert "Time budget: 45 minutes" in [c for c in calls if c.get("label") == "b-1"][0]["prompt"]
+    assert _migrate_limit(calls) == 45
+
+
+def test_batch_max_minutes_overrides_the_manifest_for_its_child(tmp_path):
+    ws, cwd = _workspace(tmp_path / "sixty", max_minutes=60)
+    proc, calls = _run(cwd, tmp_path / "sixty", [_pass_report(), _verify_report()])
+    assert proc.returncode == 0
+    assert "Time budget: 60 minutes" in [c for c in calls if c.get("label") == "b-1"][0]["prompt"]
+    assert _migrate_limit(calls) == 60
+
+    ws, cwd = _workspace(tmp_path / "thirty", max_minutes=60, batch_max_minutes=30)
+    proc, calls = _run(cwd, tmp_path / "thirty", [_pass_report(), _verify_report()])
+    assert proc.returncode == 0
+    assert "Time budget: 30 minutes" in [c for c in calls if c.get("label") == "b-1"][0]["prompt"]
+    assert _migrate_limit(calls) == 30
 
 
 def test_pointer_above_the_cwd_names_the_workspace(tmp_path):

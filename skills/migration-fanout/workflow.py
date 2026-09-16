@@ -33,7 +33,7 @@ Manifest shape (written by the plan playbook, read here):
   "width": 20,
   "breaker_threshold": 3,
   "auto_merge": false,
-  "child_minutes": 45,                        # soft time limit per child
+  "max_minutes": 45,                          # per-child session budget; a batch may override it
   "verify_depth": "sampled",                  # optional; verifier Tier 3 depth for the wave:
                                               # sampled (default) | full. Per-batch "verify_depth"
                                               # overrides it (plan sets full on D4/finance-critical).
@@ -60,6 +60,7 @@ Manifest shape (written by the plan playbook, read here):
      "deploy_objects": ["mig.load_orders"],   # optional; procedures, views, jobs the batch deploys (no DML writes
                                               #   them); each must also be in write_targets
      "verify_depth": "full",                  # optional per-batch override
+     "max_minutes": 30,                        # optional per-batch override
      "gates": [                               # required; the acceptance gates STOP C approved for these units
        {"id": "rows", "kind": "row_parity",  # kind: byte_compare | export_file | publish_leg | row_parity |
         "status": "pending", "evidence": ""},  #   structural | custom. status: pending | passed | failed | waived
@@ -413,7 +414,7 @@ def validate_manifest(m, doctor=None):
         raise SystemExit("manifest has no batches")
     if (isinstance(m["wave"], bool) or not isinstance(m["wave"], int) or m["wave"] < 0):
         raise SystemExit("manifest key 'wave' must be a non-negative integer")
-    for key in ("width", "breaker_threshold", "child_minutes"):
+    for key in ("width", "breaker_threshold", "max_minutes"):
         if key in m and (isinstance(m[key], bool) or not isinstance(m[key], int) or m[key] <= 0):
             raise SystemExit(f"manifest key '{key}' must be a positive integer")
     if m["wave"] == 0 and m.get("width", 20) != 1:
@@ -455,6 +456,9 @@ def validate_manifest(m, doctor=None):
                              "child deploys is a write target (it collides like any other)")
         if "verify_depth" in b and b["verify_depth"] not in VERIFY_DEPTHS:
             raise SystemExit(f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
+        if "max_minutes" in b and (isinstance(b["max_minutes"], bool)
+                                   or not isinstance(b["max_minutes"], int) or b["max_minutes"] <= 0):
+            raise SystemExit(f"batch {b['id']} max_minutes must be a positive integer")
         bad = [u for u in b["units"] if not isinstance(u, str) or not UNIT_ID.fullmatch(u)]
         if bad:
             raise SystemExit(f"batch {b['id']} unit id(s) {bad!r} are not a plain directory name (letters, digits, "
@@ -1464,19 +1468,24 @@ BATCHES = sorted(MANIFEST["batches"], key=lambda b: b["id"])
 WIDTH = int(MANIFEST.get("width", 20))
 BREAKER = int(MANIFEST.get("breaker_threshold", 3))
 AUTO_MERGE = bool(MANIFEST.get("auto_merge", False))
-CHILD_MINUTES = int(MANIFEST.get("child_minutes", 45))
+MAX_MINUTES = int(MANIFEST.get("max_minutes", 45))
 VERIFY_DEPTH = MANIFEST.get("verify_depth", "sampled")
 
 
 def batch_verify_depth(batch) -> str:
     return batch.get("verify_depth", VERIFY_DEPTH)
 
+
+def batch_max_minutes(batch) -> int:
+    return int(batch.get("max_minutes", MAX_MINUTES))
+
 META = {
     "name": f"smoke-wave-{WAVE}" if SMOKE else f"migration-wave-{WAVE}",
     "description": f"Wave {WAVE}: {len(BATCHES)} unit batches in parallel, then one independent verifier",
     "phases": [
         {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
-         "labels": [b["id"] for b in BATCHES], "soft_time_limit_minutes": CHILD_MINUTES},
+         "labels": [b["id"] for b in BATCHES],
+         "soft_time_limit_minutes": max(batch_max_minutes(b) for b in BATCHES)},
         {"title": "verify", "detail": "independent recon over the wave, merge green PRs",
          "count": 1, "soft_time_limit_minutes": 60},
     ],
@@ -1545,6 +1554,9 @@ def child_prompt(batch):
         f"Units: {json.dumps(batch['units'], sort_keys=True)}\n"
         f"Write targets you own (never write anywhere else): "
         f"{json.dumps(batch.get('write_targets', []), sort_keys=True)}\n"
+        f"Time budget: {batch_max_minutes(batch)} minutes. At the budget stop where you are and report "
+        f"status=BLOCKED with findings in one_line_summary (what landed, what did not, what blocked it); "
+        f"never grind past it.\n"
         f"Acceptance gates STOP C declared for these units (report each by id in gates as passed with the "
         f"evidence path, or failed; one you do not report fails the unit, the plan's status is what is expected, "
         f"not proof; a waived gate is the ledger's, not yours, and is not listed; never rename or re-kind a gate): "

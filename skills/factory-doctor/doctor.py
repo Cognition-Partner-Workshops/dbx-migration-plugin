@@ -1435,6 +1435,64 @@ def _norm_host(host: str) -> str:
     return re.sub(r"^https?://", "", host.strip().lower()).rstrip("/")
 
 
+SECRET_REF = re.compile(r"(?:\{\{\s*secrets/|\bsecrets/)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
+SECRET_GET = re.compile(r"""secrets\.get\(\s*(?:scope\s*=\s*)?["']([^"']+)["']\s*,\s*(?:key\s*=\s*)?["']([^"']+)["']""")
+
+def manifest_secret_names(manifest: dict) -> list[str]:
+    names, briefs = [], []
+    for b in manifest.get("batches", []):
+        if isinstance(b, dict):
+            names += list(b.get("secrets", []))
+            briefs.append(b.get("brief") or "")
+    names += list(manifest.get("secrets", []))
+    found = {n if isinstance(n, str) else str(n) for n in names}
+    for brief in briefs:
+        for rx in (SECRET_REF, SECRET_GET):
+            found.update(f"{scope}/{key}" for scope, key in rx.findall(str(brief)))
+    return sorted(found)
+
+
+def _list_secrets(scope: str) -> list[str] | None:
+    cli = shutil.which("databricks")
+    if not cli:
+        return None
+    rc, out, _err = _run([cli, "secrets", "list-secrets", scope, "--output", "json"], timeout=60)
+    if rc != 0:
+        return None
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    rows = payload.get("secrets") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return None
+    return [row["key"] for row in rows if isinstance(row, dict) and "key" in row]
+
+
+def check_named_secrets(names: list[str], list_secrets=None) -> Check:
+    cid = "named_secrets_exist"
+    data = {"checked": names, "missing": [], "unreadable_scopes": []}
+    if not names:
+        return Check(cid, "skipped",
+                     "no Databricks secret names referenced by the wave manifest or its briefs", data)
+    malformed = [n for n in names if not re.fullmatch(r"[^/\s]+/[^/\s]+", n)]
+    if malformed:
+        return Check(cid, "fail", f"not a scope/key secret name: {', '.join(malformed)}", data)
+    list_secrets = list_secrets or _list_secrets
+    keys = {scope: list_secrets(scope) for scope in {n.split("/", 1)[0] for n in names}}
+    data["unreadable_scopes"] = sorted(s for s, k in keys.items() if k is None)
+    data["missing"] = [n for n in names
+                       if keys[n.split("/", 1)[0]] is None or n.split("/", 1)[1] not in keys[n.split("/", 1)[0]]]
+    if data["missing"]:
+        detail = ("missing named secrets (STOP C blocker: create them before launch; values are never read): "
+                  + ", ".join(data["missing"]))
+        if data["unreadable_scopes"]:
+            detail += "; " + "; ".join(f"scope {s} not readable via `databricks secrets list-secrets`"
+                                       for s in data["unreadable_scopes"])
+        return Check(cid, "fail", detail, data)
+    return Check(cid, "ok", f"{len(names)} named secret(s) exist in {len(keys)} scope(s), names only", data)
+
+
 def check_databricks(expect_identity: str | None, expect_host: str | None = None) -> list[Check]:
     out: list[Check] = []
     cli = shutil.which("databricks")
@@ -1855,7 +1913,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         lakebase_parent_branch: str | None = None, lakebase_dsn: str | None = None,
         lakebase_schema: str | None = None, analytical_schema: str | None = None,
         source_attested: str | None = None, live_playbooks: Path | None = None,
-        target_kind: str = "databricks") -> dict:
+        target_kind: str = "databricks", secret_names: list[str] | None = None,
+        list_secrets=None) -> dict:
     checks: list[Check] = [
         _merge("workspace", [check_workspace(ws), check_stop_mode(ws)]),
         _merge("allowed_targets", [check_allowed_targets(ws, plugin_root),
@@ -1874,6 +1933,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
                                    plugin_root, params=params, attested=source_attested),
         check_dictionary_readable_all(ws, role, units or [], mappings or [], source_secret,
                                       source_family, plugin_root, params=params),
+        Check("named_secrets_exist", "skipped", "--no-databricks")
+            if no_databricks else check_named_secrets(secret_names or [], list_secrets),
     ]
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
@@ -1938,6 +1999,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mapping", type=Path, action="append", default=[], metavar="MAPPING_SPEC",
                    help="additional recon mapping_spec.json to verify (a candidate mapping at setup)")
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
+    p.add_argument("--secret", action="append", default=[], metavar="SCOPE/KEY",
+                   help="Databricks secret name a brief references; checked by name with "
+                        "`databricks secrets list-secrets`, value never read")
     p.add_argument("--source-family", choices=SOURCE_FAMILIES,
                    help="source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
     p.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks",
@@ -1988,6 +2052,7 @@ def main(argv: list[str] | None = None) -> int:
         a.source_family = source.get("family") if isinstance(source, dict) else None
         a.source_secret = source.get("secret") if isinstance(source, dict) else None
         a.param = [f"{k}={v}" for k, v in (source.get("params") or {}).items()] if isinstance(source, dict) else []
+        a.secret += manifest_secret_names(manifest)
 
     params = None
     if a.param:
@@ -2000,7 +2065,7 @@ def main(argv: list[str] | None = None) -> int:
                  a.expect_catalogs, a.source_family, a.expect_host, a.lakebase_project,
                  a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema, a.analytical_schema,
                  source_attested=a.source_attested, live_playbooks=a.live_playbooks,
-                 target_kind=a.target_kind)
+                 target_kind=a.target_kind, secret_names=a.secret)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:

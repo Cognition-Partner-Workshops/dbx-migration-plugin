@@ -106,6 +106,23 @@ def test_validate_manifest_rejects_invalid_positive_integer(value):
         validate_manifest(manifest)
 
 
+@pytest.mark.parametrize("value", [0, True, "3"])
+def test_validate_manifest_rejects_invalid_max_minutes(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="max_minutes"):
+        validate_manifest(_manifest(max_minutes=value))
+    batch_bad = _manifest()
+    batch_bad["batches"][0]["max_minutes"] = value
+    with pytest.raises(SystemExit, match="max_minutes"):
+        validate_manifest(batch_bad)
+
+
+def test_validate_manifest_accepts_a_batch_max_minutes_override():
+    m = _manifest()
+    m["batches"][0]["max_minutes"] = 30
+    _functions()["validate_manifest"](m)
+
+
 CAPS = {"identity": "sp-1", "catalogs": ["mig"], "ready": True, "guard_mode": "block", "stop_mode": "soft"}
 HOST = "https://adb-1.azuredatabricks.net"
 
@@ -1390,7 +1407,7 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
 
 def _prompt_ns(manifest):
     tree = ast.parse(WORKFLOW.read_text())
-    names = {"verify_prompt", "batch_verify_depth", "child_prompt", "capability_block",
+    names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
              "sum_cost", "cost_line"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
@@ -1398,7 +1415,8 @@ def _prompt_ns(manifest):
                     isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES"}
                     for t in node.targets))]
     ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "REPO": "repo", "MANIFEST": manifest,
-          "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled")}
+          "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
+          "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     return ns
 
