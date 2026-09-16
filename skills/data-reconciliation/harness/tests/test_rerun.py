@@ -4,6 +4,7 @@ The harness grades the two observed shapes against the shape the committed DDL d
 records `rerun_proof: {fresh, evolved}`; a failing run is `rerun_gap` and never merge-eligible."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from recon.rerun import (
     load_shape,
     normalize_type,
     rerun_gap,
+    rerun_missing,
 )
 from recon.tiers import TierResult
 
@@ -48,6 +50,7 @@ NEW_SHAPE = {"tables": {"orders": [
     {"name": "tags", "type": "array<struct<k:string,v:string>>", "nullable": True},
 ]}}
 OLD_SHAPE = {"tables": {"orders": NEW_SHAPE["tables"]["orders"][:2] + NEW_SHAPE["tables"]["orders"][3:]}}
+PRIOR = _check_shape({"tables": {"mig.sales.orders": OLD_SHAPE["tables"]["orders"]}}, "prior")
 NEW_SHAPE_QUALIFIED = {"tables": {"mig.sales.orders": NEW_SHAPE["tables"]["orders"]}}
 
 
@@ -152,6 +155,8 @@ def test_declared_shape_fails_closed_on_an_alter_it_cannot_apply(alter):
     "CREATE OR REPLACE TABLE derived USING DELTA AS SELECT id FROM anchor",
     "CREATE TABLE IF NOT EXISTS derived LIKE anchor",
     "CREATE TABLE derived (LIKE anchor INCLUDING ALL)",
+    "CREATE TABLE derived (local_id BIGINT, LIKE anchor INCLUDING ALL)",
+    "CREATE TABLE derived (local_id BIGINT, CONSTRAINT pk PRIMARY KEY (local_id), LIKE anchor)",
 ])
 def test_declared_shape_fails_closed_on_a_create_table_without_a_column_list(create):
     """CTAS and LIKE create a table whose columns the parser cannot derive; letting them fall
@@ -226,8 +231,10 @@ def test_load_record_requires_every_key_and_a_known_status(tmp_path):
 def test_fresh_and_evolved_both_pass_when_both_runs_land_the_declared_shape():
     expected = declared_shape(DDL)
     out = grade_rerun(expected, _record("fresh", NEW_SHAPE),
-                      _record("evolved", NEW_SHAPE, pre_shape=OLD_SHAPE, evidence="job-run/2"))
+                      _record("evolved", NEW_SHAPE, pre_shape=OLD_SHAPE, evidence="job-run/2"),
+                      prior=PRIOR)
     assert out["fresh"] == "pass" and out["evolved"] == "pass"
+    assert out["prior_digest"] == expected_digest(PRIOR)
     assert out["findings"] == [] and out["passed"] is True
     assert out["evidence"] == {"fresh": "job-run/1", "evolved": "job-run/2"}
     assert out["tables"] == ["mig.sales.orders"]
@@ -238,7 +245,7 @@ def test_fresh_and_evolved_both_pass_when_both_runs_land_the_declared_shape():
 def test_create_if_not_exists_on_an_old_shape_table_is_the_canonical_evolved_failure():
     expected = declared_shape(DDL)
     out = grade_rerun(expected, _record("fresh", NEW_SHAPE),
-                      _record("evolved", OLD_SHAPE, pre_shape=OLD_SHAPE))
+                      _record("evolved", OLD_SHAPE, pre_shape=OLD_SHAPE), prior=PRIOR)
     assert out["fresh"] == "pass" and out["evolved"] == "fail" and out["passed"] is False
     assert out["findings"] == [{"run": "evolved", "table": "mig.sales.orders", "check": "column_missing",
                                 "column": "channel", "detail": "declared string, absent after the run"}]
@@ -286,7 +293,7 @@ def test_column_order_drift_is_a_finding():
     cols = NEW_SHAPE["tables"]["orders"]
     reordered = {"tables": {"orders": [cols[0], cols[1], cols[3], cols[2]]}}
     out = grade_rerun(expected, _record("fresh", NEW_SHAPE),
-                      _record("evolved", reordered, pre_shape=OLD_SHAPE))
+                      _record("evolved", reordered, pre_shape=OLD_SHAPE), prior=PRIOR)
     assert out["fresh"] == "pass" and out["evolved"] == "fail"
     assert out["findings"] == [{"run": "evolved", "table": "mig.sales.orders", "check": "column_order",
                                 "column": None,
@@ -301,6 +308,10 @@ def test_check_proof_rejects_contradictory_or_malformed_artifacts():
     good = {"unit": "u", "fresh": "pass", "evolved": "unsupported", "passed": True, "findings": [],
             "notes": [], "evidence": {"fresh": "job/1"}, "unsupported_reason": "no evolved record",
             "expected_digest": DIGEST}
+    ran = {**good, "evolved": "pass", "evidence": {"fresh": "j/1", "evolved": "j/2"},
+           "prior_digest": expected_digest(PRIOR)}
+    del ran["unsupported_reason"]
+    assert check_proof(ran, "u", "x", DIGEST) == ran
     assert check_proof(good, "u", "x", DIGEST) == good
     with pytest.raises(ConfigError, match="stale"):
         check_proof(good, "u", "x", expected_digest(load_shape_dict(OLD_SHAPE)))
@@ -327,13 +338,15 @@ def test_check_proof_rejects_contradictory_or_malformed_artifacts():
                        "column": "c", "detail": "d"}]},
         {**good, "findings": [{"run": "warm", "table": "t", "check": "x", "column": None,
                               "detail": "d"}]},                         # unknown leg
+        {k: v for k, v in ran.items() if k != "prior_digest"},       # evolved pass, no prior shape
+        {**ran, "prior_digest": ""},
     ]
     for proof in bad:
         with pytest.raises(ConfigError):
             check_proof(proof, "u", "x", DIGEST)
     failed = {**good, "evolved": "fail", "passed": False, "evidence": {"fresh": "j/1", "evolved": "j/2"},
               "findings": [{"run": "evolved", "table": "t", "check": "job_failed", "column": None,
-                            "detail": "d"}]}
+                            "detail": "d"}]}  # a failed job needs no prior shape to be a failure
     del failed["unsupported_reason"]
     assert check_proof(failed, "u", "x", DIGEST) == failed
 
@@ -369,8 +382,51 @@ def test_the_proof_carries_a_digest_of_the_shape_it_graded_against():
     expected = declared_shape(DDL)
     out = grade_rerun(expected, _record("fresh", NEW_SHAPE), None)
     assert out["expected_digest"] == expected_digest(expected)
-    assert expected_digest(expected) == expected_digest(load_shape_dict(NEW_SHAPE_QUALIFIED))
     assert expected_digest(expected) != expected_digest(load_shape_dict(OLD_SHAPE))
+    assert expected_digest(load_shape_dict(NEW_SHAPE_QUALIFIED)) != expected_digest(load_shape_dict(OLD_SHAPE))
+
+
+def test_the_digest_binds_the_ddl_text_not_only_the_shape_it_lands():
+    """Idempotency is a property of the statements, not of the columns they leave behind: dropping
+    the ADD COLUMN that makes IF NOT EXISTS safe leaves the shape (and a shape-only digest) intact,
+    so `run` would accept the old proof for a job that no longer evolves the table."""
+    safe = DDL + "ALTER TABLE mig.sales.orders ADD COLUMN IF NOT EXISTS channel STRING;"
+    assert declared_shape(safe)["tables"] == declared_shape(DDL)["tables"]
+    assert expected_digest(declared_shape(safe)) != expected_digest(declared_shape(DDL))
+    assert expected_digest(declared_shape(DDL)) != expected_digest(load_shape_dict(NEW_SHAPE_QUALIFIED))
+    respaced = "/* note */ " + re.sub(r"\s+", " ", DDL.split("\n", 2)[2]).replace("; ", ";\n\n")
+    assert expected_digest(declared_shape(respaced)) == expected_digest(declared_shape(DDL))
+
+
+def test_the_evolved_leg_needs_the_prior_committed_shape_and_the_pre_shape_must_equal_it():
+    """`pre_shape != declared` only proves something differed; the leg is evolution only when the
+    table started in the previous committed shape, so that shape is an input and pre_shape must
+    match it exactly."""
+    expected = declared_shape(DDL)
+    evolved = _record("evolved", NEW_SHAPE, pre_shape=OLD_SHAPE)
+    out = grade_rerun(expected, _record("fresh", NEW_SHAPE), evolved)
+    assert out["evolved"] == "unsupported" and out["findings"] == [] and "prior_digest" not in out
+    assert out["unsupported_reason"] == ("no prior shape: pass --prior-ddl or --prior-shape (the previous "
+                                         "committed shape) so the evolved leg can be checked against it")
+    drifted = {"tables": {"orders": [dict(NEW_SHAPE["tables"]["orders"][0]),
+                                     {"name": "amount", "type": "double", "nullable": True},
+                                     *NEW_SHAPE["tables"]["orders"][2:]]}}
+    out = grade_rerun(expected, _record("fresh", NEW_SHAPE),
+                      _record("evolved", NEW_SHAPE, pre_shape=drifted), prior=PRIOR)
+    assert out["evolved"] == "unsupported" and out["prior_digest"] == expected_digest(PRIOR)
+    assert out["unsupported_reason"].startswith("evolved pre_shape is not the prior committed shape")
+    assert "channel" in out["unsupported_reason"] and "amount" in out["unsupported_reason"]
+    out = grade_rerun(expected, _record("fresh", NEW_SHAPE), evolved, prior=PRIOR)
+    assert out["evolved"] == "pass" and out["prior_digest"] == expected_digest(PRIOR)
+
+
+def test_alter_table_with_several_add_column_actions_adds_each_and_refuses_other_actions():
+    shape = declared_shape("CREATE TABLE t (a INT); ALTER TABLE t ADD COLUMN b INT, "
+                           "ADD COLUMN IF NOT EXISTS c STRING NOT NULL, ADD d INT AFTER a;")
+    assert [(c["name"], c["type"], c["nullable"]) for c in shape["tables"]["t"]] == [
+        ("a", "int", True), ("d", "int", True), ("b", "int", True), ("c", "string", False)]
+    with pytest.raises(ConfigError, match=r"DROP COLUMN a.*--expected-shape"):
+        declared_shape("CREATE TABLE t (a INT); ALTER TABLE t ADD COLUMN b INT, DROP COLUMN a;")
 
 
 def test_a_fresh_record_is_required_and_the_run_label_must_match():
@@ -394,9 +450,16 @@ def _ok():
     return TierResult(tier=1, name="row_counts", passed=True, checks_run=1, findings=[], stats={})
 
 
-def test_build_result_records_the_proof_and_blocks_on_rerun_gap():
+def test_a_result_without_a_rerun_proof_is_not_merge_eligible():
+    """Every migrated unit writes its tables, so no proof is a missing control, not a clean one:
+    result.json records null and blocks under `rerun_missing`."""
     r = build_result("u", "live", "m1", "t1", [_ok()])
-    assert r["rerun_proof"] is None and r["merge_eligible"] is True
+    assert r["rerun_proof"] is None and r["merge_eligible"] is False
+    assert r["merge_block_reasons"] == ["rerun_missing"]
+    assert rerun_missing(None) is True and rerun_missing({"fresh": "pass"}) is False
+
+
+def test_build_result_records_the_proof_and_blocks_on_rerun_gap():
     proof = {"fresh": "pass", "evolved": "pass", "passed": True, "findings": []}
     r = build_result("u", "live", "m1", "t1", [_ok()], rerun_proof=proof)
     assert r["rerun_proof"] == proof and r["merge_eligible"] is True and r["merge_block_reasons"] == []
@@ -444,11 +507,14 @@ def test_run_recon_carries_the_proof_into_result_json(tmp_path):
 
 def test_fixture_is_the_canonical_failing_case(tmp_path, capsys):
     rc = cli.main(["rerun-proof", "--unit", "orders", "--ddl", str(FIXTURE / "ddl.sql"),
+                   "--prior-ddl", str(FIXTURE / "prior_ddl.sql"),
                    "--fresh", str(FIXTURE / "fresh.json"), "--evolved", str(FIXTURE / "evolved.json"),
                    "--out", str(tmp_path)])
     assert rc == 1
     out = json.loads((tmp_path / "rerun_proof.json").read_text())
     assert out["unit"] == "orders" and out["fresh"] == "pass" and out["evolved"] == "fail"
+    assert out["prior_digest"] == expected_digest(declared_shape((FIXTURE / "prior_ddl.sql").read_text()))
+    assert out["prior_from"] == str(FIXTURE / "prior_ddl.sql")
     assert out["findings"][0]["check"] == "column_missing"
     assert json.loads(capsys.readouterr().out)["evolved"] == "fail"
     prior = (FIXTURE / "prior_ddl.sql").read_text()
@@ -523,9 +589,12 @@ def test_run_reads_a_rerun_proof_file_and_refuses_a_malformed_one(tmp_path, monk
     ddl.write_text(DDL + "\nALTER TABLE mig.sales.orders ADD COLUMN region STRING;\n")
     with pytest.raises(SystemExit, match="stale"):
         cli.main(args)
+    # a DDL-graded proof is bound to that DDL's text; the same columns from a shape file are
+    # another expected shape, so `run` must be given what rerun-proof was given
     shape = tmp_path / "expected.json"
     shape.write_text(json.dumps(NEW_SHAPE_QUALIFIED))
-    assert cli.main(base + ["--rerun-expected-shape", str(shape)]) == 0
+    with pytest.raises(SystemExit, match="stale"):
+        cli.main(base + ["--rerun-expected-shape", str(shape)])
     proof.write_text(json.dumps({"fresh": "pass"}))
     with pytest.raises(SystemExit, match="rerun-proof"):
         cli.main(args)
@@ -624,3 +693,55 @@ def test_add_column_first_and_after_place_the_column_and_leave_its_type_clean():
         ("b", "string", True), ("e", "decimal(10,2)", False)]
     with pytest.raises(ConfigError, match="AFTER zz"):
         declared_shape("CREATE TABLE t (a INT); ALTER TABLE t ADD COLUMN c INT AFTER zz;")
+
+
+class _QueuedConn(_StubConn):
+    """A stub whose successive fetches answer from a queue (one answer per statement)."""
+
+    def __init__(self, answers):
+        super().__init__([])
+        self.answers = list(answers)
+
+    def cursor(self):
+        cur, conn = super().cursor(), self
+
+        class Cur:
+            def execute(self, sql, params=()):
+                cur.execute(sql, params)
+                conn.rows = conn.answers.pop(0)
+
+            def fetchall(self):
+                return conn.rows
+        return Cur()
+
+
+def test_shape_keeps_an_existing_zero_column_table_as_an_empty_list(monkeypatch, tmp_path):
+    """`CREATE TABLE markers ()` is legal on Postgres and declared_shape records it as `[]`; the
+    shape reader must tell that table apart from an absent one by asking the catalog whether the
+    table exists, not by counting its columns."""
+    from recon import adapters
+    conn = _QueuedConn([[], [("markers",)]])
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
+    out = tmp_path / "shape.json"
+    cli.main(["shape", "--target-kind", "databricks", "--target-secret", "D", "--target-catalog", "mig",
+              "--target-schema", "sales", "--table", "markers", "--out", str(out)])
+    assert json.loads(out.read_text())["tables"] == {"markers": []}
+    assert "information_schema.tables" in conn.executed[-1][0]
+
+
+def test_lakebase_target_table_exists_asks_pg_class(monkeypatch):
+    psycopg = pytest.importorskip("psycopg")
+    from recon import adapters
+    monkeypatch.setenv("T", "dsn-under-test")
+    conn = _StubConn([("db",)])
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: conn)
+    target = adapters.LakebaseTargetAdapter("T", "db", "sales")
+    conn.rows = [(1,)]
+    assert target.table_exists("markers") is True
+    sql, params = conn.executed[-1]
+    assert "pg_class" in sql and params == ("sales", "markers")
+    conn.rows = []
+    assert target.table_exists("gone") is False

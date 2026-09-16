@@ -22,6 +22,11 @@ _NUMERIC = (int, float, decimal.Decimal)
 _OPS = {" >= ": operator.ge, " > ": operator.gt, " <= ": operator.le, " < ": operator.lt}
 
 
+# a rerun proof with both legs passed: tests of other controls need one, since a result without a
+# proof blocks under `rerun_missing`
+PROVEN_RERUN = {"fresh": "pass", "evolved": "pass", "passed": True, "findings": []}
+
+
 def _agg_of(vals: list) -> dict[str, Any]:
     nn = [v for v in vals if v is not None]
     nums = [v for v in nn if isinstance(v, _NUMERIC) and not isinstance(v, bool)]

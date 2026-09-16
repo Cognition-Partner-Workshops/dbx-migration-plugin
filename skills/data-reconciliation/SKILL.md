@@ -101,22 +101,24 @@ provenance warning and the run is not merge-eligible.
   tier has findings or unverifiable objects. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
-- Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --ddl <unit ddl> --fresh
-  <record> --evolved <record> --out <dir>` grades the idempotency job twice from two run
+- Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --ddl <unit ddl> --prior-ddl
+  <previous committed ddl> --fresh <record> --evolved <record> --out <dir>` grades the idempotency job twice from two run
   records (`dbx-recon shape` reads a target's observed columns, read-only): once on a fresh
   target, once against the table pre-created in its previous committed shape (git history or
   the prior wave's DDL; `harness/fixtures/example_rerun/` is the canonical failing case, a
   `CREATE TABLE IF NOT EXISTS` that never lands the new column). `rerun_proof.json` carries
   `{fresh: pass|fail, evolved: pass|fail|unsupported, findings}`; without an evolved record,
-  or when the pre-created shape equals the declared one, `evolved` is `unsupported` with the
-  reason, never clean; a reordered column is a `column_order` finding. The DDL parser applies
+  without `--prior-ddl`/`--prior-shape`, or when the pre-created shape equals the declared one
+  or differs from the prior one, `evolved` is `unsupported` with the reason, never clean; a reordered column is a `column_order` finding. The DDL parser applies
   `CREATE TABLE (columns)` and `ALTER TABLE ... ADD COLUMN(S)` (with `FIRST` / `AFTER`) only and refuses any other
   `ALTER TABLE`, `CREATE TABLE ... AS SELECT` or `LIKE` (use `--expected-shape`); `shape` refuses a
   table the target does not have rather than recording it empty. `run --rerun-proof <file> --rerun-ddl <unit ddl>` (or
   `--rerun-expected-shape`) copies it into `result.json` after checking its `expected_digest`
-  against the shape the unit declares now (a proof from an older DDL is stale and refused); a
+  against the DDL the unit declares now (shape and statements: a proof from an older DDL, or one
+  graded from a shape file, is stale and refused); a
   failed leg adds `rerun_gap` to `merge_block_reasons`, an unsupported evolved leg adds
-  `rerun_unsupported`, and either sets `merge_eligible=false`.
+  `rerun_unsupported`, a `run` without `--rerun-proof` adds `rerun_missing` (every migrated unit
+  writes its tables, so no proof is a missing control), and any of them sets `merge_eligible=false`.
 - Fixture shape (wave 0): `dbx-recon fixture-shape --family <f> --mapping <spec>
   --source-dsn-secret <NAME> --fixture-dsn-secret <NAME> --source-statement-cap <n> --out <dir>`
   compares the fixture copy with the real source per mapped table: column names, types (after

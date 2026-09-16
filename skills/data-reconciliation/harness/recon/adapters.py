@@ -1462,6 +1462,14 @@ class DatabricksTargetAdapter:
         return [{"name": str(name).lower(), "type": normalize_type(dtype),
                  "nullable": str(nullable).upper() != "NO"} for name, dtype, nullable, _ in rows]
 
+    def table_exists(self, object: str) -> bool:
+        """Catalog check that tells an absent table from one with no columns."""
+        rows = self._sql._rows(
+            f"SELECT table_name FROM {quote_ident(self._catalog, '`')}.information_schema.tables "
+            "WHERE table_catalog = %(catalog)s AND table_schema = %(schema)s AND table_name = %(table)s",
+            {"catalog": self._catalog, "schema": self._schema, "table": object})
+        return bool(rows)
+
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
         return self._sql.table_aggregates(self._q(object), columns, numeric, where)
@@ -1880,6 +1888,13 @@ class LakebaseTargetAdapter(_PostgresBase):
     def column_shape(self, object: str) -> list[dict[str, Any]]:
         """Observed columns in declared order for the rerun proof (recon.rerun)."""
         return self._pg_column_shape(self._schema, object)
+
+    def table_exists(self, object: str) -> bool:
+        """Catalog check that tells an absent table from one with no columns."""
+        rows = self._rows(
+            "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s", (self._schema, object))
+        return bool(rows)
 
     def null_key_count(self, object: str, key_fields: list[str], where: str | None = None) -> int:
         return super().null_key_count(self._q(object), key_fields, where)

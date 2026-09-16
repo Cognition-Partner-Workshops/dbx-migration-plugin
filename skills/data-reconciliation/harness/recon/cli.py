@@ -208,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="the unit's committed DDL; the shape it declares is what both runs must land")
     rp.add_argument("--expected-shape", type=Path,
                     help="shape JSON instead of --ddl when the DDL is generated at run time")
+    rp.add_argument("--prior-ddl", type=Path,
+                    help="the previous committed DDL (git history or the prior wave); the evolved "
+                         "run's pre_shape must equal the shape it declares")
+    rp.add_argument("--prior-shape", type=Path, help="shape JSON instead of --prior-ddl")
     rp.add_argument("--fresh", required=True, type=Path,
                     help="run record from the fresh-target run (dbx-recon shape after the job)")
     rp.add_argument("--evolved", type=Path,
@@ -348,16 +352,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "rerun-proof":
         if (args.ddl is None) == (args.expected_shape is None):
             raise SystemExit("rerun-proof needs exactly one of --ddl or --expected-shape")
+        if args.prior_ddl is not None and args.prior_shape is not None:
+            raise SystemExit("rerun-proof takes --prior-ddl or --prior-shape, not both")
         try:
             if args.ddl is not None:
                 expected = declared_shape(args.ddl.read_text())
             else:
                 expected = load_shape(args.expected_shape)
+            prior = (declared_shape(args.prior_ddl.read_text()) if args.prior_ddl is not None
+                     else load_shape(args.prior_shape) if args.prior_shape is not None else None)
             proof = grade_rerun(expected, load_record(args.fresh, "fresh"),
-                                load_record(args.evolved, "evolved") if args.evolved else None)
+                                load_record(args.evolved, "evolved") if args.evolved else None, prior)
         except (OSError, ConfigError) as exc:
             raise SystemExit(f"rerun-proof: {exc}") from None
-        proof = {"unit": args.unit, "expected_from": str(args.ddl or args.expected_shape), **proof}
+        proof = {"unit": args.unit, "expected_from": str(args.ddl or args.expected_shape),
+                 **({"prior_from": str(args.prior_ddl or args.prior_shape)} if prior is not None else {}),
+                 **proof}
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / "rerun_proof.json").write_text(json.dumps(proof, indent=2) + "\n")
         print(json.dumps(proof))
@@ -412,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
             tables = {_single_identifier(t, "table"): target.column_shape(t) for t in args.table}
-            absent = [t for t, cols in tables.items() if not cols]
+            absent = [t for t, cols in tables.items() if not cols and not target.table_exists(t)]
             if absent:
                 raise ConfigError(f"table {', '.join(absent)} not found in {target_catalog}.{target_schema}; "
                                   "a shape read before the run must name tables that exist "
