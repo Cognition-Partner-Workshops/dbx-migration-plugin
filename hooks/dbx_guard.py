@@ -130,8 +130,7 @@ _DECISION_ROW = re.compile(r"(?m)^\s*(?:\|\s*|#{1,6}\s*)?(D-[A-Za-z0-9][\w.-]*)\
 _DECISION_ID = re.compile(r"D-[A-Za-z0-9][\w.-]*")
 _WRITE_OBJECT = re.compile(
     r"(?is)^\s*(?:DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|UPDATE(?:\s+TOP\s*\([^)]*\)(?:\s+PERCENT)?|\s+STATISTICS|\s+(?:ONLY|LOW_PRIORITY|IGNORE))*|TRUNCATE(?:\s+TABLE)?|"
-    r"DROP\s+INDEX(?:\s+IF\s+EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
-    r"DROP\s+(?!INDEX\b)\w+(?:\s+IF\s+EXISTS)?|"
+    r"DROP\s+\w+(?:\s+IF\s+EXISTS)?|"
     r"CREATE(?:\s+\w+)*?\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
     r"CREATE(?:\s+OR\s+REPLACE)?\s+(?:\w+\s+)*?"
     r"(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
