@@ -1284,7 +1284,8 @@ def check_write_targets(batches, other_waves, mapping=None, namespace=""):
 
 def unit_dependencies(unit):
     """The unit's dependency analysis ({routine, reads, writes, calls} rows, shape in the source-dialect
-    skill), None when the dialect emits none. Anything else is a halt."""
+    skill; an empty list for a unit that converts no routine), None when the dialect emits none. Anything
+    else is a halt."""
     p = ROOT / ".migration" / "units" / unit / "dependencies.json"
     if not p.is_file():
         return None
@@ -1293,12 +1294,12 @@ def unit_dependencies(unit):
     except ValueError as e:
         raise SystemExit(f"{p} is not valid JSON ({e})") from None
     rows = data.get("routines") if isinstance(data, dict) else None
-    if not isinstance(rows, list) or not rows or not all(
+    if not isinstance(rows, list) or not all(
             isinstance(r, dict) and isinstance(r.get("routine"), str) and r["routine"]
             and all(isinstance(r.get(k), list) and all(isinstance(t, str) and t for t in r[k])
                     for k in ("reads", "writes", "calls"))
             for r in rows):
-        raise SystemExit(f"{p} needs a non-empty 'routines' list of {{routine, reads, writes, calls}} rows "
+        raise SystemExit(f"{p} needs a 'routines' list of {{routine, reads, writes, calls}} rows "
                          "(string name, lists of names)")
     names = Counter(r["routine"].casefold() for r in rows)
     if any(n > 1 for n in names.values()):
@@ -1308,9 +1309,9 @@ def unit_dependencies(unit):
 
 def transitive_writes(routines, resolve=None):
     """Every table written by the routines or anything they call, transitively, each through `resolve(row,
-    table)` (the source name itself by default). A callee the analysis does not cover means unknown
-    writes, so it halts."""
-    resolve = resolve or (lambda r, t: target_key(t))
+    table)` -> the set of targets it is (the source name itself by default). A callee the analysis does
+    not cover means unknown writes, so it halts."""
+    resolve = resolve or (lambda r, t: {target_key(t)})
     by_name = {r["routine"].casefold(): r for r in routines}
     seen, writes = set(), set()
     todo = list(by_name)
@@ -1320,7 +1321,8 @@ def transitive_writes(routines, resolve=None):
             continue
         seen.add(name)
         r = by_name[name]
-        writes.update(resolve(r, t) for t in r["writes"])
+        for t in r["writes"]:
+            writes |= resolve(r, t)
         for callee in r["calls"]:
             if callee.casefold() not in by_name:
                 raise SystemExit(f"routine {r['routine']} calls {callee}, which the dependency analysis does not cover, "
@@ -1330,14 +1332,13 @@ def transitive_writes(routines, resolve=None):
 
 
 def mapped_target(spec, table, namespace=""):
-    """The target the unit's mapping spec gives a source table (the object whose root_table or
-    source_table it is), None when no object names it."""
+    """The targets the unit's mapping spec gives a source table: every object whose root_table or
+    source_table it is (one legacy table can feed several), empty when no object names it."""
     k = target_key(table)
     objects = (spec.get("objects") or spec.get("tables") or []) if isinstance(spec, dict) else []
-    for o in objects if isinstance(objects, list) else []:
-        if isinstance(o, dict) and target_key(o.get("root_table") or o.get("source_table") or "") == k:
-            return target_key(o.get("object") or o.get("target_table") or "", namespace)
-    return None
+    return {target_key(o.get("object") or o.get("target_table") or "", namespace)
+            for o in (objects if isinstance(objects, list) else [])
+            if isinstance(o, dict) and target_key(o.get("root_table") or o.get("source_table") or "") == k}
 
 
 def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
@@ -1350,7 +1351,9 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
     collision check; a declared table nothing writes hides a dropped step. Either halts. With a unit
     the dialect did not analyse in the batch only the first check is possible (its targets are
     indistinguishable from extras). No declared targets is allowed only when every unit is analysed
-    and the graph writes nothing."""
+    and the graph writes nothing. The routines nothing else in the batch calls are its entry points and
+    ship as deployed objects: each must be in deploy_objects by its trailing name (a callee may be
+    inlined into its caller); one that is not is the same mismatch as an undeclared table."""
     analysis = unit_dependencies if analysis is None else analysis
     mapping = unit_mapping if mapping is None else mapping
     for b in batches:
@@ -1374,12 +1377,12 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
         def resolve(r, t):
             u = owner[r["routine"].casefold()]
             if specs[u] is None:
-                return target_key(t, namespace)
-            target = mapped_target(specs[u], t, namespace)
-            if target is None:
+                return {target_key(t, namespace)}
+            targets = mapped_target(specs[u], t, namespace)
+            if not targets:
                 raise SystemExit(f"unit {u}'s routine {r['routine']} writes '{t}', which no object of its "
                                  "mapping_spec.json has as root_table, so its target is unknown")
-            return target
+            return targets
 
         try:
             actual = transitive_writes(routines, resolve)
@@ -1396,6 +1399,14 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
             raise SystemExit(f"batch {b['id']}: declared write_targets differ from the call graph's transitive writes; "
                              f"missing from the declaration: {sorted(actual - declared) or '-'}; "
                              f"extra in the declaration: {extra or '-'}. Fix the wave plan, then re-run.")
+        called = {c.casefold() for r in routines for c in r["calls"]}
+        deployed = {d.rsplit(".", 1)[-1] for d in deploy}
+        undeclared = sorted(r["routine"] for r in routines if r["routine"].casefold() not in called
+                            and target_key(r["routine"]).rsplit(".", 1)[-1] not in deployed)
+        if undeclared:
+            raise SystemExit(f"batch {b['id']}: analysed routine(s) {undeclared} are entry points nothing in the batch "
+                             "calls, so the unit deploys them, but deploy_objects has no object of that name. "
+                             "Fix the wave plan, then re-run.")
 
 
 def child_prompt(batch):

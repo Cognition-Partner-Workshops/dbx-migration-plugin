@@ -555,11 +555,17 @@ def test_declared_write_targets_must_equal_the_call_graphs_transitive_writes(tmp
     assert not [c for c in calls if c["kind"] == "agent"]
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
-    ws, cwd = _workspace(tmp_path / "same", dependencies={"u": _analysis("MIG.T")})
+    ws, cwd = _workspace(tmp_path / "same", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
+                         deploy_objects=("mig.run",))
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "same", [_pass_report(pr), _verify_report()])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "undeployed", dependencies={"u": _analysis("MIG.T")})
+    proc, calls = _run(cwd, tmp_path / "undeployed", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "['app.run']" in proc.stderr and "deploy_objects" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def test_call_graph_writes_are_compared_as_the_mapping_specs_target_names(tmp_path):
@@ -623,11 +629,16 @@ def test_read_only_batch_declares_no_targets_only_with_an_analysis_that_writes_n
     assert proc.returncode != 0 and "b-1" in proc.stderr and "write_targets" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
-    ws, cwd = _workspace(tmp_path / "ro", write_targets=(), dependencies={"u": _analysis()})
+    ws, cwd = _workspace(tmp_path / "ro", write_targets=(), dependencies={"u": json.dumps({"routines": []})})
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "ro", [_pass_report(pr, write_targets=[]), _verify_report()])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "view", write_targets=(), dependencies={"u": _analysis()})
+    proc, calls = _run(cwd, tmp_path / "view", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "['app.run']" in proc.stderr and "deploy_objects" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def test_malformed_dependency_analysis_halts_before_launch(tmp_path):
@@ -828,7 +839,8 @@ def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tm
         assert not (ws / ".migration/waves/wave-0.base_sha").exists()
         return proc
 
-    proc = run(tmp_path / "ok", dependencies={"u": _analysis("MIG.T")})
+    proc = run(tmp_path / "ok", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
+               deploy_objects=("mig.run",))
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == {"wave": 0, "ready": True, "batches": ["b-1"]}
     proc = run(tmp_path / "drift", dependencies={"u": _analysis("mig.t", "mig.audit")})
