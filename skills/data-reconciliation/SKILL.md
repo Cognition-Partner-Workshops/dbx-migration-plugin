@@ -86,6 +86,16 @@ provenance warning and the run is not merge-eligible.
 ### Legal combinations
 
 - `--mode transactional` (operational track, Lakebase target only; refused for `--target-kind databricks`) wraps tiers 1-3 in a consistency window and adds the tiers an OLTP target needs.
+- Tier 0 `structural_parity` runs first in every mode except `continuous`/`transactional` (which
+  get the same comparison as tier 7 `schema_parity`): primary keys, uniques, foreign keys,
+  not-nulls, checks, indexes, triggers (by timing+event, names ignored), identity columns, and
+  grants (source grantees mapped through the spec's `principal_map` before comparing). The
+  tier's `stats.structural_checks` records each category as `checked` or `unsupported`, and
+  `stats.structural_diff` the per-object detail; an unsupported category is unchecked, not
+  clean. `result.json`'s `merge_block_reasons` puts `structural_gap` first when a structural
+  tier has findings or unverifiable objects. `--source-dictionary`/`--target-dictionary`
+  substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
+  shape per family) for the live catalog read; structure proven from a fixture never merges.
 - Tiers 5-7 run even when tier 1 fails, so a FAIL names the keys, lag, and schema gaps rather than just a count.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.
