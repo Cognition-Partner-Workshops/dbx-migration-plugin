@@ -270,6 +270,8 @@ def render_progress(mig: Path) -> str:
                 if status == "PASS"
                 else ""
             )
+            if result.get("auto_merge") is False and status == "PASS" and merged != "yes":
+                status = "PASS (unmerged)"
             for unit_index, unit in enumerate(sorted(units, key=_text)):
                 rows.append((
                     wave,
