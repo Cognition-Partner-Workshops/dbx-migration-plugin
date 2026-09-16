@@ -136,9 +136,10 @@ def compare_fixture(spec: MappingSpec, source, fixture,
     """Shapes first for every table (one source read each), then cardinality table by table,
     scoped by the object's `root_where`, until the source cap is reached; a table whose shape
     could not be read on either side, or that lies past the cap, is `unsupported`, never clean."""
-    if source_statement_cap is not None and source_statement_cap < len(spec.objects):
+    shape_reads = len({obj.root_table for obj in spec.objects})
+    if source_statement_cap is not None and source_statement_cap < shape_reads:
         raise ConfigError(f"source statement cap {source_statement_cap} is below the "
-                          f"{len(spec.objects)} catalog reads the shapes need")
+                          f"{shape_reads} catalog reads the shapes need")
     budget = _Budget(source, source_statement_cap)
     findings: list[dict] = []
     tables: dict[str, dict] = {}
@@ -160,8 +161,15 @@ def compare_fixture(spec: MappingSpec, source, fixture,
         findings.extend(found)
         if found:
             row["status"] = "fail"
-        # a column the fixture lacks is already a finding; aggregating it would only error
-        plans[-1] = [c for c in mapped if c in fix]
+        # a column the fixture lacks is already a finding, one the source lacks is the mapping's
+        # defect (tier 7): neither can be profiled, and the second leaves the table unproven
+        plans[-1] = [c for c in mapped if c in fix and c in src]
+        unmapped = [c for c in mapped if c not in src]
+        if unmapped:
+            row["cardinality"] = "partial"
+            row.setdefault("reason", f"source has no mapped column {unmapped[0]} (a mapping defect)")
+            if row["status"] == "pass":
+                row["status"] = "unsupported"
     for obj, mapped in zip(spec.objects, plans):
         table = obj.root_table
         row = tables[table]

@@ -285,6 +285,8 @@ def _secret(name: str) -> str:
 
 AGG_SQL = ("SELECT COUNT(*) AS n, COUNT({col}) AS nonnull, MIN({col}) AS mn, "
            "MAX({col}) AS mx, COUNT(DISTINCT {col}) AS dc FROM {table}{where}")
+# counts only: MIN/MAX are undefined for boolean columns on some engines
+PROFILE_SQL = "SELECT COUNT(*) AS n, COUNT({col}) AS nonnull, COUNT(DISTINCT {col}) AS dc FROM {table}{where}"
 
 
 # Bucket expression assigning each row to one of {n} equal-count strata ordered by key.
@@ -400,10 +402,10 @@ class _SqlAdapterBase:
         return out
 
     def column_profile(self, table: str, column: str, where: str | None = None) -> dict[str, Any]:
-        """Count, null rate and distinct count in exactly one statement (no SUM probe), for
-        checks that budget source reads per column (recon.fixture_shape)."""
+        """Count, null rate and distinct count in exactly one statement (no MIN/MAX, no SUM
+        probe), for checks that budget source reads per column (recon.fixture_shape)."""
         w = f" WHERE {where}" if where else ""
-        n, nonnull, _, _, dc = self._rows(AGG_SQL.format(col=column, table=table, where=w))[0]
+        n, nonnull, dc = self._rows(PROFILE_SQL.format(col=column, table=table, where=w))[0]
         return {"count": int(n), "null_rate": (int(n) - int(nonnull)) / int(n) if n else 0.0,
                 "distinct_count": int(dc)}
 

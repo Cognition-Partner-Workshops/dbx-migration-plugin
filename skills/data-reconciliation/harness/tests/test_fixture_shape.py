@@ -284,6 +284,35 @@ def test_comparison_keys_are_checked_even_when_not_mapped_as_fields():
     assert src.calls["column_profile"] == 2  # the key column is profiled too
 
 
+def test_a_mapped_column_the_source_lacks_is_unsupported_and_never_profiled():
+    """The mapping names a column the source does not have (tier 7's finding, not this check's),
+    so nothing about that column can be proven here: it is left out of the profile plan rather
+    than queried into a crash, and the table cannot be clean."""
+    rows = [{k: v for k, v in r.items() if k != "status"} for r in SOURCE_ROWS]
+    shape = [c for c in SOURCE_SHAPE if c["name"] != "status"]
+    src, fx = ShapedSource({"app.orders": rows}, {"app.orders": shape}), ShapedSource(
+        {"app.orders": rows}, {"app.orders": shape})
+    out = compare_fixture(SPEC, src, fx)
+    assert out["status"] == "unsupported" and out["findings"] == []
+    assert out["tables"]["app.orders"]["status"] == "unsupported"
+    assert out["tables"]["app.orders"]["reason"] == "source has no mapped column status (a mapping defect)"
+    assert out["tables"]["app.orders"]["cardinality"] == "partial"
+    assert src.calls["column_profile"] == 2  # order_id and occurred_at, never status
+
+
+def test_the_cap_floor_counts_catalog_reads_per_table_not_per_object():
+    spec = MappingSpec(version="m", objects=[
+        ObjectMapping(object="a", root_table="app.orders", key_source=["order_id"], key_target="order_id",
+                      fields=[FieldMapping("status", "status", "varchar(12)", "string")]),
+        ObjectMapping(object="b", root_table="app.orders", key_source=["order_id"], key_target="order_id",
+                      fields=[FieldMapping("occurred_at", "occurred_at", "timestamp", "timestamp")])])
+    out = compare_fixture(spec, _source(), _source(), source_statement_cap=1)
+    assert out["tables"]["app.orders"]["shape"] == "checked"
+    assert out["tables"]["app.orders"]["cardinality"] == "unsupported"
+    with pytest.raises(ConfigError, match="cap 0 is below the 1"):
+        compare_fixture(spec, _source(), _source(), source_statement_cap=0)
+
+
 def test_two_objects_on_one_root_table_each_keep_their_own_coverage():
     """A second object on the same root table (a different slice or projection) must not
     overwrite the first one's plan; each object's mapped columns and scope are checked."""
@@ -439,13 +468,18 @@ def test_sqlserver_source_column_shape_reads_sys_columns_in_order():
 
 def test_sql_column_profile_is_one_scoped_statement_with_no_sum_probe():
     from recon.adapters import SqlServerSourceAdapter
-    conn = _Conn([(10, 8, 1, 9, 3)])
+    conn = _Conn([(10, 8, 3)])
     ad = SqlServerSourceAdapter.__new__(SqlServerSourceAdapter)
     ad._conn, ad.statements, ad.rows_fetched = conn, 0, 0
     assert ad.column_profile("dbo.Orders", "status", "region = 'eu'") == {
         "count": 10, "null_rate": 0.2, "distinct_count": 3}
     assert ad.statements == 1 and len(conn.cursors) == 1
-    assert "WHERE region = 'eu'" in conn.cursors[0].sql and "SUM(" not in conn.cursors[0].sql
+    sql = conn.cursors[0].sql
+    assert "WHERE region = 'eu'" in sql and "SUM(" not in sql
+    # counts only: MIN/MAX are undefined for booleans on some engines and would abort the check
+    assert "MIN(" not in sql and "MAX(" not in sql
+    assert ad.column_profile("dbo.Orders", "status") == {"count": 10, "null_rate": 0.2, "distinct_count": 3}
+    assert "WHERE" not in conn.cursors[1].sql
 
 
 def test_databricks_source_column_shape_reads_information_schema():
