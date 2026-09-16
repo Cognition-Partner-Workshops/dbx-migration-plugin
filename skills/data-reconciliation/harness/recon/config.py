@@ -151,6 +151,9 @@ class FieldMapping:
     source_type: str
     target_type: str
     rules: list[str] = field(default_factory=list)  # canonicalization rule names, in order
+    # provenance tokens the type map's conditional alternatives require (census results, not
+    # canon rules: putting them in `rules` would hit the Canonicalizer's unknown-rule error)
+    evidence: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -224,6 +227,8 @@ class ObjectMapping:
 class MappingSpec:
     version: str
     objects: list[ObjectMapping]
+    # source principal -> target principal for the grant comparison; identity when absent
+    principal_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -287,11 +292,16 @@ def _require_version(data: dict, path: Path) -> str:
 
 
 def _field_mappings(items: list[dict]) -> list[FieldMapping]:
-    return [FieldMapping(
-        source=f["source"], target=f["target"],
-        source_type=f.get("source_type", ""), target_type=f.get("target_type", ""),
-        rules=list(f.get("rules", [])),
-    ) for f in items]
+    fields = []
+    for f in items:
+        evidence = f.get("evidence", [])
+        if not isinstance(evidence, list) or any(not isinstance(e, str) for e in evidence):
+            raise ConfigError(f"field {f.get('source')}: 'evidence' must be a list of strings")
+        fields.append(FieldMapping(
+            source=f["source"], target=f["target"],
+            source_type=f.get("source_type", ""), target_type=f.get("target_type", ""),
+            rules=list(f.get("rules", [])), evidence=list(evidence)))
+    return fields
 
 
 def _validate_mapping_identifiers(c: dict) -> None:
@@ -422,7 +432,12 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
         ))
     if not objects:
         raise ConfigError(f"{path}: mapping spec has no objects")
-    return MappingSpec(version=version, objects=objects)
+    principal_map = data.get("principal_map") or {}
+    if not isinstance(principal_map, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in principal_map.items()):
+        raise ConfigError(f"{path}: principal_map must be a string -> string object")
+    return MappingSpec(version=version, objects=objects,
+                       principal_map={k.lower(): v.lower() for k, v in principal_map.items()})
 
 
 def _flag(data: dict, key: str, path: Path) -> bool:

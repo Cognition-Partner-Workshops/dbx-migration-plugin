@@ -7,20 +7,12 @@ description: Source-dialect skill for Oracle SQL and PL/SQL estates (packages, p
 
 ## When to use / routing
 
-Source-side half only: what Oracle does, where each construct lands, which recon tier catches a wrong conversion.
-Two tracks: **A** = analytical Delta/DBSQL (ODS/warehouse schemas; MVs -> Lakeflow Pipelines, jobs -> Lakeflow Jobs),
-**L** = Lakebase Postgres via `!dbx_migrate_oltp` (application schemas; tables, constraints, sequences, triggers must
-behave identically). Procedural logic routes DBSQL SQL scripting first, Lakeflow Jobs control flow second, PySpark last.
-
-Everything Databricks-side comes from the official plugin skills through `skills/target-routing/SKILL.md`; do not
-restate it here. Citation shorthands used below: `[dbsql:<file>#<section>]` = `databricks-dbsql/references/<file>`;
-`[jobs:]`, `[pipelines:]`, `[lakebase:]`, `[uc:]` likewise for `databricks-jobs`, `databricks-pipelines`,
-`databricks-lakebase`, `databricks-unity-catalog`; `[docs:<path>]` = `docs.databricks.com/aws/en/sql/language-manual/<path>`;
-`[pg17:<page>]` = `postgresql.org/docs/17/<page>` for the Lakebase column (Lakebase product facts only from `[lakebase:]`).
-Lakebridge (`--source-dialect oracle`) handles static SQL; its seeded coverage row is in `skills/lakebridge/SKILL.md`.
-Anything with `BEGIN`, `DECLARE`, `CREATE OR REPLACE (PACKAGE|PROCEDURE|FUNCTION|TRIGGER)` or `DBMS_` comes straight here.
-Recon rules for this dialect: `canonicalization.json` (loads with `recon.config.load_canon_rules`; the `canonicalization`
-column below names the rule per type).
+Source-side half only: what Oracle does, where each construct lands, and which recon tier catches a wrong conversion.
+Tracks: **A** is analytical Delta/DBSQL (MVs -> Pipelines, jobs -> Jobs); **L** is Lakebase Postgres via `!dbx_migrate_oltp` (tables, constraints, sequences, and triggers must behave identically).
+Procedural logic routes DBSQL SQL scripting first, Lakeflow Jobs control flow second, PySpark last.
+Databricks-side facts come from the official skills via `skills/target-routing/SKILL.md`, never restated here. Citations: `[dbsql:<file>#<section>]` = `databricks-dbsql/references/<file>`, likewise `[jobs:]`, `[pipelines:]`, `[lakebase:]`, `[uc:]`; `[docs:<path>]` = `docs.databricks.com/aws/en/sql/language-manual/<path>`; `[pg17:<page>]` = `postgresql.org/docs/17/<page>` (Lakebase product facts only from `[lakebase:]`).
+Lakebridge (`--source-dialect oracle`, optional: `skills-extra/lakebridge/SKILL.md`) handles static SQL; anything with `BEGIN`, `DECLARE`, `CREATE OR REPLACE (PACKAGE|PROCEDURE|FUNCTION|TRIGGER)` or `DBMS_` comes straight here.
+Recon rules live in `canonicalization.json`, loaded by `recon.config.load_canon_rules`; the type map names each rule.
 
 ## Type map
 
@@ -46,6 +38,8 @@ column below names the rule per type).
 | Object type / `VARRAY` / nested table | `STRUCT` / `ARRAY<...>` | `JSONB` `[lakebase:references/synced-tables.md#Data Type Mapping]` | methods, `TABLE()` unnest | `identity` |
 | `BOOLEAN` (PL/SQL; 23ai SQL) | `BOOLEAN` (`CHAR(1) 'Y'/'N'` stays string unless decided) | `BOOLEAN` | none | `identity` |
 | `BFILE`, `SDO_GEOMETRY`, `ANYDATA` | path `STRING` via Volumes; `GEOMETRY`/`GEOGRAPHY` via WKT/WKB; `STRING`/`VARIANT` | `TEXT`; WKT unless PostGIS is on the Lakebase extension list; `TEXT`/`JSONB` | external file; SRID | `GAP` |
+
+`canonicalization.json`'s `type_map` marks `bigint` for `INTEGER`/`INT`/`SMALLINT` and `date` for `DATE` as conditional alternatives: the spec's field must carry the token `census_fits_int64` (census proved the values fit in 64 bits) or `census_midnight_only` (census proved `TRUNC(col)=col` on every row) in its `evidence` list — never `rules`, which is reserved for canon rules — or the declared type is a contradiction.
 
 ## Function / operator map
 
@@ -114,7 +108,7 @@ Track: **A** analytical DBSQL, **L** Lakebase, **J** Lakeflow Jobs, **P** Lakefl
 | `CREATE SEQUENCE` (`CACHE`, `NOORDER`, `CYCLE`), identity columns | A: `GENERATED ALWAYS AS IDENTITY (START WITH last_number+1)` per table; L: `CREATE SEQUENCE ... START WITH last_number+1 ... CACHE [CYCLE]`, `setval` after backfill | A, L | `[docs:sql-ref-syntax-ddl-create-table-using]`, `[pg17:sql-createsequence.html]` |
 | Constraints (PK/UK/FK/CHECK/NOT NULL, `DEFERRABLE`, `NOVALIDATE`, `DISABLE`) | A: `NOT NULL`/`CHECK` enforced, PK/FK informational (`RELY` only if census proves), uniqueness = Tier 1 check; L: all enforced, `NOVALIDATE` -> `NOT VALID`, disabled constraints not recreated (flag) | A, L | `[docs:sql-ref-syntax-ddl-create-table-constraint]`, `[pg17:ddl-constraints.html]` |
 | `CREATE MATERIALIZED VIEW ... REFRESH FAST` + MV logs; `DBMS_MVIEW.REFRESH` | pipeline MV (incremental when the query qualifies; row tracking replaces MV logs); standalone DBSQL MV with `SCHEDULE`/`TRIGGER ON UPDATE`; `REFRESH MATERIALIZED VIEW` as a Jobs SQL task; `ENABLE QUERY REWRITE` has no equivalent | P, J | `[pipelines:references/materialized-view-sql.md#Incremental refresh]`, `[dbsql:materialized-views-pipes.md#Refresh Options]` |
-| `DBMS_SCHEDULER.CREATE_JOB/PROGRAM`, chains, `DBMS_JOB`, email notifications, event/file jobs | Lakeflow Job: `quartz_cron_expression` + `timezone_id` (`FREQ=DAILY;BYHOUR=2;BYMINUTE=40;BYDAY=MON,...,SAT` -> `0 40 2 ? * MON-SAT`), `timeout_seconds`, `max_concurrent_runs: 1`; one task per program (`sql_task`/`notebook_task`); chains -> `depends_on` + `run_if`; `email_notifications`, health rules; table-update / file-arrival triggers. `max_failures` (auto-disable after n failed runs) has no field: GAP, mitigate with `on_failure` + runbook or a monitor job that sets `pause_status: PAUSED`; never map it to `max_retries` | J | `[jobs:references/triggers-schedules.md#Cron Schedule]`, `[jobs:references/notifications-monitoring.md#Retry Configuration]`, `[jobs:references/task-types.md#SQL Task]` |
+| `DBMS_SCHEDULER.CREATE_JOB/PROGRAM`, chains, `DBMS_JOB`, email notifications, event/file jobs | Lakeflow Job: `quartz_cron_expression` + `timezone_id` (`FREQ=DAILY;BYHOUR=2;BYMINUTE=40;BYDAY=MON,...,SAT` -> `0 40 2 ? * MON-SAT`), `timeout_seconds`, `max_concurrent_runs: 1`; one task per program (`sql_task`/`notebook_task`) with `SIGNAL` when `p_status_out <> 'OK'`; chains -> `depends_on` + `run_if`; `email_notifications`, health rules; table-update / file-arrival triggers. `max_failures` (auto-disable after n failed runs) has no field: GAP, mitigate with `on_failure` + runbook or a monitor job that sets `pause_status: PAUSED`; never map it to `max_retries` | J | `[jobs:references/triggers-schedules.md#Cron Schedule]`, `[jobs:references/notifications-monitoring.md#Retry Configuration]`, `[jobs:references/task-types.md#SQL Task]` |
 | SQL*Plus `SET/COLUMN/TTITLE/BREAK`, `DEFINE`/`&var`/`&1`, `SPOOL`, `WHENEVER SQLERROR`, `@file`/`START`, `HOST` | drop formatting (consumer's job); `:param` task parameters (`&var` in an identifier -> `EXECUTE IMMEDIATE`); write to a Delta table or Volume; task failure + `max_retries` + `run_if`; separate tasks with `depends_on`; OS lines -> Py or M | J, A | `[jobs:references/task-types.md#SQL Task]`, `[uc:references/6-volumes.md]` |
 | `DBMS_OUTPUT`, `DBMS_LOCK.SLEEP`, `DBMS_APPLICATION_INFO`, `DBMS_STATS`, `DBMS_LOB.*` | drop (or `INSERT` into a run-log table when consumed); drop; drop; drop; `substr`/`instr`/`length`/`concat` | A, L | |
 | `UTL_FILE`/`sqlldr` staging, `UTL_HTTP`, `UTL_SMTP`, `DBMS_AQ`/`PIPE`/`ALERT`, Java/`EXTPROC`, `@dblink` | Auto Loader / `COPY INTO` from Volumes; Py task; job notifications; M (messaging); `python_wheel_task`; Lakehouse Federation or ingest then local read | P, Py, J, M | `[pipelines:references/auto-loader-sql.md]`, `[jobs:references/task-types.md#Python Wheel Task]` |
@@ -150,36 +144,30 @@ Track: **A** analytical DBSQL, **L** Lakebase, **J** Lakeflow Jobs, **P** Lakefl
 | 24 | `DECODE(NULL,NULL,...)` | NULL matches NULL | Tier 3 on NULL-key rows | `CASE WHEN x IS NULL ...` |
 | 25 | `AVG`/`SUM` scale growth | full precision vs `+4` scale / `+10` precision, overflow -> NULL/error | Tier 2 last-digit rounding | `cast(sum(x) AS DECIMAL(38,s))`; `decimal_round` |
 
-## Canonical Lakeflow / DBSQL shape
+## Dependency analysis output
 
-One Oracle scheduler job becomes one Lakeflow Job; one package becomes one schema of DBSQL procedures/functions; every
-MV becomes a pipeline MV. Each DBSQL procedure follows this shape (example 03 is the full version):
+Before a unit is routed or planned, walk every routine in scope (package members, standalone procedures and
+functions, triggers, scheduler job actions) and write one row per routine to
+`.migration/units/<unit>/dependencies.json`; fixture: `fixtures/example_dependencies.json`.
+Each routine with `writes` also needs a routine-parity run record (`skills/data-reconciliation/SKILL.md`, "Routine parity").
 
-```sql
-CREATE OR REPLACE PROCEDURE ${catalog}.<pkg_schema>.<member>(IN ..., OUT p_rows_out BIGINT, OUT p_status_out STRING)
-LANGUAGE SQL SQL SECURITY INVOKER MODIFIES SQL DATA
-AS BEGIN
-  DECLARE <named> CONDITION FOR SQLSTATE '45nnn';                -- one per -20nnn code
-  DECLARE EXIT HANDLER FOR <named> BEGIN SET p_status_out = '...'; INSERT INTO ...audit_log ...; END;
-  DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN SET p_status_out = 'ERR'; INSERT INTO ...audit_log ...; END;
-  DROP TABLE IF EXISTS <candidates>; CREATE TEMPORARY TABLE <candidates> AS SELECT ...;   -- cursor / GTT / BULK COLLECT
-  SELECT assert_true(count(*) = 0, '...') FROM (... GROUP BY key HAVING count(*) > 1);   -- ORA-30926 / TOO_MANY_ROWS parity
-  BEGIN ATOMIC                                                    -- replaces COMMIT/SAVEPOINT; catalogManaged tables
-    MERGE INTO <target> USING <candidates> ...                    -- FORALL body + folded row-trigger columns
-      WHEN MATCHED AND <delete cond> THEN DELETE WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT ...;
-    INSERT INTO <audit_log> SELECT ... FROM <pre_image> JOIN <target> ...;   -- trigger's logger branch
-    INSERT INTO <run_log> ...;                                    -- package state
-  END;
-  SET p_rows_out = (SELECT count(*) FROM <candidates>); SET p_status_out = 'OK';
-END;
+```json
+{"routines": [{"routine": "<schema>.<pkg>.<member>", "reads": ["<schema>.<table>"], "writes": ["<schema>.<table>"], "calls": ["<routine>"]}]}
 ```
 
-Jobs wrapper: `sql_task` `CALL`ing the procedure, `SIGNAL` when `p_status_out <> 'OK'`, `quartz_cron_expression` +
-`timezone_id` from `repeat_interval`/`start_date`, `timeout_seconds` from `max_run_duration`, `max_concurrent_runs: 1`,
-`depends_on`/`run_if` from chain rules. Lakebase track: the same procedure in PL/pgSQL with the trigger and sequences
-kept as objects (example 02), `EXCEPTION WHEN` blocks, `RAISE EXCEPTION USING ERRCODE`, no autonomous transactions.
+`reads` = tables and views in `SELECT`/`FROM`/`JOIN`/`MERGE USING`/cursor bodies; `writes` = targets of
+`INSERT`/`UPDATE`/`DELETE`/`MERGE INTO`/`TRUNCATE`; `calls` = every routine invoked, including trigger-fired
+ones, `EXECUTE IMMEDIATE` targets from the allow-list, and the job action. Names are fully qualified, synonyms
+resolved, case-insensitive. The analysis must cover every callee it names (add the callee's row, even for a
+logger), or the fan-out check halts on it. The shape is dialect-neutral: every source-dialect skill that
+emits an analysis writes the same rows. `target-routing` routes from `reads`/`writes`; the fan-out workflow
+requires a batch's declared `write_targets` to equal the transitive `writes` (rule in
+`skills/migration-fanout/SKILL.md`, "Declared targets match the call graph").
 
 ## Examples
+
+Canonical shapes: `examples/03_bulk_collect_setbased/` is the DBSQL procedure shape (handlers, `assert_true` parity check, `BEGIN ATOMIC` + `MERGE`, `OUT` status); `examples/02_trigger_sequence_lakebase/` is the PL/pgSQL shape.
+Job wrapper rules are the `DBMS_SCHEDULER` row above.
 
 | Dir | Exercises | Track |
 |---|---|---|

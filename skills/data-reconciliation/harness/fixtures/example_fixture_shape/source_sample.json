@@ -1,0 +1,43 @@
+{
+  "note": "Recorded wave 0 pair: a fixture that has the table but not its shape. `expected.json` is compare_fixture over the two samples.",
+  "table": "app.events",
+  "shape": [
+    {
+      "name": "event_id",
+      "type": "bigint",
+      "nullable": false
+    },
+    {
+      "name": "occurred_at",
+      "type": "timestamp",
+      "nullable": false
+    },
+    {
+      "name": "status",
+      "type": "varchar(12)",
+      "nullable": true
+    }
+  ],
+  "rows": [
+    {
+      "event_id": 1,
+      "occurred_at": "2024-03-01T00:00:00",
+      "status": "new"
+    },
+    {
+      "event_id": 2,
+      "occurred_at": "2024-03-02T00:00:00",
+      "status": "paid"
+    },
+    {
+      "event_id": 3,
+      "occurred_at": "2024-03-03T00:00:00",
+      "status": "paid"
+    },
+    {
+      "event_id": 4,
+      "occurred_at": "2024-03-04T00:00:00",
+      "status": "void"
+    }
+  ]
+}

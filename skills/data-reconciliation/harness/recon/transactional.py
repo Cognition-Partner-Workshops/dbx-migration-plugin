@@ -46,6 +46,7 @@ from .adapters import (
     AppliedPosition,
     DeleteEvent,
     DeleteEvidence,
+    DictionaryError,
     KeyExcludingAggregates,
     SchemaFacts,
     StatementCounting,
@@ -55,6 +56,15 @@ from .adapters import (
     normalize_sql_text,
 )
 from .config import ConfigError, MappingSpec, ObjectMapping, Tolerances
+from .structure import (
+    CATEGORIES,
+    compare_grants,
+    compare_identity_columns,
+    compare_triggers,
+    mask_unsupported,
+    diff_by_object,
+    structural_checks,
+)
 from .tiers import Finding, TierResult
 from .watermarks import (
     EPOCH_SCALE,
@@ -512,6 +522,7 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
     statement per side per table, plus one fetch per side per streamed range."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
+    obj_uns: dict[str, set] = {}  # categories a live read failed for this object
     for c in spec.objects:
         n = source.row_count(c.root_table, c.root_where)
         checks += 1
@@ -677,6 +688,7 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
               source, target) -> TierResult:
     findings, checks = [], 0
     stats: dict[str, Any] = {}
+    obj_uns: dict[str, set] = {}  # categories a live read failed for this object
     for c in spec.objects:
         diff = ctx.key_diffs.get(c.object, KeyDiff())
         if c.delete_evidence is not None:
@@ -869,7 +881,9 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         primary_key=tuple(x.lower() for x in f.primary_key),
         unique={tuple(x.lower() for x in u) for u in f.unique},
         unique_nulls_equal={tuple(x.lower() for x in u) for u in f.unique_nulls_equal},
+        primary_key_informational=tuple(k.lower() for k in f.primary_key_informational),
         foreign_keys={_lower_fk(fk) for fk in f.foreign_keys},
+        foreign_keys_informational={_lower_fk(fk) for fk in f.foreign_keys_informational},
         foreign_key_actions={_lower_fk(fk): a for fk, a in f.foreign_key_actions.items()},
         not_null={x.lower() for x in f.not_null},
         indexes={tuple(x.lower() for x in i) for i in f.indexes},
@@ -878,6 +892,9 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         partial={tuple(x.lower() for x in p) for p in f.partial},
         expression_unique={normalize_sql_text(x) for x in f.expression_unique},
         expression_indexes={normalize_sql_text(x) for x in f.expression_indexes},
+        triggers={n: (t, tuple(e), g) for n, (t, e, g) in f.triggers.items()},
+        grants={g.lower(): frozenset(p.lower() for p in ps) for g, ps in f.grants.items()},
+        unsupported=f.unsupported,
         declares_not_null=f.declares_not_null)
 
 
@@ -1301,17 +1318,40 @@ def _check_keys(defs: set[str], colmap: dict[str, str]) -> dict[str, tuple[str, 
     return out
 
 
+def _category_content(f: SchemaFacts, cat: str) -> int:
+    """How much source structure category `cat` carries — nonzero means there is something to
+    lose when the other side's reader marks the category unsupported."""
+    if cat == "triggers":
+        return len(f.triggers)
+    if cat == "grants":
+        return len(f.grants)
+    if cat == "indexes":
+        return len(f.indexes) + len(f.partial) + len(f.expression_indexes)
+    if cat == "sequences_identity":
+        return len(f.identity_columns)
+    return (bool(f.primary_key) + bool(f.primary_key_informational) + len(f.unique)
+            + len(f.foreign_keys) + len(f.foreign_keys_informational) + len(f.checks)
+            + len(f.not_null) + len(f.expression_unique))
+
+
 def _covered(leading: tuple, facts: SchemaFacts) -> bool:
     candidates = [facts.primary_key] + list(facts.unique) + list(facts.indexes)
     return any(cand[:len(leading)] == leading for cand in candidates)
 
 
-def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> TierResult:
+def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, source, target,
+                  strict: bool, catalog_only: bool = False) -> TierResult:
     """Constraints are compared both ways: a source constraint the target lacks lets bad data in,
     a target constraint the source lacks rejects writes the legacy application makes today.
-    Indexes stay one-directional (an extra target index changes cost, not acceptance)."""
+    Indexes stay one-directional (an extra target index changes cost, not acceptance). Triggers
+    compare by (timing, event) coverage and grants through the spec's principal_map. `strict`
+    (tier 7) records an unreadable catalog as `unverified`; tier 0 records it as
+    `dictionary_unavailable` with every category unsupported for that object — a hole the
+    report turns into a structural_gap warning, so an unread dictionary blocks merge.
+    `catalog_only` (structural mode) skips the row-backed identity bounds."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
+    obj_uns: dict[str, set] = {}  # categories a live read failed for this object
     # both catalogs are read first so every foreign key resolves against the qualified identity
     # of every mapped table, not just the ones graded before it
     tables, targets = _TableIndex(), _TableIndex()
@@ -1323,8 +1363,9 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
         try:
             s_raw = source.schema_facts(c.root_table)
             t_raw = target.schema_facts(c.object)
-        except NotImplementedError as exc:
-            stats.setdefault("unverified", []).append(f"{c.object}: {exc}")
+        except (NotImplementedError, DictionaryError) as exc:
+            stats.setdefault("unverified" if strict else "dictionary_unavailable", []).append(
+                f"{c.object}: {exc}")
             continue
         if s_raw.table:
             tables.add(s_raw.table, obj, catalog=True)
@@ -1347,11 +1388,30 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
         s_raw, t_raw = facts[c.object]
         checks += 1
         s, t, t_lower = _lower_facts(s_raw), t_raw, _lower_facts(t_raw)
+        # categories a reader marked unsupported (or this object's read failed on) are holes
+        # in the evidence, not emptiness: masked before comparing so they can never grade on
+        # nothing, and recorded below
+        uns = s_raw.unsupported | t_raw.unsupported | obj_uns.get(c.object, set())
+        if uns:
+            s, t, t_lower = (mask_unsupported(f_, uns) for f_ in (s, t, t_lower))
         pk = _map_cols(s.primary_key, colmap)
+        pk_info = _map_cols(s.primary_key_informational, colmap)
         if pk != t_lower.primary_key:
-            findings.append(Finding(c.object, "primary_key_mismatch",
-                                    f"source {s.primary_key} -> expected {pk}, target {t.primary_key}",
-                                    s.primary_key, t.primary_key))
+            if pk and not t_lower.primary_key and t_lower.primary_key_informational == pk:
+                findings.append(Finding(c.object, "primary_key_informational_only",
+                                        "target PK is informational, not enforced: duplicate keys "
+                                        "would be accepted"))
+            elif not pk and pk_info and pk_info == t_lower.primary_key:
+                pass  # the target enforces what the source only declared informationally
+            else:
+                findings.append(Finding(c.object, "primary_key_mismatch",
+                                        f"source {s.primary_key} -> expected {pk}, target "
+                                        f"{t.primary_key}", s.primary_key, t.primary_key))
+        if (pk_info and not s.primary_key and pk_info != t_lower.primary_key
+                and pk_info != t_lower.primary_key_informational):
+            findings.append(Finding(c.object, "primary_key_informational_missing",
+                                    f"source PK {s.primary_key_informational} is informational and "
+                                    "absent on the target: duplicate keys would be accepted"))
         # a unique constraint rejects the same duplicates whatever order its columns are
         # declared in, so parity is by column set; the declared order is an access path and
         # is kept for the coverage check (`_covered`) and noted when only the order differs
@@ -1400,7 +1460,26 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
         for cols, ref, rcols in t_lower.foreign_keys:
             found = targets.resolve(ref)
             t_fks[(cols, found[0] if len(found) == 1 else ref, rcols)] = (cols, ref, rcols)
+        t_fks_info = set()
+        for cols, ref, rcols in t_lower.foreign_keys_informational:
+            found = targets.resolve(ref)
+            t_fks_info.add((cols, found[0] if len(found) == 1 else ref, rcols))
         expected_fks: set[tuple] = set()
+        for cols, ref, rcols in sorted(s.foreign_keys_informational):
+            found = tables.resolve(ref)
+            if not found:
+                stats.setdefault("foreign_keys_out_of_scope", []).append(f"{c.object}: {cols} -> {ref}")
+                continue
+            if len(found) == 1:
+                ref_map = next((_column_map(spec, o) for o in spec.objects
+                                if o.object.lower() == found[0]), {})
+                want = (_map_cols(cols, colmap), found[0], _map_cols(rcols, ref_map))
+                if want in t_fks:
+                    expected_fks.add(want)
+                elif want not in t_fks_info:
+                    findings.append(Finding(c.object, "foreign_key_informational_missing",
+                                            f"source FK {cols} -> {ref}{rcols} is informational and "
+                                            "absent on the target"))
         for cols, ref, rcols in sorted(s.foreign_keys):
             found = tables.resolve(ref)
             if len(found) > 1:
@@ -1421,8 +1500,14 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
             want = (_map_cols(cols, colmap), ref_obj, _map_cols(rcols, ref_map))
             expected_fks.add(want)
             if want not in t_fks:
-                findings.append(Finding(c.object, "foreign_key_missing",
-                                        f"source FK {cols} -> {ref}{rcols} expected on target as {want}"))
+                if want in t_fks_info:
+                    findings.append(Finding(c.object, "foreign_key_informational_only",
+                                            f"target FK {want[0]} -> {want[1]}{want[2]} is "
+                                            "informational, not enforced: orphans would be accepted"))
+                else:
+                    findings.append(Finding(c.object, "foreign_key_missing",
+                                            f"source FK {cols} -> {ref}{rcols} expected on target "
+                                            f"as {want}"))
                 continue
             s_act = s.foreign_key_actions.get((cols, ref, rcols))
             t_act = t_lower.foreign_key_actions.get(t_fks[want])
@@ -1533,18 +1618,24 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                     f"{c.object}: source index on ({expr}) has no target index on ({want}); "
                     "confirm the access path by hand")
         seq_note = None
-        if c.identity_source and c.identity_target:
+        if "sequences_identity" not in uns and c.identity_source and c.identity_target:
             checks += 1
             try:
                 t_state = target.identity_state(c.object, c.identity_target)
                 s_state = source.identity_state(c.root_table, c.identity_source)
-            except NotImplementedError as exc:
+            except (NotImplementedError, DictionaryError) as exc:
                 stats.setdefault("unverified", []).append(f"{c.object} identity: {exc}")
+                obj_uns[c.object] = obj_uns.get(c.object, set()) | {"sequences_identity"}
+                uns = uns | {"sequences_identity"}
+                s, t_lower = (mask_unsupported(f_, uns) for f_ in (s, t_lower))
             else:
-                s_min, s_max = _key_bounds(source, c.root_table, c.identity_source, c.root_where)
+                s_min, s_max = ((None, None) if catalog_only else
+                                _key_bounds(source, c.root_table, c.identity_source, c.root_where))
                 seq_note = {"source_next": None if s_state is None else s_state.next,
                             "source_max": s_max,
                             "target_next": None if t_state is None else t_state.next}
+                if catalog_only:
+                    seq_note["source_bounds"] = "unread"
                 collides = False
                 # the source identity frontier (its own next value) is compared only when both
                 # sides step the same way; opposite directions are a finding of their own
@@ -1599,8 +1690,59 @@ def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> T
                         findings.append(Finding(c.object, "sequence_increment_mismatch",
                                                 step + "target-generated keys follow a different "
                                                 "sequence", s_state.increment, t_state.increment))
+        if "triggers" not in uns:
+            tr_findings, tr_extra = compare_triggers(c.object, s, t_lower)
+            findings += tr_findings + tr_extra
+        if "grants" not in uns:
+            findings += compare_grants(c.object, s, t_lower, spec.principal_map)
+        if "sequences_identity" not in uns:
+            id_findings, id_extra = compare_identity_columns(c.object, s, t_lower, colmap)
+            findings += id_findings + id_extra
+        # a category the target reader marks unsupported is a hole in the evidence, not a pass;
+        # indexes are the exception (an access path, not acceptance), recorded without a warning
+        for cat in CATEGORIES:
+            n = _category_content(s_raw, cat)
+            if cat in (t_raw.unsupported | obj_uns.get(c.object, set())):
+                if cat == "indexes":
+                    if n:
+                        stats.setdefault("index_unsupported", []).append(
+                            f"{c.object}: {n} source indexes cannot be checked: the target catalog "
+                            "has no indexes dictionary")
+                else:
+                    stats.setdefault("unverified", []).append(
+                        f"{c.object}: target dictionary cannot expose {cat}: source has {n}")
+            m = _category_content(t_raw, cat)
+            if cat in (s_raw.unsupported | obj_uns.get(c.object, set())):
+                if cat == "indexes":
+                    if m:
+                        stats.setdefault("index_unsupported", []).append(
+                            f"{c.object}: {m} target indexes cannot be checked: the source "
+                            "catalog has no indexes dictionary")
+                else:
+                    stats.setdefault("unverified", []).append(
+                        f"{c.object}: source dictionary cannot expose {cat}: target has {m}")
         stats[c.object] = {"source": _facts_dict(s_raw), "target": _facts_dict(t_raw), "identity": seq_note}
-    return TierResult(7, "schema_parity", not findings, checks, findings, stats)
+    checks_map = structural_checks(list(facts.values()))
+    for cat in {c for cats in obj_uns.values() for c in cats}:
+        checks_map[cat] = "unsupported"
+    if not strict and any(c.object not in facts for c in spec.objects):
+        checks_map = {cat: "unsupported" for cat in CATEGORIES}
+    stats["structural_checks"] = checks_map
+    stats["structural_diff"] = diff_by_object(findings)
+    stats["dictionary"] = {"source": getattr(source, "dictionary_label", "live"),
+                           "target": getattr(target, "dictionary_label", "live")}
+    for label in stats["dictionary"].values():
+        if label != "live":
+            stats.setdefault("unverified", []).append(
+                f"structure read from fixture dictionary {label.removeprefix('fixture:')}, "
+                "not the live catalog")
+    return TierResult(tier, name, not findings, checks, findings, stats)
+
+
+def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> TierResult:
+    """Tier 7 of the transactional track: structural parity graded strictly — an unreadable
+    catalog is unverified evidence, which blocks merge there."""
+    return schema_parity(7, "schema_parity", spec, tol, source, target, strict=True)
 
 
 def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any, Any]:
@@ -1610,13 +1752,20 @@ def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any
 
 
 def _facts_dict(f: SchemaFacts) -> dict:
-    return {"primary_key": list(f.primary_key), "unique": sorted(map(list, f.unique)),
+    return {"primary_key": list(f.primary_key),
+            "primary_key_informational": list(f.primary_key_informational),
+            "unique": sorted(map(list, f.unique)),
             "unique_nulls_equal": sorted(map(list, f.unique_nulls_equal)),
             "foreign_keys": sorted([list(c), r, list(rc), *f.foreign_key_actions.get((c, r, rc), ())]
                                    for c, r, rc in f.foreign_keys),
+            "foreign_keys_informational": sorted([list(c), r, list(rc)]
+                                                for c, r, rc in f.foreign_keys_informational),
             "not_null": sorted(f.not_null), "indexes": sorted(map(list, f.indexes)),
             "check_count": f.check_count, "checks": sorted(f.checks),
             "identity_columns": sorted(f.identity_columns),
             "partial": sorted(map(list, f.partial)),
             "expression_unique": sorted(f.expression_unique),
-            "expression_indexes": sorted(f.expression_indexes)}
+            "expression_indexes": sorted(f.expression_indexes),
+            "triggers": {n: [tm, list(ev), g] for n, (tm, ev, g) in f.triggers.items()},
+            "grants": {g: sorted(p) for g, p in f.grants.items()},
+            "unsupported": sorted(f.unsupported)}

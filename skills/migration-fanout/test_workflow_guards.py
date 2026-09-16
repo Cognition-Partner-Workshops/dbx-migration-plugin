@@ -26,12 +26,21 @@ def _functions():
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
-                    and node.name in {"validate_manifest", "validate_verify", "ledger_violations"})
+                    and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
+                                      "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
+                                      "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
+                                      "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
+                                      "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices", "check_wave_tag",
+                                      "check_pipelines_published", "_is_manifest", "validate_close", "check_pipeline_updates",
+                                      "batch_verdicts"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
-                                                         "ENV_NAME", "PARAM_VALUE"}
+                                                         "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
+                                                         "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED", "_SEGMENT",
+                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE"}
                     for t in node.targets))]
-    namespace = {"Counter": Counter, "re": re}
+    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
+                 "subprocess": subprocess, "sys": sys}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -40,14 +49,23 @@ def _batch_runtime():
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
-                or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
-                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha"})
+                or (isinstance(node, ast.AsyncFunctionDef) and node.name in {"run_batch", "_run_batch"})
+                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
+                                                                         "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "MERGE_EVIDENCE_MODES" for t in node.targets))]
+                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
+                                                         "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS"}
+                    for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
+        "unit_eligibility": lambda head, units: {u: True for u in units},
+        "evidence_in_pr": lambda head, path, units: bool(head) and any(path.startswith(f".migration/recon/{u}/") for u in units),
         "Counter": Counter,
         "hashlib": hashlib,
+        "re": re,
+        "decision_ledger": lambda: "",
+        "MANIFEST": {"stop_c": "D-2"},
+        "MAX_MINUTES": 45,
         "REPLAYED": {},
         "CHILD_SCHEMA": {},
         "REPO": ".",
@@ -64,21 +82,20 @@ def _batch_runtime():
 def test_validate_verify_missing_and_extra_verdicts():
     validate_verify = _functions()["validate_verify"]
     passed = [{"batch": "w2-b03", "pr_url": "https://example/pr/3"}]
-    missing = validate_verify({"wave_verdict": "PASS", "unit_verdicts": {},
-                               "merged_prs": [], "findings": []}, passed, False)
+    missing = validate_verify({"wave_verdict": "PASS", "unit_verdicts": {}, "findings": []}, passed)
     extra = validate_verify({"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "PASS", "other": "PASS"},
-                             "merged_prs": [], "findings": []}, passed, False)
+                             "findings": []}, passed)
     assert "missing verdicts for w2-b03" in missing[0]
     assert any("unexpected verdicts" in problem for problem in extra)
 
 
-def test_validate_verify_contradiction_and_missing_merge():
+def test_validate_verify_contradiction():
     validate_verify = _functions()["validate_verify"]
     passed = [{"batch": "w2-b03", "pr_url": "https://example/pr/3"}]
-    problems = validate_verify({"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "FAIL"},
-                                "merged_prs": [], "findings": []}, passed, True)
+    problems = validate_verify({"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "FAIL"}, "findings": []}, passed)
     assert any("contradict" in problem for problem in problems)
-    assert any("missing https://example/pr/3" in problem for problem in problems)
+    problems = validate_verify({"wave_verdict": "FAIL", "unit_verdicts": {"w2-b03": "PASS"}, "findings": []}, passed)
+    assert any("contradict" in problem for problem in problems)
 
 
 @pytest.mark.parametrize("value", [0, True, "3"])
@@ -92,6 +109,73 @@ def test_validate_manifest_rejects_invalid_positive_integer(value):
         validate_manifest(manifest)
 
 
+@pytest.mark.parametrize("value", [0, True, "3"])
+def test_validate_manifest_rejects_invalid_max_minutes(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="max_minutes"):
+        validate_manifest(_manifest(max_minutes=value))
+    batch_bad = _manifest()
+    batch_bad["batches"][0]["max_minutes"] = value
+    with pytest.raises(SystemExit, match="max_minutes"):
+        validate_manifest(batch_bad)
+
+
+def test_validate_manifest_accepts_a_batch_max_minutes_override():
+    m = _manifest()
+    m["batches"][0]["max_minutes"] = 30
+    _functions()["validate_manifest"](m)
+
+
+def test_validate_manifest_rejects_max_minutes_over_sixty():
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="max_minutes.*at most 60"):
+        validate_manifest(_manifest(max_minutes=61))
+    m = _manifest()
+    m["batches"][0]["max_minutes"] = 61
+    with pytest.raises(SystemExit, match="max_minutes.*at most 60"):
+        validate_manifest(m)
+
+
+@pytest.mark.parametrize("value", [0, True, "3", 1441])
+def test_validate_manifest_rejects_invalid_doctor_max_age(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="doctor_max_age"):
+        validate_manifest(_manifest(doctor_max_age=value))
+
+
+def test_validate_manifest_accepts_doctor_max_age():
+    _functions()["validate_manifest"](_manifest(doctor_max_age=15))
+
+
+@pytest.mark.parametrize("value", [1, "true", {"x": 1}])
+def test_validate_manifest_rejects_non_bool_degraded(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="degraded"):
+        validate_manifest(_manifest(degraded=value))
+
+
+def test_validate_manifest_accepts_degraded_bool():
+    _functions()["validate_manifest"](_manifest(degraded=True))
+    _functions()["validate_manifest"](_manifest(degraded=False))
+
+
+@pytest.mark.parametrize("bad", ["a/b", 7, {"scope": "key"}])
+def test_validate_manifest_rejects_non_list_secrets(bad):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="secrets"):
+        validate_manifest(_manifest(secrets=bad))
+    m = _manifest()
+    m["batches"][0]["secrets"] = bad
+    with pytest.raises(SystemExit, match="secrets"):
+        validate_manifest(m)
+
+
+def test_validate_manifest_accepts_list_of_string_secrets():
+    m = _manifest(secrets=["app/k"])
+    m["batches"][0]["secrets"] = ["app/k2"]
+    _functions()["validate_manifest"](m)
+
+
 CAPS = {"identity": "sp-1", "catalogs": ["mig"], "ready": True, "guard_mode": "block", "stop_mode": "soft"}
 HOST = "https://adb-1.azuredatabricks.net"
 
@@ -100,13 +184,1285 @@ def _caps(**changes):
     return {**CAPS, **changes}
 
 
+GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": ""}
+
+
+def _gated(batches):
+    """Every manifest declares its gates at STOP C; tests about other fields get one pending gate each."""
+    return [{**b, "gates": b.get("gates", [dict(GATE)])} for b in batches]
+
+
 def _manifest(**extra):
     m = {"wave": 1, "repo": "repo", "child_macro": "child", "verify_macro": "verify",
          "capabilities": _caps(host=HOST),
          "base_branch": "migration/loan-servicing",
          "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
     m.update(extra)
+    m["batches"] = _gated(m["batches"])
+    m.setdefault("stop_c", "D-2")
+    m.setdefault("gates_sha", _functions()["declared_gates_sha"](m["wave"], m["batches"], m.get("degraded") is True))
     return m
+
+
+# ---------------------------------------------------------------- shared tables across waves (WS3.9)
+
+B1 = {"id": "b-1", "units": ["u1"], "write_targets": ["mig.t"], "brief": "b"}
+B2 = {"id": "b-2", "units": ["u2"], "write_targets": ["mig.t", "mig.other"], "brief": "b"}
+SCOPE = ["run_date", "unit_id", "region", "run_id", "batch_id", "run date", "Date"]
+BOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": SCOPE,
+                        "root_where": "run_date = '${as_of}'", "target_where": "run_date = '${as_of}'"}]}
+UNBOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": SCOPE}]}
+PRIOR = {"objects": [{**BOUNDED["objects"][0], "root_where": "run_date = '${prior_as_of}'",
+                      "target_where": "run_date = '${prior_as_of}'"}]}
+
+
+def _others(*batches, namespace="", name="wave-1.json"):
+    """The other_wave_manifests shape: each sibling wave carries its own target_namespace with its batches."""
+    return {name: {"target_namespace": namespace, "batches": list(batches)}}
+
+
+OTHERS = _others(B2)
+
+
+def _specs(**by_unit):
+    return lambda unit: by_unit.get(unit)
+
+
+def test_same_wave_collision_still_halts_naming_both_batches():
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"collision.*'mig.t'.*b-1.*b-2"):
+        check([B1, B2], {}, _specs(u1=BOUNDED, u2=PRIOR))
+
+
+@pytest.mark.parametrize("spec", [UNBOUNDED,
+                                  {"objects": [{**UNBOUNDED["objects"][0], "target_where": ""}]},
+                                  {"objects": [{**UNBOUNDED["objects"][0], "target_where": "  "}]},
+                                  {"objects": [{**UNBOUNDED["objects"][0], "target_where": 1}]}])
+def test_shared_table_across_waves_needs_a_bounded_target_where(spec):
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+        check([B1], _others(B2), _specs(u1=spec))
+
+
+def test_shared_table_across_waves_passes_when_every_reader_is_bounded():
+    check = _functions()["check_write_targets"]
+    check([B1], _others(B2), _specs(u1=BOUNDED, u2=PRIOR))
+    check([B1], _others({**B2, "write_targets": ["mig.other"]}), _specs())
+
+
+def test_pipeline_manifests_with_overlapping_targets_halt_and_disjoint_ones_pass(tmp_path):
+    fn = _functions()
+    (tmp_path / "wave-p1-1.json").write_text(json.dumps({"batches": []}))
+    (tmp_path / "wave-p2-1.json").write_text(json.dumps({"batches": [B2]}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p1-1.json")
+    assert "wave-p2-1.json" in others
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-p2-1\.json"):
+        fn["check_write_targets"]([B1], others, _specs(u1=UNBOUNDED))
+    (tmp_path / "wave-p2-1.json").write_text(json.dumps({"batches": [
+        {**B2, "write_targets": ["mig.other"]}]}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p1-1.json")
+    fn["check_write_targets"]([B1], others, _specs())
+
+
+def test_other_wave_manifests_skips_generated_wave_files(tmp_path):
+    fn = _functions()
+    (tmp_path / "wave-p1-1.json").write_text(json.dumps({"batches": [B1]}))
+    (tmp_path / "wave-p1-1.merged.json").write_text(json.dumps({"base": "a" * 40, "merged": {"b-1": True}}))
+    (tmp_path / "wave-p1-1.result.json").write_text(json.dumps({"wave": 1, "batches": [{"id": "b-1"}]}))
+    (tmp_path / "wave-p1-1.doctor.json").write_text(json.dumps({"checks": []}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p2-1.json")
+    assert list(others) == ["wave-p1-1.json"]
+
+
+def test_preflight_halts_until_every_declared_sibling_pipeline_has_published_a_manifest(tmp_path):
+    """The collision check reads what is on disk, so a sibling whose manifest has not landed on the integration
+    branch yet is invisible to it; the manifest names the pipelines the plan split, and launch waits until each
+    has a manifest on origin and the disk matches origin."""
+    check = _functions()["check_pipelines_published"]
+    pipelines = {"orders": 1, "payments": 1, "ledger": 1}
+    orders = json.dumps({"batches": [B1], "pipelines": pipelines})
+    (tmp_path / "wave-orders-1.json").write_text(orders)
+    manifest = {"pipelines": pipelines}
+    published = {"wave-orders-1.json": orders}
+    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json, wave-payments-1\.json.*integration branch"):
+        check(tmp_path, manifest, published)
+    payments = json.dumps({"batches": [B2], "pipelines": pipelines})
+    (tmp_path / "wave-payments-1.json").write_text(payments)
+    published["wave-payments-1.json"] = payments
+    published["wave-ledger-2.json"] = json.dumps({"batches": [], "pipelines": pipelines})   # past the count
+    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json"):
+        check(tmp_path, manifest, published)
+    published["wave-ledger-1.json"] = json.dumps({"batches": [], "pipelines": pipelines})
+    (tmp_path / "wave-ledger-1.json").write_text(published["wave-ledger-1.json"])
+    with pytest.raises(SystemExit, match=r"wave-ledger-2\.json.*plans disagree"):
+        check(tmp_path, manifest, published)
+    del published["wave-ledger-2.json"]
+    published["wave-payments-1.json"] = json.dumps(
+        {"batches": [B2], "pipelines": {"orders": 1, "payments": 1, "ledger": 2}})
+    with pytest.raises(SystemExit, match="plans disagree"):
+        check(tmp_path, manifest, published)
+    for junk in ("[]", "not json"):
+        published["wave-payments-1.json"] = junk
+        with pytest.raises(SystemExit, match="plans disagree"):
+            check(tmp_path, manifest, published)
+    published["wave-payments-1.json"] = payments
+    check(tmp_path, manifest, published)
+    check(tmp_path, {}, published)
+    with pytest.raises(SystemExit, match="billing"):
+        check(tmp_path, {"pipelines": {"orders": 1, "billing": 1}}, published)
+
+
+def test_only_wave_dash_files_are_manifests_on_origin(tmp_path):
+    """The pointer file or any other JSON committed under waves/ is not a manifest origin holds and disk lacks."""
+    is_manifest = _functions()["_is_manifest"]
+    assert is_manifest("wave-orders-1.json") and is_manifest("wave-1.json")
+    assert not is_manifest("current.json") and not is_manifest("wave-1.result.json")
+    check = _functions()["check_pipelines_published"]
+    orders = json.dumps({"batches": [B1], "pipelines": {"orders": 1}})
+    (tmp_path / "wave-orders-1.json").write_text(orders)
+    check(tmp_path, {"pipelines": {"orders": 1}}, {"wave-orders-1.json": orders, "current.json": "{}"})
+
+
+def test_preflight_halts_on_a_manifest_origin_does_not_hold_or_holds_differently(tmp_path):
+    """A manifest that is only local, or edited since it was pushed, is one no sibling can see."""
+    check = _functions()["check_pipelines_published"]
+    (tmp_path / "wave-orders-1.json").write_text(json.dumps({"batches": [B1]}))
+    with pytest.raises(SystemExit, match=r"wave-orders-1\.json.*not on origin.*commit and push"):
+        check(tmp_path, {}, {})
+    with pytest.raises(SystemExit, match=r"wave-orders-1\.json.*differs from origin.*commit and push"):
+        check(tmp_path, {}, {"wave-orders-1.json": json.dumps({"batches": [B2]})})
+    (tmp_path / "wave-orders-1.result.json").write_text("{}")
+    (tmp_path / "wave-orders-1.merged.json").write_text("{}")
+    check(tmp_path, {}, {"wave-orders-1.json": json.dumps({"batches": [B1]})})
+
+
+@pytest.mark.parametrize("bad", ["orders", [], {}, {"orders": 0}, {"orders": -1}, {"orders": True},
+                                 {"orders": "2"}, {"orders": None}, {"orders/1": 2}, {7: 2},
+                                 [["orders"]], [{"a": 1}]])
+def test_validate_manifest_rejects_a_pipelines_map_that_does_not_name_each_pipeline_and_its_wave_count(bad):
+    validate = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="'pipelines'"):
+        validate({**_manifest(), "pipelines": bad})
+    validate({**_manifest(), "pipelines": {"orders": 1, "payments_2": 3}})
+
+
+def test_check_wave_tag_pins_the_file_name_number_to_the_manifest_wave():
+    check = _functions()["check_wave_tag"]
+    check("1", {"wave": 1})
+    check("payments-1", {"wave": 1, "pipelines": {"payments": 1}})
+    for tag, wave in [("2", 1), ("payments-1", 2), ("payments", 1)]:
+        with pytest.raises(SystemExit, match="the wave number in the file name"):
+            check(tag, {"wave": wave, "pipelines": {"payments": 2}})
+
+
+def test_check_wave_tag_requires_a_tagged_manifest_to_list_its_pipelines():
+    check = _functions()["check_wave_tag"]
+    check("orders-1", {"wave": 1, "pipelines": {"orders": 2}})
+    check("orders-2", {"wave": 2, "pipelines": {"orders": 2}})
+    with pytest.raises(SystemExit, match=r"wave-<pipeline>-<N>\.json.*pipelines"):
+        check("orders-1", {"wave": 1})
+    with pytest.raises(SystemExit, match="orders"):
+        check("orders-1", {"wave": 1, "pipelines": {"payments": 1, "ledger": 1}})
+    with pytest.raises(SystemExit, match="orders"):
+        check("orders-3", {"wave": 3, "pipelines": {"orders": 2}})
+
+
+@pytest.mark.parametrize("u2", [None, {"objects": []}, {"objects": [{"object": "mig.other", "target_where": "x = 1"}]}])
+def test_shared_table_other_wave_unit_without_a_mapping_for_it_halts_too(u2):
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-1\.json.*b-2.*units/u2/mapping_spec\.json"):
+        check([B1], _others(B2), _specs(u1=BOUNDED, u2=u2))
+
+
+def test_shared_table_other_wave_unbounded_mapping_also_halts():
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u2.*target_where"):
+        check([B1], _others(B2), _specs(u1=BOUNDED, u2=UNBOUNDED))
+
+
+@pytest.mark.parametrize("spec, message", [
+    (None, "mapping_spec.json"),
+    ({"objects": []}, "mig.t"),
+    ({"objects": [{"object": "mig.other", "target_where": "x = 1"}]}, "mig.t"),
+    ({"objects": "mig.t"}, "objects"),
+    ([], "objects"),
+])
+def test_shared_table_current_unit_without_a_mapping_for_it_halts(spec, message):
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=message):
+        check([B1], _others(B2), _specs(u1=spec))
+
+
+def test_shared_table_matches_tables_key_and_target_table_spelling():
+    check = _functions()["check_write_targets"]
+    legacy = {"tables": [{"target_table": "MIG.T", "source_table": "dbo.t", "scope_columns": ["run_date"],
+                          "target_where": "run_date = '${as_of}'"}]}
+    check([B1], OTHERS, _specs(u1=legacy, u2=PRIOR))
+    with pytest.raises(SystemExit, match="target_where"):
+        check([B1], OTHERS, _specs(u1={"tables": [{"target_table": "MIG.T", "source_table": "dbo.t",
+                                                  "scope_columns": ["run_date"]}]}, u2=PRIOR))
+
+
+def test_shared_table_is_the_same_table_whatever_its_case_or_quoting():
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"collision.*b-1.*b-2"):
+        check([B1, {**B2, "write_targets": ["MIG.T"]}], {}, _specs(u1=BOUNDED, u2=PRIOR))
+    for other in ("MIG.T", "`mig`.`t`", " Mig.T "):
+        with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
+            check([B1], _others({**B2, "write_targets": [other]}), _specs(u1=UNBOUNDED, u2=PRIOR))
+        check([B1], _others({**B2, "write_targets": [other]}), _specs(u1=BOUNDED, u2=PRIOR))
+
+
+BARE = lambda where: {"objects": [{"object": "T", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"],
+                                   "target_where": where}]}
+
+
+@pytest.mark.parametrize("namespace", ["mig", "MIG", "`mig`", "cat.mig"])
+def test_one_normalizer_qualifies_bare_names_with_the_manifest_target_namespace(namespace):
+    """target_key is the one identity for manifests and mappings alike: a bare name is the table in the
+    manifest's target_namespace (the catalog and schema the harness run is given), so `t`, `mig.t` and
+    `cat.mig.t` are one target under `cat.mig` while `other.t` is not, in collisions and in readers."""
+    fn = _functions()
+    key, check = fn["target_key"], fn["check_write_targets"]
+    full = "cat.mig.t" if namespace == "cat.mig" else "mig.t"
+    assert key("t", namespace) == key("MIG.T", namespace) == key(full, namespace) == full
+    assert key("other.t", namespace) != key("t", namespace) and key("ig.t", namespace) != key("t", namespace)
+    assert fn["reads_target"]("T", "mig.t", namespace) and not fn["reads_target"]("other.t", "mig.t", namespace)
+    for current, previous in (("t", "mig.t"), ("mig.t", "t"), ("T", full), (full, "t")):
+        with pytest.raises(SystemExit, match=rf"'{re.escape(current)}'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+            check([{**B1, "write_targets": [current]}], _others({**B2, "write_targets": [previous]}, namespace=namespace),
+                  _specs(u1=UNBOUNDED, u2=PRIOR), namespace)
+        check([{**B1, "write_targets": [current]}], _others({**B2, "write_targets": [previous]}, namespace=namespace),
+              _specs(u1=BARE("run_date = '${as_of}'"), u2=PRIOR), namespace)
+    with pytest.raises(SystemExit, match=r"collision.*'(t|mig\.t)'.*b-1.*b-2"):
+        check([{**B1, "write_targets": ["t"]}, B2], {}, _specs(u1=BOUNDED, u2=PRIOR), namespace)
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*target_where"):
+        check([B1], _others(B2, namespace=namespace), _specs(u1=BARE(""), u2=PRIOR), namespace)
+    for other in ("other.t", "ig.t"):
+        with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
+            check([B1], _others(B2, namespace=namespace), _specs(u1={"objects": [{"object": other, "target_where": "id = 1"}]}, u2=PRIOR), namespace)
+        check([B1], _others({**B2, "write_targets": [other]}, namespace=namespace), _specs(), namespace)
+
+
+def test_each_wave_resolves_its_own_targets_with_its_own_target_namespace():
+    """A bare write target means the table in the namespace of the manifest that declares it, so a sibling
+    wave's targets are qualified with that wave's target_namespace, never this wave's: bare `t` under a
+    sibling's `mig` is this wave's `mig.t` (shared), while bare `t` in two waves with different namespaces,
+    or in a sibling with none, is two tables."""
+    fn = _functions()
+    check = fn["check_write_targets"]
+    sibling_bare = _others({**B2, "write_targets": ["t"]}, namespace="mig")
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+        check([B1], sibling_bare, _specs(u1=UNBOUNDED, u2=PRIOR))
+    check([B1], sibling_bare, _specs(u1=BOUNDED, u2=PRIOR))
+    check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BARE("run_date = '${prior_as_of}'")))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-1\.json.*b-2.*u2.*target_where"):
+        check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BARE("")))
+    with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
+        check([B1], sibling_bare, _specs(u1=BOUNDED, u2={"objects": [{"object": "other.t", "target_where": "id = 1"}]}))
+    check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}, namespace="mig_b"), _specs(), "mig_a")
+    check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}), _specs(), "mig_a")
+    check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}, namespace="mig"), _specs())
+    with pytest.raises(SystemExit, match=r"'t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+        check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}), _specs(u1=BARE(""), u2=PRIOR))
+    with pytest.raises(SystemExit, match=r"'t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+        check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}, namespace="mig"),
+              _specs(u1=BARE(""), u2=PRIOR), "MIG")
+    for shape in ([B2], {"batches": [B2]}, {"target_namespace": 1, "batches": [B2]},
+                  {"target_namespace": "a b", "batches": [B2]}, {"target_namespace": "", "batches": B2}):
+        with pytest.raises(SystemExit, match=r"wave-1\.json"):
+            check([B1], {"wave-1.json": shape}, _specs(u1=BOUNDED, u2=PRIOR))
+
+
+def test_without_a_target_namespace_a_bare_mapping_object_reads_the_qualified_table_of_its_name():
+    """Manifests without a target_namespace still qualify their targets while the harness's mapping objects
+    are often bare (the run supplies catalog and schema). Two manifest names stay distinct (`t` is not
+    `mig.t`), but a bare object with no namespace to resolve in reads the shared table whose trailing name
+    it is, case-folded, so it is held to a bound rather than escaping as a non-reader."""
+    fn = _functions()
+    assert fn["target_key"]("T") == "t" != fn["target_key"]("mig.t") and fn["target_key"]("MIG.T") == "mig.t"
+    assert fn["reads_target"]("T", "mig.t") and fn["reads_target"]("`MIG`.T", "mig.t")
+    assert fn["reads_target"]("mig.t", "T") and not fn["reads_target"]("other.t", "mig.t")
+    assert not fn["reads_target"]("T", "mig.t", "cat") and not fn["reads_target"]("", "t")
+    check = fn["check_write_targets"]
+    check([B1], _others({**B2, "write_targets": ["t"]}), _specs())
+    check([{**B1, "write_targets": ["t"]}, B2], {}, _specs())
+    check([B1], OTHERS, _specs(u1=BARE("run_date = '${as_of}'"), u2=PRIOR))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*target_where"):
+        check([B1], OTHERS, _specs(u1=BARE(""), u2=PRIOR))
+    with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
+        check([B1], OTHERS, _specs(u1={"objects": [{"object": "other.t", "target_where": "id = 1"}]}, u2=PRIOR))
+
+
+def test_only_the_units_whose_mappings_read_a_shared_table_must_bound_it():
+    """A batch of several units writes a shared table through one of them; the others' mappings never name
+    it and need no bound for it. A batch none of whose units read it has no scoped reader at all: halt."""
+    check = _functions()["check_write_targets"]
+    other = {"objects": [{"object": "mig.other", "root_table": "dbo.o", "key": ["id"]}]}
+    b1 = {**B1, "units": ["u1", "u3"]}
+    check([b1], _others({**B2, "units": ["u2", "u4"]}), _specs(u1=BOUNDED, u2=PRIOR, u3=other, u4=other))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
+        check([b1], OTHERS, _specs(u1=UNBOUNDED, u2=PRIOR, u3=other))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*no unit of b-1 .*reads"):
+        check([b1], OTHERS, _specs(u1=other, u2=PRIOR, u3=other))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-1\.json.*no unit of b-2 .*reads"):
+        check([b1], _others({**B2, "units": ["u2", "u4"]}), _specs(u1=BOUNDED, u2=other, u3=other, u4=other))
+    with pytest.raises(SystemExit, match=r"units/u3/mapping_spec\.json is missing"):
+        check([b1], OTHERS, _specs(u1=BOUNDED, u2=PRIOR))
+
+
+@pytest.mark.parametrize("namespace", [1, "", " ", "a b", "cat.", ".mig", "cat..mig", ["mig"]])
+def test_target_namespace_when_present_is_a_dotted_identifier(namespace):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="target_namespace"):
+        validate_manifest({**_manifest(), "target_namespace": namespace})
+    validate_manifest({**_manifest(), "target_namespace": "cat.mig"})
+
+
+@pytest.mark.parametrize("where", ["1 = 1", "1=1", "'a' = 'a'", "TRUE", "NOT (1 = 2)", "${as_of} = ${as_of}",
+                                   "DATE '2024-01-01' < DATE '2024-01-02'", "run_date = '${as_of}' OR 1 = 1",
+                                   "1 = 1 or (run_date = '${as_of}')", "x", "run_date = ; drop",
+                                   "(run_date = '${as_of}' OR 1 = 1)", "((run_date = '${as_of}') OR (1 = 1))",
+                                   "(unit_id = 'u1' OR 1 = 1) AND (1 = 1)", "NOT (run_date = '${as_of}' OR 1 = 1)",
+                                   "(unit_id = 'u1' AND 1 = 1) OR 1 = 1", "(run_date = '${as_of}'", "run_date = '${as_of}')",
+                                   "run_date = '${as_of}' OR", "AND run_date = '${as_of}'", "() OR run_date = '${as_of}'",
+                                   "unit_id = unit_id", "run_date = t.run_date", "run_date IS NOT NULL", "run_date IS NULL",
+                                   "run_date <> '${as_of}'", "run_date != '${as_of}'", "NOT run_date = '${as_of}'",
+                                   "NOT (run_date = '${as_of}')", "NOT deleted_at IS NULL", "run_date LIKE '%'",
+                                   "run_date = '${as_of}' OR run_date IS NULL", "run_date", "run_date = ",
+                                   "deleted_at = '${as_of}'", "t.other = 1 AND 1 = 1", "run_date = '${as_of}' OR other = 1"])
+def test_target_where_that_does_not_pin_a_scope_column_is_not_a_bound(where):
+    fn = _functions()
+    spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
+    assert not fn["bounded_predicate"](where, SCOPE)
+    assert fn["bounded_readers"](spec, "mig.t") == "reads it without a target_where pinning one of its scope_columns"
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
+        fn["check_write_targets"]([B1], OTHERS, _specs(u1=spec, u2=PRIOR))
+
+
+@pytest.mark.parametrize("where", ["run_date = '${as_of}'", "t.run_date = DATE '2024-01-01'", "batch_id IN (1, 2)",
+                                   "unit_id = 'u1' AND 1 = 1", "(region = 'eu' OR region = 'us') AND run_id = ${run}",
+                                   "[run date] = 1", '"Run"."Date" = 1', "RUN_DATE = '${as_of}'", "run_date > '${as_of}'",
+                                   "run_date BETWEEN '2024-01-01' AND '2024-01-31'", "run_date = '${as_of}' AND deleted_at IS NULL",
+                                   "1 = 1 AND (region = 'eu' OR (region = 'us' AND 1 = 1))", "((run_date = '${as_of}'))",
+                                   "unit_id = 'u1' AND (region = 'eu' OR 1 = 1)", "unit_id LIKE 'u1%'", "run_date IN ('${as_of}')"])
+def test_target_where_pinning_a_declared_scope_column_is_a_bound(where):
+    fn = _functions()
+    spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
+    assert fn["bounded_predicate"](where, SCOPE)
+    assert fn["bounded_readers"](spec, "mig.t") == ""
+
+
+def _slices(where):
+    return _functions()["predicate_slices"](where, SCOPE)
+
+
+@pytest.mark.parametrize("a, b", [
+    ("run_date = '${as_of}'", "run_date = '${prior_as_of}'"),
+    ("run_date = '${as_of}'", "RUN_DATE = ${prior}"),
+    ("unit_id = 'u1'", "unit_id = 'u2'"),
+    ("unit_id = 'u1'", "t.UNIT_ID = 'U1'"),
+    ("batch_id IN (1, 2)", "batch_id IN (3, 4)"),
+    ("batch_id = 1", "batch_id IN (2, 3)"),
+    ("run_date < '2024-02-01'", "run_date >= '2024-02-01'"),
+    ("run_date BETWEEN '2024-01-01' AND '2024-01-31'", "run_date BETWEEN '2024-02-01' AND '2024-02-29'"),
+    ("run_date BETWEEN DATE '2024-01-01' AND DATE '2024-01-31'", "run_date > DATE '2024-01-31'"),
+    ("batch_id <= 10", "11 <= batch_id"),
+    ("batch_id > 10", "batch_id = 10"),
+    ("unit_id = 'u1' AND run_date = '${as_of}'", "unit_id = 'u2' AND run_date = '${as_of}'"),
+    ("unit_id = 'u1' AND run_date = '${as_of}'", "unit_id = 'u1' AND run_date = '${prior}'"),
+    ("region = 'eu' OR region = 'us'", "region = 'apac' OR region = 'latam'"),
+    ("(region = 'eu' AND run_id = 1) OR region = 'us'", "region = 'apac'"),
+    ("1 = 1 AND unit_id = 'u1'", "unit_id = 'u2' AND deleted_at IS NULL"),
+])
+def test_slices_of_two_readers_are_disjoint_when_the_predicates_prove_it(a, b):
+    """Two readers of a shared table may each recon their own slice only when the predicates cannot select
+    the same row: equality or IN on a scope column with no value in common, non-overlapping literal ranges,
+    or a pin on differently named parameters (each run supplies its own; the same name is the same value).
+    An AND is separated by any one column, an OR only when every branch is."""
+    fn = _functions()
+    assert fn["disjoint_slices"](_slices(a), _slices(b)) and fn["disjoint_slices"](_slices(b), _slices(a))
+    check = fn["check_write_targets"]
+    check([B1], OTHERS, _specs(u1={"objects": [{**UNBOUNDED["objects"][0], "target_where": a}]},
+                               u2={"objects": [{**UNBOUNDED["objects"][0], "target_where": b}]}))
+
+
+@pytest.mark.parametrize("a, b", [
+    ("run_date = '${as_of}'", "run_date = '${as_of}'"),
+    ("run_date = '${as_of}'", "RUN_DATE = ${as_of}"),
+    ("run_date = '${as_of}'", "run_date = '2024-01-01'"),
+    ("run_date = '${as_of}'", "unit_id = 'u1'"),
+    ("unit_id = 'u1'", "unit_id = 'u1'"),
+    ("unit_id = 'u1'", "unit_id IN ('u1', 'u2')"),
+    ("unit_id LIKE 'u1%'", "unit_id LIKE 'u2%'"),
+    ("unit_id LIKE 'u1%'", "unit_id = 'u2'"),
+    ("run_date < '2024-02-01'", "run_date > '2024-01-15'"),
+    ("run_date <= '2024-02-01'", "run_date >= '2024-02-01'"),
+    ("run_date BETWEEN '2024-01-01' AND '2024-02-15'", "run_date BETWEEN '2024-02-01' AND '2024-02-29'"),
+    ("batch_id < 10", "batch_id < 20"),
+    ("batch_id > 10", "batch_id = 11"),
+    ("batch_id > ${lo}", "batch_id < ${hi}"),
+    ("batch_id > 10", "batch_id < '20'"),
+    ("unit_id = 'u1' AND run_date = '${as_of}'", "unit_id = 'u1' AND run_date = '${as_of}'"),
+    ("region = 'eu' OR region = 'us'", "region = 'us' OR region = 'apac'"),
+    ("(region = 'eu' AND run_id = 1) OR region = 'us'", "region = 'us' AND run_id = 2"),
+    ("region = 'eu' OR unit_id = 'u1'", "region = 'us'"),
+])
+def test_shared_table_readers_whose_slices_may_overlap_halt_naming_both_units(a, b):
+    """Overlap, or scopes the workflow cannot prove apart (a parameter against a literal, LIKE prefixes,
+    pins on different columns, ranges the same value satisfies), halts before launch naming the table and
+    both readers, whichever wave each is in."""
+    fn = _functions()
+    assert not fn["disjoint_slices"](_slices(a), _slices(b))
+    check = fn["check_write_targets"]
+    u1 = {"objects": [{**UNBOUNDED["objects"][0], "target_where": a}]}
+    u2 = {"objects": [{**UNBOUNDED["objects"][0], "target_where": b}]}
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1 .*u2 \(wave-1\.json b-2\).*overlap"):
+        check([B1], OTHERS, _specs(u1=u1, u2=u2))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*overlap"):
+        check([{**B1, "units": ["u1", "u3"]}], _others({**B2, "units": ["u2"]}), _specs(u1=u1, u3=u2, u2=PRIOR))
+
+
+def test_reader_slices_are_the_union_of_every_object_and_embed_reading_the_table():
+    """Every read of the table is a slice the other readers must be apart from: each object's and, since the
+    harness scopes an embed's nested reads by the embed's own predicate, each embed's (on its own
+    scope_columns or the object's)."""
+    fn = _functions()
+    two = {"objects": [{**UNBOUNDED["objects"][0], "target_where": "region = 'eu'"},
+                       {**UNBOUNDED["objects"][0], "object": "MIG.T", "target_where": "region = 'us'",
+                        "embeds": [{"array_path": "items", "target_where": "run_id = 7"},
+                                   {"array_path": "lines", "scope_columns": ["line_no"], "target_where": "line_no = 1"}]},
+                       {"object": "mig.other", "target_where": "region = 'apac'"}]}
+    assert fn["reader_slices"](two, "mig.t") == (_slices("region = 'eu' OR region = 'us' OR run_id = 7")
+                                                 + fn["predicate_slices"]("line_no = 1", ["line_no"]))
+    other = fn["predicate_slices"]("region = 'apac' AND run_id = 8 AND line_no = 2", SCOPE + ["line_no"])
+    assert fn["disjoint_slices"](fn["reader_slices"](two, "mig.t"), other)
+    assert not fn["disjoint_slices"](fn["reader_slices"](two, "mig.t"), _slices("region = 'apac' AND run_id = 7"))
+    assert fn["reader_slices"](two, "mig.none") is None
+
+
+@pytest.mark.parametrize("a, b, apart", [
+    ("run_date = '${as_of}'", "run_date = '${as_of}'", False),
+    ("run_date = '2024-01-01'", "run_date = '2024-01-01'", False),
+    ("unit_id = 'u1'", "unit_id = 'u2'", True),
+])
+def test_shared_table_embeds_must_be_apart_even_when_their_objects_are(a, b, apart):
+    """Disjoint object predicates prove nothing about the embeds' reads: two units whose embeds recon the same
+    rows of the shared table halt as an overlap; embeds apart on their own pass."""
+    check = _functions()["check_write_targets"]
+    u1 = {"objects": [{**UNBOUNDED["objects"][0], "target_where": "unit_id = 'u1'",
+                       "embeds": [{"array_path": "items", "target_where": a}]}]}
+    u2 = {"objects": [{**UNBOUNDED["objects"][0], "target_where": "unit_id = 'u2'",
+                       "embeds": [{"array_path": "items", "target_where": b}]}]}
+    if apart:
+        check([B1], OTHERS, _specs(u1=u1, u2=u2))
+    else:
+        with pytest.raises(SystemExit, match=r"'mig.t'.*u1 .*u2 .*overlap"):
+            check([B1], OTHERS, _specs(u1=u1, u2=u2))
+
+
+@pytest.mark.parametrize("scope", [None, [], "run_date", [1], [""]])
+def test_shared_table_reader_must_declare_scope_columns(scope):
+    check = _functions()["check_write_targets"]
+    row = {k: v for k, v in BOUNDED["objects"][0].items() if k != "scope_columns"}
+    spec = {"objects": [row if scope is None else {**row, "scope_columns": scope}]}
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*scope_columns"):
+        check([B1], OTHERS, _specs(u1=spec, u2=PRIOR))
+
+
+def _embedded(embed):
+    return {"objects": [{**BOUNDED["objects"][0], "embeds": [{"array_path": "items", "child_table": "dbo.i", **embed}]}]}
+
+
+@pytest.mark.parametrize("embed", [{}, {"target_where": ""}, {"target_where": "1 = 1"}, {"target_where": "other = 1"},
+                                   {"target_where": "run_date IS NOT NULL"},
+                                   {"scope_columns": ["item_run"], "target_where": "run_date = '${as_of}'"},
+                                   {"scope_columns": [], "target_where": "run_date = '${as_of}'"}])
+def test_embed_of_a_shared_table_reader_needs_its_own_bound(embed):
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*embed 'items'.*target_where"):
+        check([B1], OTHERS, _specs(u1=_embedded(embed), u2=PRIOR))
+
+
+@pytest.mark.parametrize("embed", [{"target_where": "run_date = '${as_of}'"},
+                                   {"scope_columns": ["item_run", "run_date"],
+                                    "target_where": "item_run = 1 AND run_date = '${as_of}'"}])
+def test_embed_bounded_on_its_own_or_the_objects_scope_columns_passes(embed):
+    check = _functions()["check_write_targets"]
+    check([B1], OTHERS, _specs(u1=_embedded(embed), u2=PRIOR))
+
+
+def test_embed_rows_must_be_a_list_of_objects():
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"u1.*embeds"):
+        check([B1], OTHERS, _specs(u1={"objects": [{**BOUNDED["objects"][0], "embeds": "items"}]}, u2=PRIOR))
+
+
+def test_other_wave_manifests_reads_every_wave_but_the_current_and_fails_closed(tmp_path):
+    read = _functions()["other_wave_manifests"]
+    (tmp_path / "wave-0.json").write_text(json.dumps({"batches": [B1]}))
+    (tmp_path / "wave-1.json").write_text(json.dumps({"target_namespace": "cat.mig", "batches": [B2]}))
+    (tmp_path / "wave-1.result.json").write_text("{")
+    (tmp_path / "wave-1.doctor.json").write_text("{")
+    (tmp_path / "wave-2.brief.md").write_text("x")
+    assert read(tmp_path, "wave-0.json") == {"wave-1.json": {"target_namespace": "cat.mig", "batches": [B2]}}
+    assert read(tmp_path, "wave-1.json") == {"wave-0.json": {"target_namespace": "", "batches": [B1]}}
+    (tmp_path / "wave-1.json").write_text(json.dumps({"target_namespace": "cat.", "batches": [B2]}))
+    with pytest.raises(SystemExit, match=r"wave-1\.json.*target_namespace"):
+        read(tmp_path, "wave-0.json")
+    (tmp_path / "wave-1.json").write_text(json.dumps({"batches": [B2]}))
+    (tmp_path / "wave-2.json").write_text("{")
+    with pytest.raises(SystemExit, match=r"wave-2\.json.*JSON"):
+        read(tmp_path, "wave-0.json")
+
+
+@pytest.mark.parametrize("manifest", [[], {}, {"batches": {}}, {"batches": ["b"]}, {"batches": [{"id": "b"}]},
+                                      {"batches": [{"id": "b", "units": ["u"], "write_targets": "t"}]},
+                                      {"batches": [{"id": "b", "units": "u", "write_targets": ["t"]}]}])
+def test_other_wave_manifest_without_batch_rows_halts(tmp_path, manifest):
+    read = _functions()["other_wave_manifests"]
+    (tmp_path / "wave-3.json").write_text(json.dumps(manifest))
+    with pytest.raises(SystemExit, match=r"wave-3\.json.*batches"):
+        read(tmp_path, "wave-0.json")
+
+
+def test_unit_mapping_is_none_when_absent_and_halts_when_malformed(tmp_path):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    assert ns["unit_mapping"]("u9") is None
+    spec = tmp_path / ".migration" / "units" / "u9" / "mapping_spec.json"
+    spec.parent.mkdir(parents=True)
+    spec.write_text(json.dumps(BOUNDED))
+    assert ns["unit_mapping"]("u9") == BOUNDED
+    spec.write_text("{")
+    with pytest.raises(SystemExit, match=r"u9/mapping_spec\.json.*JSON"):
+        ns["unit_mapping"]("u9")
+
+
+# ---------------------------------------------------------------- route by call graph (WS3.4)
+
+FIXTURE = Path(__file__).resolve().parents[1] / "oracle-plsql" / "fixtures" / "example_dependencies.json"
+
+
+def _routine(name, reads=(), writes=(), calls=()):
+    return {"routine": name, "reads": list(reads), "writes": list(writes), "calls": list(calls)}
+
+
+CLOSE = _routine("app.close_period", reads=["src.ledger"], writes=["mig.ledger"], calls=["app.log_run"])
+LOG = _routine("app.log_run", writes=["mig.run_log"])
+LOOP = _routine("app.retry", calls=["app.close_period"])
+TARGETS = ["mig.ledger", "mig.run_log", "mig.close_period"]
+DEPLOYS = {"deploy_objects": ["mig.close_period"]}
+
+
+def _deps(**by_unit):
+    return lambda unit: by_unit.get(unit)
+
+
+def test_transitive_writes_follows_calls_and_tolerates_cycles():
+    writes = _functions()["transitive_writes"]
+    assert writes([CLOSE, LOG, LOOP]) == {"mig.ledger", "mig.run_log"}
+    assert writes([LOG]) == {"mig.run_log"}
+    assert writes([_routine("app.read_only", reads=["src.x"])]) == set()
+
+
+def test_transitive_writes_is_case_insensitive_on_routine_and_table_names():
+    writes = _functions()["transitive_writes"]
+    assert writes([_routine("APP.A", writes=["MIG.T"], calls=["app.b"]), _routine("app.B", writes=["mig.t"])]) == {"mig.t"}
+
+
+def test_transitive_writes_halts_on_a_callee_the_analysis_does_not_cover():
+    writes = _functions()["transitive_writes"]
+    with pytest.raises(SystemExit, match=r"app\.close_period.*app\.log_run"):
+        writes([CLOSE])
+
+
+def test_check_dependencies_passes_when_declared_targets_equal_transitive_writes():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["MIG.ledger", "mig.run_log", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    retry = {**b, "units": ["u", "v"], "write_targets": b["write_targets"] + ["mig.retry"],
+             "deploy_objects": ["mig.close_period", "mig.retry"]}
+    check([retry], _deps(u=[CLOSE, LOG], v=[LOOP]), namespace="mig")
+    check([{**b, "units": ["u", "v"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+
+
+def test_every_root_of_the_call_graph_is_a_declared_deploy_object():
+    """The analysis lists the routines a unit converts; the ones nothing else in the batch calls are its
+    entry points and ship as deployed objects (procedures, jobs, views), which collide like any table.
+    An entry point absent from deploy_objects (its bare name under target_namespace, case-folded) is a mismatch;
+    a callee may be inlined into its caller and needs no row."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-8", "units": ["u"], "write_targets": TARGETS, **DEPLOYS, "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    check([{**b, "deploy_objects": ["MIG.Close_Period"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    check([{**b, "write_targets": TARGETS + ["mig.log_run"], "deploy_objects": ["mig.close_period", "mig.log_run"]}],
+          _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-8.*app\.close_period.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.ledger", "mig.run_log", "mig.other"], "deploy_objects": ["mig.other"]}],
+              _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-8.*app\.retry.*deploy_objects"):
+        check([{**b, "units": ["u", "v"]}], _deps(u=[CLOSE, LOG], v=[LOOP]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-8.*app\.close_period.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.ledger", "mig.run_log"], "deploy_objects": []}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-8.*app\.read_only.*deploy_objects"):
+        check([{**b, "write_targets": [], "deploy_objects": []}], _deps(u=[READ_ONLY]), namespace="mig")
+
+
+def test_same_named_roots_in_different_schemas_each_need_a_deploy_object_of_their_own():
+    """Two entry points whose trailing names agree (`app.close` and `legacy.close`) are two deployed objects:
+    one deploy_objects row cannot stand for both, a row qualified like one of them is that one's, a row
+    qualified like neither (`mig.other.close`) is nobody's, and a bare `mig.close` stands in only for a root
+    whose trailing name no other root shares."""
+    check = _functions()["check_dependencies"]
+    roots = [_routine("app.close", writes=["mig.a"]), _routine("legacy.close", writes=["mig.b"])]
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["mig.a", "mig.b", "mig.close"], "deploy_objects": ["mig.close"], "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-9.*close.*deploy_objects"):
+        check([b], _deps(u=roots), namespace="mig")
+    check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.legacy.close"],
+            "deploy_objects": ["mig.app.close", "mig.legacy.close"]}], _deps(u=roots), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*legacy\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.close"],
+                "deploy_objects": ["mig.app.close", "mig.close"]}], _deps(u=roots), namespace="mig")
+    check([{**b, "write_targets": ["mig.a", "mig.close"], "deploy_objects": ["mig.close"]}], _deps(u=[roots[0]]),
+          namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*legacy\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.other.close"],
+                "deploy_objects": ["mig.app.close", "mig.other.close"]}], _deps(u=roots), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.other.close"], "deploy_objects": ["mig.other.close"]}],
+              _deps(u=[roots[0]]), namespace="mig")
+
+
+@pytest.mark.parametrize("row", ["prod.app.close", "cat.other.app.close", "prod.close", "other.mig.app.close"])
+def test_a_deploy_object_outside_target_namespace_never_stands_for_a_root(row):
+    """A deploy_objects row is the root's only under target_namespace: `cat.mig.app.close` or the bare
+    `cat.mig.close` for `app.close`, never an object of some other catalog or schema that happens to end in
+    the same name (that is a production object the plan must not launch against)."""
+    check = _functions()["check_dependencies"]
+    root = _routine("app.close", writes=["cat.mig.a"])
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["cat.mig.a", row], "deploy_objects": [row], "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([b], _deps(u=[root]), namespace="cat.mig")
+    for good in ("cat.mig.app.close", "cat.mig.close", "close"):
+        check([{**b, "write_targets": ["cat.mig.a", good], "deploy_objects": [good]}], _deps(u=[root]),
+              namespace="cat.mig")
+
+
+def test_a_bare_root_takes_the_one_row_of_its_name_and_halts_when_several_could_be_it():
+    """A root the analysis names without a schema (`close`) is the deploy_objects row under target_namespace
+    whose trailing name is `close`: exactly one (`mig.close` or `mig.app.close`) is its row; two candidates
+    (`mig.app.close` and `mig.legacy.close`) make the root ambiguous, which halts like an undeclared one rather
+    than guessing; a qualified root (`app.close`) still takes only its exact spelling or the bare row."""
+    check = _functions()["check_dependencies"]
+    root = _routine("close", writes=["mig.a"])
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["mig.a", "mig.close"], "deploy_objects": ["mig.close"], "brief": "b"}
+    check([b], _deps(u=[root]), namespace="mig")
+    check([{**b, "write_targets": ["mig.a", "mig.app.close"], "deploy_objects": ["mig.app.close"]}], _deps(u=[root]),
+          namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*close.*ambiguous.*mig\.app\.close.*mig\.legacy\.close"):
+        check([{**b, "write_targets": ["mig.a", "mig.app.close", "mig.legacy.close"],
+                "deploy_objects": ["mig.app.close", "mig.legacy.close"]}], _deps(u=[root]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.legacy.close"], "deploy_objects": ["mig.legacy.close"]}],
+              _deps(u=[_routine("app.close", writes=["mig.a"])]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*ambiguous.*x\.app\.close.*y\.app\.close"):
+        check([{**b, "write_targets": ["a", "x.app.close", "y.app.close"], "deploy_objects": ["x.app.close", "y.app.close"]}],
+              _deps(u=[_routine("app.close", writes=["a"])]))
+
+
+def test_a_complete_analysis_with_no_routines_is_a_graph_that_writes_and_deploys_nothing():
+    """Every unit analysed and none converting a routine is a real (empty) graph: a declared table is then
+    an extra nothing writes, the same mismatch as with routines. A deploy object is not: the analysis has
+    rows for routines only, and a view or job the unit deploys is a deploy_objects row with no routine."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-0", "units": ["u", "v"], "write_targets": [], "brief": "b"}
+    check([b], _deps(u=[], v=[]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-0.*extra.*mig\.t"):
+        check([{**b, "write_targets": ["mig.t"]}], _deps(u=[], v=[]), namespace="mig")
+    check([{**b, "write_targets": ["mig.customer_v"], "deploy_objects": ["mig.customer_v"]}], _deps(u=[], v=[]),
+          namespace="mig")
+
+
+def test_check_dependencies_skips_a_batch_with_no_analysis_at_all():
+    check = _functions()["check_dependencies"]
+    check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"], "brief": "b"}], _deps(), namespace="mig")
+
+
+def test_check_dependencies_names_missing_and_extra_tables():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-7", "units": ["u"], "write_targets": ["mig.ledger", "mig.stale", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    with pytest.raises(SystemExit) as e:
+        check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    msg = str(e.value)
+    assert "b-7" in msg
+    assert re.search(r"missing.*mig\.run_log", msg)
+    assert re.search(r"extra.*mig\.stale", msg)
+    assert "mig.ledger" not in msg.split("missing", 1)[1].split("extra", 1)[0]
+
+
+def test_check_dependencies_halts_when_the_analysis_writes_nothing_the_batch_declared():
+    check = _functions()["check_dependencies"]
+    with pytest.raises(SystemExit, match=r"b.*extra.*mig\.t"):
+        check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"], "brief": "b"}],
+              _deps(u=[_routine("app.read_only", reads=["src.x"])]), namespace="mig")
+
+
+READ_ONLY = _routine("app.read_only", reads=["src.x"])
+
+
+def test_read_only_batch_may_declare_no_targets_only_when_every_unit_is_analysed_and_writes_nothing():
+    """A read-only routine still ships as a deployed object (a view, say), so the only batch with no write
+    targets at all is one whose every unit is analysed and converts no routine."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-3", "units": ["u"], "write_targets": [], "brief": "b"}
+    check([b], _deps(u=[]), namespace="mig")
+    check([{**b, "units": ["u", "v"]}], _deps(u=[], v=[]), namespace="mig")
+    view = {**b, "write_targets": ["mig.read_only"], "deploy_objects": ["mig.read_only"]}
+    check([view], _deps(u=[READ_ONLY]), namespace="mig")
+    check([{**view, "units": ["u", "v"], "write_targets": ["mig.read_only", "mig.v"], "deploy_objects": ["mig.read_only", "mig.v"]}],
+          _deps(u=[READ_ONLY], v=[_routine("app.v", reads=["src.y"])]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-3.*write_targets.*analysis"):
+        check([b], _deps(), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-3.*write_targets.*analysis"):
+        check([{**b, "units": ["u", "v"]}], _deps(u=[]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-3.*missing.*mig\.run_log"):
+        check([b], _deps(u=[LOG]), namespace="mig")
+
+
+def test_check_dependencies_with_an_unanalysed_unit_checks_only_missing_tables():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-4", "units": ["u", "v"], "write_targets": TARGETS + ["mig.v_only"], **DEPLOYS, "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-4.*missing.*mig\.run_log") as e:
+        check([{**b, "write_targets": ["mig.ledger", "mig.close_period", "mig.v_only"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    assert "mig.v_only" not in str(e.value)
+    with pytest.raises(SystemExit, match=r"b-4.*extra.*mig\.v_only"):
+        check([{**b, "deploy_objects": ["mig.close_period", "mig.read_only"], "write_targets": b["write_targets"] + ["mig.read_only"]}],
+              _deps(u=[CLOSE, LOG], v=[READ_ONLY]), namespace="mig")
+
+
+def test_check_dependencies_compares_targets_as_one_case_insensitive_identity():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["`MIG`.`Ledger`", " mig.RUN_LOG ", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    assert _functions()["transitive_writes"]([_routine("a", writes=['"MIG"."T"', "mig.t"])]) == {"mig.t"}
+
+
+def _spec(*pairs):
+    return {"objects": [{"object": tgt, "root_table": src, "key": ["id"]} for src, tgt in pairs]}
+
+
+def _maps(**by_unit):
+    return lambda unit: by_unit.get(unit)
+
+
+SRC_CLOSE = _routine("app.close_period", reads=["app.period"], writes=["APP.LEDGER"], calls=["app.log_run"])
+SRC_LOG = _routine("app.log_run", writes=["app.run_log"])
+
+
+def test_check_dependencies_resolves_source_writes_through_the_units_mapping_spec():
+    """The analysis names the legacy tables a routine writes; the manifest names what the child deploys.
+    A written source table is the target its mapping object (root_table -> object) gives it, and the
+    manifest's bare names are the manifest's target_namespace, so a renamed target compares as itself."""
+    check = _functions()["check_dependencies"]
+    spec = _spec(("app.ledger", "finance.ledger"), ("APP.RUN_LOG", "run_log"))
+    b = {"id": "b", "units": ["u"], "write_targets": ["mig.finance.ledger", "MIG.app.run_log", "close_period"],
+         "deploy_objects": ["close_period"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=spec), "mig.app")
+    with pytest.raises(SystemExit, match=r"b.*missing.*mig\.finance\.ledger.*extra.*mig\.app\.ledger"):
+        check([{**b, "write_targets": ["app.ledger", "run_log", "close_period"]}], _deps(u=[SRC_CLOSE, SRC_LOG]),
+              _maps(u=spec), "mig.app")
+
+
+def test_check_dependencies_resolves_a_callees_writes_through_the_callees_own_unit():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u", "v"], "write_targets": ["mig.app.ledger", "mig.audit.run_log", "close_period"],
+         "deploy_objects": ["close_period"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE], v=[SRC_LOG]),
+          _maps(u=_spec(("app.ledger", "ledger")), v=_spec(("app.run_log", "audit.run_log"))), "mig.app")
+    with pytest.raises(SystemExit, match=r"missing.*mig\.app\.run_log"):
+        check([b], _deps(u=[SRC_CLOSE], v=[SRC_LOG]),
+              _maps(u=_spec(("app.ledger", "ledger")), v=_spec(("app.run_log", "run_log"))), "mig.app")
+
+
+def test_check_dependencies_halts_when_a_mapped_unit_writes_a_source_table_its_mapping_does_not_name():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-2", "units": ["u"], "write_targets": TARGETS, **DEPLOYS, "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-2.*u.*app\.run_log.*mapping_spec"):
+        check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=_spec(("app.ledger", "ledger"))), "mig")
+
+
+def test_mapped_target_reads_the_legacy_tables_mapping_like_the_harness():
+    """The harness accepts both `objects` (object/root_table) and the older `tables`
+    (target_table/source_table) mapping shape; the call-graph check resolves through either."""
+    mapped = _functions()["mapped_target"]
+    legacy = {"tables": [{"source_table": "public.orders", "target_table": "orders", "key": ["id"]}]}
+    assert mapped(legacy, "PUBLIC.ORDERS", "cat.mig") == {"cat.mig.orders"}
+    assert mapped(legacy, "public.other", "cat.mig") == set()
+    assert mapped({"objects": [], "tables": legacy["tables"]}, "public.orders", "mig") == {"mig.orders"}
+    assert mapped({"tables": "nope"}, "public.orders") == set()
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["cat.mig.orders", "p"], "deploy_objects": ["p"], "brief": "b"}
+    check([b], _deps(u=[{"routine": "p", "reads": [], "writes": ["public.orders"], "calls": []}]),
+          _maps(u=legacy), "cat.mig")
+
+
+def test_a_source_table_split_over_several_mapping_objects_writes_every_one_of_them():
+    """One legacy table can feed several target objects (a table and its search copy, say); a write to
+    it is a write to all of them, whichever the mapping lists first, so each must be declared."""
+    mapped = _functions()["mapped_target"]
+    spec = _spec(("src.customer", "customer"), ("src.other", "other"), ("SRC.CUSTOMER", "customer_search"))
+    assert mapped(spec, "src.customer", "mig") == {"mig.customer", "mig.customer_search"}
+    check = _functions()["check_dependencies"]
+    deps = _deps(u=[_routine("app.upsert", writes=["src.customer"])])
+    b = {"id": "b", "units": ["u"], "write_targets": ["mig.customer", "mig.customer_search", "upsert"],
+         "deploy_objects": ["upsert"], "brief": "b"}
+    check([b], deps, _maps(u=spec), "mig")
+    with pytest.raises(SystemExit, match=r"b.*missing.*mig\.customer_search"):
+        check([{**b, "write_targets": ["mig.customer", "upsert"]}], deps, _maps(u=spec), "mig")
+
+
+def test_check_dependencies_without_a_mapping_spec_keeps_the_source_name():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["app.ledger", "app.run_log", "close_period"],
+         "deploy_objects": ["close_period"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(), "mig")
+
+
+def test_deploy_objects_are_declared_targets_outside_the_table_comparison():
+    """A procedure, view or job the unit deploys is a write target (it collides like any other) but no
+    routine's DML writes it; the batch lists it in deploy_objects so the graph comparison leaves it alone.
+    A deploy object that is also a written table halts (one outside write_targets fails the manifest check)."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-5", "units": ["u"], "write_targets": ["mig.ledger", "mig.run_log", "MIG.close_period"],
+         "deploy_objects": ["mig.close_period"], "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-5.*extra.*mig\.close_period"):
+        check([{**b, "deploy_objects": []}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-5.*deploy_objects.*mig\.ledger.*writes"):
+        check([{**b, "deploy_objects": ["mig.close_period", "mig.ledger"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+
+
+@pytest.mark.parametrize("value", ["x", [1], [""], ["mig.p", "MIG.P"]])
+def test_manifest_deploy_objects_must_be_a_list_of_distinct_names_in_write_targets(value):
+    m = _manifest()
+    m["batches"][0]["deploy_objects"] = value
+    m["batches"][0]["write_targets"] = m["batches"][0]["write_targets"] + ["mig.p"]
+    with pytest.raises(SystemExit, match=r"deploy_objects"):
+        _functions()["validate_manifest"](m)
+
+
+def test_manifest_deploy_objects_outside_write_targets_halt():
+    m = _manifest()
+    m["batches"][0]["deploy_objects"] = ["mig.p"]
+    with pytest.raises(SystemExit, match=r"deploy_objects.*mig\.p.*write_targets"):
+        _functions()["validate_manifest"](m)
+    m["batches"][0]["write_targets"] = m["batches"][0]["write_targets"] + ["MIG.P"]
+    _functions()["validate_manifest"](m)
+
+
+def test_check_dependencies_halts_on_an_uncovered_callee_naming_the_unit():
+    check = _functions()["check_dependencies"]
+    with pytest.raises(SystemExit, match=r"u.*app\.close_period.*app\.log_run"):
+        check([{"id": "b", "units": ["u"], "write_targets": ["mig.ledger"], "brief": "b"}], _deps(u=[CLOSE]))
+
+
+@pytest.mark.parametrize("body", ["{", "[]", "{}", '{"routines": {}}', '{"routines": ["x"]}',
+                                  '{"routines": [{"reads": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": "t", "writes": [], "calls": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": [1], "calls": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": [], "calls": []}, '
+                                  '{"routine": "A", "reads": [], "writes": [], "calls": []}]}'])
+def test_unit_dependencies_halts_on_a_malformed_analysis(tmp_path, body):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    p = tmp_path / ".migration" / "units" / "u9" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(body)
+    with pytest.raises(SystemExit, match=r"u9/dependencies\.json"):
+        ns["unit_dependencies"]("u9")
+
+
+def test_unit_dependencies_is_none_when_absent_and_returns_the_routine_rows(tmp_path):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    assert ns["unit_dependencies"]("u9") is None
+    p = tmp_path / ".migration" / "units" / "u9" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"routines": [CLOSE, LOG]}))
+    assert ns["unit_dependencies"]("u9") == [CLOSE, LOG]
+    p.write_text(json.dumps({"routines": []}))
+    assert ns["unit_dependencies"]("u9") == []
+
+
+def test_example_fixture_is_a_valid_analysis_whose_writes_the_check_accepts(tmp_path):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    p = tmp_path / ".migration" / "units" / "example" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(FIXTURE.read_text())
+    routines = ns["unit_dependencies"]("example")
+    assert routines and all(set(r) == {"routine", "reads", "writes", "calls"} for r in routines)
+    assert any(r["calls"] for r in routines) and any(r["reads"] for r in routines)
+    writes = ns["transitive_writes"](routines)
+    assert len(writes) > 1 and writes > set().union(*(map(str.casefold, r["writes"]) for r in routines[:1]))
+    called = {c.casefold() for r in routines for c in r["calls"]}
+    roots = [r["routine"].rsplit(".", 1)[-1] for r in routines if r["routine"].casefold() not in called]
+    assert roots and len(roots) < len(routines)
+    b = {"id": "b", "units": ["example"], "write_targets": sorted(writes) + roots, "deploy_objects": roots, "brief": "b"}
+    ns["check_dependencies"]([b])
+    with pytest.raises(SystemExit, match="missing"):
+        ns["check_dependencies"]([{**b, "write_targets": sorted(writes)[1:] + roots}])
+    with pytest.raises(SystemExit, match="deploy_objects"):
+        ns["check_dependencies"]([{**b, "write_targets": sorted(writes), "deploy_objects": []}])
+
+
+# ---------------------------------------------------------------- gates as manifest rows (WS3.3)
+
+@pytest.mark.parametrize("gates, message", [
+    (None, "gates"),
+    ([], "gates"),
+    ("g-rows", "gates"),
+    (["g-rows"], "gates"),
+    ([{**GATE, "id": ""}], "id"),
+    ([{**GATE, "id": "a b"}], "id"),
+    ([dict(GATE), dict(GATE)], "unique"),
+    ([{k: v for k, v in GATE.items() if k != "kind"}], "kind"),
+    ([{**GATE, "kind": "vibes"}], "kind"),
+    ([{k: v for k, v in GATE.items() if k != "status"}], "status"),
+    ([{**GATE, "status": "done"}], "status"),
+    ([{k: v for k, v in GATE.items() if k != "evidence"}], "evidence"),
+    ([{**GATE, "evidence": None}], "evidence"),
+    ([{**GATE, "status": "passed", "evidence": ""}], "evidence"),
+    ([{**GATE, "status": "waived"}], "decision_id"),
+    ([{**GATE, "status": "waived", "decision_id": "7"}], "decision_id"),
+    ([{**GATE, "decision_id": "seven"}], "decision_id"),
+])
+def test_validate_manifest_rejects_missing_or_malformed_gates(gates, message):
+    validate_manifest = _functions()["validate_manifest"]
+    batch = {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}
+    if gates is not None:
+        batch["gates"] = gates
+    m = _manifest()
+    m["batches"] = [batch]
+    with pytest.raises(SystemExit, match=message):
+        validate_manifest(m)
+
+
+def test_validate_manifest_accepts_every_gate_kind_and_status():
+    validate_manifest = _functions()["validate_manifest"]
+    kinds = ("byte_compare", "export_file", "publish_leg", "row_parity", "structural", "custom")
+    gates = [{"id": f"g-{k}", "kind": k, "status": "pending", "evidence": ""} for k in kinds]
+    gates += [{"id": "g-p", "kind": "custom", "status": "passed", "evidence": "recon/u/result.json"},
+              {"id": "g-f", "kind": "custom", "status": "failed", "evidence": ""},
+              {"id": "g-w", "kind": "custom", "status": "waived", "evidence": "", "decision_id": "D-12"}]
+    validate_manifest(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "x", "gates": gates}]))
+
+
+def test_gates_sha_is_approved_only_by_the_named_human_stop_c_row_for_this_wave():
+    """The approval is one parsed table row: the manifest names its D-<n>; that row has a cell that is the
+    decision id, a cell that is a human's provenance, and a cell reading exactly `STOP C wave-<N> gates_sha <sha>`
+    for this wave. Tokens scattered through prose, another wave's row, or another D-<n> do not approve."""
+    gates_approved = _functions()["gates_approved"]
+    sha = "a" * 64
+    row = f"| D-3 | 2024-05-01 | user:evt-9 | STOP C wave-2 gates_sha {sha} | plan v3 approved |\n"
+    assert gates_approved("D-3", 2, sha, "| D-1 | user:evt-1 | STOP A |\n" + row)
+    assert gates_approved("D-3", 2, sha, f"|D-3|user:evt-9|  stop c   wave-2   GATES_SHA {sha}  |\n")
+    assert gates_approved("D-3", 2, sha, f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha} |\n".rstrip("|\n") + "\n")
+    for ledger in ("",
+                   f"| D-3 | default-accepted (soft, 60s) | STOP C wave-2 gates_sha {sha} |\n",  # not a human's row
+                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {'b' * 64} |\n",               # another gate list
+                   f"| D-3 | user:evt-9 | STOP C wave-2 {sha} |\n",                              # the value without its name
+                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha}0 |\n",                   # not the exact value
+                   f"| user:evt-9 | STOP C wave-2 gates_sha {sha} |\n",                          # no decision id
+                   f"| D-4 | user:evt-9 | STOP C wave-2 gates_sha {sha} |\n",                    # not the row the manifest names
+                   f"| D-3 | user: | STOP C wave-2 gates_sha {sha} |\n",                         # user: without an id
+                   f"| D-3 | user:evt-9 | wave-2 gates_sha {sha} |\n",                           # not a STOP C row
+                   f"| D-3 | user:evt-9 | STOP CD wave-2 gates_sha {sha} |\n",
+                   f"| D-3 | user:evt-9 | STOP C gates_sha {sha} |\n",                           # no wave
+                   f"| D-3 | user:evt-9 | STOP C wave-3 gates_sha {sha} |\n",                    # another wave's approval
+                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha} approved |\n",           # prose in the approval cell
+                   f"| D-3 | user:evt-9 STOP C wave-2 gates_sha {sha} |\n",                      # provenance and approval in one cell
+                   f"D-3 user:evt-9 STOP C wave-2 gates_sha {sha}\n",                            # not a table row
+                   f"| D-3 | STOP C wave-2 gates_sha {sha} |\n| user:evt-9 |\n",                 # cells on two rows
+                   f"| D-3 | see D-3 | STOP C wave-2 gates_sha {sha} |\n",                       # no provenance cell
+                   f"| D-3 | D-3 user:evt-9 | STOP C wave-2 gates_sha {sha} |\n"):                # provenance cell is not just the provenance
+        assert not gates_approved("D-3", 2, sha, ledger), ledger
+    assert not gates_approved(None, 2, sha, row)
+    assert not gates_approved("D3", 2, sha, row)
+    assert not gates_approved("D-3", "2", sha, row)
+    assert not gates_approved("D-3", 2, None, row)
+    assert not gates_approved("D-3", 2, sha[:-1], row.replace(sha, sha[:-1]))
+
+
+def test_a_default_accepted_stop_c_row_approves_the_gates_only_under_soft_stop_mode():
+    """STOP C is resolved per stop_mode: soft lets the orchestrator's default-accepted row stand, hard needs
+    a human's. The cell is still just the provenance, in the row the manifest names, for this wave."""
+    gates_approved = _functions()["gates_approved"]
+    sha = "a" * 64
+    soft = f"| D-3 | 2024-05-01 | default-accepted (soft, 60s) | STOP C wave-2 gates_sha {sha} |\n"
+    human = soft.replace("default-accepted (soft, 60s)", "user:evt-9")
+    assert gates_approved("D-3", 2, sha, soft, stop_mode="soft")
+    assert gates_approved("D-3", 2, sha, soft.replace(" (soft, 60s)", ""), stop_mode="soft")
+    assert gates_approved("D-3", 2, sha, human, stop_mode="soft")
+    assert not gates_approved("D-3", 2, sha, soft, stop_mode="hard")
+    assert not gates_approved("D-3", 2, sha, soft)
+    assert not gates_approved("D-3", 2, sha, soft, stop_mode="open")
+    for ledger in (soft.replace("wave-2", "wave-3"),
+                   soft.replace("D-3", "D-4"),
+                   soft.replace("default-accepted (soft, 60s)", "bot:default-accepted"),
+                   soft.replace("default-accepted (soft, 60s)", "default-accepted by D-3"),
+                   soft.replace("default-accepted (soft, 60s)", "not default-accepted")):
+        assert not gates_approved("D-3", 2, sha, ledger, stop_mode="soft"), ledger
+
+
+def test_declared_gate_list_is_hashed_into_the_manifest():
+    ns = _functions()
+    validate_manifest, sha = ns["validate_manifest"], ns["declared_gates_sha"]
+    m = _manifest()
+    good = m["gates_sha"]
+    assert re.fullmatch(r"[0-9a-f]{64}", good)
+    validate_manifest(m)
+    for missing in ({k: v for k, v in m.items() if k != "gates_sha"}, {**m, "gates_sha": ""}, {**m, "gates_sha": good[:-1] + "0"}):
+        with pytest.raises(SystemExit, match="gates_sha") as e:
+            validate_manifest(missing)
+        assert good in str(e.value) and "STOP C" in str(e.value)
+    # the manifest names the STOP C row that approved it
+    for bad in ({k: v for k, v in m.items() if k != "stop_c"}, {**m, "stop_c": ""}, {**m, "stop_c": "7"}, {**m, "stop_c": ["D-2"]}):
+        with pytest.raises(SystemExit, match="stop_c"):
+            validate_manifest(bad)
+    # STOP C approved the whole row: a status or evidence edited in the manifest afterwards (a pending gate
+    # marked passed by hand) is a plan change, not an outcome; outcomes arrive in the children's reports
+    for edited in ([{**b, "gates": [{**g, "status": "passed", "evidence": "x"} for g in b["gates"]]} for b in m["batches"]],
+                   [{**b, "gates": [{**g, "evidence": "note.txt"} for g in b["gates"]]} for b in m["batches"]],
+                   [{**b, "gates": [{**g, "decision_id": "D-9"} for g in b["gates"]]} for b in m["batches"]]):
+        assert sha(m["wave"], edited) != good
+        with pytest.raises(SystemExit, match="gates_sha"):
+            validate_manifest({**m, "batches": edited})
+    # a gate swapped for another kind, renamed, dropped or added is a halt; so is a unit swapped under the gates
+    for changed in ([{**b, "gates": [{**g, "kind": "custom"} for g in b["gates"]]} for b in m["batches"]],
+                    [{**b, "units": ["other_unit"]} for b in m["batches"]],
+                    [{**b, "units": b["units"] + ["extra_unit"]} for b in m["batches"]],
+                    [{**b, "gates": [{**g, "id": "g-other"} for g in b["gates"]]} for b in m["batches"]],
+                    [{**b, "gates": b["gates"] + [{**GATE, "id": "g-extra"}]} for b in m["batches"]]):
+        assert sha(m["wave"], changed) != good
+        with pytest.raises(SystemExit, match="gates_sha"):
+            validate_manifest({**m, "batches": changed})
+    # a wave declared DEGRADED verifies at the structural tier only: that scope is part of what STOP C
+    # approved, so flipping it after the row is a plan change
+    assert sha(m["wave"], m["batches"], True) != good
+    assert sha(m["wave"], m["batches"], False) == good
+    with pytest.raises(SystemExit, match="gates_sha"):
+        validate_manifest({**m, "degraded": True})
+    validate_manifest({**m, "degraded": True, "gates_sha": sha(m["wave"], m["batches"], True)})
+    # the same declaration for another wave is another approval
+    assert sha(m["wave"] + 1, m["batches"]) != good
+    with pytest.raises(SystemExit, match="gates_sha"):
+        validate_manifest({**m, "wave": m["wave"] + 1})
+    # an absent decision_id and an explicit null hash alike; the hash is over sorted batches and gate order,
+    # so re-ordering is not a change
+    assert sha(1, [{**b, "gates": [{**g, "decision_id": None} for g in b["gates"]]} for b in m["batches"]]) == good
+    assert sha(1, list(reversed(_manifest(batches=[
+        {"id": "a", "units": ["u"], "write_targets": ["t"], "brief": "x"},
+        {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"]))) == sha(1, _manifest(batches=[
+        {"id": "a", "units": ["u"], "write_targets": ["t"], "brief": "x"},
+        {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"])
+
+
+GATES_LEDGER = ("| D-12 | user:U1 | waive g-w for u, export leg retired with the legacy feed |\n"
+                "| D-13 | user:U1 | waive g-other for u |\n"
+                f"| D-2 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n")
+
+
+def _gate_batch(*gates):
+    return {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "b", "gates": list(gates)}
+
+
+def _gate_report(**extra):
+    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
+            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"], "one_line_summary": "ok", **extra}
+
+
+def _run_gates(batch, report, ledger=GATES_LEDGER):
+    ns = _batch_runtime()
+    ns["decision_ledger"] = lambda: ledger
+
+    async def agent(prompt, **kwargs):
+        return dict(report)
+
+    ns["agent"] = agent
+    return asyncio.run(ns["run_batch"](batch, asyncio.Semaphore(1), ns["Breaker"](3)))
+
+
+def test_pass_with_a_gate_still_pending_is_downgraded():
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report())
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert "g-rows" in out["one_line_summary"] and "pending" in out["one_line_summary"]
+    assert out["gates"] == [{**GATE, "decision_id": None}]
+
+
+def test_child_reported_gate_pass_with_evidence_in_the_pr_closes_the_gate():
+    out = _run_gates(_gate_batch(dict(GATE)),
+                     _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/rows.md"}]))
+    assert out["status"] == "PASS" and "failure_class" not in out
+    assert out["gates"] == [{**GATE, "status": "passed", "evidence": ".migration/recon/u/rows.md", "decision_id": None}]
+
+
+@pytest.mark.parametrize("reported", [
+    [{"id": "g-rows", "status": "passed", "evidence": ""}],                       # no evidence
+    [{"id": "g-rows", "status": "passed", "evidence": "rows checked, all good"}],  # a claim, not a file in the PR
+    [{"id": "g-rows", "status": "passed", "evidence": "recon/u/rows.md"}],         # not under .migration/recon/<unit>/
+    [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/other_unit/rows.md"}],  # another unit's evidence
+    [{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}],
+    [{"id": "g-rows", "status": "waived", "evidence": "", "decision_id": "D-12"}],  # only the ledger waives
+    [{"id": "g-rows", "kind": "custom", "status": "passed", "evidence": "x"}],      # kind is not the child's to set
+    [{"id": "g-other", "status": "passed", "evidence": "x"}],                     # undeclared gate
+    [{"id": "g-rows", "status": "passed", "evidence": "x"}, {"id": "g-rows", "status": "passed", "evidence": "x"}],
+    ["g-rows"],
+    "g-rows passed",
+    [{"status": "passed", "evidence": "x"}],
+])
+def test_child_cannot_pass_a_gate_without_evidence_waive_it_or_rename_it(reported):
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(gates=reported))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+
+
+def test_a_ledger_waived_gate_needs_nothing_from_the_child_and_cannot_be_flipped_by_it():
+    batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
+    out = _run_gates(batch, _gate_report())
+    assert out["status"] == "PASS"
+    assert [g["status"] for g in out["gates"]] == ["waived"]
+    out = _run_gates(batch, _gate_report(gates=[{"id": "g-w", "status": "failed", "evidence": "x"}]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+
+
+def test_a_plan_passed_gate_is_a_declaration_the_child_still_has_to_prove():
+    """passed in the manifest says what STOP C expects, not what happened: without the child's result and its
+    evidence at the PR head the gate is unmet, and the child's evidence is what gets recorded."""
+    batch = _gate_batch({**GATE, "status": "passed", "evidence": "stop-c/rows.md"})
+    out = _run_gates(batch, _gate_report())
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "g-rows" in out["one_line_summary"]
+    out = _run_gates(batch, _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": "stop-c/rows.md"}]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    out = _run_gates(batch, _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/rows.md"}]))
+    assert out["status"] == "PASS"
+    assert out["gates"] == [{**GATE, "status": "passed", "evidence": ".migration/recon/u/rows.md", "decision_id": None}]
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"]({**ns["MANIFEST"]["batches"][0], "gates": batch["gates"]})
+    assert "g-rows" in child
+
+
+@pytest.mark.parametrize("ledger", [
+    "",
+    "| D-12 | user: waive g-w for other_unit |\n",                 # names another unit
+    "| D-12 | user: waive g-other for u |\n",                      # names another gate
+    "| D-120 | user: waive g-w for u |\n",                         # D-12 is not a prefix match
+])
+def test_waived_gate_whose_decision_is_not_in_the_ledger_fails_closed(ledger):
+    batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
+    out = _run_gates(batch, _gate_report(), ledger)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "D-12" in out["one_line_summary"]
+
+
+def test_a_human_waiver_recorded_after_stop_c_closes_a_declared_gate_the_child_did_not_pass():
+    """The declaration is frozen by gates_sha, so a waiver decided after STOP C lives in the ledger alone: a
+    human's D-<n> row that says waive and names the gate and every unit stands in for the child's result."""
+    ledger = GATES_LEDGER + "| D-14 | user:U2 | waive g-rows for u, parity proven on the wave-1 rerun |\n"
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), ledger)
+    assert out["status"] == "PASS", out.get("one_line_summary")
+    assert out["gates"] == [{**GATE, "status": "waived", "decision_id": "D-14"}]
+    out = _run_gates(_gate_batch(dict(GATE)),
+                     _gate_report(gates=[{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}]), ledger)
+    assert out["status"] == "PASS", out.get("one_line_summary")
+    assert out["gates"] == [{**GATE, "status": "waived", "evidence": "3 rows differ", "decision_id": "D-14"}]  # what was waived over stays visible
+
+
+def test_a_waiver_written_before_this_stop_c_row_does_not_carry_into_the_run_it_approved():
+    """A wave rerun fires STOP C again and the manifest names the new row; a waiver a human wrote for the
+    earlier run sits above that row and is that run's, so it does not waive the gate here. Only rows
+    strictly after the manifest's stop_c row are post-STOP C waivers; no stop_c row, no waiver."""
+    ledger_waiver = _batch_runtime()["ledger_waiver"]
+    old = "| D-14 | user:U2 | waive g-rows for u |\n"
+    stop_c = f"| D-20 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n"
+    new = "| D-21 | user:U2 | waive g-rows for u |\n"
+    assert ledger_waiver("g-rows", ["u"], old + stop_c + new, "D-20") == "D-21"
+    assert ledger_waiver("g-rows", ["u"], old + stop_c, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], old + new, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], old + "| D-19 | user:U0 | STOP C, see D-20 for the hash |\n" + new, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], "| D-20 | user:U2 | STOP C wave-0 gates_sha x; waive g-rows for u |\n", "D-20") is None
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), old + GATES_LEDGER)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert out["gates"] == [{**GATE, "decision_id": None}]
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), GATES_LEDGER + new.replace("D-21", "D-14"))
+    assert out["status"] == "PASS", out.get("one_line_summary")
+
+
+@pytest.mark.parametrize("row", [
+    "| D-14 | default-accepted | waive g-rows for u |\n",   # the orchestrator's row, not a human's
+    "| D-14 | user:U2 | waive g-rows for other_unit |\n",
+    "| D-14 | user:U2 | waive g-other for u |\n",
+    "| D-14 | user:U2 | g-rows for u |\n",
+])
+def test_a_ledger_row_that_does_not_waive_this_gate_for_every_unit_leaves_it_unmet(row):
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), GATES_LEDGER + row)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert out["gates"] == [{**GATE, "decision_id": None}]
+
+
+def test_evidence_in_pr_is_a_file_of_the_units_recon_dir_at_the_gated_head(tmp_path):
+    ws = tmp_path / "ws"
+    ns = _launch_ns(ws)
+    (ws / ".migration/recon/u").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(ws), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.email", "t@example.com"], check=True)
+    (ws / ".migration/recon/u/rows.md").write_text("rows\n")
+    (ws / ".migration/recon/u/sub").mkdir()
+    (ws / ".migration/recon/u/sub/x.md").write_text("x\n")
+    (ws / "notes.md").write_text("n\n")
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "evidence"], check=True)
+    head = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    evidence_in_pr = ns["evidence_in_pr"]
+    assert evidence_in_pr(head, ".migration/recon/u/rows.md", ["u", "v"])
+    assert evidence_in_pr(head, ".migration/recon/u/sub/x.md", ["u"])
+    for path in (".migration/recon/u/missing.md",          # not in the PR
+                 ".migration/recon/u",                     # a directory, not evidence
+                 ".migration/recon/u/",
+                 ".migration/recon/v/rows.md",             # v has no such file
+                 ".migration/recon/w/rows.md",             # not a unit of the batch
+                 ".migration/recon/u/../w/rows.md",
+                 "notes.md",
+                 "/" + str(ws / ".migration/recon/u/rows.md"),
+                 "", None, 3):
+        assert not evidence_in_pr(head, path, ["u", "v"]), path
+    assert not evidence_in_pr(None, ".migration/recon/u/rows.md", ["u"])
+    assert not evidence_in_pr(head[:-1] + ("0" if head[-1] != "0" else "1"), ".migration/recon/u/rows.md", ["u"])
+
+
+def test_gate_check_runs_last_after_the_pr_gate_and_merge_authority():
+    out = _run_gates(_gate_batch(dict(GATE)), {**_gate_report(), "pr_url": ""})
+    assert out["failure_class"] == "missing_pr"
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(merge_eligible=False))
+    assert out["failure_class"] == "merge_authority"
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report())
+    assert out["failure_class"] == "gates"
+
+
+def test_child_schema_and_prompts_carry_gates():
+    tree = ast.parse(WORKFLOW.read_text())
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
+    gate = schema["properties"]["gates"]["items"]
+    assert gate["properties"]["status"]["enum"] == ["passed", "failed"] and gate["required"] == ["id", "status", "evidence"]
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+    assert "g-rows" in child and "row_parity" in child and "waived" in child
+    verify = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1",
+                                  "gates": [{**GATE, "status": "passed", "evidence": "recon/u/result.json"}]}])
+    assert "g-rows" in verify and "recon/u/result.json" in verify
 
 
 @pytest.mark.parametrize("caps", [
@@ -192,9 +1548,9 @@ def test_child_prompt_names_exactly_its_batch_units_for_the_doctor():
         {"id": "c", "units": ["fees"], "write_targets": ["t2"], "brief": "brief"},
     ]))
     text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
-    assert "--role child --expect-identity sp-1 --unit loans --unit payments (exactly this batch" in text
+    assert f"--expect-identity sp-1 --expect-host {HOST} --unit loans --unit payments" in text
     assert "--unit fees" not in text and "--mapping" not in text
-    assert "mapping_spec.json itself" in text
+    assert ".migration/units/<unit_id>/mapping_spec.json" in text
 
 
 def test_child_brief_pins_the_contracts_workspace_host_for_the_doctor():
@@ -228,15 +1584,17 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
 
 def _prompt_ns(manifest):
     tree = ast.parse(WORKFLOW.read_text())
-    names = {"verify_prompt", "batch_verify_depth", "child_prompt", "capability_block",
-             "sum_cost", "cost_line"}
+    names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
+             "sum_cost", "cost_line", "close_prompt", "rerun_after_resync"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES"}
+                    isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES", "RESYNC_CLASS"}
                     for t in node.targets))]
-    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "REPO": "repo", "MANIFEST": manifest,
-          "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled")}
+    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "re": re, "WAVE": 1, "TAG": "0",
+          "REPO": "repo", "MANIFEST": manifest, "REPLAYED": {}, "PRIOR_RESYNC": None,
+          "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
+          "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     return ns
 
@@ -248,16 +1606,41 @@ def test_verifier_prompt_carries_per_batch_depth_defaulting_to_sampled():
     ns = _prompt_ns(m)
     # the shape main() hands the verifier: {"batch": id, ...}, no verify_depth on the record
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": "", "branch": ""} for b in m["batches"]]
-    text = ns["verify_prompt"](passed, True)
+    text = ns["verify_prompt"](passed)
     assert '"b1": "sampled"' in text and '"b2": "full"' in text
     assert "--depth" in text and "Never lower" in text and "recon_cost" in text
     ns2 = _prompt_ns(_manifest(verify_depth="full"))
-    assert '"b": "full"' in ns2["verify_prompt"]([{"batch": "b", "units": ["u"]}], True)
+    assert '"b": "full"' in ns2["verify_prompt"]([{"batch": "b", "units": ["u"]}])
 
 
 def test_child_prompt_asks_for_recon_cost():
     ns = _prompt_ns(_manifest())
     assert "recon_cost" in ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+
+
+def test_capability_block_points_children_at_the_signed_wave_doctor_record():
+    text = _prompt_ns(_manifest())["capability_block"](["u"])
+    assert "--reuse-record .migration/waves/wave-0.doctor.json" in text
+    assert "15" in text
+    text = _prompt_ns(_manifest(doctor_max_age=30))["capability_block"](["u"])
+    assert "doctor_max_age" in text and "30" in text
+
+
+def test_a_degraded_wave_runs_only_the_structural_tier_in_verify():
+    """A declared-DEGRADED wave's verifier runs the harness in `--mode structural` (Tier 0 only, no
+    source rows) and marks PASS on that run's verdict; the merge-eligible full run is not asked for."""
+    text = _prompt_ns(_manifest(degraded=True))["verify_prompt"](
+        [{"batch": "b", "units": ["u"], "pr_url": ""}])
+    assert "--mode structural" in text and "Tier 0" in text and "structural_drift" in text
+    # structural_parity records catalogs it could not read as gaps without failing; a PASS over a gap is
+    # unverified structure, so the verifier needs the gap-free run, not the verdict alone
+    assert 'merge_block_reasons is exactly ["mode"]' in text
+    assert "structural_gap" in text and "structure_unverifiable" in text
+    assert "merge_eligible=true" not in text and "--depth" not in text
+    assert "Mark a unit PASS only if you re-ran the harness in one of" not in text
+    text = _prompt_ns(_manifest())["verify_prompt"](
+        [{"batch": "b", "units": ["u"], "pr_url": ""}])
+    assert "--mode structural" not in text and "merge_eligible=true" in text
 
 
 def test_cost_line_compares_estimate_with_summed_actuals():
@@ -284,9 +1667,10 @@ def test_replayed_failures_do_not_refill_breaker():
         if kwargs["label"] in namespace["REPLAYED"]:
             return {"status": "FAIL", "recon_verdict": "NOT_RUN",
                     "failure_class": "same", "one_line_summary": "replayed"}
-        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live",
+        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
                 "pr_url": "https://example/pr/held", "branch": "feature/held",
-                "changed_paths": ["src/held.sql"], "one_line_summary": "held passed"}
+                "changed_paths": ["src/held.sql"],
+                "one_line_summary": "held passed"}
 
     namespace["agent"] = agent
 
@@ -305,11 +1689,105 @@ def test_replayed_failures_do_not_refill_breaker():
     assert breaker.tripped_on is None
 
 
+PIPELINE_UPDATES = WORKFLOW.parents[1] / "target-routing" / "pipeline_updates.py"
+
+
+def _pipeline_wave(tmp_path, batches, ledger="", **manifest):
+    waves = tmp_path / ".migration" / "waves"
+    waves.mkdir(parents=True)
+    (tmp_path / ".migration" / "06_decisions.md").write_text(ledger)
+    path = waves / "wave-1.json"
+    path.write_text(json.dumps({"wave": 1, "width": 4, "batches": batches, **manifest}))
+    return path
+
+
+def test_check_pipeline_updates_runs_the_script_on_the_manifest_and_returns_its_order(tmp_path):
+    """The workflow can import nothing, so the pipeline check is the plugin's script run as a subprocess on
+    the manifest; a clean run hands back `order` (later batch -> the earlier batches it waits for)."""
+    check = _functions()["check_pipeline_updates"]
+    ledger = "| D-7 | 2026-02-01 | user:U1 | pipeline_serialized p: b1 then b2 |\n"
+    path = _pipeline_wave(tmp_path, [{"id": "b1", "lakeflow_pipelines": ["p"]}, {"id": "b2", "lakeflow_pipelines": ["p"]}],
+                          ledger, serialized_pipelines={"p": "D-7"})
+    assert check(PIPELINE_UPDATES, path) == {"b2": ["b1"]}
+    assert check(PIPELINE_UPDATES, _pipeline_wave(tmp_path / "solo", [{"id": "b1", "lakeflow_pipelines": ["p"]}])) == {}
+
+
+def test_check_pipeline_updates_halts_on_a_shared_pipeline_and_on_an_undeclared_batch(tmp_path):
+    """Any non-zero exit halts the launch, `unsupported` included: a batch that declares no
+    lakeflow_pipelines cannot be checked, and an unchecked wave is not a clean one."""
+    check = _functions()["check_pipeline_updates"]
+    shared = _pipeline_wave(tmp_path / "shared", [{"id": "b1", "lakeflow_pipelines": ["p"]}, {"id": "b2", "lakeflow_pipelines": ["p"]}])
+    with pytest.raises(SystemExit, match=r"pipeline_updates.*'p'.*b1.*b2"):
+        check(PIPELINE_UPDATES, shared)
+    undeclared = _pipeline_wave(tmp_path / "undeclared", [{"id": "b1"}])
+    with pytest.raises(SystemExit, match="unsupported.*b1"):
+        check(PIPELINE_UPDATES, undeclared)
+
+
+def test_check_pipeline_updates_halts_when_the_script_is_missing_or_crashes(tmp_path):
+    check = _functions()["check_pipeline_updates"]
+    path = _pipeline_wave(tmp_path, [{"id": "b1", "lakeflow_pipelines": []}])
+    with pytest.raises(SystemExit, match="pipeline_updates.py"):
+        check(tmp_path / "nowhere" / "pipeline_updates.py", path)
+    broken = tmp_path / "pipeline_updates.py"
+    broken.write_text("raise RuntimeError('boom')\n")
+    with pytest.raises(SystemExit, match="boom"):
+        check(broken, path)
+    silent = tmp_path / "silent.py"
+    silent.write_text("print('not json')\n")
+    with pytest.raises(SystemExit, match="not json"):
+        check(silent, path)
+
+
+def test_run_batch_waits_for_the_batches_its_pipeline_order_names(tmp_path):
+    """Serialization is enforced, not just authorized: with width 2 and order {b2: [b1]}, b2's child
+    launches only after b1's finished, while b3 (no order) runs alongside b1."""
+    namespace = _batch_runtime()
+    events = []
+
+    async def agent(prompt, **kwargs):
+        events.append(("start", kwargs["label"]))
+        if kwargs["label"] == "b1":
+            await asyncio.sleep(0.05)
+        events.append(("end", kwargs["label"]))
+        return {"status": "FAIL", "recon_verdict": "NOT_RUN", "failure_class": kwargs["label"], "one_line_summary": "x"}
+
+    namespace["agent"] = agent
+    batches = [{"id": i, "units": ["u"], "write_targets": ["t"], "brief": "b"} for i in ("b1", "b2", "b3")]
+
+    async def exercise():
+        sem, breaker = asyncio.Semaphore(2), namespace["Breaker"](9)
+        done = {b["id"]: asyncio.Event() for b in batches}
+        order = {"b2": ["b1"]}
+        return await asyncio.gather(*(namespace["run_batch"](b, sem, breaker, done=done[b["id"]],
+                                                            waits=[done[d] for d in order.get(b["id"], [])])
+                                      for b in batches))
+
+    asyncio.run(exercise())
+    assert events.index(("start", "b2")) > events.index(("end", "b1"))
+    assert events.index(("start", "b3")) < events.index(("end", "b1"))
+
+
+def test_run_batch_releases_its_waiters_even_when_the_breaker_held_it_back():
+    namespace = _batch_runtime()
+    namespace["agent"] = None  # never reached
+
+    async def exercise():
+        breaker = namespace["Breaker"](1)
+        breaker.record("x")
+        done = asyncio.Event()
+        out = await namespace["run_batch"](dict(BATCH), asyncio.Semaphore(1), breaker, done=done)
+        return out, done.is_set()
+
+    out, released = asyncio.run(exercise())
+    assert out["status"] == "NOT_LAUNCHED" and released
+
+
 def test_pass_without_pr_is_downgraded():
     namespace = _batch_runtime()
 
     async def agent(prompt, **kwargs):
-        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live",
+        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
                 "branch": "feature/no-url", "one_line_summary": "passed"}
 
     namespace["agent"] = agent
@@ -344,23 +1822,210 @@ def _run_one(namespace, report):
 
 @pytest.mark.parametrize("mode", ["live", "snapshot", "transactional"])
 def test_pass_with_merge_evidence_mode_is_kept(mode):
-    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode,
+    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode, "merge_eligible": True,
                                       "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"],
                                       "one_line_summary": "ok"})
     assert out["status"] == "PASS" and "failure_class" not in out
+    assert out["merge_authority"] == {"kind": "harness", "decision_id": None}
 
 
 @pytest.mark.parametrize("mode", ["fixture", "continuous", None])
 def test_pass_without_merge_evidence_is_downgraded(mode):
-    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode,
+    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode, "merge_eligible": True,
                                       "pr_url": "https://example/pr/1", "branch": "f", "one_line_summary": "ok"})
     assert out["status"] == "FAIL" and out["failure_class"] == "non_merge_evidence"
+
+
+# ---------------------------------------------------------------- merge authority (WS3.2)
+
+LEDGER = ("| D-6 | 2024-05-01 | user:U1 | widen tolerance for orders_dim | \n"
+          "| D-7 | 2024-05-02 | user:U1 | merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
+          "| D-8 | 2024-05-02 | default-accepted | merge_override for other_unit |\n"
+          "| D-70 | 2024-05-03 | user:U1 | merge_override for u2 |\n")
+
+
+def _ns_with_ledger(text=LEDGER):
+    ns = _batch_runtime()
+    ns["decision_ledger"] = lambda: text
+    return ns
+
+
+_pass_nomerge = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "pr_url": "https://example/pr/1",
+                 "branch": "f", "changed_paths": ["src/a.sql"],
+                 "one_line_summary": "ok"}
+
+
+@pytest.mark.parametrize("report", [
+    _pass_nomerge,
+    {**_pass_nomerge, "merge_eligible": False},
+    {**_pass_nomerge, "merge_eligible": "true"},
+    {**_pass_nomerge, "merge_eligible": 1},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "harness", "decision_id": "D-7"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-6"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-8"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "7"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": "D-7"},
+])
+def test_pass_without_merge_eligible_true_needs_a_ledger_override(report):
+    out = _run_one(_ns_with_ledger(), report)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    assert "merge_override" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
+    assert "merge_authority" not in out or out["merge_authority"]["kind"] != "human_override"
+
+
+def test_human_override_recorded_in_the_ledger_for_the_unit_keeps_the_pass():
+    out = _run_one(_ns_with_ledger(), {**_pass_nomerge, "merge_eligible": False,
+                                       "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+    assert out["status"] == "PASS" and "failure_class" not in out
+    assert out["merge_authority"] == {"kind": "human_override", "decision_id": "D-7"}
+
+
+def test_override_does_not_bypass_the_merge_evidence_mode_gate():
+    out = _run_one(_ns_with_ledger(), {**_pass_nomerge, "recon_mode": "fixture", "merge_eligible": False,
+                                       "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+    assert out["status"] == "FAIL" and out["failure_class"] == "non_merge_evidence"
+
+
+def test_override_with_no_ledger_file_fails_closed():
+    out = _run_one(_ns_with_ledger(""), {**_pass_nomerge, "merge_eligible": False,
+                                         "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+
+
+def test_override_decision_row_must_name_every_unit_and_say_merge_override():
+    override_decision = _batch_runtime()["override_decision"]
+    assert override_decision("D-7", ["u"], LEDGER)
+    assert not override_decision("D-7", ["u", "u2"], LEDGER)
+    assert not override_decision("D-7", ["u"], LEDGER.replace("merge_override", "merge override"))
+    assert not override_decision("D-70", ["u"], LEDGER)      # D-70 names u2, not u
+    assert not override_decision("D-7", ["u2"], LEDGER)      # D-7 is not a prefix match for D-70
+    assert override_decision("D-70", ["u2"], LEDGER)
+    assert not override_decision("D-7", ["orders"], "D-7 merge_override for orders_dim")
+    assert not override_decision(None, ["u"], LEDGER) and not override_decision("D-", ["u"], LEDGER)
+
+
+def test_override_decision_row_names_units_in_its_text_not_in_its_metadata():
+    override_decision = _batch_runtime()["override_decision"]
+    row = "| D-7 | 2024-05-02 | user:U1 | merge_override for u |\n"
+    assert override_decision("D-7", ["u"], row)
+    assert not override_decision("D-7", ["U1"], row)                 # the provenance id is not a unit
+    assert not override_decision("D-7", ["2024-05-02"], row)         # nor the date
+    assert not override_decision("D-7", ["u", "U1"], row)
+    assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 | merge_override for u and v (feed gap) |")
+    # column order is the ledger author's: units before the marker count too
+    assert override_decision("D-7", ["orders"], "| D-7 | units: orders | user:U1 | merge_override for an accepted feed gap |")
+    assert override_decision("D-7", ["u", "v"], "| 2024-05-02T10:00:00Z | D-7 | u, v | user:U1 | merge_override |")
+    # but never a unit that is only the row's id, date or author
+    assert not override_decision("D-7", ["D-7"], "| D-7 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["2024-05-02"], "| D-7 | 2024-05-02 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["U1"], "| D-7 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | user:u | merge_override for v |")
+
+
+def test_override_decision_is_the_row_whose_id_cell_is_the_decision_not_a_row_that_mentions_it():
+    """A decision id authorizes only through its own row: one that cites it in prose (supersedes D-7,
+    see D-7) is another decision, and D-7 must be looked up as a row of its own."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u, supersedes D-7 |")
+    assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u | D-7 |")
+    assert not override_decision("D-7", ["u"], "D-7 user:U1 merge_override for u")   # prose, not a table row
+    assert override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u")   # edge pipes are optional
+    assert override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for v |\n| D-7 | user:U1 | merge_override for u |")
+
+
+def test_override_decision_counts_a_unit_named_like_metadata_when_the_row_names_it_in_its_text():
+    """Ids, dates and provenance are excluded by cell, not by shape: a unit called D-7, 2024-05-02 or
+    default-accepted is named like any other when it appears in the row's text."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert override_decision("D-9", ["D-7"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for D-7 |")
+    assert override_decision("D-9", ["2024-05-02"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for 2024-05-02 |")
+    assert override_decision("D-9", ["default-accepted"], "| D-9 | user:evt-1 | merge_override for default-accepted |")
+    assert not override_decision("D-9", ["D-7"], "| D-9 | D-7 | user:evt-1 | merge_override for u |")   # a cell that is only an id
+    assert not override_decision("D-9", ["2026-09-16"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for u |")
+    assert not override_decision("D-9", ["evt-1"], "| D-9 | user:evt-1 | merge_override for u |")
+
+
+def test_override_decision_provenance_is_a_cell_of_its_own_not_a_mention_in_the_text():
+    """Human provenance is the row's provenance cell, exactly `user:<id>`, as the STOP C row's is: a row whose
+    text mentions a user (default-accepted rows citing who asked, prose quoting an event id) is not a
+    human's decision, and a row with a default-accepted cell is the orchestrator's whatever else it says."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-7", ["u"], "| D-7 | 2024-05-02 | user:U1 merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted | merge_override for u, as user:U1 asked |")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted (soft) | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | D-7 user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | user:U1 said so | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 | user:U1 | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 |  user:U1  | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 | user:U1 | waive for u |", word="waive")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted | user:U1 waive for u |", word="waive")
+
+
+def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
+    ns = _batch_runtime()
+    ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
+    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 | merge_override for u, u2, u3 |\n"
+
+    def run(report):
+        async def agent(prompt, **kwargs):
+            return dict(report)
+        ns["agent"] = agent
+        batch = {"id": "b", "units": ["u", "u2", "u3"], "write_targets": ["t"], "brief": "b"}
+        return asyncio.run(ns["run_batch"](batch, asyncio.Semaphore(1), ns["Breaker"](3)))
+
+    base = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
+            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": [], "one_line_summary": "ok"}
+    out = run(base)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "merge_authority" not in out
+    assert "recon/u2/result.json" in out["one_line_summary"] and "merge_eligible=False" in out["one_line_summary"]
+    assert "recon/u3/result.json" in out["one_line_summary"] and "missing or malformed" in out["one_line_summary"]
+    out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
+
+
+def test_override_decision_row_needs_human_provenance():
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-8", ["other_unit"], LEDGER)          # default-accepted is not a human
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "bot:"))
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "user"))
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:U1", "user:"))      # user: with no event id
+    assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 | merge", "user:a.b@x.io | merge"))
+
+
+def test_override_decision_marker_does_not_stand_in_for_a_unit_of_that_name():
+    """A unit may be called merge_override (UNIT_ID allows it); the row's one authority marker is not then
+    also the mention of that unit. The row has to name it a second time."""
+    override_decision = _batch_runtime()["override_decision"]
+    row = "| D-9 | 2024-05-03 | user:U2 | merge_override for an accepted feed gap |\n"
+    assert not override_decision("D-9", ["merge_override"], row)
+    assert not override_decision("D-9", ["merge_override", "u"], row.replace("gap", "gap in u"))
+    assert override_decision("D-9", ["merge_override"], row.replace("gap", "gap in merge_override"))
+    assert override_decision("D-9", ["merge_override", "u"], row.replace("gap", "gap in merge_override and u"))
+
+
+def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():
+    src = WORKFLOW.read_text()
+    tree = ast.parse(src)
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
+    assert "merge_eligible" in schema["required"] and schema["properties"]["merge_eligible"]["type"] == "boolean"
+    assert schema["properties"]["merge_authority"]["properties"]["kind"]["enum"] == ["harness", "human_override"]
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"](_manifest()["batches"][0])
+    assert "merge_eligible" in child and "merge_override" in child and "06_decisions.md" in child
+    passed = [{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1",
+               "merge_authority": {"kind": "human_override", "decision_id": "D-7"}}]
+    verify = ns["verify_prompt"](passed)
+    assert "human_override" in verify and "D-7" in verify
 
 
 def test_prompts_name_every_merge_evidence_mode():
     ns = _prompt_ns(_manifest())
     child = ns["child_prompt"](_manifest()["batches"][0])
-    verify = ns["verify_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1"}], False)
+    verify = ns["verify_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1"}])
     for mode in ("live", "snapshot", "transactional"):
         assert mode in child and mode in verify
     assert "Fixture evidence is never PASS" in child
@@ -396,8 +2061,9 @@ LEDGER_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targe
 
 
 def _pass(**extra):
-    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "pr_url": "https://example/pr/1",
-            "branch": "f", "one_line_summary": "ok", **extra}
+    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
+            "pr_url": "https://example/pr/1", "branch": "f",
+            "one_line_summary": "ok", **extra}
 
 
 def test_clean_diff_stays_pass_and_recon_evidence_for_its_own_units_is_allowed():
@@ -461,7 +2127,7 @@ def test_prompts_demand_changed_paths_and_base_branch_policy_files():
     child = ns["child_prompt"](_manifest()["batches"][0])
     assert "git diff --name-only" in child and "changed_paths" in child
     assert ".migration/recon/<unit_id>/" in child and "ledger_tampered" in child
-    verify = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1"}], False)
+    verify = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1"}])
     assert "git diff --name-only" in verify and "changed_paths" in verify
     assert "03_recon_tolerances.json" in verify and "allowed_targets.json" in verify
     assert "base branch" in verify and "not the PR" in verify
@@ -471,36 +2137,36 @@ def test_prompts_demand_changed_paths_and_base_branch_policy_files():
 def test_validate_verify_requires_changed_paths_inside_the_wave_report_dir():
     validate_verify = _functions()["validate_verify"]
     passed = [{"batch": "w2-b03", "units": ["u"], "pr_url": "https://example/pr/3"}]
-    ok = {"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "PASS"}, "merged_prs": [], "findings": [],
+    ok = {"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "PASS"}, "findings": [],
           "changed_paths": [".migration/recon/wave-2/report.md"]}
-    assert validate_verify(ok, passed, False, wave=2, observed=[]) == []
+    assert validate_verify(ok, passed, wave=2, observed=[]) == []
     problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-2/report.md",
-                                                        ".migration/03_recon_tolerances.json"]}, passed, False, 2, [])
+                                                        ".migration/03_recon_tolerances.json"]}, passed, 2, [])
     assert problems == ["verifier output invalid: ledger tampered, changed .migration/03_recon_tolerances.json"]
-    problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-3/report.md"]}, passed, False, 2, [])
+    problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-3/report.md"]}, passed, 2, [])
     assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/wave-3/report.md"]
-    problems = validate_verify({k: v for k, v in ok.items() if k != "changed_paths"}, passed, False, 2, [])
+    problems = validate_verify({k: v for k, v in ok.items() if k != "changed_paths"}, passed, 2, [])
     assert problems == ["verifier output invalid: changed_paths must be a list of paths (git diff --name-only)"]
 
 
 def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_report():
     validate_verify = _functions()["validate_verify"]
     passed = [{"batch": "w2-b03", "units": ["u"], "pr_url": "https://example/pr/3"}]
-    ok = {"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "PASS"}, "merged_prs": [], "findings": [],
+    ok = {"wave_verdict": "PASS", "unit_verdicts": {"w2-b03": "PASS"}, "findings": [],
           "changed_paths": [".migration/recon/wave-2/report.md"]}
-    assert validate_verify(ok, passed, False, wave=2, observed=[".migration/recon/wave-2/report.md"]) == []
-    tampered = validate_verify(ok, passed, False, wave=2,
+    assert validate_verify(ok, passed, wave=2, observed=[".migration/recon/wave-2/report.md"]) == []
+    tampered = validate_verify(ok, passed, wave=2,
                                observed=[".migration/recon/wave-2/report.md", ".migration/allowed_targets.json"])
     assert tampered == ["verifier output invalid: ledger tampered, changed .migration/allowed_targets.json"]
-    unverifiable = validate_verify(ok, passed, False, wave=2, observed=None)
+    unverifiable = validate_verify(ok, passed, wave=2, observed=None)
     assert len(unverifiable) == 1 and "recon/wave-2" in unverifiable[0] and "git" in unverifiable[0]
     # `observed` is what the verifier itself changed (verifier_changed_paths): a passed unit's evidence in
     # it means the verifier rewrote it, which is not the verifier's to do
-    problems = validate_verify(ok, passed, False, wave=2,
+    problems = validate_verify(ok, passed, wave=2,
                                observed=[".migration/recon/wave-2/report.md", ".migration/recon/u/result.json"])
     assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/u/result.json"]
     src = WORKFLOW.read_text()
-    assert 'validate_verify(verify, passed, auto_merge, WAVE, verifier_changed_paths(WAVE, passed))' in src
+    assert 'validate_verify(verify, passed, TAG, verifier_changed_paths(TAG, passed))' in src
 
 
 # ---------------------------------------------------------------- capability contract vs the doctor's record (A3)
@@ -546,13 +2212,15 @@ def _launch_ns(tmp_path, fake_run=None):
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"signed_doctor_report", "wave_signature", "pr_changed_paths",
-                                      "ref_changed_paths", "wave_base", "launch_base",
-                                      "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate"})
+                                      "ref_changed_paths", "wave_base", "launch_base", "evidence_in_pr",
+                                      "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate",
+                                      "fetch_ref", "pr_head"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "PR_URL" for t in node.targets))]
+                    isinstance(t, ast.Name) and t.id in {"PR_URL", "UNIT_ID"} for t in node.targets))]
     ns = {"datetime": datetime, "hashlib": hashlib, "hmac": hmac, "json": json, "os": os, "re": re,
           "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
           "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target", "resume": False,
+          "TAG": "orders-1", "MANIFEST": {"repo": "github.com/acme/dbx-target"},
           "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json",
           "BASE_SHA_PATH": tmp_path / ".migration" / "waves" / "wave-1.base_sha",
           "DOCTOR_MAX_AGE": datetime.timedelta(minutes=15),
@@ -599,7 +2267,7 @@ def test_signed_doctor_report_gate(tmp_path):
 
 
 def _git_fake(calls, head, merged, paths):
-    """git as the gate sees it: the PR head fetched into FETCH_HEAD, origin/main at 't'*40 (fresh fetch),
+    """git as the gate sees it: the PR head fetched into this workflow's own ref, origin/main at 't'*40 (fresh fetch),
     `merge-base --is-ancestor` answering whether the head is already in it, one diff."""
     def fake_run(cmd, **kw):
         calls.append(cmd)
@@ -619,9 +2287,13 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     # the gated head's sha comes back with the paths: the verifier's tree is later held to exactly it
     assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == (
         "c" * 40, ["src/a.sql", ".migration/allowed_targets.json"])
-    # the host writes refs/pull/N/head; the child's branch name never reaches git
-    assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "refs/pull/42/head"]
-    assert calls[1][3:] == ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]
+    # the host writes refs/pull/N/head; the child's branch name never reaches git. The fetch lands in a ref
+    # only this workflow writes: FETCH_HEAD is shared by every process in the clone, so a sibling
+    # pipeline's fetch between the two commands would hand this wave another PR's head
+    local = "refs/migration/wave-orders-1/refs/pull/42/head"
+    assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", f"+refs/pull/42/head:{local}"]
+    assert calls[1][3:] == ["rev-parse", "--verify", local + "^{commit}"]
+    assert not any("FETCH_HEAD" in " ".join(c) for c in calls)
     # the base is fetched now, not read from the launch snapshot: a child launched on a resume forked from
     # a base the verifier had merged accepted units into, and those units are not its diff
     assert calls[2][3:] == ["fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]
@@ -650,8 +2322,22 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     assert _launch_ns(tmp_path, failing)["ref_changed_paths"]("recon/wave-2") is None
 
 
+def test_every_fetch_the_gate_makes_lands_in_this_workflows_own_ref(tmp_path):
+    calls = []
+    ns = _launch_ns(tmp_path, _git_fake(calls, "c" * 40, False, ""))
+    assert ns["ref_changed_paths"]("recon/wave-orders-1") == ("c" * 40, [])
+    assert calls[0][3:] == ["fetch", "-q", "origin", "+recon/wave-orders-1:refs/migration/wave-orders-1/recon/wave-orders-1"]
+    assert calls[1][3:] == ["rev-parse", "--verify", "refs/migration/wave-orders-1/recon/wave-orders-1^{commit}"]
+    calls.clear()
+    assert ns["pr_head"]("https://github.com/acme/dbx-target/pull/7") == "c" * 40
+    assert calls[0][3:] == ["fetch", "-q", "origin", "+refs/pull/7/head:refs/migration/wave-orders-1/refs/pull/7/head"]
+    assert calls[1][3:] == ["rev-parse", "--verify", "refs/migration/wave-orders-1/refs/pull/7/head^{commit}"]
+    assert ns["pr_head"]("https://github.com/other/repo/pull/7") is None
+    assert "FETCH_HEAD" not in WORKFLOW.read_text()
+
+
 def _replay_git(calls, head, record_merged, paths):
-    """git as replay_gate sees it: the PR's current head in FETCH_HEAD, origin/main at 't'*40, `merge-base
+    """git as replay_gate sees it: the PR's current head fetched into this workflow's ref, origin/main at 't'*40, `merge-base
     --is-ancestor` true for the recorded head only when record_merged (the resumed run's verifier merged it),
     never for the current head; one diff."""
     def fake_run(cmd, **kw):
@@ -677,7 +2363,8 @@ def test_replay_gate_reuses_the_recorded_head_only_while_the_pr_still_points_at_
     # possibly naming other units' evidence) is not what gates it; the recorded head stands as gated
     ns = _launch_ns(tmp_path, _replay_git(calls, "c" * 40, False, ".migration/recon/other/result.json\n"))
     assert ns["replay_gate"](record, url) == ("c" * 40, [])
-    assert calls[0][3:] == ["fetch", "-q", "origin", "refs/pull/42/head"]  # the PR's head, fetched now
+    assert calls[0][3:] == ["fetch", "-q", "origin",
+                            "+refs/pull/42/head:refs/migration/wave-orders-1/refs/pull/42/head"]  # the PR's head, fetched now
     calls.clear()
     # the PR gained a commit touching the allowlist since the record: the new head is gated, and fails
     ns = _launch_ns(tmp_path, _replay_git(calls, "e" * 40, False, ".migration/allowed_targets.json\nsrc/a.sql\n"))
@@ -732,7 +2419,7 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
     with pytest.raises(SystemExit, match="mode: rerun"):
         ns["launch_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = launch_base\(\)\nDOCTOR = signed_doctor_report", src)
+    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
     assert 'BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")' in src and '"base_sha": BASE_SHA' in src
 
 
@@ -769,7 +2456,7 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
     assert ns["verifier_changed_paths"](2, passed) == [
         ".migration/03_recon_tolerances.json", ".migration/recon/u/result.json", ".migration/recon/wave-2/report.md",
         "src/loans.sql"]
-    assert calls[0][3:] == ["fetch", "-q", "origin", "recon/wave-2"]
+    assert calls[0][3:] == ["fetch", "-q", "origin", "+recon/wave-2:refs/migration/wave-orders-1/recon/wave-2"]
     assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "t" * 40 + "..." + "v" * 40]
     assert calls[6][3:] == ["diff", "--name-only", "--no-renames", "1" * 40, "v" * 40, "--", ".migration/recon/u/"]
     assert calls[7][3:] == ["diff", "--name-only", "--no-renames", "b" * 40, "v" * 40, "--", ".migration/recon/u/"]
@@ -943,7 +2630,7 @@ def test_param_values_follow_the_recon_contract_so_a_timestamp_is_accepted():
     source = {"family": "sqlserver", "secret": "X", "params": {"as_of": "2026-09-08 18:43:52", "db": "loans"}}
     ns["validate_manifest"](_manifest(source=source))
     text = _prompt_ns(_manifest(source=source))["child_prompt"](_manifest()["batches"][0])
-    flags = text[text.index("--source-family"):].split(" (the source")[0]
+    flags = text[text.index("--source-family"):].split("`")[0]
     assert shlex.split(flags) == ["--source-family", "sqlserver", "--source-secret", "X",
                                   "--param", "as_of=2026-09-08 18:43:52", "--param", "db=loans"]
 
@@ -953,3 +2640,237 @@ def test_child_prompt_passes_the_source_family_and_secret_to_the_doctor():
     text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
     assert "--source-family postgres --source-secret LAKEBASE_SRC --param db=x" in text
     assert "--source-family" not in _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])
+
+
+# ---------------------------------------------------------------- G3: child contract without a per-child review, wave close
+
+
+def _child_schema():
+    tree = ast.parse(WORKFLOW.read_text())
+    return next(ast.literal_eval(n.value) for n in tree.body
+                if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
+
+
+def test_child_schema_has_no_review_fields_and_one_line_feedback_and_cost():
+    schema = _child_schema()
+    assert not {"review_clean", "review_head", "review_waiver"} & set(schema["properties"])
+    assert not {"review_clean", "review_head", "review_waiver"} & set(schema["required"])
+    assert schema["properties"]["skill_feedback"] == {"type": "array", "items": {"type": "string"},
+                                                       "description": "one line per rule you had to derive yourself"}
+    assert schema["properties"]["recon_cost"]["type"] == "object"
+    assert set(schema["required"]) == {"status", "recon_verdict", "recon_mode", "merge_eligible", "write_targets",
+                                       "changed_paths", "one_line_summary"}
+    child = _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])
+    assert "review_clean" not in child and "review_waived" not in child and "review_head" not in child
+
+
+def test_a_pass_no_longer_needs_a_review_round():
+    report = _pass(changed_paths=["src/a.sql"])
+    for k in ("review_clean", "review_head"):
+        report.pop(k, None)
+    out = _run_one(_batch_runtime(), report)
+    assert out["status"] == "PASS" and "failure_class" not in out and "review_waiver" not in out
+
+
+def test_child_prompt_is_s2_shaped_and_under_900_words():
+    brief = " ".join(f"word{i}" for i in range(300))
+    m = _manifest(batches=[{"id": "b", "units": ["loans", "payments"], "write_targets": ["mig.loans", "mig.pay"],
+                            "brief": brief, "gates": [GATE]}])
+    text = _prompt_ns(m)["child_prompt"](m["batches"][0])
+    assert len(text.split()) < 900, len(text.split())
+    order = [text.index(s) for s in (
+        '"loans"', "mig.loans",                                            # units and write targets
+        "mapping_spec.json",                                               # converted files and mapping specs
+        f"factory-doctor --role child --reuse-record .migration/waves/wave-0.doctor.json "
+        f"--expect-identity sp-1 --expect-host {HOST}",                    # exact doctor shape
+        "BLOCKED", "warn",                                                 # fail row blocks, warn continues
+        "3 full runs", "tolerance",                                        # harness cap, never loosen
+        "merge authority",                                                 # harness decides
+        "exactly one PR", "first line",                                    # one PR, PASS/FAIL line 1
+        "Do not merge",                                                    # no merge
+        ".migration/recon/<unit_id>/",                                     # ledger rule
+        "one_line_summary",                                                # structured output
+    )]
+    assert order == sorted(order), order
+    assert "hook probe" not in text.lower() and "Devin Review" not in text
+
+
+def test_close_prompt_and_schema_carry_the_wave_close_review_round():
+    ns = _prompt_ns(_manifest())
+    prompt = ns["close_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1", "pr_head": "c" * 40}], 10)
+    assert "one Devin Review round" in prompt and "review_findings" in prompt and "not a merge blocker" in prompt
+    review_only = ns["close_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1", "pr_head": "c" * 40}],
+                                     10, merge=False)
+    assert "Do not merge anything" in review_only and "one Devin Review round" in review_only
+    assert "Merge exactly these PRs" not in review_only
+    tree = ast.parse(WORKFLOW.read_text())
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CLOSE_SCHEMA" for t in n.targets))
+    assert schema["properties"]["review_findings"] == {"type": "array", "items": {"type": "string"}}
+    assert "review_findings" not in schema["required"]
+
+
+# ---------------------------------------------------------------- G3: verifier verdicts keyed by batch or unit
+
+
+def _verify(verdicts, passed):
+    return _functions()["validate_verify"]({"wave_verdict": "PASS", "unit_verdicts": verdicts, "findings": [],
+                                            "changed_paths": []}, passed)
+
+
+def test_validate_verify_normalises_unit_keys_to_batch_ids_for_any_batch_size():
+    passed = [{"batch": "w2-b03", "units": ["orders", "lines"], "pr_url": "https://example/pr/3"},
+              {"batch": "w2-b04", "units": ["fees"], "pr_url": "https://example/pr/4"}]
+    assert _verify({"orders": "PASS", "lines": "PASS", "fees": "PASS"}, passed) == []
+    assert _verify({"w2-b03": "PASS", "fees": "PASS"}, passed) == []
+    assert _verify({"orders": "PASS", "w2-b04": "PASS"}, passed) == []
+    assert _verify({"w2-b03": "PASS", "orders": "PASS", "lines": "PASS", "fees": "PASS"}, passed) == []
+    missing = _verify({"orders": "PASS"}, passed)
+    assert missing == ["verifier output invalid: missing verdicts for w2-b04"]
+    extra = _verify({"orders": "PASS", "fees": "PASS", "ledger": "PASS"}, passed)
+    assert extra == ["verifier output invalid: unexpected verdicts for ledger"]
+
+
+def test_validate_verify_fails_only_a_real_collision_after_normalisation():
+    passed = [{"batch": "w2-b03", "units": ["orders", "lines"], "pr_url": "https://example/pr/3"}]
+    problems = _verify({"orders": "PASS", "lines": "FAIL"}, passed)
+    assert any("conflicting verdicts for w2-b03" in p and "orders=PASS" in p and "lines=FAIL" in p for p in problems)
+    assert not any("unexpected verdicts" in p for p in problems)
+    problems = _verify({"w2-b03": "FAIL", "orders": "PASS"}, passed)
+    assert any("conflicting verdicts for w2-b03" in p for p in problems)
+    # a unit id that is also a batch id is read as the batch
+    passed = [{"batch": "orders", "units": ["orders"], "pr_url": "https://example/pr/3"}]
+    assert _verify({"orders": "PASS"}, passed) == []
+
+
+def test_batch_verdicts_is_what_main_reads_for_merges():
+    batch_verdicts = _functions()["batch_verdicts"]
+    passed = [{"batch": "w2-b03", "units": ["orders", "lines"]}, {"batch": "w2-b04", "units": ["fees"]}]
+    assert batch_verdicts({"orders": "PASS", "lines": "PASS", "w2-b04": "FAIL"}, passed) == {"w2-b03": "PASS", "w2-b04": "FAIL"}
+    assert batch_verdicts({"orders": "PASS", "lines": "FAIL"}, passed) == {"w2-b03": None}
+    assert batch_verdicts("nope", passed) == {}
+
+
+def test_verifier_prompt_and_schema_say_verdicts_are_normalised_to_batch_ids():
+    ns = _prompt_ns(_manifest())
+    text = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1"}])
+    assert "unit_verdicts" in text and "batch id" in text and "unit id" in text and "normalis" in text
+    tree = ast.parse(WORKFLOW.read_text())
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "VERIFY_SCHEMA" for t in n.targets))
+    desc = schema["properties"]["unit_verdicts"]["description"]
+    assert "batch id" in desc and "unit id" in desc and "PASS" in desc
+
+
+# ---------------------------------------------------------------- G3: identity resync step and selective replay
+
+
+def test_validate_manifest_accepts_and_checks_the_optional_resync_block():
+    validate_manifest = _functions()["validate_manifest"]
+    validate_manifest(_manifest(resync={"command": "python3 load/resync_identity.py --unit u", "units": ["u"]}))
+    for bad, why in (("run it", "resync"), ({"command": "x"}, "resync"), ({"units": ["u"]}, "resync"),
+                     ({"command": "", "units": ["u"]}, "command"), ({"command": "x", "units": []}, "units"),
+                     ({"command": "x", "units": ["ghost"]}, "ghost"), ({"command": "x", "units": "u"}, "units"),
+                     ({"command": "x", "units": ["u"], "sql": "setval"}, "resync")):
+        with pytest.raises(SystemExit, match=why):
+            validate_manifest(_manifest(resync=bad))
+
+
+def _resync_ns():
+    tree = ast.parse(WORKFLOW.read_text())
+    names = {"resync_prompt", "validate_resync", "rerun_after_resync"}
+    selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
+                or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"RESYNC_CLASS", "RESYNC_SCHEMA"}
+                                                       for t in n.targets))]
+    ns = {"json": json, "re": re, "WAVE": 1, "REPO": "repo", "BASE_BRANCH": "migration/x",
+          "MANIFEST": _manifest(resync={"command": "python3 load/resync_identity.py --unit u", "units": ["u"]})}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
+    return ns
+
+
+def test_resync_prompt_runs_exactly_the_command_and_commits_nothing():
+    ns = _resync_ns()
+    text = ns["resync_prompt"](ns["MANIFEST"]["resync"])
+    assert "python3 load/resync_identity.py --unit u" in text and "migration/x" in text and "repo root" in text
+    assert "setval" in text and "identity" in text and '"u"' in text
+    assert "by name" in text and "commit nothing" in text.lower() and "allowlist" in text
+    assert "before" in text and "after" in text and "sequences" in text
+    schema = ns["RESYNC_SCHEMA"]
+    assert schema["properties"]["sequences"]["items"]["required"] == ["object", "before", "after"]
+    assert set(schema["required"]) == {"status", "sequences", "changed_paths", "one_line_summary"}
+
+
+def test_validate_resync_rejects_writes_and_objects_outside_the_listed_units():
+    validate_resync = _resync_ns()["validate_resync"]
+    ok = {"status": "ok", "sequences": [{"object": "mig.u.orders_id_seq", "before": 10, "after": 42}],
+          "changed_paths": [], "one_line_summary": "reseeded"}
+    assert validate_resync(ok) == []
+    assert "expected an object" in validate_resync([])[0]
+    assert any("changed src/x.sql" in p for p in validate_resync({**ok, "changed_paths": ["src/x.sql"]}))
+    assert any("sequences" in p for p in validate_resync({**ok, "sequences": [{"object": "s"}]}))
+    assert any("status" in p for p in validate_resync({**ok, "status": "done"}))
+    failed = {"status": "failed", "sequences": [], "changed_paths": [], "one_line_summary": "setval exited 1"}
+    assert any("resync command failed" in p for p in validate_resync(failed))
+    assert validate_resync({**ok, "sequences": []}) == []
+
+
+def test_child_prompt_carries_the_resync_report_only_to_the_children_it_reruns():
+    ns = _prompt_ns(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"},
+                                       {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "brief"}]))
+    plain = {b["id"]: ns["child_prompt"](b) for b in ns["MANIFEST"]["batches"]}
+    ns["REPLAYED"] = {"b": {"id": "b", "status": "FAIL", "failure_class": "sequence_behind_source"},
+                      "c": {"id": "c", "status": "PASS"}}
+    ns["PRIOR_RESYNC"] = {"status": "ok", "sequences": [{"object": "mig.u.s", "before": 1, "after": 9}]}
+    b, c = (ns["child_prompt"](x) for x in ns["MANIFEST"]["batches"])
+    assert b != plain["b"] and "resync" in b and "mig.u.s" in b
+    assert c == plain["c"]
+
+
+def test_rerun_after_resync_reruns_only_identity_failures_and_unreported_children():
+    rerun = _resync_ns()["rerun_after_resync"]
+    seq = {"status": "FAIL", "failure_class": "sequence_behind_source"}
+    ident = {"status": "FAIL", "failure_class": "identity_drift"}
+    other = {"status": "FAIL", "failure_class": "decimal_rounding"}
+    passed = {"status": "PASS"}
+    assert rerun(seq, True) and rerun(ident, True) and rerun(None, True)
+    assert rerun({"status": "NOT_LAUNCHED"}, True)
+    assert not rerun(other, True) and not rerun(passed, True) and not rerun({"status": "BLOCKED"}, True)
+    assert not rerun(seq, False) and not rerun(None, False)
+
+
+@pytest.mark.parametrize("value", [0, True, "10", 61])
+def test_validate_manifest_rejects_a_bad_close_minutes(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="close_minutes"):
+        validate_manifest(_manifest(close_minutes=value))
+    validate_manifest(_manifest(close_minutes=10))
+    validate_manifest(_manifest(close_minutes=60))
+
+
+def test_validate_close_lists_each_verified_pr_in_exactly_one_bucket_and_nothing_else():
+    validate_close = _functions()["validate_close"]
+    to_merge = [{"batch": "b1", "pr_url": "u1"}, {"batch": "b2", "pr_url": "u2"}]
+    row = lambda url: {"pr_url": url, "merge_commit_sha": "a" * 40, "merged_head": "b" * 40}
+    ok = {"merged_prs": [row("u1")], "unmerged": [{"pr_url": "u2", "reason": "head moved"}],
+          "changed_paths": []}
+    assert validate_close(ok, to_merge) == []
+    assert any("merged with auto_merge off" in p for p in validate_close(ok, to_merge, merge=False))
+    assert "expected an object" in validate_close([], to_merge)[0]
+    problems = validate_close({**ok, "merged_prs": ["u1"]}, to_merge)
+    assert any("merged_prs rows must be" in p for p in problems)
+    problems = validate_close({**ok, "merged_prs": [row("u1"), row("foreign")]}, to_merge)
+    assert any("outside the wave" in p and "foreign" in p for p in problems)
+    problems = validate_close({"merged_prs": [], "unmerged": [], "changed_paths": []}, to_merge)
+    assert len([p for p in problems if "u1" in p or "u2" in p]) == 2
+    problems = validate_close({**ok, "merged_prs": [row("u1"), row("u2")],
+                               "unmerged": [{"pr_url": "u2", "reason": "x"}]}, to_merge)
+    assert any("u2" in p for p in problems)
+    problems = validate_close({**ok, "changed_paths": ["src/x.sql"]}, to_merge)
+    assert any("changed src/x.sql" in p for p in problems)
+
+
+def test_close_prompt_names_the_deadline_and_forbids_writes():
+    ns = _prompt_ns(_manifest())
+    prompt = ns["close_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1", "pr_head": "c" * 40}], 10)
+    assert "10 minutes" in prompt and "Write nothing" in prompt and "https://example/pr/1" in prompt
+    assert "recon/" not in prompt

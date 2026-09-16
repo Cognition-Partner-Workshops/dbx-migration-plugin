@@ -2,17 +2,17 @@
 
 The only home for the process rules below (stops, `stop_mode`, D1-D10, notifications, branch and merge, fan-out guards). `AGENTS.md` holds the always-on hard rules; each skill's `SKILL.md` holds its tool contract; `OVERVIEW.md` is the map. Other files point here and do not restate.
 
-## Stops A–E
+## Stops A–E and wave close
 
 | Stop | Plain-language question | When | Default | What the user decides |
 |---|---|---|---|---|
-| **A** | "This is what 'migrated' will mean, these are the accuracy tolerances, and this is the access we need. Correct?" | after pre-migration | per `stop_mode` (default soft) | target profiles per workload (and which are N/A), recon tolerances, access checklist status, repo topology |
-| **B** | "Here is everything in your estate. Which pipeline do we migrate first?" | after estate inventory | per `stop_mode` (default soft) | **which pipeline to migrate** (default: the inventory's recommendation), its scope boundary and exclusions |
+| **A** | "This is what 'migrated' will mean, these are the accuracy tolerances, and this is the access we need. Correct?" | after pre-migration | per `stop_mode` (default soft) | target profiles per workload (and which are N/A), recon tolerances, access checklist status, repo topology, and, when intake named the first pipeline with its scope boundary and exclusions, that packet (then STOP B is skipped) |
+| **B** | "Here is everything in your estate. Which pipeline do we migrate first?" | after estate inventory; skipped only when intake fixed both the first pipeline and its scope boundary and exclusions; if intake named only the pipeline, STOP B still runs for boundary approval with the pipeline choice fixed | per `stop_mode` (default soft) | **which pipeline to migrate** (default: the inventory's recommendation), its scope boundary and exclusions |
 | **C** | "Here is the plan: order, dependencies, how many parallel sessions, cost. Approved?" | after plan | per `stop_mode` (default soft) | analysis, plan, every dependency decision, fan-out width, wave gates, data target |
-| **D** | "A batch is done, here is the evidence it matches the old system. Any concerns?" (notification only) | after each wave | notify | review the wave's PRs and recon evidence in batch; optionally pause the fan-out |
+| **Wave close** (was D) | "A batch is done, here is the evidence it matches the old system. Any concerns?" | after each wave | notify | the wave-close review covers the wave's PASS PRs as a set, with recon evidence, in batch (an optional parent-owned resync runs before the verifier); optionally pause the fan-out. `PASS (unmerged)` in `05_progress.md` is not advanceable until the PR is recorded merged via `--refresh-merged` |
 | **E** | "The new system has matched the old one in production for weeks. Authorize cutover?" | before cutover | blocking | sign-off, evidence, independent audit, cutover authorization |
 
-Stops fire even on resumed runs; approvals never carry over. Default `stop_mode` is soft (60-second window, then the recommended default, recorded as `default-accepted`); STOP E always blocks. At every stop, the full markdown artifacts are attached, not summarized.
+Stops fire even on resumed runs; approvals never carry over. Default `stop_mode` is soft (60-second window, then the recommended default, recorded as `default-accepted`); STOP E always blocks. At every stop, the full markdown artifacts are attached, not summarized. Wave close is a notification, never a stop: nothing waits on a reply.
 
 ## stop_mode
 
@@ -48,14 +48,14 @@ Each entry records the full contract, then a decision (federate / re-point / dua
 
 ## Notification contract
 
-If `00_context.md` names a notification contract, post to it at exactly these moments: each stop when its artifacts are ready for approval (one message, artifact links, what decision is needed), each STOP D wave close (exception count and the wave report), and any fan-out halt (collision or circuit breaker) with what is paused and what unblocks it. Slack posts go through the Slack integration (stops can be approved from the thread); Teams posts go to the webhook whose URL lives in the named secret. Never post per-child or per-green-PR updates. If the interaction contract opts in, add one **daily digest** at the agreed hour (a run that spans a sleep period earns it): the latest wave-close brief's headline, the status-table delta, and anything awaiting the user, in 2-4 sentences with links; it is a summary surface, never a substitute for an approval stop.
+If `00_context.md` names a notification contract, post to it at exactly these moments: each stop when its artifacts are ready for approval (one message, artifact links, what decision is needed), each wave close (exception count and the wave report), and any fan-out halt (collision or circuit breaker) with what is paused and what unblocks it. Slack posts go through the Slack integration (stops can be approved from the thread); Teams posts go to the webhook whose URL lives in the named secret. Never post per-child or per-green-PR updates. If the interaction contract opts in, add one **daily digest** at the agreed hour (a run that spans a sleep period earns it): the latest wave-close brief's headline, the status-table delta, and anything awaiting the user, in 2-4 sentences with links; it is a summary surface, never a substitute for an approval stop.
 
 Message style and the one-message-per-event rule are `AGENTS.md`.
 
 ## Branch, PR and merge
 
 - Unit PRs and migration ledgers land on the engagement feature branch: `base_branch` is required; `main`/`master` require a recorded `trunk_base_decision`.
-- `auto_merge` is false by default and may be true only under a decision recorded at STOP A; hard `stop_mode` requires false.
+- `auto_merge` is false by default and may be true only under a decision recorded at STOP A; hard `stop_mode` requires false. In hard mode, the merge owner merges PASS PRs listed under "Awaiting manual merge" in the brief without a wave-close reply gate; rejected or paused PASS PRs need a `06_decisions.md` row, while a workflow safety halt waits for a human.
 - The normal unit deliverable is one PR per unit batch.
 - Only a live, snapshot, or transactional PASS from the independent verifier is merge-eligible.
 - Detailed manifest and PR-diff enforcement remains in `skills/migration-fanout/SKILL.md`; plan/manifest construction remains in `playbooks/4-migration_plan.md`.
@@ -66,6 +66,7 @@ Each row names the check that enforces it; the always-on rules (secrets, write s
 
 | If this happens | What catches it |
 |---|---|
+| A source probe runs before the write scope exists | Create `.migration/allowed_targets.json` with `catalogs` and `legacy_sources` before any source probe; authorized legacy writes carry `DBX_DECISION=D-<id>` with `legacy_write_authorized` and the object in `06_decisions.md`. |
 | A stop is skipped or an old approval is reused | Every stop is a dated row in `06_decisions.md`; the orchestrator re-reads it on resume and re-asks if the inputs changed. |
 | A child gets an incomplete brief | It reports BLOCKED, does nothing, and the brief says which item was missing. It never guesses. |
 | Two children write the same table | `workflow.py` collision check refuses to launch the wave; found afterwards, merges are held and the brief says so. |

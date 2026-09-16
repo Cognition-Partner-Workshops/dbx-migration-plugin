@@ -32,6 +32,25 @@ playbook is right.
 | Streaming legacy jobs (Kafka consumers, CDC streams) | `databricks-spark-structured-streaming` | Trigger modes, checkpoints, sinks. |
 | Verifying a migrated model/scoring job (prediction parity, playbook 6 ML-SCORING step) | `databricks-model-serving`, `databricks-ml-training` | Endpoints, MLflow, batch inference. |
 
+## Route by call graph
+
+Track assignment follows the dependency analysis a source-dialect skill emits
+(`.migration/units/<unit>/dependencies.json`, `{routine, reads, writes, calls}` rows; shape and fixture in
+`skills/oracle-plsql/SKILL.md`), not the table's home schema. Walk each routine's `calls` transitively and
+union its `reads` and `writes`:
+
+- A routine on the operational-database track (Lakebase, `14-front_door_oltp`) pulls every table it reads
+  onto that track as well: the converted PL/pgSQL runs inside a Postgres transaction and can only read
+  Postgres tables, so a lookup left analytical-only breaks the routine. Such a table lands on both tracks
+  (the Lakebase copy fed by the synced-table path in `databricks-lakebase`), with one side recorded as owner.
+- A routine on the analytical track routes its reads and writes to the DBSQL/Lakeflow skills above; a
+  table it writes that an OLTP routine also writes is a routing conflict to decide (`06_decisions.md`), not
+  something to split silently.
+- The transitive `writes` of a unit's routines, each taken to the target its `mapping_spec.json` names for
+  that source table, are its write targets; the routines, views and jobs it deploys are its
+  `deploy_objects`. The fan-out workflow refuses a wave whose declared `write_targets` differ from them
+  (rule in `skills/migration-fanout/SKILL.md`).
+
 ## Migration-only deltas (these override nothing in the official skills; they narrow them)
 
 Analytical-track deltas (deploy/schedule, pipelines, governance): [references/analytical-deltas.md](references/analytical-deltas.md); load for warehouse/ETL/code units, not for Lakebase-only units.
@@ -48,6 +67,16 @@ Analytical-track deltas (deploy/schedule, pipelines, governance): [references/an
   migration catalog, USE elsewhere, no admin roles), cutover (customer-held, STOP E only, never in
   a child). Never request or use account-admin or workspace-admin permissions; escalate instead.
 
+### Platform 5xx on bundle deploy and run
+
+A `databricks bundle deploy` or `databricks bundle run` that fails with an HTTP 5xx or
+platform-unavailable response is retried at most twice — three attempts total — with a backoff of
+30 s then 120 s. Nothing else is retried: a 4xx, a validation error, a failing job run, or a guard
+block is a finding, not a retry. After the third 5xx the session stops and reports `status=BLOCKED`
+with failure class `platform_5xx` and the last request id in `one_line_summary`. The retries never
+widen the write scope and never switch identity, and the three attempts count as one for the
+circuit breaker (rule in `skills/install-dbx-factory/references/contract.md`).
+
 ### Write scope
 - Migration work writes only to the migration catalog recorded in `.migration/00_context.md`, and a
   child writes only to the targets in its brief (`.migration/allowed_targets.json` is the allowlist
@@ -61,3 +90,11 @@ Analytical-track deltas (deploy/schedule, pipelines, governance): [references/an
 - Medallion applies to re-architected pipelines. A like-for-like migration lands the legacy shape
   first (this is what makes Tier 1–3 recon trivially defined) and defers medallion refactors to a
   named follow-up wave, unless the STOP A target profile says otherwise.
+- One active update per Lakeflow pipeline per wave: each batch lists the pipelines it updates as
+  `lakeflow_pipelines` in the wave manifest, and `python3 skills/target-routing/pipeline_updates.py
+  .migration/waves/wave-N.json` runs before launch (the fan-out workflow runs it itself from the
+  pointer's `plugin` root and halts on any non-zero exit). Two batches of a wave naming the same
+  pipeline is a halt unless the wave is serial (`width` 1) or `serialized_pipelines` maps that pipeline
+  to a `D-<n>` row of `06_decisions.md` tagged `pipeline_serialized` that names it; then the workflow
+  launches those batches in manifest order, each after the previous one finished. A batch that lists
+  nothing makes the result `unsupported`, not clean.

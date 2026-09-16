@@ -37,6 +37,26 @@ def test_schema_parity_findings_map_through_the_spec():
         "check_constraint_missing", "check_constraint_missing"])
     fk = next(f for f in _tier(result, "schema_parity")["findings"] if f["check"] == "foreign_key_missing")
     assert "borrowers" in fk["detail"]
+    parity = _tier(result, "schema_parity")
+    # tier 7 grades the same structural categories tier 0 reports on the other tracks
+    assert parity["stats"]["structural_checks"] == {
+        c: "direct_only" if c == "grants" else "checked"
+        for c in ("constraints", "triggers", "indexes", "sequences_identity", "grants")}
+    assert parity["stats"]["dictionary"] == {"source": "live", "target": "live"}
+
+
+def test_schema_parity_also_carries_trigger_and_grant_findings():
+    loans, borrowers = _rows(6)
+    src_facts = _facts(LOANS_FACTS, triggers={"trg": ("after", ("insert", "update"), "row")},
+                       grants={"app_rw": frozenset({"select", "insert"})})
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": src_facts, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 7})
+    _, target = _sides(loans, [dict(r) for r in loans], borrowers)
+    result = _run(source, target)
+    codes = _codes(result, "schema_parity")
+    assert "trigger_missing" in codes and "grant_missing" in codes
+    assert _tier(result, "schema_parity")["stats"]["structural_diff"]["loans"]["triggers"]
 
 
 _UNMAPPED_TARGET_ONLY = {

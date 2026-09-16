@@ -1,36 +1,14 @@
-Playbook: Front door for code and ML scoring estates (SAS, SPSS, R, Hadoop/Hive, on-prem Spark, legacy Python/notebooks, BigQuery ML). Thin intake that pins the languages and workload mix, loads the dialect skill(s), activates the ML-SCORING profile where models are present, and then runs `!dbx_migrate_pipeline` in the same session. No migration method lives here.
+Playbook: Intake code, models, and prediction consumers before selecting migration tracks.
 
-## Overview
-The customer says "we have ten years of SAS" or "our scoring jobs run on the Hadoop cluster." This playbook turns that into a configured run of the standard chain, with one family-specific addition: where the estate contains **model training or scoring code**, the parity question changes from "same rows" to "same predictions," and that distinction must be pinned at intake, not discovered at recon time.
+| Default | Rule |
+|---|---|
+| Partition | separate data movement, application code, model training, scoring, and consumers; give each an owner and target |
+| Parity | capture feature definitions, seeds, model version, numeric tolerance, prediction distributions, and a legacy bit-stability probe |
+| Scope | inventory repositories, jobs, packages, secrets by name, inputs/outputs, schedules, tests, and runtime assumptions |
+| Dialect | route only to an installed optional dialect skill; never claim a skill exists because an adapter/Lakebridge flag exists |
+| Orchestration | invoke `!dbx_migrate_pipeline` in this session after intake and profile selection |
+| Pipelines | ask which pipelines share write targets or source objects; disjoint ones run as sibling orchestrator sessions after STOP A (rule in `9-orchestrator.md`) |
+| Allowlist | write `.migration/allowed_targets.json` (catalogs, legacy_sources) before any source probe; authorized legacy writes carry `DBX_DECISION=D-<id>` — see contract.md |
 
-## What's Needed From User
-- The language inventory (SAS, R, SPSS, HiveQL, Pig, Scala/PySpark versions, notebook platforms) and where the code lives (repo, server directories, scheduler-embedded).
-- **Which parts are ML**: training jobs, scoring/inference jobs, feature preparation. For each scoring job: is there a business owner who can state an acceptable prediction-parity tolerance (exact match on scores, rank-order preservation, or a stated numeric tolerance)? A team that cannot state this is not ready to migrate that job; scope it out explicitly rather than absorbing the ambiguity.
-- Runtime access for dual-runs: can the legacy code still be executed (SAS server, Hadoop cluster) to produce comparison outputs? If not, historical outputs become the recon baseline and the caveat is recorded.
-- **Parity feasibility probe per scoring job (before any conversion effort)**: run the *legacy* scorer twice on the pinned comparison sample. If legacy itself is not bit-stable across two runs, an exact-match tolerance is structurally unachievable, and the tolerance conversation happens here, at intake, where it is cheap: propose rank-order preservation or a numeric tolerance calibrated to legacy's own run-to-run variance. Where legacy cannot be executed at all, say explicitly that exact-match cannot be promised and record the historical-baseline caveat.
-
-## Procedure
-1. **Consume the intake template first**: if a filled `00_intake_template.md` was attached or committed, load it, mark its rows FACT, probe the environment to fill what it left blank (DISCOVERED), and propose defaults for the rest (PROPOSED). Ask live only what neither the template nor a probe can answer.
-2. **Create the write-scope allowlist before touching any source system**: `mkdir -p .migration` and write `.migration/allowed_targets.json` now, with `"catalogs"` set to the designated migration catalog from intake and `"legacy_sources"` filled with every legacy host, DSN and secret name the intake names (the setup playbook completes the other fields later). No source change of any kind runs before the allowlist exists: that includes a metadata probe with side effects and a customer-approved DDL prerequisite, because without this file the guard is a no-op and an authorized legacy write is recorded only by hand. A source change the customer authorizes (a CDC prerequisite, supplemental logging) carries a `DBX_DECISION=D-<id>` prefix pointing at a `06_decisions.md` row containing `legacy_write_authorized` and the object name; see the guard section of the README.
-3. Pin languages, versions, and code locations; probe repo/server access; register D10s.
-4. Attach the matching dialect skill(s): list `skills/*/SKILL.md` in the installed plugin and pick by name. No code-family dialect skill (SAS, Hive, legacy SparkML) ships with the plugin yet, so expect a build-the-skill wave-0 item from `skills/_dialect-skill-template.md` per language, stated plainly at intake. Multiple skills are normal in this family. Load `target-routing` alongside (`databricks-serverless-migration`, `databricks-execution-compute`, `databricks-model-serving`).
-5. Partition the estate at intake into **data code** (ETL-like: standard chain, standard recon) and **model code** (training/scoring: ML-SCORING profile, prediction-parity gate, D9 consumers). This partition drives the inventory's workload typing.
-6. Set family defaults: unit = program/script/notebook + its schedule entry; lineage extraction = parser + directory convention + scheduler export (weakest lineage of the three families, so INFERRED edges are expected and priced); dual-run mechanism per the runtime-access answer; prediction-parity tolerances routed into `03_recon_tolerances.md` at setup.
-7. Record intake facts in `.migration/00_context.md` shape. Record `stop_mode` (default `soft`; `hard` only if the user asks, per engagement or per named stop) — see the orchestrator's Stop mode section. Then run `!dbx_migrate_pipeline` **in this same session**, right away. Do not open a new session, do not ask the user to run it, do not stop here: the orchestrator reads the intake facts you just wrote and begins ingest and setup as normal. The user's next message from Devin is STOP A.
-
-## Specifications
-- Deliverable: configured hand-off: languages pinned, ML partition made, dialect skills attached, dual-run mechanism stated, parity posture per scoring job recorded or explicitly scoped out.
-- Validation: `!dbx_migrate_pipeline` was invoked in this session and the orchestrator can start ingest without re-asking anything this intake covered; no scoring job enters scope without a stated parity tolerance.
-
-## Advice and Pointers
-- The ML partition is the credibility line: Devin migrates the engineering around models (pipelines, scoring jobs, lineage, upgrades) gated on prediction parity; it does not re-model. Scientific judgment (features, labels, model choice, release) stays with the customer's team, and saying so at intake wins trust.
-- Prediction parity has known nondeterminism traps: seeds, float accumulation order, Spark shuffle. The tolerance conversation at intake is where these surface cheaply.
-- SAS estates hide business logic in macro libraries and format catalogs; the dialect skill treats those as shared objects (D2), and the inventory should expect a fat wave 0.
-- This family has the weakest mechanical lineage; budget more analysis time per pipeline and lean harder on last-run evidence for scope cutting.
-
-## Forbidden Actions
-- Do NOT begin inventory, analysis, or conversion here; hand off to the chain.
-- Do NOT accept a scoring job into scope without a stated, user-owned parity tolerance.
-- Do NOT accept an exact-match parity tolerance without the legacy bit-stability probe (or an explicit user acceptance that it was impossible to run).
-- Do NOT position or attempt re-modeling, feature redesign, or model-quality improvement; that is out of kit scope by design.
-- Do NOT treat notebook code as dead just because it lacks a schedule; PROPOSED-unused with evidence, per the inventory rules.
+## Routing
+Use `CORE` + the matching `PIPELINE`, `ML-SCORING`, or `CONSUMER` profile + `DATA / DEPENDENCY`. Preserve data/model split and prediction parity through setup, inventory, analysis, and plan. Bundle deploys and runs that hit a platform 5xx follow the bounded retry rule in `skills/target-routing/SKILL.md`.

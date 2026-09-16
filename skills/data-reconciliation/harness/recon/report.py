@@ -10,6 +10,8 @@ import json
 import re
 from pathlib import Path
 
+from .rerun import rerun_gap, rerun_missing, rerun_unsupported
+from .routines import parity_missing, routine_gap
 from .tiers import TierResult
 
 MAX_FINDINGS_IN_REPORT = 50
@@ -26,12 +28,40 @@ def _mode_note(mode: str) -> str:
     return MODE_NOTES.get(mode, "")
 
 
+def _rerun_line(result: dict) -> str | None:
+    proof = result.get("rerun_proof")
+    if proof is None:
+        return None
+    line = f"- Rerun proof: fresh `{proof.get('fresh')}`, evolved `{proof.get('evolved')}`"
+    if proof.get("unsupported_reason"):
+        line += f" ({proof['unsupported_reason']})"
+    for f in proof.get("findings", [])[:MAX_FINDINGS_IN_SUMMARY]:
+        line += (f"\n  - {f.get('run')} `{f.get('table')}` {f.get('check')}"
+                 + (f" `{f['column']}`" if f.get("column") else "") + f": {f.get('detail', '')}")
+    return line
+
+
+def _authority_line(result: dict) -> str:
+    """The harness is the only authority this file writes. A merge past merge_eligible=false needs a
+    human_override the workflow checks against a merge_override row of .migration/06_decisions.md."""
+    authority = result.get("merge_authority") or {"kind": "harness", "decision_id": None}
+    return (f"- Merge authority: `{authority['kind']}`"
+            + (f" ({authority['decision_id']})" if authority.get("decision_id") else "")
+            + " (human_override needs a merge_override row in .migration/06_decisions.md naming the unit)")
+
+
 def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: str,
                  tiers: list[TierResult], seed: int = 0,
                  params: dict[str, str] | None = None,
                  snapshot: dict | None = None,
                  provenance_warnings: list[str] | None = None,
-                 depth: str = "threshold", cost: dict | None = None) -> dict:
+                 depth: str = "threshold", cost: dict | None = None,
+                 type_map: dict | None = None,
+                 routine_parity: list[dict] | None = None,
+                 routine_writers: list[str] | None = None,
+                 routine_analysis_missing: bool = False,
+                 routine_dependencies: str | None = None,
+                 rerun_proof: dict | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -39,10 +69,45 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                             "declare embed key/fields in the mapping spec to grade values)")
         for note in t.stats.get("unverified", []):
             warnings.append(f"UNVERIFIED {t.name}: {note}")
+        for note in t.stats.get("dictionary_unavailable", []):
+            warnings.append(f"UNVERIFIED {t.name}: structure unavailable: {note}")
     warnings.extend(provenance_warnings or [])
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
+    structural = next((t for t in tiers if t.name in ("structural_parity", "schema_parity")), None)
+    checks = (structural.stats.get("structural_checks") or {}) if structural else {}
+    structural_blind = any(v == "unsupported" for c, v in checks.items() if c != "indexes")
+    unlisted_writers = parity_missing(routine_parity, routine_writers)
+    parity_gap = bool(unlisted_writers) or routine_analysis_missing
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
-                      and not warnings and (mode != "snapshot" or snapshot is not None))
+                      and not warnings and not structural_blind
+                      and (mode != "snapshot" or snapshot is not None)
+                      and not routine_gap(routine_parity) and not parity_gap
+                      and not rerun_missing(rerun_proof)
+                      and not rerun_gap(rerun_proof) and not rerun_unsupported(rerun_proof))
+    reasons = []
+    if structural is not None and (structural.findings or structural.stats.get("unverified")
+                                   or structural.stats.get("dictionary_unavailable")
+                                   or structural_blind):
+        reasons.append("structural_gap")
+    if verdict == "FAIL":
+        reasons.append("tier_failed")
+    if routine_gap(routine_parity):
+        reasons.append("routine_gap")
+    if parity_gap:
+        reasons.append("routine_parity_missing")
+    if warnings:
+        reasons.append("warnings")
+    if mode not in ("live", "snapshot", "transactional"):
+        reasons.append("mode")
+    if mode == "snapshot" and snapshot is None:
+        reasons.append("snapshot_missing")
+    if mode != "structural":  # no row tier ran, so there is no rerun to prove
+        if rerun_missing(rerun_proof):
+            reasons.append("rerun_missing")
+        if rerun_gap(rerun_proof):
+            reasons.append("rerun_gap")
+        if rerun_unsupported(rerun_proof):
+            reasons.append("rerun_unsupported")
     return {
         "unit": unit,
         "mode": mode,
@@ -58,7 +123,39 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "warnings": warnings,
         "verdict": verdict,
         "merge_eligible": merge_eligible,
+        "merge_authority": {"kind": "harness", "decision_id": None},
+        "type_map": type_map,
+        "rerun_proof": rerun_proof,
+        "merge_block_reasons": reasons,
+        "routine_parity": routine_parity,
+        "routine_writers": routine_writers,
+        "routine_dependencies": routine_dependencies,
+        **({"routine_analysis_missing": True} if routine_analysis_missing else {}),
     }
+
+
+def _parity_lines(result: dict) -> list[str]:
+    parity = result.get("routine_parity")
+    if not parity:
+        if result.get("routine_analysis_missing"):
+            return ["", "## Routine parity: routine_parity_missing (no dependency analysis; commit "
+                        f".migration/units/{result['unit']}/dependencies.json, an empty `routines` list "
+                        "for a unit that writes nothing, or pass `--routine-dependencies`)"]
+        if "routine_parity_missing" in result.get("merge_block_reasons", []):
+            return ["", "## Routine parity: routine_parity_missing (the unit has writing routines and no "
+                        "parity list; run `dbx-recon routine-parity` and pass `--routine-parity`)", ""] + [
+                        f"- `{w}` no row" for w in result.get("routine_writers") or []]
+        return []
+    counts = {s: sum(1 for r in parity if r["status"] == s) for s in ("proven", "unproven", "failed")}
+    lines = ["", f"## Routine parity: {counts['proven']} proven, {counts['unproven']} unproven, "
+                 f"{counts['failed']} failed", ""]
+    for r in parity:
+        if r["status"] == "proven":
+            continue
+        why = r.get("reason") or "; ".join(f"{f['table']} {f['check']}: {f['detail']}"
+                                           for f in r.get("findings", []))
+        lines.append(f"- `{r['routine']}` {r['status']}: {why}")
+    return lines
 
 
 def render_report(result: dict) -> str:
@@ -69,6 +166,7 @@ def render_report(result: dict) -> str:
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
         (f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
          "(fixture/continuous evidence never merges)"),
+        _authority_line(result),
         f"- Mapping version: `{result['mapping_version']}`",
         f"- Tolerance version: `{result['tolerance_version']}`",
         f"- Seed: `{result.get('seed', 0)}`" + (f" | Params: `{result['params']}`"
@@ -78,8 +176,11 @@ def render_report(result: dict) -> str:
     ]
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
+    lines += _parity_lines(result)
     if result.get("cost"):
         lines.append(f"- Cost: `{json.dumps(result['cost'], default=str)}`")
+    if _rerun_line(result):
+        lines.append(_rerun_line(result))
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [
@@ -121,6 +222,7 @@ def render_summary(result: dict) -> str:
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
         (f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
          "(fixture/continuous evidence never merges)"),
+        _authority_line(result),
         f"- Mapping `{result['mapping_version']}` / tolerances `{result['tolerance_version']}`"
         f" / seed `{result.get('seed', 0)}` / depth `{result.get('depth', 'threshold')}`"
         + (f" / params `{result['params']}`" if result.get("params") else ""),
@@ -131,6 +233,11 @@ def render_summary(result: dict) -> str:
         lines.append(f"- Cost: source {cost['source_statements']} statements / "
                      f"{cost['source_rows_fetched']} rows fetched; target {cost['target_statements']} "
                      f"statements / {cost['target_rows_fetched']} rows; {cost['elapsed_s']}s")
+    lines += _parity_lines(result)
+    structural = next((t for t in result["tiers"] if t["name"] in ("structural_parity", "schema_parity")), None)
+    if structural is not None and structural["stats"].get("structural_checks"):
+        checks = ", ".join(f"{k}={v}" for k, v in structural["stats"]["structural_checks"].items())
+        lines.append(f"- Structural checks: {checks}")
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
     window = next((t for t in result["tiers"] if t["name"] == "consistency_window"), None)
@@ -147,6 +254,8 @@ def render_summary(result: dict) -> str:
         lines.append(f"- Consistency window: source isolation {side('source')}, target isolation "
                      f"{side('target')}, {state}"
                      + (f"; in flight at open: `{json.dumps(in_flight)}`" if in_flight else ""))
+    if _rerun_line(result):
+        lines.append(_rerun_line(result))
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [

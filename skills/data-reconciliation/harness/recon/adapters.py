@@ -22,8 +22,14 @@ from typing import Any, Protocol, runtime_checkable
 
 from .fingerprint import DIGEST_MODULUS
 from .fingerprint import normalise as _digest_value
+from .rerun import normalize_type
 from .watermarks import instant
 from .watermarks import literal as watermark_literal
+
+# the object kinds a CREATE TABLE leaves behind; views, materialized views, streaming tables and
+# foreign tables with the same columns are not the table the rerun proof grades
+_UC_PHYSICAL = "t.table_type IN ('MANAGED', 'EXTERNAL', 'MANAGED_SHALLOW_CLONE', 'EXTERNAL_SHALLOW_CLONE')"
+_PG_PHYSICAL = "c.relkind IN ('r', 'p')"
 
 
 @dataclass(frozen=True)
@@ -90,6 +96,20 @@ class SchemaFacts:
     # (e.g. "lower(email)"); a unique one is a constraint the column-wise facts cannot see
     expression_unique: set[str] = field(default_factory=set)
     expression_indexes: set[str] = field(default_factory=set)
+    # name -> (timing, events): timing in {"before", "after", "instead of"}, events a sorted
+    # subset of {"insert", "update", "delete", "truncate"}; granularity is "row"|"statement";
+    # disabled triggers are left out
+    triggers: dict[str, tuple[str, tuple[str, ...], str]] = field(default_factory=dict)
+    # grantee (lower) -> privileges (lower: select/insert/update/delete/...); the table owner's
+    # implicit rights are left out
+    # direct object grants only (class-1 rows / table_privileges): role-inherited and
+    # schema/database-scope grants are not expanded
+    grants: dict[str, frozenset[str]] = field(default_factory=dict)
+    # structural categories (see recon.structure.CATEGORIES) this reader cannot deliver;
+    # empty = it delivered them all
+    primary_key_informational: tuple[str, ...] = ()
+    foreign_keys_informational: set[tuple[tuple[str, ...], str, tuple[str, ...]]] =         field(default_factory=set)  # declared but not enforced (UC foreign keys)
+    unsupported: frozenset[str] = frozenset()
     # relations that cannot carry NOT NULL (Postgres views and materialized views:
     # pg_attribute.attnotnull is always false for them) set this False so tier 7 reports
     # nullability as unverified instead of missing
@@ -279,10 +299,17 @@ def _secret(name: str) -> str:
 
 AGG_SQL = ("SELECT COUNT(*) AS n, COUNT({col}) AS nonnull, MIN({col}) AS mn, "
            "MAX({col}) AS mx, COUNT(DISTINCT {col}) AS dc FROM {table}{where}")
+# counts only: MIN/MAX are undefined for boolean columns on some engines
+PROFILE_SQL = "SELECT COUNT(*) AS n, COUNT({col}) AS nonnull, COUNT(DISTINCT {col}) AS dc FROM {table}{where}"
 
 
 # Bucket expression assigning each row to one of {n} equal-count strata ordered by key.
 NTILE_SQL = "NTILE({n}) OVER (ORDER BY {order})"
+
+
+class DictionaryError(RuntimeError):
+    """A catalog dictionary read failed: the reason names the view and the driver error class,
+    never str(exc) — driver messages can carry the DSN."""
 
 
 class _SqlAdapterBase:
@@ -323,6 +350,9 @@ class _SqlAdapterBase:
     datetime_bound_sql = "{lit}"
     # Literal of a binary counter watermark (SQL Server rowversion) against this engine's column.
     binary_literal_sql = "0x{hex}"
+    # Catalog statements the structural tier issues: schema_facts and identity_state per object,
+    # session once per adapter (version reads are cached). Zero where nothing is implemented.
+    CATALOG_STATEMENTS = {"schema_facts": 0, "identity_state": 0, "session": 0}
 
     def __init__(self, conn):
         self._conn = conn
@@ -335,8 +365,8 @@ class _SqlAdapterBase:
 
     def _execute(self, sql: str, params=()):
         cur = self._conn.cursor()
+        self.statements += 1  # sent is spent: a rejected statement still reached the source
         cur.execute(sql, params)
-        self.statements += 1
         return cur
 
     def _rows(self, sql: str, params=()) -> list[tuple]:
@@ -357,6 +387,14 @@ class _SqlAdapterBase:
         if self.paramstyle == "pyformat":
             return {f"p{i}": value for i, value in enumerate(values)}
         return tuple(values)
+
+    def _dict_rows(self, table: str, view: str, sql: str, params=()) -> list[tuple]:
+        try:
+            return self._rows(sql, params)
+        except (DictionaryError, NotImplementedError):
+            raise
+        except Exception as exc:
+            raise DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})") from exc
 
     def run_query(self, sql: str) -> list[dict[str, Any]]:
         if not sql.lstrip().lower().startswith(("select", "with")):
@@ -379,6 +417,14 @@ class _SqlAdapterBase:
                "min": mn, "max": mx, "distinct_count": int(dc)}
         out["sum"] = self.sum_probe(table, column, where)
         return out
+
+    def column_profile(self, table: str, column: str, where: str | None = None) -> dict[str, Any]:
+        """Count, null rate and distinct count in exactly one statement (no MIN/MAX, no SUM
+        probe), for checks that budget source reads per column (recon.fixture_shape)."""
+        w = f" WHERE {where}" if where else ""
+        n, nonnull, dc = self._rows(PROFILE_SQL.format(col=column, table=table, where=w))[0]
+        return {"count": int(n), "null_rate": (int(n) - int(nonnull)) / int(n) if n else 0.0,
+                "distinct_count": int(dc)}
 
     def sum_probe(self, table: str, column: str, where: str | None = None) -> Any:
         w = f" WHERE {where}" if where else ""
@@ -807,6 +853,249 @@ def quote_ident(name: str, quote: str) -> str:
     return quote + name.replace(quote, quote * 2) + quote
 
 
+# pg_trigger.tgtype bit flags (row(1), before(2), then one bit per event, instead(64))
+_PG_TRIGGER_EVENTS = ((4, "insert"), (8, "delete"), (16, "update"), (32, "truncate"))
+
+
+def _pg_trigger_shape(tgtype: int) -> tuple[str, tuple[str, ...], str]:
+    timing = "instead of" if tgtype & 64 else "before" if tgtype & 2 else "after"
+    return (timing, tuple(ev for bit, ev in _PG_TRIGGER_EVENTS if tgtype & bit),
+            "row" if tgtype & 1 else "statement")
+
+
+# Every catalog object the schema_facts/identity_state readers touch, per family, as
+# (label, SELECT-1 probe) pairs. Doctor's dictionary_readable row consumes this table through
+# `dbx-recon dictionary-objects --family`, so a new reader query cannot drift past the probe
+# list (test_dictionary_objects_cover_every_reader_view enforces it).
+DICTIONARY_OBJECTS = {
+    "sqlserver": (
+        ("sys.indexes", "SELECT TOP 1 1 FROM sys.indexes"),
+        ("sys.index_columns", "SELECT TOP 1 1 FROM sys.index_columns"),
+        ("sys.columns", "SELECT TOP 1 1 FROM sys.columns"),
+        ("sys.types", "SELECT TOP 1 1 FROM sys.types"),
+        ("sys.objects", "SELECT TOP 1 1 FROM sys.objects"),
+        ("sys.schemas", "SELECT TOP 1 1 FROM sys.schemas"),
+        ("sys.foreign_keys", "SELECT TOP 1 1 FROM sys.foreign_keys"),
+        ("sys.foreign_key_columns", "SELECT TOP 1 1 FROM sys.foreign_key_columns"),
+        ("sys.check_constraints", "SELECT TOP 1 1 FROM sys.check_constraints"),
+        ("sys.identity_columns", "SELECT TOP 1 1 FROM sys.identity_columns"),
+        ("sys.triggers", "SELECT TOP 1 1 FROM sys.triggers"),
+        ("sys.trigger_events", "SELECT TOP 1 1 FROM sys.trigger_events"),
+        ("sys.database_permissions", "SELECT TOP 1 1 FROM sys.database_permissions"),
+        ("sys.database_principals", "SELECT TOP 1 1 FROM sys.database_principals"),
+    ),
+    "postgres": (
+        ("pg_constraint", "SELECT 1 FROM pg_constraint LIMIT 1"),
+        ("pg_index", "SELECT 1 FROM pg_index LIMIT 1"),
+        ("pg_class", "SELECT 1 FROM pg_class LIMIT 1"),
+        ("pg_namespace", "SELECT 1 FROM pg_namespace LIMIT 1"),
+        ("pg_attribute", "SELECT 1 FROM pg_attribute LIMIT 1"),
+        ("pg_type", "SELECT 1 FROM pg_type LIMIT 1"),
+        ("pg_sequence", "SELECT 1 FROM pg_sequence LIMIT 1"),
+        ("pg_trigger", "SELECT 1 FROM pg_trigger LIMIT 1"),
+        ("pg_get_serial_sequence", "SELECT pg_get_serial_sequence('pg_class', 'oid')"),
+        ("pg_get_indexdef", "SELECT pg_get_indexdef(0)"),
+        ("pg_get_constraintdef", "SELECT pg_get_constraintdef(0)"),
+        ("pg_get_userbyid", "SELECT pg_get_userbyid(0)"),
+        ("server_version_num", "SELECT current_setting('server_version_num')"),
+        ("information_schema.table_privileges",
+         "SELECT 1 FROM information_schema.table_privileges LIMIT 1"),
+    ),
+    "databricks": (
+        ("information_schema.table_constraints",
+         "SELECT 1 FROM {catalog}.information_schema.table_constraints LIMIT 1"),
+        ("information_schema.key_column_usage",
+         "SELECT 1 FROM {catalog}.information_schema.key_column_usage LIMIT 1"),
+        ("information_schema.referential_constraints",
+         "SELECT 1 FROM {catalog}.information_schema.referential_constraints LIMIT 1"),
+        ("information_schema.columns",
+         "SELECT 1 FROM {catalog}.information_schema.columns LIMIT 1"),
+        ("information_schema.check_constraints",
+         "SELECT 1 FROM {catalog}.information_schema.check_constraints LIMIT 1"),
+        ("information_schema.table_privileges",
+         "SELECT 1 FROM {catalog}.information_schema.table_privileges LIMIT 1"),
+        ("information_schema.tables",
+         "SELECT 1 FROM {catalog}.information_schema.tables LIMIT 1"),
+        ("SHOW CREATE TABLE", "SHOW CREATE TABLE {catalog}.{schema}.{table}"),
+        ("table_content", "SELECT 1 FROM {catalog}.{schema}.{table} LIMIT 1"),
+    ),
+}
+DICTIONARY_OBJECTS["lakebase"] = DICTIONARY_OBJECTS["postgres"]
+
+
+def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> SchemaFacts:
+    """One table's Unity Catalog facts, shared by the Databricks adapters: constraints and
+    grants over information_schema, identity columns from the SHOW CREATE TABLE DDL (the
+    GENERATED ... AS IDENTITY clause; information_schema marks them reserved). Delta has no
+    indexes or triggers; UC foreign keys and primary keys are informational: no actions to read."""
+    facts = SchemaFacts(table=f"{catalog}.{schema}.{table}",
+                        # indexes are unreadable on UC; triggers are provably absent
+                        unsupported=frozenset({"indexes"}))
+
+    def q(view: str, sql: str, params: dict) -> list[tuple]:
+        try:
+            return run_query(sql, params)
+        except (DictionaryError, NotImplementedError):
+            raise
+        except Exception as exc:
+            raise DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})") from exc
+
+    rows = q("information_schema.table_constraints",
+        f"SELECT tc.constraint_type, tc.constraint_name, kcu.column_name, "
+        "uk.table_schema, uk.table_name, uk.column_name "
+        f"FROM {catalog}.information_schema.table_constraints tc "
+        f"LEFT JOIN {catalog}.information_schema.key_column_usage kcu "
+        "  ON kcu.constraint_catalog = tc.constraint_catalog "
+        " AND kcu.constraint_schema = tc.constraint_schema "
+        " AND kcu.constraint_name = tc.constraint_name "
+        " AND kcu.table_name = tc.table_name "
+        f"LEFT JOIN {catalog}.information_schema.referential_constraints rc "
+        "  ON rc.constraint_catalog = tc.constraint_catalog "
+        " AND rc.constraint_schema = tc.constraint_schema "
+        " AND rc.constraint_name = tc.constraint_name "
+        f"LEFT JOIN {catalog}.information_schema.key_column_usage uk "
+        "  ON uk.constraint_catalog = rc.unique_constraint_catalog "
+        " AND uk.constraint_schema = rc.unique_constraint_schema "
+        " AND uk.constraint_name = rc.unique_constraint_name "
+        " AND uk.ordinal_position = kcu.position_in_unique_constraint "
+        "WHERE tc.table_catalog = %(catalog)s AND tc.table_schema = %(schema)s "
+        "AND tc.table_name = %(table)s "
+        "ORDER BY tc.constraint_name, kcu.ordinal_position",
+        {"catalog": catalog, "schema": schema, "table": table})
+    by_con: dict[str, list] = {}
+    for ctype, cname, col, ref_schema, ref_table, ref_col in rows:
+        entry = by_con.setdefault(cname, [ctype, [], None, []])
+        if col is not None:
+            entry[1].append(col)
+        if ref_table is not None:
+            entry[2] = f"{ref_schema}.{ref_table}"
+            if ref_col is not None:
+                entry[3].append(ref_col)
+    for ctype, cols, ref, ref_cols in by_con.values():
+        kind = str(ctype).upper()
+        if kind == "PRIMARY KEY":
+            facts.primary_key_informational = tuple(cols)  # UC PKs are RELY, never enforced
+        elif kind == "UNIQUE":
+            facts.unique.add(tuple(cols))
+        elif kind == "FOREIGN KEY" and ref is not None:
+            facts.foreign_keys_informational.add((tuple(cols), ref, tuple(ref_cols)))
+        elif kind == "CHECK":
+            facts.check_count += 1
+    rows = q("information_schema.columns",
+        f"SELECT column_name, is_nullable FROM {catalog}.information_schema.columns "
+        "WHERE table_catalog = %(catalog)s AND table_schema = %(schema)s AND table_name = %(table)s",
+        {"catalog": catalog, "schema": schema, "table": table})
+    for col, nullable in rows:
+        if str(nullable).upper() == "NO":
+            facts.not_null.add(col)
+    facts.identity_columns = set(_uc_identity_columns(
+        q("SHOW CREATE TABLE",
+          f"SHOW CREATE TABLE {quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
+          f"{quote_ident(table, '`')}", {})))
+    rows = q("information_schema.check_constraints",
+        f"SELECT cc.check_clause FROM {catalog}.information_schema.check_constraints cc "
+        f"JOIN {catalog}.information_schema.table_constraints tc "
+        "  ON tc.constraint_catalog = cc.constraint_catalog "
+        " AND tc.constraint_schema = cc.constraint_schema "
+        " AND tc.constraint_name = cc.constraint_name "
+        "WHERE tc.table_catalog = %(catalog)s AND tc.table_schema = %(schema)s "
+        "AND tc.table_name = %(table)s",
+        {"catalog": catalog, "schema": schema, "table": table})
+    facts.check_count = max(facts.check_count, len(rows))
+    facts.checks = {clause for (clause,) in rows}
+    rows = q("information_schema.table_privileges",
+        f"SELECT tp.grantee, tp.privilege_type FROM {catalog}.information_schema.table_privileges tp "
+        f"JOIN {catalog}.information_schema.tables t "
+        "  ON t.table_catalog = tp.table_catalog AND t.table_schema = tp.table_schema "
+        " AND t.table_name = tp.table_name "
+        "WHERE tp.table_catalog = %(catalog)s AND tp.table_schema = %(schema)s "
+        "AND tp.table_name = %(table)s AND tp.grantee <> t.owner "
+        "ORDER BY tp.grantee",
+        {"catalog": catalog, "schema": schema, "table": table})
+    grants: dict[str, set] = {}
+    for grantee, priv in rows:
+        grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
+    facts.grants = {g: frozenset(p) for g, p in grants.items()}
+    return facts
+
+
+_UC_IDENTITY_RE = re.compile(
+    r"^\s*(?:`(?P<bt>[^`]+)`|\"(?P<dq>[^\"]+)\"|(?P<plain>[A-Za-z_][\w$]*))"
+    r".*?\bGENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY"
+    r"(?:\s*\((?P<opts>[^)]*)\))?",
+    re.IGNORECASE)
+
+
+def _uc_identity_columns(ddl_rows) -> dict[str, tuple[int, int]]:
+    """column -> (start, increment), parsed from the SHOW CREATE TABLE DDL: each column line's
+    GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY clause, defaulting to (1, 1) when the
+    parenthesised START WITH / INCREMENT BY clause is absent."""
+    out: dict[str, tuple[int, int]] = {}
+    for (ddl,) in ddl_rows:
+        for line in str(ddl).splitlines():
+            m = _UC_IDENTITY_RE.match(line)
+            if not m:
+                continue
+            col = m.group("bt") or m.group("dq") or m.group("plain")
+            opts = m.group("opts") or ""
+            start = re.search(r"START\s+WITH\s+(-?\d+)", opts, re.IGNORECASE)
+            inc = re.search(r"INCREMENT\s+BY\s+(-?\d+)", opts, re.IGNORECASE)
+            out[col] = (int(start.group(1)) if start else 1,
+                        int(inc.group(1)) if inc else 1)
+    return out
+
+
+def _uc_identity_state(run_query, catalog: str, schema: str, table: str,
+                       column: str) -> IdentityState | None:
+    """One UC identity column's next value and step. The step and declared start come from the
+    SHOW CREATE TABLE DDL; Delta's high-water mark isn't in the catalog, so the column's MAX
+    (MIN for a negative step) is the readable frontier — a conservative bound, since deleted
+    frontier rows aren't visible (the declared start when the table is empty). None when the
+    column is not identity."""
+    qual = (f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
+            f"{quote_ident(table, '`')}")
+
+    def q(view: str, sql: str) -> list[tuple]:
+        try:
+            return run_query(sql, {})
+        except (DictionaryError, NotImplementedError):
+            raise
+        except Exception as exc:
+            raise DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})") from exc
+
+    state = _uc_identity_columns(q("SHOW CREATE TABLE", f"SHOW CREATE TABLE {qual}")).get(column)
+    if not state:
+        return None
+    start, inc = state
+    edge = "MIN" if inc < 0 else "MAX"
+    (mx,) = q(f"{column} {edge.lower()}",
+              f"SELECT {edge}({quote_ident(column, '`')}) FROM {qual}")[0]
+    return IdentityState(int(mx) + inc if mx is not None else start, inc)
+
+
+_TSQL_LENGTH_TYPES = ("char", "varchar", "binary", "varbinary", "nchar", "nvarchar")
+_TSQL_PRECISION_TYPES = ("decimal", "numeric")
+_TSQL_SCALE_TYPES = ("datetime2", "datetimeoffset", "time")
+_TSQL_BITS_TYPES = ("float",)  # float(24) and float(53) are different storage
+
+
+def _tsql_type(kind, max_length, precision, scale) -> str:
+    """sys.types name plus the length/precision sys.columns carries, spelled as declared."""
+    kind = str(kind).lower()
+    if kind in _TSQL_LENGTH_TYPES and max_length is not None:
+        if int(max_length) == -1:
+            return f"{kind}(max)"
+        n = int(max_length) // 2 if kind.startswith("n") else int(max_length)
+        return f"{kind}({n})"
+    if kind in _TSQL_PRECISION_TYPES and precision is not None:
+        return f"{kind}({int(precision)},{int(scale or 0)})"
+    if kind in _TSQL_SCALE_TYPES and scale is not None:
+        return f"{kind}({int(scale)})"
+    if kind in _TSQL_BITS_TYPES and precision is not None:
+        return f"{kind}({int(precision)})"
+    return normalize_type(kind)
+
+
 def _split_table(table: str, default_schema: str | None) -> tuple[str | None, str]:
     parts = table.replace("[", "").replace("]", "").replace('"', "").split(".")
     return (parts[-2] if len(parts) > 1 else default_schema), parts[-1]
@@ -886,6 +1175,7 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
     snapshot_sql = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT"
     snapshot_reset_sql = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
     mod_sql = "({x} % {m})"  # T-SQL has no MOD(); pyodbc binds with `?`, so `%` is literal
+    CATALOG_STATEMENTS = {"schema_facts": 6, "identity_state": 1, "session": 0}
     # Every INSERT/UPDATE/DELETE statement against the table bumps user_updates, committed or
     # not, so a window whose token held saw no write at all. Needs VIEW SERVER STATE (2019) /
     # VIEW DATABASE PERFORMANCE STATE (2022+) on the read-only login; without it the token is
@@ -908,7 +1198,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
     def schema_facts(self, table: str) -> SchemaFacts:
         schema, name = _split_table(table, "dbo")
         facts = SchemaFacts(table=f"{schema}.{name}")
-        rows = self._rows(
+        rows = self._dict_rows(
+            table, "sys.indexes",
             "SELECT i.is_primary_key, i.is_unique, i.has_filter, i.name, ic.key_ordinal, c.name "
             "FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id "
             "JOIN sys.schemas s ON s.schema_id = o.schema_id "
@@ -930,7 +1221,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
                 facts.unique_nulls_equal.add(tuple(cols))
             else:
                 facts.indexes.add(tuple(cols))
-        rows = self._rows(
+        rows = self._dict_rows(
+            table, "sys.foreign_keys",
             "SELECT fk.name, pc.name, rs.name + '.' + ro.name, rc.name, "
             "       fk.update_referential_action_desc, fk.delete_referential_action_desc "
             "FROM sys.foreign_keys fk "
@@ -952,7 +1244,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             fk = (tuple(cols), ref_table, tuple(ref_cols))
             facts.foreign_keys.add(fk)
             facts.foreign_key_actions[fk] = tuple(_fk_action(a) for a in actions)
-        rows = self._rows(
+        rows = self._dict_rows(
+            table, "sys.columns",
             "SELECT c.name, c.is_nullable, c.is_identity FROM sys.columns c "
             "JOIN sys.objects o ON o.object_id = c.object_id "
             "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = ? AND o.name = ?",
@@ -962,7 +1255,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
                 facts.not_null.add(col)
             if is_identity:
                 facts.identity_columns.add(col)
-        rows = self._rows(
+        rows = self._dict_rows(
+            table, "sys.check_constraints",
             "SELECT cc.definition FROM sys.check_constraints cc "
             "JOIN sys.objects o ON o.object_id = cc.parent_object_id "
             "JOIN sys.schemas s ON s.schema_id = o.schema_id "
@@ -970,7 +1264,51 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             (schema, name))
         facts.check_count = len(rows)
         facts.checks = {definition for (definition,) in rows}
+        rows = self._dict_rows(
+            table, "sys.triggers",
+            "SELECT tr.name, tr.is_instead_of_trigger, te.type_desc "
+            "FROM sys.triggers tr "
+            "JOIN sys.objects o ON o.object_id = tr.parent_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "LEFT JOIN sys.trigger_events te ON te.object_id = tr.object_id "
+            "WHERE s.name = ? AND o.name = ? AND tr.parent_class = 1 AND tr.is_disabled = 0 "
+            "ORDER BY tr.name", (schema, name))
+        by_trigger: dict[str, tuple] = {}
+        for tname, is_instead, type_desc in rows:
+            timing, events = by_trigger.setdefault(
+                tname, ("instead of" if is_instead else "after", []))
+            if type_desc:
+                events.append(str(type_desc).lower())
+        for tname, (timing, events) in by_trigger.items():
+            facts.triggers[tname] = (timing, tuple(sorted(set(events))), "statement")
+        rows = self._dict_rows(
+            table, "sys.database_permissions",
+            "SELECT dp.name, p.permission_name "
+            "FROM sys.database_permissions p "
+            "JOIN sys.database_principals dp ON dp.principal_id = p.grantee_principal_id "
+            "JOIN sys.objects o ON o.object_id = p.major_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "WHERE p.class = 1 AND s.name = ? AND o.name = ? AND p.state IN ('G', 'W') "
+            "AND dp.principal_id <> s.principal_id "  # the schema owner's implicit rights are not grants
+            "ORDER BY dp.name", (schema, name))
+        grants: dict[str, set] = {}
+        for grantee, priv in rows:
+            grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
+        facts.grants = {g: frozenset(p) for g, p in grants.items()}
         return facts
+
+    def column_shape(self, table: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order (recon.fixture_shape); one catalog read."""
+        schema, name = _split_table(table, "dbo")
+        rows = self._rows(
+            "SELECT c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable, c.column_id "
+            "FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id "
+            "JOIN sys.objects o ON o.object_id = c.object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = ? AND o.name = ? "
+            "ORDER BY c.column_id", (schema, name))
+        return [{"name": str(col).lower(), "type": _tsql_type(kind, max_length, precision, scale),
+                 "nullable": bool(nullable)}
+                for col, kind, max_length, precision, scale, nullable, _ in rows]
 
     def numeric_columns(self, table: str) -> set[str]:
         schema, name = _split_table(table, "dbo")
@@ -998,7 +1336,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
 
     def identity_state(self, table: str, column: str) -> IdentityState | None:
         schema, name = _split_table(table, "dbo")
-        rows = self._rows(
+        rows = self._dict_rows(
+            table, "sys.identity_columns",
             "SELECT CAST(ic.last_value AS BIGINT), CAST(ic.increment_value AS BIGINT), "
             "       CAST(ic.seed_value AS BIGINT) "
             "FROM sys.identity_columns ic JOIN sys.objects o ON o.object_id = ic.object_id "
@@ -1053,8 +1392,41 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
 class DatabricksSourceAdapter(_SqlAdapterBase):
     """Databricks as the SOURCE (workspace-to-workspace or Hive-to-UC moves)."""
 
+    paramstyle = "pyformat"
+    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 0}
+
     def __init__(self, dsn_secret: str):
         super().__init__(_databricks_connect(dsn_secret))
+
+    def schema_facts(self, table: str) -> SchemaFacts:
+        parts = table.replace("`", "").split(".")
+        if len(parts) != 3:
+            raise NotImplementedError(
+                f"{type(self).__name__} needs a catalog.schema.table name, got {table!r}")
+        return _uc_schema_facts(lambda sql, params: self._rows(sql, params), *parts)
+
+    def column_shape(self, table: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order (recon.fixture_shape); one catalog read."""
+        parts = table.replace("`", "").split(".")
+        if len(parts) != 3:
+            raise NotImplementedError(
+                f"{type(self).__name__} needs a catalog.schema.table name, got {table!r}")
+        catalog, schema, name = parts
+        rows = self._rows(
+            f"SELECT column_name, full_data_type, is_nullable, ordinal_position "
+            f"FROM {quote_ident(catalog, '`')}.information_schema.columns "
+            "WHERE table_catalog = %(catalog)s AND table_schema = %(schema)s AND table_name = %(table)s "
+            "ORDER BY ordinal_position", {"catalog": catalog, "schema": schema, "table": name})
+        return [{"name": str(col).lower(), "type": normalize_type(dtype),
+                 "nullable": str(nullable).upper() != "NO"} for col, dtype, nullable, _ in rows]
+
+    def identity_state(self, table: str, column: str) -> IdentityState | None:
+        parts = table.replace("`", "").split(".")
+        if len(parts) != 3:
+            raise NotImplementedError(
+                f"{type(self).__name__} needs a catalog.schema.table name, got {table!r}")
+        return _uc_identity_state(
+            lambda sql, params: self._rows(sql, params), *parts, column)
 
 
 SOURCE_ADAPTERS = {
@@ -1089,8 +1461,12 @@ class DatabricksTargetAdapter:
     fields. Object names in the mapping spec are bare table names; the adapter qualifies
     them with the migration catalog and schema so a spec never points at production."""
 
+    # Unity Catalog reads share _uc_schema_facts/_uc_identity_state with the source adapter.
+    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 0}
+
     def __init__(self, secret_name: str, catalog: str, schema: str):
         # names are validated before a session is opened so a bad name never leaks one
+        self._catalog, self._schema = catalog, schema
         self._prefix = f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
         self._conn = _databricks_connect(secret_name)
         self._sql = _SqlAdapterBase(self._conn)
@@ -1106,6 +1482,40 @@ class DatabricksTargetAdapter:
 
     def _q(self, object: str) -> str:
         return self._prefix + quote_ident(object, "`")
+
+    def schema_facts(self, object: str) -> SchemaFacts:
+        return _uc_schema_facts(lambda sql, params: self._sql._rows(sql, params),
+                                self._catalog, self._schema, object)
+
+    def identity_state(self, object: str, column: str) -> IdentityState | None:
+        return _uc_identity_state(
+            lambda sql, params: self._sql._rows(sql, params),
+            self._catalog, self._schema, object, column)
+
+    def column_shape(self, object: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order for the rerun proof (recon.rerun); a view with the
+        same columns is not the table."""
+        cat = quote_ident(self._catalog, '`')
+        rows = self._sql._rows(
+            f"SELECT c.column_name, c.full_data_type, c.is_nullable, c.ordinal_position "
+            f"FROM {cat}.information_schema.columns c "
+            f"JOIN {cat}.information_schema.tables t "
+            "ON t.table_catalog = c.table_catalog AND t.table_schema = c.table_schema "
+            "AND t.table_name = c.table_name "
+            "WHERE c.table_catalog = %(catalog)s AND c.table_schema = %(schema)s AND c.table_name = %(table)s "
+            f"AND {_UC_PHYSICAL} ORDER BY ordinal_position",
+            {"catalog": self._catalog, "schema": self._schema, "table": object})
+        return [{"name": str(name).lower(), "type": normalize_type(dtype),
+                 "nullable": str(nullable).upper() != "NO"} for name, dtype, nullable, _ in rows]
+
+    def table_exists(self, object: str) -> bool:
+        """Catalog check that tells an absent table from one with no columns."""
+        rows = self._sql._rows(
+            f"SELECT t.table_name FROM {quote_ident(self._catalog, '`')}.information_schema.tables t "
+            "WHERE t.table_catalog = %(catalog)s AND t.table_schema = %(schema)s AND t.table_name = %(table)s "
+            f"AND {_UC_PHYSICAL}",
+            {"catalog": self._catalog, "schema": self._schema, "table": object})
+        return bool(rows)
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None,
@@ -1123,6 +1533,9 @@ class DatabricksTargetAdapter:
 
     def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
         return self._sql.field_aggregates(self._q(object), field_path, where)
+
+    def column_profile(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
+        return self._sql.column_profile(self._q(object), field_path, where)
 
     def sum_probe(self, object: str, field_path: str, where: str | None = None) -> Any:
         return self._sql.sum_probe(self._q(object), field_path, where)
@@ -1179,6 +1592,19 @@ class _PostgresBase(_SqlAdapterBase):
     # column ignores the offset, so the explicit +00:00 is right for both under the UTC contract.
     watermark_literal_utc_offset = True
     binary_literal_sql = "'\\x{hex}'::bytea"
+    # schema_facts' server_version_num read is cached after the first object (session).
+    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 1}
+
+    def _pg_column_shape(self, schema: str, name: str, physical: bool = False) -> list[dict[str, Any]]:
+        kind = f"AND {_PG_PHYSICAL} " if physical else ""
+        rows = self._rows(
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attnum "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            f"WHERE n.nspname = %s AND c.relname = %s {kind}AND a.attnum > 0 AND NOT a.attisdropped "
+            "ORDER BY a.attnum", (schema, name))
+        return [{"name": str(col), "type": normalize_type(dtype), "nullable": not notnull}
+                for col, dtype, notnull, _ in rows]
 
     def open_window(self) -> str:
         """Every statement until close_window reads one REPEATABLE READ snapshot."""
@@ -1195,7 +1621,8 @@ class _PostgresBase(_SqlAdapterBase):
     def schema_facts(self, table: str) -> SchemaFacts:
         schema, name = _split_table(table, "public")
         facts = SchemaFacts(table=f"{schema}.{name}")
-        rows = self._rows(
+        rows = self._dict_rows(
+            table, "pg_constraint",
             "SELECT con.contype, con.conname, a.attname, "
             "       CASE WHEN con.contype = 'f' THEN rn.nspname || '.' || rc.relname END, "
             "       ra.attname, k.ord, con.confupdtype, con.confdeltype, "
@@ -1235,7 +1662,8 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.checks.add(definition)
         # attnum 0 in indkey marks an expression key; a LEFT JOIN keeps those indexes visible
         nulls_equal = "ix.indnullsnotdistinct" if self._server_version() >= 150000 else "FALSE"
-        rows = self._rows(
+        rows = self._dict_rows(
+            table, "pg_index",
             "SELECT ix.indexrelid, ix.indisunique, ix.indpred IS NOT NULL, ix.indexprs IS NOT NULL, "
             f"a.attname, k.ord, pg_get_indexdef(ix.indexrelid), {nulls_equal} "
             "FROM pg_index ix JOIN pg_class c ON c.oid = ix.indrelid "
@@ -1266,7 +1694,8 @@ class _PostgresBase(_SqlAdapterBase):
                     facts.unique_nulls_equal.add(tuple(entry["cols"]))
             else:
                 facts.indexes.add(tuple(entry["cols"]))
-        rows = self._rows(
+        rows = self._dict_rows(
+            table, "pg_attribute",
             "SELECT a.attname, a.attnotnull, a.attidentity <> '' OR "
             "       pg_get_serial_sequence(%s, a.attname) IS NOT NULL, c.relkind "
             "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
@@ -1281,6 +1710,29 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.not_null.add(col)
             if has_seq:
                 facts.identity_columns.add(col)
+        rows = self._dict_rows(
+            table, "pg_trigger",
+            "SELECT t.tgname, t.tgtype::int "
+            "FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND NOT t.tgisinternal AND t.tgenabled <> 'D' "
+            "ORDER BY t.tgname", (schema, name))
+        for tname, tgtype in rows:
+            facts.triggers[tname] = _pg_trigger_shape(int(tgtype))
+        rows = self._dict_rows(
+            table, "information_schema.table_privileges",
+            "SELECT tp.grantee, tp.privilege_type "
+            "FROM information_schema.table_privileges tp "
+            "JOIN pg_class c ON c.relname = tp.table_name "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = tp.table_schema "
+            "WHERE tp.table_schema = %s AND tp.table_name = %s "
+            "AND tp.grantee <> pg_get_userbyid(c.relowner) "
+            "ORDER BY tp.grantee", (schema, name))
+        grants: dict[str, set] = {}
+        for grantee, priv in rows:
+            grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
+        facts.grants = {g: frozenset(p) for g, p in grants.items()}
         return facts
 
     # In-flight keys travel as one text[] per key column and are cast to the column's declared
@@ -1373,11 +1825,13 @@ class _PostgresBase(_SqlAdapterBase):
 
     def identity_state(self, table: str, column: str) -> IdentityState | None:
         schema, name = _split_table(table, "public")
-        (seq,) = self._rows("SELECT pg_get_serial_sequence(%s, %s)",
-                            (f'"{schema}"."{name}"', column))[0]
+        (seq,) = self._dict_rows(table, "pg_get_serial_sequence",
+                                 "SELECT pg_get_serial_sequence(%s, %s)",
+                                 (f'"{schema}"."{name}"', column))[0]
         if seq is None:
             return None
-        (last, is_called, inc) = self._rows(
+        (last, is_called, inc) = self._dict_rows(
+            table, "pg_sequence",
             f"SELECT s.last_value, s.is_called, p.seqincrement FROM {seq} s, "
             "pg_sequence p WHERE p.seqrelid = %s::regclass", (seq,))[0]
         step = int(inc)
@@ -1391,6 +1845,10 @@ class PostgresSourceAdapter(_PostgresBase):
     def __init__(self, dsn_secret: str):
         import psycopg  # lazy: optional extra
         super().__init__(psycopg.connect(_secret(dsn_secret)))
+
+    def column_shape(self, table: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order (recon.fixture_shape); one catalog read."""
+        return self._pg_column_shape(*_split_table(table, "public"))
 
 
 SOURCE_ADAPTERS["postgres"] = PostgresSourceAdapter
@@ -1438,6 +1896,9 @@ class LakebaseTargetAdapter(_PostgresBase):
     def field_aggregates(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
         return super().field_aggregates(self._q(object), field_path, where)
 
+    def column_profile(self, object: str, field_path: str, where: str | None = None) -> dict[str, Any]:
+        return super().column_profile(self._q(object), field_path, where)
+
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None,
                          *, unordered: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
@@ -1484,6 +1945,17 @@ class LakebaseTargetAdapter(_PostgresBase):
     def identity_state(self, object: str, column: str) -> IdentityState | None:
         return super().identity_state(self._q(object), column)
 
+    def column_shape(self, object: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order for the rerun proof (recon.rerun)."""
+        return self._pg_column_shape(self._schema, object, physical=True)
+
+    def table_exists(self, object: str) -> bool:
+        """Catalog check that tells an absent table from one with no columns."""
+        rows = self._rows(
+            "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            f"WHERE n.nspname = %s AND c.relname = %s AND {_PG_PHYSICAL}", (self._schema, object))
+        return bool(rows)
+
     def null_key_count(self, object: str, key_fields: list[str], where: str | None = None) -> int:
         return super().null_key_count(self._q(object), key_fields, where)
 
@@ -1503,3 +1975,6 @@ class LakebaseTargetAdapter(_PostgresBase):
         from .config import ConfigError
         raise ConfigError(f"{table}.{column}: applied position must be bytea or an integer, "
                           f"got {type(value).__name__}")
+
+
+TARGET_ADAPTERS = {"databricks": DatabricksTargetAdapter, "lakebase": LakebaseTargetAdapter}

@@ -13,6 +13,7 @@ from .adapters import StatementCounting
 from .canon import Canonicalizer
 from .config import CanonRule, ConfigError, MappingSpec, Tolerances
 from .report import build_result, write_outputs
+from .structure import tier0_structural_parity
 from .tiers import tier1_counts, tier2_aggregates, tier3_diffs, tier4_parity
 from .transactional import (
     abandon_window,
@@ -29,7 +30,9 @@ from .transactional import (
 # its one live run.
 # transactional: the operational track (OLTP source, Lakebase target), both sides live; adds
 # the consistency-window, PK-set, CDC-lag/ordering and schema-parity tiers.
-MODES = ("fixture", "live", "snapshot", "continuous", "transactional")
+# structural: Tier 0 only, both catalogs read, no row read on either side; the independent verifier's
+# run on a wave declared DEGRADED. Never merge evidence.
+MODES = ("fixture", "live", "snapshot", "continuous", "transactional", "structural")
 # Modes named in the docs but not runnable in this harness version (none at present).
 PLANNED_MODES: tuple[str, ...] = ()
 
@@ -55,7 +58,7 @@ def _cost(source, target, started: float, ctx=None) -> dict:
 
 def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | None,
                                   spec: MappingSpec, tier1) -> list[str]:
-    if snapshot is None:
+    if snapshot is None or tier1 is None:
         return []
     warnings = []
     if snapshot.get("source") != source_family:
@@ -78,6 +81,8 @@ def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | No
 def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source, target,
                seed: int, depth: str, mode: str, ops: list[dict] | None, run_source, run_target,
                ctx) -> list:
+    if mode == "structural":
+        return [tier0_structural_parity(spec, tol, source, target, catalog_only=True)]
     tiers = [tier1_counts(spec, source, target, ctx=ctx)]
     if tiers[0].passed:
         # Tier 1 failures are load defects or mapping-spec violations; nothing else runs.
@@ -93,6 +98,9 @@ def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source,
         tiers.append(tier7_schema_parity(spec, tol, source, target))
         # the window closes last so every tier above read inside it; a moved side fails the run
         tiers.insert(0, close_window(spec, tol, ctx, source, target))
+    elif mode != "continuous":
+        # structural parity outside a window: runs regardless of tier 1's outcome, gates nothing
+        tiers.insert(0, tier0_structural_parity(spec, tol, source, target))
     return tiers
 
 
@@ -118,7 +126,12 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
               params: dict[str, str] | None = None,
               snapshot: dict | None = None,
               source_family: str | None = None,
-              depth: str = "threshold") -> dict:
+              depth: str = "threshold", type_map: dict | None = None,
+              routine_parity: list[dict] | None = None,
+              routine_writers: list[str] | None = None,
+              routine_analysis_missing: bool = False,
+              routine_dependencies: str | None = None,
+              rerun_proof: dict | None = None) -> dict:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     if depth not in DEPTHS:
@@ -154,11 +167,15 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
                 _report_release_failure(exc, str(err))
         raise
     provenance_warnings = _snapshot_provenance_warnings(
-        snapshot, source_family, spec, next(t for t in tiers if t.tier == 1))
+        snapshot, source_family, spec, next((t for t in tiers if t.tier == 1), None))
     result = build_result(unit, mode, spec.version, tol.version, tiers,
                           seed=seed, params=params, snapshot=snapshot,
                           provenance_warnings=provenance_warnings, depth=depth,
-                          cost=_cost(source, target, started, ctx))
+                          cost=_cost(source, target, started, ctx), type_map=type_map,
+                          routine_parity=routine_parity, routine_writers=routine_writers,
+                          routine_analysis_missing=routine_analysis_missing,
+                          routine_dependencies=routine_dependencies,
+                          rerun_proof=rerun_proof)
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result

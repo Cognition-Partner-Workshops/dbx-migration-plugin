@@ -285,7 +285,7 @@ def test_tier3_stratified_sampling_does_not_stream_all_keys():
     source, target = big_estate()
     tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=12)
     result = run_recon("u", "live", SPEC, tol, RULES, source, target, seed=3)
-    stats = result["tiers"][2]["stats"]["orders"]
+    stats = result["tiers"][3]["stats"]["orders"]
     assert stats["mode"] == "stratified_sample" and stats["sampling"] == "stratified"
     assert stats["strata"] > 1
     assert source.calls["iter_keys"] == 0
@@ -308,7 +308,7 @@ def test_tier3_stratified_catches_a_seeded_diff_in_every_stratum_edge():
     tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=4)
     result = run_recon("u", "live", SPEC, tol, RULES, source, target)
     assert result["verdict"] == "FAIL"
-    assert any(f["check"] == "field_diff" and "199" in f["detail"] for f in result["tiers"][2]["findings"])
+    assert any(f["check"] == "field_diff" and "199" in f["detail"] for f in result["tiers"][3]["findings"])
 
 
 def test_null_key_count_is_one_statement_and_honours_where():
@@ -329,8 +329,8 @@ def test_tier3_reports_null_comparison_keys_that_sampling_cannot_reach():
                                      "total": 5.0, "items": []})
     tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=12)
     result = run_recon("u", "live", SPEC, tol, RULES, source, target, seed=3)
-    assert result["tiers"][0]["passed"] and result["tiers"][1]["passed"]
-    t3 = result["tiers"][2]
+    assert result["tiers"][1]["passed"] and result["tiers"][2]["passed"]
+    t3 = result["tiers"][3]
     assert result["verdict"] == "FAIL" and not t3["passed"]
     checks = [f["check"] for f in t3["findings"]]
     assert checks == ["null_comparison_key", "null_comparison_key"]
@@ -345,7 +345,7 @@ def test_null_key_rows_are_reported_in_full_diff_mode_too():
     source.tables["ORDERS"].append({"ORDER_ID": None, "CUST_NAME": "5", "TOTAL": 5.0})
     target.objects["orders"].append({"order_id": None, "customer": {"name": "5"}, "total": 5.0, "items": []})
     result = run_recon("u", "live", SPEC, Tolerances(version="t"), RULES, source, target, seed=3)
-    t3 = result["tiers"][2]
+    t3 = result["tiers"][3]
     assert t3["stats"]["orders"]["mode"] == "full_diff"
     assert [f["check"] for f in t3["findings"]] == ["null_comparison_key", "null_comparison_key"]
     assert t3["stats"]["orders"]["null_key_rows"] == {"source": 1, "target": 1}
@@ -358,7 +358,7 @@ def test_tier3_stratified_counts_source_duplicates_without_streaming():
     target.objects["orders"].append({"order_id": 5, "customer": {"name": "5"}, "total": 5.0, "items": []})
     tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=4)
     result = run_recon("u", "live", SPEC, tol, RULES, source, target)
-    assert result["tiers"][2]["stats"]["orders"]["duplicate_source_key_count"] == 1
+    assert result["tiers"][3]["stats"]["orders"]["duplicate_source_key_count"] == 1
     assert source.calls["iter_keys"] == 0
 
 
@@ -376,7 +376,7 @@ def test_reservoir_fallback_for_adapters_without_strata():
                                      "items": []} for i in range(50)]})
     tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=5)
     result = run_recon("u", "live", SPEC, tol, RULES, source, target)
-    stats = result["tiers"][2]["stats"]["orders"]
+    stats = result["tiers"][3]["stats"]["orders"]
     assert stats["sampling"] == "reservoir" and source.calls["iter_keys"] == 1
     assert result["verdict"] == "PASS"
 
@@ -388,21 +388,21 @@ def test_depth_full_forces_full_diff_above_threshold():
     tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=4)
     result = run_recon("u", "live", SPEC, tol, RULES, source, target, depth="full")
     assert result["depth"] == "full"
-    assert result["tiers"][2]["stats"]["orders"]["mode"] == "full_diff"
+    assert result["tiers"][3]["stats"]["orders"]["mode"] == "full_diff"
 
 
 def test_depth_sampled_forces_sampling_below_threshold():
     source, target = big_estate(20)
     result = run_recon("u", "live", SPEC, Tolerances(version="t"), RULES, source, target, depth="sampled")
     assert result["depth"] == "sampled"
-    assert result["tiers"][2]["stats"]["orders"]["mode"] == "stratified_sample"
+    assert result["tiers"][3]["stats"]["orders"]["mode"] == "stratified_sample"
 
 
 def test_depth_default_is_tolerance_threshold_and_invalid_rejected():
     source, target = big_estate(20)
     result = run_recon("u", "live", SPEC, Tolerances(version="t"), RULES, source, target)
     assert result["depth"] == "threshold"
-    assert result["tiers"][2]["stats"]["orders"]["mode"] == "full_diff"
+    assert result["tiers"][3]["stats"]["orders"]["mode"] == "full_diff"
     with pytest.raises(ConfigError, match="depth"):
         run_recon("u", "live", SPEC, Tolerances(version="t"), RULES, source, target, depth="deep")
 

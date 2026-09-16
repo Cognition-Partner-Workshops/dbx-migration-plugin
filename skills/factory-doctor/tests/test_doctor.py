@@ -39,7 +39,9 @@ def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), c
             mig.joinpath(f).write_text(json.dumps(allowed if allowed is not None else
                                                   {"catalogs": ["mig_cat"], "legacy_sources": ["LEGACY_DSN"]}))
         elif f == "00_context.md":
-            mig.joinpath(f).write_text(f"# context\n\nstop_mode: {stop_mode}\n")
+            mig.joinpath(f).write_text(
+                f"# context\n\nstop_mode: {stop_mode}\n\n## Glossary\n- term: meaning\n"
+            )
         else:
             mig.joinpath(f).write_text(f"# {f}\n")
     if with_lock:
@@ -165,6 +167,21 @@ def test_platform_probe_reuses_a_pending_nonce_until_accepted(tmp_path):
     assert sub_by_id(fresh, "hook_guard")["hook_platform_loaded"]["status"] == "unverified"
 
 
+def test_one_nonce_serves_functional_and_platform_probe(tmp_path):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    nonce = by_id(report)["hook_guard"]["data"]["probe_nonce"]
+    sub = sub_by_id(report, "hook_guard")
+    assert f"__dbx_guard_probe__{nonce}" in sub["hook_guard_functional"]["detail"]
+    assert sub["hook_platform_loaded"]["data"]["probe_command"] == \
+        doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)
+    second = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    sub2 = sub_by_id(second, "hook_guard")
+    assert f"__dbx_guard_probe__{nonce}" in sub2["hook_guard_functional"]["detail"]
+    assert sub2["hook_platform_loaded"]["data"]["probe_command"] == \
+        doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)
+
+
 def test_failed_hook_report_without_probe_nonce_does_not_crash(tmp_path):
     ws = make_workspace(tmp_path)
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps({
@@ -220,9 +237,17 @@ def test_run_core_rows_are_ten(tmp_path):
     optional = {"lakebase_branch_create", "lakebase_target_grants", "analytical_target_grants"}
     assert [c["id"] for c in report["checks"] if c["id"] not in optional] == [
         "workspace", "allowed_targets", "allowlist_committed", "playbooks_in_sync", "hook_guard",
-        "official_databricks_plugin", "recon_harness", "recon_family_supported", "delete_evidence",
-        "source_principal_read_only", "databricks_identity",
+        "official_databricks_plugin", "recon_harness", "recon_family_supported", "type_map_audit",
+        "delete_evidence", "source_principal_read_only", "dictionary_readable",
+        "named_secrets_exist", "databricks_identity",
     ]
+
+
+def test_security_controls_are_role_specific():
+    assert doctor.security_controls("child") == ("hook_guard_functional", "databricks_identity")
+    assert doctor.security_controls("orchestrator") == doctor.security_controls("setup") \
+        == doctor.SECURITY_CONTROLS
+    assert len(doctor.SECURITY_CONTROLS) == 3
 
 
 def test_merged_row_status_rules():
@@ -579,19 +604,59 @@ def test_not_blocked_probe_fails(tmp_path):
     assert by_id(report)["hook_guard"]["status"] == "fail"
 
 
-def test_missing_files_and_stop_mode_fail(tmp_path):
-    ws = make_workspace(tmp_path, omit=("05_progress.md",))
-    (ws / ".migration" / "00_context.md").write_text("# no mode here\n")
+def test_generated_and_folded_files_are_not_required(tmp_path):
+    ws = make_workspace(tmp_path, omit=("02_glossary.md", "05_progress.md"))
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert c["workspace"]["status"] == "fail" and "05_progress.md" in c["workspace"]["data"]["missing"]
+    assert c["workspace"]["status"] == "ok"
+    (ws / ".migration" / "00_context.md").write_text("# no mode here\n\n## Glossary\n- term: meaning\n")
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
     assert sub_by_id({"checks": [c["workspace"]]}, "workspace")["stop_mode"]["status"] == "fail"
 
 
-def test_setup_outputs_glossary_and_tolerances_json_are_required(tmp_path):
-    ws = make_workspace(tmp_path, omit=("02_glossary.md", "03_recon_tolerances.json"))
+def test_workspace_requires_glossary_section(tmp_path):
+    ws = make_workspace(tmp_path, omit=("02_glossary.md",))
+    (ws / ".migration" / "00_context.md").write_text("stop_mode: hard\n")
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
     assert c["workspace"]["status"] == "fail"
-    assert c["workspace"]["data"]["missing"] == ["02_glossary.md", "03_recon_tolerances.json"]
+    assert "Glossary" in c["workspace"]["detail"]
+
+    (ws / ".migration" / "00_context.md").write_text(
+        "stop_mode: hard\n\n## Glossary\n- term: meaning\n"
+    )
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "ok"
+
+
+def test_workspace_accepts_legacy_glossary_file(tmp_path):
+    ws = make_workspace(tmp_path)
+    (ws / ".migration" / "02_glossary.md").write_text("# legacy glossary\n")
+    (ws / ".migration" / "00_context.md").write_text("stop_mode: hard\n")
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "ok"
+
+
+def test_workspace_rejects_glossary_directory(tmp_path):
+    ws = make_workspace(tmp_path, omit=("02_glossary.md",))
+    (ws / ".migration" / "02_glossary.md").mkdir()
+    (ws / ".migration" / "00_context.md").write_text("stop_mode: hard\n")
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "fail"
+    assert "Glossary" in c["workspace"]["detail"]
+
+
+def test_workspace_rejects_context_directory(tmp_path):
+    ws = make_workspace(tmp_path, omit=("00_context.md",))
+    (ws / ".migration" / "00_context.md").mkdir()
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "fail"
+    assert "00_context.md" in c["workspace"]["detail"]
+
+
+def test_setup_outputs_tolerances_json_is_required(tmp_path):
+    ws = make_workspace(tmp_path, omit=("03_recon_tolerances.json",))
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "fail"
+    assert c["workspace"]["data"]["missing"] == ["03_recon_tolerances.json"]
 
 
 @pytest.mark.parametrize("who, expected", [
@@ -639,6 +704,22 @@ def test_cli_writes_capabilities_json_and_exit_codes(tmp_path):
                         "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--hook-probe-result", "not-blocked"],
                        capture_output=True, text=True)
     assert r.returncode == 1
+
+
+def test_unverified_probe_prints_the_command_as_the_last_line(tmp_path, capsys):
+    ws = make_workspace(tmp_path)
+    doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT),
+                 "--no-databricks", "--out", "-"])
+    out = capsys.readouterr().out
+    nonce = (ws / doctor.HOOK_PROBE_NONCE).read_text().split()[0]
+    assert out.splitlines()[-1] == (
+        "PROBE_COMMAND (run in the lead session's exec tool, not a sidekick shell): "
+        f"{doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)}")
+    child = make_workspace(tmp_path / "child")
+    _unit_mapping(child, "loans", evidence=False)
+    doctor.main(["--workspace", str(child), "--plugin-root", str(PLUGIN_ROOT), "--no-databricks",
+                 "--role", "child", "--unit", "loans", "--out", "-"])
+    assert "PROBE_COMMAND" not in capsys.readouterr().out
 
 
 def test_no_workspace_does_not_write(tmp_path):
@@ -829,6 +910,96 @@ def test_child_names_its_batch_and_every_unit_of_it_is_checked(tmp_path, monkeyp
     assert set(c.data["mappings"]) == {"loans", "payments"}
 
 
+def test_child_non_security_failures_are_warnings_and_do_not_block(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path, with_lock=False)
+    _unit_mapping(ws, "loans", evidence=False)
+    monkeypatch.setattr(doctor, "check_harness",
+                        lambda *a, **k: doctor.Check("recon_harness", "fail", "selftest rc=1"))
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "ok", "oauth-m2m (env)"),
+        doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
+        doctor.Check("databricks_warehouse", "warn", "none"),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"])
+    row = by_id(report)["recon_harness"]
+    assert row["status"] == "warn" and "selftest rc=1" in row["detail"]
+    assert by_id(report)["playbooks_in_sync"]["status"] == "warn"
+    assert report["ready"] is True and report["blocking"] == []
+
+
+def test_child_missing_unit_mapping_still_blocks(tmp_path):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True, units=["nope"])
+    rows = by_id(report)
+    for rid in ("type_map_audit", "delete_evidence", "source_principal_read_only",
+                "dictionary_readable"):
+        assert rows[rid]["status"] == "fail" and rows[rid]["data"]["units_problem"] is True, rid
+        assert f"{rid}=fail" in report["blocking"], rid
+    assert report["ready"] is False
+
+
+def test_child_blocks_when_a_security_control_is_missing(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    empty_plugin = tmp_path / "no_plugin"  # no hooks.json/dbx_guard.py: check_hooks returns only hooks_files=fail
+    empty_plugin.mkdir()
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "fail", "databricks CLI not on PATH"),
+    ])
+    report = doctor.run(ws, empty_plugin, "child", "unknown", None, False, units=["loans"])
+    assert "hook_guard_functional=missing" in report["blocking"]
+    assert "databricks_identity=missing" in report["blocking"]
+    assert report["ready"] is False
+
+
+def test_child_malformed_unit_mapping_still_blocks(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    spec = _unit_mapping(ws, "loans")
+    spec.write_text("{not json")
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "ok", "oauth-m2m (env)"),
+        doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
+        doctor.Check("databricks_warehouse", "warn", "none"),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"],
+                        source_family="sqlserver")
+    rows = by_id(report)
+    for rid in ("type_map_audit", "delete_evidence", "source_principal_read_only",
+                "dictionary_readable"):
+        assert rows[rid]["status"] == "fail" and rows[rid]["data"]["units_problem"] is True, rid
+        assert f"{rid}=fail" in report["blocking"], rid
+    assert report["ready"] is False
+
+
+def test_child_writable_source_principal_blocks(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans")
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "ok", "oauth-m2m (env)"),
+        doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
+        doctor.Check("databricks_warehouse", "warn", "none"),
+    ])
+    monkeypatch.setattr(doctor, "check_source_principal", lambda tables, family, secret:
+                        doctor.Check("source_principal_read_only", "fail",
+                                     "principal can INSERT on raw.loans"))
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"],
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "source_principal_read_only=fail" in report["blocking"]
+    assert report["ready"] is False
+    # unverified stays advisory in a child
+    monkeypatch.setattr(doctor, "check_source_principal", lambda tables, family, secret:
+                        doctor.Check("source_principal_read_only", "unverified",
+                                     "cannot reach the source"))
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"],
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "unverified"
+    assert "source_principal_read_only=unverified" not in report["blocking"]
+
+
 def test_delete_evidence_declared_needs_a_named_source_secret(tmp_path, monkeypatch):
     monkeypatch.delenv("LEGACY_ODBC", raising=False)
     c = doctor.check_delete_evidence(_mapping(tmp_path), None, PLUGIN_ROOT)
@@ -991,7 +1162,9 @@ def test_run_includes_delete_evidence_and_a_failed_check_blocks(tmp_path, monkey
     _unit_mapping(ws, "loans")
     report = doctor.run(ws, PLUGIN_ROOT, "child", probed(ws), None, True, units=["loans"],
                         source_secret="LEGACY_ODBC")
-    assert "delete_evidence=fail" in report["blocking"]
+    row = by_id(report)["delete_evidence"]
+    assert row["status"] == "warn" and "CDC is not enabled" in row["detail"]
+    assert "delete_evidence=fail" not in report["blocking"]
     # a child preflight without its batch is a blocking row, never a silent skip
     report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True)
     assert by_id(report)["delete_evidence"]["status"] == "fail"
@@ -1331,8 +1504,9 @@ def test_run_resolves_the_in_scope_tables_from_the_same_mappings_as_delete_evide
     report = doctor.run(ws, PLUGIN_ROOT, "child", probed(ws), None, True, units=["loans", "payments"],
                         source_secret="LEGACY_ODBC")
     assert seen == {"tables": ["raw.loans"], "family": "sqlserver", "secret": "LEGACY_ODBC"}
-    # unverified for a declared source blocks readiness; a fail does too
-    assert "source_principal_read_only=unverified" in report["blocking"]
+    # only `fail` softens in a child: the row stays unverified but does not block child readiness
+    assert by_id(report)["source_principal_read_only"]["status"] == "unverified"
+    assert "source_principal_read_only=unverified" not in report["blocking"]
     # --source-family is authoritative; without it the family comes from the mapping's delete_evidence kind
     seen.clear()
     doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_secret="LEGACY_ODBC",
@@ -1379,6 +1553,214 @@ def test_source_families_are_the_harness_families_and_databricks_without_cli_is_
                         source_family="databricks")
     assert by_id(report)["source_principal_read_only"]["status"] == "unverified"
     assert "source_principal_read_only=unverified" in report["blocking"] and report["ready"] is False
+
+
+# ------------------------------------------------------------------ dictionary_readable (WS3.1)
+
+sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness"))
+from recon.adapters import DICTIONARY_OBJECTS  # noqa: E402
+
+
+class FakeDictConn:
+    """A source seen through the doctor's dictionary probes. `fail_views` names catalog views
+    whose probe raises; `census` maps a table to (declared, listed) trigger answers. Records
+    every statement."""
+
+    def __init__(self, *, fail_views=(), census=None):
+        self.fail_views, self.census, self.statements = set(fail_views), census or {}, []
+
+    def cursor(self):
+        outer = self
+
+        class Cur:
+            def execute(self, sql, params=()):
+                outer.statements.append(sql)
+                sql_l = sql.lower()
+                for label in outer.fail_views:
+                    if label.lower() in sql_l:
+                        raise RuntimeError(f"permission denied for {label} secret=DSN://leak")
+                outer.result = [(1,)]
+                if "tablehasinserttrigger" in sql_l or "relhastriggers" in sql_l:
+                    outer.result = [(outer.census.get(params[0], (0, 0))[0],)]
+                elif "count(*)" in sql_l:
+                    outer.result = [(outer.census.get(params[0], (0, 0))[1],)]
+                return self
+
+            def fetchall(self):
+                return outer.result
+        return Cur()
+
+    def close(self):
+        pass
+
+
+def test_dictionary_readable_unverified_for_unprobed_families(monkeypatch):
+    for family in ("teradata", "databricks"):
+        c = doctor.check_dictionary_readable(TABLES, family, "LEGACY_ODBC")
+        assert c.status == "unverified" and "unsupported" in c.detail
+
+
+def test_dictionary_readable_fails_without_the_secret(monkeypatch):
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", None,
+                                         views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "fail" and "--source-secret" in c.detail
+    monkeypatch.delenv("LEGACY_ODBC", raising=False)
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC",
+                                         views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "fail" and "not set" in c.detail
+
+
+def test_dictionary_readable_fails_when_a_catalog_view_is_unreadable(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"sys.triggers"})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "fail" and "sys.triggers" in c.detail and "DSN" not in c.detail
+
+
+def test_dictionary_readable_fails_when_sqlserver_hides_triggers(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"raw.loans": (1, 0), "raw.payments": (0, 0)})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "fail" and "raw.loans" in c.detail and "filtered by permission" in c.detail
+    assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 0}
+
+
+def test_dictionary_readable_fails_when_a_constraint_view_is_unreadable(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"pg_index"})
+    c = doctor.check_dictionary_readable(TABLES, "postgres", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["postgres"])
+    assert c.status == "fail" and "pg_index" in c.detail and "DSN" not in c.detail
+
+
+def test_dictionary_readable_warns_on_a_postgres_census_lag(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"public.loans": (1, 0)})
+    c = doctor.check_dictionary_readable(["public.loans"], "postgres", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["postgres"])
+    assert c.status == "warn" and "relhastriggers" in c.detail
+
+
+def test_dictionary_readable_ok_with_data(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"raw.loans": (1, 2), "raw.payments": (0, 0)})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "ok"
+    assert "sys.triggers" in c.data["views"] and "sys.database_permissions" in c.data["views"]
+    assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 2}
+
+
+def test_dictionary_readable_probes_per_table_ddl_for_databricks(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "ok" and "trigger_census" not in {
+        k for k, v in c.data.items() if v}
+    assert any("SHOW CREATE TABLE `cat`.`s`.`loans`" in q for q in conn.statements)
+    assert any("`cat`.information_schema" in q for q in conn.statements)
+
+
+def test_dictionary_readable_probes_each_catalog_once_for_databricks(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["a.s.loans", "a.s.fees", "b.s.loans"],
+                                         "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "ok"
+    cat_scoped = [q for q in conn.statements if "information_schema" in q]
+    per_catalog = [q for q in cat_scoped if ".information_schema" in q]
+    assert per_catalog and all(q.startswith("SELECT 1") for q in per_catalog)
+    assert sum("`a`.information_schema" in q for q in per_catalog) == 7
+    assert sum("`b`.information_schema" in q for q in per_catalog) == 7
+    assert sum("SHOW CREATE TABLE" in q for q in conn.statements) == 3
+    assert "SHOW CREATE TABLE `a`.`s`.`loans`" in conn.statements
+
+
+def test_dictionary_readable_fails_on_a_two_part_databricks_table(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "s.loans" in c.detail and "catalog.schema.table" in c.detail
+
+
+def test_dictionary_readable_registers_a_databricks_connector():
+    assert "databricks" in doctor._READ_ONLY_CONNECT
+
+
+def test_dictionary_readable_databricks_without_the_connector_names_the_package(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "{}")
+    monkeypatch.setitem(sys.modules, "databricks", None)  # import fails
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "databricks-sql-connector" in c.detail
+    assert "{" not in c.detail  # never the secret
+
+
+def test_dictionary_readable_quotes_probe_identifiers(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["cat.`a;b`.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "ok"
+    assert conn.statements
+    for q in conn.statements:
+        assert "a;b" not in q or "`a;b`" in q  # the part only ever appears backtick-quoted
+    assert any("`a;b`" in q for q in conn.statements)
+
+
+def test_dictionary_readable_fails_on_an_empty_databricks_name_part(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["a..t"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "a..t" in c.detail
+
+
+def test_dictionary_readable_fails_on_an_unreadable_databricks_table(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"SHOW CREATE TABLE"})
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "SHOW CREATE TABLE" in c.detail and "cat.s.loans" in c.detail
+
+
+def test_dictionary_readable_all_resolves_units_and_children(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    row = by_id(report)["dictionary_readable"]
+    assert row["status"] == "skipped"
+    _unit_mapping(ws, "loans")
+    seen = {}
+    monkeypatch.setattr(doctor, "check_dictionary_readable",
+                        lambda tables, family, secret, **kw: seen.update(tables=tables) or
+                        doctor.Check("dictionary_readable", "ok", "stub"))
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    assert by_id(report)["dictionary_readable"]["status"] == "ok" and seen["tables"]
+
+
+def test_dictionary_readable_fail_blocks_the_run(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans")
+    monkeypatch.setattr(doctor, "check_dictionary_readable",
+                        lambda *a, **k: doctor.Check("dictionary_readable", "fail", "stub"))
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    assert "dictionary_readable=fail" in report["blocking"] and report["ready"] is False
 
 
 # ------------------------------------------------------------------ databricks source principal + attested
@@ -1545,8 +1927,8 @@ def test_source_attested_reports_attested_and_does_not_block(tmp_path):
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                         source_family="teradata", source_attested="D-7")
     row = by_id(report)["source_principal_read_only"]
-    assert row["status"] == "attested" and row["data"]["decision"] == "D-7"
-    assert row["data"]["provenance"] == "user:msg-41"
+    assert row["status"] == "ok" and row["data"]["attested"] == "D-7"
+    assert row["data"]["decision"] == "D-7" and row["data"]["provenance"] == "user:msg-41"
     assert not [b for b in report["blocking"] if b.startswith("source_principal_read_only")]
     assert report["blocking"] == ["hook_guard=unverified", "recon_family_supported=fail",
                                   "databricks_identity=skipped"]
@@ -1675,7 +2057,7 @@ def test_recon_family_supported_is_its_own_row_beside_an_attested_principal(tmp_
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                         source_family="teradata", source_attested="D-7")
     rows = by_id(report)
-    assert rows["source_principal_read_only"]["status"] == "attested"
+    assert rows["source_principal_read_only"]["status"] == "ok"
     assert rows["recon_family_supported"]["status"] == "fail"
     assert "recon_family_supported=fail" in report["blocking"] and report["ready"] is False
 
@@ -1698,6 +2080,133 @@ def test_wave_manifest_family_reaches_recon_family_supported(tmp_path):
     row = next(c for c in record["checks"] if c["id"] == "recon_family_supported")
     assert row["status"] == "fail" and "recon_family_supported=fail" in record["blocking"]
     assert any(l.startswith("fail") and "recon_family_supported" in l for l in result.stdout.splitlines())
+
+
+# ------------------------------------------------------------------ type_map_audit (WS3.5)
+
+def _typed_unit_mapping(ws: Path, unit: str, fields: list[dict]) -> Path:
+    p = ws / ".migration" / "units" / unit / "mapping_spec.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"version": "m1", "objects": [{
+        "object": "orders", "root_table": "ORDERS",
+        "key": {"source": ["ORDER_ID"], "target": ["order_id"]},
+        "fields": fields}]}))
+    return p
+
+
+def _field(source, source_type, target_type):
+    return {"source": source, "target": source.lower(),
+            "source_type": source_type, "target_type": target_type}
+
+
+def test_type_map_audit_skipped_at_setup(tmp_path):
+    ws = make_workspace(tmp_path)
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], None, PLUGIN_ROOT)
+    assert c.status == "skipped" and "not applicable" in c.detail
+
+
+def test_type_map_audit_unverified_without_a_family(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], None, PLUGIN_ROOT)
+    assert c.status == "unverified" and "--source-family" in c.detail
+
+
+def test_type_map_audit_ok_fills_in_the_undeclared_count(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [
+        _field("ORDER_ID", "NUMBER(18,0)", "bigint"),
+        _field("AMOUNT", "NUMBER(12,2)", "decimal(12,2)"),
+        _field("CREATED_AT", "TIMESTAMP(6)", "timestamp_ntz"),
+        _field("NOTE", "VARCHAR2(200)", ""),
+    ])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "ok"
+    assert c.data["map"].endswith("oracle-plsql/canonicalization.json")
+    assert c.data["undeclared"] == 1 and c.data["fields"] == 4
+
+
+def test_type_map_audit_fails_on_a_forbidden_target_and_blocks_the_run(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [
+        _field("AMOUNT", "NUMBER(12,2)", "double"),
+        _field("CREATED_AT", "TIMESTAMP", "timestamptz"),
+    ])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail"
+    for needle in ("orders.AMOUNT", "double", "decimal(12,2)", "orders.CREATED_AT"):
+        assert needle in c.detail, needle
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_family="oracle")
+    assert "type_map_audit=fail" in report["blocking"] and report["ready"] is False
+
+
+def test_type_map_audit_warns_for_a_family_with_no_map(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "sqlserver", PLUGIN_ROOT)
+    assert c.status == "warn" and "sqlserver" in c.detail
+
+
+def test_type_map_audit_audits_against_the_declared_target_kind(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [
+        _field("CREATED_AT", "TIMESTAMP WITH TIME ZONE", "timestamp with time zone"),
+        _field("NOTE", "VARCHAR2(200)", "text"),
+    ])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT,
+                                    target_kind="lakebase")
+    assert c.status == "ok" and c.data["target_kind"] == "lakebase"
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and c.data["target_kind"] == "databricks"
+
+
+def test_type_map_audit_warns_when_the_family_maps_a_different_kind(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    payload = json.dumps({"family_known": True, "target_known": False, "map": None,
+                          "findings": [], "error": None})
+    monkeypatch.setattr(doctor.shutil, "which",
+                        lambda name: "/usr/bin/dbx-recon" if name == "dbx-recon" else None)
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, payload, ""))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "sqlserver", PLUGIN_ROOT,
+                                    target_kind="lakebase")
+    assert c.status == "warn" and "sqlserver->lakebase" in c.detail
+    assert c.data["harness"] == "dbx-recon"
+
+
+def test_type_map_audit_fails_when_the_harness_reports_an_error(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    payload = json.dumps({"family_known": True, "target_known": True, "map": None,
+                          "findings": [], "error": "ConfigError: multiple canonicalization "
+                          "files carry a type_map for oracle"})
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, payload, ""))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and "multiple canonicalization" in c.detail
+
+
+def test_type_map_audit_fails_on_malformed_harness_output(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, "not json", ""))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and "cannot audit" in c.detail
+
+
+def test_type_map_audit_asks_the_installed_harness_first(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    payload = json.dumps({"family_known": True, "target_known": True,
+                          "map": "/x/canonicalization.json",
+                          "findings": [{"field": "orders.ORDER_ID", "verdict": "ok",
+                                        "detail": "bigint", "source_type": "NUMBER(18,0)",
+                                        "target_type": "bigint"}], "error": None})
+    monkeypatch.setattr(doctor.shutil, "which",
+                        lambda name: "/usr/bin/dbx-recon" if name == "dbx-recon" else None)
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, payload, ""))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "ok" and c.data["harness"] == "dbx-recon" and c.data["fields"] == 1
+
 
 
 # ------------------------------------------------------------------ ledger integrity rows (A2c)
@@ -1945,6 +2454,38 @@ def test_hook_guard_functional_requires_the_probe_token_in_the_block_reason(tmp_
         assert c.status == "fail" and "__dbx_guard_probe__" in c.detail, reason
 
 
+def test_child_never_live_probes_the_platform_hook(tmp_path):
+    ws = make_workspace(tmp_path)
+    first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    nonce = by_id(first)["hook_guard"]["data"]["probe_nonce"]
+    _unit_mapping(ws, "loans", evidence=False)
+    report = doctor.run(ws, PLUGIN_ROOT, "child", f"blocked:{nonce}", None, True, units=["loans"])
+    sub = sub_by_id(report, "hook_guard")
+    assert sub["hook_platform_loaded"]["status"] == "warn"
+    assert "orchestrator-only" in sub["hook_platform_loaded"]["detail"]
+    assert not [b for b in report["blocking"] if b.startswith("hook_guard")]
+    # a workspace with no pending nonce stays without one: a child never mints or writes it
+    fresh = make_workspace(tmp_path / "fresh")
+    _unit_mapping(fresh, "loans", evidence=False)
+    doctor.run(fresh, PLUGIN_ROOT, "child", f"blocked:{nonce}", None, True, units=["loans"])
+    assert not (fresh / doctor.HOOK_PROBE_NONCE).exists()
+
+
+def test_child_inherits_platform_row_from_the_signed_record(tmp_path):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    reused = {"signed_at": "2026-01-01T00:00:00Z",
+              "checks": [{"id": "hook_guard", "status": "ok", "detail": "…",
+                          "data": {"sub_results": [{"id": "hook_platform_loaded", "status": "ok",
+                                                    "detail": "live probe was BLOCKED…",
+                                                    "data": {"probe_nonce": "deadbeef"}}]}}]}
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, True, units=["loans"], reused=reused)
+    sub = sub_by_id(report, "hook_guard")["hook_platform_loaded"]
+    assert sub["status"] == "ok"
+    assert sub["detail"].startswith("reused from the orchestrator's record signed 2026-01-01T00:00:00Z")
+    assert sub["data"]["reused_from"] == "2026-01-01T00:00:00Z"
+
+
 # ------------------------------------------------------------------ playbooks in sync
 
 PLAYBOOKS_DIR = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
@@ -1997,21 +2538,23 @@ def test_playbooks_in_sync_ok(tmp_path):
     assert "and the live export (0 min old)" in c.detail
 
 
-def test_playbooks_in_sync_fails_on_stale_missing_and_unknown(tmp_path):
+def test_orchestrator_playbook_drift_is_a_warning_not_a_blocker(tmp_path):
     ws = make_workspace(tmp_path, with_lock=False)
     _lock(ws, overrides={"!dbx_migrate_pipeline": "0" * 64})
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail"
+    assert c.status == "warn"
     assert "!dbx_migrate_pipeline" in c.detail and "install-dbx-factory" in c.detail
     assert c.data["stale"] == ["!dbx_migrate_pipeline"]
     ws = make_workspace(tmp_path / "missing", with_lock=False)
     _lock(ws, drop=("!dbx_migrate_oltp",))
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child")
-    assert c.status == "fail" and c.data["missing"] == ["!dbx_migrate_oltp"]
+    assert c.status == "warn" and c.data["missing"] == ["!dbx_migrate_oltp"]
     ws = make_workspace(tmp_path / "unknown", with_lock=False)
     _lock(ws, overrides={"!dbx_gone": "f" * 64})
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and c.data["unknown"] == ["!dbx_gone"]
+    assert c.status == "warn" and c.data["unknown"] == ["!dbx_gone"]
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
 
 
 def test_playbooks_in_sync_lock_missing_and_role(tmp_path):
@@ -2026,10 +2569,10 @@ def test_playbooks_in_sync_lock_missing_and_role(tmp_path):
     row = next(l for l in r.stdout.splitlines() if "playbooks_in_sync" in l)
     assert row.startswith("skipped"), r.stdout
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "install-dbx-factory" in c.detail
-    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child").status == "fail"
+    assert c.status == "warn" and "install-dbx-factory" in c.detail
+    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child").status == "warn"
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert "playbooks_in_sync=fail" in report["blocking"]
+    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
 
 
 def test_playbooks_in_sync_malformed_entry_fails_not_crashes(tmp_path):
@@ -2038,7 +2581,7 @@ def test_playbooks_in_sync_malformed_entry_fails_not_crashes(tmp_path):
     entries["!dbx_migration_plan"]["installed_at"] = 1
     (ws / doctor.PLAYBOOKS_LOCK).write_text(json.dumps(entries))
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and c.data["malformed"] == ["!dbx_migration_plan"]
+    assert c.status == "warn" and c.data["malformed"] == ["!dbx_migration_plan"]
     assert "malformed: !dbx_migration_plan" in c.detail and "install-dbx-factory" in c.detail
 
 
@@ -2050,7 +2593,7 @@ def test_playbooks_in_sync_unlisted_repo_file_is_a_finding(tmp_path, monkeypatch
         c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
     finally:
         stray.unlink()
-    assert c.status == "fail" and "15-unlisted.md" in c.detail and "index.json" in c.detail
+    assert c.status == "warn" and "15-unlisted.md" in c.detail and "index.json" in c.detail
 
 
 def test_playbooks_in_sync_ok_checks_the_live_export(tmp_path):
@@ -2064,9 +2607,9 @@ def test_playbooks_in_sync_orchestrator_needs_the_live_export(tmp_path):
     ws = make_workspace(tmp_path)
     (ws / doctor.LIVE_PLAYBOOKS).unlink()
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "live_playbooks.json" in c.detail
+    assert c.status == "warn" and "live_playbooks.json" in c.detail
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert "playbooks_in_sync=fail" in report["blocking"]
+    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child")
     assert c.status == "ok" and c.data["live"] is None
     assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "setup").status == "ok"
@@ -2076,17 +2619,17 @@ def test_playbooks_in_sync_stale_live_export_fails(tmp_path):
     ws = make_workspace(tmp_path)
     _live(ws, age_minutes=20)
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "stale export" in c.detail
+    assert c.status == "warn" and "stale export" in c.detail
     ws2 = make_workspace(tmp_path / "child")
     _live(ws2, age_minutes=20)
-    assert doctor.check_playbooks_in_sync(ws2, PLUGIN_ROOT, "child").status == "fail"
+    assert doctor.check_playbooks_in_sync(ws2, PLUGIN_ROOT, "child").status == "warn"
 
 
 def test_playbooks_in_sync_live_drift_fails(tmp_path):
     ws = make_workspace(tmp_path)
     _live(ws, overrides={"!dbx_migrate_pipeline": "# edited live\n"})
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "!dbx_migrate_pipeline" in c.detail
+    assert c.status == "warn" and "!dbx_migrate_pipeline" in c.detail
     assert c.data["live_stale"] == ["!dbx_migrate_pipeline"]
 
 
@@ -2094,7 +2637,7 @@ def test_playbooks_in_sync_duplicate_macro_fails(tmp_path):
     ws = make_workspace(tmp_path)
     _live(ws, duplicate="!dbx_migrate_etl")
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "!dbx_migrate_etl" in c.detail
+    assert c.status == "warn" and "!dbx_migrate_etl" in c.detail
     assert "playbook-dbx_migrate_etl" in c.detail and "playbook-extra-copy" in c.detail
     assert sorted(c.data["duplicate"]["!dbx_migrate_etl"]) == [
         "playbook-dbx_migrate_etl", "playbook-extra-copy"]
@@ -2104,17 +2647,17 @@ def test_playbooks_in_sync_live_missing_macro_fails(tmp_path):
     ws = make_workspace(tmp_path)
     _live(ws, drop=("!dbx_migrate_oltp",))
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and c.data["live_missing"] == ["!dbx_migrate_oltp"]
+    assert c.status == "warn" and c.data["live_missing"] == ["!dbx_migrate_oltp"]
 
 
 def test_playbooks_in_sync_malformed_live_export_fails_not_crashes(tmp_path):
     ws = make_workspace(tmp_path)
     (ws / doctor.LIVE_PLAYBOOKS).write_text('{"a": 1}')
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "malformed" in c.detail
+    assert c.status == "warn" and "malformed" in c.detail
     (ws / doctor.LIVE_PLAYBOOKS).write_text('[{"macro": "!dbx_migrate_etl", "content": 7}]')
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "malformed" in c.detail
+    assert c.status == "warn" and "malformed" in c.detail
 
 
 def test_playbooks_in_sync_trailing_newline_is_normalized(tmp_path):
@@ -2142,4 +2685,509 @@ def test_playbooks_in_sync_cli_live_playbooks_flag(tmp_path):
 def test_playbooks_in_sync_explicit_live_path_must_exist(tmp_path):
     ws = make_workspace(tmp_path)
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child", tmp_path / "nowhere.json")
-    assert c.status == "fail" and "nowhere.json" in c.detail
+    assert c.status == "warn" and "nowhere.json" in c.detail
+
+
+# ------------------------------------------------------------------ named_secrets_exist (WS2.6)
+
+def test_manifest_secret_names_collects_lists_and_brief_references():
+    manifest = {
+        "secrets": ["app/db-host"],
+        "batches": [
+            {"id": "b-1", "secrets": ["app/db-user"],
+             "brief": "read {{secrets/app/db-password}} then dbutils.secrets.get(scope=\"app\", key=\"db-token\")"},
+            {"id": "b-2",
+             "brief": "also secrets/warehouse/token and secrets.get(\"app\", \"db-host\")"},
+        ],
+    }
+    assert doctor.manifest_secret_names(manifest) == [
+        "app/db-host", "app/db-password", "app/db-token", "app/db-user", "warehouse/token"]
+
+
+def test_manifest_secret_names_parses_secrets_get_in_any_argument_order():
+    manifest = {"batches": [{"id": "b", "brief": (
+        'a = dbutils.secrets.get(key="password", scope="payments")\n'
+        'b = secrets.get("s", key="k")\n'
+        "c = dbutils.secrets.get(scope='app', key='db-token')\n"
+        'd = secrets.get("only")\n')}]}
+    assert doctor.manifest_secret_names(manifest) == ["app/db-token", "payments/password", "s/k"]
+
+
+@pytest.mark.parametrize("bad", ["a/b", 7, None, ["ok/k", 3]])
+def test_manifest_secret_names_rejects_a_non_list_of_strings(bad):
+    with pytest.raises(SystemExit, match="must be a list of scope/key strings"):
+        doctor.manifest_secret_names({"secrets": bad, "batches": []})
+    with pytest.raises(SystemExit, match="must be a list of scope/key strings"):
+        doctor.manifest_secret_names({"batches": [{"id": "b", "secrets": bad}]})
+
+
+def test_wave_manifest_with_bad_secrets_shape_exits_cleanly(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({
+        "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
+        "source": {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
+        "secrets": "app/db-user",
+    }))
+    result = subprocess.run(
+        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+         "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    assert "must be a list of scope/key strings" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not manifest.with_suffix(".doctor.json").exists()
+
+
+def test_manifest_secret_names_ignores_other_text():
+    manifest = {"batches": [{"id": "b-1", "brief": "no secrets here, just secrets talk"}]}
+    assert doctor.manifest_secret_names(manifest) == []
+
+
+def test_check_named_secrets_skipped_without_names():
+    c = doctor.check_named_secrets([])
+    assert c.status == "skipped" and "no Databricks secret names" in c.detail
+    assert c.data == {"checked": [], "missing": [], "unreadable_scopes": []}
+
+
+def test_check_named_secrets_fails_on_missing_key():
+    values = {"app": {"db-user": "s3cr3t-value"}}  # keys the stub returns; values never seen
+    c = doctor.check_named_secrets(["app/db-user", "app/db-password"],
+                                   lambda scope: list(values.get(scope, {})))
+    assert c.status == "fail"
+    assert "STOP C" in c.detail and "app/db-password" in c.detail
+    assert c.data["missing"] == ["app/db-password"]
+    assert c.data["checked"] == ["app/db-user", "app/db-password"]
+    assert "s3cr3t-value" not in json.dumps(asdict(c))
+
+
+def test_check_named_secrets_fails_on_unreadable_scope():
+    c = doctor.check_named_secrets(["hidden/key", "app/ok"],
+                                   lambda scope: None if scope == "hidden" else ["ok"])
+    assert c.status == "fail"
+    assert "scope hidden" in c.detail and "list-secrets" in c.detail
+    assert c.data["unreadable_scopes"] == ["hidden"]
+    assert "hidden/key" in c.data["missing"]
+
+
+def test_check_named_secrets_fails_on_malformed_name():
+    c = doctor.check_named_secrets(["nokey", "app/db-user"], lambda scope: ["db-user"])
+    assert c.status == "fail" and "not a scope/key secret name" in c.detail and "nokey" in c.detail
+
+
+def test_check_named_secrets_ok_when_all_present():
+    calls = []
+
+    def ls(scope):
+        calls.append(scope)
+        return {"app": ["db-user", "db-password"], "wh": ["token"]}[scope]
+
+    c = doctor.check_named_secrets(["app/db-user", "wh/token", "app/db-password"], ls)
+    assert c.status == "ok"
+    assert "3 named secret(s) exist in 2 scope(s)" in c.detail
+    assert sorted(calls) == ["app", "wh"]
+    assert c.data["missing"] == [] and c.data["unreadable_scopes"] == []
+
+
+def test_list_secrets_parses_key_rows(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+    seen = []
+
+    def fake_run(cmd, timeout=0):
+        seen.append(cmd)
+        return (0, '[{"key": "db-user", "last_updated_timestamp": 1}, {"key": "db-password"}]', "")
+
+    monkeypatch.setattr(doctor, "_run", fake_run)
+    assert doctor._list_secrets("app") == ["db-user", "db-password"]
+    assert seen[0][1:] == ["secrets", "list-secrets", "app", "--output", "json"]
+
+
+def test_list_secrets_accepts_the_wrapped_shape(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+    monkeypatch.setattr(doctor, "_run",
+                        lambda cmd, **kw: (0, '{"secrets": [{"key": "k"}]}', ""))
+    assert doctor._list_secrets("app") == ["k"]
+
+
+def test_list_secrets_none_without_cli_on_error_or_on_non_json(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+    assert doctor._list_secrets("app") is None
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (1, "", "denied"))
+    assert doctor._list_secrets("app") is None
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, "not json", ""))
+    assert doctor._list_secrets("app") is None
+
+
+def test_run_named_secrets_skipped_offline_and_never_blocking(tmp_path):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        secret_names=["app/db-user"])
+    row = by_id(report)["named_secrets_exist"]
+    assert row["status"] == "skipped" and row["detail"] == "--no-databricks"
+    assert not [b for b in report["blocking"] if b.startswith("named_secrets_exist")]
+
+
+def test_run_named_secrets_fail_is_blocking(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1"}),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, False,
+                        secret_names=["app/db-user"], list_secrets=lambda scope: [])
+    row = by_id(report)["named_secrets_exist"]
+    assert row["status"] == "fail" and "named_secrets_exist=fail" in report["blocking"]
+
+
+def test_wave_manifest_secrets_reach_the_report(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({
+        "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
+        "source": {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
+        "secrets": ["app/db-user"],
+        "batches": [{"id": "b-1", "secrets": ["app/db-password"],
+                     "brief": "uses {{secrets/wh/token}} too"}],
+    }))
+    result = subprocess.run(
+        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+         "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+        capture_output=True, text=True, check=False,
+    )
+    record = json.loads(manifest.with_suffix(".doctor.json").read_text())
+    row = next(c for c in record["checks"] if c["id"] == "named_secrets_exist")
+    assert row["status"] == "skipped" and row["detail"] == "--no-databricks"
+
+
+def test_secret_flag_passes_names_to_the_check(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1"}),
+    ])
+    seen = {}
+
+    def stub(names, ls=None):
+        seen["names"] = list(names)
+        return doctor.Check("named_secrets_exist", "ok", "captured")
+
+    monkeypatch.setattr(doctor, "check_named_secrets", stub)
+    doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT),
+                 "--secret", "app/db-user", "--secret", "wh/token", "--out", "-"])
+    assert seen["names"] == ["app/db-user", "wh/token"]
+
+
+# --------------------------------------------------------- reused wave records (WS4.1)
+
+def _signed_record(manifest, *, identity="sp-1", host="https://adb-1", rows=None, **overrides):
+    """An orchestrator's wave-<N>.doctor.json: sign_wave_report over a ready report whose checks
+    carry one row per reusable id, against manifest_bytes of this exact manifest."""
+    manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
+    rows = rows if rows is not None else [
+        {"id": rid, "status": "ok", "detail": f"{rid} done", "data": {"k": rid}}
+        for rid in doctor.REUSABLE_ROWS]
+    report = {"schema": "dbx-migration-factory/capabilities/1", "role": "orchestrator",
+              "ready": True, "identity": {"userName": identity, "host": host}, "inputs_sha": "inputs-a",
+              "checks": rows, "summary": {}, "blocking": [], **overrides}
+    return doctor.sign_wave_report(report, manifest_bytes,
+                                  signed_at=overrides.pop("signed_at", None)), manifest_bytes
+
+
+def test_reusable_record_accepts_a_fresh_signed_orchestrator_record():
+    manifest = {"wave": 1}
+    record, manifest_bytes = _signed_record(manifest)
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "SP-1", "https://adb-1")
+    assert got is record and why == ""
+
+
+def test_reusable_record_rejects_a_record_older_than_doctor_max_age():
+    manifest = {"wave": 1}
+    record, manifest_bytes = _signed_record(
+        manifest, signed_at="2020-01-01T00:00:00+00:00")
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert got is None and "age" in why
+
+    manifest5 = {"wave": 1, "doctor_max_age": 5}
+    recent = (doctor.datetime.datetime.now(doctor.datetime.timezone.utc)
+              - doctor.datetime.timedelta(minutes=10)).isoformat()
+    record, manifest_bytes = _signed_record(manifest5, signed_at=recent)
+    got, why = doctor.reusable_record(record, manifest5, manifest_bytes, "sp-1", "https://adb-1")
+    assert got is None and "age" in why
+    record, manifest_bytes = _signed_record({"wave": 1}, signed_at=recent)
+    got, why = doctor.reusable_record(record, {"wave": 1}, manifest_bytes, "sp-1", "https://adb-1")
+    assert got is record
+
+
+def test_reusable_record_binds_the_manifest_bytes_and_the_signature():
+    manifest = {"wave": 1}
+    record, manifest_bytes = _signed_record(manifest)
+    got, why = doctor.reusable_record(record, {"wave": 2}, b'{"wave": 2}',
+                                      "sp-1", "https://adb-1")
+    assert got is None and "manifest" in why
+    tampered = json.loads(json.dumps(record))
+    tampered["checks"][0]["detail"] = "edited"
+    got, why = doctor.reusable_record(tampered, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert got is None and "signature" in why
+
+
+def test_reusable_record_requires_the_expected_identity_and_host():
+    manifest = {"wave": 1}
+    record, manifest_bytes = _signed_record(manifest)
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "other", "https://adb-1")
+    assert got is None and "identity" in why
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-2")
+    assert got is None and "host" in why
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, None, None)
+    assert got is None
+
+
+def test_reusable_record_rejects_non_orchestrator_not_ready_and_malformed():
+    manifest = {"wave": 1}
+    record, manifest_bytes = _signed_record(manifest, role="child")
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert got is None
+    record, manifest_bytes = _signed_record(manifest, ready=False)
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert got is None
+    for bad in (None, "x", {"role": "orchestrator"}, {"role": "orchestrator", "ready": True}):
+        got, why = doctor.reusable_record(bad, manifest, manifest_bytes, "sp-1", "https://adb-1")
+        assert got is None and why, bad
+    record, manifest_bytes = _signed_record(manifest, signed_at="not-a-date")
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert got is None
+    future = (doctor.datetime.datetime.now(doctor.datetime.timezone.utc)
+              + doctor.datetime.timedelta(minutes=1)).isoformat()
+    record, manifest_bytes = _signed_record(manifest, signed_at=future)
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert got is None
+
+
+SAFETY_ROWS = ("source_principal_read_only", "named_secrets_exist", "recon_family_supported")
+LOCAL_ROWS = ("recon_harness",)
+
+
+def test_reusable_rows_are_the_non_safety_checkout_bound_ones():
+    """Reuse is policy, not the signature: a record any manifest reader could forge may only stand in
+    for rows that read the checkout and the source (type map, dictionary, delete evidence); the rows
+    that guard the source and the secrets always run in the child, and so does recon_harness, whose
+    driver imports describe the orchestrator's machine, not the child's."""
+    assert set(doctor.REUSABLE_ROWS) == {"type_map_audit", "delete_evidence", "dictionary_readable"}
+    assert not set(doctor.REUSABLE_ROWS) & set(SAFETY_ROWS + LOCAL_ROWS)
+
+
+def test_run_reuses_the_signed_source_side_rows_and_keeps_identity_fresh(tmp_path, monkeypatch):
+    manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1"}}
+    rows = [{"id": rid, "status": "ok", "detail": f"{rid} done",
+             "data": {"k": rid, "target_kind": "databricks"}}
+            for rid in (*doctor.REUSABLE_ROWS, *SAFETY_ROWS, *LOCAL_ROWS)]
+    record, manifest_bytes = _signed_record(manifest, rows=rows)
+    reused, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert reused is record
+
+    def boom(*a, **k):
+        raise AssertionError("computed a reusable row")
+
+    for name in ("check_type_map_audit", "check_delete_evidence_all", "check_dictionary_readable_all"):
+        monkeypatch.setattr(doctor, name, boom)
+    for name, rid in (("check_recon_family_supported", "recon_family_supported"),
+                      ("check_source_principal_all", "source_principal_read_only"),
+                      ("check_named_secrets", "named_secrets_exist"),
+                      ("check_harness", "recon_harness"),
+                      ("check_drivers", "recon_drivers")):
+        monkeypatch.setattr(doctor, name, lambda *a, _rid=rid, **k: doctor.Check(_rid, "ok", "fresh"))
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1",
+                                                          "host": "https://adb-1"})])
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "child", "blocked", "sp-1", False,
+                        expect_host="https://adb-1", reused=reused)
+    rows = by_id(report)
+    for rid in doctor.REUSABLE_ROWS:
+        assert rows[rid]["status"] == "ok", rid
+        assert rows[rid]["detail"].startswith("reused from the orchestrator's record signed"), rid
+        assert rows[rid]["data"]["reused_from"] == reused["signed_at"]
+        assert rows[rid]["reusable"] is True
+    for rid in SAFETY_ROWS:
+        assert rows[rid]["detail"] == "fresh" and rows[rid]["reusable"] is False, rid
+    assert rows["recon_harness"]["reusable"] is False
+    assert "reused from" not in rows["recon_harness"]["detail"]
+    assert rows["databricks_identity"]["reusable"] is False
+    assert report["reused_doctor"] == reused["signed_at"]
+    assert "reused from" not in rows["databricks_identity"]["detail"]
+
+
+def test_run_recomputes_type_map_audit_when_the_recorded_target_kind_differs(tmp_path, monkeypatch):
+    """Type maps are keyed by source family and target kind: a Lakebase child must not stand on the
+    orchestrator's Databricks audit, and a recorded row that names no target kind proves nothing."""
+    manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1"}}
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1",
+                                                          "host": "https://adb-1"})])
+    monkeypatch.setattr(doctor, "check_type_map_audit",
+                        lambda *a, target_kind="databricks", **k:
+                        doctor.Check("type_map_audit", "ok", "fresh", {"target_kind": target_kind}))
+    ws = make_workspace(tmp_path)
+    for recorded, child in (("databricks", "lakebase"), (None, "databricks")):
+        data = {"k": "x"} if recorded is None else {"k": "x", "target_kind": recorded}
+        rows = [{"id": "type_map_audit", "status": "ok", "detail": "audited", "data": data}]
+        record, manifest_bytes = _signed_record(manifest, rows=rows)
+        reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+        assert reused is record
+        report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True,
+                            expect_host="https://adb-1", target_kind=child, reused=reused)
+        row = by_id(report)["type_map_audit"]
+        assert row["detail"] == "fresh" and row["data"]["target_kind"] == child, (recorded, child)
+    rows = [{"id": "type_map_audit", "status": "ok", "detail": "audited",
+             "data": {"target_kind": "lakebase"}}]
+    record, manifest_bytes = _signed_record(manifest, rows=rows)
+    reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True,
+                        expect_host="https://adb-1", target_kind="lakebase", reused=reused)
+    assert by_id(report)["type_map_audit"]["detail"].startswith("reused from")
+
+
+def test_run_computes_a_reusable_row_the_record_lacks(tmp_path, monkeypatch):
+    manifest = {"wave": 1}
+    rows = [r for r in _signed_record(manifest)[0]["checks"] if r["id"] != "dictionary_readable"]
+    record, manifest_bytes = _signed_record(manifest, rows=rows)
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1",
+                                                          "host": "https://adb-1"})])
+    monkeypatch.setattr(doctor, "check_dictionary_readable_all",
+                        lambda *a, **k: doctor.Check("dictionary_readable", "unverified", "fresh"))
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "child", "blocked", "sp-1", False,
+                        expect_host="https://adb-1", reused=record)
+    assert by_id(report)["dictionary_readable"]["detail"] == "fresh"
+
+
+def _reuse_ws(tmp_path, manifest=None, **record_overrides):
+    ws = make_workspace(tmp_path)
+    waves = ws / ".migration" / "waves"
+    waves.mkdir(exist_ok=True)
+    manifest = manifest or {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1",
+                                                        "catalogs": ["mig_cat"]}}
+    manifest_path = waves / "wave-1.json"
+    record_overrides.setdefault("inputs_sha", doctor.inputs_sha(ws))
+    record, manifest_bytes = _signed_record(manifest, **record_overrides)
+    manifest_path.write_bytes(manifest_bytes)
+    record_path = waves / "wave-1.doctor.json"
+    record_path.write_text(json.dumps(record))
+    return ws, manifest_path, record_path
+
+
+def test_reuse_record_rejects_bad_flag_combinations(tmp_path):
+    ws, manifest_path, record_path = _reuse_ws(tmp_path)
+    base = [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--role", "child",
+            "--reuse-record", str(record_path), "--expect-identity", "sp-1", "--out", "-"]
+    for extra in (["--wave", str(manifest_path)], ["--role", "orchestrator"], ["--no-databricks"]):
+        r = subprocess.run(base + extra, capture_output=True, text=True, check=False)
+        assert r.returncode == 2, (extra, r.stderr)
+    r = subprocess.run(base[:-4] + base[-2:], capture_output=True, text=True, check=False)
+    assert r.returncode == 2 and "--expect-identity" in r.stderr
+
+
+def test_reuse_record_reuses_rows_and_reports_it(tmp_path):
+    ws, manifest_path, record_path = _reuse_ws(tmp_path)
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
+                        "--role", "child", "--reuse-record", str(record_path), "--expect-identity", "sp-1",
+                        "--expect-host", "https://adb-1", "--out", "-"],
+                       capture_output=True, text=True, check=False)
+    assert "doctor_record" in r.stdout and "reused" in r.stdout
+    assert "reused from the orchestrator's record" in r.stdout
+    out = tmp_path / "caps.json"
+    subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
+                    "--role", "child", "--reuse-record", str(record_path), "--expect-identity", "sp-1",
+                    "--expect-host", "https://adb-1", "--out", str(out)],
+                   capture_output=True, text=True, check=False)
+    rows = json.loads(out.read_text())["checks"]
+    assert all(isinstance(c.get("reusable"), bool) for c in rows)
+    assert next(c for c in rows if c["id"] == "doctor_record")["reusable"] is False
+
+
+def test_reuse_record_falls_back_to_a_full_run_when_not_reusable(tmp_path):
+    ws, manifest_path, record_path = _reuse_ws(tmp_path, signed_at="2020-01-01T00:00:00+00:00")
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
+                        "--role", "child", "--reuse-record", str(record_path), "--expect-identity", "sp-1",
+                        "--expect-host", "https://adb-1", "--out", "-"],
+                       capture_output=True, text=True, check=False)
+    assert "doctor record not reused:" in r.stderr
+    assert "reused from the orchestrator's record" not in r.stdout
+
+
+def test_reusable_record_requires_the_checkouts_inputs_to_match():
+    """The record binds the inputs its source-side rows were computed from; a child whose
+    .migration/units or top-level .migration/*.json differ runs in full."""
+    manifest = {"wave": 1}
+    record, manifest_bytes = _signed_record(manifest)
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1",
+                                      inputs_sha="inputs-a")
+    assert got is record and why == ""
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1",
+                                      inputs_sha="inputs-b")
+    assert got is None and "inputs" in why
+    record, manifest_bytes = _signed_record(manifest, inputs_sha=None)
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1",
+                                      inputs_sha="inputs-a")
+    assert got is None and "inputs_sha" in why
+
+
+def test_inputs_sha_follows_unit_mappings_and_migration_json_not_the_doctors_own_output(tmp_path):
+    ws = make_workspace(tmp_path)
+    before = doctor.inputs_sha(ws)
+    (ws / ".migration" / "09_capabilities.json").write_text("{}")
+    assert doctor.inputs_sha(ws) == before
+    unit = ws / ".migration" / "units" / "u1"
+    unit.mkdir(parents=True)
+    (unit / "mapping_spec.json").write_text('{"target_type": "STRING"}')
+    changed = doctor.inputs_sha(ws)
+    assert changed != before
+    (unit / "mapping_spec.json").write_text('{"target_type": "DOUBLE"}')
+    assert doctor.inputs_sha(ws) not in (before, changed)
+    (ws / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["other"]}')
+    assert doctor.inputs_sha(ws) not in (before, changed)
+
+
+def test_orchestrator_wave_record_carries_the_inputs_sha(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"capabilities": {"identity": "sp-1", "host": "https://h",
+                                                      "catalogs": ["mig_cat"]}}))
+    subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+                    "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+                   capture_output=True, text=True, check=False)
+    record = json.loads(manifest.with_suffix(".doctor.json").read_text())
+    assert record["inputs_sha"] == doctor.inputs_sha(ws)
+    assert record["signature"] == doctor.wave_signature(record, manifest.read_bytes())
+
+
+def test_reuse_record_falls_back_to_a_full_run_when_the_checkout_inputs_differ(tmp_path):
+    ws, manifest_path, record_path = _reuse_ws(tmp_path)
+    unit = ws / ".migration" / "units" / "u1"
+    unit.mkdir(parents=True)
+    (unit / "mapping_spec.json").write_text('{"target_type": "STRING"}')
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
+                        "--role", "child", "--reuse-record", str(record_path), "--expect-identity", "sp-1",
+                        "--expect-host", "https://adb-1", "--out", "-"],
+                       capture_output=True, text=True, check=False)
+    assert "doctor record not reused:" in r.stderr and "inputs" in r.stderr
+    assert "reused from the orchestrator's record" not in r.stdout
+
+
+def test_reuse_record_accepts_the_manifests_own_source_flags(tmp_path):
+    """The child brief names --source-family/--source-secret/--param from the manifest; the same
+    values beside --reuse-record are fine, different ones are the error."""
+    manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1", "catalogs": ["mig_cat"]},
+                "source": {"family": "oracle", "secret": "LEGACY_DSN", "params": {"db": "loans"}}}
+    ws, manifest_path, record_path = _reuse_ws(tmp_path, manifest=manifest)
+    base = [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--role", "child",
+            "--reuse-record", str(record_path), "--expect-identity", "sp-1", "--expect-host", "https://adb-1",
+            "--out", "-"]
+    r = subprocess.run(base + ["--source-family", "oracle", "--source-secret", "LEGACY_DSN", "--param", "db=loans"],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode != 2, r.stderr
+    assert "reused from the orchestrator's record" in r.stdout
+    for extra in (["--source-family", "sqlserver"], ["--source-secret", "OTHER"], ["--param", "db=cards"]):
+        r = subprocess.run(base + extra, capture_output=True, text=True, check=False)
+        assert r.returncode == 2 and "manifest" in r.stderr, (extra, r.stderr)

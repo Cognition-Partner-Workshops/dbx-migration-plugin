@@ -1,0 +1,72 @@
+{
+  "family": "databricks",
+  "note": "Example Unity Catalog shape for --target-dictionary. UC exposes no indexes, so that category stays unsupported; triggers are provably absent on Delta (an empty dictionary, not a hole), constraints are informational, and identity columns come from the SHOW CREATE TABLE DDL.",
+  "unsupported": [
+    "indexes"
+  ],
+  "tables": {
+    "loans": {
+      "unique": [
+        [
+          "loan_number"
+        ]
+      ],
+      "not_null": [
+        "loan_id",
+        "loan_number",
+        "borrower_id"
+      ],
+      "checks": [
+        "current_balance >= 0"
+      ],
+      "identity_columns": [
+        "loan_id"
+      ],
+      "identity_state": {
+        "loan_id": {
+          "next": 1001,
+          "increment": 1
+        }
+      },
+      "grants": {
+        "migration_svc": [
+          "select",
+          "modify"
+        ]
+      },
+      "foreign_keys_informational": [
+        {
+          "columns": [
+            "borrower_id"
+          ],
+          "references": "borrowers",
+          "referenced_columns": [
+            "borrower_id"
+          ],
+          "on_update": "no action",
+          "on_delete": "no action"
+        }
+      ],
+      "primary_key_informational": [
+        "loan_id"
+      ]
+    },
+    "borrowers": {
+      "not_null": [
+        "borrower_id"
+      ],
+      "identity_columns": [
+        "borrower_id"
+      ],
+      "identity_state": {
+        "borrower_id": {
+          "next": 500,
+          "increment": 1
+        }
+      },
+      "primary_key_informational": [
+        "borrower_id"
+      ]
+    }
+  }
+}

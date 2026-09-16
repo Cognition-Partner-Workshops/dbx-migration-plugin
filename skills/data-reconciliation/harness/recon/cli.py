@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import decimal
 import json
+import os
 import re
 import sys
 import uuid as uuid_mod
@@ -30,6 +31,9 @@ from .config import (
 )
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
+from .fixture_shape import compare_fixture
+from .rerun import check_proof, grade_rerun, load_prior, load_record, source_digest
+from .typemap import apply_type_map, load_type_map
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres")
 # databricks: Delta under Unity Catalog (analytical track). lakebase: a schema in a Lakebase
@@ -135,11 +139,36 @@ def selftest() -> int:
     return 0
 
 
+def _load_spec(mapping, canonicalization, family, target_kind, params):
+    """Mapping spec with the family's type map applied for the given target kind — the same
+    shape `run` reconciles, so `estimate` counts the statements the run will issue."""
+    spec = load_mapping_spec(mapping, params)
+    type_map = None
+    if canonicalization and family:
+        try:
+            tm = load_type_map(canonicalization, family, target_kind)
+            if tm:
+                spec, type_map = apply_type_map(tm, spec)
+        except ConfigError as exc:
+            raise SystemExit(f"type map: {exc}") from None
+    return spec, type_map
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="dbx-recon")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="verify the harness install (no connections needed)")
     sub.add_parser("families", help="print the live-tested vs refused source families as JSON")
+    d = sub.add_parser("dictionary-objects", help="print the catalog objects a family's "
+                       "dictionary readers probe as JSON (doctor's dictionary_readable table)")
+    d.add_argument("--family", required=True)
+    t = sub.add_parser("type-map-audit", help="audit a spec's declared target types against the "
+                       "family type_map (JSON, no connections)")
+    t.add_argument("--spec", required=True, type=Path)
+    t.add_argument("--family", required=True)
+    t.add_argument("--target-kind", default="databricks", choices=TARGET_KINDS)
+    t.add_argument("--canonicalization", action="append", type=Path, default=[])
+    t.add_argument("--param", action="append", default=[])
     e = sub.add_parser("estimate", help="statements/rows a run would cost (no connections); "
                                         "summed per wave for the STOP C cost line")
     e.add_argument("--mapping", required=True, type=Path)
@@ -151,7 +180,67 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--ops-count", type=int, default=0, help="number of Tier 4 recorded ops")
     e.add_argument("--mode", choices=MODES, default="live",
                    help="transactional adds the window, PK-set and schema-parity statements")
+    e.add_argument("--family", choices=SOURCE_FAMILIES,
+                   help="source engine; with --canonicalization its type_map is applied so the "
+                        "estimate counts the statements the run will actually issue")
+    e.add_argument("--canonicalization", type=Path,
+                   help="the source-dialect skill's canonicalization.json (optional; fills "
+                        "undeclared target types like `run` does)")
+    e.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
     e.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
+    rp = sub.add_parser("routine-parity", help="grade committed runs of writing routines against "
+                        "their golden sets (no connections); exit 0 all proven, 2 some unproven, 1 any failed")
+    rp.add_argument("--dependencies", required=True, type=Path,
+                    help="the unit's dependencies.json ({routines: [{routine, writes, ...}]})")
+    rp.add_argument("--runs", required=True, type=Path,
+                    help="a *.run.json file or a directory of them, one committed run per routine")
+    rp.add_argument("--repo", type=Path, default=Path("."),
+                    help="the repository whose committed tree must hold each run's evidence and "
+                         "fixture snapshot (default: the current directory)")
+    rp.add_argument("--out", required=True, type=Path)
+    fs = sub.add_parser("fixture-shape", help="wave 0: compare the fixture copy's column shape "
+                        "and sample cardinality with the real source (read-only, capped); "
+                        "writes <out>/fixture_shape.json")
+    fs.add_argument("--family", required=True, choices=SOURCE_FAMILIES)
+    fs.add_argument("--mapping", required=True, type=Path)
+    fs.add_argument("--source-dsn-secret", required=True,
+                    help="ENV VAR NAME holding the real source connection (read-only principal)")
+    fs.add_argument("--fixture-dsn-secret", required=True,
+                    help="ENV VAR NAME holding the fixture copy's connection (same engine)")
+    fs.add_argument("--source-statement-cap", required=True, type=int,
+                    help="most statements this check may issue against the real source; the "
+                         "wave's legacy-query cap share for wave 0")
+    fs.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
+    fs.add_argument("--out", required=True, type=Path)
+    rp = sub.add_parser("rerun-proof", help="grade the schema-evolution rerun proof from the "
+                        "child's two run records (no connections); writes <out>/rerun_proof.json")
+    rp.add_argument("--unit", required=True)
+    rp.add_argument("--source", action="append", default=[], type=Path,
+                    help="a source file of the job under proof (DDL, notebook, SQL); repeatable; the "
+                         "proof digests them so any later edit makes it stale")
+    rp.add_argument("--ddl", type=Path,
+                    help="optional DDL hint: tables it creates that the fresh run did not record are notes")
+    rp.add_argument("--prior-proof", type=Path,
+                    help="the previously committed rerun_proof.json; its observed shape is what the "
+                         "evolved run's pre_shape must equal")
+    rp.add_argument("--prior-shape", type=Path,
+                    help="shape JSON instead of --prior-proof (first run: the manifest-declared old shape)")
+    rp.add_argument("--fresh", required=True, type=Path,
+                    help="run record from the fresh-target run (dbx-recon shape after the job)")
+    rp.add_argument("--evolved", type=Path,
+                    help="run record from the run against the table pre-created in its previous "
+                         "committed shape, with pre_shape read before the job; omitted = unsupported")
+    rp.add_argument("--out", required=True, type=Path)
+    sh = sub.add_parser("shape", help="read the observed column shape of target tables into a "
+                        "shape JSON (read-only; the rerun proof's record input)")
+    sh.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
+    sh.add_argument("--target-secret", required=True)
+    sh.add_argument("--target-catalog", required=True)
+    sh.add_argument("--allowed-targets-file", type=Path,
+                    default=Path(".migration/allowed_targets.json"))
+    sh.add_argument("--target-schema", required=True)
+    sh.add_argument("--table", action="append", required=True)
+    sh.add_argument("--out", required=True, type=Path)
     r = sub.add_parser("run", help="run the recon gate for one unit")
     r.add_argument("--unit", required=True)
     r.add_argument("--family", required=True, choices=SOURCE_FAMILIES)
@@ -176,6 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--target-schema", required=True)
     r.add_argument("--ops", type=Path, help="recorded representative queries for Tier 4")
     r.add_argument("--snapshot-manifest", type=Path)
+    r.add_argument("--source-dictionary", type=Path,
+                   help="fixture dictionary JSON (harness/fixtures/example_<family>/dictionary.json): "
+                        "structural facts read from the file, not the live catalog; never merge-eligible")
+    r.add_argument("--target-dictionary", type=Path,
+                   help="same, for the target side")
     r.add_argument("--seed", type=int, default=0,
                    help="sampling seed (recorded in result.json for re-runnability)")
     r.add_argument("--depth", choices=DEPTHS, default="threshold",
@@ -184,8 +278,39 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="resolve a ${name} placeholder in the mapping spec's where clauses "
                         "(e.g. partition/date scoping); repeatable; recorded in result.json")
+    r.add_argument("--routine-parity", type=Path,
+                   help="routine_parity.json from `routine-parity`; carried into result.json, a "
+                        "failed routine blocks merge (routine_gap); needs --routine-dependencies")
+    r.add_argument("--routine-dependencies", type=Path,
+                   help="the unit's dependencies.json (default .migration/units/<unit>/dependencies.json); "
+                        "every writing routine it lists must have a routine_parity row, otherwise it is "
+                        "carried as unproven; no analysis at all blocks merge (routine_parity_missing)")
+    r.add_argument("--rerun-proof", type=Path,
+                   help="rerun_proof.json from `dbx-recon rerun-proof`; a failed leg blocks merge "
+                        "with reason rerun_gap; an unsupported evolved leg with rerun_unsupported")
+    r.add_argument("--rerun-source", action="append", default=[], type=Path,
+                   help="with --rerun-proof: the job's source files as committed now (the same set "
+                        "rerun-proof was given); a proof of other files is stale and refused")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
+
+    if args.cmd == "routine-parity":
+        from .routines import git_committed, grade_routines, load_runs
+        try:
+            deps = json.loads(args.dependencies.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot read {args.dependencies}: {exc}") from None
+        try:
+            out = grade_routines(deps, load_runs(args.runs, args.repo), git_committed(args.repo))
+        except ConfigError as exc:
+            raise SystemExit(f"routine-parity: {exc}") from None
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "routine_parity.json").write_text(json.dumps(out, indent=2) + "\n")
+        parity = out["routine_parity"]
+        counts = {s: sum(1 for r in parity if r["status"] == s) for s in ("proven", "unproven", "failed")}
+        print(f"dbx-recon routine-parity: {counts['proven']} proven, {counts['unproven']} unproven, "
+              f"{counts['failed']} failed -> {args.out}/routine_parity.json")
+        return 1 if counts["failed"] else 2 if counts["unproven"] else 0
 
     if args.cmd == "selftest":
         return selftest()
@@ -198,6 +323,97 @@ def main(argv: list[str] | None = None) -> int:
         }))
         return 0
 
+    if args.cmd == "dictionary-objects":
+        from .adapters import DICTIONARY_OBJECTS
+        print(json.dumps({
+            "family": args.family,
+            "family_known": args.family in DICTIONARY_OBJECTS,
+            "objects": [list(x) for x in DICTIONARY_OBJECTS.get(args.family, ())],
+        }))
+        return 0
+
+    if args.cmd == "type-map-audit":
+        from .typemap import audit_spec, load_type_map, type_map_families, type_map_targets
+        out = {"family_known": False, "target_known": False, "map": None,
+               "findings": [], "error": None}
+        try:
+            maps = []
+            for c in args.canonicalization:
+                if args.family in type_map_families(c):
+                    out["family_known"] = True
+                    if args.target_kind in type_map_targets(c, args.family):
+                        out["target_known"] = True
+                tm = load_type_map(c, args.family, args.target_kind)
+                if tm:
+                    maps.append((c, tm))
+            if len(maps) > 1:
+                out["error"] = (f"multiple canonicalization files carry a type_map for "
+                                f"{args.family}")
+            elif maps:
+                out["map"] = str(maps[0][0])
+                spec = load_mapping_spec(args.spec, parse_params(args.param))
+                for row in audit_spec(maps[0][1], spec):
+                    out["findings"].append({"field": f"{row['object']}.{row['source']}",
+                                            "verdict": row["status"], "detail": row["expected"],
+                                            "source_type": row["source_type"],
+                                            "target_type": row["target_type"]})
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+        print(json.dumps(out))
+        return 0
+
+    if args.cmd == "fixture-shape":
+        from .adapters import SOURCE_ADAPTERS, is_untested_source_family
+        if is_untested_source_family(args.family):
+            raise SystemExit(f"--family {args.family}: {args.family} source adapter is untested; "
+                             "see SKILL.md")
+        if args.source_statement_cap < 1:
+            raise SystemExit("--source-statement-cap must be at least 1")
+        src_secret, fix_secret = args.source_dsn_secret, args.fixture_dsn_secret
+        if src_secret == fix_secret or (os.environ.get(src_secret) is not None
+                                        and os.environ.get(src_secret) == os.environ.get(fix_secret)):
+            raise SystemExit(f"fixture-shape: --source-dsn-secret {src_secret} and --fixture-dsn-secret "
+                             f"{fix_secret} resolve to the same connection; the fixture copy must live "
+                             "apart from the legacy source")
+        spec = load_mapping_spec(args.mapping, parse_params(args.param))
+        source = SOURCE_ADAPTERS[args.family](src_secret)
+        fixture = SOURCE_ADAPTERS[args.family](fix_secret)
+        try:
+            check = compare_fixture(spec, source, fixture, args.source_statement_cap)
+        except ConfigError as exc:
+            raise SystemExit(f"fixture-shape: {exc}") from None
+        check = {"family": args.family, "mapping_version": spec.version,
+                 "source_statement_cap": args.source_statement_cap, **check}
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "fixture_shape.json").write_text(json.dumps(check, indent=2) + "\n")
+        print(f"dbx-recon fixture-shape {check['status']}: {len(check['findings'])} finding(s), "
+              f"{check['source_statements']}/{args.source_statement_cap} source statements "
+              f"-> {args.out}/fixture_shape.json")
+        return 0 if check["status"] == "pass" else 1
+
+    if args.cmd == "rerun-proof":
+        if not args.source:
+            raise SystemExit("rerun-proof needs --source <file> (the job's DDL, notebook or SQL; repeatable)")
+        if args.prior_proof is not None and args.prior_shape is not None:
+            raise SystemExit("rerun-proof takes --prior-proof or --prior-shape, not both")
+        prior_path = args.prior_proof or args.prior_shape
+        try:
+            prior = (load_prior(prior_path, args.unit, proof=args.prior_proof is not None)
+                     if prior_path is not None else None)
+            proof = grade_rerun(load_record(args.fresh, "fresh"),
+                                load_record(args.evolved, "evolved") if args.evolved else None, prior,
+                                digest=source_digest(args.source),
+                                ddl=args.ddl.read_text() if args.ddl is not None else None)
+        except (OSError, ConfigError) as exc:
+            raise SystemExit(f"rerun-proof: {exc}") from None
+        proof = {"unit": args.unit, "sources": [str(s) for s in args.source],
+                 **({"prior_from": str(prior_path)} if prior is not None else {}),
+                 **proof}
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "rerun_proof.json").write_text(json.dumps(proof, indent=2) + "\n")
+        print(json.dumps(proof))
+        return 0 if proof["passed"] else 1
+
     if args.cmd == "run" and args.mode in PLANNED_MODES:
         raise SystemExit(f"--mode {args.mode} is not implemented in this harness version")
     if args.cmd == "run" and args.mode == "transactional" \
@@ -208,9 +424,12 @@ def main(argv: list[str] | None = None) -> int:
             "one. Analytical-track units reconcile with --mode snapshot or live at a stated "
             "consistency point. See 14-front_door_oltp.")
 
-    params = parse_params(args.param)
+    params = parse_params(args.param) if args.cmd != "shape" else {}
     if args.cmd == "estimate":
-        spec = load_mapping_spec(args.mapping, params)
+        if args.canonicalization and not args.family:
+            raise SystemExit("--canonicalization needs --family so its type_map is selected")
+        spec, _ = _load_spec(args.mapping, args.canonicalization, args.family,
+                             args.target_kind, params)
         tol = load_tolerances(args.tolerances)
         row_counts = None
         if args.row_counts is not None:
@@ -221,8 +440,12 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(row_counts, dict) or any(
                     isinstance(v, bool) or not isinstance(v, int) for v in row_counts.values()):
                 raise SystemExit(f"{args.row_counts} must be a JSON object of integer row counts")
-        print(json.dumps(estimate_cost(spec, tol, args.depth, row_counts, args.ops_count,
-                                       mode=args.mode), indent=2))
+        try:
+            est = estimate_cost(spec, tol, args.depth, row_counts, args.ops_count,
+                                mode=args.mode, family=args.family, target_kind=args.target_kind)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        print(json.dumps(est, indent=2))
         return 0
 
     allowed_catalogs = _load_allowed_targets(args.allowed_targets_file)
@@ -237,15 +460,46 @@ def main(argv: list[str] | None = None) -> int:
         TargetIdentityError,
         is_untested_source_family,
     )
+    if args.cmd == "shape":
+        try:
+            if args.target_kind == "lakebase":
+                target = LakebaseTargetAdapter(args.target_secret, target_catalog, target_schema)
+            else:
+                target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
+            tables = {_single_identifier(t, "table"): target.column_shape(t) for t in args.table}
+            absent = [t for t, cols in tables.items() if not cols and not target.table_exists(t)]
+            if absent:
+                raise ConfigError(f"table {', '.join(absent)} not found in {target_catalog}.{target_schema}; "
+                                  "a shape read before the run must name tables that exist "
+                                  "(pre-create the previous shape first)")
+        except (TargetIdentityError, ConfigError) as exc:
+            raise SystemExit(f"shape: {exc}") from None
+        shape = {"target_kind": args.target_kind, "catalog": target_catalog, "schema": target_schema,
+                 "read_at": dt.datetime.now(dt.timezone.utc).isoformat(), "tables": tables}
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(shape, indent=2) + "\n")
+        print(json.dumps({"tables": {t: len(c) for t, c in tables.items()}, "out": str(args.out)}))
+        return 0
     if is_untested_source_family(args.family):  # refused before any input file is read
         raise SystemExit(f"--family {args.family}: {args.family} source adapter is untested; "
                          "see SKILL.md")
 
-    spec = load_mapping_spec(args.mapping, params)
+    spec, type_map = _load_spec(args.mapping, args.canonicalization, args.family,
+                                args.target_kind, params)
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
 
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
+    rerun_proof = None
+    if args.rerun_proof is not None:
+        if not args.rerun_source:
+            raise SystemExit("--rerun-proof needs --rerun-source <file> (the job's source files as they "
+                             "are now; the proof must bind to them)")
+        try:
+            rerun_proof = check_proof(json.loads(args.rerun_proof.read_text()), args.unit,
+                                      str(args.rerun_proof), source_digest(args.rerun_source))
+        except (OSError, json.JSONDecodeError, ConfigError) as exc:
+            raise SystemExit(f"--rerun-proof: {exc}") from None
     try:
         ops = json.loads(args.ops.read_text()) if args.ops else None
     except (OSError, json.JSONDecodeError) as exc:
@@ -267,12 +521,55 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(str(exc)) from None
     else:
         target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
+    if args.source_dictionary or args.target_dictionary:
+        from .structure import DictionaryOverlay, load_dictionary
+        try:
+            if args.source_dictionary:
+                source = DictionaryOverlay(source, load_dictionary(args.source_dictionary))
+            if args.target_dictionary:
+                target = DictionaryOverlay(target, load_dictionary(args.target_dictionary))
+        except ConfigError as exc:
+            raise SystemExit(f"dictionary: {exc}") from None
+    routine_parity = routine_writers = routine_dependencies = None
+    if args.routine_parity and not args.routine_dependencies:
+        raise SystemExit("--routine-parity needs --routine-dependencies: the unit's dependency analysis "
+                         "says which writing routines the file must cover")
+    deps_path = args.routine_dependencies or Path(".migration/units") / args.unit / "dependencies.json"
+    if args.routine_dependencies is not None and not deps_path.is_file():
+        raise SystemExit(f"--routine-dependencies {deps_path} is not a file")
+    routine_analysis_missing = not deps_path.is_file()
+    if not routine_analysis_missing:
+        from .routines import check_parity, git_committed, writers
+        repo, committed = Path("."), git_committed(Path("."))
+        try:
+            rel = deps_path.resolve().relative_to(repo.resolve()).as_posix()
+        except ValueError:
+            rel = None
+        if rel is None or not committed(rel):
+            raise SystemExit(f"{deps_path} is not a committed file of the repository: the dependency analysis "
+                             "names the unit's writing routines, so only the committed one counts (commit it, "
+                             "or pass --routine-dependencies with the committed path)")
+        routine_dependencies = rel
+        try:
+            deps = json.loads(deps_path.read_text())
+            rows = json.loads(args.routine_parity.read_text()).get("routine_parity") if args.routine_parity else []
+            routine_writers = list(writers(deps))
+            if args.routine_parity or not routine_writers:
+                routine_parity = check_parity(rows, str(args.routine_parity or "routine_parity"), deps,
+                                              committed, repo)
+        except (OSError, json.JSONDecodeError, AttributeError) as exc:
+            raise SystemExit(f"cannot read {args.routine_parity or deps_path}: {exc}") from None
+        except ConfigError as exc:
+            raise SystemExit(str(exc)) from None
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
-                       source_family=args.family, depth=args.depth)
+                       source_family=args.family, depth=args.depth, type_map=type_map,
+                       routine_parity=routine_parity, routine_writers=routine_writers,
+                       routine_analysis_missing=routine_analysis_missing,
+                       routine_dependencies=routine_dependencies, rerun_proof=rerun_proof)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")

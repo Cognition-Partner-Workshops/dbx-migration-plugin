@@ -38,7 +38,7 @@ def block(cmd, cfg=CFG):
 
 def test_new_keys_are_optional_and_normalised():
     assert MINIMAL.target_hosts == [] and MINIMAL.bundle_targets == []
-    assert CFG.target_hosts == ["fixture-host", "lakebase_dsn"]
+    assert CFG.target_hosts == ["fixture-host", "LAKEBASE_DSN"]
     assert CFG.bundle_targets == ["migration", "dev"]
     assert CFG.forbidden_bundle_targets == ("prod", "production")
     for bad in ({"catalogs": ["c"], "target_hosts": "h"}, {"catalogs": ["c"], "bundle_targets": {"a": 1}}):

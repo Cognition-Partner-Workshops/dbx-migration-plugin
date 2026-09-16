@@ -22,6 +22,11 @@ _NUMERIC = (int, float, decimal.Decimal)
 _OPS = {" >= ": operator.ge, " > ": operator.gt, " <= ": operator.le, " < ": operator.lt}
 
 
+# a rerun proof with both legs passed: tests of other controls need one, since a result without a
+# proof blocks under `rerun_missing`
+PROVEN_RERUN = {"fresh": "pass", "evolved": "pass", "passed": True, "findings": []}
+
+
 def _agg_of(vals: list) -> dict[str, Any]:
     nn = [v for v in vals if v is not None]
     nums = [v for v in nn if isinstance(v, _NUMERIC) and not isinstance(v, bool)]
@@ -260,6 +265,11 @@ class FakeSource(_TransactionalMixin):
         self._count("field_aggregates")
         return self._aggs(self._rows(table, where), [column], [column])[column]
 
+    def column_profile(self, table: str, column: str, where: str | None = None) -> dict[str, Any]:
+        self._count("column_profile")
+        a = self._aggs(self._rows(table, where), [column], [])[column]
+        return {k: a[k] for k in ("count", "null_rate", "distinct_count")}
+
     def iter_keys(self, table, key_cols, where=None):
         self._count("iter_keys")
         for r in self._sorted(table, key_cols, where):
@@ -357,3 +367,8 @@ class FakeTarget(_TransactionalMixin):
     def field_aggregates(self, object: str, field_path: str, where=None) -> dict[str, Any]:
         self.calls["field_aggregates"] += 1  # rides on the batched read: no statement of its own
         return self._aggs(self._rows(object, where), [field_path], [field_path])[field_path]
+
+    def column_profile(self, object: str, field_path: str, where=None) -> dict[str, Any]:
+        self._count("column_profile")
+        a = self._aggs(self._rows(object, where), [field_path], [])[field_path]
+        return {k: a[k] for k in ("count", "null_rate", "distinct_count")}
