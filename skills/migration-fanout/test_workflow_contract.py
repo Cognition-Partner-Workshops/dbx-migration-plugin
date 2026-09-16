@@ -26,7 +26,8 @@ def _gates_sha(batches, wave=0):
 def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
-               gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft"):
+               gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
+               other_waves=None, mappings=None, namespace=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -36,6 +37,12 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         d.mkdir(parents=True)
         (d / "result.json").write_text(eligible if isinstance(eligible, str) else json.dumps(
             {"verdict": "PASS", "merge_eligible": eligible, "merge_authority": {"kind": "harness", "decision_id": None}}))
+    for name, text in (other_waves or {}).items():
+        (waves / name).write_text(text)
+    for unit, spec in (mappings or {}).items():
+        path = ws / ".migration" / "units" / unit / "mapping_spec.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(spec))
     source = {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}}
     manifest = {
         "wave": 0,
@@ -56,6 +63,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief",
                      "gates": gates if gates is not None else [GATE]}],
     }
+    if namespace is not None:
+        manifest["target_namespace"] = namespace
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
     manifest["stop_c"] = "D-2"
     ledger = f"| D-2 | 2026-01-05 | user:U0 | STOP C wave-0 gates_sha {manifest['gates_sha']} | plan approved |\n" if stop_c else ""
@@ -460,6 +469,107 @@ def test_a_rerun_over_a_result_that_cannot_say_which_stop_c_it_spent_halts(tmp_p
     assert proc.returncode != 0 and "wave-0.result.json" in proc.stderr and "STOP C" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
     assert (ws / ".migration/waves/wave-0.result.json").read_text() == prior
+
+
+WAVE_1 = json.dumps({"wave": 1, "batches": [{"id": "b-2", "units": ["v"], "write_targets": ["mig.t"], "brief": "b"}]})
+MAPPING = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"]}]}
+BOUNDED_MAPPING = {"objects": [{**MAPPING["objects"][0], "root_where": "run_date = '${as_of}'",
+                                "target_where": "run_date = '${as_of}'"}]}
+PRIOR_MAPPING = {"objects": [{**MAPPING["objects"][0], "root_where": "run_date = '${prior_as_of}'",
+                              "target_where": "run_date = '${prior_as_of}'"}]}
+
+
+def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_bounded(tmp_path):
+    ws, cwd = _workspace(tmp_path / "open", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": MAPPING, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "open", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0
+    assert "'mig.t'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr and "target_where" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+    tautology = {"objects": [{**MAPPING["objects"][0], "root_where": "1 = 1", "target_where": "1 = 1"}]}
+    ws, cwd = _workspace(tmp_path / "taut", other_waves={"wave-1.json": WAVE_1.replace("mig.t", "MIG.T")},
+                         mappings={"u": tautology, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "taut", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "target_where" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    bounded = {"objects": [{**BOUNDED_MAPPING["objects"][0], "object": "T"}]}
+    unbounded = {"objects": [{**MAPPING["objects"][0], "object": "T"}]}
+    ws, cwd = _workspace(tmp_path / "bare", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": unbounded, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "bare", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "(unit u) reads it without a target_where" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    ws, cwd = _workspace(tmp_path / "elsewhere", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": {"objects": [{**MAPPING["objects"][0], "object": "other.t"}]}, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "elsewhere", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "no unit of b-1 reads 'mig.t'" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    sibling_bare = WAVE_1.replace('"mig.t"', '"t"').replace('"wave": 1', '"wave": 1, "target_namespace": "mig"')
+    ws, cwd = _workspace(tmp_path / "prior", other_waves={"wave-1.json": sibling_bare},
+                         mappings={"u": bounded}, namespace="MIG")
+    proc, calls = _run(cwd, tmp_path / "prior", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "units/v/mapping_spec.json is missing" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "other_ns", other_waves={"wave-1.json": WAVE_1.replace('"mig.t"', '"t"')},
+                         mappings={"u": bounded}, namespace="MIG")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "other_ns", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "bad_ns", other_waves={"wave-1.json": sibling_bare.replace('"mig"', '"cat."')},
+                         mappings={"u": bounded}, namespace="MIG")
+    proc, calls = _run(cwd, tmp_path / "bad_ns", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "wave-1.json" in proc.stderr and "target_namespace" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "overlap", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": bounded, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "overlap", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "unit u and unit v (wave-1.json b-2)" in proc.stderr
+    assert "overlap" in proc.stderr and not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": bounded, "v": PRIOR_MAPPING})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "bounded", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+
+def test_a_hand_run_wave_reserves_nothing_while_a_shared_table_is_unbounded(tmp_path):
+    """`reserve` is the small wave's launch: it runs the same cross-wave collision check the workflow does
+    before it spends the STOP C row, so an unbounded mapping on a shared table launches nothing by hand either."""
+    ws, cwd = _workspace(tmp_path / "open", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": MAPPING, "v": BOUNDED_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "Traceback" not in proc.stderr
+    assert "'mig.t'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr and "target_where" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+
+    ws, cwd = _workspace(tmp_path / "overlap", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": BOUNDED_MAPPING, "v": BOUNDED_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "overlap" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+
+    ws, cwd = _workspace(tmp_path / "bounded", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": BOUNDED_MAPPING, "v": PRIOR_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["reserved"] is True
+
+
+def test_malformed_sibling_wave_manifest_halts_before_launch(tmp_path):
+    ws, cwd = _workspace(tmp_path, other_waves={"wave-1.json": "{"})
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "wave-1.json" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def _push_pr(ws, n=1):
