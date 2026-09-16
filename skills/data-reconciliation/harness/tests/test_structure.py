@@ -40,7 +40,7 @@ def test_load_dictionary_reads_each_family_fixture(family):
     assert d.family == family and d.tables
     assert all(isinstance(f, SchemaFacts) for f in d.tables.values())
     if family == "databricks":
-        assert d.unsupported == frozenset({"indexes", "triggers"})
+        assert d.unsupported == frozenset({"indexes", "triggers", "sequences_identity"})
         assert all(f.unsupported == d.unsupported for f in d.tables.values())
     loans = next(f for f in d.tables.values() if f.primary_key)
     assert loans.identity_columns
@@ -76,7 +76,8 @@ def test_structural_checks_mark_a_reader_hole():
     t = next(iter(d.tables.values()))
     sc = structural_checks([(full, t)])
     assert sc["triggers"] == "unsupported" and sc["indexes"] == "unsupported"
-    assert sc["constraints"] == sc["grants"] == sc["sequences_identity"] == "checked"
+    assert sc["sequences_identity"] == "unsupported"
+    assert sc["constraints"] == sc["grants"] == "checked"
     assert set(structural_checks([]).values()) == {"unsupported"}
 
 
@@ -185,12 +186,13 @@ def test_tier0_unsupported_indexes_are_not_a_warning():
                        indexes=set())
     result = _live(loans_src_facts=src_facts, loans_tgt_facts=tgt_facts)
     t0 = result["tiers"][0]
-    assert t0["stats"]["indexes_unsupported"]
+    assert t0["stats"]["index_unsupported"]
+    assert "index_missing" not in {f["check"] for f in t0["findings"]}
     assert not t0["stats"].get("unverified")
     assert result["merge_eligible"] is (result["verdict"] == "PASS")
 
 
-def test_tier0_unreadable_catalog_is_a_hole_not_a_warning():
+def test_tier0_unreadable_catalog_blocks_merge():
     loans, borrowers = _rows(12)
     source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers})
     target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers})
@@ -200,8 +202,57 @@ def test_tier0_unreadable_catalog_is_a_hole_not_a_warning():
     assert t0["stats"]["structural_checks"] == {c: "unsupported" for c in CATEGORIES}
     assert t0["stats"]["dictionary_unavailable"]
     assert not t0["stats"].get("unverified")
-    assert result["merge_eligible"] is True
-    assert result["merge_block_reasons"] == []
+    assert any(w.startswith("UNVERIFIED structural_parity: structure unavailable:")
+               for w in result["warnings"])
+    assert result["merge_eligible"] is False
+    assert result["merge_block_reasons"] == ["structural_gap", "warnings"]
+
+
+class _DictErrorTarget(FakeTarget):
+    def schema_facts(self, table):
+        from recon.adapters import DictionaryError
+        raise DictionaryError(f"{table}: sys.triggers read failed (RuntimeError)")
+
+
+def test_tier0_dictionary_error_records_view_not_credential():
+    loans, borrowers = _rows(12)
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 13})
+    target = _DictErrorTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers})
+    result = run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target)  # run completes
+    t0 = result["tiers"][0]
+    notes = t0["stats"]["dictionary_unavailable"]
+    assert any("sys.triggers read failed (RuntimeError)" in n for n in notes)
+    assert not any("DSN" in n or "password" in n for n in notes)
+    assert result["merge_eligible"] is False and "structural_gap" in result["merge_block_reasons"]
+
+
+def test_tier0_target_without_identity_reader_marks_category_unchecked():
+    tgt_facts = _facts(TARGET_LOANS_FACTS, unsupported=frozenset({"sequences_identity"}))
+    result = _live(loans_tgt_facts=tgt_facts)
+    t0 = result["tiers"][0]
+    assert "sequence_missing" not in {f["check"] for f in t0["findings"]}
+    assert "identity_missing" not in {f["check"] for f in t0["findings"]}
+    assert t0["stats"]["structural_checks"]["sequences_identity"] == "unsupported"
+
+
+def test_tier0_informational_target_fk_is_a_finding_not_a_pass():
+    tgt_facts = _facts(TARGET_LOANS_FACTS,
+                       foreign_keys=set(),
+                       foreign_keys_informational={(("borrower_id",), "borrowers", ("borrower_id",))})
+    result = _live(loans_tgt_facts=tgt_facts)
+    t0 = result["tiers"][0]
+    codes = {f["check"] for f in t0["findings"]}
+    assert "foreign_key_informational_only" in codes and "foreign_key_missing" not in codes
+    assert t0["stats"]["structural_diff"]["loans"]["constraints"]
+    assert result["merge_eligible"] is False
+    assert "structural_gap" in result["merge_block_reasons"]
+
+
+def test_tier0_absent_target_fk_is_still_missing():
+    result = _live(loans_tgt_facts=_facts(TARGET_LOANS_FACTS, foreign_keys=set()))
+    assert "foreign_key_missing" in {f["check"] for f in result["tiers"][0]["findings"]}
 
 
 def test_tier0_fixture_dictionary_never_merges():
@@ -332,11 +383,16 @@ def test_databricks_schema_facts_maps_information_schema():
     a._sql = Sql()
     facts = a.schema_facts("loans")
     assert facts.primary_key == ("loan_id",)
-    assert facts.foreign_keys == {(("borrower_id",), "s.borrowers", ("borrower_id",))}
+    # UC foreign keys are informational, never enforced
+    assert facts.foreign_keys_informational == {(("borrower_id",), "s.borrowers", ("borrower_id",))}
+    assert not facts.foreign_keys
     assert facts.not_null == {"loan_id"} and facts.identity_columns == {"loan_id"}
     assert facts.checks == {"current_balance >= 0"} and facts.check_count == 1
     assert facts.grants == {"svc_app": frozenset({"select", "modify"})}
-    assert facts.unsupported == frozenset({"indexes", "triggers"})
+    assert facts.unsupported == frozenset({"indexes", "triggers", "sequences_identity"})
+    import pytest as _pt
+    with _pt.raises(NotImplementedError):
+        a.identity_state("loans", "loan_id")
     joined = " ".join(answers)
     for view in ("table_constraints", "key_column_usage", "referential_constraints",
                  "columns", "check_constraints", "table_privileges"):
@@ -353,3 +409,56 @@ def test_build_result_merge_block_reasons():
     gap = TierResult(0, "structural_parity", False, 1, [Finding("o", "trigger_missing", "d")], {})
     r = build_result("u", "live", "m1", "t1", [gap])
     assert r["merge_block_reasons"][0] == "structural_gap" and "tier_failed" in r["merge_block_reasons"]
+
+
+def test_databricks_source_adapter_reads_uc_dictionary():
+    from recon.adapters import DatabricksSourceAdapter
+    a = DatabricksSourceAdapter.__new__(DatabricksSourceAdapter)
+    answers = []
+
+    class Conn:
+        def cursor(self):
+            class Cur:
+                def execute(self, sql, params=()):
+                    answers.append(sql)
+                    if "check_constraints" in sql:
+                        self.rows = []
+                    elif "table_constraints" in sql:
+                        self.rows = [("PRIMARY KEY", "pk", "loan_id", None, None, None)]
+                    else:
+                        self.rows = []
+                def fetchall(self):
+                    return self.rows
+            return Cur()
+    a._conn = Conn()
+    a.statements = a.rows_fetched = 0
+    facts = a.schema_facts("cat.s.loans")
+    assert facts.primary_key == ("loan_id",)
+    assert "information_schema.table_constraints" in " ".join(answers)
+    with pytest.raises(NotImplementedError):
+        a.identity_state("cat.s.loans", "loan_id")
+
+
+def test_schema_facts_driver_errors_are_dictionary_errors_without_secrets():
+    from tests.loans import _StubConn
+
+    class Conn(_StubConn):
+        def cursor(self):
+            class Cur:
+                def execute(self, sql, params=()):
+                    if "sys.triggers" in sql.lower():
+                        raise RuntimeError("connection DSN=prod-host;password=hunter2 failed")
+                    self.rows = []
+                def fetchall(self):
+                    return self.rows
+            return Cur()
+    from recon.adapters import DictionaryError, SqlServerSourceAdapter
+    a = SqlServerSourceAdapter.__new__(SqlServerSourceAdapter)
+    a._conn = Conn()
+    a.statements = a.rows_fetched = 0
+    with pytest.raises(DictionaryError, match="sys.triggers read failed \\(RuntimeError\\)"):
+        a.schema_facts("dbo.loans")
+    try:
+        a.schema_facts("dbo.loans")
+    except DictionaryError as exc:
+        assert "hunter2" not in str(exc) and "prod-host" not in str(exc)

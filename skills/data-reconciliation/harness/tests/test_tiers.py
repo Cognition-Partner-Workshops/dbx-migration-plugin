@@ -216,7 +216,9 @@ def make_graded():
 def test_embed_values_graded_green():
     result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, *make_graded())
     assert result["verdict"] == "PASS"
-    assert result["warnings"] == []
+    assert result["warnings"] == [
+        "UNVERIFIED structural_parity: structure unavailable: "
+        "orders: fake has no schema facts for ORDERS"]
     assert result["tiers"][3]["stats"]["embeds_graded"]["orders.items"] == 3
 
 
@@ -622,7 +624,7 @@ def test_snapshot_provenance_matching_is_merge_eligible():
                   "row_counts": {"ORDERS": 2}},
         source_family="oracle")
     assert result["verdict"] == "PASS"
-    assert result["merge_eligible"] is True
+    assert result["merge_eligible"] is False  # snapshot fakes carry no dictionary
 
 
 def test_composite_key_full_and_sampled_diff():

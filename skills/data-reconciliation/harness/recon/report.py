@@ -49,13 +49,16 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                             "declare embed key/fields in the mapping spec to grade values)")
         for note in t.stats.get("unverified", []):
             warnings.append(f"UNVERIFIED {t.name}: {note}")
+        for note in t.stats.get("dictionary_unavailable", []):
+            warnings.append(f"UNVERIFIED {t.name}: structure unavailable: {note}")
     warnings.extend(provenance_warnings or [])
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and (mode != "snapshot" or snapshot is not None))
     structural = next((t for t in tiers if t.name in ("structural_parity", "schema_parity")), None)
     reasons = []
-    if structural is not None and (structural.findings or structural.stats.get("unverified")):
+    if structural is not None and (structural.findings or structural.stats.get("unverified")
+                                   or structural.stats.get("dictionary_unavailable")):
         reasons.append("structural_gap")
     if verdict == "FAIL":
         reasons.append("tier_failed")

@@ -12,6 +12,8 @@ from pathlib import Path
 
 from .adapters import IdentityState, SchemaFacts
 from .config import ConfigError
+import dataclasses
+
 from .tiers import Finding, TierResult
 
 CATEGORIES = ("constraints", "triggers", "indexes", "sequences_identity", "grants")
@@ -23,6 +25,7 @@ _CHECK_CATEGORY = {
     "unique_nulls_equal_missing": "constraints", "unique_nulls_equal_extra": "constraints",
     "foreign_key_missing": "constraints", "foreign_key_extra": "constraints",
     "foreign_key_action_mismatch": "constraints",
+    "foreign_key_informational_only": "constraints",
     "not_null_missing": "constraints", "not_null_extra": "constraints",
     "check_constraint_missing": "constraints", "check_constraint_extra": "constraints",
     "check_constraint_unverified": "constraints",
@@ -36,6 +39,26 @@ _CHECK_CATEGORY = {
     "trigger_missing": "triggers", "trigger_extra": "triggers",
     "grant_missing": "grants", "grant_extra": "grants",
 }
+
+
+def mask_unsupported(facts: SchemaFacts, categories) -> SchemaFacts:
+    """The same facts with the named categories emptied, so comparators can never grade a
+    hole as an absence."""
+    fields = {}
+    if "constraints" in categories:
+        fields.update(primary_key=(), unique=frozenset(), unique_nulls_equal=frozenset(),
+                      foreign_keys=frozenset(), foreign_keys_informational=frozenset(),
+                      foreign_key_actions={}, not_null=frozenset(), check_count=0,
+                      checks=frozenset(), expression_unique=frozenset())
+    if "indexes" in categories:
+        fields.update(indexes=frozenset(), partial=frozenset(), expression_indexes=frozenset())
+    if "sequences_identity" in categories:
+        fields["identity_columns"] = frozenset()
+    if "triggers" in categories:
+        fields["triggers"] = {}
+    if "grants" in categories:
+        fields["grants"] = {}
+    return dataclasses.replace(facts, **fields) if fields else facts
 
 
 def structural_checks(pairs: list[tuple[SchemaFacts, SchemaFacts]]) -> dict[str, str]:
@@ -157,6 +180,8 @@ def load_dictionary(path: Path) -> FixtureDictionary:
         try:
             fks = {(tuple(fk["columns"]), fk["references"], tuple(fk["referenced_columns"]))
                    for fk in t.get("foreign_keys", [])}
+            info_fks = {(tuple(fk["columns"]), fk["references"], tuple(fk["referenced_columns"]))
+                        for fk in t.get("foreign_keys_informational", [])}
             fk_actions = {(cols, ref, rcols): (str(fk.get("on_update", "no action")),
                                              str(fk.get("on_delete", "no action")))
                           for fk in t.get("foreign_keys", [])
@@ -171,6 +196,7 @@ def load_dictionary(path: Path) -> FixtureDictionary:
                 unique={tuple(u) for u in (t.get("unique") or [])},
                 unique_nulls_equal={tuple(u) for u in (t.get("unique_nulls_equal") or [])},
                 foreign_keys=fks, foreign_key_actions=fk_actions,
+                foreign_keys_informational=info_fks,
                 not_null=set(t.get("not_null") or []),
                 indexes={tuple(i) for i in (t.get("indexes") or [])},
                 check_count=len(checks) if checks else int(t.get("check_count") or 0),
