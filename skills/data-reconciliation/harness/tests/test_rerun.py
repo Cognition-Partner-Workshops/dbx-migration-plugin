@@ -599,6 +599,20 @@ def test_drop_table_takes_every_table_in_its_list_and_the_dialect_modifiers():
             declared_shape("CREATE TABLE t (a INT); " + bad)
 
 
+def test_bracket_quoted_names_keep_their_commas_and_escaped_brackets():
+    """T-SQL brackets quote like backticks do: a comma or a doubled `]]` inside them is part of
+    the name, in a DROP list and in a column list alike."""
+    shape = declared_shape("CREATE TABLE [orders,archive] ([a,b] INT, [c]]d] INT); "
+                           "DROP TABLE [orders,archive];")
+    assert shape["tables"] == {}
+    shape = declared_shape("CREATE TABLE [orders,archive] ([a,b] INT, [c]]d] INT NOT NULL);")
+    assert shape["tables"] == {"orders,archive": [
+        {"name": "a,b", "type": "int", "nullable": True},
+        {"name": "c]d", "type": "int", "nullable": False}]}
+    shape = declared_shape("CREATE TABLE [x,y] (a INT); CREATE TABLE z (a INT); DROP TABLE [x,y], z;")
+    assert shape["tables"] == {}
+
+
 # ---- result.json wiring -----------------------------------------------------------------------
 
 def _ok():
