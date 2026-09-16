@@ -590,3 +590,37 @@ def test_lakebase_target_reads_the_observed_shape_from_pg_attribute(monkeypatch)
         {"name": "amount", "type": "decimal(18,2)", "nullable": True}]
     sql, params = conn.executed[-1]
     assert "pg_attribute" in sql and "format_type" in sql and params == ("sales", "orders")
+
+
+def test_a_top_level_comparison_does_not_swallow_the_statements_after_it():
+    """`<` and `>` nest only inside a type (STRUCT<...>); in a statement body they are operators,
+    and treating them as brackets would drop a later ALTER TABLE from the expected shape."""
+    shape = declared_shape(
+        "CREATE TABLE t (a INT); INSERT INTO audit SELECT 1 WHERE 1 < 2; "
+        "ALTER TABLE t ADD COLUMN b INT; "
+        "CREATE TABLE u (c INT, d ARRAY<STRUCT<x: INT, y: INT>>, e INT DEFAULT 3 CHECK (e > 1));")
+    assert [c["name"] for c in shape["tables"]["t"]] == ["a", "b"]
+    assert [c["name"] for c in shape["tables"]["u"]] == ["c", "d", "e"]
+    assert shape["tables"]["u"][1]["type"] == "array<struct<x:int,y:int>>"
+    assert shape["altered"] == ["t"] and shape["statements"]["other"] == 1
+
+
+def test_comment_markers_inside_literals_and_quoted_identifiers_are_kept():
+    shape = declared_shape(
+        "-- header\n"
+        "CREATE TABLE t (url STRING DEFAULT 'https://host/a--b', /* real; comment, */ id INT, "
+        "note STRING DEFAULT 'it''s /* not */ a comment', `odd--name` INT); -- trailing")
+    assert [c["name"] for c in shape["tables"]["t"]] == ["url", "id", "note", "odd--name"]
+    assert shape["statements"] == {"create_table": 1, "alter_table": 0, "other": 0}
+
+
+def test_add_column_first_and_after_place_the_column_and_leave_its_type_clean():
+    shape = declared_shape(
+        "CREATE TABLE t (a INT, b STRING); "
+        "ALTER TABLE t ADD COLUMN c STRING AFTER a; "
+        "ALTER TABLE t ADD COLUMNS (d INT FIRST, e DECIMAL(10, 2) NOT NULL AFTER b);")
+    assert [(c["name"], c["type"], c["nullable"]) for c in shape["tables"]["t"]] == [
+        ("d", "int", True), ("a", "int", True), ("c", "string", True),
+        ("b", "string", True), ("e", "decimal(10,2)", False)]
+    with pytest.raises(ConfigError, match="AFTER zz"):
+        declared_shape("CREATE TABLE t (a INT); ALTER TABLE t ADD COLUMN c INT AFTER zz;")

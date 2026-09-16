@@ -62,8 +62,10 @@ def _ident(raw: str) -> str:
     return ".".join(p.strip('`"[]').lower() for p in raw.strip().split("."))
 
 
-def _split_top(body: str, sep: str = ",") -> list[str]:
-    parts, depth, buf, quote = [], 0, [], None
+def _split_top(body: str, sep: str = ",", angle: bool = True) -> list[str]:
+    """Split on `sep` outside quotes and parentheses; `<...>` nests too when `angle` (a column
+    list, where it is a type's brackets), never when splitting statements (where it compares)."""
+    parts, depth, angles, buf, quote = [], 0, 0, [], None
     for ch in body:
         if quote:
             buf.append(ch)
@@ -72,11 +74,15 @@ def _split_top(body: str, sep: str = ",") -> list[str]:
             continue
         if ch in "'\"`":
             quote = ch
-        elif ch in "(<":
+        elif ch == "(":
             depth += 1
-        elif ch in ")>":
+        elif ch == ")":
             depth -= 1
-        elif ch == sep and depth == 0:
+        elif ch == "<" and angle and depth == 0:
+            angles += 1
+        elif ch == ">" and angle and depth == 0 and angles:
+            angles -= 1
+        elif ch == sep and depth == 0 and angles == 0:
             parts.append("".join(buf))
             buf = []
             continue
@@ -108,7 +114,7 @@ def _balanced(text: str, start: int) -> int:
 def _top_level(text: str) -> str:
     """`text` with every quoted literal and bracketed group blanked to spaces (same length), so
     keyword searches see only the top level and offsets still index the original."""
-    out, depth, quote = [], 0, None
+    out, depth, angles, quote = [], 0, 0, None
     for ch in text:
         if quote:
             out.append(" ")
@@ -117,14 +123,20 @@ def _top_level(text: str) -> str:
         elif ch in "'\"`":
             quote = ch
             out.append(" ")
-        elif ch in "(<":
+        elif ch == "(":
             depth += 1
             out.append(" ")
-        elif ch in ")>":
+        elif ch == ")":
             depth = max(depth - 1, 0)
             out.append(" ")
+        elif ch == "<" and depth == 0:
+            angles += 1
+            out.append(" ")
+        elif ch == ">" and depth == 0 and angles:
+            angles -= 1
+            out.append(" ")
         else:
-            out.append(ch if depth == 0 else " ")
+            out.append(ch if depth == 0 and angles == 0 else " ")
     return "".join(out)
 
 
@@ -164,8 +176,53 @@ def _table_columns(body: str) -> list[dict]:
 
 
 def _strip_comments(sql: str) -> str:
-    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    return re.sub(r"--[^\r\n]*", " ", sql)
+    """Blank `-- ...` and `/* ... */` outside quoted literals and identifiers (a `--` inside a
+    string is text, not a comment)."""
+    out, i, quote, n = [], 0, None, len(sql)
+    while i < n:
+        ch = sql[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+        elif ch in "'\"`":
+            quote = ch
+            out.append(ch)
+            i += 1
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end < 0 else end
+            out.append(" ")
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+_PLACEMENT = re.compile(r"\b(?:(?P<first>FIRST)|AFTER\s+(?P<after>\S+))\s*$", re.IGNORECASE)
+
+
+def _add_column(cols: list[dict], defn: str) -> None:
+    """Apply one ADD COLUMN definition, honouring a trailing FIRST / AFTER <column> placement."""
+    m = _PLACEMENT.search(_top_level(defn))
+    c = _column(defn[:m.start()].rstrip() if m else defn)
+    if not c or any(x["name"] == c["name"] for x in cols):
+        return
+    if m and m.group("after"):
+        anchor = _ident(m.group("after"))
+        at = [i for i, x in enumerate(cols) if x["name"] == anchor]
+        if not at:
+            raise ConfigError(f"ADD COLUMN {c['name']} AFTER {anchor}: no such column")
+        cols.insert(at[0] + 1, c)
+    elif m:
+        cols.insert(0, c)
+    else:
+        cols.append(c)
 
 
 def declared_shape(sql: str) -> dict:
@@ -176,7 +233,7 @@ def declared_shape(sql: str) -> dict:
     if_not_exists: list[str] = []
     altered: list[str] = []
     counts = {"create_table": 0, "alter_table": 0, "other": 0}
-    for stmt in _split_top(_strip_comments(sql), ";"):
+    for stmt in _split_top(_strip_comments(sql), ";", angle=False):
         stmt = stmt.strip()
         m = _CREATE.match(stmt)
         if m:
@@ -198,9 +255,8 @@ def declared_shape(sql: str) -> dict:
             if body.startswith("("):
                 body = body[1:_balanced(body, 0) - 1]
             cols = tables.setdefault(name, [])
-            for c in (_column(d) for d in _split_top(body)):
-                if c and all(x["name"] != c["name"] for x in cols):
-                    cols.append(c)
+            for d in _split_top(body):
+                _add_column(cols, d)
             counts["alter_table"] += 1
             if name not in altered:
                 altered.append(name)
