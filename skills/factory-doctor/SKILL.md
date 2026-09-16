@@ -29,10 +29,22 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--source-secret <ENV VAR NAME> [--source-family sqlserver|postgres|...] --param name=value ...] \
     [--source-attested D-<id>] [--lakebase-project NAME --lakebase-parent-branch NAME] \
     [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] [--analytical-schema CATALOG.SCHEMA] \
-    [--live-playbooks PATH] [--out PATH]
+    [--live-playbooks PATH] [--reuse-record PATH] [--out PATH]
 ```
 
 Writes `.migration/09_capabilities.json` and prints one line per row. Exit 0 means `ready`.
+
+A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the orchestrator's signed
+record beside the wave manifest). When the record is an orchestrator's, `ready`, signed for the
+same manifest bytes, fresher than the manifest's `doctor_max_age` minutes (default 15), and signed
+for the `--expect-identity`/`--expect-host` principal, the source-side rows (`recon_harness`,
+`recon_family_supported`, `type_map_audit`, `delete_evidence`, `source_principal_read_only`,
+`dictionary_readable`, `named_secrets_exist`) are taken from it — anything else in the report, and
+the whole run when the record fails any check, is computed fresh. `databricks_identity` and the
+workspace/hook/allowlist rows always run fresh. The `doctor_record` row says what happened; a
+rejected record prints `doctor record not reused: <why>` on stderr and does not change the exit
+code. `--reuse-record` refuses `--wave`, `--no-databricks`, a non-child role, and a missing
+`--expect-identity`.
 `ready` requires no `fail`, the security rows `hook_guard` and `databricks_identity` to have every
 security sub-result at `ok`, and `source_principal_read_only` not `unverified` once mappings exist.
 Other warnings are advisory. Sub-results live in `data.sub_results`; `--no-databricks` leaves
