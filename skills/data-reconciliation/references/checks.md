@@ -11,7 +11,7 @@ instead of a paragraph.
 | Tier | Check | What a FAIL means |
 |---|---|---|
 | 1 | Row counts, source table vs target table (through the mapping, with `root_where`) | Load defect or wrong scope. Nothing else runs. |
-| 2 | Per-column aggregates (null rate, min, max, distinct count, sum on numeric columns), one statement per table per side | Type or conversion drift. |
+| 2 | Per-column aggregates (null rate, min, max, distinct count, sum on numeric columns), one statement per table per side; min/max are skipped for the unordered types (`bit`, `boolean`, `uniqueidentifier`, `uuid`) that no engine orders, and the skip is recorded in `stats.minmax_skipped` | Type or conversion drift. |
 | 3 | Keyed row diff: full below `full_diff_row_threshold`, else server-side stratified sample (equal-count key ranges, seeded positions inside each, every range's first and last key, plus a duplicate-key probe), overridable with `--depth` | Value-level mismatch; findings name the key and column. |
 | 4 | Replay of recorded representative queries on both engines (optional, `--ops`) | Report or extract does not match. SQL ops execute read-only and only `SELECT`/`WITH` queries are allowed. |
 
