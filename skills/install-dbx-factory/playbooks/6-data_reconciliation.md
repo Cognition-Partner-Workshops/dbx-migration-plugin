@@ -1,40 +1,18 @@
-Playbook: Independent reconciliation pass over a completed wave: re-run the parity evidence with fresh eyes, catch what the migrating children graded themselves too kindly on, and produce the wave's recon report for wave close.
-
-## Overview
-Every unit PR already carries its own recon evidence, but the author grading their own work is not the whole story. This playbook runs in a session that did **not** convert any unit in the wave. It re-executes the gates, probes beyond them, and writes the wave-level report. It is the data-migration analogue of an independent test pass: cheap because the harness is machine-checkable, valuable because it is adversarial.
-
-```
-[wave complete: all batch PRs recon-green]  ->  re-run every gate independently
-                                            ->  adversarial probes beyond the gate
-                                            ->  cross-unit consistency checks
-                                            ->  <Pipeline>_wave<N>_recon.md  ->  wave close (notify)
-```
-
-## What's Needed From User (or from the orchestrator)
-- The wave's PR list, the plan's recon spec, the tolerance record, and access to both engines (same coexistence mechanism the children used).
-- Nothing else: independence means this session reads the artifacts, not the children's chat.
+Playbook: Independently verify one completed wave and publish its evidence for wave close.
 
 ## Procedure
-1. **Re-run every unit's recon gate verbatim** from the plan spec, not from the PR's pasted output. Both runs are timestamped; legacy data may have moved (drift), so a mismatch is triaged as drift vs conversion error before anyone panics: re-run the legacy side twice to see if it is moving. **In DEGRADED mode** (snapshot/sample per the tolerance record) the double-run trick does not apply: triage instead against the snapshot manifest (extraction time, row counts), verify the children compared against the same snapshot version, and mark every verdict with the mode; a DEGRADED PASS is a statement about the snapshot, never about production. Respect the legacy-query concurrency cap when parallelizing re-runs. During triage, re-run only the failed check on the failed unit; never re-run the wave's green checks on suspicion alone.
-2. **Probe beyond the gate, adversarially**: null distributions per column, duplicate keys, boundary rows (min/max per key column), empty-input behavior, a sample of row-level spot checks on columns the gate only aggregates, and report-output byte comparison where the tolerance record demands exactness.
-3. **Cross-unit consistency**: units in a wave share tables; check referential consistency across batch boundaries (the classic parallel failure: two batches each green alone, jointly inconsistent because both dual-wrote a shared dimension).
-4. **ML-SCORING units** (prediction parity; there is no separate harness, this step is the method): re-run both scorers on the pinned sample (a fixed, versioned input with a manifest: source, extraction time, row count, checksum) with seeds set on both sides, and compare per the user-confirmed parity tolerance in `.migration/03_recon_tolerances.md`: exact (bitwise/decimal), numeric (abs/relative diff per score) or rank-order (Spearman/Kendall, top-k overlap where the consumer is a ranking). Never invent a tolerance. Before any conversion effort the legacy scorer is run twice on the same sample: if it is not bit-stable with itself an exact-match tolerance is structurally unachievable, so report that and get the tolerance revised. When scores diverge compare the intermediate feature values first; most divergence is in the feature pipeline, not the model. Evidence: sample manifest, both run commands/environments, per-metric table, verdict against the named tolerance version, divergence diagnosis. Verify the tolerance math, seeds and sample provenance rather than trusting the child's summary; no re-modeling, retraining or tolerance relaxation without explicit user approval, and whether a drift is acceptable is the customer's call, not the verifier's.
-5. **Write `<Pipeline>_wave<N>_recon.md`**: per-unit verdict table (PASS / FAIL / DRIFT-EXPLAINED), probe results, any finding with evidence, and the wave verdict. FAIL routes back to the orchestrator to reopen the unit; never fix converted code here, and never touch legacy.
-6. Update the ledger and hand the report to the orchestrator for **wave close** (notify: PRs, recon report, findings, in batch).
+1. Use a fresh verifier session with the plan, manifest, child results, tolerances, source-volume declaration, and target allowlist; never grade your own conversion.
+2. Choose LIVE when federation or an approved live path exists; use `--mode snapshot` for a customer export or in-perimeter dual-run when it does not. Record DEGRADED and the D10 reason.
+3. Run Tier 1 counts/aggregates, Tier 2 keyed samples and range fingerprints, then Tier 3 row diffs only for narrowed failures; check schema, nullability, precision, timezone, collation, and deletes.
+4. Keep all federated queries, partition copies, and legacy extracts under the recorded legacy-query concurrency cap; wide pulls use size tiers, not ad hoc scans.
+5. Probe adversarial boundaries: empty/all-null, duplicate keys, late arrivals, deletes, timezone/DST, decimal extremes, Unicode/collation, skew, retries, and reruns.
+6. Compare cross-unit totals and consumer outputs; for ML score parity compare features, seed/model version, distributions, and agreed numeric tolerance.
+7. Write a machine-readable report with mode, snapshot, populations, commands, counts, checksums, samples, failures, cap/cost, evidence paths, and finding codes. A result is PASS, FAIL, or DEGRADED with an explicit unverified-path register.
+8. Hand the report, PR list, and exceptions to the orchestrator for wave close; the orchestrator owns notification and merge decisions.
 
 ## Specifications
-- Gate re-runs use the `dbx-recon` CLI (`data-reconciliation` skill; its SKILL.md holds the one tier table and finding-code reference, which this playbook does not restate) with the unit's committed mapping and tolerance files, in `live` or `snapshot` mode. Gate on `result.json`, not on the PR text or the CLI stdout.
-- Deliverable: the wave recon report, every unit independently re-verified. Write it under `.migration/recon/wave-<N>/`, on its own branch when launched by the fan-out workflow, and touch nothing else in `.migration/`.
-- Validation: (1) every gate re-run from spec, not trusted from the PR; (2) probes executed and recorded even when all green; (3) any FAIL has evidence and a routed owner; (4) this session converted nothing in the wave.
+- Deliverable: independent wave report plus `dbx-recon` JSON and evidence ledger.
+- Validation: source and target are read-only to the verifier, checks are rerunnable, and a fresh session can reproduce the verdict.
 
-## Advice and Pointers
-- Independence is the point: do not read the children's diagnosis before re-running, or you will see what they saw.
-- Drift vs defect is the first triage question in any live-legacy comparison; timestamp everything.
-- The adversarial probes are where this pass earns its cost; the gate re-run mostly confirms, the probes occasionally catch the aggregate that hid a compensating error.
-- Keep it fast: this pass gates wave N+1's merge, and the fan-out is waiting. Parallelize the re-runs themselves where the warehouse allows.
-
-## Forbidden Actions
-- Do NOT fix converted code, modify legacy source, or adjust tolerances here.
-- Do NOT accept a PR's pasted evidence in place of re-execution.
-- Do NOT run this pass in a session that performed any of the wave's migration.
-- Do NOT mark DRIFT-EXPLAINED without the double-run evidence showing legacy movement.
+## Pointers
+Tier definitions, source access, load posture, and D10 rules are in this skill and `references/contract.md`.

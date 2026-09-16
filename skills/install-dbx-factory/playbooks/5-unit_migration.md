@@ -1,55 +1,33 @@
-Playbook: Convert ONE fan-out batch of migration units to the target state, prove parity with the reconciliation harness, and open one PR carrying the evidence. This is the child playbook the orchestrator launches N-wide per wave.
+Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed PR.
 
-## Overview
-You are one of potentially dozens of concurrent sessions. Everything you need is in your hand-off; everything you produce must be self-contained and self-graded. You convert your batch's units per the target profiles, run the recon gate, iterate to green, and open a PR whose description carries the full evidence. You never touch anything outside your batch.
+## Child checklist
 
-```
-[hand-off: batch spec]  ->  convert each unit per profile + dialect skill
-                        ->  build/deploy to the batch's isolated target area
-                        ->  run recon gate (dual-run vs live legacy)
-                        ->  FAIL: diagnose -> fix CONVERTED code only -> re-run to green
-                        ->  one PR: converted code + full recon evidence
-```
+### Before conversion
+- [ ] Read the complete hand-off: units, profiles, dictionary, dependencies, targets, branch, gate, tolerances, and `.migration/` path.
+- [ ] Run `factory-doctor --role child` with the capability contract, every unit, source secret/parameters, and hook probe; report BLOCKED on any failed check.
+- [ ] Confirm every write target is declared; never edit `.migration/` outside `.migration/recon/<unit_id>/`, `allowed_targets.json`, or the ledger.
+- [ ] Never edit `05_progress.md`; it is generated from wave results, and report every changed path in `result.json`.
 
-## What's Needed From User (from the orchestrator's hand-off; stop and ask if anything is missing)
-- The batch spec from the plan: unit list with source locations, workload types, target-profile references, field-dictionary rows, decided dependency entries the batch implements, branch name, and the recon plan rows with the exact gate commands and tolerances.
-- Repo topology, target catalog/schema, warehouse/compute identifiers, and secret names (never values).
-- The `.migration/` workspace path and the target-state artifact.
+### Convert and deploy
+- [ ] Convert each unit with CORE + workload profile + dialect skill; record systematic gaps as SKILL FEEDBACK.
+- [ ] Implement only the decided dependency mechanisms for this batch; never touch legacy sources.
+- [ ] Deploy only to the isolated namespace, idempotently, with Lakeflow Jobs owned by bundle/IaC and schedule PAUSED.
 
-## Procedure
-1. **Verify the hand-off is complete** before converting anything: every unit's source present, every profile referenced resolves, gate commands runnable. Run `factory-doctor --role child --expect-identity <userName from the brief's capability contract> --expect-host <host from the same contract> --unit <unit_id>` (one `--unit` per unit in the batch brief; the doctor resolves and verifies each `.migration/units/<unit_id>/mapping_spec.json` itself, so the set cannot be shortened) `--source-secret <the secret the recon gate passes as --source-dsn-secret> [--param name=value ...]` (the same values the gate will get) and do its hook probe; a `fail` (wrong identity or workspace, harness missing, hooks not applied, allowlist mismatch with the brief or not the committed copy, the source principal able to write an in-scope table, batch not named or a unit's mapping missing, declared delete evidence not readable on the source) is reported as `status=BLOCKED` with the check id. The PR must change nothing under `.migration/` except `.migration/recon/<unit_id>/`, and `result.json` reports every path the PR changes (`changed_paths`, from `git diff --name-only <base>...<head>`); the workflow downgrades any other ledger change to `ledger_tampered`, a tolerance you cannot live with is a report, not an edit. Never continue as a different identity, never run `databricks auth login`, never edit `allowed_targets.json`. A missing input is reported to the orchestrator immediately, not improvised around.
-2. **Confirm your write targets first**: before any deploy, check that every table, schema or shared object the conversion will write (shared objects: none, by definition) is in the brief's declared write-target list; the workflow checked that list for collisions across batches before you were launched, and `.migration/05_progress.md` is the orchestrator's to write (a child edit to it is `ledger_tampered`). A target the brief does not name is a lineage-extraction miss: stop and report it to the orchestrator, never add it (an undeclared target in your `result.json` `write_targets` halts the wave); proceeding anyway is forbidden.
-3. **Convert each unit** per CORE + its workload profile + the source-dialect skill. Look conversion rules up in the skill before reasoning them out from first principles; a rule the skill lacks that you had to derive belongs in SKILL FEEDBACK so no later child pays for the same derivation. Convert: SQL objects to Databricks SQL per the dialect rules; ETL mappings to the PIPELINE profile's runtime shape; schedules to the ORCHESTRATION profile; ML-SCORING units per that profile with the parity harness wired. The converted unit must produce identical results per the tolerance record, not merely valid syntax. Implement any decided dependency mechanisms assigned to this batch via `!dbx_dependency_resolution` implement mode.
-4. **Deploy to the batch's isolated target area** (own schema or table prefix per the plan) so parallel batches never collide. Never write to another batch's targets or shared objects. **Deploys must be idempotent**: drop and recreate the isolated area (or an equivalent idempotent bundle deploy) at the start of every run, so a relaunched child after a partial failure starts clean rather than reconciling against its own debris. Ledger status flips to RECON_GREEN only after the gate passes, never on deploy. **Lakeflow Jobs are deployed objects, not just code**: the unit's job lands as a bundle/IaC-owned object in the workspace, schedule PAUSED, named per the plan's naming convention (checked by the contract validator); cutover unpauses the exact object that was tested, it never deploys anything new. A unit whose job exists only as code in the PR has not delivered its deployable.
-5. **Run the recon gate exactly as specified, fixture-first**: children iterate against the **fixture layer** (`run_mode: fixture`); fixture scripts read their endpoint from the variable declared in `fixture_endpoints` and exit non-zero if it is unset, while the guard blocks the cloud CLI/SDK until that variable is present; the live legacy source is touched only where the plan explicitly grants the child a live budget, because the authoritative live proof is the parent's single uncontended window per wave, not N children hammering a shared warehouse through every fix round. Batch the check battery: one multi-metric statement per table, not one statement per metric, and run the whole battery in **one warehouse window per unit run** (each scattered burst pays a full auto-stop idle tail). The checks: row counts, per-column aggregates, row-level diffs on the declared keys, report-output comparison where the unit is a report. **Evidence-integrity rules, non-negotiable**: every rate or threshold is computed over the population the recon plan declares for that check, never a convenient superset or subset; parity is never measured against data this unit generated, seeded, or invented, the baseline is always source-derived per the plan; idempotency evidence must come from a run that actually wrote rows; and the fixture/environment is seeded to the volumes the hand-off states before any measurement (your isolated area is yours alone, seed it, do not assume it); and the evidence carries the contract's **declared source-volume assertion**: the row volume the source system actually holds for each table, asserted against what the unit processed, so a unit can never pass green against a population it generated itself (a pipeline proven on 478 self-made rows is proven, not sized). **Never babysit long-running work**: backfills and heavy recon run as Databricks jobs; launch them, record the run id in your result evidence, and work another unit (or end the pass) instead of polling in-session. Poll async APIs at generous intervals, never tight loops.
-6. **On FAIL, do not stop and do not paper over it**: capture the failing evidence verbatim, diagnose the root cause (dialect function semantics, type truncation, ordering nondeterminism, timezone), fix the **converted code only**, and re-run to green, re-running only the failed check on the failed unit, never the batch's green checks. **Full end-to-end re-runs are capped** (default 3 per unit, from the plan): a unit that needs a fourth full live re-run is escalated to the orchestrator with the evidence instead, because at that point the loop is compute-bound, not thinking-bound, and burning serverless time on repetition is a plan or dictionary defect to fix once, not a persistence test. If the root cause is systematic (would affect other units of this dialect), write it up for the skill/knowledge update in the PR description under `SKILL FEEDBACK`.
-7. **Self-review against the contract before opening the PR**: walk every gate item and every tolerance-record row against your recon JSON and evidence, as a reviewer would, and fix what fails on paper. This checklist pass needs no live re-run; a review round that bounces the PR costs a full round trip plus re-runs, the checklist costs minutes. **Review rounds are hard-capped** (default 3 after the self-check): at the cap, stop fixing, summarize what keeps bouncing and why, and escalate to the orchestrator; an unbounded review loop is the failure mode that turns one unit into a third of the run's cost, and the cap converts it into a 30-second human decision.
-8. If green cannot be reached because the legacy behavior itself is ambiguous against the tolerance record, stop and escalate to the orchestrator with the evidence; that is a tolerance decision, never a unilateral call.
-9. **Open one PR** into the pipeline branch, shaped for a reviewer's attention budget, not for completeness:
-   - **Evidence is tiered**: commit the full recon JSON, and beside it a ~30-line `recon.summary.md` (money lines with quarantine counts, idempotency proof, declared populations, halt basis). The PR renders the summary and links the JSON; a reviewer never opens a 400KB evidence file.
-   - **Fixed three-part body, ~2,000 characters cap**: (1) Decisions and **unverified paths / declared-unexercised** at the TOP, each with an **owner, severity, and the gate before which it must close** (that list is the cutover blocker register, not a footnote; 74 orphan lines nobody owns is not a decision surface), (2) Code, (3) Evidence (the summary, with links). Dependency entries flipped to IMPLEMENTED with evidence and the SKILL FEEDBACK section (possibly empty) follow.
-   - **Commit narrative**: ordered, semantically named commits (contract, implementation, recon evidence, fix rounds) so the PR reads commit-by-commit; this is the digestibility of a stack without its retarget/CI cost.
-   - **XL units only** (per the plan's sizing): split decision-first into two PRs, a ~100-line contract/decision PR the reviewer signs before the implementation exists, then the implementation PR. Never diff-split otherwise; measured cost of general stacking is 8-10x the review rounds for zero digestibility gain.
-   Report your rows (status, parity, unverified paths, cost, `write_targets`) in the structured result; the orchestrator regenerates `.migration/05_progress.md` from the wave result with `skills/migration-fanout/progress.py`, not by appending to it.
+### Reconcile
+- [ ] Run `dbx-recon` fixture-first with declared endpoints and fail closed when endpoints are missing; use one batched check window.
+- [ ] Check counts, aggregates, keyed diffs, report output, declared source volumes, populations, and idempotency evidence.
+- [ ] Launch heavy backfills/recon as jobs, record run IDs, and never babysit polling in-session.
+- [ ] On FAIL, capture evidence, fix converted code only, rerun only the failed check, and stop after three full runs.
+
+### Review and deliver
+- [ ] Self-review every gate, tolerance, unverified path, owner, severity, and closure gate; stop after three review rounds and escalate.
+- [ ] Run the live or snapshot merge verdict exactly once as specified; fixture PASS is not merge eligibility.
+- [ ] Keep the source principal read-only, use one warehouse window, and report connector/live budget and recon cost in the evidence.
+- [ ] Open one PR with changed paths, full recon JSON, short summary, three-part body, cost, write targets, and SKILL FEEDBACK.
 
 ## Specifications
-- The recon gate is the `dbx-recon` CLI from the `data-reconciliation` skill, never hand-written SQL: `dbx-recon run --unit <id> --family <source> --mapping ... --tolerances ... --mode fixture --target-catalog <migration catalog> --allowed-targets-file .migration/allowed_targets.json --target-schema <schema>` while fixing, then `--mode live` (or `snapshot` with `--snapshot-manifest <path>`) exactly once. `result.json` is the verdict; `recon.summary.md` goes in the PR. A fixture PASS is not a merge verdict.
-- Cap: 3 full recon runs. Still red after that: stop, report FAIL with a one-word failure class (for example `timestamp_precision`), do not keep iterating.
-- Deliverable: one PR per batch, recon green at the time of the run, evidence in the description. Do not edit `.migration/`; the orchestrator or workflow writes the ledger from your structured report.
-- Validation: (1) every unit in the batch converted and recon-green, or explicitly escalated; (2) no file outside the batch's scope touched; (3) no legacy source modified; (4) evidence sufficient for a reviewer to re-run the gate from the PR alone.
+- Deliverable: one PR per batch with recon evidence, or an explicit escalation.
+- Validation: all units green or escalated; scope is limited to the batch; legacy is untouched; evidence is rerunnable.
 
-## Advice and Pointers
-- The first recon failure is usually types, not logic: numeric truncation, AVG semantics, timestamp zones. Check the field dictionary's INFERRED rows first.
-- Nondeterministic legacy output diffs are resolved by the determinism rule in the recon plan, not by sorting until it passes; if no rule exists, escalate.
-- SKILL FEEDBACK is how 50 children make each other smarter; a systematic finding reported once saves 49 repeats.
-- Keep the batch's wall time short; a batch too big to finish in one session was mis-planned, so escalate rather than half-deliver.
-
-## Forbidden Actions
-- Do NOT modify legacy source to make reconciliation pass, ever.
-- Do NOT touch units, tables, or shared objects outside your batch, and do NOT write to another batch's target area.
-- Do NOT deploy a target the brief does not declare, and do NOT proceed past a write-target collision; you never write the ledger.
-- Do NOT relax, reinterpret, or skip any tolerance; escalate ambiguity.
-- Do NOT open a PR without recon evidence, without the pre-submit checklist pass, or without the run output captured.
-- Do NOT poll long-running work with sleep/pgrep loops; launch as jobs and verify later per step 5.
-- Do NOT widen your scope to fix something broken elsewhere; report it to the orchestrator.
-- Do NOT include demo/meta language in committed files or the PR.
+## Pointers
+The `data-reconciliation` skill owns tiers and finding codes; the workflow owns ledger and target enforcement.

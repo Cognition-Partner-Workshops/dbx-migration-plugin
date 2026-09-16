@@ -1,30 +1,12 @@
-Playbook: Front door for SQL warehouse estates (Redshift, Teradata, BigQuery, Synapse, Oracle EDW). Thin intake that pins the engine, loads the dialect skill, sets warehouse-family defaults, and then runs `!dbx_migrate_pipeline` in the same session. No migration method lives here.
+Playbook: Intake a warehouse/reporting workload and route it to migration analysis.
 
-## Overview
-The customer says "we're moving off Redshift." This playbook turns that into a configured run of the standard chain: engine and version pinned, catalog metadata access confirmed, dialect skill attached, and the warehouse-family defaults set. Everything after intake is the standard chain, unmodified.
+| Default | Rule |
+|---|---|
+| Intake | engine/version, catalogs/schemas, query history, views/procs/UDFs, BI consumers, schedules, SLAs, security |
+| Access | prefer Lakehouse Federation for supported read-only discovery; record source-query cost and concurrency |
+| Fallback | if federation is denied or unsupported, use customer export or connector path and record DEGRADED/D10 |
+| Dialect | route to an installed optional dialect skill; an adapter or Lakebridge flag does not prove a skill exists |
+| Orchestration | invoke `!dbx_migrate_pipeline` in this session after intake and profile selection |
 
-## What's Needed From User
-- The engine and version, and read access for Devin to the system catalogs (`information_schema`, `svv_*`, `dbc.*`) and query history. Query history is the census's consumer-detection source; if it is unavailable, D4 sweeps lose their best evidence and the user should know.
-- Whether a JDBC path from Databricks to the warehouse can be approved (Lakehouse Federation is the default coexistence and recon mechanism for this family; if refused, snapshots become the fallback and recon scope narrows accordingly).
-- The ingestion/BI landscape at a headline level (what loads the warehouse, what reads it), to seed the D3/D4 sweeps.
-
-## Procedure
-1. **Consume the intake template first**: if a filled `00_intake_template.md` was attached or committed, load it, mark its rows FACT, probe the environment to fill what it left blank (DISCOVERED), and propose defaults for the rest (PROPOSED). Ask live only what neither the template nor a probe can answer.
-2. Pin engine and version; probe catalog access with one live metadata query; register D10s for anything blocked.
-3. Attach the matching dialect skill: core ships `oracle-plsql`; `teradata-bteq`, `informatica-xml`, and `tsql-ssis` are optional skills under `skills-extra/` (install per its README before intake). No Redshift skill exists; Redshift follows the generic-ANSI plus build-the-skill path. Never claim a skill exists because an adapter or Lakebridge flag exists for the engine. If none exists: generic ANSI translation plus a build-the-skill wave-0 item from `skills/_dialect-skill-template.md`, stated plainly at intake. Load `target-routing` alongside the dialect skill; it names the official Databricks skill for each conversion target.
-4. Set family defaults for the chain: unit = view / procedure / scheduled query / load script; lineage extraction = catalog metadata + view dependency graphs + query history; SQL profile is the dominant surface; the physical design translation (dist/sort keys, partitioning to liquid clustering) is a named dictionary concern; federation-first coexistence.
-5. Record intake facts in `.migration/00_context.md` shape. Record `stop_mode` (default `soft`; `hard` only if the user asks, per engagement or per named stop) — see the orchestrator's Stop mode section. For the analytical target, the setup doctor invocation includes `--analytical-schema <catalog>.<schema>`. Then run `!dbx_migrate_pipeline` **in this same session**, right away. Do not open a new session, do not ask the user to run it, do not stop here: the orchestrator reads the intake facts you just wrote and begins ingest and setup as normal. The user's next message from Devin is STOP A.
-
-## Specifications
-- Deliverable: configured hand-off: engine pinned, access probed, dialect skill attached, family defaults recorded.
-- Validation: `!dbx_migrate_pipeline` was invoked in this session and the orchestrator can start ingest without re-asking anything this intake covered.
-
-## Advice and Pointers
-- Warehouse migrations look easier than ETL migrations and hide their difficulty in the same two places every time: engine-specific function semantics (numeric truncation, timestamp behavior) and the untracked consumer population. The dictionary and the D4 sweep are where this family's engagements are won.
-- Stored procedures are the schedule risk in this family: procedural dialects (Teradata SPL, Redshift plpgsql, T-SQL, PL/SQL) convert slower than views; the inventory's complexity ranking should weight them accordingly. The default target for a like-for-like procedure is a DBSQL stored procedure (SQL scripting, DBR 17+), not a PySpark rewrite; the SQL profile should say when PySpark is allowed.
-- Federation approval is the single highest-leverage early request; fire it at intake if the user can approve it directly.
-
-## Forbidden Actions
-- Do NOT begin inventory, analysis, or conversion here; hand off to the chain.
-- Do NOT assume federation is approvable; probe or ask, and register the answer.
-- Do NOT let missing query history pass silently; record the D4-evidence gap at intake.
+## Routing
+Use `CORE` + `SQL` + `CONSUMER` + `DATA / DEPENDENCY`; preserve query semantics, governance, and consumer contracts. Continue through setup, inventory, analysis, and plan.

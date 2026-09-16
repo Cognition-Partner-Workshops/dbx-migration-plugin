@@ -1,42 +1,21 @@
-Playbook: Close out one pipeline: end-to-end verification, consumer cutover plan executed, independent skeptical audit, dependency closure, evidence pack, and the user's explicit cutover authorization at STOP E.
+Playbook: Verify production readiness, obtain independent sign-off, and execute the customer-authorized cutover.
 
-## Overview
-Everything before this was construction; this is acceptance. The pipeline's converted code is merged, the parallel-run ledger shows sustained green, and the question is now: flip the consumers, close the dependencies, and agree what turns the legacy pipeline off. The audit is performed by a session that did not migrate anything in this pipeline, reading artifacts skeptically rather than trusting the ledger.
-
-```
-[waves merged + parallel-run green]  ->  end-to-end run on schedule  ->  evidence pack
-                                     ->  independent audit (fresh session)
-                                     ->  consumer cutover per D4 decisions
-                                     ->  dependency closure sweep  ->  STOP E (blocking)
-                                     ->  authorized: flip routing points, start decommission clock
-```
-
-## What's Needed From User
-- The cutover window and rollback posture (how long both systems stay warm after the flip).
-- Presence at STOP E: cutover authorization is never inferred, never carried over from a prior approval.
+## Entry criteria
+- All waves are merged and green; recon reports, target/governance parity, costs, and the unverified-path register are complete.
+- In DEGRADED mode, attach source/export manifests, coverage limits, and a customer-run in-perimeter recon as a STOP E entry criterion.
+- The deployable exists in the target catalog, scheduled jobs are paused or controlled, and the DEGRADED criterion is explicitly accepted or closed.
 
 ## Procedure
-1. **Entry criteria check**: all waves merged and green, parallel-run ledger shows the agreed N consecutive green cycles, no dependency entry UNDECIDED or IMPLEMENTED-without-evidence, no unclosed D10. **The unverified-path register is closed**: every unverified path carried on unit PRs has its owner, severity, and gate, and every line gated at or before STOP E is resolved or explicitly user-accepted; that register is the sign-off checklist finance/ops/audit sign, not a footnote. **The deployables exist**: every unit's job/Workflow is present in the workspace as a bundle/IaC-owned object, schedule PAUSED, named per convention; the flip unpauses tested objects, it deploys nothing new. **Governance parity**: the effective-access diff legacy vs UC is green: resolve, for every (principal, object) pair, what each side actually permits (role/group expansion included) into matched, lost-access and gained-access sets, and every lost or gained entry is user-accepted with a reason, and every source masking/row policy has a verified UC counterpart or a documented accepted gap; the parity report joins the evidence pack. Production-catalog grants from the approved mapping execute only as part of the STOP E flip, under the cutover principal. **If the engagement ran in DEGRADED recon mode**, one additional criterion: an in-perimeter recon run against production data, executed by the customer with the delivered harness, green and attached; sample parity alone never authorizes a production cutover. Any gap routes back before anything else happens.
-2. **End-to-end verification run**: execute the full converted pipeline on its production schedule shape (real trigger, real parameters, full volume), then run the complete recon suite over every terminal output. This is the only place the whole pipeline is proven as a system rather than as units.
-3. **Verify the evidence pack** in DOCS (waves append to it as they close; this step verifies completeness and fills gaps, it does not rebuild history): per-wave recon reports, the parallel-run ledger, the end-to-end run results, the dependency register's closure states, the tolerance record, and the deviations log (every accepted PROPOSED, every DRIFT-EXPLAINED, every deferral with its condition).
-4. **Independent skeptical audit**: a fresh session that performed no migration work walks the evidence pack against the plan: re-runs a sample of recon gates, checks the coverage arithmetic still closes (no unit silently dropped between inventory and merge), verifies every routing point exists and flips where the register says, and writes an audit memo with findings. Findings are fixed or explicitly accepted by the user, never quietly absorbed.
-5. **Consumer cutover rehearsal**: per D4 decision, verify each consumer's re-point mechanism against the non-production environment (dashboard renders from UC, extract byte-matches, API contract holds), and write the ordered cutover runbook with per-consumer rollback steps.
-6. **STOP E (blocking)**: attach the evidence pack, audit memo, and cutover runbook. Present the decommission condition (what must stay true for how long before legacy turns off) and the parallel-run disposition (keep during rollback window, then decommission). Get explicit authorization, always, regardless of stop_mode.
-7. **Execute the flip** per the runbook: routing points in register order, per-consumer verification after each, ledger updated after each. Start the decommission clock, regenerate `.migration/05_progress.md` from wave results and update `06_decisions.md`, and record what the next pipeline inherits (shared objects now live, tuned skills, updated knowledge notes).
+1. Assemble the evidence pack: inventory, analysis, plan, wave manifests/results, recon JSON, parallel-run ledger, audit memo, costs, open risks, and regenerated `05_progress.md`.
+2. Verify every path end to end with a fresh session: deployability, schema and governance parity, secrets, schedules, consumers, rollback, and idempotent rerun.
+3. Run an independent audit and a consumer rehearsal against the target; record failures as converted-code fixes or explicit exceptions.
+4. Regenerate `05_progress.md`, update `.migration/06_decisions.md`, and confirm no unverified path blocks cutover. Do not self-authorize the production flip.
+5. Present the evidence pack at STOP E; only the customer-held cutover principal authorizes the flip.
+6. Execute the approved consumer repoint, smoke test, rollback watch, and decommission clock; record timestamps, owners, and evidence.
 
 ## Specifications
-- Deliverable: merged, cut-over pipeline; evidence pack and audit memo in DOCS; executed runbook; decommission clock started with a written condition.
-- Validation: (1) audit performed by a non-migrating session; (2) every consumer verified post-flip; (3) every dependency closed or deferred-with-condition-and-owner; (4) STOP E authorization explicit, on this run.
+- Deliverable: signed evidence pack, STOP E authorization, cutover record, rollback watch, and decommission plan.
+- Validation: independent audit and rehearsal pass, all gates are cited, and no source modification occurred.
 
-## Advice and Pointers
-- The end-to-end run catches what unit recon cannot: orchestration wiring, parameter passing, schedule semantics, and cross-unit interactions merged since the last wave report.
-- Cut consumers over in blast-radius order: internal reports first, then dashboards, then external/partner feeds. Verify after each, not after all.
-- The decommission condition is the forcing function customers thank you for later; without a written condition, legacy runs forever and the migration never financially closes.
-- What this pipeline learned (dialect fixes, tolerance clarifications, skill updates) is the next pipeline's head start; spend ten minutes writing it down before closing.
-
-## Forbidden Actions
-- Do NOT let the migrating sessions audit their own work.
-- Do NOT cut over any consumer whose D4 mechanism lacks rehearsal evidence.
-- Do NOT proceed past STOP E on a prior session's approval, and do NOT infer authorization from silence.
-- Do NOT decommission or stop the parallel run before the written rollback window elapses.
-- Do NOT absorb audit findings silently; each is fixed or user-accepted on the record.
+## Pointers
+Cutover gates and notification behavior are in `references/contract.md`; source and target safety rules are in `AGENTS.md`.
