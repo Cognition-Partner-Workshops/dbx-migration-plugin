@@ -269,7 +269,8 @@ def test_expected_target_normalises_extreme_scales(oracle_map, source_type, expe
 
 @pytest.mark.parametrize("source_type, target_type, status, expected", [
     ("NUMBER(5,-2)", "double", "contradiction", "bigint"),
-    ("NUMBER(4,5)", "decimal(4,5)", "contradiction", "decimal(5,5)"),
+    ("NUMBER(4,5)", "decimal(4,5)", "contradiction",
+     "declared decimal(4,5) is not a valid databricks decimal: s > p; databricks decimals stop at 38"),
     ("NUMBER(4,5)", "decimal(5,5)", "ok", "decimal(5,5)"),
 ])
 def test_audit_field_normalises_extreme_scales(oracle_map, source_type, target_type, status, expected):
@@ -426,3 +427,21 @@ def test_wildcard_number_precision_anchors_at_38(oracle_map, oracle_lakebase_map
     spec = _spec([FieldMapping("N", "n", "NUMBER(*,39)", "")])
     new_spec, _ = apply_type_map(oracle_lakebase_map, spec)
     assert new_spec.objects[0].fields[0].target_type == "numeric(39,39)"
+
+
+@pytest.mark.parametrize("declared,status", [
+    ("decimal(38,10)", "ok"),       # the honest fill
+    ("decimal(38,99)", "contradiction"),  # s > p: no such decimal
+    ("decimal(38,-1)", "contradiction"),
+    ("decimal(0,0)", "contradiction"),
+    ("decimal(39,1)", "contradiction"),   # past the databricks ceiling
+])
+def test_a_declared_decimal_outside_the_kinds_shape_is_a_contradiction(oracle_map, declared, status):
+    result = audit_field(oracle_map, "NUMBER", declared)
+    assert result[0] == status
+    if status == "contradiction":
+        assert declared in result[1] and "38" in result[1]
+
+
+def test_lakebases_larger_decimal_ceiling_accepts_wider_declarations(oracle_lakebase_map):
+    assert audit_field(oracle_lakebase_map, "NUMBER(39,39)", "numeric(39,39)")[0] == "ok"

@@ -223,6 +223,20 @@ def audit_field(tm: TypeMap, source_type: str, target_type: str,
     if not (target_type or "").strip():
         return "undeclared", expected
     dname, dargs = _parse(target_type, kind=tm.target_kind)
+    # a declared decimal-family (p,s) that can't exist on the kind is a contradiction even
+    # when a wildcard pattern would swallow it
+    if (dname in _DECIMAL_SOURCES and len(dargs) == 2
+            and all(isinstance(a, int) for a in dargs)):
+        p_, s_ = dargs
+        bad = "s > p" if s_ > p_ else ("s < 0" if s_ < 0 else
+              ("p < 1" if p_ < 1 else
+               f"precision past {tm.target_kind}'s {tm.decimal_max_precision}"
+               if tm.decimal_max_precision is not None and p_ > tm.decimal_max_precision else None))
+        if bad:
+            cap = (f"; {tm.target_kind} decimals stop at {tm.decimal_max_precision}"
+                   if tm.decimal_max_precision is not None else "")
+            return "contradiction", (f"declared {dname}({p_},{s_}) is not a valid "
+                                     f"{tm.target_kind} decimal: {bad}{cap}")
     for pat in (expected, *accepts):
         if _target_matches(dname, dargs, pat, tm.target_kind):
             return "ok", expected
