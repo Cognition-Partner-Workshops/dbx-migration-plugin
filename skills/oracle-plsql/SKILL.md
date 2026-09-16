@@ -9,9 +9,9 @@ description: Source-dialect skill for Oracle SQL and PL/SQL estates (packages, p
 
 Source-side half only: what Oracle does, where each construct lands, and which recon tier catches a wrong conversion.
 Tracks: **A** is analytical Delta/DBSQL (MVs -> Pipelines, jobs -> Jobs); **L** is Lakebase Postgres via `!dbx_migrate_oltp` (tables, constraints, sequences, and triggers must behave identically).
-Route procedural logic containing `BEGIN`, `DECLARE`, `CREATE OR REPLACE`, or `DBMS_` to DBSQL SQL scripting first, Lakeflow Jobs control flow second, and PySpark last.
-Databricks-side facts come from `skills/target-routing/SKILL.md`; citations use `[dbsql:]`, `[jobs:]`, `[pipelines:]`, `[lakebase:]`, `[uc:]`, `[docs:]`, and `[pg17:]` for the corresponding official skills and docs.
-Lakebridge (`--source-dialect oracle`) is optional under `skills-extra/lakebridge/SKILL.md`; its seeded row covers static SQL.
+Procedural logic routes DBSQL SQL scripting first, Lakeflow Jobs control flow second, PySpark last.
+Databricks-side facts come from the official skills via `skills/target-routing/SKILL.md`, never restated here. Citations: `[dbsql:<file>#<section>]` = `databricks-dbsql/references/<file>`, likewise `[jobs:]`, `[pipelines:]`, `[lakebase:]`, `[uc:]`; `[docs:<path>]` = `docs.databricks.com/aws/en/sql/language-manual/<path>`; `[pg17:<page>]` = `postgresql.org/docs/17/<page>` (Lakebase product facts only from `[lakebase:]`).
+Lakebridge (`--source-dialect oracle`, optional: `skills-extra/lakebridge/SKILL.md`) handles static SQL; anything with `BEGIN`, `DECLARE`, `CREATE OR REPLACE (PACKAGE|PROCEDURE|FUNCTION|TRIGGER)` or `DBMS_` comes straight here.
 Recon rules live in `canonicalization.json`, loaded by `recon.config.load_canon_rules`; the type map names each rule.
 
 ## Type map

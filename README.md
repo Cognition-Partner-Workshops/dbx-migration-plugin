@@ -1,8 +1,8 @@
 # dbx-migration-factory (Devin plugin)
 
 Private, installable Devin plugin for Databricks migrations: source-dialect skills (Oracle PL/SQL
-and optional dialects), a reconciliation harness, a Lakebridge wrapper, enforcement hooks, a
-preflight doctor, always-on guardrail rules, and a bootstrap skill
+in core; other dialects and the Lakebridge wrapper are optional under `skills-extra/`), a
+reconciliation harness, enforcement hooks, a preflight doctor, always-on guardrail rules, and a bootstrap skill
 that imports the DBX playbook chain into the org.
 
 The factory owns the *migration* problem: source dialects, lineage, reconciliation, fan-out, human

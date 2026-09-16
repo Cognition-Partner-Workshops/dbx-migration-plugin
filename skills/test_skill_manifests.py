@@ -45,7 +45,7 @@ def test_extra_skills_are_not_in_core():
     extra = {p.name for p in (ROOT / "skills-extra").iterdir() if p.is_dir()}
     assert core.isdisjoint(extra)
     assert {"teradata-bteq", "informatica-xml", "tsql-ssis", "lakebridge"} <= extra
-    assert "redshift-" + "sql" not in core | extra
+    assert "redshift-sql" not in core | extra
 
 
 def test_extra_canonicalization_rules_load():
