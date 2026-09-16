@@ -51,13 +51,17 @@ def _manifest_bytes(path: Path, expected_sha):
     return manifest_path, manifest_bytes
 
 
-def _manifest_units(manifest_path: Path, manifest_bytes: bytes) -> dict:
+def _manifest(manifest_path: Path, manifest_bytes: bytes) -> dict:
     try:
         manifest = json.loads(manifest_bytes)
     except (UnicodeDecodeError, ValueError) as exc:
         raise ValueError(f"{manifest_path}: manifest is unreadable") from exc
     if not isinstance(manifest, dict):
         raise ValueError(f"{manifest_path}: manifest is not an object")
+    return manifest
+
+
+def _manifest_units(manifest_path: Path, manifest: dict) -> dict:
     batches = manifest.get("batches")
     if not isinstance(batches, list):
         raise ValueError(f"{manifest_path}: manifest batches is not a list")
@@ -66,13 +70,12 @@ def _manifest_units(manifest_path: Path, manifest_bytes: bytes) -> dict:
         if not isinstance(batch, dict):
             raise ValueError(f"{manifest_path}: manifest batch is not an object")
         batch_id = batch.get("id")
+        if batch_id in (None, ""):
+            raise ValueError(f"{manifest_path}: manifest batch has no id")
         batch_units = batch.get("units")
-        if batch_units is None:
-            continue
         if not isinstance(batch_units, list):
-            raise ValueError(f"{manifest_path}: manifest batch {batch_id!r} units is not a list")
-        if batch_id not in (None, ""):
-            units[_text(batch_id)] = batch_units
+            raise ValueError(f"{manifest_path}: manifest batch {batch_id!r} has no units")
+        units[_text(batch_id)] = batch_units
     return units
 
 
@@ -223,7 +226,7 @@ def _landed(repo: Path, pr_head: str, base_ref: str, pr_url: str) -> bool:
     base_branch = base_ref.removeprefix("origin/")
     try:
         provider = subprocess.run(
-            ["gh", "pr", "view", pr_url, "--json", "state,baseRefName"],
+            ["gh", "pr", "view", pr_url, "--json", "state,baseRefName,headRefOid"],
             check=False,
             capture_output=True,
             text=True,
@@ -238,6 +241,7 @@ def _landed(repo: Path, pr_head: str, base_ref: str, pr_url: str) -> bool:
         isinstance(details, dict)
         and details.get("state") == "MERGED"
         and details.get("baseRefName") == base_branch
+        and details.get("headRefOid") == pr_head
     )
 
 
@@ -312,7 +316,6 @@ def render_progress(mig: Path) -> str:
 
     rows = []
     for result, path in results:
-        wave = _wave(result, path)
         if not isinstance(result.get("batches"), list):
             raise ValueError(f"{path}: result batches is not a list")
         try:
@@ -323,6 +326,24 @@ def render_progress(mig: Path) -> str:
                     f"{path}: manifest_sha does not match the manifest (regenerate the result)"
                 ) from None
             raise
+        manifest = _manifest(manifest_path, manifest_bytes)
+        manifest_wave = manifest.get("wave")
+        if (
+            not isinstance(manifest_wave, int)
+            or isinstance(manifest_wave, bool)
+            or manifest_wave < 0
+        ):
+            raise ValueError(
+                f"{manifest_path}: manifest wave is not a non-negative integer"
+            )
+        filename_wave = _WAVE_NAME.fullmatch(path.name)
+        if (
+            ("wave" in result and result["wave"] != manifest_wave)
+            or filename_wave is not None
+            and int(filename_wave.group(1)) != manifest_wave
+        ):
+            raise ValueError(f"{path}: wave does not match the manifest")
+        wave = manifest_wave
         merged_record = _merged_record(path)
         merged_record_entries = merged_record.get("merged", {}) if merged_record else {}
         verify = result.get("verify")
@@ -334,31 +355,35 @@ def render_progress(mig: Path) -> str:
         merged_prs = verify.get("merged_prs") if isinstance(verify, dict) else None
         if merged_prs is not None and not isinstance(merged_prs, list):
             raise ValueError(f"{path}: verify merged_prs is not a list")
-        manifest_units = None
+        manifest_units = _manifest_units(manifest_path, manifest)
+        result_ids = []
         for batch in result["batches"]:
             if not isinstance(batch, dict):
                 raise ValueError(f"{path}: result batch is not an object")
             batch_id = batch.get("id")
             if batch_id in (None, ""):
                 raise ValueError(f"{path}: result batch has no id")
-            batch_id = _text(batch_id)
+            result_ids.append(_text(batch_id))
+        missing = sorted(set(manifest_units) - set(result_ids))
+        extra = sorted(set(result_ids) - set(manifest_units))
+        if missing or extra:
+            raise ValueError(
+                f"{path}: result batches do not match the manifest "
+                f"(missing {missing}, extra {extra})"
+            )
+        for batch in result["batches"]:
+            batch_id = _text(batch["id"])
             cost = batch.get("recon_cost")
             cost_text = json.dumps(cost, sort_keys=True, separators=(",", ":")) \
                 if isinstance(cost, dict) else ""
-            units = batch.get("units")
-            if not isinstance(units, list):
-                if manifest_units is None:
-                    try:
-                        manifest_units = _manifest_units(manifest_path, manifest_bytes)
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"{path}: batch {batch.get('id')!r} has no units and no readable manifest entry"
-                        ) from None
-                units = manifest_units.get(batch_id)
-                if not isinstance(units, list):
-                    raise ValueError(
-                        f"{path}: batch {batch_id!r} has no units and no readable manifest entry"
-                    )
+            embedded_units = batch.get("units")
+            if isinstance(embedded_units, list) and sorted(embedded_units) != sorted(
+                manifest_units[batch_id]
+            ):
+                raise ValueError(
+                    f"{path}: batch {batch_id!r} units do not match the manifest"
+                )
+            units = manifest_units[batch_id]
             if not units:
                 raise ValueError(f"{path}: batch {batch_id!r} has no units")
             verifier_verdict = (

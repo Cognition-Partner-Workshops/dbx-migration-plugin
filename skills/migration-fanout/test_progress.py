@@ -93,10 +93,12 @@ def test_render_progress_normalizes_numeric_batch_ids(tmp_path):
 
 def test_render_progress_rejects_empty_batch_id(tmp_path):
     mig = tmp_path / ".migration"
-    _write_result(mig, "wave-1.result.json", {
+    manifest_sha = _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}])
+    (mig / "waves" / "wave-1.result.json").write_text(json.dumps({
         "wave": 1,
+        "manifest_sha": manifest_sha,
         "batches": [{"id": "", "units": ["u1"]}],
-    })
+    }))
 
     with pytest.raises(ValueError, match=r"wave-1\.result\.json: result batch has no id"):
         render_progress(mig)
@@ -180,7 +182,7 @@ def test_render_progress_rejects_missing_manifest_units(tmp_path):
         "batches": [{"id": "w1-b01", "status": "PASS"}],
     })
 
-    with pytest.raises(ValueError, match=r"wave-1\.result\.json: batch 'w1-b01' has no units and no readable manifest entry"):
+    with pytest.raises(ValueError, match=r"wave-1\.json: manifest batch 'w1-b01' has no units"):
         render_progress(mig)
 
 
@@ -190,7 +192,7 @@ def test_render_progress_rejects_manifest_without_batch_units(tmp_path):
     waves.mkdir(parents=True)
     manifest_text = json.dumps({
         "wave": 1,
-        "batches": [{"id": "other", "units": ["u_a"]}],
+        "batches": [{"id": "w1-b01"}],
     })
     (waves / "wave-1.json").write_text(manifest_text)
     (waves / "wave-1.result.json").write_text(json.dumps({
@@ -199,8 +201,118 @@ def test_render_progress_rejects_manifest_without_batch_units(tmp_path):
         "batches": [{"id": "w1-b01", "status": "PASS"}],
     }))
 
-    with pytest.raises(ValueError, match=r"wave-1\.result\.json: batch 'w1-b01' has no units and no readable manifest entry"):
+    with pytest.raises(ValueError, match=r"wave-1\.json: manifest batch 'w1-b01' has no units"):
         render_progress(mig)
+
+
+def test_render_progress_rejects_manifest_batch_without_id(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 1, [{"units": ["u1"]}])
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"id": "b1", "units": ["u1"], "status": "FAIL"}],
+    })
+
+    with pytest.raises(ValueError, match=r"wave-1\.json: manifest batch has no id"):
+        render_progress(mig)
+
+
+def test_render_progress_rejects_result_missing_manifest_batch(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 1, [
+        {"id": "b1", "units": ["u1"]},
+        {"id": "b2", "units": ["u2"]},
+    ])
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"id": "b1", "units": ["u1"], "status": "PASS"}],
+    })
+
+    with pytest.raises(ValueError, match=r"result batches do not match the manifest \(missing \['b2'\], extra \[\]\)"):
+        render_progress(mig)
+
+
+def test_render_progress_rejects_result_extra_manifest_batch(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}])
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [
+            {"id": "b1", "units": ["u1"], "status": "PASS"},
+            {"id": "b2", "units": ["u2"], "status": "PASS"},
+        ],
+    })
+
+    with pytest.raises(ValueError, match=r"result batches do not match the manifest \(missing \[\], extra \['b2'\]\)"):
+        render_progress(mig)
+
+
+def test_render_progress_rejects_embedded_units_different_from_manifest(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}])
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"id": "b1", "units": ["u2"], "status": "PASS"}],
+    })
+
+    with pytest.raises(ValueError, match=r"batch 'b1' units do not match the manifest"):
+        render_progress(mig)
+
+
+def test_render_progress_renders_matching_embedded_units_from_manifest(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 1, [{"id": "b1", "units": ["u1", "u2"]}])
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"id": "b1", "units": ["u2", "u1"], "status": "FAIL"}],
+    })
+
+    lines = render_progress(mig).splitlines()
+
+    assert "| 1 | b1 | u1 | FAIL |  |  |  |  |  |" in lines
+    assert "| 1 | b1 | u2 | FAIL |  |  |  |  |  |" in lines
+    assert lines.index("| 1 | b1 | u1 | FAIL |  |  |  |  |  |") < lines.index(
+        "| 1 | b1 | u2 | FAIL |  |  |  |  |  |"
+    )
+
+
+def test_render_progress_rejects_result_wave_mismatch(tmp_path):
+    mig = tmp_path / ".migration"
+    manifest_sha = _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}])
+    (mig / "waves" / "wave-1.result.json").write_text(json.dumps({
+        "wave": 2,
+        "manifest_sha": manifest_sha,
+        "batches": [{"id": "b1", "units": ["u1"], "status": "FAIL"}],
+    }))
+
+    with pytest.raises(ValueError, match=r"wave-1\.result\.json: wave does not match the manifest"):
+        render_progress(mig)
+
+
+def test_render_progress_rejects_non_integer_manifest_wave(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}])
+    manifest_path = mig / "waves" / "wave-1.json"
+    manifest_path.write_text(json.dumps({
+        "wave": "1",
+        "batches": [{"id": "b1", "units": ["u1"]}],
+    }))
+    _write_result(mig, "wave-1.result.json", {
+        "batches": [{"id": "b1", "units": ["u1"], "status": "FAIL"}],
+    })
+
+    with pytest.raises(ValueError, match=r"manifest wave is not a non-negative integer"):
+        render_progress(mig)
+
+
+def test_render_progress_uses_manifest_wave_without_result_wave(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 3, [{"id": "b1", "units": ["u1"]}])
+    _write_result(mig, "wave-3.result.json", {
+        "batches": [{"id": "b1", "units": ["u1"], "status": "FAIL"}],
+    })
+
+    assert "| 3 | b1 | u1 | FAIL |  |  |  |  |  |" in render_progress(mig)
 
 
 def test_render_progress_rejects_non_list_result_batches(tmp_path):
@@ -412,9 +524,12 @@ def test_refresh_merged_records_ancestral_heads(tmp_path):
     mig = repo / ".migration"
     waves = mig / "waves"
     waves.mkdir(parents=True)
-    (waves / "wave-1.json").write_text(json.dumps({"wave": 1, "base_branch": "main"}))
     url_1 = "https://example.invalid/1"
     url_2 = "https://example.invalid/2"
+    _write_manifest(mig, 1, [
+        {"id": "b1", "units": ["u1"]},
+        {"id": "b2", "units": ["u2"]},
+    ], base_branch="main")
     _write_result(mig, "wave-1.result.json", {
         "wave": 1,
         "auto_merge": False,
@@ -598,7 +713,7 @@ def test_refresh_merged_uses_gh_fallback(tmp_path, monkeypatch):
     pr_url = "https://github.com/example/repo/pull/1"
     mig, waves = _refresh_result(repo, pr_head, pr_url)
     real_run = progress.subprocess.run
-    response = {"state": "MERGED", "baseRefName": "base"}
+    response = {"state": "MERGED", "baseRefName": "base", "headRefOid": pr_head}
 
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh" if name == "gh" else None)
 
@@ -616,6 +731,11 @@ def test_refresh_merged_uses_gh_fallback(tmp_path, monkeypatch):
     }
 
     (waves / "wave-1.merged.json").unlink()
+    response["headRefOid"] = "different-head"
+    refresh_merged(mig)
+    assert not (waves / "wave-1.merged.json").exists()
+
+    response["headRefOid"] = pr_head
     response["state"] = "OPEN"
     refresh_merged(mig)
     assert not (waves / "wave-1.merged.json").exists()
@@ -646,10 +766,12 @@ def test_render_progress_rejects_non_object_batch(tmp_path):
 
 def test_render_progress_rejects_batch_without_id(tmp_path):
     mig = tmp_path / ".migration"
-    _write_result(mig, "wave-1.result.json", {
+    manifest_sha = _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}])
+    (mig / "waves" / "wave-1.result.json").write_text(json.dumps({
         "wave": 1,
+        "manifest_sha": manifest_sha,
         "batches": [{"units": ["u1"]}],
-    })
+    }))
 
     with pytest.raises(ValueError, match=r"wave-1\.result\.json: result batch has no id"):
         render_progress(mig)
