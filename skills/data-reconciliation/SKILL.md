@@ -1,6 +1,6 @@
 ---
 name: data-reconciliation
-description: Run the reconciliation harness that gates every Databricks migration unit, wave, parallel-run cycle, and cutover. Use whenever a migration PR needs its recon verdict, a wave needs independent re-verification, or cutover needs final evidence. The harness verdict is the merge authority; nothing else self-certifies.
+description: Run the reconciliation harness that gates every Databricks migration unit, wave, parallel-run cycle, and cutover. Use whenever a migration PR needs its recon verdict, a wave needs independent re-verification, or cutover needs final evidence. The harness verdict is the merge authority; nothing else self-certifies. Also owns live-mode source access (Lakehouse Federation) and the materialize load-posture table.
 ---
 
 # data-reconciliation
@@ -90,6 +90,42 @@ provenance warning and the run is not merge-eligible.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.
 - Only PASS results in `live`, `snapshot`, or `transactional` mode have `merge_eligible=true`; fixture and continuous evidence never merges.
+
+## Source access
+
+### Live mode prerequisites (Lakehouse Federation)
+Federation is a read-only live view of a legacy source through a connection plus a foreign catalog.
+It is the default recon and coexistence bridge whenever a JDBC path exists.
+1. Fire network path and private-link/VPN requirements as an early D10 dependency; confirm the engine is supported.
+2. Put legacy credentials in a Databricks secret scope and reference scope/key names only.
+3. Create `CREATE CONNECTION ... OPTIONS (... secret(...))` with the read-only legacy principal, never an admin login.
+4. Create `CREATE FOREIGN CATALOG ... USING CONNECTION` and grant `USE` to the migration principal only.
+5. Verify a trivial `SELECT COUNT(*)` on an in-scope table, record it in the access checklist, and reuse existing connections/catalogs rather than duplicating them.
+- Federation is read-only by policy even where the engine allows writes; aggregates and filters push down, but wide row-level pulls do not, so large comparisons use the size tiers.
+- Every federated query loads the legacy production engine and counts against the legacy-query concurrency cap in the tolerance record.
+- Small-table backfill uses CTAS from the foreign catalog; federation is never the production consumer path.
+- At STOP E consumers point at Delta in the target catalog; federation remains a recon and rollback bridge until decommission.
+- If JDBC access is unavailable or security denies it, run DEGRADED recon from customer exports with `--mode snapshot` or an in-perimeter dual-run and record a D10; for an unsupported engine, use export/unload to cloud storage or JDBC via Spark with the same read-only principal.
+- Lakeflow Connect keeps a copy current under continuous legacy writes; it is not a read-in-place substitute and its connector row is below.
+
+### Load posture (materialize)
+| Class | Signal | Method |
+|---|---|---|
+| Small and static | below the size threshold, no in-flight writes | CTAS through federation, single shot |
+| Large and partitionable | above threshold, natural partition key (date, id range) | partitioned incremental copy with checkpointing and per-partition verification |
+| Very large or mutable, engine has a Lakeflow Connect connector | SQL Server (CT/CDC gateway, GA), Postgres/MySQL CDC, or query-based Oracle/Teradata/SQL Server/PG/MySQL | managed initial snapshot plus continuous CDC into the migration catalog; connector is the watermark and catch-up |
+| Very large or mutable, no connector | CDC-fed or continuously written | initial copy to a recorded watermark, then CDC catch-up via own extract or Auto Loader over exported change files, ordered against in-flight changes |
+| Restricted | no live read access | customer-run export or in-perimeter execution; DEGRADED recon rules apply |
+Prefer the connector row when the engine has one and its D10 prerequisites close in time; build it via `target-routing` -> `databricks-lakeflow-connect`, destination the batch's isolated schema in the migration catalog, schedule PAUSED until STOP E, and count query-based polling against the legacy-query cap.
+The output is a machine-readable table of object, class, method, partition key, watermark rule, verification rule, and projected legacy-side cost, attached to the plan and each unit handoff.
+- Checkpoint each partition in a load ledger with id, row count, and aggregate checksum; resume from it, and drop and recopy any unverified partial partition.
+- Verify each partition with this harness's aggregate check.
+- Share partition-copy parallelism with the legacy-query cap used by recon.
+- Run loads as checkpointed Databricks jobs: launch, record the run id in the ledger, verify later, and never poll in-session.
+- Customer DBA/platform owns CT/CDC enablement, connector DB user, and gateway path as D10 entries; never run `ALTER DATABASE` or `sp_cdc_enable_table`, and fall back to the hand-rolled row if prerequisites are open at wave launch.
+- Reconcile connector-fed tables at a recorded Tier 1/2 snapshot; CDC lag is a stated finding, and connector output never self-certifies.
+- For mutable tables without a connector, record the exact timestamp/SCN/LSN at copy start and re-verify catch-up in the cutover runbook; if no usable watermark exists and no freeze is possible, say so in the plan.
+
 ## Outputs (in `--out`)
 
 - `result.json`: machine-readable. The workflow gates on `verdict`, and the wave gate reads
