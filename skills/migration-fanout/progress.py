@@ -110,6 +110,13 @@ def _result(path: Path) -> dict:
     return result
 
 
+def _patch_lines(diff_text: str) -> list:
+    return [
+        line for line in diff_text.splitlines()
+        if line[:1] in "+-" and not line.startswith(("+++", "---"))
+    ]
+
+
 def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
     head_check = subprocess.run(
         ["git", "-C", str(repo), "cat-file", "-e", f"{pr_head}^{{commit}}"],
@@ -140,17 +147,6 @@ def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
                 f"merge-base rc={merged_head.returncode} for {pr_head}"
             )
 
-        cherry = subprocess.run(
-            ["git", "-C", str(repo), "cherry", base_ref, pr_head],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if cherry.returncode == 0 and cherry.stdout.strip() and not any(
-            line.startswith("+") for line in cherry.stdout.splitlines()
-        ):
-            return True
-
         merge_base = subprocess.run(
             ["git", "-C", str(repo), "merge-base", base_ref, pr_head],
             check=False,
@@ -175,6 +171,37 @@ def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
                 )
                 pid = patch_id.stdout.split()[0] if patch_id.returncode == 0 and patch_id.stdout.split() else ""
                 if pid:
+                    pr_patches = []
+                    pr_commits = subprocess.run(
+                        ["git", "-C", str(repo), "rev-list", "--reverse", f"{mb}..{pr_head}"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if pr_commits.returncode == 0:
+                        for commit in pr_commits.stdout.splitlines():
+                            commit_diff = subprocess.run(
+                                ["git", "-C", str(repo), "diff-tree", "-p", "--root", commit],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                            )
+                            if commit_diff.returncode != 0:
+                                continue
+                            commit_patch_id = subprocess.run(
+                                ["git", "-C", str(repo), "patch-id", "--stable"],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                                input=commit_diff.stdout,
+                            )
+                            if commit_patch_id.returncode == 0 and commit_patch_id.stdout.split():
+                                pr_patches.append(
+                                    (
+                                        commit_patch_id.stdout.split()[0],
+                                        _patch_lines(commit_diff.stdout),
+                                    )
+                                )
                     commits = subprocess.run(
                         ["git", "-C", str(repo), "rev-list", "-n", "500", base_ref, f"^{mb}"],
                         check=False,
@@ -182,6 +209,7 @@ def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
                         text=True,
                     )
                     if commits.returncode == 0:
+                        base_patches = {}
                         for commit in commits.stdout.splitlines():
                             commit_diff = subprocess.run(
                                 ["git", "-C", str(repo), "diff-tree", "-p", "--root", commit],
@@ -201,9 +229,17 @@ def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
                             if (
                                 commit_patch_id.returncode == 0
                                 and commit_patch_id.stdout.split()
-                                and commit_patch_id.stdout.split()[0] == pid
                             ):
-                                return True
+                                base_patches[commit_patch_id.stdout.split()[0]] = _patch_lines(
+                                    commit_diff.stdout
+                                )
+                        if base_patches.get(pid) == _patch_lines(diff.stdout):
+                            return True
+                        if pr_patches and all(
+                            base_patches.get(commit_pid) == commit_lines
+                            for commit_pid, commit_lines in pr_patches
+                        ) and len(pr_patches) == len(pr_commits.stdout.splitlines()):
+                            return True
 
     return False
 
