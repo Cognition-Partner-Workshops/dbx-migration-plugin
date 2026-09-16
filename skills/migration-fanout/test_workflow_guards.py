@@ -27,11 +27,11 @@ def _functions():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
-                                      "validate_gates"})
+                                      "validate_gates", "gates_approved"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
-                                                         "DECISION_ID"}
+                                                         "DECISION_ID", "HUMAN_PROVENANCE"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
@@ -168,6 +168,22 @@ def test_validate_manifest_accepts_every_gate_kind_and_status():
     validate_manifest(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "x", "gates": gates}]))
 
 
+def test_gates_sha_is_approved_only_by_a_human_stop_c_row():
+    gates_approved = _functions()["gates_approved"]
+    sha = "a" * 64
+    assert gates_approved(sha, f"| D-3 | 2024-05-01 | user:evt-9 | STOP C approved wave-2 gates_sha {sha} |\n")
+    for ledger in ("",
+                   f"| D-3 | default-accepted (soft, 60s) STOP C gates_sha {sha} |\n",   # not a human's row
+                   f"| D-3 | user:evt-9 STOP C gates_sha {'b' * 64} |\n",               # another gate list
+                   f"| D-3 | user:evt-9 STOP C {sha} |\n",                              # the value without its name
+                   f"| D-3 | user:evt-9 STOP C gates_sha {sha}0 |\n",                   # not the exact value
+                   f"| user:evt-9 STOP C gates_sha {sha} |\n",                          # no decision id
+                   f"| D-3 | user: STOP C gates_sha {sha} |\n"):                        # user: without an id
+        assert not gates_approved(sha, ledger), ledger
+    assert not gates_approved(None, f"| D-3 | user:evt-9 gates_sha {sha} |\n")
+    assert not gates_approved(sha[:-1], f"| D-3 | user:evt-9 gates_sha {sha[:-1]} |\n")
+
+
 def test_declared_gate_list_is_hashed_into_the_manifest():
     ns = _functions()
     validate_manifest, sha = ns["validate_manifest"], ns["declared_gates_sha"]
@@ -198,8 +214,8 @@ def test_declared_gate_list_is_hashed_into_the_manifest():
         {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"])
 
 
-GATES_LEDGER = ("| D-12 | user: waive g-w for u, export leg retired with the legacy feed |\n"
-                "| D-13 | user: waive g-other for u |\n")
+GATES_LEDGER = ("| D-12 | user:U1 waive g-w for u, export leg retired with the legacy feed |\n"
+                "| D-13 | user:U1 waive g-other for u |\n")
 
 
 def _gate_batch(*gates):
@@ -275,10 +291,12 @@ def test_waived_gate_whose_decision_is_not_in_the_ledger_fails_closed(ledger):
     assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "D-12" in out["one_line_summary"]
 
 
-def test_gate_check_runs_before_the_pr_gate_and_after_merge_authority():
+def test_gate_check_runs_last_after_the_pr_gate_and_merge_authority():
+    out = _run_gates(_gate_batch(dict(GATE)), {**_gate_report(), "pr_url": ""})
+    assert out["failure_class"] == "missing_pr"
     out = _run_gates(_gate_batch(dict(GATE)), _gate_report(merge_eligible=False))
     assert out["failure_class"] == "merge_authority"
-    out = _run_gates(_gate_batch(dict(GATE)), {**_gate_report(), "pr_url": ""})
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report())
     assert out["failure_class"] == "gates"
 
 

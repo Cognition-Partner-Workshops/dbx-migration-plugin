@@ -64,14 +64,18 @@ Manifest shape (written by the plan playbook, read here):
      "brief": "...complete hand-off text for this batch..."}
   ],
   "gates_sha": "<sha256>",                   # required; sha256 of the sorted {batch id: [[gate id, kind], ...]}
-                                              # map, compact JSON, recorded at STOP C. A gate renamed, added,
-                                              # dropped or swapped for another kind afterwards is a halt.
+                                              # map, compact JSON. The STOP C row of 06_decisions.md (user:<id>
+                                              # provenance) must say gates_sha <that value>; a gate renamed,
+                                              # added, dropped or swapped for another kind since is a halt.
   "smoke": true                              # only valid for wave 0, width 1, mode smoke
 }
 
 A child closes a pending or failed gate by reporting gates: [{id, status: passed, evidence}] with non-empty
 evidence; it cannot waive, rename or re-kind one. A PASS with any gate not passed (or waived by a ledger row)
-is recorded FAIL with failure_class gates, so the wave cannot close over it.
+is recorded FAIL with failure_class gates, so the wave cannot close over it. A wave gathered by hand (the
+orchestrator's small-wave path) applies the same rule with `python3 workflow.py gates <results.json>`, where
+the file is the children's [{batch, gates}] reports: it prints the overlaid gates and exits non-zero on any
+unmet one.
 
 Wave 0 uses the same workflow with `"wave": 0` and `"width": 1` for serial shared objects.
 """
@@ -84,6 +88,7 @@ import json
 import re
 import shlex
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -270,6 +275,17 @@ def override_decision(decision_id, units, ledger, word="merge_override"):
 def declared_gates_sha(batches):
     declared = {b["id"]: [[g["id"], g["kind"]] for g in b["gates"]] for b in batches}
     return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def gates_approved(sha, ledger):
+    """Whether a human's STOP C row of the ledger records this gate list: a D-<n> line with user:<id>
+    provenance saying `gates_sha <sha>`. The manifest alone cannot vouch for itself (editing the gates and
+    recomputing the hash there satisfies the manifest check)."""
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        return False
+    words = re.compile(rf"(?<![A-Za-z0-9_.-])gates_sha(?![A-Za-z0-9_.-]).*(?<![A-Za-z0-9_.-]){sha}(?![A-Za-z0-9_.-])")
+    return any(DECISION_ID.search(line) and HUMAN_PROVENANCE.search(line) and words.search(line)
+               for line in ledger.splitlines())
 
 
 def validate_gates(b):
@@ -491,6 +507,78 @@ def launch_base():
     return sha
 
 
+def gate_outcomes(batch, reported, ledger):
+    """The batch's gates after the child's report: a pending or failed gate takes the child's passed (with
+    evidence) or failed; a passed or waived gate is the plan's and stays. Returns the gates and what keeps
+    the unit from closing: any gate not passed, or waived without its ledger row naming gate and units."""
+    declared = {g["id"]: {**g, "decision_id": g.get("decision_id")} for g in batch.get("gates", [])}
+    unmet = []
+    if reported is None:
+        reported = []
+    if not isinstance(reported, list) or not all(isinstance(r, dict) for r in reported):
+        unmet.append("reported gates are not a list of {id, status, evidence} rows")
+        reported = []
+    seen = Counter(r.get("id") for r in reported)
+    for r in reported:
+        gid, g = r.get("id"), declared.get(r.get("id"))
+        if g is None:
+            unmet.append(f"gate {gid!r} reported but not declared for {batch['id']}")
+        elif (seen[gid] > 1 or set(r) - {"id", "status", "evidence"} or r.get("status") not in ("passed", "failed")
+              or not isinstance(r.get("evidence"), str) or (r["status"] == "passed" and not r["evidence"])):
+            unmet.append(f"gate {gid} report must be one {{id, status: passed|failed, evidence}} row, evidence "
+                         "non-empty when passed")
+        elif g["status"] == "passed" and (r["status"], r["evidence"]) == ("passed", g["evidence"]):
+            pass
+        elif g["status"] in ("passed", "waived"):
+            unmet.append(f"gate {gid} is {g['status']} in the plan; a child cannot change it")
+        else:
+            g.update(status=r["status"], evidence=r["evidence"])
+    for g in declared.values():
+        if g["status"] == "waived":
+            if not override_decision(g["decision_id"], [g["id"], *batch["units"]], ledger, word="waive"):
+                unmet.append(f"gate {g['id']} waived by {g['decision_id']} but no such row naming the gate and "
+                             f"{', '.join(batch['units'])} is in .migration/06_decisions.md")
+        elif g["status"] != "passed":
+            unmet.append(f"gate {g['id']} ({g['kind']}) is {g['status']}")
+    return list(declared.values()), unmet
+
+
+def gates_command(path):
+    """`workflow.py gates <results.json>`: the wave-close gate rule for a wave the orchestrator gathered by
+    hand. The file holds the children's [{batch, gates}] reports; every manifest batch must be in it once.
+    Prints {closed, batches: {id: {gates, unmet}}} and exits 1 unless every gate is passed or waived."""
+    try:
+        reports = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"{path}: cannot read the children's results: {e}") from None
+    if not isinstance(reports, list) or not all(isinstance(r, dict) and isinstance(r.get("batch"), str) for r in reports):
+        raise SystemExit(f"{path} must be a list of {{batch, gates}} rows, one per child")
+    by_batch = Counter(r["batch"] for r in reports)
+    unknown = sorted(set(by_batch) - {b["id"] for b in MANIFEST["batches"]})
+    if unknown or any(c > 1 for c in by_batch.values()):
+        raise SystemExit(f"{path}: batches not in the manifest {unknown}, reported twice "
+                         f"{sorted(b for b, c in by_batch.items() if c > 1)}")
+    ledger = decision_ledger()
+    out = {}
+    for b in sorted(MANIFEST["batches"], key=lambda b: b["id"]):
+        report = next((r for r in reports if r["batch"] == b["id"]), None)
+        if report is None:
+            gates, unmet = [dict(g, decision_id=g.get("decision_id")) for g in b["gates"]], [f"batch {b['id']} was not gathered"]
+        else:
+            gates, unmet = gate_outcomes(b, report.get("gates"), ledger)
+        out[b["id"]] = {"gates": gates, "unmet": unmet}
+    closed = not any(v["unmet"] for v in out.values())
+    print(json.dumps({"wave": MANIFEST["wave"], "closed": closed, "batches": out}, indent=2, sort_keys=True))
+    return 0 if closed else 1
+
+
+if not gates_approved(MANIFEST.get("gates_sha"), decision_ledger()):
+    raise SystemExit(f"manifest 'gates_sha' {MANIFEST.get('gates_sha')!r} is not in a human's STOP C row of {DECISIONS_PATH} "
+                     "(a D-<n> line with user:<id> provenance saying 'gates_sha <value>'); the manifest cannot approve "
+                     "its own gate list, so this run halts until STOP C records it")
+if sys.argv[1:2] == ["gates"]:
+    validate_manifest(MANIFEST)
+    sys.exit(gates_command(*sys.argv[2:3]) if len(sys.argv) == 3 else "usage: workflow.py gates <results.json>")
 validate_manifest(MANIFEST)
 BASE_SHA = launch_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
@@ -753,9 +841,10 @@ def child_prompt(batch):
         f"Units: {json.dumps(batch['units'], sort_keys=True)}\n"
         f"Write targets you own (never write anywhere else): "
         f"{json.dumps(batch.get('write_targets', []), sort_keys=True)}\n"
-        f"Acceptance gates STOP C declared for these units (report each by id in gates as passed with the "
-        f"evidence path, or failed; one still pending fails the unit; a waived one is the ledger's, not yours; "
-        f"never rename or re-kind a gate): {json.dumps(batch.get('gates', []), sort_keys=True)}\n\n"
+        f"Acceptance gates STOP C declared for these units that are still open (report each by id in gates as "
+        f"passed with the evidence path, or failed; one still pending fails the unit; a gate already passed or "
+        f"waived is the ledger's, not yours, and is not listed; never rename or re-kind a gate): "
+        f"{json.dumps([g for g in batch.get('gates', []) if g['status'] in ('pending', 'failed')], sort_keys=True)}\n\n"
         + capability_block(batch["units"])
         + "Rules that override anything else:\n"
         "- Do not edit files under .migration/ except your own recon evidence under "
@@ -881,12 +970,6 @@ async def run_batch(batch, sem, breaker):
             out["one_line_summary"] = (
                 f"PASS downgraded: recon evidence was {out.get('recon_mode')}/"
                 f"{out.get('recon_verdict')}; " + out["one_line_summary"])
-        if out["status"] == "PASS":
-            out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger())
-            if unmet:
-                out["status"] = "FAIL"
-                out["failure_class"] = "gates"
-                out["one_line_summary"] = "PASS downgraded: " + "; ".join(unmet) + "; " + out["one_line_summary"]
         if (out["status"] == "PASS"
                 and (not out.get("pr_url") or not out.get("branch"))):
             out["status"] = "FAIL"
@@ -942,6 +1025,12 @@ async def run_batch(batch, sem, breaker):
                     f"PASS downgraded: recon evidence is not merge_eligible=true for every unit ({why}) "
                     f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
                     ".migration/06_decisions.md; " + out["one_line_summary"])
+        if out["status"] == "PASS":
+            out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger())
+            if unmet:
+                out["status"] = "FAIL"
+                out["failure_class"] = "gates"
+                out["one_line_summary"] = "PASS downgraded: " + "; ".join(unmet) + "; " + out["one_line_summary"]
         # a replayed failure of this class was counted by the run being resumed; a replayed PASS (or FAIL of
         # another class) that the gate fails now was not
         if out["status"] != "PASS" and (record is None or (isinstance(record, dict) and (
@@ -988,38 +1077,8 @@ def cost_line(results, verify) -> str:
                if any("verify_depth" in b for b in BATCHES) else "") + ".")
 
 
-def gate_outcomes(batch, reported, ledger):
-    """The batch's gates after the child's report: a pending or failed gate takes the child's passed (with
-    evidence) or failed; a passed or waived gate is the plan's and stays. Returns the gates and what keeps
-    the unit from closing: any gate not passed, or waived without its ledger row naming gate and units."""
-    declared = {g["id"]: {**g, "decision_id": g.get("decision_id")} for g in batch.get("gates", [])}
-    unmet = []
-    if reported is None:
-        reported = []
-    if not isinstance(reported, list) or not all(isinstance(r, dict) for r in reported):
-        unmet.append("reported gates are not a list of {id, status, evidence} rows")
-        reported = []
-    seen = Counter(r.get("id") for r in reported)
-    for r in reported:
-        gid, g = r.get("id"), declared.get(r.get("id"))
-        if g is None:
-            unmet.append(f"gate {gid!r} reported but not declared for {batch['id']}")
-        elif (seen[gid] > 1 or set(r) - {"id", "status", "evidence"} or r.get("status") not in ("passed", "failed")
-              or not isinstance(r.get("evidence"), str) or (r["status"] == "passed" and not r["evidence"])):
-            unmet.append(f"gate {gid} report must be one {{id, status: passed|failed, evidence}} row, evidence "
-                         "non-empty when passed")
-        elif g["status"] in ("passed", "waived"):
-            unmet.append(f"gate {gid} is {g['status']} in the plan; a child cannot change it")
-        else:
-            g.update(status=r["status"], evidence=r["evidence"])
-    for g in declared.values():
-        if g["status"] == "waived":
-            if not override_decision(g["decision_id"], [g["id"], *batch["units"]], ledger, word="waive"):
-                unmet.append(f"gate {g['id']} waived by {g['decision_id']} but no such row naming the gate and "
-                             f"{', '.join(batch['units'])} is in .migration/06_decisions.md")
-        elif g["status"] != "passed":
-            unmet.append(f"gate {g['id']} ({g['kind']}) is {g['status']}")
-    return list(declared.values()), unmet
+
+
 
 
 def waived_gates(results):
