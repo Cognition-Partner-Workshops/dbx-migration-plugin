@@ -10,7 +10,7 @@ import json
 import re
 from pathlib import Path
 
-from .rerun import rerun_gap
+from .rerun import rerun_gap, rerun_unsupported
 from .tiers import TierResult
 
 MAX_FINDINGS_IN_REPORT = 50
@@ -73,7 +73,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and not structural_blind
                       and (mode != "snapshot" or snapshot is not None)
-                      and not rerun_gap(rerun_proof))
+                      and not rerun_gap(rerun_proof) and not rerun_unsupported(rerun_proof))
     reasons = []
     if structural is not None and (structural.findings or structural.stats.get("unverified")
                                    or structural.stats.get("dictionary_unavailable")
@@ -89,6 +89,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         reasons.append("snapshot_missing")
     if rerun_gap(rerun_proof):
         reasons.append("rerun_gap")
+    if rerun_unsupported(rerun_proof):
+        reasons.append("rerun_unsupported")
     return {
         "unit": unit,
         "mode": mode,

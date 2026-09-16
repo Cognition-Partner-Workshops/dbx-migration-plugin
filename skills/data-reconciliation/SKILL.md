@@ -109,8 +109,9 @@ provenance warning and the run is not merge-eligible.
   `CREATE TABLE IF NOT EXISTS` that never lands the new column). `rerun_proof.json` carries
   `{fresh: pass|fail, evolved: pass|fail|unsupported, findings}`; without an evolved record,
   or when the pre-created shape equals the declared one, `evolved` is `unsupported` with the
-  reason, never clean. `run --rerun-proof <file>` copies it into `result.json`; a failed leg
-  adds `rerun_gap` to `merge_block_reasons` and sets `merge_eligible=false`.
+  reason, never clean; a reordered column is a `column_order` finding. `run --rerun-proof <file>`
+  copies it into `result.json`; a failed leg adds `rerun_gap` to `merge_block_reasons`, an
+  unsupported evolved leg adds `rerun_unsupported`, and either sets `merge_eligible=false`.
 - Fixture shape (wave 0): `dbx-recon fixture-shape --family <f> --mapping <spec>
   --source-dsn-secret <NAME> --fixture-dsn-secret <NAME> --source-statement-cap <n> --out <dir>`
   compares the fixture copy with the real source per mapped table: column names, types (after
