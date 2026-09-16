@@ -1644,12 +1644,22 @@ def _patch_id(a, b):
 
 
 def _same_change(parent, commit, head):
-    """Whether commit's change against parent is head's change against its merge base with parent: what a
-    squash/rebase of head onto parent produces, and what an unrelated commit cannot reproduce."""
-    base = subprocess.run(["git", "-C", str(ROOT), "merge-base", head, parent],
+    """Whether commit is a squash or rebase of head: the change of the squash commit, or of the N
+    first-parent rebased commits ending at it, against what precedes them must be the gated head's
+    change against its merge base (git's patch-id of each range; an unrelated commit cannot match)."""
+    git = ["git", "-C", str(ROOT)]
+    base = subprocess.run(git + ["merge-base", head, commit],
                           check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+    n = int(subprocess.run(git + ["rev-list", "--count", f"{base}..{head}"],
+                           check=True, capture_output=True, text=True, timeout=300).stdout)
     want = _patch_id(base, head)
-    return bool(want) and want == _patch_id(parent, commit)
+    if not want:
+        return False
+    if want == _patch_id(parent, commit):
+        return True
+    start = subprocess.run(git + ["rev-parse", "--verify", "--quiet", f"{commit}~{n}"],
+                           check=False, capture_output=True, text=True, timeout=300)
+    return n > 1 and start.returncode == 0 and want == _patch_id(start.stdout.strip(), commit)
 
 
 def proven_merged(to_merge, reported):
@@ -1657,8 +1667,9 @@ def proven_merged(to_merge, reported):
     gated head (a commit appended after verification is not the verified tree) and origin's base tip carries
     the merge: a merge_commit_sha the wave-close step recorded (`gh pr view` state MERGED, merged_head the
     gated head) must be on the tip and, when it has two parents, name the gated head as its PR-side parent
-    (a single-parent squash/rebase commit has no PR-side parent, so its change against its parent must be
-    the gated head's change against its merge base — git's patch-id of both, the record alone binds nothing).
+    (a single-parent squash/rebase commit has no PR-side parent, so the change of the squash commit, or
+    of the N rebased commits ending at it, against what precedes them must be the gated head's change
+    against its merge base — git's patch-id of both, the record alone binds nothing).
     With no record — the step died, timed out, or dropped the PR — git alone still proves a
     merge commit on the base's first-parent line whose PR-side parent is the gated head. Whatever the close
     step reported or failed to report is reconciled against git."""

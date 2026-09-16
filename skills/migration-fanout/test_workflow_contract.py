@@ -1510,6 +1510,96 @@ def test_a_single_parent_record_must_carry_the_gated_heads_change(tmp_path):
     assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
 
 
+def _three_commit_pr(ws):
+    """A pushed PR of three commits (a.sql, b.sql, c.sql) still off the base; returns (url, A, head)."""
+    git = ["git", "-C", str(ws)]
+    for name, text in (("a.sql", "select 1"), ("b.sql", "select 2"), ("c.sql", "select 3")):
+        (ws / name).write_text(text)
+        subprocess.run(git + ["add", name], check=True)
+        subprocess.run(git + ["commit", "-qm", name], check=True)
+        if name == "a.sql":
+            sha_a = subprocess.run(git + ["rev-parse", "HEAD"],
+                                   check=True, capture_output=True, text=True).stdout.strip()
+    head = subprocess.run(git + ["rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:refs/pull/1/head", "HEAD:recon/wave-0"],
+                   check=True)
+    url = "https://github.com/acme/target/pull/1"
+    _PR_HEADS[url] = head
+    return url, sha_a, head
+
+
+def _advance_base(ws, commits):
+    """Move origin/migration/x past the PR's fork point with unrelated commits; returns the new tip."""
+    git = ["git", "-C", str(ws)]
+    subprocess.run(git + ["reset", "-q", "--hard", "origin/migration/x"], check=True)
+    for name, text in commits:
+        (ws / name).write_text(text)
+        subprocess.run(git + ["add", name], check=True)
+        subprocess.run(git + ["commit", "-qm", name], check=True)
+    tip = subprocess.run(git + ["rev-parse", "HEAD"],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    return tip
+
+
+def test_a_rebase_merge_of_several_commits_is_proven_by_the_rebased_range(tmp_path):
+    """A host's rebase merge lands the PR's commits one by one on the base and records the last as
+    mergeCommit: the N commits ending at the record must carry the gated head's whole change."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    git = ["git", "-C", str(ws)]
+    fork = subprocess.run(git + ["rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    pr, sha_a, head = _three_commit_pr(ws)
+    _advance_base(ws, [("u.sql", "select 0")])
+    subprocess.run(git + ["cherry-pick", f"{fork}..{head}"], check=True, capture_output=True)
+    mc = subprocess.run(git + ["rev-parse", "HEAD"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+
+
+def test_a_rebase_range_that_is_not_the_prs_change_is_not_proof(tmp_path):
+    """The last N first-parent commits ending at the record carry a different change than the gated
+    head's, so the record proves nothing."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    git = ["git", "-C", str(ws)]
+    pr, sha_a, head = _three_commit_pr(ws)
+    _advance_base(ws, [("u.sql", "select 0"), ("v.sql", "select -1")])
+    subprocess.run(git + ["cherry-pick", sha_a], check=True, capture_output=True)
+    (ws / "d.sql").write_text("select 9")
+    subprocess.run(git + ["add", "d.sql"], check=True)
+    subprocess.run(git + ["commit", "-qm", "d"], check=True)
+    mc = subprocess.run(git + ["rev-parse", "HEAD"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_multi_commit_squash_is_still_proven(tmp_path):
+    """A squash of a multi-commit PR is one commit carrying the head's whole tree; the single-parent
+    check compares its full change, not the head's last commit."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr, sha_a, head = _three_commit_pr(ws)
+    _squash_merge_to_base(ws)
+    mc = subprocess.run(["git", "-C", str(ws), "rev-parse", "origin/migration/x"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+
+
 def test_a_record_whose_merged_head_is_not_the_gated_head_is_not_proven(tmp_path):
     ws, cwd = _workspace(tmp_path, auto_merge=True)
     pr = _unproven_pr(ws)
