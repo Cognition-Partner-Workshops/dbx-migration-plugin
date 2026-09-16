@@ -28,8 +28,9 @@ redoes finished work.
 4. Write the pointer at `~/.migration/waves/current.json` — the `run_workflow` sandbox's
    cwd is the session home directory, not the repo, and the script looks for the pointer
    at or above its cwd — with
-   `{"manifest": "wave-<N>.json", "mode": "start", "run_id": null, "hook_probe": "blocked:<nonce>", "workspace": "/abs/path/to/repo"}`.
-   `run_id` is null on a first run: the tool only reports it once the run starts.
+   `{"manifest": "wave-<N>.json", "mode": "start", "run_id": null, "hook_probe": "blocked:<nonce>", "workspace": "/abs/path/to/repo", "plugin": "<plugin>"}`.
+   `run_id` is null on a first run: the tool only reports it once the run starts. `plugin` is the
+   plugin root; the script runs `skills/target-routing/pipeline_updates.py` from it before launch.
 5. Run:
    `run_workflow(workflow_name="migration-wave-<N>", script_path="<plugin>/skills/migration-fanout/workflow.py")`.
 6. Record the returned `run_id` in `.migration/waves/wave-<N>.run_id`, commit, read
