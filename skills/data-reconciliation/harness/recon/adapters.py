@@ -21,6 +21,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .fingerprint import DIGEST_MODULUS
 from .fingerprint import normalise as _digest_value
+from .rerun import normalize_type
 from .watermarks import instant
 from .watermarks import literal as watermark_literal
 
@@ -1389,6 +1390,17 @@ class DatabricksTargetAdapter:
             lambda sql, params: self._sql._rows(sql, params),
             self._catalog, self._schema, object, column)
 
+    def column_shape(self, object: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order for the rerun proof (recon.rerun)."""
+        rows = self._sql._rows(
+            f"SELECT column_name, full_data_type, is_nullable, ordinal_position "
+            f"FROM {quote_ident(self._catalog, '`')}.information_schema.columns "
+            "WHERE table_catalog = %(catalog)s AND table_schema = %(schema)s AND table_name = %(table)s "
+            "ORDER BY ordinal_position",
+            {"catalog": self._catalog, "schema": self._schema, "table": object})
+        return [{"name": str(name).lower(), "type": normalize_type(dtype),
+                 "nullable": str(nullable).upper() != "NO"} for name, dtype, nullable, _ in rows]
+
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
         return self._sql.table_aggregates(self._q(object), columns, numeric, where)
@@ -1783,6 +1795,17 @@ class LakebaseTargetAdapter(_PostgresBase):
 
     def identity_state(self, object: str, column: str) -> IdentityState | None:
         return super().identity_state(self._q(object), column)
+
+    def column_shape(self, object: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order for the rerun proof (recon.rerun)."""
+        rows = self._rows(
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attnum "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped "
+            "ORDER BY a.attnum", (self._schema, object))
+        return [{"name": str(name).lower(), "type": normalize_type(dtype), "nullable": not notnull}
+                for name, dtype, notnull, _ in rows]
 
     def null_key_count(self, object: str, key_fields: list[str], where: str | None = None) -> int:
         return super().null_key_count(self._q(object), key_fields, where)

@@ -30,6 +30,7 @@ from .config import (
 )
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
+from .rerun import check_proof, declared_shape, grade_rerun, load_record, load_shape
 from .typemap import apply_type_map, load_type_map
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres")
@@ -185,6 +186,29 @@ def main(argv: list[str] | None = None) -> int:
                         "undeclared target types like `run` does)")
     e.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
     e.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
+    rp = sub.add_parser("rerun-proof", help="grade the schema-evolution rerun proof from the "
+                        "child's two run records (no connections); writes <out>/rerun_proof.json")
+    rp.add_argument("--unit", required=True)
+    rp.add_argument("--ddl", type=Path,
+                    help="the unit's committed DDL; the shape it declares is what both runs must land")
+    rp.add_argument("--expected-shape", type=Path,
+                    help="shape JSON instead of --ddl when the DDL is generated at run time")
+    rp.add_argument("--fresh", required=True, type=Path,
+                    help="run record from the fresh-target run (dbx-recon shape after the job)")
+    rp.add_argument("--evolved", type=Path,
+                    help="run record from the run against the table pre-created in its previous "
+                         "committed shape, with pre_shape read before the job; omitted = unsupported")
+    rp.add_argument("--out", required=True, type=Path)
+    sh = sub.add_parser("shape", help="read the observed column shape of target tables into a "
+                        "shape JSON (read-only; the rerun proof's record input)")
+    sh.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
+    sh.add_argument("--target-secret", required=True)
+    sh.add_argument("--target-catalog", required=True)
+    sh.add_argument("--allowed-targets-file", type=Path,
+                    default=Path(".migration/allowed_targets.json"))
+    sh.add_argument("--target-schema", required=True)
+    sh.add_argument("--table", action="append", required=True)
+    sh.add_argument("--out", required=True, type=Path)
     r = sub.add_parser("run", help="run the recon gate for one unit")
     r.add_argument("--unit", required=True)
     r.add_argument("--family", required=True, choices=SOURCE_FAMILIES)
@@ -222,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="resolve a ${name} placeholder in the mapping spec's where clauses "
                         "(e.g. partition/date scoping); repeatable; recorded in result.json")
+    r.add_argument("--rerun-proof", type=Path,
+                   help="rerun_proof.json from `dbx-recon rerun-proof`; a failed leg blocks merge "
+                        "with reason rerun_gap")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -275,6 +302,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(out))
         return 0
 
+    if args.cmd == "rerun-proof":
+        if (args.ddl is None) == (args.expected_shape is None):
+            raise SystemExit("rerun-proof needs exactly one of --ddl or --expected-shape")
+        try:
+            if args.ddl is not None:
+                expected = declared_shape(args.ddl.read_text())
+            else:
+                expected = load_shape(args.expected_shape)
+            proof = grade_rerun(expected, load_record(args.fresh, "fresh"),
+                                load_record(args.evolved, "evolved") if args.evolved else None)
+        except (OSError, ConfigError) as exc:
+            raise SystemExit(f"rerun-proof: {exc}") from None
+        proof = {"unit": args.unit, "expected_from": str(args.ddl or args.expected_shape), **proof}
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "rerun_proof.json").write_text(json.dumps(proof, indent=2) + "\n")
+        print(json.dumps(proof))
+        return 0 if proof["passed"] else 1
+
     if args.cmd == "run" and args.mode in PLANNED_MODES:
         raise SystemExit(f"--mode {args.mode} is not implemented in this harness version")
     if args.cmd == "run" and args.mode == "transactional" \
@@ -285,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
             "one. Analytical-track units reconcile with --mode snapshot or live at a stated "
             "consistency point. See 14-front_door_oltp.")
 
-    params = parse_params(args.param)
+    params = parse_params(args.param) if args.cmd != "shape" else {}
     if args.cmd == "estimate":
         if args.canonicalization and not args.family:
             raise SystemExit("--canonicalization needs --family so its type_map is selected")
@@ -317,6 +362,21 @@ def main(argv: list[str] | None = None) -> int:
         TargetIdentityError,
         is_untested_source_family,
     )
+    if args.cmd == "shape":
+        try:
+            if args.target_kind == "lakebase":
+                target = LakebaseTargetAdapter(args.target_secret, target_catalog, target_schema)
+            else:
+                target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
+            tables = {_single_identifier(t, "table"): target.column_shape(t) for t in args.table}
+        except (TargetIdentityError, ConfigError) as exc:
+            raise SystemExit(f"shape: {exc}") from None
+        shape = {"target_kind": args.target_kind, "catalog": target_catalog, "schema": target_schema,
+                 "read_at": dt.datetime.now(dt.timezone.utc).isoformat(), "tables": tables}
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(shape, indent=2) + "\n")
+        print(json.dumps({"tables": {t: len(c) for t, c in tables.items()}, "out": str(args.out)}))
+        return 0
     if is_untested_source_family(args.family):  # refused before any input file is read
         raise SystemExit(f"--family {args.family}: {args.family} source adapter is untested; "
                          "see SKILL.md")
@@ -327,6 +387,13 @@ def main(argv: list[str] | None = None) -> int:
     rules = load_canon_rules(args.canonicalization)
 
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
+    rerun_proof = None
+    if args.rerun_proof is not None:
+        try:
+            rerun_proof = check_proof(json.loads(args.rerun_proof.read_text()), args.unit,
+                                      str(args.rerun_proof))
+        except (OSError, json.JSONDecodeError, ConfigError) as exc:
+            raise SystemExit(f"--rerun-proof: {exc}") from None
     try:
         ops = json.loads(args.ops.read_text()) if args.ops else None
     except (OSError, json.JSONDecodeError) as exc:
@@ -362,7 +429,8 @@ def main(argv: list[str] | None = None) -> int:
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
-                       source_family=args.family, depth=args.depth, type_map=type_map)
+                       source_family=args.family, depth=args.depth, type_map=type_map,
+                       rerun_proof=rerun_proof)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")

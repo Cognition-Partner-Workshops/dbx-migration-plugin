@@ -101,6 +101,16 @@ provenance warning and the run is not merge-eligible.
   tier has findings or unverifiable objects. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
+- Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --ddl <unit ddl> --fresh
+  <record> --evolved <record> --out <dir>` grades the idempotency job twice from two run
+  records (`dbx-recon shape` reads a target's observed columns, read-only): once on a fresh
+  target, once against the table pre-created in its previous committed shape (git history or
+  the prior wave's DDL; `harness/fixtures/example_rerun/` is the canonical failing case, a
+  `CREATE TABLE IF NOT EXISTS` that never lands the new column). `rerun_proof.json` carries
+  `{fresh: pass|fail, evolved: pass|fail|unsupported, findings}`; without an evolved record,
+  or when the pre-created shape equals the declared one, `evolved` is `unsupported` with the
+  reason, never clean. `run --rerun-proof <file>` copies it into `result.json`; a failed leg
+  adds `rerun_gap` to `merge_block_reasons` and sets `merge_eligible=false`.
 - Tiers 5-7 run even when tier 1 fails, so a FAIL names the keys, lag, and schema gaps rather than just a count.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.
