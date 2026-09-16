@@ -394,26 +394,35 @@ def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None
     return Check("allowlist_matches_contract", "ok", f"allowlist catalogs match the contract: {cats}", data)
 
 
-# Files in the playbooks dir that are documentation, not importable playbooks (the README itself
-# and the pre-kickoff intake form the front doors consume).
-_NOT_PLAYBOOKS = frozenset({"0-README.md", "00_intake_template.md"})
-_README_MACRO_ROW = re.compile(r"\|\s*`([^`]+\.md)`\s*\|[^|]*\|\s*`(![\w]+)`\s*\|")
+# Files in the playbooks dir that are not importable playbooks (the pre-kickoff intake form).
+_NOT_PLAYBOOKS = frozenset({"00_intake_template.md"})
+PLAYBOOKS_INDEX = "index.json"
 
 
 def _repo_playbooks(plugin_root: Path) -> dict[str, tuple[str, str]]:
-    """macro -> (repo_file, sha256 of the file bytes). Macros come from the Files table in
-    playbooks/0-README.md: rows `| `<file>` | <title> | `!<macro>` |`."""
+    """macro -> (repo_file, sha256 of the file bytes), from playbooks/index.json
+    (`{"playbooks": [{"file", "title", "macro"}, ...]}`)."""
     playbooks = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
     macros: dict[str, tuple[str, str]] = {}
-    readme = playbooks / "0-README.md"
-    if readme.is_file():
-        for line in readme.read_text().splitlines():
-            m = _README_MACRO_ROW.match(line)
-            if not m:
-                continue
-            p = playbooks / m.group(1)
-            if p.is_file() and p.name not in _NOT_PLAYBOOKS:
-                macros[m.group(2)] = (p.name, hashlib.sha256(p.read_bytes()).hexdigest())
+    index = playbooks / PLAYBOOKS_INDEX
+    if not index.is_file():
+        return macros
+    try:
+        doc = json.loads(index.read_text())
+    except ValueError:
+        return macros
+    if not isinstance(doc, dict):
+        return macros
+    rows = doc.get("playbooks", [])
+    if not isinstance(rows, list):
+        return macros
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        p = playbooks / str(row.get("file", ""))
+        macro = str(row.get("macro", ""))
+        if p.is_file() and p.name not in _NOT_PLAYBOOKS and macro.startswith("!"):
+            macros[macro] = (p.name, hashlib.sha256(p.read_bytes()).hexdigest())
     return macros
 
 
@@ -463,7 +472,7 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str,
                 (("malformed", data["malformed"]), ("stale", data["stale"]),
                  ("missing", data["missing"]), ("unknown", data["unknown"])) if v]
     if data["unlisted"]:
-        findings.append(f"not in the 0-README Files table: {', '.join(data['unlisted'])}")
+        findings.append(f"not in playbooks/{PLAYBOOKS_INDEX}: {', '.join(data['unlisted'])}")
     live = live_playbooks or ws / LIVE_PLAYBOOKS
     data["live"] = None
     data["duplicate"] = {}
