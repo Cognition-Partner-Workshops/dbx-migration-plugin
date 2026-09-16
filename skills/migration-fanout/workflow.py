@@ -380,6 +380,10 @@ def target_key(name, namespace=""):
     return ".".join(parts)
 
 
+def valid_namespace(value):
+    return isinstance(value, str) and all(re.fullmatch(r"[a-z_][\w$]*", s) for s in target_key(value).split("."))
+
+
 def reads_target(obj, table, namespace=""):
     """A mapping object reads the target when both resolve to the same identity."""
     o = target_key(obj, namespace)
@@ -406,8 +410,7 @@ def validate_manifest(m, doctor=None):
     if not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
             and ".." not in m["base_branch"]):
         raise SystemExit("manifest 'base_branch' must be a plain branch name (letters, digits, _ . / -)")
-    if "target_namespace" in m and not (isinstance(m["target_namespace"], str) and all(
-            re.fullmatch(r"[a-z_][\w$]*", s) for s in target_key(m["target_namespace"]).split("."))):
+    if "target_namespace" in m and not valid_namespace(m["target_namespace"]):
         raise SystemExit("manifest 'target_namespace' must be the dotted catalog.schema (or schema) the harness run is "
                          "given, so a bare write target or mapping object is that table and no other")
     if m["base_branch"] in ("main", "master") and not (
@@ -1042,8 +1045,10 @@ VERIFY_SCHEMA = {
 
 
 def other_wave_manifests(waves_dir, current):
-    """{file name: batches} for every other wave-*.json in .migration/waves/. A wave the plan wrote
-    is part of the collision picture whether or not it has run, so one that cannot be read halts."""
+    """{file name: {target_namespace, batches}} for every other wave-*.json in .migration/waves/: a bare
+    write target means the table in the namespace of the manifest that declares it, so each wave's is kept
+    with its batches. A wave the plan wrote is part of the collision picture whether or not it has run, so
+    one that cannot be read halts."""
     out = {}
     for p in sorted(waves_dir.glob("wave-*.json")):
         if p.name == current or p.name.endswith((".result.json", ".doctor.json")):
@@ -1061,7 +1066,12 @@ def other_wave_manifests(waves_dir, current):
                 for b in batches):
             raise SystemExit(f"{p} has no 'batches' list of {{id, units, write_targets}} rows; every wave manifest is "
                              "read for cross-wave write-target collisions, so fix or remove it, then re-run")
-        out[p.name] = batches
+        namespace = m.get("target_namespace", "")
+        if "target_namespace" in m and not valid_namespace(namespace):
+            raise SystemExit(f"{p} 'target_namespace' must be the dotted catalog.schema (or schema) its harness run is "
+                             "given; every wave manifest is read for cross-wave write-target collisions, so fix it, "
+                             "then re-run")
+        out[p.name] = {"target_namespace": namespace, "batches": batches}
     return out
 
 
@@ -1204,7 +1214,8 @@ def check_write_targets(batches, other_waves, mapping=None, namespace=""):
     A table written by units in different waves is shared: whole-table recon of the earlier unit is
     undone by the later one's rows, so every mapping that reads it must be bounded (target_where to the
     unit's own partition or run date), or this wave does not launch. Every name here, written or read,
-    goes through target_key with the manifest's target_namespace, so one table has one identity."""
+    goes through target_key with the target_namespace of the wave that declares or reads it, so one table
+    has one identity and a bare name is never read in another wave's namespace."""
     mapping = unit_mapping if mapping is None else mapping
     owners, spelled = {}, {}
     for b in batches:
@@ -1214,11 +1225,16 @@ def check_write_targets(batches, other_waves, mapping=None, namespace=""):
                 raise SystemExit(f"write-target collision before launch: '{t}' is claimed by "
                                  f"{owners[k]} and {b['id']}. Fix the wave plan, then re-run.")
             owners[k], spelled[k] = b["id"], t
-    elsewhere = {}
-    for name, others in other_waves.items():
-        for b in others:
+    elsewhere, namespaces = {}, {None: namespace}
+    for name, other in other_waves.items():
+        if not (isinstance(other, dict) and isinstance(other.get("batches"), list) and "target_namespace" in other
+                and (other["target_namespace"] == "" or valid_namespace(other["target_namespace"]))):
+            raise SystemExit(f"{name} has no {{target_namespace, batches}} record; every wave manifest is read for "
+                             "cross-wave write-target collisions, so fix it, then re-run")
+        namespaces[name] = other["target_namespace"]
+        for b in other["batches"]:
             for t in b["write_targets"]:
-                elsewhere.setdefault(target_key(t, namespace), []).append((name, b))
+                elsewhere.setdefault(target_key(t, namespaces[name]), []).append((name, b))
     for k, mine in owners.items():
         if k not in elsewhere:
             continue
@@ -1237,7 +1253,7 @@ def check_write_targets(batches, other_waves, mapping=None, namespace=""):
                 if spec is None:
                     raise SystemExit(f"{why}: {path} is missing, so unit {u}{where} cannot be scoped")
                 try:
-                    problem = bounded_readers(spec, t, namespace)
+                    problem = bounded_readers(spec, k, namespaces[wave])
                 except SystemExit as e:
                     raise SystemExit(f"{why}: {path}: {e}") from None
                 if problem is None:

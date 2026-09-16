@@ -28,7 +28,7 @@ def _functions():
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
-                                      "unit_mapping", "bounded_readers", "target_key", "reads_target", "bounded_predicate",
+                                      "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
                                       "column_key"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
@@ -141,7 +141,14 @@ SCOPE = ["run_date", "unit_id", "region", "run_id", "batch_id", "run date", "Dat
 BOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": SCOPE,
                         "root_where": "run_date = '${as_of}'", "target_where": "run_date = '${as_of}'"}]}
 UNBOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": SCOPE}]}
-OTHERS = {"wave-1.json": [B2]}
+
+
+def _others(*batches, namespace="", name="wave-1.json"):
+    """The other_wave_manifests shape: each sibling wave carries its own target_namespace with its batches."""
+    return {name: {"target_namespace": namespace, "batches": list(batches)}}
+
+
+OTHERS = _others(B2)
 
 
 def _specs(**by_unit):
@@ -161,26 +168,26 @@ def test_same_wave_collision_still_halts_naming_both_batches():
 def test_shared_table_across_waves_needs_a_bounded_target_where(spec):
     check = _functions()["check_write_targets"]
     with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1=spec))
+        check([B1], _others(B2), _specs(u1=spec))
 
 
 def test_shared_table_across_waves_passes_when_every_reader_is_bounded():
     check = _functions()["check_write_targets"]
-    check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED, u2=BOUNDED))
-    check([B1], {"wave-1.json": [{**B2, "write_targets": ["mig.other"]}]}, _specs())
+    check([B1], _others(B2), _specs(u1=BOUNDED, u2=BOUNDED))
+    check([B1], _others({**B2, "write_targets": ["mig.other"]}), _specs())
 
 
 @pytest.mark.parametrize("u2", [None, {"objects": []}, {"objects": [{"object": "mig.other", "target_where": "x = 1"}]}])
 def test_shared_table_other_wave_unit_without_a_mapping_for_it_halts_too(u2):
     check = _functions()["check_write_targets"]
     with pytest.raises(SystemExit, match=r"'mig.t'.*wave-1\.json.*b-2.*units/u2/mapping_spec\.json"):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED, u2=u2))
+        check([B1], _others(B2), _specs(u1=BOUNDED, u2=u2))
 
 
 def test_shared_table_other_wave_unbounded_mapping_also_halts():
     check = _functions()["check_write_targets"]
     with pytest.raises(SystemExit, match=r"'mig.t'.*u2.*target_where"):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED, u2=UNBOUNDED))
+        check([B1], _others(B2), _specs(u1=BOUNDED, u2=UNBOUNDED))
 
 
 @pytest.mark.parametrize("spec, message", [
@@ -193,7 +200,7 @@ def test_shared_table_other_wave_unbounded_mapping_also_halts():
 def test_shared_table_current_unit_without_a_mapping_for_it_halts(spec, message):
     check = _functions()["check_write_targets"]
     with pytest.raises(SystemExit, match=message):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1=spec))
+        check([B1], _others(B2), _specs(u1=spec))
 
 
 def test_shared_table_matches_tables_key_and_target_table_spelling():
@@ -212,8 +219,8 @@ def test_shared_table_is_the_same_table_whatever_its_case_or_quoting():
         check([B1, {**B2, "write_targets": ["MIG.T"]}], {}, _specs(u1=BOUNDED, u2=BOUNDED))
     for other in ("MIG.T", "`mig`.`t`", " Mig.T "):
         with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
-            check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=UNBOUNDED, u2=BOUNDED))
-        check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=BOUNDED, u2=BOUNDED))
+            check([B1], _others({**B2, "write_targets": [other]}), _specs(u1=UNBOUNDED, u2=BOUNDED))
+        check([B1], _others({**B2, "write_targets": [other]}), _specs(u1=BOUNDED, u2=BOUNDED))
 
 
 BARE = lambda where: {"objects": [{"object": "T", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"],
@@ -233,18 +240,48 @@ def test_one_normalizer_qualifies_bare_names_with_the_manifest_target_namespace(
     assert fn["reads_target"]("T", "mig.t", namespace) and not fn["reads_target"]("other.t", "mig.t", namespace)
     for current, previous in (("t", "mig.t"), ("mig.t", "t"), ("T", full), (full, "t")):
         with pytest.raises(SystemExit, match=rf"'{re.escape(current)}'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
-            check([{**B1, "write_targets": [current]}], {"wave-1.json": [{**B2, "write_targets": [previous]}]},
+            check([{**B1, "write_targets": [current]}], _others({**B2, "write_targets": [previous]}, namespace=namespace),
                   _specs(u1=UNBOUNDED, u2=BOUNDED), namespace)
-        check([{**B1, "write_targets": [current]}], {"wave-1.json": [{**B2, "write_targets": [previous]}]},
+        check([{**B1, "write_targets": [current]}], _others({**B2, "write_targets": [previous]}, namespace=namespace),
               _specs(u1=BARE("run_date = '${as_of}'"), u2=BOUNDED), namespace)
     with pytest.raises(SystemExit, match=r"collision.*'(t|mig\.t)'.*b-1.*b-2"):
         check([{**B1, "write_targets": ["t"]}, B2], {}, _specs(u1=BOUNDED, u2=BOUNDED), namespace)
     with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*target_where"):
-        check([B1], OTHERS, _specs(u1=BARE(""), u2=BOUNDED), namespace)
+        check([B1], _others(B2, namespace=namespace), _specs(u1=BARE(""), u2=BOUNDED), namespace)
     for other in ("other.t", "ig.t"):
         with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
-            check([B1], OTHERS, _specs(u1={"objects": [{"object": other, "target_where": "id = 1"}]}, u2=BOUNDED), namespace)
-        check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(), namespace)
+            check([B1], _others(B2, namespace=namespace), _specs(u1={"objects": [{"object": other, "target_where": "id = 1"}]}, u2=BOUNDED), namespace)
+        check([B1], _others({**B2, "write_targets": [other]}, namespace=namespace), _specs(), namespace)
+
+
+def test_each_wave_resolves_its_own_targets_with_its_own_target_namespace():
+    """A bare write target means the table in the namespace of the manifest that declares it, so a sibling
+    wave's targets are qualified with that wave's target_namespace, never this wave's: bare `t` under a
+    sibling's `mig` is this wave's `mig.t` (shared), while bare `t` in two waves with different namespaces,
+    or in a sibling with none, is two tables."""
+    fn = _functions()
+    check = fn["check_write_targets"]
+    sibling_bare = _others({**B2, "write_targets": ["t"]}, namespace="mig")
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+        check([B1], sibling_bare, _specs(u1=UNBOUNDED, u2=BOUNDED))
+    check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BOUNDED))
+    check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BARE("run_date = '${as_of}'")))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-1\.json.*b-2.*u2.*target_where"):
+        check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BARE("")))
+    with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
+        check([B1], sibling_bare, _specs(u1=BOUNDED, u2={"objects": [{"object": "other.t", "target_where": "id = 1"}]}))
+    check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}, namespace="mig_b"), _specs(), "mig_a")
+    check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}), _specs(), "mig_a")
+    check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}, namespace="mig"), _specs())
+    with pytest.raises(SystemExit, match=r"'t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+        check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}), _specs(u1=BARE(""), u2=BOUNDED))
+    with pytest.raises(SystemExit, match=r"'t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+        check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}, namespace="mig"),
+              _specs(u1=BARE(""), u2=BOUNDED), "MIG")
+    for shape in ([B2], {"batches": [B2]}, {"target_namespace": 1, "batches": [B2]},
+                  {"target_namespace": "a b", "batches": [B2]}, {"target_namespace": "", "batches": B2}):
+        with pytest.raises(SystemExit, match=r"wave-1\.json"):
+            check([B1], {"wave-1.json": shape}, _specs(u1=BOUNDED, u2=BOUNDED))
 
 
 def test_without_a_target_namespace_a_bare_name_is_only_itself():
@@ -255,7 +292,7 @@ def test_without_a_target_namespace_a_bare_name_is_only_itself():
     assert fn["target_key"]("T") == "t" != fn["target_key"]("mig.t") and fn["target_key"]("MIG.T") == "mig.t"
     assert not fn["reads_target"]("T", "mig.t") and fn["reads_target"]("`MIG`.T", "mig.t")
     check = fn["check_write_targets"]
-    check([B1], {"wave-1.json": [{**B2, "write_targets": ["t"]}]}, _specs())
+    check([B1], _others({**B2, "write_targets": ["t"]}), _specs())
     check([{**B1, "write_targets": ["t"]}, B2], {}, _specs())
     with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
         check([B1], OTHERS, _specs(u1=BARE("run_date = '${as_of}'"), u2=BOUNDED))
@@ -339,12 +376,16 @@ def test_embed_rows_must_be_a_list_of_objects():
 def test_other_wave_manifests_reads_every_wave_but_the_current_and_fails_closed(tmp_path):
     read = _functions()["other_wave_manifests"]
     (tmp_path / "wave-0.json").write_text(json.dumps({"batches": [B1]}))
-    (tmp_path / "wave-1.json").write_text(json.dumps({"batches": [B2]}))
+    (tmp_path / "wave-1.json").write_text(json.dumps({"target_namespace": "cat.mig", "batches": [B2]}))
     (tmp_path / "wave-1.result.json").write_text("{")
     (tmp_path / "wave-1.doctor.json").write_text("{")
     (tmp_path / "wave-2.brief.md").write_text("x")
-    assert read(tmp_path, "wave-0.json") == {"wave-1.json": [B2]}
-    assert read(tmp_path, "wave-1.json") == {"wave-0.json": [B1]}
+    assert read(tmp_path, "wave-0.json") == {"wave-1.json": {"target_namespace": "cat.mig", "batches": [B2]}}
+    assert read(tmp_path, "wave-1.json") == {"wave-0.json": {"target_namespace": "", "batches": [B1]}}
+    (tmp_path / "wave-1.json").write_text(json.dumps({"target_namespace": "cat.", "batches": [B2]}))
+    with pytest.raises(SystemExit, match=r"wave-1\.json.*target_namespace"):
+        read(tmp_path, "wave-0.json")
+    (tmp_path / "wave-1.json").write_text(json.dumps({"batches": [B2]}))
     (tmp_path / "wave-2.json").write_text("{")
     with pytest.raises(SystemExit, match=r"wave-2\.json.*JSON"):
         read(tmp_path, "wave-0.json")

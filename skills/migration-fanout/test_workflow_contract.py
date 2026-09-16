@@ -499,10 +499,24 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
     assert proc.returncode != 0 and "units/u/mapping_spec.json has no object reading 'mig.t'" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
-    ws, cwd = _workspace(tmp_path / "prior", other_waves={"wave-1.json": WAVE_1.replace('"mig.t"', '"t"')},
+    sibling_bare = WAVE_1.replace('"mig.t"', '"t"').replace('"wave": 1', '"wave": 1, "target_namespace": "mig"')
+    ws, cwd = _workspace(tmp_path / "prior", other_waves={"wave-1.json": sibling_bare},
                          mappings={"u": bounded}, namespace="MIG")
     proc, calls = _run(cwd, tmp_path / "prior", [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0 and "units/v/mapping_spec.json is missing" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "other_ns", other_waves={"wave-1.json": WAVE_1.replace('"mig.t"', '"t"')},
+                         mappings={"u": bounded}, namespace="MIG")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "other_ns", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "bad_ns", other_waves={"wave-1.json": sibling_bare.replace('"mig"', '"cat."')},
+                         mappings={"u": bounded}, namespace="MIG")
+    proc, calls = _run(cwd, tmp_path / "bad_ns", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "wave-1.json" in proc.stderr and "target_namespace" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
     ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1},
