@@ -1548,7 +1548,8 @@ def test_source_attested_reports_attested_and_does_not_block(tmp_path):
     assert row["status"] == "attested" and row["data"]["decision"] == "D-7"
     assert row["data"]["provenance"] == "user:msg-41"
     assert not [b for b in report["blocking"] if b.startswith("source_principal_read_only")]
-    assert report["blocking"] == ["hook_guard=unverified", "databricks_identity=skipped"]
+    assert report["blocking"] == ["hook_guard=unverified", "recon_family_supported=fail",
+                                  "databricks_identity=skipped"]
 
 
 def test_source_attested_fails_without_a_matching_ledger_line(tmp_path):
@@ -1604,6 +1605,75 @@ def test_source_principal_unsupported_family_stays_unverified_and_blocking(tmp_p
     row = by_id(report)["source_principal_read_only"]
     assert row["status"] == "unverified" and "--source-attested" in row["detail"]
     assert "source_principal_read_only=unverified" in report["blocking"] and report["ready"] is False
+
+
+# ------------------------------------------------------------------ recon_family_supported (WS3.11)
+
+sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness"))
+from recon.adapters import SOURCE_ADAPTERS, is_untested_source_family  # noqa: E402
+
+_UNTESTED_FAMILIES = [f for f in SOURCE_ADAPTERS if is_untested_source_family(f)]
+
+
+def test_recon_family_supported_skipped_without_a_family(tmp_path):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    row = by_id(report)["recon_family_supported"]
+    assert row["status"] == "skipped" and "--source-family" in row["detail"]
+    assert not [b for b in report["blocking"] if b.startswith("recon_family_supported")]
+
+
+@pytest.mark.parametrize("family", ("sqlserver", "postgres", "databricks"))
+def test_recon_family_supported_ok_for_live_tested_families(family):
+    c = doctor.check_recon_family_supported(PLUGIN_ROOT, family)
+    assert c.status == "ok" and c.data["family"] == family and family in c.data["live_tested"]
+
+
+@pytest.mark.parametrize("family", _UNTESTED_FAMILIES)
+def test_recon_family_supported_fails_for_every_family_the_harness_refuses(family):
+    assert _UNTESTED_FAMILIES
+    c = doctor.check_recon_family_supported(PLUGIN_ROOT, family)
+    assert c.status == "fail"
+    assert "Attestation says the principal is read-only; this row says whether we can reconcile the family" in c.detail
+    assert f"dbx-recon run --family {family}" in c.detail and "DSN=" not in c.detail
+    assert c.data["live_tested"] == ["databricks", "postgres", "sqlserver"]
+
+
+def test_recon_family_supported_fails_for_an_unknown_family():
+    c = doctor.check_recon_family_supported(PLUGIN_ROOT, "mysql")
+    assert c.status == "fail" and "no source adapter" in c.detail
+
+
+def test_recon_family_supported_is_its_own_row_beside_an_attested_principal(tmp_path):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal | user:msg-41\n")
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_family="teradata", source_attested="D-7")
+    rows = by_id(report)
+    assert rows["source_principal_read_only"]["status"] == "attested"
+    assert rows["recon_family_supported"]["status"] == "fail"
+    assert "recon_family_supported=fail" in report["blocking"] and report["ready"] is False
+
+
+def test_wave_manifest_family_reaches_recon_family_supported(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({
+        "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
+        "source": {"family": "oracle", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
+    }))
+    result = subprocess.run(
+        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+         "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    record = json.loads(manifest.with_suffix(".doctor.json").read_text())
+    row = next(c for c in record["checks"] if c["id"] == "recon_family_supported")
+    assert row["status"] == "fail" and "recon_family_supported=fail" in record["blocking"]
+    assert any(l.startswith("fail") and "recon_family_supported" in l for l in result.stdout.splitlines())
 
 
 # ------------------------------------------------------------------ ledger integrity rows (A2c)

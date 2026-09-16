@@ -586,6 +586,30 @@ def check_drivers() -> Check:
                  {"drivers": present})
 
 
+def check_recon_family_supported(plugin_root: Path, source_family: str | None) -> Check:
+    """Whether the harness can reconcile the declared source family. Deliberately not folded into
+    source_principal_read_only: attestation says the principal is read-only; this row says whether
+    we can reconcile the family."""
+    cid = "recon_family_supported"
+    if not source_family:
+        return Check(cid, "skipped", "no source family declared (--source-family, or source.family in the wave manifest)")
+    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
+    try:
+        from recon.adapters import SOURCE_ADAPTERS, is_untested_source_family
+    except ImportError as e:
+        return Check(cid, "fail", f"harness adapters not importable: {_redact(str(e))}", {"family": source_family})
+    live = sorted(f for f in SOURCE_ADAPTERS if not is_untested_source_family(f))
+    data = {"family": source_family, "live_tested": live}
+    if source_family not in SOURCE_ADAPTERS:
+        return Check(cid, "fail", f"{source_family}: no source adapter in the harness; live-tested families: {live}", data)
+    if is_untested_source_family(source_family):
+        return Check(cid, "fail", f"{source_family}: the harness refuses this family (`dbx-recon run --family "
+                     f"{source_family}` exits before connecting). Attestation says the principal is read-only; this "
+                     f"row says whether we can reconcile the family, and today we cannot: live-tested families are "
+                     f"{live}; adding one is a live-tested adapter, never an attestation", data)
+    return Check(cid, "ok", f"{source_family}: live-tested source adapter", data)
+
+
 # ------------------------------------------------------------------ delete evidence (source CDC)
 
 _CDC_QUERIES = {
@@ -1552,6 +1576,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         _merge("hook_guard", check_hooks(plugin_root, ws, probe_result)),
         check_official_plugin(plugin_root),
         _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
+        check_recon_family_supported(plugin_root, source_family),
         check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
                                   params=params),
         check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
