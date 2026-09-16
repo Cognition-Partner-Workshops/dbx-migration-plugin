@@ -188,6 +188,43 @@ The output is a machine-readable table of object, class, method, partition key, 
 - Reconcile connector-fed tables at a recorded Tier 1/2 snapshot; CDC lag is a stated finding, and connector output never self-certifies.
 - For mutable tables without a connector, record the exact timestamp/SCN/LSN at copy start and re-verify catch-up in the cutover runbook; if no usable watermark exists and no freeze is possible, say so in the plan.
 
+## Routine parity (writing routines)
+
+A converted routine that writes, itself or through a routine it `calls` (its `dependencies.json` row,
+transitively), is proven only by one committed run on a dedicated execution target (Lakebase branch
+`mig-<pipeline>-exec`; Unity Catalog schema `<catalog>.<pipeline>_exec`; never the migration target itself)
+against a committed fixture snapshot (`snapshot: "fixture:<path in the repo>"`; anything else, a production
+or ad hoc snapshot, is `unproven`), with the rows it left in every written table compared to a golden set.
+The run record and the snapshot must both be files in the committed tree (`--repo`, default the current
+directory), byte-identical to `HEAD`; a run naming a file that is untracked, staged, edited or missing is
+`unproven`. The record is its own evidence: `evidence` is the record's path in the repository, and a
+record read from any other path (or from outside the repository) is `unproven`, so `--runs` cannot borrow
+some other committed file. Record each run as `<routine>.run.json`
+(`{routine, target_family, target_branch, snapshot, evidence, golden: {table: [rows]}, observed: {table: [rows]}}`;
+fixture: `harness/fixtures/example_routine_parity/`, laid out like a unit's repository) and grade them:
+
+```bash
+dbx-recon routine-parity --dependencies .migration/units/<unit>/dependencies.json \
+  --runs .migration/recon/<unit>/runs/ --out .migration/recon/<unit>/
+```
+
+`routine_parity.json` carries `routine_parity: [{routine, status: proven|unproven|failed, evidence}]`. A
+routine with no run, a run off a dedicated target, without evidence or a snapshot, or in a family with no
+dedicated-target rule is `unproven` (exit 2), never silently clean; rows that differ, or a written table
+absent from either set, are `failed` (exit 1); table names compare case-insensitively. Pass the file to
+`run --routine-parity <file>` so `result.json` carries it. `run` reads the unit's dependency analysis
+(`.migration/units/<unit>/dependencies.json`, or `--routine-dependencies`), which must be a committed file
+of the repository (an outside, untracked or edited file is refused; `result.json` records the path as
+`routine_dependencies`), and regrades every row that names evidence from the committed run record: a
+`proven`/`failed` claim the run does not support is refused, an unreadable or uncommitted record is
+`unproven`, and an `unproven` row whose run grades `failed` is carried as failed. A writing routine the
+file lacks is carried as `unproven`; a row for a routine the analysis does not know, or a routine listed twice, is refused. A `failed` routine sets
+`merge_eligible=false` with reason `routine_gap`; `unproven` routines are listed in `recon.summary.md` and
+become cutover exceptions (`8-cutover_signoff.md`). No analysis, or writers with no parity file, is
+`merge_eligible=false` with reason `routine_parity_missing` (only an analysis with zero writers needs no file):
+absent parity is never clean parity. The run itself
+needs the read-only principal to hold EXECUTE on the routines under test; the intake asks (`14-front_door_oltp.md`).
+
 ## Outputs (in `--out`)
 
 - `result.json`: machine-readable. The workflow gates on `verdict`, and the wave gate reads

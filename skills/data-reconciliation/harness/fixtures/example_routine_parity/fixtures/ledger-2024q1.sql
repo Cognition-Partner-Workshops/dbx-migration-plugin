@@ -1,0 +1,1 @@
+-- fixture snapshot the example runs were executed against (illustrative)
