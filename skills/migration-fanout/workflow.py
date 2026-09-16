@@ -733,7 +733,7 @@ def gates_command(path):
                 unmet.append(f"{report['pr_url']} is not a PR of {MANIFEST['repo']} whose head git can fetch; no evidence stands")
         out[b["id"]] = {"gates": gates, "unmet": unmet}
     closed = not any(v["unmet"] for v in out.values())
-    print(json.dumps({"wave": MANIFEST["wave"], "closed": closed, "batches": out}, indent=2, sort_keys=True))
+    print(json.dumps({"wave": MANIFEST["wave"], "tag": TAG, "closed": closed, "batches": out}, indent=2, sort_keys=True))
     return 0 if closed else 1
 
 
@@ -809,6 +809,14 @@ def hand_run_state():
     return state
 
 
+def check_wave_tag(tag, wave):
+    """wave-<tag>.json's last '-' segment is the wave number it runs, so a file renamed or mis-numbered
+    cannot run under a wave the name does not declare."""
+    last = tag.rsplit("-", 1)[-1]
+    if not last.isdigit() or int(last) != wave:
+        raise SystemExit(f"wave-{tag}.json: the wave number in the file name must equal the manifest's 'wave' ({wave})")
+
+
 def other_wave_manifests(waves_dir, current):
     """{file name: {target_namespace, batches}} for every other wave-*.json in .migration/waves/: a bare
     write target means the table in the namespace of the manifest that declares it, so each wave's is kept
@@ -816,7 +824,7 @@ def other_wave_manifests(waves_dir, current):
     one that cannot be read halts."""
     out = {}
     for p in sorted(waves_dir.glob("wave-*.json")):
-        if p.name == current or p.name.endswith((".result.json", ".doctor.json")):
+        if p.name == current or not TAG_RE.fullmatch(p.stem[len("wave-"):]):
             continue
         try:
             m = json.loads(p.read_text())
@@ -1271,6 +1279,7 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
 
 if sys.argv[1:2] == ["reserve"]:
     validate_manifest(MANIFEST)
+    check_wave_tag(TAG, MANIFEST["wave"])
     check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                         other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
                         namespace=MANIFEST.get("target_namespace", ""))
@@ -1281,6 +1290,7 @@ if sys.argv[1:2] == ["reserve"]:
     sys.exit(0)
 if sys.argv[1:2] == ["gates"]:
     validate_manifest(MANIFEST)
+    check_wave_tag(TAG, MANIFEST["wave"])
     state = hand_run_state()
     if state == "closed":
         raise SystemExit(f"{RUNS_PATH} records that the hand run under STOP C row {MANIFEST['stop_c']} closed already; a new "
@@ -1302,6 +1312,7 @@ if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
     raise spent_halt()
 PREFLIGHT = sys.argv[1:] == ["preflight"]
 validate_manifest(MANIFEST)
+check_wave_tag(TAG, MANIFEST["wave"])
 BASE_SHA = None if PREFLIGHT else launch_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
 if not SMOKE:
@@ -1929,7 +1940,7 @@ async def main():
               and all(r["status"] == "PASS" for r in results))
     result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
     result_tmp.write_text(json.dumps({
-        "wave": WAVE, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
+        "wave": WAVE, "tag": TAG, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
         "run_id": RUN_ID, "base_sha": BASE_SHA, "mode": MODE, "stop_c": MANIFEST["stop_c"],
         "hook_probe": HOOK_PROBE_RESULT, "doctor_signed_at": DOCTOR.get("signed_at"),
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,

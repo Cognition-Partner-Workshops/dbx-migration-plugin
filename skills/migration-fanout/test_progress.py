@@ -1036,3 +1036,54 @@ def test_main_does_not_write_progress_file_for_invalid_result(tmp_path):
         main([str(mig)])
 
     assert not (mig / "05_progress.md").exists()
+
+
+def _write_tagged(mig, tag, wave, result, batches=None):
+    waves = mig / "waves"
+    waves.mkdir(parents=True, exist_ok=True)
+    manifest = {"wave": wave, "batches": batches if batches is not None else [{"id": "b-1", "units": ["u1"]}]}
+    manifest_bytes = json.dumps(manifest).encode()
+    (waves / f"wave-{tag}.json").write_bytes(manifest_bytes)
+    result.setdefault("wave", wave)
+    result["manifest_sha"] = hashlib.sha256(manifest_bytes).hexdigest()[:12]
+    (waves / f"wave-{tag}.result.json").write_text(json.dumps(result))
+
+
+def test_render_progress_distinguishes_sibling_pipelines_by_tag(tmp_path):
+    mig = tmp_path / ".migration"
+    for tag in ("orders-1", "payments-1"):
+        _write_tagged(mig, tag, 1, {
+            "tag": tag,
+            "batches": [{"id": "b-1", "status": "PASS", "recon_verdict": "PASS",
+                         "pr_url": f"https://example.invalid/{tag}"}],
+            "verify": {"unit_verdicts": {"b-1": "PASS"}, "merged_prs": []},
+        })
+
+    text = render_progress(mig)
+
+    assert "| orders-1 | b-1 | u1 |" in text
+    assert "| payments-1 | b-1 | u1 |" in text
+    assert "wave orders-1: closed=" in text
+    assert "wave payments-1: closed=" in text
+
+
+def test_render_progress_rejects_a_result_tag_that_differs_from_the_file_name(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_tagged(mig, "orders-1", 1, {
+        "tag": "payments-1",
+        "batches": [{"id": "b-1", "status": "PASS"}],
+    })
+
+    with pytest.raises(ValueError, match="tag"):
+        render_progress(mig)
+
+
+def test_render_progress_rejects_a_tag_wave_that_differs_from_the_manifest(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_tagged(mig, "orders-2", 1, {
+        "tag": "orders-2",
+        "batches": [{"id": "b-1", "status": "PASS"}],
+    })
+
+    with pytest.raises(ValueError, match=r"wave-orders-2\.result\.json: wave does not match the manifest"):
+        render_progress(mig)

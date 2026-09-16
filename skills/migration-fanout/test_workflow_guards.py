@@ -30,12 +30,12 @@ def _functions():
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
                                       "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
-                                      "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices"})
+                                      "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices", "check_wave_tag"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
                                                          "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED", "_SEGMENT",
-                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS"}
+                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent")}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
@@ -192,6 +192,25 @@ def test_pipeline_manifests_with_overlapping_targets_halt_and_disjoint_ones_pass
         {**B2, "write_targets": ["mig.other"]}]}))
     others = fn["other_wave_manifests"](tmp_path, "wave-p1-1.json")
     fn["check_write_targets"]([B1], others, _specs())
+
+
+def test_other_wave_manifests_skips_generated_wave_files(tmp_path):
+    fn = _functions()
+    (tmp_path / "wave-p1-1.json").write_text(json.dumps({"batches": [B1]}))
+    (tmp_path / "wave-p1-1.merged.json").write_text(json.dumps({"base": "a" * 40, "merged": {"b-1": True}}))
+    (tmp_path / "wave-p1-1.result.json").write_text(json.dumps({"wave": 1, "batches": [{"id": "b-1"}]}))
+    (tmp_path / "wave-p1-1.doctor.json").write_text(json.dumps({"checks": []}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p2-1.json")
+    assert list(others) == ["wave-p1-1.json"]
+
+
+def test_check_wave_tag_pins_the_file_name_number_to_the_manifest_wave():
+    check = _functions()["check_wave_tag"]
+    check("1", 1)
+    check("payments-1", 1)
+    for tag, wave in [("2", 1), ("payments-1", 2), ("payments", 1)]:
+        with pytest.raises(SystemExit, match="the wave number in the file name"):
+            check(tag, wave)
 
 
 @pytest.mark.parametrize("u2", [None, {"objects": []}, {"objects": [{"object": "mig.other", "target_where": "x = 1"}]}])
@@ -2095,7 +2114,7 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
     with pytest.raises(SystemExit, match="mode: rerun"):
         ns["launch_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
+    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\[\"wave\"\]\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
     assert 'BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")' in src and '"base_sha": BASE_SHA' in src
 
 
