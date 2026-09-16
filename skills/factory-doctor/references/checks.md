@@ -55,7 +55,6 @@ the secret's host/token with inherited `DATABRICKS_*` stripped except host/token
 are `unverified`. Unsupported/uninferred families are `unverified`; `--source-attested D-<id>`
 is `attested` only for families without a query and a human-provenance decision line. Rows name
 objects/privileges, never credentials; `readonly=True`/`default_transaction_read_only` are hints.
-### `databricks_identity`
 ### `recon_family_supported`
 
 `fail` when `--source-family` names a family the harness has no live-tested source adapter for —

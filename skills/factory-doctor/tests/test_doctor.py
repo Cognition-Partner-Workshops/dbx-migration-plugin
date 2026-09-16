@@ -1644,6 +1644,22 @@ def test_recon_family_supported_fails_for_an_unknown_family():
     assert c.status == "fail" and "no source adapter" in c.detail
 
 
+def test_recon_family_supported_asks_the_installed_harness_first(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which",
+                        lambda name: "/usr/bin/dbx-recon" if name == "dbx-recon" else None)
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, '{"live_tested": ["oracle"], "untested": []}', ""))
+    c = doctor.check_recon_family_supported(PLUGIN_ROOT, "oracle")
+    assert c.status == "ok" and "dbx-recon" in c.data["harness"]
+
+
+def test_recon_family_supported_fails_when_the_harness_cannot_answer(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which",
+                        lambda name: "/usr/bin/dbx-recon" if name == "dbx-recon" else None)
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (1, "", "boom"))
+    c = doctor.check_recon_family_supported(PLUGIN_ROOT, "sqlserver")
+    assert c.status == "fail" and "cannot ask the harness" in c.detail
+
+
 def test_recon_family_supported_is_its_own_row_beside_an_attested_principal(tmp_path):
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
