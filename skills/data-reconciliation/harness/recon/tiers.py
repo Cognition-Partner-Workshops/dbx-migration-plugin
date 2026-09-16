@@ -144,6 +144,19 @@ def _type_numeric(type_name: str) -> bool | None:
     return type_name.lower().split("(")[0].strip() in NUMERIC_TYPES
 
 
+# Engines have no ordering aggregate for these types (MIN(bit)/MIN(uniqueidentifier) error on
+# T-SQL; min(boolean)/min(uuid) do not exist on Postgres), so both sides skip min/max
+# (None == None in _agg_close) and rely on count/null_rate/distinct_count plus the Tier 3
+# keyed diff.
+UNORDERED_TYPES = {"bit", "boolean", "bool", "uniqueidentifier", "uuid"}
+
+
+def _type_unordered(type_name: str) -> bool:
+    if not type_name:
+        return False
+    return type_name.lower().split("(")[0].strip() in UNORDERED_TYPES
+
+
 def sum_plan(own_type: str, other_type: str) -> str:
     """How one side obtains SUM for a field: 'batch' (declared numeric, in the table statement),
     'probe' (undeclared, or declared non-numeric while the other side is numeric: a conversion
@@ -200,6 +213,13 @@ def _sum_plans(pairs: list[tuple[str, str, str]], adapter, table: str) -> dict[s
     return plan
 
 
+def _unordered_cols(c: ObjectMapping, attr: str) -> list[str]:
+    """One side's column names for fields either side declares unordered: when a field is
+    unordered anywhere, both sides skip its min/max so the stats stay symmetric."""
+    return [getattr(f, attr) for f in c.fields
+            if _type_unordered(f.source_type) or _type_unordered(f.target_type)]
+
+
 def _object_aggregates(c: ObjectMapping, source, target, source_where: str | None = None,
                        exclude_keys: list[tuple] | None = None
                        ) -> tuple[dict[str, dict], dict[str, dict], dict[str, str], dict[str, str]]:
@@ -212,9 +232,11 @@ def _object_aggregates(c: ObjectMapping, source, target, source_where: str | Non
     s_where = source_where if source_where is not None else c.root_where
     s_plan = _sum_plans([(f.source, f.source_type, f.target_type) for f in c.fields], source, c.root_table)
     cols = list(s_plan)
+    s_unordered = _unordered_cols(c, "source")
+    t_unordered = _unordered_cols(c, "target")
     if isinstance(source, BatchAggregates):
         s_all = source.table_aggregates(c.root_table, cols, [k for k, p in s_plan.items() if p == "batch"],
-                                        s_where)
+                                        s_where, unordered=s_unordered)
         for col, p in s_plan.items():
             if p == "probe":
                 if isinstance(source, SumProbe):
@@ -229,15 +251,18 @@ def _object_aggregates(c: ObjectMapping, source, target, source_where: str | Non
     def t_probe(col: str) -> dict:
         if exclude_keys is not None:
             return target.table_aggregates_excluding(c.object, [col], [col], list(c.key_target),
-                                                     exclude_keys, c.target_where)[col]
+                                                     exclude_keys, c.target_where,
+                                                     unordered=[col] if col in t_unordered else ())[col]
         return (target.field_aggregates(c.object, col, c.target_where)
                 if c.target_where is not None else target.field_aggregates(c.object, col))
 
     if exclude_keys is not None:
         t_all = target.table_aggregates_excluding(c.object, list(t_plan), t_batch, list(c.key_target),
-                                                  exclude_keys, c.target_where)
+                                                  exclude_keys, c.target_where,
+                                                  unordered=t_unordered)
     elif isinstance(target, BatchAggregates):
-        t_all = target.table_aggregates(c.object, list(t_plan), t_batch, c.target_where)
+        t_all = target.table_aggregates(c.object, list(t_plan), t_batch, c.target_where,
+                                        unordered=t_unordered)
     else:
         t_all = {col: t_probe(col) for col in t_plan}
     if exclude_keys is not None or isinstance(target, BatchAggregates):
@@ -254,6 +279,7 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                      source, target, ctx=None) -> TierResult:
     findings, checks = [], 0
     deferred: list[str] = []
+    minmax_skipped: list[str] = []
     applied_subset: dict[str, dict[str, Any]] = {}
     for c in spec.objects:
         in_flight = ctx.in_flight(c) if ctx is not None else 0
@@ -296,6 +322,9 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
             s, t = s_all[f.source], t_all[f.target]
             numeric = _is_numeric_field(f, s, t, s_plan[f.source], t_plan[f.target])
             stats_to_check: tuple[str, ...] = ("null_rate", "distinct_count", "min", "max")
+            if _type_unordered(f.source_type) or _type_unordered(f.target_type):
+                stats_to_check = tuple(s for s in stats_to_check if s not in ("min", "max"))
+                minmax_skipped.append(f"{c.object}.{f.target}")
             if numeric:
                 stats_to_check += ("sum",)
             if NULL_SEMANTIC_RULES & set(f.rules):
@@ -318,6 +347,8 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
                     findings.append(Finding(c.object, f"aggregate_{stat}",
                                             f"field {f.source}->{f.target}", sv, tv, f.rules))
     stats: dict[str, Any] = {"deferred_to_tier3": deferred} if deferred else {}
+    if minmax_skipped:
+        stats["minmax_skipped"] = minmax_skipped
     if applied_subset:
         stats["applied_subset"] = applied_subset
     return TierResult(2, "per_field_aggregates", not findings, checks, findings, stats)

@@ -85,6 +85,7 @@ class _TransactionalMixin:
         self.tables, self.schema, self.sequences = tables, schema or {}, sequences or {}
         self.calls, self.statements, self.rows_fetched, self.fail_on = Counter(), 0, 0, {}
         self.last_fetch_keyed = self.last_table_aggregates_numeric = self.last_excluded_keys = None
+        self.last_table_aggregates_unordered = None
         self.isolation, self.window_open, self.on_open = "none", False, None
         self.pin, self.change_token = "fake_snapshot", None
 
@@ -110,6 +111,13 @@ class _TransactionalMixin:
         return sorted(rows, key=lambda r: tuple(repr(v) for v in self._key(r, key_cols)))
 
     @staticmethod
+    def _aggs_unordered(rows, columns, numeric, unordered) -> dict[str, dict[str, Any]]:
+        out = _TransactionalMixin._aggs(rows, columns, numeric)
+        for col in unordered:
+            out[col]["min"] = out[col]["max"] = None
+        return out
+
+    @staticmethod
     def _aggs(rows, columns, numeric) -> dict[str, dict[str, Any]]:
         out = {col: _agg_of([None if (v := get_path(d, col)) is MISSING else v for d in rows])
                for col in columns}
@@ -133,16 +141,17 @@ class _TransactionalMixin:
         self._count("sum_probe")
         return self._aggs(self._rows(table, where), [column], [column])[column]["sum"]
 
-    def table_aggregates(self, table, columns, numeric, where=None) -> dict[str, dict[str, Any]]:
+    def table_aggregates(self, table, columns, numeric, where=None, *, unordered=()) -> dict[str, dict[str, Any]]:
         self._count("table_aggregates")
         self.last_table_aggregates_numeric = list(numeric)
-        return self._aggs(self._rows(table, where), columns, numeric)
+        self.last_table_aggregates_unordered = list(unordered)
+        return self._aggs_unordered(self._rows(table, where), columns, numeric, unordered)
 
     def exclusion_capacity(self, key_width: int) -> int:
         return max(1, self.max_params // max(1, key_width))
 
     def table_aggregates_excluding(self, table, columns, numeric, key_cols, exclude_keys,
-                                   where=None) -> dict[str, dict[str, Any]]:
+                                   where=None, *, unordered=()) -> dict[str, dict[str, Any]]:
         if len(exclude_keys) > self.exclusion_capacity(len(key_cols)):
             raise ValueError(f"{len(exclude_keys)} keys x {len(key_cols)} columns exceed the "
                              f"{self.max_params}-parameter budget of one statement")
@@ -150,7 +159,7 @@ class _TransactionalMixin:
         self.last_excluded_keys = list(exclude_keys)
         excluded = {tuple(k) for k in exclude_keys}
         rows = [d for d in self._rows(table, where) if self._key(d, key_cols) not in excluded]
-        return self._aggs(rows, columns, numeric)
+        return self._aggs_unordered(rows, columns, numeric, unordered)
 
     def fetch_keyed(self, table, key_cols, columns, where=None, keys=None) -> Iterable[dict]:
         key_cols = [key_cols] if isinstance(key_cols, str) else key_cols

@@ -697,7 +697,7 @@ def test_postgres_schema_facts_reads_triggers_and_grants():
                     elif "table_privileges" in sql_l:
                         outer.rows = [("app_rw", "SELECT"), ("reporting_ro", "SELECT")]
                     elif "pg_attribute" in sql_l and "attidentity" in sql_l:
-                        outer.rows = [("loan_id", True, False)]
+                        outer.rows = [("loan_id", True, False, "r")]
                     elif "server_version" in sql_l or "current_setting" in sql_l:
                         outer.rows = [(150000,)]
                     else:

@@ -894,7 +894,8 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         expression_indexes={normalize_sql_text(x) for x in f.expression_indexes},
         triggers={n: (t, tuple(e), g) for n, (t, e, g) in f.triggers.items()},
         grants={g.lower(): frozenset(p.lower() for p in ps) for g, ps in f.grants.items()},
-        unsupported=f.unsupported)
+        unsupported=f.unsupported,
+        declares_not_null=f.declares_not_null)
 
 
 # Lexer for index expression text as the catalogs render it (pg_get_indexdef): a string literal
@@ -1530,15 +1531,20 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                 stats.setdefault("target_only_columns_unverified", []).append(
                     f"{c.object}: FK {cols} -> {ref}{rcols} covers a column outside the mapping")
         expected_not_null = {colmap[col] for col in s.not_null if col in colmap}
-        for col in sorted(s.not_null):
-            mapped = colmap.get(col, col)
-            if col in colmap and mapped not in t_lower.not_null:
-                findings.append(Finding(c.object, "not_null_missing",
-                                        f"source NOT NULL {col} -> target {mapped} is nullable"))
-        for col in sorted((t_lower.not_null & mapped_targets) - expected_not_null - set(t_lower.primary_key)):
-            tightened(Finding(c.object, "not_null_extra",
-                              f"target {col} is NOT NULL but its source column is nullable: "
-                              "legacy-valid NULLs would be rejected"))
+        if t_lower.declares_not_null:
+            for col in sorted(s.not_null):
+                mapped = colmap.get(col, col)
+                if col in colmap and mapped not in t_lower.not_null:
+                    findings.append(Finding(c.object, "not_null_missing",
+                                            f"source NOT NULL {col} -> target {mapped} is nullable"))
+            for col in sorted((t_lower.not_null & mapped_targets) - expected_not_null - set(t_lower.primary_key)):
+                tightened(Finding(c.object, "not_null_extra",
+                                  f"target {col} is NOT NULL but its source column is nullable: "
+                                  "legacy-valid NULLs would be rejected"))
+        else:
+            stats.setdefault("not_null_unverified", []).append(
+                f"{c.object}: target relation cannot declare NOT NULL; "
+                f"{len(expected_not_null)} source NOT NULL columns unverified")
         for idx in sorted(s.indexes):
             if not _covered(_map_cols(idx, colmap), t_lower):
                 findings.append(Finding(c.object, "index_missing",

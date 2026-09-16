@@ -1,9 +1,11 @@
 """Recon hot path: one statement per table for Tier 2, real key stratification for Tier 3,
 the verify-depth knob, and cost accounting in the result."""
 
+import datetime as dt
 import json
 import random
 import sqlite3
+import struct
 from itertools import pairwise
 
 import pytest
@@ -18,7 +20,12 @@ from recon.config import (
 )
 from recon.cost import estimate_cost
 from recon.engine import run_recon
-from recon.tiers import _object_aggregates, _stratified_keys, tier2_aggregates
+from recon.tiers import (
+    _object_aggregates,
+    _stratified_keys,
+    _type_unordered,
+    tier2_aggregates,
+)
 
 from tests.fakes import FakeSource, FakeTarget
 from tests.test_tiers import RULES, SPEC, TOL
@@ -468,3 +475,52 @@ def test_cli_refuses_transactional_mode_by_name(tmp_path, capsys):
     msg = str(exc.value)
     assert "transactional" in msg and "not implemented" in msg
     assert "snapshot" in msg
+
+
+# ------------------------------------------- unordered types: bit/boolean/uuid min/max skip
+
+def test_type_unordered():
+    assert all(_type_unordered(t) for t in ("BIT", "boolean", "UNIQUEIDENTIFIER", "uuid"))
+    assert not any(_type_unordered(t) for t in ("int", "varchar(20)", ""))
+
+
+def test_tier2_unordered_field_skips_minmax_and_reports():
+    # BIT -> boolean has no ordering aggregate on either engine: both sides skip min/max,
+    # stats record the skip, and count/null_rate/distinct_count still grade.
+    spec = MappingSpec(version="m", objects=[ObjectMapping(
+        object="c", root_table="T", key_source=["ID"], key_target="id",
+        fields=[FieldMapping("ID", "id", "INT", "integer"),
+                FieldMapping("FLAG", "flag", "BIT", "boolean", rules=["identity"])])])
+    source = FakeSource({"T": [{"ID": 1, "FLAG": 1}, {"ID": 2, "FLAG": 0}]})
+    target = FakeTarget({"c": [{"id": 1, "flag": True}, {"id": 2, "flag": False}]})
+    result = _tier2(spec, source, target)
+    assert result.passed and not result.findings
+    assert source.last_table_aggregates_unordered == ["FLAG"]
+    assert target.last_table_aggregates_unordered == ["flag"]
+    assert result.stats["minmax_skipped"] == ["c.flag"]
+
+
+def test_table_aggregates_emits_no_min_max_for_unordered_columns():
+    class Capture(_SqlAdapterBase):
+        def _rows(self, sql, params=()):
+            self.captured = sql
+            # COUNT(*) + per column COUNT/MIN|NULL/MAX|NULL/DISTINCT (+ SUM on numeric)
+            return [(5, 5, None, None, 3, 5, 1, 10, 5, 15)]
+
+    ad = Capture(conn=None)
+    out = ad.table_aggregates("t", ["is_active", "id"], ["id"], unordered=["is_active"])
+    assert "COUNT(DISTINCT is_active)" in ad.captured
+    assert "MIN(is_active)" not in ad.captured and "MAX(is_active)" not in ad.captured
+    assert "MIN(id)" in ad.captured and "MAX(id)" in ad.captured
+    assert out["is_active"]["min"] is None and out["is_active"]["max"] is None
+    assert out["id"]["min"] == 1 and out["id"]["sum"] == 15
+
+
+def test_datetimeoffset_from_odbc():
+    from recon.adapters import _datetimeoffset_from_odbc
+    raw = struct.pack("<6hI2h", 2024, 3, 5, 13, 14, 15, 123456700, -5, -30)
+    got = _datetimeoffset_from_odbc(raw)
+    assert got == dt.datetime(2024, 3, 5, 13, 14, 15, 123456,
+                              tzinfo=dt.timezone(dt.timedelta(hours=-5, minutes=-30)))
+    utc = _datetimeoffset_from_odbc(struct.pack("<6hI2h", 2024, 1, 1, 0, 0, 0, 0, 0, 0))
+    assert utc.tzinfo == dt.timezone.utc
