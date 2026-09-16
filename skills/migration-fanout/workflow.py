@@ -202,6 +202,9 @@ PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-
 DECISION_ID = re.compile(r"D-[0-9]+")
 # Its provenance when a human wrote it (`user:<message/event id>`), as the ledger convention names it.
 HUMAN_PROVENANCE = re.compile(r"(?<![\w-])user:[\w][\w.@/-]*")
+# The parts of a ledger row that are about the row, not about units: its ids, dates/times and provenance.
+LEDGER_METADATA = re.compile(rf"(?<![\w-])D-[0-9]+(?![\w-])|(?<![\w-])\d{{4}}-\d{{2}}-\d{{2}}(?:[T ][\d:.]+Z?(?:[+-]\d{{2}}:?\d{{2}})?)?"
+                             rf"|{HUMAN_PROVENANCE.pattern}|(?<![\w-])default-accepted(?![\w-])")
 
 
 def decision_ledger():
@@ -214,8 +217,9 @@ def decision_ledger():
 def override_decision(decision_id, units, ledger):
     """Whether the ledger holds the D-<n> row that lets a human merge past merge_eligible=false: one
     line carrying that id, human provenance (`user:<id>`; a default-accepted row is the orchestrator's,
-    not a human's), and the word merge_override followed by the id of every unit in the batch. Units
-    count only in that clause, so a row's date, id or author never stands in for a unit it did not name."""
+    not a human's), the word merge_override and the id of every unit in the batch, in whatever column
+    order the ledger keeps. Units are looked for in the row's text only: its decision ids, dates and
+    provenance are blanked first, so none of those stands in for a unit the row did not name."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
         return False
 
@@ -223,10 +227,9 @@ def override_decision(decision_id, units, ledger):
         return rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])"
 
     for line in ledger.splitlines():
-        clause = re.split(word("merge_override"), line, maxsplit=1)
-        if len(clause) == 2 and HUMAN_PROVENANCE.search(line) and re.search(word(decision_id), line):
-            scope = HUMAN_PROVENANCE.sub(" ", clause[1])
-            if all(re.search(word(u), scope) for u in units):
+        if HUMAN_PROVENANCE.search(line) and re.search(word(decision_id), line):
+            text = LEDGER_METADATA.sub(" ", line)
+            if all(re.search(word(w), text) for w in ("merge_override", *units)):
                 return True
     return False
 

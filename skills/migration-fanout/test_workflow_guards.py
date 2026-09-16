@@ -43,7 +43,7 @@ def _batch_runtime():
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE"}
+                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA"}
                     for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
@@ -431,15 +431,22 @@ def test_override_decision_row_must_name_every_unit_and_say_merge_override():
     assert not override_decision(None, ["u"], LEDGER) and not override_decision("D-", ["u"], LEDGER)
 
 
-def test_override_decision_row_names_units_after_merge_override_not_in_its_metadata():
+def test_override_decision_row_names_units_in_its_text_not_in_its_metadata():
     override_decision = _batch_runtime()["override_decision"]
     row = "| D-7 | 2024-05-02 | user:U1 merge_override for u |\n"
     assert override_decision("D-7", ["u"], row)
     assert not override_decision("D-7", ["U1"], row)                 # the provenance id is not a unit
     assert not override_decision("D-7", ["2024-05-02"], row)         # nor the date
     assert not override_decision("D-7", ["u", "U1"], row)
-    assert not override_decision("D-7", ["orders"], "| D-7 | orders | user:U1 merge_override for u |")
     assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 merge_override for u and v (feed gap) |")
+    # column order is the ledger author's: units before the marker count too
+    assert override_decision("D-7", ["orders"], "| D-7 | units: orders | user:U1 | merge_override for an accepted feed gap |")
+    assert override_decision("D-7", ["u", "v"], "| 2024-05-02T10:00:00Z | D-7 | u, v | user:U1 | merge_override |")
+    # but never a unit that is only the row's id, date or author
+    assert not override_decision("D-7", ["D-7"], "| D-7 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["2024-05-02"], "| D-7 | 2024-05-02 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["U1"], "| D-7 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | user:u | merge_override for v |")
 
 
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
