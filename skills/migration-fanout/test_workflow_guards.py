@@ -953,3 +953,21 @@ def test_child_prompt_passes_the_source_family_and_secret_to_the_doctor():
     text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
     assert "--source-family postgres --source-secret LAKEBASE_SRC --param db=x" in text
     assert "--source-family" not in _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])
+
+
+def test_validate_verify_unit_keyed_verdict_remaps_to_batch():
+    validate_verify = _functions()["validate_verify"]
+    passed = [{"batch": "w2-b03", "units": ["orders"], "pr_url": "https://example/pr/3"}]
+    problems = validate_verify({"wave_verdict": "PASS", "unit_verdicts": {"orders": "PASS"},
+                                "merged_prs": [], "findings": [], "changed_paths": []}, passed, False)
+    assert problems == []
+
+
+def test_validate_verify_unit_key_collision_stays_unmapped():
+    validate_verify = _functions()["validate_verify"]
+    passed = [{"batch": "w2-b03", "units": ["orders"], "pr_url": "https://example/pr/3"}]
+    problems = validate_verify({"wave_verdict": "PASS",
+                                "unit_verdicts": {"w2-b03": "PASS", "orders": "PASS"},
+                                "merged_prs": [], "findings": [], "changed_paths": []}, passed, False)
+    assert problems
+    assert any("unexpected verdicts" in problem for problem in problems)
