@@ -94,6 +94,19 @@ def test_only_mapped_columns_are_compared_but_extra_fixture_columns_are_named():
     assert [f["check"] for f in out["findings"]] == ["column_extra"]
 
 
+def test_an_empty_source_population_is_unsupported_not_a_pass():
+    """No source rows in scope means the cardinality check compared nothing; that is not evidence
+    the fixture has the source's profile."""
+    src = ShapedSource({"app.orders": []}, {"app.orders": SOURCE_SHAPE})
+    out = compare_fixture(SPEC, src, _source())
+    assert out["findings"] == []
+    assert out["status"] == "unsupported"
+    assert out["tables"]["app.orders"] == {
+        "status": "unsupported", "shape": "checked", "cardinality": "unsupported",
+        "reason": "source has 0 rows in scope, nothing to compare the fixture's profile with"}
+    assert src.calls["column_profile"] == 1  # stops at the first empty profile
+
+
 def test_sample_cardinality_gaps_are_findings():
     flat = [{"order_id": i, "status": "new", "occurred_at": None} for i in range(1, 6)]
     fixture = ShapedSource({"app.orders": flat}, {"app.orders": SOURCE_SHAPE})

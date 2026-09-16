@@ -132,9 +132,9 @@ provenance warning and the run is not merge-eligible.
   `type_mismatch`, `nullable_mismatch`, `empty_fixture`, `cardinality_collapsed`,
   `null_profile`. Source reads are catalog queries plus one profile statement per column,
   read-only and counted against the cap on the adapter's statement counter: shapes first, then
-  cardinality until the cap; a table past it, or whose shape either side could not read, is
-  `unsupported` with the reason, never clean. The wave 0 manifest declares it as a `custom`
-  gate with this file as evidence; a `fail` is a listed finding the child reports as `failed`,
+  cardinality until the cap; a table past it, whose shape either side could not read, or whose
+  source scope has no rows to profile, is `unsupported` with the reason, never clean. The wave 0 manifest declares it
+  as a `custom` gate with this file as evidence; a `fail` is a listed finding the child reports as `failed`,
   so wave 0 does not close and wave 1 is not launched on an unproven fixture.
   `harness/fixtures/example_fixture_shape/` is the canonical gap (a column spelled differently,
   a loosened type, one status for every row).

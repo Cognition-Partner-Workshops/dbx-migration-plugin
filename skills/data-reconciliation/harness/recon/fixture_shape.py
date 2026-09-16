@@ -103,6 +103,8 @@ def _compare_cardinality(table: str, columns: list[str], where: str | None, sour
         except Exception as exc:  # a profile the side cannot run (no equality operator, denied)
             return out, f"profiling {col} failed: {type(exc).__name__}: {exc}"
         s_rows, f_rows = int(s["count"]), int(f["count"])
+        if s_rows == 0:
+            return out, "source has 0 rows in scope, nothing to compare the fixture's profile with"
         if f_rows == 0:
             out.append(_find(table, "empty_fixture", f"source {s_rows} rows, fixture 0 rows"))
             break
