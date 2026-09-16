@@ -88,9 +88,12 @@ def test_writers_include_what_the_callees_write_transitively():
 
 
 @pytest.mark.parametrize("rows, match", [
-    ([{"routine": "a", "writes": "app.t"}], "a: writes must be a list"),
-    ([{"routine": "a", "writes": ["app.t", 3]}], "a: writes must be a list of table names"),
-    ([{"routine": "a", "writes": ["app.t"]}, {"routine": "A", "writes": []}], "routine a appears twice"),
+    ([{"routine": "a", "writes": "app.t", "calls": []}], "a: writes must be a list"),
+    ([{"routine": "a", "writes": ["app.t", 3], "calls": []}], "a: writes must be a list of table names"),
+    ([{"routine": "a", "writes": ["app.t"], "calls": []}, {"routine": "A", "writes": [], "calls": []}],
+     "routine a appears twice"),
+    ([{"routine": "a", "calls": []}], "a: writes must be present"),
+    ([{"routine": "a", "writes": []}], "a: calls must be present"),
     ([{"routine": "a", "writes": ["app.t"], "calls": "b"}], "a: calls must be a list"),
     ([{"routine": "a", "writes": ["app.t"], "calls": ["b"]}], "a calls b, which has no row"),
     ([{"writes": ["app.t"]}], "every row is"),
@@ -100,7 +103,8 @@ def test_writers_include_what_the_callees_write_transitively():
 ])
 def test_a_malformed_dependency_analysis_is_refused_not_guessed_at(rows, match):
     """A string `writes` would iterate as characters, a duplicate row would silently win, an
-    unknown callee would hide its writes: each is an error the analysis has to fix."""
+    unknown callee would hide its writes, an omitted `writes` or `calls` would read as a routine that
+    writes and calls nothing: each is an error the analysis has to fix."""
     deps = rows if isinstance(rows, dict) else {"routines": rows}
     with pytest.raises(ConfigError, match=match):
         writers(deps)
@@ -383,6 +387,26 @@ def test_load_runs_accepts_a_file_or_a_directory(tmp_path):
         load_runs(runs, tmp_path)
 
 
+def test_load_runs_refuses_a_symlinked_record_before_reading_it(tmp_path):
+    """A link inside the repository can point anywhere; what it points at is nobody's committed
+    evidence, so the record is refused by its link path and the target is never read."""
+    repo, elsewhere = tmp_path / "repo", tmp_path / "elsewhere"
+    (repo / "recon" / "runs").mkdir(parents=True)
+    elsewhere.mkdir()
+    (elsewhere / "x.run.json").write_text(json.dumps(_run()))
+    (repo / "recon" / "runs" / "a.run.json").symlink_to(elsewhere / "x.run.json")
+    with pytest.raises(ConfigError, match="recon/runs/a.run.json: is a symlink"):
+        load_runs(repo / "recon" / "runs" / "a.run.json", repo)
+    with pytest.raises(ConfigError, match="recon/runs/a.run.json: is a symlink"):
+        load_runs(repo / "recon" / "runs", repo)
+    (repo / "runs").symlink_to(repo / "recon" / "runs", target_is_directory=True)
+    (repo / "recon" / "runs" / "a.run.json").unlink()
+    (repo / "recon" / "runs" / "b.run.json").write_text(json.dumps(_run()))
+    with pytest.raises(ConfigError, match="runs/b.run.json: is a symlink"):
+        load_runs(repo / "runs" / "b.run.json", repo)
+    assert load_runs(repo / "recon" / "runs" / "b.run.json", repo)[0]["record"] == "recon/runs/b.run.json"
+
+
 # ---- result.json / merge -------------------------------------------------------------------
 
 def test_result_carries_routine_parity_and_a_failed_run_blocks_merge(tmp_path):
@@ -547,6 +571,9 @@ def test_cli_run_grades_the_parity_file_against_the_unit_dependency_analysis(tmp
         {"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}]}))
     with pytest.raises(SystemExit, match="--routine-dependencies"):
         _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity))
+    with pytest.raises(SystemExit, match="--routine-dependencies analysis/missing.json is not a file"):
+        _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity),
+                 "--routine-dependencies", "analysis/missing.json")
     _committed_run(tmp_path)
     rc, result = _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity),
                           "--routine-dependencies", deps)

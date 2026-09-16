@@ -531,6 +531,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--routine-parity needs --routine-dependencies: the unit's dependency analysis "
                          "says which writing routines the file must cover")
     deps_path = args.routine_dependencies or Path(".migration/units") / args.unit / "dependencies.json"
+    if args.routine_dependencies is not None and not deps_path.is_file():
+        raise SystemExit(f"--routine-dependencies {deps_path} is not a file")
     routine_analysis_missing = not deps_path.is_file()
     if not routine_analysis_missing:
         from .routines import check_parity, git_committed, writers

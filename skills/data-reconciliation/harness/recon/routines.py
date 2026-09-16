@@ -67,7 +67,9 @@ def git_committed(repo: Path) -> Committed:
 
 
 def _names(row: dict, key: str) -> list[str]:
-    values = row.get(key, [])
+    if key not in row:
+        raise ConfigError(f"{row['routine']}: {key} must be present")
+    values = row[key]
     if not isinstance(values, list):
         raise ConfigError(f"{row['routine']}: {key} must be a list")
     if any(not isinstance(v, str) or not v for v in values):
@@ -289,14 +291,20 @@ def _regrade(claim: dict, where: str, writing: dict[str, list[str]], committed: 
 
 def load_runs(path: Path, repo: Path = Path(".")) -> list[dict]:
     """Read run records and stamp each with `record`, its path inside `repo` (never what the file
-    says about itself); a file outside the repository can be nobody's committed evidence."""
+    says about itself); a file outside the repository, or reached through a symlink, can be nobody's
+    committed evidence and is refused before it is read."""
     files = sorted(path.glob("*.run.json")) if path.is_dir() else [path]
     root = Path(repo).resolve()
     runs = []
     for f in files:
-        rel = Path(os.path.relpath(f.resolve(), root))
+        rel = Path(os.path.relpath(Path(os.path.abspath(f)), root))
         if ".." in rel.parts:
             raise ConfigError(f"{f}: is outside the repository {root}")
+        node = root
+        for part in rel.parts:
+            node = node / part
+            if node.is_symlink():
+                raise ConfigError(f"{rel.as_posix()}: is a symlink; a committed run record is a regular file")
         try:
             run = json.loads(f.read_text())
         except (OSError, json.JSONDecodeError) as exc:
