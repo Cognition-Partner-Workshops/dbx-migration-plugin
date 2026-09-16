@@ -9,9 +9,10 @@ Playbook: Turn one pipeline's analysis into a decided, costed execution plan and
 2. Decide every dependency, fire its lead-time request, and leave no UNDECIDED entry past STOP C.
 3. Specify wave-0 scaffolding: catalog/schemas, federation or backfill, CI, recon harness, and bundle/job shells. Where the data-load posture is materialized backfill, **classify every table with the load-posture table in `skills/data-reconciliation/SKILL.md`** and give each class beyond CTAS its own line in the wall-clock math. A backfill too big for CTAS is a wave-0 workstream, not a footnote.
 4. Write the schedule: unit batches, branches, profiles, recon rows, isolated namespaces, idempotency, base branch, width, legacy-query cap, breaker threshold, serial floor, reviewer throughput, parallel-run tier, and projected cost. XL units use the decision-first 2-PR split; small units batch 4–5, complex units 1–2.
-5. Write each `.migration/waves/wave-<N>.json` with repo, child/verifier macros, width, breaker, `auto_merge`, source family/secret/params, batch ids/units/write targets/briefs, capability contract, `verify_depth`, and `cost_estimate`. Commit manifests before STOP C.
+5. Write each `.migration/waves/wave-<N>.json` with repo, child/verifier macros, width, breaker, `auto_merge`, source family/secret/params, batch ids/units/write targets/briefs, capability contract, `verify_depth`, `cost_estimate`, and executable `gates`; commit manifests before STOP C.
 6. Specify mechanical recon commands, populations, source-volume assertions, fixture ownership, review/full-rerun caps, governance mapping and GAP rows. Children use fixture first; the independent verifier supplies live/snapshot/transactional merge evidence.
 7. Write `<Pipeline>_plan.md` with risks, unresolved blockers, fired requests, schedule, gate, governance map, and scaffolding. Resolve STOP C before execution.
+8. Hash each manifest's gates as `gates_sha`, name that hash in the STOP C decision row (`stop_c`), and let `workflow.py` enforce acceptance gates and append-only `wave-<N>.runs.jsonl` reservations and closes.
 
 | Plan control | Required rule |
 |---|---|
@@ -26,4 +27,4 @@ Playbook: Turn one pipeline's analysis into a decided, costed execution plan and
 - Validation: no UNDECIDED entries, self-contained batches, executable gates, narrow pilot, explicit approval on this run.
 
 ## Pointers
-Manifest schema and fan-out enforcement are in `skills/migration-fanout/workflow.py`; stops, branch/merge, and D1–D10 are in `references/contract.md`.
+Manifest schema and fan-out enforcement are in `skills/migration-fanout/workflow.py`; acceptance gates are in `skills/migration-fanout/SKILL.md`; stops, branch/merge, and D1–D10 are in `references/contract.md`.

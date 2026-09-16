@@ -26,12 +26,14 @@ def _functions():
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
-                    and node.name in {"validate_manifest", "validate_verify", "ledger_violations"})
+                    and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
+                                      "validate_gates", "gates_approved"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
-                                                         "ENV_NAME", "PARAM_VALUE"}
+                                                         "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
+                                                         "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED"}
                     for t in node.targets))]
-    namespace = {"Counter": Counter, "re": re}
+    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -41,17 +43,20 @@ def _batch_runtime():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
-                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows"})
+                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
+                                                                         "gate_outcomes", "ledger_waiver"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA"}
+                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA", "DEFAULT_ACCEPTED"}
                     for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
         "unit_eligibility": lambda head, units: {u: True for u in units},
+        "evidence_in_pr": lambda head, path, units: bool(head) and any(path.startswith(f".migration/recon/{u}/") for u in units),
         "Counter": Counter,
         "hashlib": hashlib,
         "re": re,
         "decision_ledger": lambda: "",
+        "MANIFEST": {"stop_c": "D-2"},
         "REPLAYED": {},
         "CHILD_SCHEMA": {},
         "REPO": ".",
@@ -104,13 +109,363 @@ def _caps(**changes):
     return {**CAPS, **changes}
 
 
+GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": ""}
+
+
+def _gated(batches):
+    """Every manifest declares its gates at STOP C; tests about other fields get one pending gate each."""
+    return [{**b, "gates": b.get("gates", [dict(GATE)])} for b in batches]
+
+
 def _manifest(**extra):
     m = {"wave": 1, "repo": "repo", "child_macro": "child", "verify_macro": "verify",
          "capabilities": _caps(host=HOST),
          "base_branch": "migration/loan-servicing",
          "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
     m.update(extra)
+    m["batches"] = _gated(m["batches"])
+    m.setdefault("stop_c", "D-2")
+    m.setdefault("gates_sha", _functions()["declared_gates_sha"](m["wave"], m["batches"]))
     return m
+
+
+# ---------------------------------------------------------------- gates as manifest rows (WS3.3)
+
+@pytest.mark.parametrize("gates, message", [
+    (None, "gates"),
+    ([], "gates"),
+    ("g-rows", "gates"),
+    (["g-rows"], "gates"),
+    ([{**GATE, "id": ""}], "id"),
+    ([{**GATE, "id": "a b"}], "id"),
+    ([dict(GATE), dict(GATE)], "unique"),
+    ([{k: v for k, v in GATE.items() if k != "kind"}], "kind"),
+    ([{**GATE, "kind": "vibes"}], "kind"),
+    ([{k: v for k, v in GATE.items() if k != "status"}], "status"),
+    ([{**GATE, "status": "done"}], "status"),
+    ([{k: v for k, v in GATE.items() if k != "evidence"}], "evidence"),
+    ([{**GATE, "evidence": None}], "evidence"),
+    ([{**GATE, "status": "passed", "evidence": ""}], "evidence"),
+    ([{**GATE, "status": "waived"}], "decision_id"),
+    ([{**GATE, "status": "waived", "decision_id": "7"}], "decision_id"),
+    ([{**GATE, "decision_id": "seven"}], "decision_id"),
+])
+def test_validate_manifest_rejects_missing_or_malformed_gates(gates, message):
+    validate_manifest = _functions()["validate_manifest"]
+    batch = {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}
+    if gates is not None:
+        batch["gates"] = gates
+    m = _manifest()
+    m["batches"] = [batch]
+    with pytest.raises(SystemExit, match=message):
+        validate_manifest(m)
+
+
+def test_validate_manifest_accepts_every_gate_kind_and_status():
+    validate_manifest = _functions()["validate_manifest"]
+    kinds = ("byte_compare", "export_file", "publish_leg", "row_parity", "structural", "custom")
+    gates = [{"id": f"g-{k}", "kind": k, "status": "pending", "evidence": ""} for k in kinds]
+    gates += [{"id": "g-p", "kind": "custom", "status": "passed", "evidence": "recon/u/result.json"},
+              {"id": "g-f", "kind": "custom", "status": "failed", "evidence": ""},
+              {"id": "g-w", "kind": "custom", "status": "waived", "evidence": "", "decision_id": "D-12"}]
+    validate_manifest(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "x", "gates": gates}]))
+
+
+def test_gates_sha_is_approved_only_by_the_named_human_stop_c_row_for_this_wave():
+    """The approval is one parsed table row: the manifest names its D-<n>; that row has a cell that is the
+    decision id, a cell that is a human's provenance, and a cell reading exactly `STOP C wave-<N> gates_sha <sha>`
+    for this wave. Tokens scattered through prose, another wave's row, or another D-<n> do not approve."""
+    gates_approved = _functions()["gates_approved"]
+    sha = "a" * 64
+    row = f"| D-3 | 2024-05-01 | user:evt-9 | STOP C wave-2 gates_sha {sha} | plan v3 approved |\n"
+    assert gates_approved("D-3", 2, sha, "| D-1 | user:evt-1 | STOP A |\n" + row)
+    assert gates_approved("D-3", 2, sha, f"|D-3|user:evt-9|  stop c   wave-2   GATES_SHA {sha}  |\n")
+    assert gates_approved("D-3", 2, sha, f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha} |\n".rstrip("|\n") + "\n")
+    for ledger in ("",
+                   f"| D-3 | default-accepted (soft, 60s) | STOP C wave-2 gates_sha {sha} |\n",  # not a human's row
+                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {'b' * 64} |\n",               # another gate list
+                   f"| D-3 | user:evt-9 | STOP C wave-2 {sha} |\n",                              # the value without its name
+                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha}0 |\n",                   # not the exact value
+                   f"| user:evt-9 | STOP C wave-2 gates_sha {sha} |\n",                          # no decision id
+                   f"| D-4 | user:evt-9 | STOP C wave-2 gates_sha {sha} |\n",                    # not the row the manifest names
+                   f"| D-3 | user: | STOP C wave-2 gates_sha {sha} |\n",                         # user: without an id
+                   f"| D-3 | user:evt-9 | wave-2 gates_sha {sha} |\n",                           # not a STOP C row
+                   f"| D-3 | user:evt-9 | STOP CD wave-2 gates_sha {sha} |\n",
+                   f"| D-3 | user:evt-9 | STOP C gates_sha {sha} |\n",                           # no wave
+                   f"| D-3 | user:evt-9 | STOP C wave-3 gates_sha {sha} |\n",                    # another wave's approval
+                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha} approved |\n",           # prose in the approval cell
+                   f"| D-3 | user:evt-9 STOP C wave-2 gates_sha {sha} |\n",                      # provenance and approval in one cell
+                   f"D-3 user:evt-9 STOP C wave-2 gates_sha {sha}\n",                            # not a table row
+                   f"| D-3 | STOP C wave-2 gates_sha {sha} |\n| user:evt-9 |\n",                 # cells on two rows
+                   f"| D-3 | see D-3 | STOP C wave-2 gates_sha {sha} |\n",                       # no provenance cell
+                   f"| D-3 | D-3 user:evt-9 | STOP C wave-2 gates_sha {sha} |\n"):                # provenance cell is not just the provenance
+        assert not gates_approved("D-3", 2, sha, ledger), ledger
+    assert not gates_approved(None, 2, sha, row)
+    assert not gates_approved("D3", 2, sha, row)
+    assert not gates_approved("D-3", "2", sha, row)
+    assert not gates_approved("D-3", 2, None, row)
+    assert not gates_approved("D-3", 2, sha[:-1], row.replace(sha, sha[:-1]))
+
+
+def test_a_default_accepted_stop_c_row_approves_the_gates_only_under_soft_stop_mode():
+    """STOP C is resolved per stop_mode: soft lets the orchestrator's default-accepted row stand, hard needs
+    a human's. The cell is still just the provenance, in the row the manifest names, for this wave."""
+    gates_approved = _functions()["gates_approved"]
+    sha = "a" * 64
+    soft = f"| D-3 | 2024-05-01 | default-accepted (soft, 60s) | STOP C wave-2 gates_sha {sha} |\n"
+    human = soft.replace("default-accepted (soft, 60s)", "user:evt-9")
+    assert gates_approved("D-3", 2, sha, soft, stop_mode="soft")
+    assert gates_approved("D-3", 2, sha, soft.replace(" (soft, 60s)", ""), stop_mode="soft")
+    assert gates_approved("D-3", 2, sha, human, stop_mode="soft")
+    assert not gates_approved("D-3", 2, sha, soft, stop_mode="hard")
+    assert not gates_approved("D-3", 2, sha, soft)
+    assert not gates_approved("D-3", 2, sha, soft, stop_mode="open")
+    for ledger in (soft.replace("wave-2", "wave-3"),
+                   soft.replace("D-3", "D-4"),
+                   soft.replace("default-accepted (soft, 60s)", "bot:default-accepted"),
+                   soft.replace("default-accepted (soft, 60s)", "default-accepted by D-3"),
+                   soft.replace("default-accepted (soft, 60s)", "not default-accepted")):
+        assert not gates_approved("D-3", 2, sha, ledger, stop_mode="soft"), ledger
+
+
+def test_declared_gate_list_is_hashed_into_the_manifest():
+    ns = _functions()
+    validate_manifest, sha = ns["validate_manifest"], ns["declared_gates_sha"]
+    m = _manifest()
+    good = m["gates_sha"]
+    assert re.fullmatch(r"[0-9a-f]{64}", good)
+    validate_manifest(m)
+    for missing in ({k: v for k, v in m.items() if k != "gates_sha"}, {**m, "gates_sha": ""}, {**m, "gates_sha": good[:-1] + "0"}):
+        with pytest.raises(SystemExit, match="gates_sha") as e:
+            validate_manifest(missing)
+        assert good in str(e.value) and "STOP C" in str(e.value)
+    # the manifest names the STOP C row that approved it
+    for bad in ({k: v for k, v in m.items() if k != "stop_c"}, {**m, "stop_c": ""}, {**m, "stop_c": "7"}, {**m, "stop_c": ["D-2"]}):
+        with pytest.raises(SystemExit, match="stop_c"):
+            validate_manifest(bad)
+    # STOP C approved the whole row: a status or evidence edited in the manifest afterwards (a pending gate
+    # marked passed by hand) is a plan change, not an outcome; outcomes arrive in the children's reports
+    for edited in ([{**b, "gates": [{**g, "status": "passed", "evidence": "x"} for g in b["gates"]]} for b in m["batches"]],
+                   [{**b, "gates": [{**g, "evidence": "note.txt"} for g in b["gates"]]} for b in m["batches"]],
+                   [{**b, "gates": [{**g, "decision_id": "D-9"} for g in b["gates"]]} for b in m["batches"]]):
+        assert sha(m["wave"], edited) != good
+        with pytest.raises(SystemExit, match="gates_sha"):
+            validate_manifest({**m, "batches": edited})
+    # a gate swapped for another kind, renamed, dropped or added is a halt; so is a unit swapped under the gates
+    for changed in ([{**b, "gates": [{**g, "kind": "custom"} for g in b["gates"]]} for b in m["batches"]],
+                    [{**b, "units": ["other_unit"]} for b in m["batches"]],
+                    [{**b, "units": b["units"] + ["extra_unit"]} for b in m["batches"]],
+                    [{**b, "gates": [{**g, "id": "g-other"} for g in b["gates"]]} for b in m["batches"]],
+                    [{**b, "gates": b["gates"] + [{**GATE, "id": "g-extra"}]} for b in m["batches"]]):
+        assert sha(m["wave"], changed) != good
+        with pytest.raises(SystemExit, match="gates_sha"):
+            validate_manifest({**m, "batches": changed})
+    # the same declaration for another wave is another approval
+    assert sha(m["wave"] + 1, m["batches"]) != good
+    with pytest.raises(SystemExit, match="gates_sha"):
+        validate_manifest({**m, "wave": m["wave"] + 1})
+    # an absent decision_id and an explicit null hash alike; the hash is over sorted batches and gate order,
+    # so re-ordering is not a change
+    assert sha(1, [{**b, "gates": [{**g, "decision_id": None} for g in b["gates"]]} for b in m["batches"]]) == good
+    assert sha(1, list(reversed(_manifest(batches=[
+        {"id": "a", "units": ["u"], "write_targets": ["t"], "brief": "x"},
+        {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"]))) == sha(1, _manifest(batches=[
+        {"id": "a", "units": ["u"], "write_targets": ["t"], "brief": "x"},
+        {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"])
+
+
+GATES_LEDGER = ("| D-12 | user:U1 | waive g-w for u, export leg retired with the legacy feed |\n"
+                "| D-13 | user:U1 | waive g-other for u |\n"
+                f"| D-2 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n")
+
+
+def _gate_batch(*gates):
+    return {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "b", "gates": list(gates)}
+
+
+def _gate_report(**extra):
+    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
+            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"], "one_line_summary": "ok", **extra}
+
+
+def _run_gates(batch, report, ledger=GATES_LEDGER):
+    ns = _batch_runtime()
+    ns["decision_ledger"] = lambda: ledger
+
+    async def agent(prompt, **kwargs):
+        return dict(report)
+
+    ns["agent"] = agent
+    return asyncio.run(ns["run_batch"](batch, asyncio.Semaphore(1), ns["Breaker"](3)))
+
+
+def test_pass_with_a_gate_still_pending_is_downgraded():
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report())
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert "g-rows" in out["one_line_summary"] and "pending" in out["one_line_summary"]
+    assert out["gates"] == [{**GATE, "decision_id": None}]
+
+
+def test_child_reported_gate_pass_with_evidence_in_the_pr_closes_the_gate():
+    out = _run_gates(_gate_batch(dict(GATE)),
+                     _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/rows.md"}]))
+    assert out["status"] == "PASS" and "failure_class" not in out
+    assert out["gates"] == [{**GATE, "status": "passed", "evidence": ".migration/recon/u/rows.md", "decision_id": None}]
+
+
+@pytest.mark.parametrize("reported", [
+    [{"id": "g-rows", "status": "passed", "evidence": ""}],                       # no evidence
+    [{"id": "g-rows", "status": "passed", "evidence": "rows checked, all good"}],  # a claim, not a file in the PR
+    [{"id": "g-rows", "status": "passed", "evidence": "recon/u/rows.md"}],         # not under .migration/recon/<unit>/
+    [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/other_unit/rows.md"}],  # another unit's evidence
+    [{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}],
+    [{"id": "g-rows", "status": "waived", "evidence": "", "decision_id": "D-12"}],  # only the ledger waives
+    [{"id": "g-rows", "kind": "custom", "status": "passed", "evidence": "x"}],      # kind is not the child's to set
+    [{"id": "g-other", "status": "passed", "evidence": "x"}],                     # undeclared gate
+    [{"id": "g-rows", "status": "passed", "evidence": "x"}, {"id": "g-rows", "status": "passed", "evidence": "x"}],
+    ["g-rows"],
+    "g-rows passed",
+    [{"status": "passed", "evidence": "x"}],
+])
+def test_child_cannot_pass_a_gate_without_evidence_waive_it_or_rename_it(reported):
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(gates=reported))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+
+
+def test_a_ledger_waived_gate_needs_nothing_from_the_child_and_cannot_be_flipped_by_it():
+    batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
+    out = _run_gates(batch, _gate_report())
+    assert out["status"] == "PASS"
+    assert [g["status"] for g in out["gates"]] == ["waived"]
+    out = _run_gates(batch, _gate_report(gates=[{"id": "g-w", "status": "failed", "evidence": "x"}]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+
+
+def test_a_plan_passed_gate_is_a_declaration_the_child_still_has_to_prove():
+    """passed in the manifest says what STOP C expects, not what happened: without the child's result and its
+    evidence at the PR head the gate is unmet, and the child's evidence is what gets recorded."""
+    batch = _gate_batch({**GATE, "status": "passed", "evidence": "stop-c/rows.md"})
+    out = _run_gates(batch, _gate_report())
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "g-rows" in out["one_line_summary"]
+    out = _run_gates(batch, _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": "stop-c/rows.md"}]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    out = _run_gates(batch, _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/rows.md"}]))
+    assert out["status"] == "PASS"
+    assert out["gates"] == [{**GATE, "status": "passed", "evidence": ".migration/recon/u/rows.md", "decision_id": None}]
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"]({**ns["MANIFEST"]["batches"][0], "gates": batch["gates"]})
+    assert "g-rows" in child
+
+
+@pytest.mark.parametrize("ledger", [
+    "",
+    "| D-12 | user: waive g-w for other_unit |\n",                 # names another unit
+    "| D-12 | user: waive g-other for u |\n",                      # names another gate
+    "| D-120 | user: waive g-w for u |\n",                         # D-12 is not a prefix match
+])
+def test_waived_gate_whose_decision_is_not_in_the_ledger_fails_closed(ledger):
+    batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
+    out = _run_gates(batch, _gate_report(), ledger)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "D-12" in out["one_line_summary"]
+
+
+def test_a_human_waiver_recorded_after_stop_c_closes_a_declared_gate_the_child_did_not_pass():
+    """The declaration is frozen by gates_sha, so a waiver decided after STOP C lives in the ledger alone: a
+    human's D-<n> row that says waive and names the gate and every unit stands in for the child's result."""
+    ledger = GATES_LEDGER + "| D-14 | user:U2 | waive g-rows for u, parity proven on the wave-1 rerun |\n"
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), ledger)
+    assert out["status"] == "PASS", out.get("one_line_summary")
+    assert out["gates"] == [{**GATE, "status": "waived", "decision_id": "D-14"}]
+    out = _run_gates(_gate_batch(dict(GATE)),
+                     _gate_report(gates=[{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}]), ledger)
+    assert out["status"] == "PASS", out.get("one_line_summary")
+    assert out["gates"] == [{**GATE, "status": "waived", "evidence": "3 rows differ", "decision_id": "D-14"}]  # what was waived over stays visible
+
+
+def test_a_waiver_written_before_this_stop_c_row_does_not_carry_into_the_run_it_approved():
+    """A wave rerun fires STOP C again and the manifest names the new row; a waiver a human wrote for the
+    earlier run sits above that row and is that run's, so it does not waive the gate here. Only rows
+    strictly after the manifest's stop_c row are post-STOP C waivers; no stop_c row, no waiver."""
+    ledger_waiver = _batch_runtime()["ledger_waiver"]
+    old = "| D-14 | user:U2 | waive g-rows for u |\n"
+    stop_c = f"| D-20 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n"
+    new = "| D-21 | user:U2 | waive g-rows for u |\n"
+    assert ledger_waiver("g-rows", ["u"], old + stop_c + new, "D-20") == "D-21"
+    assert ledger_waiver("g-rows", ["u"], old + stop_c, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], old + new, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], old + "| D-19 | user:U0 | STOP C, see D-20 for the hash |\n" + new, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], "| D-20 | user:U2 | STOP C wave-0 gates_sha x; waive g-rows for u |\n", "D-20") is None
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), old + GATES_LEDGER)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert out["gates"] == [{**GATE, "decision_id": None}]
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), GATES_LEDGER + new.replace("D-21", "D-14"))
+    assert out["status"] == "PASS", out.get("one_line_summary")
+
+
+@pytest.mark.parametrize("row", [
+    "| D-14 | default-accepted | waive g-rows for u |\n",   # the orchestrator's row, not a human's
+    "| D-14 | user:U2 | waive g-rows for other_unit |\n",
+    "| D-14 | user:U2 | waive g-other for u |\n",
+    "| D-14 | user:U2 | g-rows for u |\n",
+])
+def test_a_ledger_row_that_does_not_waive_this_gate_for_every_unit_leaves_it_unmet(row):
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), GATES_LEDGER + row)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert out["gates"] == [{**GATE, "decision_id": None}]
+
+
+def test_evidence_in_pr_is_a_file_of_the_units_recon_dir_at_the_gated_head(tmp_path):
+    ws = tmp_path / "ws"
+    ns = _launch_ns(ws)
+    (ws / ".migration/recon/u").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(ws), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.email", "t@example.com"], check=True)
+    (ws / ".migration/recon/u/rows.md").write_text("rows\n")
+    (ws / ".migration/recon/u/sub").mkdir()
+    (ws / ".migration/recon/u/sub/x.md").write_text("x\n")
+    (ws / "notes.md").write_text("n\n")
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "evidence"], check=True)
+    head = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    evidence_in_pr = ns["evidence_in_pr"]
+    assert evidence_in_pr(head, ".migration/recon/u/rows.md", ["u", "v"])
+    assert evidence_in_pr(head, ".migration/recon/u/sub/x.md", ["u"])
+    for path in (".migration/recon/u/missing.md",          # not in the PR
+                 ".migration/recon/u",                     # a directory, not evidence
+                 ".migration/recon/u/",
+                 ".migration/recon/v/rows.md",             # v has no such file
+                 ".migration/recon/w/rows.md",             # not a unit of the batch
+                 ".migration/recon/u/../w/rows.md",
+                 "notes.md",
+                 "/" + str(ws / ".migration/recon/u/rows.md"),
+                 "", None, 3):
+        assert not evidence_in_pr(head, path, ["u", "v"]), path
+    assert not evidence_in_pr(None, ".migration/recon/u/rows.md", ["u"])
+    assert not evidence_in_pr(head[:-1] + ("0" if head[-1] != "0" else "1"), ".migration/recon/u/rows.md", ["u"])
+
+
+def test_gate_check_runs_last_after_the_pr_gate_and_merge_authority():
+    out = _run_gates(_gate_batch(dict(GATE)), {**_gate_report(), "pr_url": ""})
+    assert out["failure_class"] == "missing_pr"
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(merge_eligible=False))
+    assert out["failure_class"] == "merge_authority"
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report())
+    assert out["failure_class"] == "gates"
+
+
+def test_child_schema_and_prompts_carry_gates():
+    tree = ast.parse(WORKFLOW.read_text())
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
+    gate = schema["properties"]["gates"]["items"]
+    assert gate["properties"]["status"]["enum"] == ["passed", "failed"] and gate["required"] == ["id", "status", "evidence"]
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+    assert "g-rows" in child and "row_parity" in child and "waived" in child
+    verify = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1",
+                                  "gates": [{**GATE, "status": "passed", "evidence": "recon/u/result.json"}]}], False)
+    assert "g-rows" in verify and "recon/u/result.json" in verify
 
 
 @pytest.mark.parametrize("caps", [
@@ -364,10 +719,10 @@ def test_pass_without_merge_evidence_is_downgraded(mode):
 
 # ---------------------------------------------------------------- merge authority (WS3.2)
 
-LEDGER = ("| D-6 | 2024-05-01 | user:U1 widen tolerance for orders_dim | \n"
-          "| D-7 | 2024-05-02 | user:U1 merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
-          "| D-8 | 2024-05-02 | default-accepted: merge_override for other_unit |\n"
-          "| D-70 | 2024-05-03 | user:U1 merge_override for u2 |\n")
+LEDGER = ("| D-6 | 2024-05-01 | user:U1 | widen tolerance for orders_dim | \n"
+          "| D-7 | 2024-05-02 | user:U1 | merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
+          "| D-8 | 2024-05-02 | default-accepted | merge_override for other_unit |\n"
+          "| D-70 | 2024-05-03 | user:U1 | merge_override for u2 |\n")
 
 
 def _ns_with_ledger(text=LEDGER):
@@ -433,12 +788,12 @@ def test_override_decision_row_must_name_every_unit_and_say_merge_override():
 
 def test_override_decision_row_names_units_in_its_text_not_in_its_metadata():
     override_decision = _batch_runtime()["override_decision"]
-    row = "| D-7 | 2024-05-02 | user:U1 merge_override for u |\n"
+    row = "| D-7 | 2024-05-02 | user:U1 | merge_override for u |\n"
     assert override_decision("D-7", ["u"], row)
     assert not override_decision("D-7", ["U1"], row)                 # the provenance id is not a unit
     assert not override_decision("D-7", ["2024-05-02"], row)         # nor the date
     assert not override_decision("D-7", ["u", "U1"], row)
-    assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 merge_override for u and v (feed gap) |")
+    assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 | merge_override for u and v (feed gap) |")
     # column order is the ledger author's: units before the marker count too
     assert override_decision("D-7", ["orders"], "| D-7 | units: orders | user:U1 | merge_override for an accepted feed gap |")
     assert override_decision("D-7", ["u", "v"], "| 2024-05-02T10:00:00Z | D-7 | u, v | user:U1 | merge_override |")
@@ -470,13 +825,29 @@ def test_override_decision_counts_a_unit_named_like_metadata_when_the_row_names_
     assert override_decision("D-9", ["default-accepted"], "| D-9 | user:evt-1 | merge_override for default-accepted |")
     assert not override_decision("D-9", ["D-7"], "| D-9 | D-7 | user:evt-1 | merge_override for u |")   # a cell that is only an id
     assert not override_decision("D-9", ["2026-09-16"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for u |")
-    assert not override_decision("D-9", ["evt-1"], "| D-9 | user:evt-1 merge_override for u |")
+    assert not override_decision("D-9", ["evt-1"], "| D-9 | user:evt-1 | merge_override for u |")
+
+
+def test_override_decision_provenance_is_a_cell_of_its_own_not_a_mention_in_the_text():
+    """Human provenance is the row's provenance cell, exactly `user:<id>`, as the STOP C row's is: a row whose
+    text mentions a user (default-accepted rows citing who asked, prose quoting an event id) is not a
+    human's decision, and a row with a default-accepted cell is the orchestrator's whatever else it says."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-7", ["u"], "| D-7 | 2024-05-02 | user:U1 merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted | merge_override for u, as user:U1 asked |")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted (soft) | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | D-7 user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | user:U1 said so | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 | user:U1 | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 |  user:U1  | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-7 | user:U1 | waive for u |", word="waive")
+    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted | user:U1 waive for u |", word="waive")
 
 
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
     ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
-    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 merge_override for u, u2, u3 |\n"
+    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 | merge_override for u, u2, u3 |\n"
 
     def run(report):
         async def agent(prompt, **kwargs):
@@ -501,7 +872,7 @@ def test_override_decision_row_needs_human_provenance():
     assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "bot:"))
     assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "user"))
     assert not override_decision("D-7", ["u"], LEDGER.replace("user:U1", "user:"))      # user: with no event id
-    assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 merge", "user:a.b@x.io merge"))
+    assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 | merge", "user:a.b@x.io | merge"))
 
 
 def test_override_decision_marker_does_not_stand_in_for_a_unit_of_that_name():
@@ -720,10 +1091,10 @@ def _launch_ns(tmp_path, fake_run=None):
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"signed_doctor_report", "wave_signature", "pr_changed_paths",
-                                      "ref_changed_paths", "wave_base", "launch_base",
+                                      "ref_changed_paths", "wave_base", "launch_base", "evidence_in_pr",
                                       "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "PR_URL" for t in node.targets))]
+                    isinstance(t, ast.Name) and t.id in {"PR_URL", "UNIT_ID"} for t in node.targets))]
     ns = {"datetime": datetime, "hashlib": hashlib, "hmac": hmac, "json": json, "os": os, "re": re,
           "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
           "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target", "resume": False,
