@@ -108,6 +108,31 @@ def test_a_run_without_evidence_or_snapshot_is_unproven():
     assert row["status"] == "unproven" and "snapshot" in row["reason"]
 
 
+def test_a_snapshot_that_is_not_a_fixture_leaves_the_routine_unproven():
+    """Only a run against a committed fixture snapshot proves a routine; a production or ad hoc
+    snapshot is not evidence, however non-empty the string is."""
+    for bad in ("production-2026-09-16", "prod", "fixture:", "fixture: ", "Fixture:ledger", "/tmp/snap", 7):
+        run = _run()
+        run["snapshot"] = bad
+        row = grade_routines(DEPS, [run])["routine_parity"][0]
+        assert row["status"] == "unproven" and "fixture:" in row["reason"], bad
+    for ok in ("fixture:ledger-2024q1", "fixture:ledger/2024q1.v2"):
+        run = _run()
+        run["snapshot"] = ok
+        assert grade_routines(DEPS, [run])["routine_parity"][0]["status"] == "proven", ok
+
+
+def test_table_names_in_golden_and_observed_compare_case_insensitively():
+    upper = {"APP.Ledger_Balance": GOLDEN["app.ledger_balance"]}
+    out = grade_routines(DEPS, [_run(golden=upper, observed=upper)])
+    assert out["routine_parity"][0]["status"] == "proven"
+    out = grade_routines(DEPS, [_run(golden=upper)])
+    assert out["routine_parity"][0]["status"] == "proven"
+    both = {"app.ledger_balance": GOLDEN["app.ledger_balance"], "APP.LEDGER_BALANCE": []}
+    with pytest.raises(ConfigError, match="app.ledger_balance.*twice"):
+        grade_routines(DEPS, [_run(observed=both)])
+
+
 def test_a_run_for_a_routine_the_analysis_lacks_is_a_config_error():
     with pytest.raises(ConfigError, match="not in the dependency analysis"):
         grade_routines(DEPS, [_run("app_pkg.nobody")])
@@ -119,6 +144,22 @@ def test_routine_gap_is_only_a_failed_run():
     assert routine_gap(None) is False
     assert routine_gap([{"routine": "r", "status": "unproven", "evidence": None}]) is False
     assert routine_gap([{"routine": "r", "status": "failed", "evidence": "e"}]) is True
+
+
+def test_check_parity_against_the_dependency_analysis_materializes_missing_writers_as_unproven():
+    """A parity file that omits a writing routine is not clean: the routine is `unproven`, and a
+    row for a routine the analysis lacks (another unit's file) is refused."""
+    proven = [{"routine": "app_pkg.close_period", "status": "proven", "evidence": "e"}]
+    out = check_parity(proven, "x", dependencies=DEPS)
+    assert out == proven + [{"routine": "app_pkg.write_run_log", "status": "unproven", "evidence": None,
+                             "reason": "no row in x"}]
+    assert check_parity([], "x", dependencies=DEPS)[0]["status"] == "unproven"
+    assert check_parity([], "x", dependencies={"routines": []}) == []
+    with pytest.raises(ConfigError, match="other_pkg.nobody.*not in the dependency analysis"):
+        check_parity(proven + [{"routine": "other_pkg.nobody", "status": "proven", "evidence": "e"}],
+                     "x", dependencies=DEPS)
+    with pytest.raises(ConfigError, match="routines"):
+        check_parity(proven, "x", dependencies={})
 
 
 def test_check_parity_validates_a_written_result():
@@ -172,6 +213,47 @@ def test_result_without_parity_omits_it():
     source, target = make_green()
     result = run_recon("orders", "live", SPEC, TOL, RULES, source, target)
     assert result["routine_parity"] is None and "routine_gap" not in result["merge_block_reasons"]
+
+
+def _cli_run(tmp_path, monkeypatch, *extra):
+    from recon import adapters
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir(exist_ok=True)
+    (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig"]}))
+    source, target = make_green()
+    monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "oracle", lambda secret: source)
+    monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: target)
+    monkeypatch.setattr(cli, "load_mapping_spec", lambda path, params: FLAT)
+    monkeypatch.setattr(cli, "load_tolerances", lambda path: TOL)
+    monkeypatch.setattr(cli, "load_canon_rules", lambda path: RULES)
+    rc = cli.main(["run", "--unit", "u", "--family", "oracle", "--mode", "live", "--mapping", "m", "--tolerances", "t",
+                   "--canonicalization", "c", "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
+                   "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out"), *extra])
+    return rc, json.loads((tmp_path / "out" / "result.json").read_text())
+
+
+def test_cli_run_grades_the_parity_file_against_the_unit_dependency_analysis(tmp_path, monkeypatch):
+    """`run --routine-parity` needs the unit's dependency analysis: a parity file missing a writer,
+    or no parity file at all, lists that writer as `unproven` instead of leaving the unit clean."""
+    deps = tmp_path / "dependencies.json"
+    deps.write_text(json.dumps(DEPS))
+    parity = tmp_path / "routine_parity.json"
+    parity.write_text(json.dumps({"routine_parity": [
+        {"routine": "app_pkg.close_period", "status": "proven", "evidence": "e"}]}))
+    with pytest.raises(SystemExit, match="--routine-dependencies"):
+        _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity))
+    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity),
+                          "--routine-dependencies", str(deps))
+    assert rc == 0 and result["merge_eligible"] is True
+    assert [(r["routine"], r["status"]) for r in result["routine_parity"]] == [
+        ("app_pkg.close_period", "proven"), ("app_pkg.write_run_log", "unproven")]
+    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", str(deps))
+    assert [r["status"] for r in result["routine_parity"]] == ["unproven", "unproven"]
+    assert "unproven" in (tmp_path / "out" / "recon.summary.md").read_text()
+    parity.write_text(json.dumps({"routine_parity": [
+        {"routine": "other_pkg.x", "status": "proven", "evidence": "e"}]}))
+    with pytest.raises(SystemExit, match="other_pkg.x.*not in the dependency analysis"):
+        _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity), "--routine-dependencies", str(deps))
 
 
 # ---- fixture -----------------------------------------------------------------------------

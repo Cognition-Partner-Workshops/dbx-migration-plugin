@@ -28,6 +28,28 @@ DEDICATED_TARGET = {
     "lakebase": re.compile(r"mig-[A-Za-z0-9_-]+-exec"),
     "databricks": re.compile(r"[A-Za-z0-9_]+\.[A-Za-z0-9_]+_exec"),
 }
+# a run proves a routine only against a committed fixture snapshot, named `fixture:<id>`
+FIXTURE_SNAPSHOT = re.compile(r"fixture:[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def _writers(dependencies: object) -> dict[str, list[str]]:
+    rows = dependencies.get("routines") if isinstance(dependencies, dict) else None
+    if not isinstance(rows, list):
+        raise ConfigError("dependency analysis must be {routines: [...]}")
+    return {str(r["routine"]).lower(): [str(t).lower() for t in r.get("writes", [])]
+            for r in rows if r.get("writes")}
+
+
+def _tables(mapping: object, routine: str, which: str) -> dict[str, object]:
+    if not isinstance(mapping, dict):
+        raise ConfigError(f"{routine}: golden and observed must map table -> rows")
+    out: dict[str, object] = {}
+    for table, rows in mapping.items():
+        key = str(table).lower()
+        if key in out:
+            raise ConfigError(f"{routine}: {which} names {key} twice (differing only in case)")
+        out[key] = rows
+    return out
 
 
 def _canon(rows) -> list[str]:
@@ -48,8 +70,10 @@ def _grade_run(routine: str, writes: list[str], run: dict) -> dict:
     evidence = str(run["evidence"] or "")
     if not evidence:
         return _row(routine, "unproven", None, reason="run record has no evidence")
-    if not run["snapshot"]:
-        return _row(routine, "unproven", evidence, reason="run record names no fixture snapshot")
+    snapshot = run["snapshot"]
+    if not isinstance(snapshot, str) or not FIXTURE_SNAPSHOT.fullmatch(snapshot):
+        return _row(routine, "unproven", evidence,
+                    reason=f"snapshot {snapshot!r} is not a committed fixture snapshot (fixture:<id>)")
     family, branch = str(run["target_family"]), str(run["target_branch"])
     pattern = DEDICATED_TARGET.get(family)
     if pattern is None:
@@ -58,9 +82,8 @@ def _grade_run(routine: str, writes: list[str], run: dict) -> dict:
     if not pattern.fullmatch(branch):
         return _row(routine, "unproven", evidence,
                     reason=f"{branch} is not a dedicated execution target ({pattern.pattern})")
-    golden, observed = run["golden"], run["observed"]
-    if not isinstance(golden, dict) or not isinstance(observed, dict):
-        raise ConfigError(f"{routine}: golden and observed must map table -> rows")
+    golden = _tables(run["golden"], routine, "golden")
+    observed = _tables(run["observed"], routine, "observed")
     findings = []
     for table in writes:
         if table not in golden:
@@ -83,15 +106,12 @@ def _grade_run(routine: str, writes: list[str], run: dict) -> dict:
 
 
 def grade_routines(dependencies: dict, runs: list[dict]) -> dict:
-    rows = dependencies.get("routines") if isinstance(dependencies, dict) else None
-    if not isinstance(rows, list):
-        raise ConfigError("dependency analysis must be {routines: [...]}")
-    writers = {str(r["routine"]).lower(): [str(t).lower() for t in r.get("writes", [])]
-               for r in rows if r.get("writes")}
+    writers = _writers(dependencies)
+    known = {str(r["routine"]).lower() for r in dependencies["routines"]}
     by_routine: dict[str, dict] = {}
     for run in runs:
         name = str(run.get("routine", "")).lower()
-        if name not in {str(r["routine"]).lower() for r in rows}:
+        if name not in known:
             raise ConfigError(f"run for {name or '<unnamed>'}: routine is not in the dependency analysis")
         if name not in writers:
             continue  # a read-only routine has nothing to prove here
@@ -114,8 +134,10 @@ def routine_gap(parity: list[dict] | None) -> bool:
     return bool(parity) and any(r.get("status") == "failed" for r in parity)
 
 
-def check_parity(data: object, where: str) -> list[dict]:
-    """Validate a routine_parity list before result.json carries it."""
+def check_parity(data: object, where: str, dependencies: object = None) -> list[dict]:
+    """Validate a routine_parity list before result.json carries it. With the unit's dependency
+    analysis, every writing routine gets a row: one the list lacks is `unproven`, and a row for a
+    routine the analysis does not know (another unit's file) is refused."""
     if not isinstance(data, list):
         raise ConfigError(f"{where}: routine_parity must be a list")
     for r in data:
@@ -123,7 +145,15 @@ def check_parity(data: object, where: str) -> list[dict]:
             raise ConfigError(f"{where}: each row is {{routine, status: proven|unproven|failed, evidence}}")
         if r["status"] != "unproven" and not r.get("evidence"):
             raise ConfigError(f"{where}: {r['routine']} is {r['status']} without evidence")
-    return data
+    if dependencies is None:
+        return data
+    writers = _writers(dependencies)
+    seen = [str(r["routine"]).lower() for r in data]
+    for name in seen:
+        if name not in writers:
+            raise ConfigError(f"{where}: {name} is not in the dependency analysis as a writing routine")
+    return data + [_row(routine, "unproven", None, reason=f"no row in {where}")
+                   for routine in writers if routine not in seen]
 
 
 def load_runs(path: Path) -> list[dict]:

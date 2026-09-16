@@ -231,7 +231,10 @@ def main(argv: list[str] | None = None) -> int:
                         "(e.g. partition/date scoping); repeatable; recorded in result.json")
     r.add_argument("--routine-parity", type=Path,
                    help="routine_parity.json from `routine-parity`; carried into result.json, a "
-                        "failed routine blocks merge (routine_gap)")
+                        "failed routine blocks merge (routine_gap); needs --routine-dependencies")
+    r.add_argument("--routine-dependencies", type=Path,
+                   help="the unit's dependencies.json; every writing routine it lists must have a "
+                        "routine_parity row, otherwise it is carried as unproven")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -386,14 +389,18 @@ def main(argv: list[str] | None = None) -> int:
         except ConfigError as exc:
             raise SystemExit(f"dictionary: {exc}") from None
     routine_parity = None
-    if args.routine_parity:
+    if args.routine_parity and not args.routine_dependencies:
+        raise SystemExit("--routine-parity needs --routine-dependencies: the unit's dependency analysis "
+                         "says which writing routines the file must cover")
+    if args.routine_dependencies:
         from .routines import check_parity
         try:
-            routine_parity = check_parity(
-                json.loads(args.routine_parity.read_text()).get("routine_parity"),
-                str(args.routine_parity))
+            deps = json.loads(args.routine_dependencies.read_text())
+            rows = (json.loads(args.routine_parity.read_text()).get("routine_parity")
+                    if args.routine_parity else [])
+            routine_parity = check_parity(rows, str(args.routine_parity or "routine_parity"), deps)
         except (OSError, json.JSONDecodeError, AttributeError) as exc:
-            raise SystemExit(f"cannot read {args.routine_parity}: {exc}") from None
+            raise SystemExit(f"cannot read {args.routine_parity or args.routine_dependencies}: {exc}") from None
         except ConfigError as exc:
             raise SystemExit(str(exc)) from None
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None

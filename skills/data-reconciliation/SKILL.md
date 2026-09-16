@@ -146,7 +146,8 @@ The output is a machine-readable table of object, class, method, partition key, 
 
 A converted routine whose `dependencies.json` row has `writes` is proven only by one committed run on a
 dedicated execution target (Lakebase branch `mig-<pipeline>-exec`; Unity Catalog schema
-`<catalog>.<pipeline>_exec`; never the migration target itself) against a fixture snapshot, with the rows it
+`<catalog>.<pipeline>_exec`; never the migration target itself) against a committed fixture snapshot
+(`snapshot: "fixture:<id>"`; anything else, a production or ad hoc snapshot, is `unproven`), with the rows it
 left in every written table compared to a golden set. Record each run as `<routine>.run.json`
 (`{routine, target_family, target_branch, snapshot, evidence, golden: {table: [rows]}, observed: {table: [rows]}}`;
 fixture: `harness/fixtures/example_routine_parity/`) and grade them:
@@ -159,8 +160,10 @@ dbx-recon routine-parity --dependencies .migration/units/<unit>/dependencies.jso
 `routine_parity.json` carries `routine_parity: [{routine, status: proven|unproven|failed, evidence}]`. A
 routine with no run, a run off a dedicated target, without evidence or a snapshot, or in a family with no
 dedicated-target rule is `unproven` (exit 2), never silently clean; rows that differ, or a written table
-absent from either set, are `failed` (exit 1). Pass the file to `run --routine-parity` so `result.json`
-carries it: a `failed` routine sets `merge_eligible=false` with reason `routine_gap`; `unproven` routines
+absent from either set, are `failed` (exit 1); table names compare case-insensitively. Pass the file to
+`run --routine-parity <file> --routine-dependencies <unit dependencies.json>` so `result.json` carries it
+(a writing routine the file lacks is carried as `unproven`; a row for a routine the analysis does not
+know is refused; `--routine-dependencies` alone carries every writer as `unproven`): a `failed` routine sets `merge_eligible=false` with reason `routine_gap`; `unproven` routines
 are listed in `recon.summary.md` and become cutover exceptions (`8-cutover_signoff.md`). The run itself
 needs the read-only principal to hold EXECUTE on the routines under test; the intake asks (`14-front_door_oltp.md`).
 
