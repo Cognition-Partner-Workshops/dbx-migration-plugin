@@ -1,0 +1,5 @@
+{
+  "_comment": "Engagement-specific identifiers that must never appear in the plugin. Read by skills/test_no_estate_strings.py; matched case-insensitively outside **/fixtures/example_*.",
+  "engagements": ["ow_tp", "otterworks", "OW_BILLING", "tp-run"],
+  "catalogs_and_tables": ["analytics_daily_summary", "billing_audit_log", "usage_events"]
+}

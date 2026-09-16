@@ -47,6 +47,18 @@ def block(cmd: str, cfg=CFG):
     return v
 
 
+def test_write_objects_normalize_index_and_schema_targets():
+    assert g._write_objects([
+        "CREATE UNIQUE INDEX ix ON dbo.t (a)",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA s TO r",
+        "REVOKE ALL ON ALL SEQUENCES IN SCHEMA s FROM r",
+        "ALTER MATERIALIZED VIEW dbo.v REFRESH",
+        "DROP MATERIALIZED VIEW IF EXISTS dbo.v",
+        "DROP INDEX ix ON dbo.t",
+        "ALTER USER x",
+    ]) == [["dbo.t"], ["s"], ["s"], ["dbo.v"], ["dbo.v"], ["dbo.t"], []]
+
+
 # ---------------------------------------------------------------- allowed shapes
 
 @pytest.mark.parametrize("cmd", [
@@ -651,6 +663,22 @@ def test_cd_into_workspace_with_broken_allowlist_is_blocked(tmp_path: Path):
     (tmp_path / "b" / ".migration" / "allowed_targets.json").write_text("{not json")
     v = g.evaluate_with_workdirs("cd ../b && databricks jobs list", g.load_config(a), a)
     assert v.decision == "block" and "cannot read" in v.reason
+
+
+def test_nested_legacy_violation_stays_structural_under_parent_warn(tmp_path: Path):
+    parent = _workspace(tmp_path / "parent", ["mig_cat"])
+    (parent / ".migration" / "allowed_targets.json").write_text(
+        json.dumps({"catalogs": ["mig_cat"], "guard_mode": "warn"})
+    )
+    nested = _workspace(parent / "sub", ["mig_cat"])
+    (nested / ".migration" / "allowed_targets.json").write_text(
+        json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["tdprod.corp"]})
+    )
+    cfg = g.load_config(parent)
+    write = "sqlcmd -S tdprod.corp -Q 'DROP TABLE dbo.orders'"
+    read = "sqlcmd -S tdprod.corp -Q 'SELECT 1'"
+    assert g.evaluate_with_workdirs(f"cd sub && {write}", cfg, parent, str(parent)).decision == "block"
+    assert g.evaluate_with_workdirs(f"cd sub && {read}", cfg, parent, str(parent)).decision == "approve"
 
 
 def test_main_judges_cd_target_workspace(tmp_path: Path):

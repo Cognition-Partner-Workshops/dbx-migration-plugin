@@ -57,9 +57,26 @@ def decide(tool: str, tool_input: dict, ws: Path, env: dict[str, str] | None = N
     ("write", ".migration/recon/u1/result.json", {"content": "{}"}, "approve"),
     ("write", ".migration/waves/wave-1.json", {"content": "{}"}, "approve"),
     ("edit", "src/etl.py", {"old_string": "ok", "new_string": "better"}, "approve"),
-    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "| D-7 | 2026-01-01 | accept tolerances |"}, "approve"),
+    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\n| D-7 | 2026-01-01 | accept tolerances |\n"}, "approve"),
+    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\n| D-7 | 2026-01-01 | legacy_write_authorized: drop dbo.orders |\n"}, "block"),
+    ("write", ".migration/06_decisions.md", {"content": "# Decisions\n| D-7 | 2026-01-01 | legacy_write_authorized: drop dbo.orders |\n"}, "block"),
+    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\n| D-7 | 2026-01-01 | Legacy_Write_Authorized: drop dbo.orders |\n"}, "block"),
     ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\nmore prose\n"}, "block"),
     ("edit", ".migration/06_decisions.md", {"old_string": "| D-7 | old | decision |\n", "new_string": "| D-7 | new | changed |\n"}, "block"),
+    ("edit", ".migration/06_decisions.md", {
+        "old_string": "| D-7 | 2026-01-01 | legacy_write_authorized: dbo.orders |\n",
+        "new_string": "| D-7 | 2026-01-01 | approved dbo.orders |\n| D-13 | 2026-01-02 | legacy_write_authorized: dbo.customers |\n",
+    }, "block"),
+    ("edit", ".migration/06_decisions.md", {
+        "old_string": "# Decisions\n",
+        "new_string": "# Ledger\n| D-7 | x | y |\n",
+    }, "block"),
+    ("write", ".migration/06_decisions.md", {
+        "content": "# Decisions\n| D-7 | 2026-01-01 | accept tolerances |\n",
+    }, "approve"),
+    ("MultiEdit", ".migration/06_decisions.md", {
+        "edits": [{"old_string": "# Decisions\n", "new_string": "# Decisions\n| D-7 | 2026-01-01 | accept tolerances |\n"}],
+    }, "block"),
 ])
 def test_edit_event(tool, path, tool_input, expected, tmp_path):
     ws = _make_ws(tmp_path)
@@ -89,7 +106,7 @@ def test_nested_workspace_edit_falls_back_to_file_config(tmp_path):
     added = run_hook("edit", {
         "file_path": str(decisions),
         "old_string": "# Decisions\n",
-        "new_string": "| D-8 | 2026-01-01 | accept tolerances |\n",
+        "new_string": "# Decisions\n| D-8 | 2026-01-01 | accept tolerances |\n",
     }, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
     blocked = run_hook("write", {"file_path": str(allowlist), "content": "{}"}, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
     assert added.returncode == 0
