@@ -1278,12 +1278,23 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
         try:
             cur = conn.cursor()
             for label, sql in views:
-                try:
-                    cur.execute(sql).fetchall()
-                except Exception as e:  # noqa: BLE001
-                    return Check(cid, "fail", f"cannot read {label}: {_redact(str(e))}: the "
-                                 "structural tier would grade on an incomplete dictionary", data)
+                probes = [(None, sql)]
+                if "{" in sql:
+                    probes = [(t, sql.format(catalog=p_[0], schema=p_[1], table=p_[2]))
+                              for t in tables
+                              if len(p_ := t.replace("`", "").split(".")) == 3]
+                for table, probe in probes:
+                    try:
+                        cur.execute(probe).fetchall()
+                    except Exception as e:  # noqa: BLE001
+                        where = f" on {table}" if table else ""
+                        return Check(cid, "fail", f"cannot read {label}{where}: "
+                                     f"{_redact(str(e))}: the structural tier would grade on an "
+                                     "incomplete dictionary", data)
                 data["views"].append(label)
+            if q is None:
+                return Check(cid, "ok", f"{family}: catalog views readable on "
+                             f"{len(tables)} in-scope table(s)", data)
             declared_sql, listed_sql = q
             mismatched = []
             for t in tables:

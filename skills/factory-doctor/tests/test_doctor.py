@@ -1482,6 +1482,26 @@ def test_dictionary_readable_ok_with_data(monkeypatch):
     assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 2}
 
 
+def test_dictionary_readable_probes_per_table_ddl_for_databricks(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "ok" and "trigger_census" not in {
+        k for k, v in c.data.items() if v}
+    assert any("SHOW CREATE TABLE cat.s.loans" in q for q in conn.statements)
+
+
+def test_dictionary_readable_fails_on_an_unreadable_databricks_table(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"SHOW CREATE TABLE"})
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "SHOW CREATE TABLE" in c.detail and "cat.s.loans" in c.detail
+
+
 def test_dictionary_readable_all_resolves_units_and_children(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,

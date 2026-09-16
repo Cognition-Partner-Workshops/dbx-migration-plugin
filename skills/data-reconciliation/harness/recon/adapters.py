@@ -95,6 +95,8 @@ class SchemaFacts:
     triggers: dict[str, tuple[str, tuple[str, ...], str]] = field(default_factory=dict)
     # grantee (lower) -> privileges (lower: select/insert/update/delete/...); the table owner's
     # implicit rights are left out
+    # direct object grants only (class-1 rows / table_privileges): role-inherited and
+    # schema/database-scope grants are not expanded
     grants: dict[str, frozenset[str]] = field(default_factory=dict)
     # structural categories (see recon.structure.CATEGORIES) this reader cannot deliver;
     # empty = it delivered them all
@@ -879,6 +881,7 @@ DICTIONARY_OBJECTS = {
          "SELECT 1 FROM information_schema.table_privileges LIMIT 1"),
         ("information_schema.tables", "SELECT 1 FROM information_schema.tables LIMIT 1"),
         ("SHOW CREATE TABLE", "SHOW CREATE TABLE {catalog}.{schema}.{table}"),
+        ("table_content", "SELECT 1 FROM {catalog}.{schema}.{table} LIMIT 1"),
     ),
 }
 DICTIONARY_OBJECTS["lakebase"] = DICTIONARY_OBJECTS["postgres"]
@@ -1008,19 +1011,27 @@ def _uc_identity_columns(ddl_rows) -> dict[str, tuple[int, int]]:
 
 def _uc_identity_state(run_query, catalog: str, schema: str, table: str,
                        column: str) -> IdentityState | None:
-    """The declared start/step for one UC identity column (Delta exposes no last_value, so the
-    declared START WITH is what is readable); None when the column is not identity."""
-    try:
-        rows = run_query(
-            f"SHOW CREATE TABLE {quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
-            f"{quote_ident(table, '`')}", {})
-    except (DictionaryError, NotImplementedError):
-        raise
-    except Exception as exc:
-        raise DictionaryError(
-            f"{table}: SHOW CREATE TABLE read failed ({type(exc).__name__})") from exc
-    state = _uc_identity_columns(rows).get(column)
-    return IdentityState(state[0], state[1]) if state else None
+    """One UC identity column's next value and step. The step and declared start come from the
+    SHOW CREATE TABLE DDL; Delta's high-water mark isn't in the catalog, so the column's MAX is
+    the readable frontier (the declared start when the table is empty). None when the column is
+    not identity."""
+    qual = (f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
+            f"{quote_ident(table, '`')}")
+
+    def q(view: str, sql: str) -> list[tuple]:
+        try:
+            return run_query(sql, {})
+        except (DictionaryError, NotImplementedError):
+            raise
+        except Exception as exc:
+            raise DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})") from exc
+
+    state = _uc_identity_columns(q("SHOW CREATE TABLE", f"SHOW CREATE TABLE {qual}")).get(column)
+    if not state:
+        return None
+    start, inc = state
+    (mx,) = q(f"{column} max", f"SELECT MAX({quote_ident(column, '`')}) FROM {qual}")[0]
+    return IdentityState(int(mx) + inc if mx is not None else start, inc)
 
 
 def _split_table(table: str, default_schema: str | None) -> tuple[str | None, str]:

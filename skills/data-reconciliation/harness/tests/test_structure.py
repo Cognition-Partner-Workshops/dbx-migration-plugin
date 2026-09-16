@@ -72,12 +72,12 @@ def test_overlay_serves_fixture_facts_and_delegates_the_rest():
 
 def test_structural_checks_mark_a_reader_hole():
     full = SchemaFacts()
-    assert set(structural_checks([(full, full)]).values()) == {"checked"}
+    assert set(structural_checks([(full, full)]).values()) == {"checked", "direct_only"}
     d = load_dictionary(FIXTURES / "example_databricks" / "dictionary.json")
     t = next(iter(d.tables.values()))
     sc = structural_checks([(full, t)])
-    assert sc["indexes"] == "unsupported"
-    assert sc["triggers"] == sc["constraints"] == sc["grants"] == "checked"
+    assert sc["indexes"] == "unsupported" and sc["grants"] == "direct_only"
+    assert sc["triggers"] == sc["constraints"] == "checked"
     assert set(structural_checks([]).values()) == {"unsupported"}
 
 
@@ -178,7 +178,8 @@ def test_tier0_fails_on_missing_trigger_and_grant():
     assert "trigger_missing" in codes and "grant_missing" in codes
     assert result["merge_eligible"] is False
     assert result["merge_block_reasons"][0] == "structural_gap"
-    assert t0["stats"]["structural_checks"] == {c: "checked" for c in CATEGORIES}
+    assert t0["stats"]["structural_checks"] == {
+        c: "direct_only" if c == "grants" else "checked" for c in CATEGORIES}
     assert t0["stats"]["structural_diff"]["loans"]["triggers"]
 
 
@@ -291,7 +292,8 @@ def test_databricks_fixture_marks_triggers_checked_not_a_hole():
     t = next(iter(d.tables.values()))
     sc = structural_checks([(t, t)])
     # Delta reads every category but indexes (identity comes from SHOW CREATE TABLE DDL)
-    assert sc == {c: "unsupported" if c == "indexes" else "checked" for c in sc}
+    assert sc == {c: ("unsupported" if c == "indexes" else
+                      "direct_only" if c == "grants" else "checked") for c in sc}
 
 
 def test_tier0_informational_source_keys_must_exist_on_the_target():
@@ -323,6 +325,18 @@ def test_compare_triggers_flags_a_granularity_mismatch():
     assert [f.check for f in findings] == ["trigger_granularity_mismatch"] and tight == []
 
 
+def test_compare_triggers_counts_multiplicity_by_shape():
+    s = SchemaFacts(triggers={"a": ("after", ("insert",), "row"),
+                              "b": ("after", ("insert",), "row")})
+    t = SchemaFacts(triggers={"x": ("after", ("insert",), "row")})
+    findings, extra = compare_triggers("o", s, t)
+    assert [f.check for f in findings] == ["trigger_missing"]
+    assert "after insert row: source 2, target 1" == findings[0].detail and extra == []
+    findings, extra = compare_triggers("o", s,
+                                       SchemaFacts(triggers=dict(s.triggers)))
+    assert findings == [] and extra == []
+
+
 def test_compare_triggers_passes_when_both_granularities_are_covered():
     both = {"a": ("after", ("insert",), "row"), "b": ("after", ("insert",), "statement")}
     findings, tight = compare_triggers("o", SchemaFacts(triggers=both),
@@ -344,7 +358,7 @@ def test_tier0_target_only_trigger_fails_despite_accept_target_only_constraints(
     source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
                         schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
                         sequences={("dbo.loans", "loan_id"): 13})
-    tgt_facts = _facts(TARGET_LOANS_FACTS, triggers={"x": ("after", ("insert",), "row")})
+    tgt_facts = _facts(TARGET_LOANS_FACTS, triggers={"x": ("after", ("delete",), "row")})
     target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
                         schema={"loans": tgt_facts, "borrowers": BORROWER_FACTS},
                         sequences={("loans", "loan_id"): 13})
@@ -536,6 +550,8 @@ def test_databricks_schema_facts_maps_information_schema():
                 return [("CREATE TABLE `mig`.`s`.`loans` (\n"
                          "  `loan_id` BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 5 "
                          "INCREMENT BY 1),\n  `note` STRING)",)]
+            if "MAX(" in sql:
+                return [(1000,)]
             return []
     a._sql = Sql()
     facts = a.schema_facts("loans")
@@ -550,7 +566,7 @@ def test_databricks_schema_facts_maps_information_schema():
     assert facts.unsupported == frozenset({"indexes"})
     assert facts.triggers == {}
     state = a.identity_state("loans", "loan_id")
-    assert (state.next, state.increment) == (5, 1)
+    assert (state.next, state.increment) == (1001, 1)  # MAX(1000) + increment
     assert a.identity_state("loans", "note") is None
     joined = " ".join(answers)
     for view in ("table_constraints", "key_column_usage", "referential_constraints",
@@ -595,6 +611,23 @@ def test_databricks_source_adapter_reads_uc_dictionary():
     assert facts.primary_key_informational == ("loan_id",)
     assert "information_schema.table_constraints" in " ".join(answers)
     assert a.identity_state("cat.s.loans", "loan_id") is None
+
+
+def test_uc_identity_state_uses_the_declared_start_on_an_empty_table():
+    from recon.adapters import DatabricksTargetAdapter
+    a = DatabricksTargetAdapter.__new__(DatabricksTargetAdapter)
+    a._catalog, a._schema = "mig", "s"
+
+    class Sql:
+        def _rows(self, sql, params):
+            if "SHOW CREATE" in sql:
+                return [("`loan_id` BIGINT GENERATED BY DEFAULT AS IDENTITY",)]
+            if "MAX(" in sql:
+                return [(None,)]
+            return []
+    a._sql = Sql()
+    state = a.identity_state("loans", "loan_id")
+    assert (state.next, state.increment) == (1, 1)
 
 
 def test_schema_facts_driver_errors_are_dictionary_errors_without_secrets():

@@ -7,6 +7,7 @@ live catalog is out of reach. What a reader cannot deliver is recorded per categ
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,43 +68,62 @@ def mask_unsupported(facts: SchemaFacts, categories) -> SchemaFacts:
 
 def structural_checks(pairs: list[tuple[SchemaFacts, SchemaFacts]]) -> dict[str, str]:
     """category -> "checked" when at least one object was read and no facts on either side
-    marks it unsupported; "unsupported" is a hole, not a pass."""
-    return {cat: "checked" if pairs and not any(cat in f.unsupported for pair in pairs for f in pair)
+    marks it unsupported; "unsupported" is a hole, not a pass. Grants are "direct_only":
+    the readers see direct object grants (class-1 / table_privileges rows); role-inherited
+    and schema/database-scope grants are not expanded."""
+    return {cat: ("direct_only" if cat == "grants" else "checked")
+            if pairs and not any(cat in f.unsupported for pair in pairs for f in pair)
             else "unsupported" for cat in CATEGORIES}
 
 
-def _trigger_cover(facts: SchemaFacts) -> dict[tuple[str, str], set[str]]:
-    cov: dict[tuple[str, str], set[str]] = {}
+def _trigger_cover(facts: SchemaFacts) -> Counter:
+    cov = Counter()
     for timing, events, gran in facts.triggers.values():
         for ev in events:
-            cov.setdefault((timing, ev), set()).add(gran)
+            cov[(timing, ev, gran)] += 1
     return cov
 
 
 def compare_triggers(obj: str, s: SchemaFacts, t: SchemaFacts) -> tuple[list[Finding], list[Finding]]:
-    """(findings, extra): trigger names are ignored (conversion renames them) — coverage is by
-    (timing, event) pairs at matching granularity. A source pair the target lacks is
-    trigger_missing; the pair exists on both sides but the target's granularity set is disjoint
-    is trigger_granularity_mismatch; a target pair with no source counterpart is trigger_extra."""
+    """(findings, extra): trigger names and bodies are not comparable across dialects, so parity
+    is by shape count — a multiset of (timing, event, granularity). A source shape with fewer
+    target triggers is trigger_missing; more is trigger_extra. When a (timing, event) pair is
+    present on both sides with disjoint granularity sets it is trigger_granularity_mismatch
+    instead — the shapes differ in kind, not count."""
     s_cov, t_cov = _trigger_cover(s), _trigger_cover(t)
+    s_pairs = {(tm, ev) for tm, ev, _ in s_cov}
+    t_pairs = {(tm, ev) for tm, ev, _ in t_cov}
+
+    def _grans(cov: Counter, pair: tuple[str, str]) -> set[str]:
+        return {g for (tm, ev, g) in cov if (tm, ev) == pair}
+
+    def _disjoint(pair: tuple[str, str]) -> bool:
+        return pair in s_pairs and pair in t_pairs and \
+            _grans(s_cov, pair).isdisjoint(_grans(t_cov, pair))
+
+    name_of = {(tm, ev): n for n, (tm, evs, _g) in sorted(s.triggers.items()) for ev in evs}
     findings, extra = [], []
-    for name, (timing, events, gran) in sorted(s.triggers.items()):
-        for ev in sorted(events):
-            if (timing, ev) not in t_cov:
-                findings.append(Finding(obj, "trigger_missing",
-                                        f"source trigger {name} ({timing} "
-                                        f"{','.join(sorted(events))}) has no target trigger for "
-                                        f"{timing} {ev}"))
-            elif t_cov[(timing, ev)].isdisjoint({gran}):
-                findings.append(Finding(obj, "trigger_granularity_mismatch",
-                                        f"source trigger {name} fires {timing} {ev} per {gran}, "
-                                        f"target fires it per "
-                                        f"{'/'.join(sorted(t_cov[(timing, ev)]))}"))
-    for name, (timing, events, _g) in sorted(t.triggers.items()):
-        for ev in sorted(e for e in events if (timing, e) not in s_cov):
+    for (timing, ev, gran), n in sorted(s_cov.items()):
+        if _disjoint((timing, ev)):
+            continue
+        have = t_cov.get((timing, ev, gran), 0)
+        if n > have:
+            findings.append(Finding(obj, "trigger_missing",
+                                    f"{timing} {ev} {gran}: source {n}, target {have}"))
+    for pair in sorted(s_pairs & t_pairs):
+        if _grans(s_cov, pair).isdisjoint(_grans(t_cov, pair)):
+            findings.append(Finding(obj, "trigger_granularity_mismatch",
+                                    f"source trigger {name_of.get(pair, '?')} fires {pair[0]} "
+                                    f"{pair[1]} per {'/'.join(sorted(_grans(s_cov, pair)))}, "
+                                    f"target fires it per {'/'.join(sorted(_grans(t_cov, pair)))}"))
+    for (timing, ev, gran), n in sorted(t_cov.items()):
+        if _disjoint((timing, ev)):
+            continue
+        have = s_cov.get((timing, ev, gran), 0)
+        if n > have:
             extra.append(Finding(obj, "trigger_extra",
-                                 f"target trigger {name} fires on {timing} {ev} the source has no "
-                                 "trigger for: writes the legacy app makes today behave differently"))
+                                 f"{timing} {ev} {gran}: target {n}, source {have}: writes the "
+                                 "legacy app makes today behave differently"))
     return findings, extra
 
 
