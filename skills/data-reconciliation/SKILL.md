@@ -110,8 +110,9 @@ provenance warning and the run is not merge-eligible.
   `{fresh: pass|fail, evolved: pass|fail|unsupported, findings}`; without an evolved record,
   or when the pre-created shape equals the declared one, `evolved` is `unsupported` with the
   reason, never clean; a reordered column is a `column_order` finding. The DDL parser applies
-  `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN(S)` only and refuses any other `ALTER TABLE`
-  (use `--expected-shape`). `run --rerun-proof <file> --rerun-ddl <unit ddl>` (or
+  `CREATE TABLE (columns)` and `ALTER TABLE ... ADD COLUMN(S)` only and refuses any other
+  `ALTER TABLE`, `CREATE TABLE ... AS SELECT` or `LIKE` (use `--expected-shape`); `shape` refuses a
+  table the target does not have rather than recording it empty. `run --rerun-proof <file> --rerun-ddl <unit ddl>` (or
   `--rerun-expected-shape`) copies it into `result.json` after checking its `expected_digest`
   against the shape the unit declares now (a proof from an older DDL is stale and refused); a
   failed leg adds `rerun_gap` to `merge_block_reasons`, an unsupported evolved leg adds

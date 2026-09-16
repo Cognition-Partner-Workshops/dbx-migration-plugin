@@ -374,6 +374,11 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
             tables = {_single_identifier(t, "table"): target.column_shape(t) for t in args.table}
+            absent = [t for t, cols in tables.items() if not cols]
+            if absent:
+                raise ConfigError(f"table {', '.join(absent)} not found in {target_catalog}.{target_schema}; "
+                                  "a shape read before the run must name tables that exist "
+                                  "(pre-create the previous shape first)")
         except (TargetIdentityError, ConfigError) as exc:
             raise SystemExit(f"shape: {exc}") from None
         shape = {"target_kind": args.target_kind, "catalog": target_catalog, "schema": target_schema,
