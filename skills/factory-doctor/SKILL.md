@@ -59,6 +59,7 @@ guard mode, and stop mode are the workflow capability contract.
 | `delete_evidence` | mapped CDC evidence is absent, incomplete, or unreadable | provide source CDC evidence; never enable it here |
 | `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a user-attested decision |
 | `dictionary_readable` | the source principal cannot read a catalog view the structural tier needs, or hides declared triggers | fix the principal's catalog visibility |
+| `named_secrets_exist` | a Databricks secret name (`scope/key`) the manifest or a brief references is missing or its scope is unreadable | create the named secret before STOP C; a missing name is a STOP C blocker, not a per-unit discovery |
 | `databricks_identity` | CLI/auth/host/identity is missing, human, or mismatched | use the expected OAuth M2M principal and host |
 | `lakebase_branch_create` | optional branch probe cannot create/delete a one-hour child | fix Lakebase project/parent permissions |
 | `lakebase_target_grants` | optional DSN role lacks database/schema `CREATE` | grant target create permission |
