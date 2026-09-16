@@ -316,8 +316,8 @@ def rerun_unsupported(proof: dict | None) -> bool:
 
 def check_proof(data: object, unit: str, where: str) -> dict:
     """A rerun_proof.json written by `dbx-recon rerun-proof`, re-read by `run`. Every field is
-    typed and the fields agree: `passed` follows the legs, a failed leg names its findings, an
-    unsupported evolved leg names its reason, every run leg has evidence."""
+    typed and the fields agree: `passed` follows the legs, a leg has findings exactly when it
+    failed, an unsupported evolved leg names its reason, every run leg has evidence."""
     if not isinstance(data, dict):
         raise ConfigError(f"{where}: rerun proof must be a JSON object")
     for key in ("unit", "fresh", "evolved", "passed", "findings", "notes", "evidence"):
@@ -334,17 +334,19 @@ def check_proof(data: object, unit: str, where: str) -> dict:
     if not isinstance(findings, list) or not all(
             isinstance(f, dict) and {"run", "table", "check", "column", "detail"} <= set(f) for f in findings):
         raise ConfigError(f"{where}: findings must be a list of {{run, table, check, column, detail}}")
+    if any(f["run"] not in RUNS for f in findings):
+        raise ConfigError(f"{where}: every finding's run must be one of {RUNS}")
     if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
         raise ConfigError(f"{where}: notes must be a list of strings")
     if not isinstance(evidence, dict):
         raise ConfigError(f"{where}: evidence must map each run leg to its run id or path")
     for leg, status in (("fresh", fresh), ("evolved", evolved)):
-        if status == "unsupported":
-            continue
-        if not isinstance(evidence.get(leg), str) or not evidence[leg].strip():
+        has_findings = any(f["run"] == leg for f in findings)
+        if (status == "fail") != has_findings:
+            raise ConfigError(f"{where}: the {leg} leg is {status} but "
+                              f"{'lists a finding for it' if has_findings else 'lists no finding for it'}")
+        if status != "unsupported" and (not isinstance(evidence.get(leg), str) or not evidence[leg].strip()):
             raise ConfigError(f"{where}: the {leg} leg ran ({status}) but has no evidence")
-        if status == "fail" and not any(f["run"] == leg for f in findings):
-            raise ConfigError(f"{where}: the {leg} leg failed but lists no finding for it")
     if evolved == "unsupported" and not str(data.get("unsupported_reason") or "").strip():
         raise ConfigError(f"{where}: evolved is unsupported without an unsupported_reason")
     return data

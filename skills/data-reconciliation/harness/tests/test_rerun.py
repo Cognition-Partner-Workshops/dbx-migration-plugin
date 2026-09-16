@@ -231,6 +231,16 @@ def test_check_proof_rejects_contradictory_or_malformed_artifacts():
         {**good, "notes": "x"},
         {k: v for k, v in good.items() if k != "unsupported_reason"},
         {**good, "fresh": "fail", "passed": False, "findings": []},  # a failed leg names why
+        # a leg that passed, or did not run, cannot carry a finding: a finding is a failure
+        {**good, "findings": [{"run": "fresh", "table": "t", "check": "column_missing",
+                              "column": "c", "detail": "d"}]},
+        {**good, "findings": [{"run": "evolved", "table": "t", "check": "job_failed",
+                              "column": None, "detail": "d"}]},
+        {**good, "evolved": "pass", "evidence": {"fresh": "j/1", "evolved": "j/2"},
+         "findings": [{"run": "evolved", "table": "t", "check": "column_missing",
+                       "column": "c", "detail": "d"}]},
+        {**good, "findings": [{"run": "warm", "table": "t", "check": "x", "column": None,
+                              "detail": "d"}]},                         # unknown leg
     ]
     for proof in bad:
         with pytest.raises(ConfigError):
