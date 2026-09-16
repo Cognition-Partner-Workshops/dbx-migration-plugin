@@ -138,14 +138,29 @@ def test_source_digest_binds_the_job_files_content_and_names(tmp_path):
 
 def test_the_prior_shape_comes_from_the_previous_proof_or_a_declared_old_shape(tmp_path):
     proof = tmp_path / "rerun_proof.json"
-    proof.write_text(json.dumps({"unit": "u", "shape": OLD_SHAPE}))
-    assert load_prior(proof) == PRIOR
+    proof.write_text(json.dumps({"unit": "u", "shape": OLD_SHAPE, "shape_digest": shape_digest(PRIOR)}))
+    assert load_prior(proof, "u") == PRIOR
     shape = tmp_path / "old_shape.json"
     shape.write_text(json.dumps(OLD_SHAPE))
-    assert load_prior(shape) == PRIOR
-    proof.write_text(json.dumps({"unit": "u"}))
-    with pytest.raises(ConfigError, match="tables"):
-        load_prior(proof)
+    assert load_prior(shape, "u") == PRIOR
+    proof.write_text(json.dumps({"unit": "u", "shape": None, "shape_digest": None}))
+    with pytest.raises(ConfigError, match="fresh leg failed"):
+        load_prior(proof, "u")
+
+
+def test_a_prior_proof_must_be_this_units_and_carry_the_shape_it_digested(tmp_path):
+    """The prior proof is the previous committed shape *of this unit*: another unit's proof, or a
+    proof whose shape no longer matches its own shape_digest, is refused rather than exercised."""
+    proof = tmp_path / "rerun_proof.json"
+    proof.write_text(json.dumps({"unit": "other", "shape": OLD_SHAPE, "shape_digest": shape_digest(PRIOR)}))
+    with pytest.raises(ConfigError, match="unit 'other', not 'u'"):
+        load_prior(proof, "u")
+    proof.write_text(json.dumps({"unit": "u", "shape": OLD_SHAPE, "shape_digest": shape_digest(NEW_SHAPE)}))
+    with pytest.raises(ConfigError, match="shape_digest"):
+        load_prior(proof, "u")
+    proof.write_text(json.dumps({"unit": "u", "shape": OLD_SHAPE}))
+    with pytest.raises(ConfigError, match="shape_digest"):
+        load_prior(proof, "u")
 
 
 # ---- grading ----------------------------------------------------------------------------------
@@ -196,7 +211,7 @@ def test_a_fresh_run_that_landed_no_table_is_a_failure_not_an_empty_expectation(
     assert out["fresh"] == "fail" and out["passed"] is False
     assert out["findings"] == [{"run": "fresh", "table": None, "check": "no_tables", "column": None,
                                 "detail": "the fresh run recorded no table; nothing to prove a rerun against"}]
-    assert out["tables"] == [] and "shape" not in out
+    assert out["tables"] == [] and out["shape"] is None and out["shape_digest"] is None
 
 
 def test_a_job_the_child_reports_failed_fails_regardless_of_shape():
@@ -221,6 +236,8 @@ def test_a_failed_fresh_leg_leaves_the_evolved_leg_unsupported():
                  _record("evolved", NEW_SHAPE, pre_shape=OLD_SHAPE), prior=PRIOR)
     assert out["fresh"] == "fail" and out["evolved"] == "unsupported" and out["passed"] is False
     assert out["unsupported_reason"] == "the fresh run failed, so there is no shape the evolved run can be held to"
+    assert out["shape"] is None and out["shape_digest"] is None
+    assert check_proof({"unit": "u", **out}, "u", "x", DIGEST)["fresh"] == "fail"
 
 
 def test_column_order_drift_is_a_finding():

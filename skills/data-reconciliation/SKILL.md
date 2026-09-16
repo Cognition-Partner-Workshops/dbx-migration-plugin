@@ -108,8 +108,9 @@ provenance warning and the run is not merge-eligible.
   never the DDL: the shape the fresh run landed is the expected shape and the evolved run, against the
   table pre-created in its previous committed shape, must land the identical one (`harness/fixtures/example_rerun/`
   is the canonical failing case, a `CREATE TABLE IF NOT EXISTS` that never lands the new column).
-  The previous shape is the last committed proof's observed `shape` (`--prior-proof`), or on a unit's
-  first run the manifest-declared old shape (`--prior-shape`). `rerun_proof.json` carries
+  The previous shape is the last committed proof's observed `shape` (`--prior-proof`; it must be this
+  unit's proof and its shape must still match its `shape_digest`), or on a unit's first run the
+  manifest-declared old shape (`--prior-shape`). `rerun_proof.json` carries
   `{fresh: pass|fail, evolved: pass|fail|unsupported, findings, shape, shape_digest, source_digest}`;
   without an evolved record, without a prior, when the pre-created shape equals the fresh one or
   differs from the prior one, or when the fresh leg failed, `evolved` is `unsupported` with the reason,

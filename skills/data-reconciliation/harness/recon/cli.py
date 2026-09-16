@@ -363,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("rerun-proof takes --prior-proof or --prior-shape, not both")
         prior_path = args.prior_proof or args.prior_shape
         try:
-            prior = load_prior(prior_path) if prior_path is not None else None
+            prior = load_prior(prior_path, args.unit) if prior_path is not None else None
             proof = grade_rerun(load_record(args.fresh, "fresh"),
                                 load_record(args.evolved, "evolved") if args.evolved else None, prior,
                                 digest=source_digest(args.source),
