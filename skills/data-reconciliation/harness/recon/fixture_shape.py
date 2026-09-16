@@ -149,11 +149,15 @@ def compare_fixture(spec: MappingSpec, source, fixture,
     findings: list[dict] = []
     tables: dict[str, dict] = {}
     shapes: dict[str, tuple] = {}  # one catalog read per side per table, shared by its objects
-    plans: list[list[str] | None] = []  # per object: the columns to profile, or nothing
+    plans: list[list[str] | None] = []  # per object: the columns to profile (as mapped), or nothing
     for obj in spec.objects:
         table = obj.root_table
-        mapped = list(dict.fromkeys([*(c.lower() for c in obj.key_source),
-                                     *(f.source.lower() for f in obj.fields)]))
+        # shapes compare on the lower-cased name; the profile statement gets the mapping's spelling
+        # (a case-sensitive source knows `OrderId`, not `orderid`)
+        spelled: dict[str, str] = {}
+        for c in [*obj.key_source, *(f.source for f in obj.fields)]:
+            spelled.setdefault(c.lower(), c)
+        mapped = list(spelled)
         row = tables.setdefault(table, {"status": "pass", "shape": "checked",
                                         "cardinality": "checked"})
         plans.append(None)
@@ -168,7 +172,7 @@ def compare_fixture(spec: MappingSpec, source, fixture,
             row["status"] = "fail"
         # a column the fixture lacks is already a finding, one the source lacks is the mapping's
         # defect (tier 7): neither can be profiled, and the second leaves the table unproven
-        plans[-1] = [c for c in mapped if c in fix and c in src]
+        plans[-1] = [spelled[c] for c in mapped if c in fix and c in src]
         unmapped = [c for c in mapped if c not in src]
         if unmapped:
             row["cardinality"] = "partial"

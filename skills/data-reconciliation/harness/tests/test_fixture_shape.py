@@ -84,6 +84,33 @@ def test_types_compare_after_normalisation_and_names_case_insensitively():
     assert compare_fixture(SPEC, _source(), fixture)["findings"] == []
 
 
+def test_profiles_use_the_mapped_spelling_while_comparing_case_insensitively():
+    """A case-sensitive source (SQL Server binary collation) knows `OrderId`, not `orderid`;
+    the mapping's spelling goes into the profile statement, lower-case is for comparison only."""
+    spec = MappingSpec(version="map-v1", objects=[ObjectMapping(
+        object="orders", root_table="app.orders", key_source=["OrderId"], key_target="order_id",
+        fields=[FieldMapping("OrderId", "order_id", "bigint", "long"),
+                FieldMapping("Status", "status", "varchar(12)", "string")])])
+    rows = [{"OrderId": i, "Status": s} for i, s in enumerate(["new", "paid", None], start=1)]
+    shape = [{"name": "ORDERID", "type": "bigint", "nullable": False},
+             {"name": "status", "type": "varchar(12)", "nullable": True}]
+
+    class Strict(ShapedSource):
+        profiled: list[str] = []
+
+        def column_profile(self, table, column, where=None):
+            self.profiled.append(column)
+            if not any(column in r for r in self.tables[table]):
+                raise RuntimeError(f"Invalid column name '{column}'")
+            return super().column_profile(table, column, where)
+
+    src = Strict({"app.orders": rows}, {"app.orders": shape})
+    out = compare_fixture(spec, src, Strict({"app.orders": rows}, {"app.orders": shape}))
+    assert out["findings"] == [] and out["status"] == "pass"
+    assert out["tables"]["app.orders"]["cardinality"] == "checked"
+    assert Strict.profiled == ["OrderId", "OrderId", "Status", "Status"]
+
+
 def test_only_mapped_columns_are_compared_but_extra_fixture_columns_are_named():
     src = ShapedSource({"app.orders": SOURCE_ROWS},
                        {"app.orders": SOURCE_SHAPE + [{"name": "legacy_flag", "type": "char(1)",
