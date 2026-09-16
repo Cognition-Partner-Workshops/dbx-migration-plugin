@@ -829,7 +829,8 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
     adapters. Delta has no indexes or triggers, so both are declared unsupported rather than
     silently empty. UC foreign keys are informational: no actions to read."""
     facts = SchemaFacts(table=f"{catalog}.{schema}.{table}",
-                        unsupported=frozenset({"indexes", "triggers", "sequences_identity"}))
+                        # indexes and sequences are unreadable on UC; triggers are provably absent
+                        unsupported=frozenset({"indexes", "sequences_identity"}))
 
     def q(view: str, sql: str, params: dict) -> list[tuple]:
         try:

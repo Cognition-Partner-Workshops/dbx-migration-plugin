@@ -1393,15 +1393,22 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
         if uns:
             s, t, t_lower = (mask_unsupported(f_, uns) for f_ in (s, t, t_lower))
         pk = _map_cols(s.primary_key, colmap)
+        pk_info = _map_cols(s.primary_key_informational, colmap)
         if pk != t_lower.primary_key:
             if pk and not t_lower.primary_key and t_lower.primary_key_informational == pk:
                 findings.append(Finding(c.object, "primary_key_informational_only",
                                         "target PK is informational, not enforced: duplicate keys "
                                         "would be accepted"))
+            elif not pk and pk_info and pk_info == t_lower.primary_key:
+                pass  # the target enforces what the source only declared informationally
             else:
                 findings.append(Finding(c.object, "primary_key_mismatch",
                                         f"source {s.primary_key} -> expected {pk}, target "
                                         f"{t.primary_key}", s.primary_key, t.primary_key))
+        if pk_info and not s.primary_key and                 pk_info != t_lower.primary_key and pk_info != t_lower.primary_key_informational:
+            findings.append(Finding(c.object, "primary_key_informational_missing",
+                                    f"source PK {s.primary_key_informational} is informational and "
+                                    "absent on the target: duplicate keys would be accepted"))
         # a unique constraint rejects the same duplicates whatever order its columns are
         # declared in, so parity is by column set; the declared order is an access path and
         # is kept for the coverage check (`_covered`) and noted when only the order differs
@@ -1455,6 +1462,19 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
             found = targets.resolve(ref)
             t_fks_info.add((cols, found[0] if len(found) == 1 else ref, rcols))
         expected_fks: set[tuple] = set()
+        for cols, ref, rcols in sorted(s.foreign_keys_informational):
+            found = tables.resolve(ref)
+            if not found:
+                stats.setdefault("foreign_keys_out_of_scope", []).append(f"{c.object}: {cols} -> {ref}")
+                continue
+            if len(found) == 1:
+                ref_map = next((_column_map(spec, o) for o in spec.objects
+                                if o.object.lower() == found[0]), {})
+                want = (_map_cols(cols, colmap), found[0], _map_cols(rcols, ref_map))
+                if want not in t_fks and want not in t_fks_info:
+                    findings.append(Finding(c.object, "foreign_key_informational_missing",
+                                            f"source FK {cols} -> {ref}{rcols} is informational and "
+                                            "absent on the target"))
         for cols, ref, rcols in sorted(s.foreign_keys):
             found = tables.resolve(ref)
             if len(found) > 1:
@@ -1684,14 +1704,15 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                         f"{c.object}: {n} source {cat} cannot be checked: the target catalog "
                         f"has no {cat} dictionary")
             m = _category_content(t_raw, cat)
-            if m and cat in (s_raw.unsupported | obj_uns.get(c.object, set())):
+            if cat in (s_raw.unsupported | obj_uns.get(c.object, set())):
                 if cat == "indexes":
-                    stats.setdefault("index_unsupported", []).append(
-                        f"{c.object}: {m} target indexes cannot be checked: the source catalog "
-                        "has no indexes dictionary")
+                    if m:
+                        stats.setdefault("index_unsupported", []).append(
+                            f"{c.object}: {m} target indexes cannot be checked: the source "
+                            "catalog has no indexes dictionary")
                 else:
                     stats.setdefault("unverified", []).append(
-                        f"{c.object}: target has {m} {cat} the source dictionary cannot expose")
+                        f"{c.object}: source dictionary cannot expose {cat}: target has {m}")
         stats[c.object] = {"source": _facts_dict(s_raw), "target": _facts_dict(t_raw), "identity": seq_note}
     checks_map = structural_checks(list(facts.values()))
     for cat in {c for cats in obj_uns.values() for c in cats}:

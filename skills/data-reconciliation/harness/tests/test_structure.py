@@ -40,7 +40,7 @@ def test_load_dictionary_reads_each_family_fixture(family):
     assert d.family == family and d.tables
     assert all(isinstance(f, SchemaFacts) for f in d.tables.values())
     if family == "databricks":
-        assert d.unsupported == frozenset({"indexes", "triggers", "sequences_identity"})
+        assert d.unsupported == frozenset({"indexes", "sequences_identity"})
         assert all(f.unsupported == d.unsupported for f in d.tables.values())
     loans = next(f for f in d.tables.values() if f.primary_key or f.primary_key_informational)
     assert loans.identity_columns
@@ -75,9 +75,8 @@ def test_structural_checks_mark_a_reader_hole():
     d = load_dictionary(FIXTURES / "example_databricks" / "dictionary.json")
     t = next(iter(d.tables.values()))
     sc = structural_checks([(full, t)])
-    assert sc["triggers"] == "unsupported" and sc["indexes"] == "unsupported"
-    assert sc["sequences_identity"] == "unsupported"
-    assert sc["constraints"] == sc["grants"] == "checked"
+    assert sc["indexes"] == "unsupported" and sc["sequences_identity"] == "unsupported"
+    assert sc["triggers"] == sc["constraints"] == sc["grants"] == "checked"
     assert set(structural_checks([]).values()) == {"unsupported"}
 
 
@@ -276,6 +275,45 @@ def test_tier0_informational_target_fk_is_a_finding_not_a_pass():
     assert "structural_gap" in result["merge_block_reasons"]
 
 
+def test_tier0_source_unsupported_category_warns_even_when_target_is_empty():
+    src = _facts(LOANS_FACTS, unsupported=frozenset({"triggers"}), triggers={})
+    result = _live(loans_src_facts=src)  # target has no triggers either
+    t0 = result["tiers"][0]
+    assert result["verdict"] == "PASS" and t0["passed"] is True
+    assert any("source dictionary cannot expose triggers" in n
+               for n in t0["stats"]["unverified"])
+    assert result["merge_eligible"] is False
+
+
+def test_databricks_fixture_marks_triggers_checked_not_a_hole():
+    d = load_dictionary(FIXTURES / "example_databricks" / "dictionary.json")
+    t = next(iter(d.tables.values()))
+    sc = structural_checks([(t, t)])
+    assert sc["triggers"] == "checked" and sc["indexes"] == "unsupported"
+
+
+def test_tier0_informational_source_keys_must_exist_on_the_target():
+    src = _facts(LOANS_FACTS, primary_key=(), primary_key_informational=("loan_id",),
+                 foreign_keys=set(),
+                 foreign_keys_informational={(("borrower_id",), "borrowers", ("borrower_id",))})
+    empty_tgt = _facts(TARGET_LOANS_FACTS, primary_key=(), foreign_keys=set())
+    result = _live(loans_src_facts=src, loans_tgt_facts=empty_tgt)
+    t0 = result["tiers"][0]
+    codes = {f["check"] for f in t0["findings"]}
+    assert {"primary_key_informational_missing", "foreign_key_informational_missing"} <= codes
+    assert t0["stats"]["structural_diff"]["loans"]["constraints"]
+    assert result["merge_eligible"] is False
+
+    info_tgt = _facts(empty_tgt, primary_key_informational=("loan_id",),
+                      foreign_keys_informational={(("borrower_id",), "borrowers", ("borrower_id",))})
+    assert "informational_missing" not in " ".join(
+        f["check"] for f in _live(loans_src_facts=src, loans_tgt_facts=info_tgt)["tiers"][0]["findings"])
+
+    enforced_tgt = _facts(TARGET_LOANS_FACTS)  # enforced pk + fk cover the informational source
+    assert "informational_missing" not in " ".join(
+        f["check"] for f in _live(loans_src_facts=src, loans_tgt_facts=enforced_tgt)["tiers"][0]["findings"])
+
+
 def test_tier0_informational_target_pk_still_counts_for_a_blind_source():
     src = _facts(LOANS_FACTS, unsupported=frozenset({"constraints"}),
                  primary_key=(), unique=frozenset(), foreign_keys=set(),
@@ -309,7 +347,7 @@ def test_tier0_source_unsupported_category_with_target_content_warns():
     result = _live(loans_src_facts=src_facts, loans_tgt_facts=tgt_facts)
     t0 = result["tiers"][0]
     assert result["verdict"] == "PASS" and t0["passed"] is True
-    assert any("target has 1 triggers the source dictionary cannot expose" in n
+    assert any("source dictionary cannot expose triggers: target has 1" in n
                for n in t0["stats"]["unverified"])
     assert result["merge_eligible"] is False
 
@@ -454,7 +492,8 @@ def test_databricks_schema_facts_maps_information_schema():
     assert facts.not_null == {"loan_id"} and facts.identity_columns == {"loan_id"}
     assert facts.checks == {"current_balance >= 0"} and facts.check_count == 1
     assert facts.grants == {"svc_app": frozenset({"select", "modify"})}
-    assert facts.unsupported == frozenset({"indexes", "triggers", "sequences_identity"})
+    assert facts.unsupported == frozenset({"indexes", "sequences_identity"})
+    assert facts.triggers == {}
     import pytest as _pt
     with _pt.raises(NotImplementedError):
         a.identity_state("loans", "loan_id")

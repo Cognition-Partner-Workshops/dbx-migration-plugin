@@ -22,11 +22,13 @@ CATEGORIES = ("constraints", "triggers", "indexes", "sequences_identity", "grant
 _CHECK_CATEGORY = {
     "primary_key_mismatch": "constraints",
     "primary_key_informational_only": "constraints",
+    "primary_key_informational_missing": "constraints",
     "unique_missing": "constraints", "unique_extra": "constraints",
     "unique_nulls_equal_missing": "constraints", "unique_nulls_equal_extra": "constraints",
     "foreign_key_missing": "constraints", "foreign_key_extra": "constraints",
     "foreign_key_action_mismatch": "constraints",
     "foreign_key_informational_only": "constraints",
+    "foreign_key_informational_missing": "constraints",
     "not_null_missing": "constraints", "not_null_extra": "constraints",
     "check_constraint_missing": "constraints", "check_constraint_extra": "constraints",
     "check_constraint_unverified": "constraints",

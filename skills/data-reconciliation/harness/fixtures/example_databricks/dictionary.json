@@ -1,9 +1,8 @@
 {
   "family": "databricks",
-  "note": "Example Unity Catalog shape for --target-dictionary. Delta has no indexes or triggers, so both are declared unsupported \u2014 an honest hole, not clean.",
+  "note": "Example Unity Catalog shape for --target-dictionary. UC exposes no indexes or sequence state, so those stay unsupported; triggers are provably absent on Delta (an empty dictionary, not a hole) and constraints are informational.",
   "unsupported": [
     "indexes",
-    "triggers",
     "sequences_identity"
   ],
   "tables": {
