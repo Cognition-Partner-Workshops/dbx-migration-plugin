@@ -236,8 +236,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="routine_parity.json from `routine-parity`; carried into result.json, a "
                         "failed routine blocks merge (routine_gap); needs --routine-dependencies")
     r.add_argument("--routine-dependencies", type=Path,
-                   help="the unit's dependencies.json; every writing routine it lists must have a "
-                        "routine_parity row, otherwise it is carried as unproven")
+                   help="the unit's dependencies.json (default .migration/units/<unit>/dependencies.json); "
+                        "every writing routine it lists must have a routine_parity row, otherwise it is "
+                        "carried as unproven; no analysis at all blocks merge (routine_parity_missing)")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -395,17 +396,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.routine_parity and not args.routine_dependencies:
         raise SystemExit("--routine-parity needs --routine-dependencies: the unit's dependency analysis "
                          "says which writing routines the file must cover")
-    if args.routine_dependencies:
+    deps_path = args.routine_dependencies or Path(".migration/units") / args.unit / "dependencies.json"
+    routine_analysis_missing = not deps_path.is_file()
+    if not routine_analysis_missing:
         from .routines import check_parity, git_committed, writers
         try:
-            deps = json.loads(args.routine_dependencies.read_text())
-            rows = (json.loads(args.routine_parity.read_text()).get("routine_parity")
-                    if args.routine_parity else [])
+            deps = json.loads(deps_path.read_text())
+            rows = json.loads(args.routine_parity.read_text()).get("routine_parity") if args.routine_parity else []
             routine_writers = list(writers(deps))
-            routine_parity = check_parity(rows, str(args.routine_parity or "routine_parity"), deps,
-                                          git_committed(Path(".")))
+            if args.routine_parity or not routine_writers:
+                routine_parity = check_parity(rows, str(args.routine_parity or "routine_parity"), deps,
+                                              git_committed(Path(".")), Path("."))
         except (OSError, json.JSONDecodeError, AttributeError) as exc:
-            raise SystemExit(f"cannot read {args.routine_parity or args.routine_dependencies}: {exc}") from None
+            raise SystemExit(f"cannot read {args.routine_parity or deps_path}: {exc}") from None
         except ConfigError as exc:
             raise SystemExit(str(exc)) from None
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
@@ -414,7 +417,8 @@ def main(argv: list[str] | None = None) -> int:
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
                        source_family=args.family, depth=args.depth, type_map=type_map,
-                       routine_parity=routine_parity, routine_writers=routine_writers)
+                       routine_parity=routine_parity, routine_writers=routine_writers,
+                       routine_analysis_missing=routine_analysis_missing)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")

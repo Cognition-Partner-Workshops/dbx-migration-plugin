@@ -217,31 +217,36 @@ def parity_missing(parity: list[dict] | None, writers: list[str] | None) -> list
 
 
 def check_parity(data: object, where: str, dependencies: object = None,
-                 committed: Committed | None = None) -> list[dict]:
-    """Validate a routine_parity list before result.json carries it. A `proven` row is a claim:
-    its evidence must be a committed file or the row is carried `unproven`. With the unit's
-    dependency analysis, every writing routine gets a row: one the list lacks is `unproven`, and
-    a row for a routine the analysis does not know (another unit's file) is refused."""
+                 committed: Committed | None = None, repo: Path | None = None) -> list[dict]:
+    """Validate a routine_parity list before result.json carries it. A `proven` or `failed` row is
+    a claim about a committed run: the run record its evidence names is read again from `repo` and
+    graded again (`_grade_run`), the recomputed row is what gets carried, and a claim the run does
+    not support is refused. With the unit's dependency analysis, every writing routine gets a row:
+    one the list lacks is `unproven`, and a row for a routine the analysis does not know (another
+    unit's file) is refused."""
     if not isinstance(data, list):
         raise ConfigError(f"{where}: routine_parity must be a list")
     writing = writers(dependencies) if dependencies is not None else None
-    rows = []
     for r in data:
         if not isinstance(r, dict) or not r.get("routine") or r.get("status") not in STATUSES:
             raise ConfigError(f"{where}: each row is {{routine, status: proven|unproven|failed, evidence}}")
         if r["status"] != "unproven" and not r.get("evidence"):
             raise ConfigError(f"{where}: {r['routine']} is {r['status']} without evidence")
-        if r["status"] == "proven":
-            if committed is None:
-                raise ConfigError(f"{where}: {r['routine']} is proven; a committed-file check is needed")
-            if not committed(str(r["evidence"])):
-                r = _row(r["routine"], "unproven", r["evidence"],
-                         reason=f"{where}: evidence {r['evidence']} is not a committed file")
-        rows.append(r)
-    seen = [str(r["routine"]).lower() for r in rows]
+    seen = [str(r["routine"]).lower() for r in data]
     for name in seen:
         if seen.count(name) > 1:
             raise ConfigError(f"{where}: {name} appears twice")
+    rows = []
+    for r in data:
+        if r["status"] != "unproven":
+            if committed is None or writing is None:
+                raise ConfigError(f"{where}: {r['routine']} is {r['status']}; the dependency analysis and a "
+                                  "committed-file check are needed to grade its run again")
+            if repo is None:
+                raise ConfigError(f"{where}: {r['routine']} is {r['status']}; the repository root is needed "
+                                  "to read its run record")
+            r = _regrade(r, where, writing, committed, Path(repo))
+        rows.append(r)
     if writing is None:
         return rows
     for name in seen:
@@ -249,6 +254,29 @@ def check_parity(data: object, where: str, dependencies: object = None,
             raise ConfigError(f"{where}: {name} is not in the dependency analysis as a writing routine")
     return rows + [_row(routine, "unproven", None, reason=f"no row in {where}")
                    for routine in writing if routine not in seen]
+
+
+def _regrade(claim: dict, where: str, writing: dict[str, list[str]], committed: Committed, repo: Path) -> dict:
+    routine, evidence = str(claim["routine"]), str(claim["evidence"])
+    writes = writing.get(routine.lower())
+    if writes is None:
+        raise ConfigError(f"{where}: {routine} is not in the dependency analysis as a writing routine")
+    path = repo / evidence
+    if not path.is_file():
+        return _row(routine, "unproven", evidence,
+                    reason=f"{where}: cannot read evidence {evidence}: not a committed file")
+    try:
+        run = load_runs(path, repo)[0]
+    except ConfigError as exc:
+        return _row(routine, "unproven", evidence, reason=f"{where}: cannot read evidence {evidence}: {exc}")
+    if str(run.get("routine", "")).lower() != routine.lower():
+        return _row(routine, "unproven", evidence,
+                    reason=f"{where}: evidence {evidence} is a run of {run.get('routine')!r}, not {routine}")
+    graded = _grade_run(routine.lower(), writes, run, committed)
+    if graded["status"] != claim["status"] and graded["status"] != "unproven":
+        raise ConfigError(f"{where}: {routine} claims {claim['status']}; its committed run {evidence} "
+                          f"grades {graded['status']}")
+    return graded
 
 
 def load_runs(path: Path, repo: Path = Path(".")) -> list[dict]:

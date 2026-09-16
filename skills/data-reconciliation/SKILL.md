@@ -166,12 +166,15 @@ dbx-recon routine-parity --dependencies .migration/units/<unit>/dependencies.jso
 routine with no run, a run off a dedicated target, without evidence or a snapshot, or in a family with no
 dedicated-target rule is `unproven` (exit 2), never silently clean; rows that differ, or a written table
 absent from either set, are `failed` (exit 1); table names compare case-insensitively. Pass the file to
-`run --routine-parity <file> --routine-dependencies <unit dependencies.json>` so `result.json` carries it
-(a writing routine the file lacks is carried as `unproven`; a row for a routine the analysis does not
-know, or a routine listed twice, is refused; `--routine-dependencies` alone carries every writer as `unproven`): a `failed` routine sets `merge_eligible=false` with reason `routine_gap`; `unproven` routines
-are listed in `recon.summary.md` and become cutover exceptions (`8-cutover_signoff.md`). The result is
-built against the analysis's writer list, and one with writers but no row for each of them is
-`merge_eligible=false` with reason `routine_parity_missing`: absent parity is never clean parity. The run itself
+`run --routine-parity <file>` so `result.json` carries it. `run` reads the unit's dependency analysis
+(`.migration/units/<unit>/dependencies.json`, or `--routine-dependencies`) and regrades every `proven` or
+`failed` row from the committed run record its evidence names: a row the run does not support is refused,
+an unreadable or uncommitted record is `unproven`. A writing routine the file lacks is carried as `unproven`; a
+row for a routine the analysis does not know, or a routine listed twice, is refused. A `failed` routine sets
+`merge_eligible=false` with reason `routine_gap`; `unproven` routines are listed in `recon.summary.md` and
+become cutover exceptions (`8-cutover_signoff.md`). No analysis, or writers with no parity file, is
+`merge_eligible=false` with reason `routine_parity_missing` (only an analysis with zero writers needs no file):
+absent parity is never clean parity. The run itself
 needs the read-only principal to hold EXECUTE on the routines under test; the intake asks (`14-front_door_oltp.md`).
 
 ## Outputs (in `--out`)

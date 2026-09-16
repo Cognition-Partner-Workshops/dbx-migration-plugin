@@ -276,32 +276,35 @@ def test_routine_gap_is_only_a_failed_run():
     assert routine_gap([{"routine": "r", "status": "failed", "evidence": "e"}]) is True
 
 
-def test_check_parity_against_the_dependency_analysis_materializes_missing_writers_as_unproven():
+def test_check_parity_against_the_dependency_analysis_materializes_missing_writers_as_unproven(tmp_path):
     """A parity file that omits a writing routine is not clean: the routine is `unproven`, and a
     row for a routine the analysis lacks (another unit's file) is refused."""
+    repo = _committed_repo(tmp_path / "r")
+    _committed_run(repo)
     proven = [{"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}]
-    out = check_parity(proven, "x", dependencies=DEPS, committed=COMMITTED)
+    out = check_parity(proven, "x", dependencies=DEPS, committed=git_committed(repo), repo=repo)
     assert out == proven + [{"routine": "app_pkg.write_run_log", "status": "unproven", "evidence": None,
                              "reason": "no row in x"}]
     assert check_parity([], "x", dependencies=DEPS)[0]["status"] == "unproven"
     assert check_parity([], "x", dependencies={"routines": []}) == []
     with pytest.raises(ConfigError, match="other_pkg.nobody.*not in the dependency analysis"):
         check_parity(proven + [{"routine": "other_pkg.nobody", "status": "proven", "evidence": EVIDENCE}],
-                     "x", dependencies=DEPS, committed=COMMITTED)
+                     "x", dependencies=DEPS, committed=git_committed(repo), repo=repo)
     with pytest.raises(ConfigError, match="routines"):
         check_parity(proven, "x", dependencies={})
 
 
-def test_check_parity_downgrades_a_proven_row_whose_evidence_is_not_committed():
-    """The parity file is a claim; `run` re-checks that the evidence it names is in the committed
-    tree, so an edited or uncommitted file cannot carry `proven` into result.json."""
+def test_check_parity_downgrades_a_claim_whose_evidence_is_not_committed(tmp_path):
+    """The parity file is a claim; `run` re-reads the run it names from the committed tree, so an
+    absent, uncommitted or edited file cannot carry `proven` (or a made-up `failed`) into result.json."""
+    repo = _committed_repo(tmp_path / "r")
     proven = [{"routine": "app_pkg.close_period", "status": "proven", "evidence": "scratch/run.json"}]
-    out = check_parity(proven, "x", dependencies=DEPS, committed=COMMITTED)
+    out = check_parity(proven, "x", dependencies=DEPS, committed=git_committed(repo), repo=repo)
     assert out[0] == {"routine": "app_pkg.close_period", "status": "unproven", "evidence": "scratch/run.json",
-                      "reason": "x: evidence scratch/run.json is not a committed file"}
+                      "reason": "x: cannot read evidence scratch/run.json: not a committed file"}
     failed = [{"routine": "app_pkg.close_period", "status": "failed", "evidence": "scratch/run.json",
                "findings": []}]
-    assert check_parity(failed, "x", dependencies=DEPS, committed=COMMITTED)[0] == failed[0]
+    assert check_parity(failed, "x", dependencies=DEPS, committed=git_committed(repo), repo=repo)[0] == out[0]
     with pytest.raises(ConfigError, match="committed"):
         check_parity(proven, "x")
 
@@ -316,13 +319,17 @@ def test_check_parity_refuses_a_routine_listed_twice():
         check_parity(rows, "x", committed=COMMITTED)
 
 
-def test_check_parity_validates_a_written_result():
-    good = [{"routine": "r", "status": "proven", "evidence": "e"}]
-    assert check_parity(good, "x", committed=lambda p: True) == good
+def test_check_parity_validates_a_written_result(tmp_path):
+    repo = _committed_repo(tmp_path / "r")
+    _committed_run(repo)
+    good = [{"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}]
+    assert check_parity(good, "x", DEPS, git_committed(repo), repo)[0] == good[0]
     for bad in ({}, [{"routine": "r", "status": "clean", "evidence": "e"}],
                 [{"routine": "r", "status": "proven", "evidence": None}], [{"status": "proven"}]):
         with pytest.raises(ConfigError):
-            check_parity(bad, "x", committed=lambda p: True)
+            check_parity(bad, "x", DEPS, git_committed(repo), repo)
+    with pytest.raises(ConfigError, match="dependency analysis"):
+        check_parity(good, "x", committed=git_committed(repo), repo=repo)
 
 
 def test_load_runs_accepts_a_file_or_a_directory(tmp_path):
@@ -399,6 +406,58 @@ def test_a_unit_with_writing_routines_and_no_complete_parity_list_is_not_merge_e
     assert result["merge_eligible"] is True  # the analysis says nothing writes
 
 
+def test_a_unit_with_no_dependency_analysis_at_all_is_not_merge_eligible(tmp_path):
+    """Not knowing whether the unit has writers is not the same as knowing it has none: with no
+    dependency analysis `build_result` blocks with `routine_parity_missing` and says what to commit."""
+    source, target = make_green()
+    result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, out_dir=tmp_path,
+                       routine_analysis_missing=True)
+    assert result["verdict"] == "PASS" and result["merge_eligible"] is False
+    assert result["merge_block_reasons"] == ["routine_parity_missing"]
+    text = (tmp_path / "recon.summary.md").read_text()
+    assert "routine_parity_missing" in text and "dependencies.json" in text
+
+
+def _committed_run(repo, evidence=EVIDENCE, **overrides):
+    """A run record committed at the path its evidence names, plus its fixture snapshot."""
+    run = {k: v for k, v in _run(evidence=evidence, **overrides).items() if k != "record"}
+    for f, text in ((evidence, json.dumps(run) + "\n"), (SNAPSHOT[len("fixture:"):], "-- snapshot\n")):
+        (repo / f).parent.mkdir(parents=True, exist_ok=True)
+        (repo / f).write_text(text)
+        _git(repo, "add", f)
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", "run")
+    return run
+
+
+def test_check_parity_regrades_every_claim_from_its_committed_run_record(tmp_path):
+    """A `proven` or `failed` row is a claim about a committed run; `check_parity` re-reads that run
+    and grades it again with `_grade_run`, so a parity file cannot relabel a failed run as proven,
+    and the row carried is the recomputed one (its findings too)."""
+    repo = _committed_repo(tmp_path / "r")
+    _committed_run(repo, observed={**GOLDEN, "app.run_log": []})  # the committed run fails
+    claim = [{"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE},
+             {"routine": "app_pkg.write_run_log", "status": "unproven", "evidence": None, "reason": "none"}]
+    with pytest.raises(ConfigError, match="close_period.*claims proven.*grades failed"):
+        check_parity(claim, "p", DEPS, git_committed(repo), repo)
+    claim[0] = {**claim[0], "status": "failed",
+                "findings": [{"table": "app.ledger_balance", "check": "rows_differ", "detail": "made up"}]}
+    rows = check_parity(claim, "p", DEPS, git_committed(repo), repo)
+    assert rows[0]["status"] == "failed"
+    assert [(f["table"], f["check"]) for f in rows[0]["findings"]] == [("app.run_log", "rows_differ")]
+    _committed_run(repo)  # the run now matches its golden set
+    claim[0] = {"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}
+    rows = check_parity(claim, "p", DEPS, git_committed(repo), repo)
+    assert rows[0] == {"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}
+    (repo / EVIDENCE).write_text(json.dumps({**_run(), "observed": {}}))  # edited after commit
+    rows = check_parity(claim, "p", DEPS, git_committed(repo), repo)
+    assert rows[0]["status"] == "unproven" and "not a committed file" in rows[0]["reason"]
+    claim[0] = {"routine": "app_pkg.close_period", "status": "proven", "evidence": "nowhere/x.run.json"}
+    rows = check_parity(claim, "p", DEPS, git_committed(repo), repo)
+    assert rows[0]["status"] == "unproven" and "cannot read" in rows[0]["reason"]
+    with pytest.raises(ConfigError, match="repository root"):
+        check_parity(claim, "p", DEPS, git_committed(repo))
+
+
 def _cli_run(tmp_path, monkeypatch, *extra):
     from recon import adapters
     monkeypatch.chdir(tmp_path)
@@ -428,6 +487,7 @@ def test_cli_run_grades_the_parity_file_against_the_unit_dependency_analysis(tmp
         {"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}]}))
     with pytest.raises(SystemExit, match="--routine-dependencies"):
         _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity))
+    _committed_run(tmp_path)
     rc, result = _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity),
                           "--routine-dependencies", str(deps))
     assert rc == 0 and result["merge_eligible"] is True
@@ -439,18 +499,57 @@ def test_cli_run_grades_the_parity_file_against_the_unit_dependency_analysis(tmp
         _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity), "--routine-dependencies", str(deps))
 
 
-def test_cli_run_with_no_parity_file_carries_every_writer_from_the_analysis_as_unproven(tmp_path, monkeypatch):
+def test_cli_run_with_no_parity_file_blocks_and_names_every_writer_from_the_analysis(tmp_path, monkeypatch):
     """Absent parity is not clean parity: with only the dependency analysis, every routine that
-    writes (directly or through a callee) is an `unproven` row in result.json and the summary."""
+    writes (directly or through a callee) is a writer without a row, so the unit blocks with
+    `routine_parity_missing` and the summary names them; `unproven` rows stay eligible only when a
+    parity file carries them."""
     deps = tmp_path / "dependencies.json"
     deps.write_text(json.dumps({"routines": DEPS["routines"] + [
         {"routine": "app_pkg.month_end", "writes": [], "calls": ["app_pkg.close_period"]}]}))
     rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", str(deps))
-    assert rc == 0 and result["merge_eligible"] is True and "routine_gap" not in result["merge_block_reasons"]
-    assert result["routine_parity"] == [
-        {"routine": r, "status": "unproven", "evidence": None, "reason": "no row in routine_parity"}
-        for r in ("app_pkg.close_period", "app_pkg.write_run_log", "app_pkg.month_end")]
-    assert "unproven" in (tmp_path / "out" / "recon.summary.md").read_text()
+    assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["routine_parity_missing"]
+    assert result["routine_parity"] is None
+    text = (tmp_path / "out" / "recon.summary.md").read_text()
+    assert "routine_parity_missing" in text
+    assert all(r in text for r in ("app_pkg.close_period", "app_pkg.write_run_log", "app_pkg.month_end"))
+    parity = tmp_path / "routine_parity.json"
+    parity.write_text(json.dumps({"routine_parity": [
+        {"routine": r, "status": "unproven", "evidence": None, "reason": "no committed run"}
+        for r in ("app_pkg.close_period", "app_pkg.write_run_log", "app_pkg.month_end")]}))
+    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", str(deps), "--routine-parity", str(parity))
+    assert rc == 0 and result["merge_eligible"] is True
+
+
+def test_cli_run_loads_the_units_committed_dependency_analysis_by_default(tmp_path, monkeypatch):
+    """Omitting --routine-dependencies never leaves the gate off: `run` reads
+    `.migration/units/<unit>/dependencies.json`; with writers and no parity the unit blocks with
+    `routine_parity_missing`; only an analysis with zero writers lets the unit through; no analysis
+    at all blocks too, naming the file to commit."""
+    rc, result = _cli_run(tmp_path, monkeypatch)
+    assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["routine_parity_missing"]
+    assert ".migration/units/u/dependencies.json" in (tmp_path / "out" / "recon.summary.md").read_text()
+    unit = tmp_path / ".migration" / "units" / "u"
+    unit.mkdir(parents=True)
+    (unit / "dependencies.json").write_text(json.dumps(DEPS))
+    rc, result = _cli_run(tmp_path, monkeypatch)
+    assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["routine_parity_missing"]
+    assert result["routine_parity"] is None and result["routine_writers"] == ["app_pkg.close_period", "app_pkg.write_run_log"]
+    (unit / "dependencies.json").write_text(json.dumps({"routines": [DEPS["routines"][2]]}))
+    rc, result = _cli_run(tmp_path, monkeypatch)
+    assert rc == 0 and result["merge_eligible"] is True and result["routine_parity"] == []
+
+
+def test_cli_run_refuses_a_parity_row_whose_committed_run_grades_differently(tmp_path, monkeypatch):
+    deps = tmp_path / "dependencies.json"
+    deps.write_text(json.dumps(DEPS))
+    _committed_repo(tmp_path)
+    _committed_run(tmp_path, observed={**GOLDEN, "app.run_log": []})
+    parity = tmp_path / "routine_parity.json"
+    parity.write_text(json.dumps({"routine_parity": [
+        {"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}]}))
+    with pytest.raises(SystemExit, match="claims proven.*grades failed"):
+        _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity), "--routine-dependencies", str(deps))
 
 
 def test_cli_run_downgrades_proven_rows_whose_evidence_is_not_in_the_committed_tree(tmp_path, monkeypatch):
