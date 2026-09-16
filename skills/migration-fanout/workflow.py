@@ -16,6 +16,11 @@ What this script guarantees, so the orchestrator does not have to:
   - The verifier is a different session from every child. Only PRs the verifier marks
     PASS are merged, and only if the manifest says auto_merge (false by default; soft stop_mode
     may set true by a recorded STOP A decision).
+  - Merge authority is the harness (every unit's .migration/recon/<unit>/result.json at the PR head
+    says merge_eligible=true) or a human: a batch with a unit whose evidence says otherwise is
+    recorded PASS only with merge_authority {kind: human_override, decision_id: D-<n>} where that
+    D-<n> row of .migration/06_decisions.md is a human's (user:<id>), names every unit of the batch and
+    says merge_override. The result lists every override.
   - Re-running with the same run_id in the pointer replays finished children and only launches
     the rest.
 
@@ -119,6 +124,7 @@ BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
 BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")
 DOCTOR_PATH = MANIFEST_PATH.with_suffix(".doctor.json")
+DECISIONS_PATH = ROOT / ".migration" / "06_decisions.md"
 resume = MODE == "resume"
 SMOKE = MODE == "smoke"
 if SMOKE and not (MANIFEST.get("smoke") is True and MANIFEST.get("wave") == 0 and MANIFEST.get("width") == 1):
@@ -192,6 +198,58 @@ ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
 # A PR of this repo, as the host names it; its head is refs/pull/N/head, which only the host writes.
 PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
+# A row of the decision ledger (.migration/06_decisions.md).
+DECISION_ID = re.compile(r"D-[0-9]+")
+# Its provenance when a human wrote it (`user:<message/event id>`), as the ledger convention names it.
+HUMAN_PROVENANCE = re.compile(r"(?<![\w-])user:[\w][\w.@/-]*")
+# A cell of a ledger row that is about the row, not about units: an id, a date/time or the provenance.
+LEDGER_METADATA = re.compile(rf"D-[0-9]+|\d{{4}}-\d{{2}}-\d{{2}}(?:[T ][\d:.]+Z?(?:[+-]\d{{2}}:?\d{{2}})?)?"
+                             rf"|{HUMAN_PROVENANCE.pattern}|default-accepted")
+
+
+def decision_ledger():
+    try:
+        return DECISIONS_PATH.read_text()
+    except OSError:
+        return ""
+
+
+def ledger_rows(ledger):
+    """Each markdown table row of the ledger as (decision id, its cells): the id is the first cell that is
+    one alone, so a row that cites another decision in prose or a later column is not that decision's.
+    Edge pipes are optional, as in markdown and the guard's ledger reading; a line without a pipe is prose."""
+    for line in ledger.splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        cells = [" ".join(c.split()) for c in line.strip("|").split("|")]
+        ids = [c for c in cells if DECISION_ID.fullmatch(c)]
+        if ids:
+            yield ids[0], cells
+
+
+def override_decision(decision_id, units, ledger):
+    """Whether the ledger holds the D-<n> row that lets a human merge past merge_eligible=false: the row
+    whose id cell is that id, with human provenance (`user:<id>`; a default-accepted row is the
+    orchestrator's, not a human's), the word merge_override and the id of every unit in the batch, in
+    whatever column order the ledger keeps. Units are looked for in the row's text cells only: a cell
+    that is an id, a date or the provenance alone is about the row and is skipped, and a provenance token
+    inside a text cell is blanked, so none of those stands in for a unit the row did not name, while a
+    unit that happens to be called like one counts when the text names it; nor does the marker stand in
+    for a unit that happens to be called merge_override (the row names it again)."""
+    if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
+        return False
+
+    def word(w):
+        return rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])"
+
+    for row_id, cells in ledger_rows(ledger):
+        if row_id == decision_id and any(HUMAN_PROVENANCE.search(c) for c in cells):
+            text = " | ".join(HUMAN_PROVENANCE.sub(" ", c) for c in cells if not LEDGER_METADATA.fullmatch(c))
+            need = Counter(("merge_override", *units))
+            if all(len(re.findall(word(w), text)) >= n for w, n in need.items()):
+                return True
+    return False
 
 
 def validate_manifest(m, doctor=None):
@@ -416,6 +474,22 @@ def ref_changed_paths(ref):
         return None
 
 
+def unit_eligibility(head, units):
+    """{unit: merge_eligible} from each unit's own .migration/recon/<unit>/result.json at the gated PR
+    head. A batch reports one boolean for up to five units, so the per-unit evidence decides; a file
+    git cannot show, or one without a boolean merge_eligible, is None (not eligible)."""
+    out = {}
+    for u in units:
+        try:
+            text = subprocess.run(["git", "-C", str(ROOT), "show", f"{head}:.migration/recon/{u}/result.json"],
+                                  check=True, capture_output=True, text=True, timeout=300).stdout
+            got = json.loads(text).get("merge_eligible")
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            got = None
+        out[u] = got if isinstance(got, bool) else None
+    return out
+
+
 def pr_changed_paths(pr_url):
     """What the PR really changes: the head the host holds for that PR of this repo (refs/pull/N/head),
     so the branch name in the child's report never selects what is inspected."""
@@ -560,6 +634,13 @@ CHILD_SCHEMA = {
         "branch": {"type": "string"},
         "recon_verdict": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]},
         "recon_mode": {"type": "string", "description": "recon --mode of the evidence run (fixture never merges)"},
+        "merge_eligible": {"type": "boolean", "description": "result.json['merge_eligible'] of the evidence run"},
+        "merge_authority": {
+            "type": "object",
+            "properties": {"kind": {"type": "string", "enum": ["harness", "human_override"]},
+                           "decision_id": {"type": "string"}},
+            "description": "human_override with the D-<n> row of .migration/06_decisions.md that says merge_override "
+                           "for your units; the workflow verifies the row. harness otherwise."},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
         "changed_paths": {"type": "array", "items": {"type": "string"},
@@ -569,7 +650,8 @@ CHILD_SCHEMA = {
                        "description": "result.json['cost'] of the final live/snapshot/transactional run"},
         "one_line_summary": {"type": "string"},
     },
-    "required": ["status", "recon_verdict", "recon_mode", "write_targets", "changed_paths", "one_line_summary"],
+    "required": ["status", "recon_verdict", "recon_mode", "merge_eligible", "write_targets", "changed_paths",
+                 "one_line_summary"],
 }
 
 VERIFY_SCHEMA = {
@@ -620,7 +702,11 @@ def child_prompt(batch):
         "- Do not merge your own PR.\n"
         f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
         "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
-        "evidence is never PASS.\n"
+        "evidence is never PASS. Report merge_eligible=true only when every unit's "
+        ".migration/recon/<unit>/result.json in your PR says so; the workflow reads each file. If any is "
+        "false and a human recorded a merge_override row for exactly your units in .migration/06_decisions.md, "
+        "report merge_authority {kind: human_override, decision_id: D-<n>}; the workflow checks the row and "
+        "fails the unit if it is missing. Never write that row yourself.\n"
         "- If the recon harness fails 3 full runs, stop and report status=FAIL with a short "
         "failure_class (for example 'timestamp_precision', 'decimal_rounding', 'missing_rule').\n"
         "- Report every rule you had to derive yourself in skill_feedback.\n"
@@ -677,7 +763,9 @@ def verify_prompt(passed, auto_merge):
         "ledger_tampered. "
         f"Mark a unit PASS only if you re-ran the harness in one of {list(MERGE_EVIDENCE_MODES)} "
         "(the same mode the child used: transactional for Lakebase/operational units) and result.json "
-        "says merge_eligible=true. "
+        "says merge_eligible=true. A batch listed with merge_authority kind human_override was cleared by the "
+        "named D-<n> merge_override row of .migration/06_decisions.md: mark it PASS on a PASS verdict even if "
+        "merge_eligible is false, and cite the decision id in findings. "
         f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
         "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
         "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. "
@@ -762,6 +850,27 @@ async def run_batch(batch, sem, breaker):
                 "PASS downgraded: changed_paths "
                 + ("not reported" if not usable else "not verifiable from git (not a PR of this repo, or its fetch or diff failed)")
                 + ", ledger integrity unverified; " + out["one_line_summary"])
+        if out["status"] == "PASS":
+            claimed = out.get("merge_authority")
+            decision = claimed.get("decision_id") if isinstance(claimed, dict) else None
+            evidence = unit_eligibility(out["pr_head"], batch["units"])
+            ineligible = sorted(u for u, e in evidence.items() if e is not True)
+            if out.get("merge_eligible") is True and not ineligible:
+                out["merge_authority"] = {"kind": "harness", "decision_id": None}
+            elif (isinstance(claimed, dict) and claimed.get("kind") == "human_override"
+                  and override_decision(decision, batch["units"], decision_ledger())):
+                out["merge_authority"] = {"kind": "human_override", "decision_id": decision}
+            else:
+                out["status"] = "FAIL"
+                out["failure_class"] = "merge_authority"
+                out.pop("merge_authority", None)
+                why = "; ".join(f".migration/recon/{u}/result.json at the PR head "
+                                + ("is missing or malformed" if evidence[u] is None else f"has merge_eligible={evidence[u]!r}")
+                                for u in ineligible) or f"the child reported merge_eligible={out.get('merge_eligible')!r}"
+                out["one_line_summary"] = (
+                    f"PASS downgraded: recon evidence is not merge_eligible=true for every unit ({why}) "
+                    f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
+                    ".migration/06_decisions.md; " + out["one_line_summary"])
         # a replayed failure of this class was counted by the run being resumed; a replayed PASS (or FAIL of
         # another class) that the gate fails now was not
         if out["status"] != "PASS" and (record is None or (isinstance(record, dict) and (
@@ -808,6 +917,12 @@ def cost_line(results, verify) -> str:
                if any("verify_depth" in b for b in BATCHES) else "") + ".")
 
 
+def merge_overrides(results):
+    return [{"batch": b["id"], "units": b["units"], "decision_id": r["merge_authority"]["decision_id"]}
+            for b, r in zip(BATCHES, results)
+            if r["status"] == "PASS" and (r.get("merge_authority") or {}).get("kind") == "human_override"]
+
+
 def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
     """Ten lines a lead reads in one minute. The orchestrator posts this at wave close."""
     n = len(BATCHES)
@@ -836,6 +951,10 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
     if unreported:
         lines.append(f"Merges held: {', '.join(unreported)} passed but reported no write targets; "
                      "a human confirms what they wrote before any PR lands.")
+    overrides = merge_overrides(results)
+    if overrides:
+        lines.append("Human override authority (merge_eligible=false; merged only if listed above): "
+                     + "; ".join(f"{o['batch']} ({', '.join(o['units'])}) by {o['decision_id']}" for o in overrides) + ".")
     if not auto_merge:
         urls = [r["pr_url"] for r in results
                 if r["status"] == "PASS" and r.get("pr_url")]
@@ -893,7 +1012,7 @@ async def main():
             "Auto-merge is off for this wave; a human decides at wave close.")
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
-               "branch": r.get("branch", ""), "pr_head": r.get("pr_head")}
+               "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority")}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
     verify = None
     if passed:
@@ -929,6 +1048,7 @@ async def main():
         "write_target_overlaps": surprises,
         "undeclared_write_targets": undeclared,
         "unreported_write_targets": unreported,
+        "merge_overrides": merge_overrides(results),
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
         "verify": verify,
     }, indent=2, sort_keys=True) + "\n")

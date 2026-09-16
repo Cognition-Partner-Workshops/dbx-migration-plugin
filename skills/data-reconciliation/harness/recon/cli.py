@@ -139,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="dbx-recon")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="verify the harness install (no connections needed)")
+    sub.add_parser("families", help="print the live-tested vs refused source families as JSON")
     e = sub.add_parser("estimate", help="statements/rows a run would cost (no connections); "
                                         "summed per wave for the STOP C cost line")
     e.add_argument("--mapping", required=True, type=Path)
@@ -188,6 +189,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "selftest":
         return selftest()
+
+    if args.cmd == "families":
+        from .adapters import SOURCE_ADAPTERS, is_untested_source_family
+        print(json.dumps({
+            "live_tested": sorted(f for f in SOURCE_ADAPTERS if not is_untested_source_family(f)),
+            "untested": sorted(f for f in SOURCE_ADAPTERS if is_untested_source_family(f)),
+        }))
+        return 0
 
     if args.cmd == "run" and args.mode in PLANNED_MODES:
         raise SystemExit(f"--mode {args.mode} is not implemented in this harness version")

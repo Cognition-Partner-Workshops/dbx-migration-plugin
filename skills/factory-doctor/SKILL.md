@@ -43,6 +43,7 @@ guard mode, and stop mode are the workflow capability contract.
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
 | `recon_harness` | harness self-test/import or a required driver fails | install the harness extras |
+| `recon_family_supported` | the harness refuses the declared source family (asked of the same harness `recon_harness` ran) | reconcile through a family the harness supports |
 | `delete_evidence` | mapped CDC evidence is absent, incomplete, or unreadable | provide source CDC evidence; never enable it here |
 | `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a user-attested decision |
 | `databricks_identity` | CLI/auth/host/identity is missing, human, or mismatched | use the expected OAuth M2M principal and host |
