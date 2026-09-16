@@ -160,6 +160,7 @@ MANIFEST = json.loads(MANIFEST_BYTES)
 BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
+MERGES_PATH = MANIFEST_PATH.with_suffix(".merges.json")
 RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
@@ -1601,9 +1602,16 @@ def validate_close(close, to_merge) -> list[str]:
     if not isinstance(close, dict):
         return ["expected an object"]
     merged = close.get("merged_prs")
-    if not isinstance(merged, list) or not all(isinstance(u, str) for u in merged):
-        problems.append("merged_prs must be a list of PR urls")
+    if not isinstance(merged, list) or not all(
+            isinstance(u, dict) and isinstance(u.get("pr_url"), str)
+            and isinstance(u.get("merge_commit_sha"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", u["merge_commit_sha"])
+            and isinstance(u.get("merged_head"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", u["merged_head"])
+            for u in merged):
+        problems.append("merged_prs rows must be {pr_url, merge_commit_sha, merged_head}")
         merged = []
+    merged_urls = [u["pr_url"] for u in merged]
     unmerged = close.get("unmerged")
     if not isinstance(unmerged, list) or not all(
             isinstance(u, dict) and isinstance(u.get("pr_url"), str) and isinstance(u.get("reason"), str)
@@ -1611,10 +1619,10 @@ def validate_close(close, to_merge) -> list[str]:
         problems.append("unmerged must be a list of {pr_url, reason} rows")
         unmerged = []
     want = {p.get("pr_url") for p in to_merge}
-    for url in merged:
+    for url in merged_urls:
         if url not in want:
             problems.append(f"merged a PR outside the wave ({url})")
-    listed = Counter([*merged, *(u["pr_url"] for u in unmerged)])
+    listed = Counter([*merged_urls, *(u["pr_url"] for u in unmerged)])
     for url in sorted(want):
         if listed.get(url, 0) != 1:
             problems.append(f"{url} is in {listed.get(url, 0)} of merged_prs/unmerged, expected exactly one")
@@ -1627,63 +1635,22 @@ def validate_close(close, to_merge) -> list[str]:
     return problems
 
 
-def _contains(lines, part):
-    return not part or any(lines[i:i + len(part)] == part for i in range(len(lines) - len(part) + 1))
-
-
-def _tip_file(tip, path):
-    r = subprocess.run(["git", "-C", str(ROOT), "show", f"{tip}:{path}"],
-                       check=False, capture_output=True, text=True, timeout=300)
-    return r.stdout.splitlines() if r.returncode == 0 else []
-
-
-def _patch_on_tip(patch, tip):
-    """({path touched}, {path whose hunks the tip lost}) for this patch (a `git diff -U1` text): a hunk holds
-    when its result (its added lines with one line of context) is still contiguous in the tip's file and, if
-    it removed lines, its old text is not back. A later PR editing elsewhere in the same file loses nothing;
-    a revert, or an overwrite of the patched lines, loses the path. A file the diff calls binary holds only
-    byte-equal at the tip."""
-    path, lines, hunks, touched, lost = None, [], [], set(), set()
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
-            path = line.split(" b/", 1)[1]
-            touched.add(path)
-            lines = _tip_file(tip, path)
-        elif line.startswith("Binary files "):
-            same = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", tip, "--", path],
-                                  check=False, capture_output=True, timeout=300).returncode
-            if same != 0:
-                lost.add(path)
-        elif line.startswith("@@"):
-            hunks.append((path, lines, [], [], False))
-        elif hunks and line[:1] in (" ", "+", "-") and not line.startswith(("+++", "---")):
-            hunk_path, file_lines, new, old, removed = hunks[-1]
-            if line[0] != "-":
-                new.append(line[1:])
-            if line[0] != "+":
-                old.append(line[1:])
-            if line[0] == "-":
-                hunks[-1] = (hunk_path, file_lines, new, old, True)
-    lost |= {hunk_path for hunk_path, file_lines, new, old, removed in hunks
-             if not _contains(file_lines, new) or (removed and _contains(file_lines, old))}
-    return touched, lost
-
-
-def proven_merged(to_merge):
-    """({proven pr_url}, {pr_url: reason}) — a merge counts only when the PR head still equals the gated
-    head (a commit appended after verification is not the verified tree) and origin's base tip still carries
-    the PR's patch: a merged head stays an ancestor after a revert, and a squash/rebase merge leaves only the
-    tree, so the tip holding the patch's hunks is the proof either way (a later PR editing the same file
-    beside it is fine; a historical match the base later reverted is not the verified code). A merged head
-    whose hunks the tip lost on some path is still merged when another PR of this wave, itself proven on the
-    tip, touched that path: the wave's later PR superseded it. Lost with no such PR is a revert. Whatever the
-    close step reported or failed to report is reconciled against git."""
-    proven, reasons, touches, superseded = set(), {}, {}, {}
+def proven_merged(to_merge, reported):
+    """({pr_url: merge_commit_sha}, {pr_url: reason}) — a merge counts only when the PR head still equals the
+    gated head (a commit appended after verification is not the verified tree) and origin's base tip carries
+    the merge: a merge_commit_sha the wave-close step recorded (`gh pr view` state MERGED, merged_head the
+    gated head) must be on the tip and, when it has two parents, name the gated head as its PR-side parent
+    (a single-parent squash/rebase commit has no PR-side parent to check and is accepted on the recorded
+    merged_head). With no record — the step died, timed out, or dropped the PR — git alone still proves a
+    merge commit on the base's first-parent line whose PR-side parent is the gated head. Whatever the close
+    step reported or failed to report is reconciled against git."""
+    proven, reasons = {}, {}
     try:
         tip = _base_tip()
     except (OSError, subprocess.SubprocessError) as e:
         return proven, {p["pr_url"]: f"cannot resolve origin/{BASE_BRANCH} ({e})" for p in to_merge}
     git = ["git", "-C", str(ROOT)]
+    merges = None
     for p in to_merge:
         url, head = p["pr_url"], p.get("pr_head")
         if not (isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head)):
@@ -1694,34 +1661,44 @@ def proven_merged(to_merge):
             reasons[url] = ("PR head unreadable" if current is None
                             else f"PR head moved from {head} to {current} after verification")
             continue
+        record = reported.get(url)
         try:
-            merged = subprocess.run(git + ["merge-base", "--is-ancestor", head, tip],
-                                    check=False, capture_output=True, timeout=300).returncode
-            if merged not in (0, 1):
-                raise subprocess.SubprocessError(f"merge-base rc={merged}")
-            patch = subprocess.run(git + ["diff", "-U1", "--no-renames", f"{BASE_SHA if merged == 0 else tip}...{head}"],
-                                   check=True, capture_output=True, text=True, timeout=300).stdout
-            if not patch:
-                if merged == 0:
-                    proven.add(url)
-                else:
-                    reasons[url] = "PR diff is empty"
+            if record is not None:
+                mc = record.get("merge_commit_sha")
+                if record.get("merged_head") != head:
+                    reasons[url] = f"merged head {record.get('merged_head')} is not the gated head {head}"
+                    continue
+                on_base = (isinstance(mc, str) and re.fullmatch(r"[0-9a-f]{40}", mc)
+                           and subprocess.run(git + ["merge-base", "--is-ancestor", mc, tip],
+                                              check=False, capture_output=True,
+                                              timeout=300).returncode == 0)
+                if not on_base:
+                    reasons[url] = f"merge commit {mc} is not on origin/{BASE_BRANCH}"
+                    continue
+                parents = subprocess.run(git + ["rev-list", "--parents", "-n1", mc],
+                                         check=True, capture_output=True, text=True,
+                                         timeout=300).stdout.split()[1:]
+                if len(parents) >= 2 and parents[1] != head:
+                    reasons[url] = f"merge commit's PR-side parent is {parents[1]}, not the gated head"
+                    continue
+                proven[url] = mc
                 continue
-            touched, lost = _patch_on_tip(patch, tip)
-            if not lost:
-                proven.add(url)
-            elif merged == 0:
-                superseded[url] = lost
+            if merges is None:
+                merges = {}
+                for line in subprocess.run(
+                        git + ["rev-list", "--merges", "--first-parent", "--parents",
+                               f"{BASE_SHA}..{tip}"],
+                        check=True, capture_output=True, text=True, timeout=300).stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        merges[parts[2]] = parts[0]
+            if head in merges:
+                proven[url] = merges[head]
             else:
-                reasons[url] = f"head not on origin/{BASE_BRANCH}"
-            touches[url] = touched
+                reasons[url] = (f"merge not recorded by the wave-close step and no merge commit on "
+                                f"origin/{BASE_BRANCH} has the gated head as its PR-side parent")
         except (OSError, subprocess.SubprocessError) as e:
             reasons[url] = f"merge proof failed ({e})"
-    for url, lost in superseded.items():
-        if all(any(path in touches[other] for other in proven if other != url) for path in lost):
-            proven.add(url)
-        else:
-            reasons[url] = f"reverted on origin/{BASE_BRANCH} after the merge"
     return proven, reasons
 
 WAVE = MANIFEST["wave"]
@@ -1821,7 +1798,14 @@ VERIFY_SCHEMA = {
 CLOSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "merged_prs": {"type": "array", "items": {"type": "string"}},
+        "merged_prs": {"type": "array",
+                       "items": {"type": "object",
+                                 "properties": {"pr_url": {"type": "string"},
+                                                "merge_commit_sha": {"type": "string"},
+                                                "merged_head": {"type": "string"}},
+                                 "required": ["pr_url", "merge_commit_sha", "merged_head"]},
+                       "description": "from `gh pr view <url> --json state,mergeCommit,headRefOid` after "
+                                      "the merge; state must be MERGED"},
         "unmerged": {"type": "array",
                      "items": {"type": "object",
                                "properties": {"pr_url": {"type": "string"}, "reason": {"type": "string"}},
@@ -1941,7 +1925,10 @@ def close_prompt(to_merge, deadline_minutes):
         f"{json.dumps(to_merge, sort_keys=True)}. Each was verified PASS by the independent verifier at "
         "pr_head; before merging, check the PR head still equals it and the PR is open and mergeable, "
         "otherwise leave it and list it in unmerged with a one-sentence reason. Merge nothing whose head "
-        "is not exactly the verified pr_head, and never push to the PR branch. Do it within "
+        "is not exactly the verified pr_head, and never push to the PR branch. After each merge run "
+        "`gh pr view <url> --json state,mergeCommit,headRefOid`: put {pr_url, merge_commit_sha: "
+        "mergeCommit.oid, merged_head: headRefOid} in merged_prs only when state is MERGED — anything else "
+        "goes to unmerged. Do it within "
         f"{deadline_minutes} minutes; when time is up, stop and list the rest as unmerged. Write nothing: "
         "no commits, no files, no other PR; report `git diff --name-only` of anything you changed in "
         "changed_paths (it must be empty). The orchestrator commits the wave's ledger artifacts in one "
@@ -2271,20 +2258,37 @@ async def main():
                      "changed_paths": []}
     close_problems = validate_close(close, to_merge) if close is not None else []
     if close is not None:
-        raw, (proven, proof) = close, proven_merged(to_merge)
-        reported = raw.get("merged_prs") if isinstance(raw, dict) else None
-        reported = {u for u in reported if isinstance(u, str)} if isinstance(reported, list) else set()
+        raw = close
+        reported = {}
+        if resume and MERGES_PATH.exists():
+            try:
+                stored = json.loads(MERGES_PATH.read_text())
+            except ValueError:
+                stored = {}
+            gated = {p["pr_url"]: p.get("pr_head") for p in to_merge}
+            reported.update({u: {"merge_commit_sha": mc, "merged_head": gated[u]}
+                             for u, mc in stored.items()
+                             if u in gated and isinstance(mc, str)} if isinstance(stored, dict) else {})
+        rows = raw.get("merged_prs") if isinstance(raw, dict) else None
+        if isinstance(rows, list):
+            reported.update({u["pr_url"]: u for u in rows
+                             if isinstance(u, dict) and isinstance(u.get("pr_url"), str)})
+        proven, proof = proven_merged(to_merge, reported)
         reasons = {u["pr_url"]: u["reason"] for u in raw.get("unmerged", [])
                    if isinstance(u, dict) and isinstance(u.get("pr_url"), str)
                    and isinstance(u.get("reason"), str)} if isinstance(raw, dict) else {}
         changed = raw.get("changed_paths") if isinstance(raw, dict) else None
         close = {"merged_prs": [p["pr_url"] for p in to_merge if p["pr_url"] in proven],
+                 "merges": [{"pr_url": p["pr_url"], "merge_commit_sha": proven[p["pr_url"]]}
+                            for p in to_merge if p["pr_url"] in proven],
                  "unmerged": [{"pr_url": p["pr_url"],
-                               "reason": (proof.get(p["pr_url"], "merge not proven")
-                                          if p["pr_url"] in reported
-                                          else reasons.get(p["pr_url"], "wave-close output invalid"))}
+                               "reason": (proof.get(p["pr_url"]) or reasons.get(p["pr_url"])
+                                          or "wave-close output invalid")}
                               for p in to_merge if p["pr_url"] not in proven],
                  "changed_paths": changed if isinstance(changed, list) else []}
+        merges_tmp = MERGES_PATH.with_suffix(".merges.json.tmp")
+        merges_tmp.write_text(json.dumps(proven, indent=2, sort_keys=True) + "\n")
+        merges_tmp.replace(MERGES_PATH)
         if close_problems:
             close["invalid"] = raw
     if close_problems:

@@ -2565,14 +2565,18 @@ def test_validate_manifest_rejects_a_bad_close_minutes(value):
 def test_validate_close_lists_each_verified_pr_in_exactly_one_bucket_and_nothing_else():
     validate_close = _functions()["validate_close"]
     to_merge = [{"batch": "b1", "pr_url": "u1"}, {"batch": "b2", "pr_url": "u2"}]
-    ok = {"merged_prs": ["u1"], "unmerged": [{"pr_url": "u2", "reason": "head moved"}], "changed_paths": []}
+    row = lambda url: {"pr_url": url, "merge_commit_sha": "a" * 40, "merged_head": "b" * 40}
+    ok = {"merged_prs": [row("u1")], "unmerged": [{"pr_url": "u2", "reason": "head moved"}],
+          "changed_paths": []}
     assert validate_close(ok, to_merge) == []
     assert "expected an object" in validate_close([], to_merge)[0]
-    problems = validate_close({**ok, "merged_prs": ["u1", "foreign"]}, to_merge)
+    problems = validate_close({**ok, "merged_prs": ["u1"]}, to_merge)
+    assert any("merged_prs rows must be" in p for p in problems)
+    problems = validate_close({**ok, "merged_prs": [row("u1"), row("foreign")]}, to_merge)
     assert any("outside the wave" in p and "foreign" in p for p in problems)
     problems = validate_close({"merged_prs": [], "unmerged": [], "changed_paths": []}, to_merge)
     assert len([p for p in problems if "u1" in p or "u2" in p]) == 2
-    problems = validate_close({**ok, "merged_prs": ["u1", "u2"],
+    problems = validate_close({**ok, "merged_prs": [row("u1"), row("u2")],
                                "unmerged": [{"pr_url": "u2", "reason": "x"}]}, to_merge)
     assert any("u2" in p for p in problems)
     problems = validate_close({**ok, "changed_paths": ["src/x.sql"]}, to_merge)
