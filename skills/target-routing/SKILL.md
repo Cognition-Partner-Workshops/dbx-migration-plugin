@@ -80,3 +80,9 @@ Analytical-track deltas (deploy/schedule, pipelines, governance): [references/an
 - Medallion applies to re-architected pipelines. A like-for-like migration lands the legacy shape
   first (this is what makes Tier 1–3 recon trivially defined) and defers medallion refactors to a
   named follow-up wave, unless the STOP A target profile says otherwise.
+- One active update per Lakeflow pipeline per wave: each batch lists the pipelines it updates as
+  `lakeflow_pipelines` in the wave manifest, and `python3 skills/target-routing/pipeline_updates.py
+  .migration/waves/wave-N.json` runs before launch. Two batches of a wave naming the same pipeline is
+  a halt unless the wave is serial (`width` 1) or `serialized_pipelines` maps that pipeline to a
+  decision row in `06_decisions.md`; a batch that lists nothing makes the result `unsupported`, not
+  clean.
