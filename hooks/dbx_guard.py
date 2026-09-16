@@ -130,11 +130,12 @@ _DECISION_ROW = re.compile(r"(?m)^\s*(?:\|\s*|#{1,6}\s*)?(D-[A-Za-z0-9][\w.-]*)\
 _DECISION_ID = re.compile(r"D-[A-Za-z0-9][\w.-]*")
 _WRITE_OBJECT = re.compile(
     r"(?is)^\s*(?:DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|UPDATE(?:\s+TOP\s*\([^)]*\)(?:\s+PERCENT)?|\s+STATISTICS|\s+(?:ONLY|LOW_PRIORITY|IGNORE))*|TRUNCATE(?:\s+TABLE)?|"
-    r"DROP\s+\w+(?:\s+IF\s+EXISTS)?|"
-    r"CREATE(?:\s+\w+)*?\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
+    r"(?:CREATE|ALTER|DROP)(?:\s+\w+)*?\s+INDEX(?:\s+IF\s+(?:NOT\s+)?EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
     r"CREATE(?:\s+OR\s+REPLACE)?\s+(?:\w+\s+)*?"
     r"(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
-    r"ALTER\s+\w+|(?:GRANT|REVOKE)\b.*?\bON\s+ALL\s+\w+\s+IN\s+SCHEMA|"
+    r"(?:ALTER|DROP)(?:\s+\w+)*?\s+"
+    r"(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+EXISTS)?|"
+    r"(?:GRANT|REVOKE)\b.*?\bON\s+ALL\s+\w+\s+IN\s+SCHEMA|"
     r"GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)"
 )
 _WRITE_OBJECT_NEXT = re.compile(r"\s*,\s*([\w.$\"\[\]`]+)")
@@ -1605,14 +1606,20 @@ def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd
     violations = []
     decision = False
     if kind in ("inside", "self"):
-        decision = Path(file_path).name == "06_decisions.md" and len(_DECISION_ROW.findall(new)) > len(_DECISION_ROW.findall(old))
-        if decision and new.lower().count("legacy_write_authorized") > old.lower().count("legacy_write_authorized"):
-            violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
-            decision = False
+        ledger = Path(file_path).name == "06_decisions.md"
+        added = new[len(old):] if new.startswith(old) else new
+        authorized = "legacy_write_authorized" in added.lower()
+        decision = bool(ledger and tool != "MultiEdit" and new.startswith(old) and added and _DECISION_ROW.search(added)
+                        and not authorized)
         if not decision:
-            violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
-                              ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
-                              "decision — 06_decisions.md accepts only an added `D-<id>` row)")
+            if ledger and authorized:
+                violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
+            elif ledger:
+                violations.append("06_decisions.md is append-only: the edit must keep the existing text and only add `D-<id>` rows")
+            else:
+                violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
+                                  ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
+                                  "decision — 06_decisions.md accepts only an added `D-<id>` row)")
     elif kind == "identity":
         violations.append(f"file-edit tool `{tool}` writes `{file_path}`, the Databricks CLI's credential store; the session runs as the "
                           "doctor-verified migration principal only")
@@ -1673,7 +1680,8 @@ def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str 
             continue
         if other is not None and other.path not in seen:
             seen.add(other.path)
-            violations += [f"[{other.path}] {x}" for x in evaluate(command, other, d).violations]
+            violations += [type(x)(f"[{other.path}] {x}") for x in evaluate(command, other, d).violations
+                           if not x.startswith(_AUTHORIZED)]
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 

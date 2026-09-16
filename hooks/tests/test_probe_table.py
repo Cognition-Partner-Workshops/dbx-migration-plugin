@@ -168,7 +168,7 @@ FILES2 = {
     "fix.sh": "cat /etc/hosts\n",
     "q.sql": "SELECT 1;\n",
     "capture_baseline.py": "import boto3\ns3 = boto3.client(\"s3\")\nprint(s3.list_buckets())\n",
-    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n| D-11 | 2026-01-05 | legacy_write_authorized: approved modifiers TOP and STATISTICS |\n| D-12 | 2026-01-06 | legacy_write_authorized: approved DROP TABLE on dbo.orders and dbo.customers |\n| D-13 | 2026-01-07 | legacy_write_authorized: approved CDC index on \"dbo\".\"customers\" |\n| D-14 | 2026-01-08 | legacy_write_authorized: read grant on schema billing |\n",
+    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n| D-11 | 2026-01-05 | legacy_write_authorized: approved modifiers TOP and STATISTICS |\n| D-12 | 2026-01-06 | legacy_write_authorized: approved DROP TABLE on dbo.orders and dbo.customers |\n| D-13 | 2026-01-07 | legacy_write_authorized: approved CDC index on \"dbo\".\"customers\" |\n| D-14 | 2026-01-08 | legacy_write_authorized: read grant on schema billing |\n| D-15 | 2026-01-09 | legacy_write_authorized: approved VIEW maintenance on dbo.customers |\n",
     "d.patch": "--- a/.migration/allowed_targets.json\n+++ b/.migration/allowed_targets.json\n",
     "ok.patch": "--- a/notes.md\n+++ b/notes.md\n",
 }
@@ -720,6 +720,9 @@ PROBES2 = [
     ("R5 create index name does not authorize table", "DBX_DECISION=D-13 sqlcmd -S sqlserver-demo -Q 'CREATE INDEX ix_orders ON dbo.orders (id)'", "block"),
     ("R5 grant on all tables authorizes schema", "DBX_DECISION=D-14 psql -h tdprod.corp -c 'GRANT SELECT ON ALL TABLES IN SCHEMA billing TO r'", "approve"),
     ("R5 grant on another schema blocks", "DBX_DECISION=D-7 psql -h tdprod.corp -c 'GRANT SELECT ON ALL TABLES IN SCHEMA billing TO r'", "block"),
+    ("R6 drop external table authorizes the table", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'DROP EXTERNAL TABLE dbo.orders'", "approve"),
+    ("R6 view wording does not authorize another object", "DBX_DECISION=D-15 sqlcmd -S sqlserver-demo -Q 'ALTER MATERIALIZED VIEW dbo.orders_archive REFRESH'", "block"),
+    ("R6 unknown ALTER kind blocks", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'ALTER USER app WITH PASSWORD x'", "block"),
 ]
 
 WARN_PROBES = [
