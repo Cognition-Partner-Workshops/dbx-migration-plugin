@@ -21,7 +21,7 @@ from recon.structure import (
 )
 from recon.tiers import Finding
 
-from tests.fakes import FakeSource, FakeTarget
+from tests.fakes import PROVEN_RERUN, FakeSource, FakeTarget
 from tests.loans import (
     BORROWER_FACTS,
     LOANS_FACTS,
@@ -164,7 +164,7 @@ def _live(loans_src_facts=LOANS_FACTS, loans_tgt_facts=None):
                         schema={"loans": loans_tgt_facts or TARGET_LOANS_FACTS,
                                 "borrowers": BORROWER_FACTS},
                         sequences={("loans", "loan_id"): 13})
-    return run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target)
+    return run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target, rerun_proof=PROVEN_RERUN)
 
 
 def test_tier0_fails_on_missing_trigger_and_grant():
@@ -244,7 +244,7 @@ def test_tier0_unreadable_catalog_blocks_merge():
     loans, borrowers = _rows(12)
     source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers})
     target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers})
-    result = run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target)
+    result = run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target, rerun_proof=PROVEN_RERUN)
     t0 = result["tiers"][0]
     assert t0["name"] == "structural_parity" and t0["passed"] is True
     assert t0["stats"]["structural_checks"] == {c: "unsupported" for c in CATEGORIES}
@@ -289,7 +289,7 @@ def test_tier0_identity_read_error_is_unverified_and_blocks_merge():
                         sequences={("dbo.loans", "loan_id"): 13})
     target = _IdErrorTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
                             schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS})
-    result = run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target)
+    result = run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target, rerun_proof=PROVEN_RERUN)
     t0 = result["tiers"][0]
     assert any("SHOW CREATE TABLE read failed" in n for n in t0["stats"]["unverified"])
     assert any("UNVERIFIED" in w for w in result["warnings"])
@@ -302,11 +302,11 @@ def test_build_result_structural_gap_from_checks_alone():
                    {"structural_checks": {"constraints": "checked", "triggers": "unsupported",
                                           "indexes": "checked", "sequences_identity": "checked",
                                           "grants": "direct_only"}})
-    r = build_result("u", "live", "m1", "t1", [t])
+    r = build_result("u", "live", "m1", "t1", [t], rerun_proof=PROVEN_RERUN)
     assert "structural_gap" in r["merge_block_reasons"] and r["merge_eligible"] is False
     t = TierResult(0, "structural_parity", True, 1, [],
                    {"structural_checks": {"indexes": "unsupported", "triggers": "checked"}})
-    r = build_result("u", "live", "m1", "t1", [t])
+    r = build_result("u", "live", "m1", "t1", [t], rerun_proof=PROVEN_RERUN)
     assert "structural_gap" not in r["merge_block_reasons"] and r["merge_eligible"] is True
 
 
@@ -632,10 +632,11 @@ def test_databricks_schema_facts_maps_information_schema():
 def test_build_result_merge_block_reasons():
     from recon.tiers import TierResult
     ok = TierResult(0, "structural_parity", True, 1, [], {})
-    assert build_result("u", "live", "m1", "t1", [ok])["merge_block_reasons"] == []
+    assert build_result("u", "live", "m1", "t1", [ok], rerun_proof=PROVEN_RERUN)["merge_block_reasons"] == []
     failed = TierResult(1, "row_counts", False, 1, [Finding("o", "row_count_diff", "d")], {})
-    assert build_result("u", "live", "m1", "t1", [ok, failed])["merge_block_reasons"] == ["tier_failed"]
-    assert build_result("u", "fixture", "m1", "t1", [ok])["merge_block_reasons"] == ["mode"]
+    assert build_result("u", "live", "m1", "t1", [ok, failed],
+                        rerun_proof=PROVEN_RERUN)["merge_block_reasons"] == ["tier_failed"]
+    assert build_result("u", "fixture", "m1", "t1", [ok], rerun_proof=PROVEN_RERUN)["merge_block_reasons"] == ["mode"]
     gap = TierResult(0, "structural_parity", False, 1, [Finding("o", "trigger_missing", "d")], {})
     r = build_result("u", "live", "m1", "t1", [gap])
     assert r["merge_block_reasons"][0] == "structural_gap" and "tier_failed" in r["merge_block_reasons"]

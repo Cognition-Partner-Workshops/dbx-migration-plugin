@@ -21,8 +21,14 @@ from typing import Any, Protocol, runtime_checkable
 
 from .fingerprint import DIGEST_MODULUS
 from .fingerprint import normalise as _digest_value
+from .rerun import normalize_type
 from .watermarks import instant
 from .watermarks import literal as watermark_literal
+
+# the object kinds a CREATE TABLE leaves behind; views, materialized views, streaming tables and
+# foreign tables with the same columns are not the table the rerun proof grades
+_UC_PHYSICAL = "t.table_type IN ('MANAGED', 'EXTERNAL', 'MANAGED_SHALLOW_CLONE', 'EXTERNAL_SHALLOW_CLONE')"
+_PG_PHYSICAL = "c.relkind IN ('r', 'p')"
 
 
 @dataclass(frozen=True)
@@ -1389,6 +1395,31 @@ class DatabricksTargetAdapter:
             lambda sql, params: self._sql._rows(sql, params),
             self._catalog, self._schema, object, column)
 
+    def column_shape(self, object: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order for the rerun proof (recon.rerun); a view with the
+        same columns is not the table."""
+        cat = quote_ident(self._catalog, '`')
+        rows = self._sql._rows(
+            f"SELECT c.column_name, c.full_data_type, c.is_nullable, c.ordinal_position "
+            f"FROM {cat}.information_schema.columns c "
+            f"JOIN {cat}.information_schema.tables t "
+            "ON t.table_catalog = c.table_catalog AND t.table_schema = c.table_schema "
+            "AND t.table_name = c.table_name "
+            "WHERE c.table_catalog = %(catalog)s AND c.table_schema = %(schema)s AND c.table_name = %(table)s "
+            f"AND {_UC_PHYSICAL} ORDER BY ordinal_position",
+            {"catalog": self._catalog, "schema": self._schema, "table": object})
+        return [{"name": str(name).lower(), "type": normalize_type(dtype),
+                 "nullable": str(nullable).upper() != "NO"} for name, dtype, nullable, _ in rows]
+
+    def table_exists(self, object: str) -> bool:
+        """Catalog check that tells an absent table from one with no columns."""
+        rows = self._sql._rows(
+            f"SELECT t.table_name FROM {quote_ident(self._catalog, '`')}.information_schema.tables t "
+            "WHERE t.table_catalog = %(catalog)s AND t.table_schema = %(schema)s AND t.table_name = %(table)s "
+            f"AND {_UC_PHYSICAL}",
+            {"catalog": self._catalog, "schema": self._schema, "table": object})
+        return bool(rows)
+
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
         return self._sql.table_aggregates(self._q(object), columns, numeric, where)
@@ -1783,6 +1814,25 @@ class LakebaseTargetAdapter(_PostgresBase):
 
     def identity_state(self, object: str, column: str) -> IdentityState | None:
         return super().identity_state(self._q(object), column)
+
+    def column_shape(self, object: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order for the rerun proof (recon.rerun). attname is the
+        effective name: quoted identifiers keep their case, so it is kept as reported."""
+        rows = self._rows(
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attnum "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            f"WHERE n.nspname = %s AND c.relname = %s AND {_PG_PHYSICAL} "
+            "AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum", (self._schema, object))
+        return [{"name": str(name), "type": normalize_type(dtype), "nullable": not notnull}
+                for name, dtype, notnull, _ in rows]
+
+    def table_exists(self, object: str) -> bool:
+        """Catalog check that tells an absent table from one with no columns."""
+        rows = self._rows(
+            "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            f"WHERE n.nspname = %s AND c.relname = %s AND {_PG_PHYSICAL}", (self._schema, object))
+        return bool(rows)
 
     def null_key_count(self, object: str, key_fields: list[str], where: str | None = None) -> int:
         return super().null_key_count(self._q(object), key_fields, where)
