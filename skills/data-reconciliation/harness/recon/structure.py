@@ -40,6 +40,7 @@ _CHECK_CATEGORY = {
     "sequence_increment_mismatch": "sequences_identity",
     "identity_missing": "sequences_identity", "identity_extra": "sequences_identity",
     "trigger_missing": "triggers", "trigger_extra": "triggers",
+    "trigger_granularity_mismatch": "triggers",
     "grant_missing": "grants", "grant_extra": "grants",
 }
 
@@ -71,30 +72,38 @@ def structural_checks(pairs: list[tuple[SchemaFacts, SchemaFacts]]) -> dict[str,
             else "unsupported" for cat in CATEGORIES}
 
 
-def _trigger_cover(facts: SchemaFacts) -> dict[str, set[str]]:
-    cov: dict[str, set[str]] = {}
-    for _, (timing, events) in facts.triggers.items():
-        cov.setdefault(timing, set()).update(events)
+def _trigger_cover(facts: SchemaFacts) -> dict[tuple[str, str], str]:
+    cov = {}
+    for timing, events, gran in facts.triggers.values():
+        for ev in events:
+            cov.setdefault((timing, ev), gran)
     return cov
 
 
 def compare_triggers(obj: str, s: SchemaFacts, t: SchemaFacts) -> tuple[list[Finding], list[Finding]]:
-    """(findings, tightened): trigger names are ignored (conversion renames them) — coverage is
-    by (timing, event) pairs. A source pair the target lacks is trigger_missing; a target pair
-    with no source counterpart is a tightened trigger_extra."""
+    """(findings, extra): trigger names are ignored (conversion renames them) — coverage is by
+    (timing, event) pairs at matching granularity. A source pair the target lacks is
+    trigger_missing; the same pair firing per-statement where the source fires per-row is
+    trigger_granularity_mismatch; a target pair with no source counterpart is trigger_extra."""
     s_cov, t_cov = _trigger_cover(s), _trigger_cover(t)
-    findings, tight = [], []
-    for name, (timing, events) in sorted(s.triggers.items()):
-        for ev in sorted(set(events) - t_cov.get(timing, set())):
-            findings.append(Finding(obj, "trigger_missing",
-                                    f"source trigger {name} ({timing} {','.join(sorted(events))}) "
-                                    f"has no target trigger for {timing} {ev}"))
-    for name, (timing, events) in sorted(t.triggers.items()):
-        for ev in sorted(set(events) - s_cov.get(timing, set())):
-            tight.append(Finding(obj, "trigger_extra",
+    findings, extra = [], []
+    for name, (timing, events, gran) in sorted(s.triggers.items()):
+        for ev in sorted(events):
+            if (timing, ev) not in t_cov:
+                findings.append(Finding(obj, "trigger_missing",
+                                        f"source trigger {name} ({timing} "
+                                        f"{','.join(sorted(events))}) has no target trigger for "
+                                        f"{timing} {ev}"))
+            elif t_cov[(timing, ev)] != gran:
+                findings.append(Finding(obj, "trigger_granularity_mismatch",
+                                        f"source trigger {name} fires {timing} {ev} per {gran}, "
+                                        f"target fires it per {t_cov[(timing, ev)]}"))
+    for name, (timing, events, _g) in sorted(t.triggers.items()):
+        for ev in sorted(e for e in events if (timing, e) not in s_cov):
+            extra.append(Finding(obj, "trigger_extra",
                                  f"target trigger {name} fires on {timing} {ev} the source has no "
                                  "trigger for: writes the legacy app makes today behave differently"))
-    return findings, tight
+    return findings, extra
 
 
 _PRIVILEGE_CAPABILITIES = {"modify": ("insert", "update", "delete")}
@@ -220,7 +229,8 @@ def load_dictionary(path: Path) -> FixtureDictionary:
                 check_count=len(checks) if checks else int(t.get("check_count") or 0),
                 checks=checks,
                 identity_columns=set(t.get("identity_columns") or []),
-                triggers={n: (str(v["timing"]), tuple(sorted(v["events"])))
+                triggers={n: (str(v["timing"]), tuple(sorted(v["events"])),
+                              str(v.get("granularity") or "row"))
                           for n, v in (t.get("triggers") or {}).items()},
                 grants={str(g).lower(): frozenset(str(p).lower() for p in ps)
                         for g, ps in (t.get("grants") or {}).items()},

@@ -46,7 +46,7 @@ def test_schema_parity_findings_map_through_the_spec():
 
 def test_schema_parity_also_carries_trigger_and_grant_findings():
     loans, borrowers = _rows(6)
-    src_facts = _facts(LOANS_FACTS, triggers={"trg": ("after", ("insert", "update"))},
+    src_facts = _facts(LOANS_FACTS, triggers={"trg": ("after", ("insert", "update"), "row")},
                        grants={"app_rw": frozenset({"select", "insert"})})
     source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
                         schema={"dbo.loans": src_facts, "dbo.borrowers": BORROWER_FACTS},

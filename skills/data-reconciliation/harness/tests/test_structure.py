@@ -45,7 +45,8 @@ def test_load_dictionary_reads_each_family_fixture(family):
     loans = next(f for f in d.tables.values() if f.primary_key or f.primary_key_informational)
     assert loans.identity_columns
     if family != "databricks":
-        assert ("after", ("insert", "update")) in loans.triggers.values()
+        assert ("after", ("insert", "update"),
+                "statement" if family == "sqlserver" else "row") in loans.triggers.values()
 
 
 def test_load_dictionary_refuses_a_bad_foreign_key_shape(tmp_path):
@@ -81,17 +82,17 @@ def test_structural_checks_mark_a_reader_hole():
 
 
 def test_compare_triggers_by_timing_and_event():
-    s = SchemaFacts(triggers={"trg_a": ("after", ("insert", "update"))})
-    t = SchemaFacts(triggers={"renamed": ("after", ("insert",))})
+    s = SchemaFacts(triggers={"trg_a": ("after", ("insert", "update"), "row")})
+    t = SchemaFacts(triggers={"renamed": ("after", ("insert",), "row")})
     findings, tightened = compare_triggers("o", s, t)
     assert len(findings) == 1 and findings[0].check == "trigger_missing"
     assert "update" in findings[0].detail
     # renamed but equal -> nothing
     findings, tightened = compare_triggers("o", s, SchemaFacts(
-        triggers={"x": ("after", ("insert", "update"))}))
+        triggers={"x": ("after", ("insert", "update"), "row")}))
     assert findings == [] and tightened == []
     _, tightened = compare_triggers("o", SchemaFacts(), SchemaFacts(
-        triggers={"t2": ("before", ("delete",))}))
+        triggers={"t2": ("before", ("delete",), "row")}))
     assert [f.check for f in tightened] == ["trigger_extra"]
 
 
@@ -168,7 +169,7 @@ def _live(loans_src_facts=LOANS_FACTS, loans_tgt_facts=None):
 
 def test_tier0_fails_on_missing_trigger_and_grant():
     src_facts = _facts(LOANS_FACTS,
-                       triggers={"trg_loans_audit": ("after", ("insert", "update"))},
+                       triggers={"trg_loans_audit": ("after", ("insert", "update"), "row")},
                        grants={"app_rw": frozenset({"select", "insert"})})
     result = _live(loans_src_facts=src_facts)
     t0 = result["tiers"][0]
@@ -191,7 +192,7 @@ def test_tier0_passes_and_tiers_shift_when_structure_matches():
 
 
 def test_tier0_records_target_unsupported_categories_as_unchecked():
-    src_facts = _facts(LOANS_FACTS, triggers={"trg": ("after", ("insert",))})
+    src_facts = _facts(LOANS_FACTS, triggers={"trg": ("after", ("insert",), "row")})
     tgt_facts = _facts(TARGET_LOANS_FACTS, unsupported=frozenset({"triggers"}))
     result = _live(loans_src_facts=src_facts, loans_tgt_facts=tgt_facts)
     t0 = result["tiers"][0]
@@ -314,6 +315,39 @@ def test_tier0_informational_source_keys_must_exist_on_the_target():
         f["check"] for f in _live(loans_src_facts=src, loans_tgt_facts=enforced_tgt)["tiers"][0]["findings"])
 
 
+def test_compare_triggers_flags_a_granularity_mismatch():
+    s = SchemaFacts(triggers={"trg": ("after", ("insert",), "row")})
+    t = SchemaFacts(triggers={"x": ("after", ("insert",), "statement")})
+    findings, tight = compare_triggers("o", s, t)
+    assert [f.check for f in findings] == ["trigger_granularity_mismatch"] and tight == []
+
+
+def test_tier0_target_only_trigger_fails_despite_accept_target_only_constraints():
+    loans, borrowers = _rows(12)
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 13})
+    tgt_facts = _facts(TARGET_LOANS_FACTS, triggers={"x": ("after", ("insert",), "row")})
+    target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                        schema={"loans": tgt_facts, "borrowers": BORROWER_FACTS},
+                        sequences={("loans", "loan_id"): 13})
+    result = run_recon("u1", "live", _spec(),
+                       Tolerances("t1", accept_target_only_constraints=True), [], source, target)
+    t0 = result["tiers"][0]
+    assert "trigger_extra" in {f["check"] for f in t0["findings"]} and t0["passed"] is False
+    assert not t0["stats"].get("accepted_target_only_constraints")
+
+
+def test_tier0_target_unsupported_category_warns_even_when_source_is_empty():
+    tgt = _facts(TARGET_LOANS_FACTS, unsupported=frozenset({"triggers"}), triggers={})
+    result = _live(loans_tgt_facts=tgt)  # source has no triggers either
+    t0 = result["tiers"][0]
+    assert t0["passed"] is True
+    assert any("target dictionary cannot expose triggers" in n
+               for n in t0["stats"]["unverified"])
+    assert result["merge_eligible"] is False
+
+
 def test_tier0_informational_target_pk_still_counts_for_a_blind_source():
     src = _facts(LOANS_FACTS, unsupported=frozenset({"constraints"}),
                  primary_key=(), unique=frozenset(), foreign_keys=set(),
@@ -343,7 +377,7 @@ def test_tier0_informational_target_pk_is_a_finding_not_a_pass():
 
 def test_tier0_source_unsupported_category_with_target_content_warns():
     src_facts = _facts(LOANS_FACTS, unsupported=frozenset({"triggers"}), triggers={})
-    tgt_facts = _facts(TARGET_LOANS_FACTS, triggers={"trg": ("after", ("insert",))})
+    tgt_facts = _facts(TARGET_LOANS_FACTS, triggers={"trg": ("after", ("insert",), "row")})
     result = _live(loans_src_facts=src_facts, loans_tgt_facts=tgt_facts)
     t0 = result["tiers"][0]
     assert result["verdict"] == "PASS" and t0["passed"] is True
@@ -419,8 +453,8 @@ def test_sqlserver_schema_facts_reads_triggers_and_grants():
     a._conn = Conn()
     a.statements = a.rows_fetched = 0
     facts = a.schema_facts("dbo.loans")
-    assert facts.triggers == {"trg_a": ("after", ("insert", "update")),
-                              "trg_i": ("instead of", ("delete",))}
+    assert facts.triggers == {"trg_a": ("after", ("insert", "update"), "statement"),
+                              "trg_i": ("instead of", ("delete",), "statement")}
     assert facts.grants == {"app_rw": frozenset({"select", "insert"})}
     sql = " ".join(s.lower() for s, _ in a._conn.executed)
     for view in ("sys.triggers", "sys.trigger_events", "sys.database_permissions",
@@ -440,7 +474,7 @@ def test_postgres_schema_facts_reads_triggers_and_grants():
                     outer.executed.append((sql, params))
                     sql_l = sql.lower()
                     if "pg_trigger" in sql_l:
-                        outer.rows = [("trg_a", 2 + 4 + 16), ("trg_i", 64 + 8)]  # before insert,update / instead of delete
+                        outer.rows = [("trg_a", 1 + 2 + 4 + 16), ("trg_i", 64 + 8)]  # row before insert,update / instead of delete (statement)
                     elif "table_privileges" in sql_l:
                         outer.rows = [("app_rw", "SELECT"), ("reporting_ro", "SELECT")]
                     elif "pg_attribute" in sql_l and "attidentity" in sql_l:
@@ -458,8 +492,8 @@ def test_postgres_schema_facts_reads_triggers_and_grants():
     a._conn = Conn()
     a.statements = a.rows_fetched = 0
     facts = a.schema_facts("public.loans")
-    assert facts.triggers["trg_a"] == ("before", ("insert", "update"))
-    assert facts.triggers["trg_i"] == ("instead of", ("delete",))
+    assert facts.triggers["trg_a"] == ("before", ("insert", "update"), "row")
+    assert facts.triggers["trg_i"] == ("instead of", ("delete",), "statement")
     assert facts.grants == {"app_rw": frozenset({"select"}), "reporting_ro": frozenset({"select"})}
 
 

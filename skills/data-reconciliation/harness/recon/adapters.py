@@ -90,8 +90,9 @@ class SchemaFacts:
     expression_unique: set[str] = field(default_factory=set)
     expression_indexes: set[str] = field(default_factory=set)
     # name -> (timing, events): timing in {"before", "after", "instead of"}, events a sorted
-    # subset of {"insert", "update", "delete", "truncate"}; disabled triggers are left out
-    triggers: dict[str, tuple[str, tuple[str, ...]]] = field(default_factory=dict)
+    # subset of {"insert", "update", "delete", "truncate"}; granularity is "row"|"statement";
+    # disabled triggers are left out
+    triggers: dict[str, tuple[str, tuple[str, ...], str]] = field(default_factory=dict)
     # grantee (lower) -> privileges (lower: select/insert/update/delete/...); the table owner's
     # implicit rights are left out
     grants: dict[str, frozenset[str]] = field(default_factory=dict)
@@ -819,9 +820,10 @@ def quote_ident(name: str, quote: str) -> str:
 _PG_TRIGGER_EVENTS = ((4, "insert"), (8, "delete"), (16, "update"), (32, "truncate"))
 
 
-def _pg_trigger_shape(tgtype: int) -> tuple[str, tuple[str, ...]]:
+def _pg_trigger_shape(tgtype: int) -> tuple[str, tuple[str, ...], str]:
     timing = "instead of" if tgtype & 64 else "before" if tgtype & 2 else "after"
-    return timing, tuple(ev for bit, ev in _PG_TRIGGER_EVENTS if tgtype & bit)
+    return (timing, tuple(ev for bit, ev in _PG_TRIGGER_EVENTS if tgtype & bit),
+            "row" if tgtype & 1 else "statement")
 
 
 def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> SchemaFacts:
@@ -1088,7 +1090,7 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             if type_desc:
                 events.append(str(type_desc).lower())
         for tname, (timing, events) in by_trigger.items():
-            facts.triggers[tname] = (timing, tuple(sorted(set(events))))
+            facts.triggers[tname] = (timing, tuple(sorted(set(events))), "statement")
         rows = self._dict_rows(
             table, "sys.database_permissions",
             "SELECT dp.name, p.permission_name "

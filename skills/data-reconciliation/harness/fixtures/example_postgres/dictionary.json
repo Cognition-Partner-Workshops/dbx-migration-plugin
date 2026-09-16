@@ -1,24 +1,91 @@
-{"family": "postgres",
- "note": "Example Postgres catalog shape for --source-dictionary: the facts pg_constraint/pg_index/pg_trigger/information_schema would return for a loans table.",
- "unsupported": [],
- "tables": {
-  "public.loans": {
-   "primary_key": ["loan_id"],
-   "unique": [["loan_number"]],
-   "unique_nulls_equal": [],
-   "foreign_keys": [{"columns": ["borrower_id"], "references": "public.borrowers",
-                     "referenced_columns": ["borrower_id"],
-                     "on_update": "no action", "on_delete": "cascade"}],
-   "not_null": ["loan_id", "loan_number", "borrower_id"],
-   "indexes": [["borrower_id"]],
-   "checks": ["CHECK ((current_balance >= (0)::numeric))"],
-   "identity_columns": ["loan_id"],
-   "identity_state": {"loan_id": {"next": 1001, "increment": 1}},
-   "triggers": {"trg_loans_audit": {"timing": "after", "events": ["insert", "update"]}},
-   "grants": {"app_rw": ["select", "insert", "update", "delete"], "reporting_ro": ["select"]}},
-  "public.borrowers": {
-   "primary_key": ["borrower_id"],
-   "not_null": ["borrower_id"],
-   "identity_columns": ["borrower_id"],
-   "identity_state": {"borrower_id": {"next": 500, "increment": 1}}}}}
-
+{
+  "family": "postgres",
+  "note": "Example Postgres catalog shape for --source-dictionary: the facts pg_constraint/pg_index/pg_trigger/information_schema would return for a loans table.",
+  "unsupported": [],
+  "tables": {
+    "public.loans": {
+      "primary_key": [
+        "loan_id"
+      ],
+      "unique": [
+        [
+          "loan_number"
+        ]
+      ],
+      "unique_nulls_equal": [],
+      "foreign_keys": [
+        {
+          "columns": [
+            "borrower_id"
+          ],
+          "references": "public.borrowers",
+          "referenced_columns": [
+            "borrower_id"
+          ],
+          "on_update": "no action",
+          "on_delete": "cascade"
+        }
+      ],
+      "not_null": [
+        "loan_id",
+        "loan_number",
+        "borrower_id"
+      ],
+      "indexes": [
+        [
+          "borrower_id"
+        ]
+      ],
+      "checks": [
+        "CHECK ((current_balance >= (0)::numeric))"
+      ],
+      "identity_columns": [
+        "loan_id"
+      ],
+      "identity_state": {
+        "loan_id": {
+          "next": 1001,
+          "increment": 1
+        }
+      },
+      "triggers": {
+        "trg_loans_audit": {
+          "timing": "after",
+          "events": [
+            "insert",
+            "update"
+          ],
+          "granularity": "row"
+        }
+      },
+      "grants": {
+        "app_rw": [
+          "select",
+          "insert",
+          "update",
+          "delete"
+        ],
+        "reporting_ro": [
+          "select"
+        ]
+      }
+    },
+    "public.borrowers": {
+      "primary_key": [
+        "borrower_id"
+      ],
+      "not_null": [
+        "borrower_id"
+      ],
+      "identity_columns": [
+        "borrower_id"
+      ],
+      "identity_state": {
+        "borrower_id": {
+          "next": 500,
+          "increment": 1
+        }
+      }
+    }
+  }
+}

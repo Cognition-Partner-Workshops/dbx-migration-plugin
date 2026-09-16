@@ -1,24 +1,95 @@
-{"family": "sqlserver",
- "note": "Example SQL Server catalog shape for --source-dictionary: the facts sys.indexes/sys.triggers/sys.database_permissions would return for a loans table.",
- "unsupported": [],
- "tables": {
-  "dbo.loans": {
-   "primary_key": ["loan_id"],
-   "unique": [["loan_number"]],
-   "unique_nulls_equal": [["loan_number"]],
-   "foreign_keys": [{"columns": ["borrower_id"], "references": "dbo.borrowers",
-                     "referenced_columns": ["borrower_id"],
-                     "on_update": "no action", "on_delete": "cascade"}],
-   "not_null": ["loan_id", "loan_number", "borrower_id"],
-   "indexes": [["borrower_id"]],
-   "checks": ["([current_balance]>=(0))"],
-   "identity_columns": ["loan_id"],
-   "identity_state": {"loan_id": {"next": 1001, "increment": 1}},
-   "triggers": {"trg_loans_audit": {"timing": "after", "events": ["insert", "update"]}},
-   "grants": {"app_rw": ["select", "insert", "update", "delete"], "reporting_ro": ["select"]}},
-  "dbo.borrowers": {
-   "primary_key": ["borrower_id"],
-   "not_null": ["borrower_id"],
-   "identity_columns": ["borrower_id"],
-   "identity_state": {"borrower_id": {"next": 500, "increment": 1}}}}}
-
+{
+  "family": "sqlserver",
+  "note": "Example SQL Server catalog shape for --source-dictionary: the facts sys.indexes/sys.triggers/sys.database_permissions would return for a loans table.",
+  "unsupported": [],
+  "tables": {
+    "dbo.loans": {
+      "primary_key": [
+        "loan_id"
+      ],
+      "unique": [
+        [
+          "loan_number"
+        ]
+      ],
+      "unique_nulls_equal": [
+        [
+          "loan_number"
+        ]
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "borrower_id"
+          ],
+          "references": "dbo.borrowers",
+          "referenced_columns": [
+            "borrower_id"
+          ],
+          "on_update": "no action",
+          "on_delete": "cascade"
+        }
+      ],
+      "not_null": [
+        "loan_id",
+        "loan_number",
+        "borrower_id"
+      ],
+      "indexes": [
+        [
+          "borrower_id"
+        ]
+      ],
+      "checks": [
+        "([current_balance]>=(0))"
+      ],
+      "identity_columns": [
+        "loan_id"
+      ],
+      "identity_state": {
+        "loan_id": {
+          "next": 1001,
+          "increment": 1
+        }
+      },
+      "triggers": {
+        "trg_loans_audit": {
+          "timing": "after",
+          "events": [
+            "insert",
+            "update"
+          ],
+          "granularity": "statement"
+        }
+      },
+      "grants": {
+        "app_rw": [
+          "select",
+          "insert",
+          "update",
+          "delete"
+        ],
+        "reporting_ro": [
+          "select"
+        ]
+      }
+    },
+    "dbo.borrowers": {
+      "primary_key": [
+        "borrower_id"
+      ],
+      "not_null": [
+        "borrower_id"
+      ],
+      "identity_columns": [
+        "borrower_id"
+      ],
+      "identity_state": {
+        "borrower_id": {
+          "next": 500,
+          "increment": 1
+        }
+      }
+    }
+  }
+}

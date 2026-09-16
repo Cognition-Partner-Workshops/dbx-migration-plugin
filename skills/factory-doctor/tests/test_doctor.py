@@ -1446,6 +1446,14 @@ def test_dictionary_readable_fails_when_sqlserver_hides_triggers(monkeypatch):
     assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 0}
 
 
+def test_dictionary_readable_fails_when_a_constraint_view_is_unreadable(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"pg_index"})
+    c = doctor.check_dictionary_readable(TABLES, "postgres", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn)
+    assert c.status == "fail" and "pg_index" in c.detail and "DSN" not in c.detail
+
+
 def test_dictionary_readable_warns_on_a_postgres_census_lag(monkeypatch):
     monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
     conn = FakeDictConn(census={"public.loans": (1, 0)})

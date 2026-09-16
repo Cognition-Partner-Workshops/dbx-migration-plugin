@@ -1243,6 +1243,15 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
 _DICTIONARY_QUERIES = {
     "sqlserver": {
         "views": [
+            ("sys.indexes", "SELECT TOP 1 1 FROM sys.indexes"),
+            ("sys.index_columns", "SELECT TOP 1 1 FROM sys.index_columns"),
+            ("sys.columns", "SELECT TOP 1 1 FROM sys.columns"),
+            ("sys.objects", "SELECT TOP 1 1 FROM sys.objects"),
+            ("sys.schemas", "SELECT TOP 1 1 FROM sys.schemas"),
+            ("sys.foreign_keys", "SELECT TOP 1 1 FROM sys.foreign_keys"),
+            ("sys.foreign_key_columns", "SELECT TOP 1 1 FROM sys.foreign_key_columns"),
+            ("sys.check_constraints", "SELECT TOP 1 1 FROM sys.check_constraints"),
+            ("sys.identity_columns", "SELECT TOP 1 1 FROM sys.identity_columns"),
             ("sys.triggers", "SELECT TOP 1 1 FROM sys.triggers"),
             ("sys.trigger_events", "SELECT TOP 1 1 FROM sys.trigger_events"),
             ("sys.database_permissions", "SELECT TOP 1 1 FROM sys.database_permissions"),
@@ -1256,6 +1265,14 @@ _DICTIONARY_QUERIES = {
     },
     "postgres": {
         "views": [
+            ("pg_constraint", "SELECT 1 FROM pg_constraint LIMIT 1"),
+            ("pg_index", "SELECT 1 FROM pg_index LIMIT 1"),
+            ("pg_class", "SELECT 1 FROM pg_class LIMIT 1"),
+            ("pg_namespace", "SELECT 1 FROM pg_namespace LIMIT 1"),
+            ("pg_attribute", "SELECT 1 FROM pg_attribute LIMIT 1"),
+            ("pg_sequence", "SELECT 1 FROM pg_sequence LIMIT 1"),
+            ("pg_get_serial_sequence", "SELECT pg_get_serial_sequence('pg_class', 'oid')"),
+            ("server_version_num", "SELECT current_setting('server_version_num')"),
             ("pg_trigger", "SELECT 1 FROM pg_trigger LIMIT 1"),
             ("information_schema.table_privileges",
              "SELECT 1 FROM information_schema.table_privileges LIMIT 1"),

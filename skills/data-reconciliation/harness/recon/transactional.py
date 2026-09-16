@@ -892,7 +892,7 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         partial={tuple(x.lower() for x in p) for p in f.partial},
         expression_unique={normalize_sql_text(x) for x in f.expression_unique},
         expression_indexes={normalize_sql_text(x) for x in f.expression_indexes},
-        triggers={n: (t, tuple(e)) for n, (t, e) in f.triggers.items()},
+        triggers={n: (t, tuple(e), g) for n, (t, e, g) in f.triggers.items()},
         grants={g.lower(): frozenset(p.lower() for p in ps) for g, ps in f.grants.items()},
         unsupported=f.unsupported)
 
@@ -1680,30 +1680,26 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                                                 step + "target-generated keys follow a different "
                                                 "sequence", s_state.increment, t_state.increment))
         if "triggers" not in uns:
-            tr_findings, tr_tight = compare_triggers(c.object, s, t_lower)
-            findings += tr_findings
-            for f_ in tr_tight:
-                tightened(f_)
+            tr_findings, tr_extra = compare_triggers(c.object, s, t_lower)
+            findings += tr_findings + tr_extra
         if "grants" not in uns:
             findings += compare_grants(c.object, s, t_lower, spec.principal_map)
         if "sequences_identity" not in uns:
-            id_findings, id_tight = compare_identity_columns(c.object, s, t_lower, colmap)
-            findings += id_findings
-            for f_ in id_tight:
-                tightened(f_)
+            id_findings, id_extra = compare_identity_columns(c.object, s, t_lower, colmap)
+            findings += id_findings + id_extra
         # a category the target reader marks unsupported is a hole in the evidence, not a pass;
         # indexes are the exception (an access path, not acceptance), recorded without a warning
         for cat in CATEGORIES:
             n = _category_content(s_raw, cat)
-            if n and cat in (t_raw.unsupported | obj_uns.get(c.object, set())):
+            if cat in (t_raw.unsupported | obj_uns.get(c.object, set())):
                 if cat == "indexes":
-                    stats.setdefault("index_unsupported", []).append(
-                        f"{c.object}: {n} source indexes cannot be checked: the target catalog "
-                        "has no indexes dictionary")
+                    if n:
+                        stats.setdefault("index_unsupported", []).append(
+                            f"{c.object}: {n} source indexes cannot be checked: the target catalog "
+                            "has no indexes dictionary")
                 else:
                     stats.setdefault("unverified", []).append(
-                        f"{c.object}: {n} source {cat} cannot be checked: the target catalog "
-                        f"has no {cat} dictionary")
+                        f"{c.object}: target dictionary cannot expose {cat}: source has {n}")
             m = _category_content(t_raw, cat)
             if cat in (s_raw.unsupported | obj_uns.get(c.object, set())):
                 if cat == "indexes":
@@ -1759,6 +1755,6 @@ def _facts_dict(f: SchemaFacts) -> dict:
             "partial": sorted(map(list, f.partial)),
             "expression_unique": sorted(f.expression_unique),
             "expression_indexes": sorted(f.expression_indexes),
-            "triggers": {n: [tm, list(ev)] for n, (tm, ev) in f.triggers.items()},
+            "triggers": {n: [tm, list(ev), g] for n, (tm, ev, g) in f.triggers.items()},
             "grants": {g: sorted(p) for g, p in f.grants.items()},
             "unsupported": sorted(f.unsupported)}
