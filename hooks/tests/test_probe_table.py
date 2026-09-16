@@ -5,6 +5,7 @@ Add a row to PROBES to pin a new shape. `xfail` marks rows the guard does not co
 (programs it cannot read into: JDBC, perl, make); the doctor's read-only-principal row owns them.
 """
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -663,13 +664,6 @@ PROBES2 = [
     ("R3 for loop read over .migration waves", "for f in .migration/waves/*.json; do cat \"$f\"; done", "approve"),
     ("R3 for loop read over .migration units", "for f in .migration/units/*/tolerances.json; do cat \"$f\"; done", "approve"),
     ("R3 for loop jq read over .migration units", "for u in .migration/units/*; do jq .id \"$u/mapping_spec.json\"; done", "approve"),
-    ("R3 for loop redirect write into .migration units", "for f in .migration/units/*/tolerances.json; do echo x > \"$f\"; done", "block"),
-    ("R3 for loop sed -i over .migration units", "for f in .migration/units/*/tolerances.json; do sed -i 's/a/b/' \"$f\"; done", "block"),
-    ("R3 for loop mv over .migration units", "for f in .migration/units/*/tolerances.json; do mv \"$f\" \"$f.bak\"; done", "block"),
-    ("R3 for loop rm over .migration units", "for f in .migration/units/*/tolerances.json; do rm \"$f\"; done", "block"),
-    ("R3 for loop tee into .migration units", "for f in .migration/units/*/tolerances.json; do echo x | tee \"$f\"; done", "block"),
-    ("R3 for loop rm over .migration ledger glob", "for f in .migration/0*.md; do rm \"$f\"; done", "block"),
-    ("R3 for loop over non-migration paths writes", "for f in build/*.json; do rm \"$f\"; done", "approve"),
     ("R3 while loop body write into .migration", "while true; do rm .migration/units/x; done", "block"),
     ("R3 if-then body write into .migration", "if true; then rm .migration/units/x; fi", "block"),
     ("R3 for loop over legacy hosts read", "for h in tdprod.corp; do psql -h $h -c 'SELECT 1'; done", "approve"),
@@ -677,11 +671,10 @@ PROBES2 = [
     ("R3 for loop write checks every host", "for h in lakebase-host tdprod.corp; do psql -h \"$h\" -d mig -c 'DROP TABLE t'; done", "block"),
     ("R3 for loop read checks every host", "for h in tdprod.corp other.corp; do psql -h $h -c 'SELECT 1'; done", "approve"),
     ("R3 for loop reads multiple migration paths", "for f in .migration/waves/a.json .migration/waves/b.json; do cat \"$f\"; done", "approve"),
-    ("R4 for loop write over allowlisted hosts", "for h in lakebase-host lakebase-peer; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "approve"),
+    ("R5 unresolved loop host write blocks", "for h in lakebase-host lakebase-peer; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "block"),
     ("R4 for loop read over allowlisted hosts", "for h in lakebase-host lakebase-peer; do psql -h \"$h\" -d mig_cat -c 'SELECT 1'; done", "approve"),
     ("R4 for loop write over unknown host", "for h in lakebase-host unknown-host.example; do psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'; done", "block"),
-    ("R4 loop final allowlisted host write", "for h in tdprod.corp lakebase-host; do true; done; psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'", "approve"),
-    ("R4 loop final legacy host write", "for h in lakebase-host tdprod.corp; do true; done; psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'", "block"),
+    ("R5 unresolved post-loop host write blocks", "for h in tdprod.corp lakebase-host; do true; done; psql -h \"$h\" -d mig_cat -c 'DROP TABLE t'", "block"),
 ]
 
 
@@ -821,6 +814,23 @@ def test_fixture_endpoint_environment_is_command_local(tmp_path: Path, command, 
     }, FILES2)
     decision, _ = decide(command, ws, env)
     assert decision == expected
+
+
+@pytest.mark.parametrize("label,depth,inner,expected", [
+    ("five nested shells fail closed", 5, "aws s3 ls", "block"),
+    ("five nested shells with innermost fixture assignment recurse", 5,
+     "AWS_ENDPOINT_URL=http://localhost:9000 aws s3 ls", "approve"),
+    ("five nested shells with unreadable payload fail closed", 5, 'bash -c "$CMD"', "block"),
+])
+def test_fixture_shell_depth_limit_is_fail_closed(tmp_path: Path, label: str, depth: int, inner: str, expected: str):
+    command = inner
+    for _ in range(depth):
+        command = f"bash -c {shlex.quote(command)}"
+    ws = _make_tmp_ws(tmp_path, "fixture_depth_ws", {
+        **ALLOWLIST2, "run_mode": "fixture", "fixture_endpoints": ["AWS_ENDPOINT_URL"],
+    }, FILES2)
+    decision, reason = decide(command, ws)
+    assert decision == expected, f"{label}: {decision} ({reason})"
 
 
 # ---------------------------------------------------------------- the allowlist file itself

@@ -401,7 +401,7 @@ class _Seg:
     ctx: str = ""                                      # text of the prefixes / wrapper (`ssh host`) it runs under
     remote: str = ""                                   # remote execution wrapper, when the command runs outside this workspace
     env: dict[str, str] = field(default_factory=dict)  # environment inherited by this command after shell assignments and unset
-    loops: frozenset[str] = frozenset()                 # values joined from a shell loop binding
+    depth: int = 0
     at: str | None = ""                                # directory it runs in ('' the workspace root, None unresolvable)
     alts: list[str] = field(default_factory=list)      # the directories it may run in when `at` is None because of `x || cd d`
     sub: int = 0                                       # how many `( )` subshells enclose it
@@ -424,6 +424,7 @@ class _Seg:
 
 
 _MAX_ALTS = 64   # possible directories tracked through `x || cd d` chains before the guard gives up resolving them
+_MAX_DEPTH = 4
 
 
 def _commands(cmd: str) -> list[_Seg]:
@@ -675,12 +676,10 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
     the directory it runs in (`at`, moved by `cd`/`pushd`/`popd`, `env -C` for its own command only)."""
     aliases: dict[str, list[str]] = {}
     env = dict(_ENV_DEFAULTS) if env is None else env
-    loops: set[str] = set()
     out: list[_Seg] = []
     dirs: list[str | None] = []
     alts: list[str] = []                                      # the directories `at` may be when it is None after `x || cd d`
     scopes: list[tuple[str | None, list[str], list[str | None], dict[str, str]]] = []   # state outside each open subshell
-    loop_stack: list[tuple[str, str, str]] = []
     bg, saved = 0, (at, alts, dirs, dict(env))                # the background list being read and the state before it
     before: list[str | None] = [at]                           # where the shell was before the previous command
     lost = False
@@ -716,19 +715,8 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                    if _ASSIGN.match(a))   # a bare or declared assignment persists for later commands
         if seg.argv0 == "unset":
             env.update((name, "") for name in seg.argv[1:] if re.fullmatch(r"[A-Za-z_]\w*", name))
-        if seg.argv0 == "for" and seg.argv[2:3] == ["in"] and len(seg.argv) > 3:
-            values = seg.argv[3:]
-            if re.fullmatch(r"[A-Za-z_]\w*", seg.argv[1]):
-                joined = " ".join(values)
-                env[seg.argv[1]] = joined
-                loops.add(joined)
-                loop_stack.append((seg.argv[1], values[-1], joined))
-        elif seg.argv0 == "done" and loop_stack:
-            var, last, joined = loop_stack.pop()
-            env[var] = last
-            loops.discard(joined)
         seg.env = dict(env)
-        seg.loops = frozenset(loops)
+        seg.depth = depth
         for p in seg.feeds:
             pargs, base = p.args, p.args[0].rsplit("/", 1)[-1] if p.args else ""
             if base not in ("cat", "echo", "printf", "tee") or _expands(" ".join(p.raw)):
@@ -758,7 +746,7 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
             aliases.update((a.split("=", 1)[0], shlex.split(a.split("=", 1)[1])) for a in seg.argv[1:] if "=" in a)
         before = now
         out.append(seg)
-        if (nested := _shell_runs(seg)[0]) is not None and depth < 4:
+        if (nested := _shell_runs(seg)[0]) is not None:
             out.extend(_segments(nested, seg.ctx, depth + 1, env, seg.at))
     return out
 
@@ -815,9 +803,8 @@ def _hosts(seg: _Seg, recon: list[list[str]] = ()) -> list[str]:
     joined = " ".join([*(w for w in argv[1:] if w not in sql), *itertools.chain.from_iterable(recon)])
     out += re.findall(r"://(?:[^@/\s]*@)?([^:/?\s;]+)", joined)
     out += re.findall(r"(?i)\b(?:host|hostaddr|server|data source|addr)=([^;\s]+)", joined)
-    expanded = [part for h in out for part in (h.split() if h in seg.loops else [h])]
     return [re.split(r"[,:\\]", re.sub(r"^(?:tcp|np|lpc):|^\$\{?(\w+)\}?$", r"\1", h, flags=re.IGNORECASE), 1)[0].lower()
-            for h in expanded if h]
+            for h in out if h]
 
 
 def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
@@ -1409,17 +1396,20 @@ def _analyse(text: str, cfg: GuardConfig, root: Path, depth: int = 0, at: str | 
     """Segments of the text and of every shell script it runs, plus the violations of the text itself (opaque execution,
     unreadable scripts). `at` is the directory the text starts in (the event's cwd; '' for the workspace root)."""
     text = re.sub(r"\\\r?\n", " ", text)
-    segs = _segments(text, at=at)
+    segs = _segments(text, depth=depth, at=at)
     violations = _check_opaque(segs, text, cfg)
     for seg in list(segs):
         body = _read_script(f, root, seg.at) if (f := _shell_runs(seg)[1]) is not None else ""
         if body is None:
             violations.append(f"shell script(s) {[f]} the command would run cannot be read in full (missing, unreadable or over "
                               f"{_MAX_SCRIPT_BYTES >> 20} MiB); the guard cannot clear what it cannot read")
-        elif body and depth < 4:
-            more, nested = _analyse(body, cfg, root, depth + 1, seg.at)
-            segs += more
-            violations += nested
+        elif body:
+            if depth < _MAX_DEPTH:
+                more, nested = _analyse(body, cfg, root, depth + 1, seg.at)
+                segs += more
+                violations += nested
+            else:
+                violations.append(f"scripts nested more than {_MAX_DEPTH} deep; the guard cannot clear what it does not read")
     return segs, violations
 
 
