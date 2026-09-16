@@ -1,3 +1,4 @@
+import fcntl
 import hashlib
 import json
 import subprocess
@@ -270,10 +271,8 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
     pr = _push_pr(ws)
     passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
     proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
-    assert proc.returncode == 0, proc.stderr
-    out = json.loads(proc.stdout)
-    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == []
-    assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
+    assert proc.returncode != 0 and "workflow.py reserve" in proc.stderr and "D-2" in proc.stderr  # no reservation
+    assert _workflow(cwd, "reserve").returncode == 0
     for reports in ([{"batch": "b-1", "pr_url": pr, "gates": []}],                                   # g-rows still pending
                     [],                                                                               # batch not gathered
                     [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": ""}]}],
@@ -289,7 +288,69 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
     assert "pull/7 is not a PR of github.com/acme/target whose head git can fetch" in json.dumps(json.loads(proc.stdout)["batches"]["b-1"]["unmet"])
     proc = run("not a list")
     assert proc.returncode != 0 and "{batch, pr_url, gates}" in proc.stderr
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    assert [json.loads(l)["mode"] for l in runs.read_text().splitlines()] == ["reserve"]  # unmet gates: the run stays open
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == []
+    assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
+    assert [(json.loads(l)["stop_c"], json.loads(l)["mode"]) for l in runs.read_text().splitlines()] == [("D-2", "reserve"), ("D-2", "gates")]
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    assert proc.returncode != 0 and "closed" in proc.stderr and "D-2" in proc.stderr and "STOP C" in proc.stderr
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def _workflow(cwd, *args, **kw):
+    return subprocess.run([sys.executable, str(WORKFLOW), *args], cwd=cwd, env={}, capture_output=True, text=True, **kw)
+
+
+def test_a_hand_run_wave_reserves_its_stop_c_row_before_launch_and_a_spent_row_reserves_nothing(tmp_path):
+    """`workflow.py reserve` is the hand-run path's launch record: it spends the manifest's STOP C row in the
+    run log as a workflow start does, so a second hand launch, or a workflow start over it, halts."""
+    ws, cwd = _workspace(tmp_path / "hand", doctor=False)
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"wave": 0, "stop_c": "D-2", "reserved": True}
+    assert [json.loads(l) for l in runs.read_text().splitlines()] == [{"stop_c": "D-2", "mode": "reserve", "run_id": None}]
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert len(runs.read_text().splitlines()) == 1
+
+    ws, cwd = _workspace(tmp_path / "then_workflow")
+    assert _workflow(cwd, "reserve").returncode == 0
+    proc, calls = _run(cwd, tmp_path / "then_workflow", [_pass_report()])
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "after_workflow", doctor=False)
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": None}) + "\n")
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    (tmp_path / "after_workflow" / "results.json").write_text("[]")
+    proc = _workflow(cwd, "gates", str(tmp_path / "after_workflow" / "results.json"))
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr and "Traceback" not in proc.stderr
+
+
+def test_the_stop_c_row_is_spent_under_the_run_log_lock_so_two_starts_cannot_both_take_it(tmp_path):
+    """The check that a row is unspent and the record that spends it happen under an exclusive lock on the
+    run log: a start that finds the log locked waits, then sees the other start's record and halts."""
+    ws, cwd = _workspace(tmp_path / "ws", doctor=False)
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    runs.touch()
+    with runs.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        waiting = subprocess.Popen([sys.executable, str(WORKFLOW), "reserve"], cwd=cwd, env={},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with pytest.raises(subprocess.TimeoutExpired):
+            waiting.wait(timeout=2)
+        held.write(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": None}) + "\n")
+        held.flush()
+        fcntl.flock(held, fcntl.LOCK_UN)
+    _, err = waiting.communicate(timeout=30)
+    assert waiting.returncode != 0 and "D-2" in err and "STOP C" in err
+    assert len(runs.read_text().splitlines()) == 1
 
 
 @pytest.mark.parametrize("changed", [{"gates": [{**GATE, "kind": "custom"}]}, {"units": ("other_unit",)}])

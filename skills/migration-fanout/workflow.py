@@ -80,14 +80,17 @@ is a file under .migration/recon/<unit>/ that its PR head carries (checked from 
 plan's passed is what STOP C expects, not proof, and a gate not reported is unmet; it cannot waive, rename
 or re-kind one. A PASS with any gate not passed (or waived by a ledger row) is recorded FAIL with
 failure_class gates, so the wave cannot close over it. A wave gathered by hand (the orchestrator's small-wave
-path) applies the same rule with `python3 workflow.py gates <results.json>`, where the file is the children's
-[{batch, pr_url, gates}] reports: it prints the overlaid gates and exits non-zero on any unmet one.
+path) spends the STOP C row with `python3 workflow.py reserve` before launching its children (the same run-log
+record a workflow start makes, so a second launch under the row halts), then applies the same rule with
+`python3 workflow.py gates <results.json>`, where the file is the children's [{batch, pr_url, gates}] reports:
+it prints the overlaid gates, exits non-zero on any unmet one, and records the close once every gate is met.
 
 Wave 0 uses the same workflow with `"wave": 0` and `"width": 1` for serial shared objects.
 """
 
 import asyncio
 import datetime
+import fcntl
 import hashlib
 import hmac
 import json
@@ -682,11 +685,11 @@ if not gates_approved(MANIFEST.get("stop_c"), MANIFEST.get("wave"), MANIFEST.get
                      "records it")
 
 
-def spent_stop_c():
-    """The STOP C rows this wave's runs have spent, from its append-only run log (one {stop_c, mode, run_id}
-    line per launch) and the last result. The result holds one run, so the log is what remembers a row two
-    reruns back; a log that cannot be read is not proof a row is unspent and halts."""
-    spent = []
+def run_log():
+    """This wave's append-only run log: one {stop_c, mode, run_id} record per launch (a workflow start or
+    rerun, a hand run's `reserve`) and per hand-run close (`gates`). A log that cannot be read is not proof
+    a row is unspent and halts."""
+    runs = []
     if RUNS_PATH.exists():
         try:
             for n, line in enumerate(RUNS_PATH.read_text().splitlines(), 1):
@@ -694,10 +697,17 @@ def spent_stop_c():
                 if run is not None and not (isinstance(run, dict) and isinstance(run.get("stop_c"), str)):
                     raise ValueError(f"line {n} is not a {{stop_c, ...}} record")
                 if run is not None:
-                    spent.append(run["stop_c"])
+                    runs.append(run)
         except (OSError, ValueError) as e:
             raise SystemExit(f"{RUNS_PATH} cannot say which STOP C rows this wave's runs spent ({e}); inspect or restore "
                              "it before running, no approval is reusable on its word") from None
+    return runs
+
+
+def spent_stop_c():
+    """The STOP C rows this wave's runs have spent, from its run log and the last result. The result holds
+    one run, so the log is what remembers a row two reruns back."""
+    spent = [run["stop_c"] for run in run_log()]
     if MODE == "rerun" and RESULT_PATH.exists():
         try:
             previous = json.loads(RESULT_PATH.read_text())
@@ -710,13 +720,60 @@ def spent_stop_c():
     return spent
 
 
-if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
-    raise SystemExit(f"{RUNS_PATH} or {RESULT_PATH} records a run this wave already made under STOP C row "
-                     f"{MANIFEST['stop_c']}; a rerun is a new run of the wave, so STOP C fires again: record its new row in "
-                     "the ledger and name it in the manifest's stop_c")
+def spent_halt():
+    return SystemExit(f"{RUNS_PATH} or {RESULT_PATH} records a run this wave already made under STOP C row "
+                      f"{MANIFEST['stop_c']}; a rerun is a new run of the wave, so STOP C fires again: record its new row in "
+                      "the ledger and name it in the manifest's stop_c")
+
+
+def record_run(mode, run_id=None, unspent=True):
+    """Appends {stop_c, mode, run_id} to the run log under its exclusive lock, and when `unspent`, only if no
+    record read under that same lock already spent the manifest's STOP C row: two starts that both saw the
+    row free cannot both take it, since the second reads the first's record once the lock is its."""
+    with RUNS_PATH.open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        if unspent and MANIFEST["stop_c"] in spent_stop_c():
+            raise spent_halt()
+        f.write(json.dumps({"stop_c": MANIFEST["stop_c"], "mode": mode, "run_id": run_id}, sort_keys=True) + "\n")
+        f.flush()
+
+
+def hand_run_state():
+    """What the run log says of a hand run under the manifest's STOP C row: 'open' after `reserve`, 'closed'
+    once `gates` closed it, 'workflow' when a workflow run spent the row, None when nothing did."""
+    state = None
+    for run in run_log():
+        if run["stop_c"] == MANIFEST["stop_c"]:
+            state = {"reserve": "open", "gates": "closed"}.get(run.get("mode"), "workflow")
+    return state
+
+
+if sys.argv[1:2] == ["reserve"]:
+    validate_manifest(MANIFEST)
+    record_run("reserve")
+    print(json.dumps({"wave": MANIFEST["wave"], "stop_c": MANIFEST["stop_c"], "reserved": True}))
+    sys.exit(0)
 if sys.argv[1:2] == ["gates"]:
     validate_manifest(MANIFEST)
-    sys.exit(gates_command(*sys.argv[2:3]) if len(sys.argv) == 3 else "usage: workflow.py gates <results.json>")
+    state = hand_run_state()
+    if state == "closed":
+        raise SystemExit(f"{RUNS_PATH} records that the hand run under STOP C row {MANIFEST['stop_c']} closed already; a new "
+                         "launch is a new run of the wave, so STOP C fires again: record its new row and name it in the "
+                         "manifest's stop_c, then `workflow.py reserve` before launching")
+    if state == "workflow":
+        raise spent_halt()
+    if state is None:
+        raise SystemExit(f"{RUNS_PATH} holds no reservation of STOP C row {MANIFEST['stop_c']}: run `python3 "
+                         "skills/migration-fanout/workflow.py reserve` before launching the children by hand, so the row "
+                         "is spent by that launch and no second launch reuses it")
+    if len(sys.argv) != 3:
+        sys.exit("usage: workflow.py gates <results.json>")
+    code = gates_command(sys.argv[2])
+    if code == 0:
+        record_run("gates", unspent=False)
+    sys.exit(code)
+if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
+    raise spent_halt()
 validate_manifest(MANIFEST)
 BASE_SHA = launch_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
@@ -1373,6 +1430,5 @@ async def main():
 
 
 if not resume and not SMOKE:
-    with RUNS_PATH.open("a") as f:
-        f.write(json.dumps({"stop_c": MANIFEST["stop_c"], "mode": MODE, "run_id": RUN_ID}, sort_keys=True) + "\n")
+    record_run(MODE, RUN_ID)
 asyncio.run(main())
