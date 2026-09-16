@@ -141,10 +141,11 @@ def _load_spec(mapping, canonicalization, family, target_kind, params):
     shape `run` reconciles, so `estimate` counts the statements the run will issue."""
     spec = load_mapping_spec(mapping, params)
     type_map = None
-    tm = load_type_map(canonicalization, family, target_kind) if canonicalization and family else None
-    if tm:
+    if canonicalization and family:
         try:
-            spec, type_map = apply_type_map(tm, spec)
+            tm = load_type_map(canonicalization, family, target_kind)
+            if tm:
+                spec, type_map = apply_type_map(tm, spec)
         except ConfigError as exc:
             raise SystemExit(f"type map: {exc}") from None
     return spec, type_map

@@ -386,3 +386,43 @@ def test_lakebase_parses_timestamp_without_time_zone_as_timestamp(oracle_map, or
     assert audit_field(oracle_lakebase_map, "TIMESTAMP(6)", "TIMESTAMP(6) WITHOUT TIME ZONE")[0] == "ok"
     # databricks unchanged: the spelling is timestamp_ntz there, and a bare timestamp_ntz stays ok
     assert audit_field(oracle_map, "TIMESTAMP(6)", "timestamp_ntz")[0] == "ok"
+
+
+def test_lakebase_zoned_timestamp_keeps_precision_under_six(oracle_map, oracle_lakebase_map):
+    assert expected_target(oracle_lakebase_map, "TIMESTAMP(3) WITH TIME ZONE")[0] == "timestamp(3) with time zone"
+    assert expected_target(oracle_lakebase_map, "TIMESTAMP(9) WITH TIME ZONE")[0] == "timestamp(6) with time zone"
+    assert audit_field(oracle_lakebase_map, "TIMESTAMP(3) WITH TIME ZONE",
+                       "timestamp(3) with time zone")[0] == "ok"
+    assert audit_field(oracle_lakebase_map, "TIMESTAMP(9) WITH TIME ZONE",
+                       "timestamp(6) with time zone")[0] == "ok"
+    assert audit_field(oracle_lakebase_map, "TIMESTAMP(9) WITH TIME ZONE",
+                       "timestamp(9) with time zone")[0] == "contradiction"
+    spec = _spec([FieldMapping("T", "t", "TIMESTAMP(3) WITH TIME ZONE", "")])
+    new_spec, _ = apply_type_map(oracle_lakebase_map, spec)
+    assert new_spec.objects[0].fields[0].target_type == "timestamp(3) with time zone"
+    # databricks unaffected
+    assert expected_target(oracle_map, "TIMESTAMP(9) WITH TIME ZONE")[0] == "timestamp"
+
+
+def test_load_spec_wraps_a_malformed_map_in_type_map_exit(tmp_path):
+    from recon.cli import _load_spec
+    (tmp_path / "m.json").write_text(json.dumps({"version": "m1", "objects": [{
+        "object": "orders", "root_table": "ORDERS",
+        "key": {"source": ["N"], "target": "n"},
+        "fields": [{"source": "N", "target": "n", "source_type": "NUMBER"}]}]}))
+    (tmp_path / "c.json").write_text(json.dumps(
+        {"rules": [], "type_map": {"oracle": {"databricks": {"types": [{"source": "NUMBER"}]}}}}))
+    with pytest.raises(SystemExit, match=r"^type map:"):
+        _load_spec(tmp_path / "m.json", tmp_path / "c.json", "oracle", "databricks", {})
+
+
+def test_wildcard_number_precision_anchors_at_38(oracle_map, oracle_lakebase_map):
+    from recon.typemap import read_as
+    assert expected_target(oracle_map, "NUMBER(*,10)")[0] == "decimal(38,10)"
+    assert expected_target(oracle_map, "NUMBER(*,-2)")[0] == "decimal(40,0)"
+    assert read_as("NUMBER(*,39)") == "NUMBER(39,39)"
+    assert audit_field(oracle_map, "NUMBER(*,39)", "")[0] == "unrepresentable"
+    assert expected_target(oracle_lakebase_map, "NUMBER(*,39)")[0] == "numeric(39,39)"
+    spec = _spec([FieldMapping("N", "n", "NUMBER(*,39)", "")])
+    new_spec, _ = apply_type_map(oracle_lakebase_map, spec)
+    assert new_spec.objects[0].fields[0].target_type == "numeric(39,39)"

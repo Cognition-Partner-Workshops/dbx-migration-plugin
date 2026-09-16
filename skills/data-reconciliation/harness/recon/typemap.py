@@ -77,6 +77,8 @@ def _norm_decimal(name: str, args: tuple) -> tuple:
     """Oracle NUMBER(p,s) edge shapes, as decimal arithmetic, not Oracle specifics:
     s < 0 rounds to whole 10^-s so (p+|s|, 0) is exact; s > p means |x| < 0.1 with
     s fractional digits, so (s, s)."""
+    if name in _DECIMAL_SOURCES and len(args) == 2 and args[0] == "*" and isinstance(args[1], int):
+        args = (38, args[1])  # an open precision is decimal-max wide
     if name in _DECIMAL_SOURCES and len(args) == 2 and all(isinstance(a, int) for a in args):
         p, s = args
         if s < 0:
@@ -118,10 +120,14 @@ def _match(rule: TypeRule, name: str, args: tuple) -> dict | None:
 
 
 def _render(pattern: str, bound: dict) -> str:
-    name, args = _parse(pattern, aliases=False)  # render the kind's own name (numeric stays numeric)
-    if not args:
-        return name
-    return f"{name}({','.join(str(bound.get(a, a)) for a in args)})"
+    # the kind's own spelling, args substituted where the pattern put them (numeric stays
+    # numeric, `timestamp(n) with time zone` keeps its mid-name paren group)
+    if not _PAREN.search(pattern):
+        return _parse(pattern, aliases=False)[0]
+    return _WS.sub(" ", _PAREN.sub(
+        lambda m: "(" + ",".join(str(bound.get(a.strip(), a.strip()))
+                                 for a in m.group(1).split(",")) + ")",
+        pattern.strip().lower()))
 
 
 def _target_matches(dname: str, dargs: tuple, pattern: str, kind: str | None = None) -> bool:
