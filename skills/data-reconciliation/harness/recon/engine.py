@@ -118,7 +118,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
               params: dict[str, str] | None = None,
               snapshot: dict | None = None,
               source_family: str | None = None,
-              depth: str = "threshold") -> dict:
+              depth: str = "threshold", type_map: dict | None = None) -> dict:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     if depth not in DEPTHS:
@@ -158,7 +158,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
     result = build_result(unit, mode, spec.version, tol.version, tiers,
                           seed=seed, params=params, snapshot=snapshot,
                           provenance_warnings=provenance_warnings, depth=depth,
-                          cost=_cost(source, target, started, ctx))
+                          cost=_cost(source, target, started, ctx), type_map=type_map)
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result
