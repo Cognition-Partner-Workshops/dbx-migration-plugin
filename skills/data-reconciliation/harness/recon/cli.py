@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import decimal
 import json
+import os
 import re
 import sys
 import uuid as uuid_mod
@@ -30,6 +31,7 @@ from .config import (
 )
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
+from .fixture_shape import compare_fixture
 from .rerun import check_proof, grade_rerun, load_prior, load_record, source_digest
 from .typemap import apply_type_map, load_type_map
 
@@ -196,6 +198,20 @@ def main(argv: list[str] | None = None) -> int:
                     help="the repository whose committed tree must hold each run's evidence and "
                          "fixture snapshot (default: the current directory)")
     rp.add_argument("--out", required=True, type=Path)
+    fs = sub.add_parser("fixture-shape", help="wave 0: compare the fixture copy's column shape "
+                        "and sample cardinality with the real source (read-only, capped); "
+                        "writes <out>/fixture_shape.json")
+    fs.add_argument("--family", required=True, choices=SOURCE_FAMILIES)
+    fs.add_argument("--mapping", required=True, type=Path)
+    fs.add_argument("--source-dsn-secret", required=True,
+                    help="ENV VAR NAME holding the real source connection (read-only principal)")
+    fs.add_argument("--fixture-dsn-secret", required=True,
+                    help="ENV VAR NAME holding the fixture copy's connection (same engine)")
+    fs.add_argument("--source-statement-cap", required=True, type=int,
+                    help="most statements this check may issue against the real source; the "
+                         "wave's legacy-query cap share for wave 0")
+    fs.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
+    fs.add_argument("--out", required=True, type=Path)
     rp = sub.add_parser("rerun-proof", help="grade the schema-evolution rerun proof from the "
                         "child's two run records (no connections); writes <out>/rerun_proof.json")
     rp.add_argument("--unit", required=True)
@@ -346,6 +362,35 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(out))
         return 0
 
+    if args.cmd == "fixture-shape":
+        from .adapters import SOURCE_ADAPTERS, is_untested_source_family
+        if is_untested_source_family(args.family):
+            raise SystemExit(f"--family {args.family}: {args.family} source adapter is untested; "
+                             "see SKILL.md")
+        if args.source_statement_cap < 1:
+            raise SystemExit("--source-statement-cap must be at least 1")
+        src_secret, fix_secret = args.source_dsn_secret, args.fixture_dsn_secret
+        if src_secret == fix_secret or (os.environ.get(src_secret) is not None
+                                        and os.environ.get(src_secret) == os.environ.get(fix_secret)):
+            raise SystemExit(f"fixture-shape: --source-dsn-secret {src_secret} and --fixture-dsn-secret "
+                             f"{fix_secret} resolve to the same connection; the fixture copy must live "
+                             "apart from the legacy source")
+        spec = load_mapping_spec(args.mapping, parse_params(args.param))
+        source = SOURCE_ADAPTERS[args.family](src_secret)
+        fixture = SOURCE_ADAPTERS[args.family](fix_secret)
+        try:
+            check = compare_fixture(spec, source, fixture, args.source_statement_cap)
+        except ConfigError as exc:
+            raise SystemExit(f"fixture-shape: {exc}") from None
+        check = {"family": args.family, "mapping_version": spec.version,
+                 "source_statement_cap": args.source_statement_cap, **check}
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "fixture_shape.json").write_text(json.dumps(check, indent=2) + "\n")
+        print(f"dbx-recon fixture-shape {check['status']}: {len(check['findings'])} finding(s), "
+              f"{check['source_statements']}/{args.source_statement_cap} source statements "
+              f"-> {args.out}/fixture_shape.json")
+        return 0 if check["status"] == "pass" else 1
+
     if args.cmd == "rerun-proof":
         if not args.source:
             raise SystemExit("rerun-proof needs --source <file> (the job's DDL, notebook or SQL; repeatable)")
@@ -353,7 +398,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("rerun-proof takes --prior-proof or --prior-shape, not both")
         prior_path = args.prior_proof or args.prior_shape
         try:
-            prior = load_prior(prior_path) if prior_path is not None else None
+            prior = (load_prior(prior_path, args.unit, proof=args.prior_proof is not None)
+                     if prior_path is not None else None)
             proof = grade_rerun(load_record(args.fresh, "fresh"),
                                 load_record(args.evolved, "evolved") if args.evolved else None, prior,
                                 digest=source_digest(args.source),
