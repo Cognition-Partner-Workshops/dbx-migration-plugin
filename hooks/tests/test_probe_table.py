@@ -671,6 +671,8 @@ PROBES2 = [
     ("R3 for loop tee into .migration units", "for f in .migration/units/*/tolerances.json; do echo x | tee \"$f\"; done", "block"),
     ("R3 for loop rm over .migration ledger glob", "for f in .migration/0*.md; do rm \"$f\"; done", "block"),
     ("R3 for loop over non-migration paths writes", "for f in build/*.json; do rm \"$f\"; done", "approve"),
+    ("R5 loop var reassigned to a ledger path blocks", "for f in a b; do f=.migration/06_decisions.md; echo x > \"$f\"; done", "block"),
+    ("R3 for loop over build output paths writes", "for d in build out; do echo x > \"$d/x.json\"; done", "approve"),
     ("R3 while loop body write into .migration", "while true; do rm .migration/units/x; done", "block"),
     ("R3 if-then body write into .migration", "if true; then rm .migration/units/x; fi", "block"),
     ("R3 for loop over legacy hosts read", "for h in tdprod.corp; do psql -h $h -c 'SELECT 1'; done", "approve"),

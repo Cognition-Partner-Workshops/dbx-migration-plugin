@@ -723,6 +723,8 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                 name, value = assignment.split("=", 1)
                 if name not in multi:
                     env[name] = value
+                else:
+                    env[name] = f"{env.get(name, '')} {value}".strip()
         if seg.argv0 == "unset":
             env.update((name, "") for name in seg.argv[1:]
                        if re.fullmatch(r"[A-Za-z_]\w*", name) and name not in multi)
