@@ -185,6 +185,13 @@ def main(argv: list[str] | None = None) -> int:
                         "undeclared target types like `run` does)")
     e.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
     e.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
+    rp = sub.add_parser("routine-parity", help="grade committed runs of writing routines against "
+                        "their golden sets (no connections); exit 0 all proven, 2 some unproven, 1 any failed")
+    rp.add_argument("--dependencies", required=True, type=Path,
+                    help="the unit's dependencies.json ({routines: [{routine, writes, ...}]})")
+    rp.add_argument("--runs", required=True, type=Path,
+                    help="a *.run.json file or a directory of them, one committed run per routine")
+    rp.add_argument("--out", required=True, type=Path)
     r = sub.add_parser("run", help="run the recon gate for one unit")
     r.add_argument("--unit", required=True)
     r.add_argument("--family", required=True, choices=SOURCE_FAMILIES)
@@ -222,8 +229,29 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="resolve a ${name} placeholder in the mapping spec's where clauses "
                         "(e.g. partition/date scoping); repeatable; recorded in result.json")
+    r.add_argument("--routine-parity", type=Path,
+                   help="routine_parity.json from `routine-parity`; carried into result.json, a "
+                        "failed routine blocks merge (routine_gap)")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
+
+    if args.cmd == "routine-parity":
+        from .routines import grade_routines, load_runs
+        try:
+            deps = json.loads(args.dependencies.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot read {args.dependencies}: {exc}") from None
+        try:
+            out = grade_routines(deps, load_runs(args.runs))
+        except ConfigError as exc:
+            raise SystemExit(f"routine-parity: {exc}") from None
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "routine_parity.json").write_text(json.dumps(out, indent=2) + "\n")
+        parity = out["routine_parity"]
+        counts = {s: sum(1 for r in parity if r["status"] == s) for s in ("proven", "unproven", "failed")}
+        print(f"dbx-recon routine-parity: {counts['proven']} proven, {counts['unproven']} unproven, "
+              f"{counts['failed']} failed -> {args.out}/routine_parity.json")
+        return 1 if counts["failed"] else 2 if counts["unproven"] else 0
 
     if args.cmd == "selftest":
         return selftest()
@@ -357,12 +385,24 @@ def main(argv: list[str] | None = None) -> int:
                 target = DictionaryOverlay(target, load_dictionary(args.target_dictionary))
         except ConfigError as exc:
             raise SystemExit(f"dictionary: {exc}") from None
+    routine_parity = None
+    if args.routine_parity:
+        from .routines import check_parity
+        try:
+            routine_parity = check_parity(
+                json.loads(args.routine_parity.read_text()).get("routine_parity"),
+                str(args.routine_parity))
+        except (OSError, json.JSONDecodeError, AttributeError) as exc:
+            raise SystemExit(f"cannot read {args.routine_parity}: {exc}") from None
+        except ConfigError as exc:
+            raise SystemExit(str(exc)) from None
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
-                       source_family=args.family, depth=args.depth, type_map=type_map)
+                       source_family=args.family, depth=args.depth, type_map=type_map,
+                       routine_parity=routine_parity)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")

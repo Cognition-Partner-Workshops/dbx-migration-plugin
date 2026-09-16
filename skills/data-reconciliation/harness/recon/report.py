@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 
+from .routines import routine_gap
 from .tiers import TierResult
 
 MAX_FINDINGS_IN_REPORT = 50
@@ -41,7 +42,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  snapshot: dict | None = None,
                  provenance_warnings: list[str] | None = None,
                  depth: str = "threshold", cost: dict | None = None,
-                 type_map: dict | None = None) -> dict:
+                 type_map: dict | None = None,
+                 routine_parity: list[dict] | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -58,7 +60,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     structural_blind = any(v == "unsupported" for c, v in checks.items() if c != "indexes")
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and not structural_blind
-                      and (mode != "snapshot" or snapshot is not None))
+                      and (mode != "snapshot" or snapshot is not None)
+                      and not routine_gap(routine_parity))
     reasons = []
     if structural is not None and (structural.findings or structural.stats.get("unverified")
                                    or structural.stats.get("dictionary_unavailable")
@@ -66,6 +69,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         reasons.append("structural_gap")
     if verdict == "FAIL":
         reasons.append("tier_failed")
+    if routine_gap(routine_parity):
+        reasons.append("routine_gap")
     if warnings:
         reasons.append("warnings")
     if mode not in ("live", "snapshot", "transactional"):
@@ -90,7 +95,24 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "merge_authority": {"kind": "harness", "decision_id": None},
         "type_map": type_map,
         "merge_block_reasons": reasons,
+        "routine_parity": routine_parity,
     }
+
+
+def _parity_lines(result: dict) -> list[str]:
+    parity = result.get("routine_parity")
+    if not parity:
+        return []
+    counts = {s: sum(1 for r in parity if r["status"] == s) for s in ("proven", "unproven", "failed")}
+    lines = ["", f"## Routine parity: {counts['proven']} proven, {counts['unproven']} unproven, "
+                 f"{counts['failed']} failed", ""]
+    for r in parity:
+        if r["status"] == "proven":
+            continue
+        why = r.get("reason") or "; ".join(f"{f['table']} {f['check']}: {f['detail']}"
+                                           for f in r.get("findings", []))
+        lines.append(f"- `{r['routine']}` {r['status']}: {why}")
+    return lines
 
 
 def render_report(result: dict) -> str:
@@ -111,6 +133,7 @@ def render_report(result: dict) -> str:
     ]
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
+    lines += _parity_lines(result)
     if result.get("cost"):
         lines.append(f"- Cost: `{json.dumps(result['cost'], default=str)}`")
     for w in result.get("warnings", []):
@@ -165,6 +188,7 @@ def render_summary(result: dict) -> str:
         lines.append(f"- Cost: source {cost['source_statements']} statements / "
                      f"{cost['source_rows_fetched']} rows fetched; target {cost['target_statements']} "
                      f"statements / {cost['target_rows_fetched']} rows; {cost['elapsed_s']}s")
+    lines += _parity_lines(result)
     structural = next((t for t in result["tiers"] if t["name"] in ("structural_parity", "schema_parity")), None)
     if structural is not None and structural["stats"].get("structural_checks"):
         checks = ", ".join(f"{k}={v}" for k, v in structural["stats"]["structural_checks"].items())

@@ -1,0 +1,39 @@
+{
+  "note": "The canonical failure: the converted routine archived both entries but deleted only one, so the source table still holds a row the golden set says is gone.",
+  "routine": "app_pkg.archive_entries",
+  "target_family": "lakebase",
+  "target_branch": "mig-ledger-exec",
+  "snapshot": "fixture:ledger-2024q1",
+  "evidence": ".migration/recon/ledger/archive_entries.run.json",
+  "golden": {
+    "app.ledger_entry_hist": [
+      {
+        "entry_id": 10,
+        "amount": "1250.00"
+      },
+      {
+        "entry_id": 11,
+        "amount": "-80.25"
+      }
+    ],
+    "app.ledger_entry": []
+  },
+  "observed": {
+    "app.ledger_entry_hist": [
+      {
+        "entry_id": 10,
+        "amount": "1250.00"
+      },
+      {
+        "entry_id": 11,
+        "amount": "-80.25"
+      }
+    ],
+    "app.ledger_entry": [
+      {
+        "entry_id": 11,
+        "amount": "-80.25"
+      }
+    ]
+  }
+}

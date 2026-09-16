@@ -142,6 +142,28 @@ The output is a machine-readable table of object, class, method, partition key, 
 - Reconcile connector-fed tables at a recorded Tier 1/2 snapshot; CDC lag is a stated finding, and connector output never self-certifies.
 - For mutable tables without a connector, record the exact timestamp/SCN/LSN at copy start and re-verify catch-up in the cutover runbook; if no usable watermark exists and no freeze is possible, say so in the plan.
 
+## Routine parity (writing routines)
+
+A converted routine whose `dependencies.json` row has `writes` is proven only by one committed run on a
+dedicated execution target (Lakebase branch `mig-<pipeline>-exec`; Unity Catalog schema
+`<catalog>.<pipeline>_exec`; never the migration target itself) against a fixture snapshot, with the rows it
+left in every written table compared to a golden set. Record each run as `<routine>.run.json`
+(`{routine, target_family, target_branch, snapshot, evidence, golden: {table: [rows]}, observed: {table: [rows]}}`;
+fixture: `harness/fixtures/example_routine_parity/`) and grade them:
+
+```bash
+dbx-recon routine-parity --dependencies .migration/units/<unit>/dependencies.json \
+  --runs .migration/recon/<unit>/runs/ --out .migration/recon/<unit>/
+```
+
+`routine_parity.json` carries `routine_parity: [{routine, status: proven|unproven|failed, evidence}]`. A
+routine with no run, a run off a dedicated target, without evidence or a snapshot, or in a family with no
+dedicated-target rule is `unproven` (exit 2), never silently clean; rows that differ, or a written table
+absent from either set, are `failed` (exit 1). Pass the file to `run --routine-parity` so `result.json`
+carries it: a `failed` routine sets `merge_eligible=false` with reason `routine_gap`; `unproven` routines
+are listed in `recon.summary.md` and become cutover exceptions (`8-cutover_signoff.md`). The run itself
+needs the read-only principal to hold EXECUTE on the routines under test; the intake asks (`14-front_door_oltp.md`).
+
 ## Outputs (in `--out`)
 
 - `result.json`: machine-readable. The workflow gates on `verdict`, and the wave gate reads
