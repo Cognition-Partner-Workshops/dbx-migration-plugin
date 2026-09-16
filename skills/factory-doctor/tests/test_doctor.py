@@ -224,7 +224,7 @@ def test_run_core_rows_are_ten(tmp_path):
         "workspace", "allowed_targets", "allowlist_committed", "playbooks_in_sync", "hook_guard",
         "official_databricks_plugin", "recon_harness", "recon_family_supported", "type_map_audit",
         "delete_evidence", "source_principal_read_only", "dictionary_readable",
-        "databricks_identity",
+        "named_secrets_exist", "databricks_identity",
     ]
 
 
@@ -2521,3 +2521,194 @@ def test_playbooks_in_sync_explicit_live_path_must_exist(tmp_path):
     ws = make_workspace(tmp_path)
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child", tmp_path / "nowhere.json")
     assert c.status == "fail" and "nowhere.json" in c.detail
+
+
+# ------------------------------------------------------------------ named_secrets_exist (WS2.6)
+
+def test_manifest_secret_names_collects_lists_and_brief_references():
+    manifest = {
+        "secrets": ["app/db-host"],
+        "batches": [
+            {"id": "b-1", "secrets": ["app/db-user"],
+             "brief": "read {{secrets/app/db-password}} then dbutils.secrets.get(scope=\"app\", key=\"db-token\")"},
+            {"id": "b-2",
+             "brief": "also secrets/warehouse/token and secrets.get(\"app\", \"db-host\")"},
+        ],
+    }
+    assert doctor.manifest_secret_names(manifest) == [
+        "app/db-host", "app/db-password", "app/db-token", "app/db-user", "warehouse/token"]
+
+
+def test_manifest_secret_names_parses_secrets_get_in_any_argument_order():
+    manifest = {"batches": [{"id": "b", "brief": (
+        'a = dbutils.secrets.get(key="password", scope="payments")\n'
+        'b = secrets.get("s", key="k")\n'
+        "c = dbutils.secrets.get(scope='app', key='db-token')\n"
+        'd = secrets.get("only")\n')}]}
+    assert doctor.manifest_secret_names(manifest) == ["app/db-token", "payments/password", "s/k"]
+
+
+@pytest.mark.parametrize("bad", ["a/b", 7, None, ["ok/k", 3]])
+def test_manifest_secret_names_rejects_a_non_list_of_strings(bad):
+    with pytest.raises(SystemExit, match="must be a list of scope/key strings"):
+        doctor.manifest_secret_names({"secrets": bad, "batches": []})
+    with pytest.raises(SystemExit, match="must be a list of scope/key strings"):
+        doctor.manifest_secret_names({"batches": [{"id": "b", "secrets": bad}]})
+
+
+def test_wave_manifest_with_bad_secrets_shape_exits_cleanly(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({
+        "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
+        "source": {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
+        "secrets": "app/db-user",
+    }))
+    result = subprocess.run(
+        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+         "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    assert "must be a list of scope/key strings" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not manifest.with_suffix(".doctor.json").exists()
+
+
+def test_manifest_secret_names_ignores_other_text():
+    manifest = {"batches": [{"id": "b-1", "brief": "no secrets here, just secrets talk"}]}
+    assert doctor.manifest_secret_names(manifest) == []
+
+
+def test_check_named_secrets_skipped_without_names():
+    c = doctor.check_named_secrets([])
+    assert c.status == "skipped" and "no Databricks secret names" in c.detail
+    assert c.data == {"checked": [], "missing": [], "unreadable_scopes": []}
+
+
+def test_check_named_secrets_fails_on_missing_key():
+    values = {"app": {"db-user": "s3cr3t-value"}}  # keys the stub returns; values never seen
+    c = doctor.check_named_secrets(["app/db-user", "app/db-password"],
+                                   lambda scope: list(values.get(scope, {})))
+    assert c.status == "fail"
+    assert "STOP C" in c.detail and "app/db-password" in c.detail
+    assert c.data["missing"] == ["app/db-password"]
+    assert c.data["checked"] == ["app/db-user", "app/db-password"]
+    assert "s3cr3t-value" not in json.dumps(asdict(c))
+
+
+def test_check_named_secrets_fails_on_unreadable_scope():
+    c = doctor.check_named_secrets(["hidden/key", "app/ok"],
+                                   lambda scope: None if scope == "hidden" else ["ok"])
+    assert c.status == "fail"
+    assert "scope hidden" in c.detail and "list-secrets" in c.detail
+    assert c.data["unreadable_scopes"] == ["hidden"]
+    assert "hidden/key" in c.data["missing"]
+
+
+def test_check_named_secrets_fails_on_malformed_name():
+    c = doctor.check_named_secrets(["nokey", "app/db-user"], lambda scope: ["db-user"])
+    assert c.status == "fail" and "not a scope/key secret name" in c.detail and "nokey" in c.detail
+
+
+def test_check_named_secrets_ok_when_all_present():
+    calls = []
+
+    def ls(scope):
+        calls.append(scope)
+        return {"app": ["db-user", "db-password"], "wh": ["token"]}[scope]
+
+    c = doctor.check_named_secrets(["app/db-user", "wh/token", "app/db-password"], ls)
+    assert c.status == "ok"
+    assert "3 named secret(s) exist in 2 scope(s)" in c.detail
+    assert sorted(calls) == ["app", "wh"]
+    assert c.data["missing"] == [] and c.data["unreadable_scopes"] == []
+
+
+def test_list_secrets_parses_key_rows(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+    seen = []
+
+    def fake_run(cmd, timeout=0):
+        seen.append(cmd)
+        return (0, '[{"key": "db-user", "last_updated_timestamp": 1}, {"key": "db-password"}]', "")
+
+    monkeypatch.setattr(doctor, "_run", fake_run)
+    assert doctor._list_secrets("app") == ["db-user", "db-password"]
+    assert seen[0][1:] == ["secrets", "list-secrets", "app", "--output", "json"]
+
+
+def test_list_secrets_accepts_the_wrapped_shape(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+    monkeypatch.setattr(doctor, "_run",
+                        lambda cmd, **kw: (0, '{"secrets": [{"key": "k"}]}', ""))
+    assert doctor._list_secrets("app") == ["k"]
+
+
+def test_list_secrets_none_without_cli_on_error_or_on_non_json(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+    assert doctor._list_secrets("app") is None
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (1, "", "denied"))
+    assert doctor._list_secrets("app") is None
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, "not json", ""))
+    assert doctor._list_secrets("app") is None
+
+
+def test_run_named_secrets_skipped_offline_and_never_blocking(tmp_path):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        secret_names=["app/db-user"])
+    row = by_id(report)["named_secrets_exist"]
+    assert row["status"] == "skipped" and row["detail"] == "--no-databricks"
+    assert not [b for b in report["blocking"] if b.startswith("named_secrets_exist")]
+
+
+def test_run_named_secrets_fail_is_blocking(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1"}),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, False,
+                        secret_names=["app/db-user"], list_secrets=lambda scope: [])
+    row = by_id(report)["named_secrets_exist"]
+    assert row["status"] == "fail" and "named_secrets_exist=fail" in report["blocking"]
+
+
+def test_wave_manifest_secrets_reach_the_report(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({
+        "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
+        "source": {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
+        "secrets": ["app/db-user"],
+        "batches": [{"id": "b-1", "secrets": ["app/db-password"],
+                     "brief": "uses {{secrets/wh/token}} too"}],
+    }))
+    result = subprocess.run(
+        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+         "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+        capture_output=True, text=True, check=False,
+    )
+    record = json.loads(manifest.with_suffix(".doctor.json").read_text())
+    row = next(c for c in record["checks"] if c["id"] == "named_secrets_exist")
+    assert row["status"] == "skipped" and row["detail"] == "--no-databricks"
+
+
+def test_secret_flag_passes_names_to_the_check(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1"}),
+    ])
+    seen = {}
+
+    def stub(names, ls=None):
+        seen["names"] = list(names)
+        return doctor.Check("named_secrets_exist", "ok", "captured")
+
+    monkeypatch.setattr(doctor, "check_named_secrets", stub)
+    doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT),
+                 "--secret", "app/db-user", "--secret", "wh/token", "--out", "-"])
+    assert seen["names"] == ["app/db-user", "wh/token"]
