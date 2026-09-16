@@ -33,14 +33,24 @@ _CATALOG_OBJECT_RE = re.compile(
     r"\b(sys\.[a-z_]+|pg_[a-z_]+|information_schema\.[a-z_]+)\b(?!\()")
 
 
+_STRUCTURAL_READERS = {"schema_facts", "identity_state", "_uc_schema_facts",
+                       "_uc_identity_state"}
+
+
 def test_dictionary_objects_cover_every_reader_view():
-    """Every catalog object named in the readers' SQL must be probed by DICTIONARY_OBJECTS, so
-    doctor's dictionary_readable table cannot drift behind a new reader query."""
-    src = (Path(adapters.__file__).read_text())
-    used = set(_CATALOG_OBJECT_RE.findall(src)) | {"SHOW CREATE TABLE",
-                                                   "server_version_num", "pg_get_serial_sequence",
-                                                   "pg_get_indexdef", "pg_get_constraintdef",
-                                                   "pg_get_userbyid"}
+    """Every catalog object named in the structural readers' SQL (schema_facts / identity_state)
+    must be probed by DICTIONARY_OBJECTS, so doctor's dictionary_readable table cannot drift
+    behind a new reader query. Change-token reads are not dictionary reads."""
+    import ast, inspect
+    tree = ast.parse(Path(adapters.__file__).read_text())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                node.name in _STRUCTURAL_READERS:
+            names.update(_CATALOG_OBJECT_RE.findall(ast.get_source_segment(
+                Path(adapters.__file__).read_text(), node) or ""))
+    used = names | {"SHOW CREATE TABLE", "server_version_num", "pg_get_serial_sequence",
+                    "pg_get_indexdef", "pg_get_constraintdef", "pg_get_userbyid"}
     have = {label for views in adapters.DICTIONARY_OBJECTS.values() for label, _ in views}
     assert used <= have
     for family, views in adapters.DICTIONARY_OBJECTS.items():

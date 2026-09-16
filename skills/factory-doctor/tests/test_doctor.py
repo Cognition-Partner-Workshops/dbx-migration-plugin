@@ -1493,6 +1493,19 @@ def test_dictionary_readable_probes_per_table_ddl_for_databricks(monkeypatch):
     assert any("SHOW CREATE TABLE cat.s.loans" in q for q in conn.statements)
 
 
+def test_dictionary_readable_registers_a_databricks_connector():
+    assert "databricks" in doctor._READ_ONLY_CONNECT
+
+
+def test_dictionary_readable_databricks_without_the_connector_names_the_package(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "{}")
+    monkeypatch.setitem(sys.modules, "databricks", None)  # import fails
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "databricks-sql-connector" in c.detail
+    assert "{" not in c.detail  # never the secret
+
+
 def test_dictionary_readable_fails_on_an_unreadable_databricks_table(monkeypatch):
     monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
     conn = FakeDictConn(fail_views={"SHOW CREATE TABLE"})

@@ -1617,8 +1617,7 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                 t_state = target.identity_state(c.object, c.identity_target)
                 s_state = source.identity_state(c.root_table, c.identity_source)
             except (NotImplementedError, DictionaryError) as exc:
-                key = "unverified" if strict else "sequences_identity_unsupported"
-                stats.setdefault(key, []).append(f"{c.object} identity: {exc}")
+                stats.setdefault("unverified", []).append(f"{c.object} identity: {exc}")
                 obj_uns[c.object] = obj_uns.get(c.object, set()) | {"sequences_identity"}
                 uns = uns | {"sequences_identity"}
                 s, t_lower = (mask_unsupported(f_, uns) for f_ in (s, t_lower))

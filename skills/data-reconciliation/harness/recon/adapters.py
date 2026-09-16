@@ -848,7 +848,6 @@ DICTIONARY_OBJECTS = {
         ("sys.trigger_events", "SELECT TOP 1 1 FROM sys.trigger_events"),
         ("sys.database_permissions", "SELECT TOP 1 1 FROM sys.database_permissions"),
         ("sys.database_principals", "SELECT TOP 1 1 FROM sys.database_principals"),
-        ("sys.dm_db_index_usage_stats", "SELECT TOP 1 1 FROM sys.dm_db_index_usage_stats"),
     ),
     "postgres": (
         ("pg_constraint", "SELECT 1 FROM pg_constraint LIMIT 1"),
@@ -1012,9 +1011,10 @@ def _uc_identity_columns(ddl_rows) -> dict[str, tuple[int, int]]:
 def _uc_identity_state(run_query, catalog: str, schema: str, table: str,
                        column: str) -> IdentityState | None:
     """One UC identity column's next value and step. The step and declared start come from the
-    SHOW CREATE TABLE DDL; Delta's high-water mark isn't in the catalog, so the column's MAX is
-    the readable frontier (the declared start when the table is empty). None when the column is
-    not identity."""
+    SHOW CREATE TABLE DDL; Delta's high-water mark isn't in the catalog, so the column's MAX
+    (MIN for a negative step) is the readable frontier — a conservative bound, since deleted
+    frontier rows aren't visible (the declared start when the table is empty). None when the
+    column is not identity."""
     qual = (f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
             f"{quote_ident(table, '`')}")
 
@@ -1030,7 +1030,9 @@ def _uc_identity_state(run_query, catalog: str, schema: str, table: str,
     if not state:
         return None
     start, inc = state
-    (mx,) = q(f"{column} max", f"SELECT MAX({quote_ident(column, '`')}) FROM {qual}")[0]
+    edge = "MIN" if inc < 0 else "MAX"
+    (mx,) = q(f"{column} {edge.lower()}",
+              f"SELECT {edge}({quote_ident(column, '`')}) FROM {qual}")[0]
     return IdentityState(int(mx) + inc if mx is not None else start, inc)
 
 

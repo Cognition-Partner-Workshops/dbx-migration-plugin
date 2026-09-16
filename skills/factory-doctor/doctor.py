@@ -978,7 +978,21 @@ _PRIVILEGE_QUERIES = {
         "read_only": "SELECT current_setting('transaction_read_only')",
     },
 }
-_READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect}
+def _databricks_sql_connect(secret_value: str):
+    """Same secret contract the harness's Databricks adapter uses (JSON server_hostname /
+    http_path / access_token); the connector is an optional extra, so its absence is reported
+    as a package name, never the secret."""
+    try:
+        from databricks import sql  # optional extra (databricks-sql-connector)
+    except ImportError:
+        raise RuntimeError("databricks-sql-connector is not installed") from None
+    cfg = json.loads(secret_value)
+    return sql.connect(server_hostname=cfg["server_hostname"], http_path=cfg["http_path"],
+                       access_token=cfg["access_token"])
+
+
+_READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect,
+                      "databricks": _databricks_sql_connect}
 _ADVISORY = ("driver-level read-only (SQL Server readonly=True, Postgres default_transaction_read_only) is advisory, "
              "a hint the server may ignore; only the principal's grants stop writes")
 

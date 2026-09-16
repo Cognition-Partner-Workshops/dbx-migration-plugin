@@ -255,6 +255,40 @@ def test_tier0_dictionary_error_records_view_not_credential():
     assert result["merge_eligible"] is False and "structural_gap" in result["merge_block_reasons"]
 
 
+class _IdErrorTarget(FakeTarget):
+    def identity_state(self, table, column):
+        from recon.adapters import DictionaryError
+        raise DictionaryError(f"{table}: SHOW CREATE TABLE read failed (RuntimeError)")
+
+
+def test_tier0_identity_read_error_is_unverified_and_blocks_merge():
+    loans, borrowers = _rows(12)
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 13})
+    target = _IdErrorTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                            schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS})
+    result = run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target)
+    t0 = result["tiers"][0]
+    assert any("SHOW CREATE TABLE read failed" in n for n in t0["stats"]["unverified"])
+    assert any("UNVERIFIED" in w for w in result["warnings"])
+    assert result["merge_eligible"] is False and "structural_gap" in result["merge_block_reasons"]
+
+
+def test_build_result_structural_gap_from_checks_alone():
+    from recon.tiers import TierResult
+    t = TierResult(0, "structural_parity", True, 1, [],
+                   {"structural_checks": {"constraints": "checked", "triggers": "unsupported",
+                                          "indexes": "checked", "sequences_identity": "checked",
+                                          "grants": "direct_only"}})
+    r = build_result("u", "live", "m1", "t1", [t])
+    assert "structural_gap" in r["merge_block_reasons"] and r["merge_eligible"] is False
+    t = TierResult(0, "structural_parity", True, 1, [],
+                   {"structural_checks": {"indexes": "unsupported", "triggers": "checked"}})
+    r = build_result("u", "live", "m1", "t1", [t])
+    assert "structural_gap" not in r["merge_block_reasons"] and r["merge_eligible"] is True
+
+
 def test_tier0_target_without_identity_reader_marks_category_unchecked():
     tgt_facts = _facts(TARGET_LOANS_FACTS, unsupported=frozenset({"sequences_identity"}))
     result = _live(loans_tgt_facts=tgt_facts)
@@ -611,6 +645,23 @@ def test_databricks_source_adapter_reads_uc_dictionary():
     assert facts.primary_key_informational == ("loan_id",)
     assert "information_schema.table_constraints" in " ".join(answers)
     assert a.identity_state("cat.s.loans", "loan_id") is None
+
+
+def test_uc_identity_state_uses_min_for_a_negative_increment():
+    from recon.adapters import DatabricksTargetAdapter
+    a = DatabricksTargetAdapter.__new__(DatabricksTargetAdapter)
+    a._catalog, a._schema = "mig", "s"
+
+    class Sql:
+        def _rows(self, sql, params):
+            if "SHOW CREATE" in sql:
+                return [("`loan_id` BIGINT GENERATED ALWAYS AS IDENTITY "
+                         "(START WITH 100 INCREMENT BY -1)",)]
+            assert "MIN(" in sql.upper()
+            return [(98,)]
+    a._sql = Sql()
+    state = a.identity_state("loans", "loan_id")
+    assert (state.next, state.increment) == (97, -1)
 
 
 def test_uc_identity_state_uses_the_declared_start_on_an_empty_table():
