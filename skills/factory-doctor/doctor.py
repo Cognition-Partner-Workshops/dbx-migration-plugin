@@ -1009,11 +1009,14 @@ def _check_databricks_source_principal(tables: list[str], source_secret: str | N
                  f"{len(tables)} in-scope table(s), their schemas and catalogs; no ownership", data)
 
 
+_USER_PROVENANCE = re.compile(r"(?<![\w-])user:[\w][\w.@/-]*")
+
+
 def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
     """--source-attested D-<id>: a ledger decision standing in for a privilege query the family
     does not have (files in object storage, a read-only share, a static dump — no principal to
-    query). The decision's line must name the check and the attestation; a family with a query
-    runs the query instead."""
+    query). The decision's line must name the check, the attestation and a `user:<id>` provenance
+    (a default-accepted row is not a human attesting); a family with a query runs the query instead."""
     cid = "source_principal_read_only"
     if family == "databricks" or family in _PRIVILEGE_QUERIES:
         return Check(cid, "fail", f"{family}: --source-attested {decision} rejected, this family has a "
@@ -1026,12 +1029,17 @@ def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
     named = re.compile(rf"(?<![\w-]){re.escape(decision)}(?![\w-])")
     for line in ledger.read_text().splitlines():
         if named.search(line) and "source_principal_read_only" in line and "attested" in line:
+            who = _USER_PROVENANCE.search(line)
+            if not who:
+                return Check(cid, "fail", f"{family}: decision {decision} attests source_principal_read_only "
+                             "without user:<id> provenance; a default-accepted row cannot attest the source "
+                             "is read-only, a human has to reply", {"decision": decision})
             return Check(cid, "attested", f"{family}: source principal read-only attested by decision "
-                         f"{decision} in .migration/06_decisions.md (no principal to query)",
-                         {"decision": decision, "family": family, "tables": tables})
+                         f"{decision} ({who.group(0)}) in .migration/06_decisions.md (no principal to query)",
+                         {"decision": decision, "family": family, "tables": tables, "provenance": who.group(0)})
     return Check(cid, "fail", f"{family}: decision {decision} is not in .migration/06_decisions.md with "
-                 "'source_principal_read_only' and 'attested' in its line; record the attestation in the "
-                 "ledger first", {"decision": decision})
+                 "'source_principal_read_only', 'attested' and user:<id> provenance in its line; record the "
+                 "attestation in the ledger first", {"decision": decision})
 
 
 def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str | None,

@@ -1495,11 +1495,12 @@ def _attest(ws, line):
 def test_source_attested_reports_attested_and_does_not_block(tmp_path):
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
-    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal\n")
+    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal | user:msg-41\n")
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                         source_family="teradata", source_attested="D-7")
     row = by_id(report)["source_principal_read_only"]
     assert row["status"] == "attested" and row["data"]["decision"] == "D-7"
+    assert row["data"]["provenance"] == "user:msg-41"
     assert not [b for b in report["blocking"] if b.startswith("source_principal_read_only")]
     assert report["blocking"] == ["hook_platform_loaded=unverified", "databricks_identity=skipped"]
 
@@ -1521,11 +1522,28 @@ def test_source_attested_fails_without_a_matching_ledger_line(tmp_path):
         assert by_id(report)["source_principal_read_only"]["status"] == "fail", wrong
 
 
+@pytest.mark.parametrize("line", [
+    "D-8 | source_principal_read_only attested: static export | default-accepted (soft, 60s, no reply)\n",
+    "D-8 | source_principal_read_only attested: static export\n",
+    "D-8 | source_principal_read_only attested: static export | user:\n",
+    "D-8 | source_principal_read_only attested: static export | reviewer:alice\n",
+])
+def test_source_attested_requires_user_provenance(tmp_path, line):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    _attest(ws, line)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_family="teradata", source_attested="D-8")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "user:" in row["detail"] and "D-8" in row["detail"]
+    assert "source_principal_read_only=fail" in report["blocking"]
+
+
 def test_source_attested_is_rejected_for_families_with_a_privilege_query(tmp_path, monkeypatch):
     monkeypatch.setattr(doctor, "check_source_principal", lambda *a, **k: pytest.fail("must not connect"))
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
-    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal\n")
+    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal | user:msg-41\n")
     for family in ("postgres", "databricks"):
         report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                             source_family=family, source_attested="D-7")

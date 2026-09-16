@@ -27,7 +27,8 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
 # --source-secret/--param: the same values the recon run will get. --expect-catalogs: the
 # catalogs the wave's capability contract names. --source-attested D-<id>: a decision in
 # .migration/06_decisions.md attesting the source has no principal to query (files in object
-# storage, a read-only share, a static dump); only for families without a privilege query.
+# storage, a read-only share, a static dump); only for families without a privilege query, and
+# only a row a human replied to (`user:<id>` provenance) attests — `default-accepted` does not.
 ```
 
 Writes `.migration/09_capabilities.json` and prints one line per check. Exit 0 = `ready`.
@@ -110,8 +111,9 @@ Reference details and factory placement: [references/checks.md](references/check
   without a well-formed `privilege_assignments` list is `unverified`) and fails on any
   privilege outside
   SELECT/USE_CATALOG/USE_SCHEMA/BROWSE/READ_VOLUME; `attested` when `--source-attested D-<id>`
-  matches a `06_decisions.md` line containing the id, `source_principal_read_only` and `attested`
-  (rejected for families that have a query — Databricks included); `unverified` for the other
+  matches a `06_decisions.md` line containing the id, `source_principal_read_only`, `attested` and a
+  `user:<id>` provenance (a `default-accepted` row fails: no human attested; rejected for families
+  that have a query — Databricks included); `unverified` for the other
   families, and it blocks `ready`.
 - `playbooks_in_sync` compares `.migration/playbooks.lock.json` against the repo playbook files
   (sha256 each): a stale, missing or unknown macro, or a playbook file absent from the 0-README
