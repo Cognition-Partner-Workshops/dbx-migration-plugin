@@ -150,9 +150,12 @@ transitively), is proven only by one committed run on a dedicated execution targ
 against a committed fixture snapshot (`snapshot: "fixture:<path in the repo>"`; anything else, a production
 or ad hoc snapshot, is `unproven`), with the rows it left in every written table compared to a golden set.
 The run record and the snapshot must both be files in the committed tree (`--repo`, default the current
-directory); a run naming a file that is untracked, staged or missing is `unproven`. Record each run as `<routine>.run.json`
+directory), byte-identical to `HEAD`; a run naming a file that is untracked, staged, edited or missing is
+`unproven`. The record is its own evidence: `evidence` is the record's path in the repository, and a
+record read from any other path (or from outside the repository) is `unproven`, so `--runs` cannot borrow
+some other committed file. Record each run as `<routine>.run.json`
 (`{routine, target_family, target_branch, snapshot, evidence, golden: {table: [rows]}, observed: {table: [rows]}}`;
-fixture: `harness/fixtures/example_routine_parity/`) and grade them:
+fixture: `harness/fixtures/example_routine_parity/`, laid out like a unit's repository) and grade them:
 
 ```bash
 dbx-recon routine-parity --dependencies .migration/units/<unit>/dependencies.json \
@@ -165,8 +168,10 @@ dedicated-target rule is `unproven` (exit 2), never silently clean; rows that di
 absent from either set, are `failed` (exit 1); table names compare case-insensitively. Pass the file to
 `run --routine-parity <file> --routine-dependencies <unit dependencies.json>` so `result.json` carries it
 (a writing routine the file lacks is carried as `unproven`; a row for a routine the analysis does not
-know is refused; `--routine-dependencies` alone carries every writer as `unproven`): a `failed` routine sets `merge_eligible=false` with reason `routine_gap`; `unproven` routines
-are listed in `recon.summary.md` and become cutover exceptions (`8-cutover_signoff.md`). The run itself
+know, or a routine listed twice, is refused; `--routine-dependencies` alone carries every writer as `unproven`): a `failed` routine sets `merge_eligible=false` with reason `routine_gap`; `unproven` routines
+are listed in `recon.summary.md` and become cutover exceptions (`8-cutover_signoff.md`). The result is
+built against the analysis's writer list, and one with writers but no row for each of them is
+`merge_eligible=false` with reason `routine_parity_missing`: absent parity is never clean parity. The run itself
 needs the read-only principal to hold EXECUTE on the routines under test; the intake asks (`14-front_door_oltp.md`).
 
 ## Outputs (in `--out`)

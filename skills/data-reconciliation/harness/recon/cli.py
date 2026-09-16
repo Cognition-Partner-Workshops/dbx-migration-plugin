@@ -248,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, json.JSONDecodeError) as exc:
             raise SystemExit(f"cannot read {args.dependencies}: {exc}") from None
         try:
-            out = grade_routines(deps, load_runs(args.runs), git_committed(args.repo))
+            out = grade_routines(deps, load_runs(args.runs, args.repo), git_committed(args.repo))
         except ConfigError as exc:
             raise SystemExit(f"routine-parity: {exc}") from None
         args.out.mkdir(parents=True, exist_ok=True)
@@ -391,16 +391,17 @@ def main(argv: list[str] | None = None) -> int:
                 target = DictionaryOverlay(target, load_dictionary(args.target_dictionary))
         except ConfigError as exc:
             raise SystemExit(f"dictionary: {exc}") from None
-    routine_parity = None
+    routine_parity = routine_writers = None
     if args.routine_parity and not args.routine_dependencies:
         raise SystemExit("--routine-parity needs --routine-dependencies: the unit's dependency analysis "
                          "says which writing routines the file must cover")
     if args.routine_dependencies:
-        from .routines import check_parity, git_committed
+        from .routines import check_parity, git_committed, writers
         try:
             deps = json.loads(args.routine_dependencies.read_text())
             rows = (json.loads(args.routine_parity.read_text()).get("routine_parity")
                     if args.routine_parity else [])
+            routine_writers = list(writers(deps))
             routine_parity = check_parity(rows, str(args.routine_parity or "routine_parity"), deps,
                                           git_committed(Path(".")))
         except (OSError, json.JSONDecodeError, AttributeError) as exc:
@@ -413,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
                        source_family=args.family, depth=args.depth, type_map=type_map,
-                       routine_parity=routine_parity)
+                       routine_parity=routine_parity, routine_writers=routine_writers)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")

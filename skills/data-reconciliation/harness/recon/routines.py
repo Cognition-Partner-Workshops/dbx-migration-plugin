@@ -7,14 +7,17 @@ as a cutover exception; a run whose rows differ is `failed` and blocks merge (`r
 
     routine_parity: [{routine, status: proven|unproven|failed, evidence, reason?, findings?}]
 
-Run record (one JSON per routine, `<dir>/*.run.json`):
+Run record (one JSON per routine, `<dir>/*.run.json`), committed at the path its `evidence` names:
     {routine, target_family, target_branch, snapshot, evidence,
      golden: {table: [rows]}, observed: {table: [rows]}}
+`load_runs` adds `record`, the repository path the file was read from; a record is graded only as
+the evidence file it names, so `--runs` content cannot borrow some other committed path.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -37,18 +40,22 @@ Committed = Callable[[str], bool]
 
 
 def git_committed(repo: Path) -> Committed:
-    """`committed(path)`: the file is in HEAD's tree of `repo` and present on disk at that path.
-    Untracked, staged-only, deleted and out-of-tree paths are not committed artifacts."""
+    """`committed(path)`: the file is in HEAD's tree of `repo`, present on disk at that path and
+    byte-identical to the committed blob. Untracked, staged-only, edited, deleted and out-of-tree
+    paths are not committed artifacts."""
     repo = Path(repo)
+
+    def git(*args: str) -> bool:
+        try:
+            return subprocess.run(["git", "-C", str(repo), *args], capture_output=True).returncode == 0
+        except OSError:
+            return False
 
     def committed(path: str) -> bool:
         if not path or Path(path).is_absolute() or ".." in Path(path).parts or not (repo / path).is_file():
             return False
-        try:
-            return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"HEAD:{path}"],
-                                  capture_output=True).returncode == 0
-        except OSError:
-            return False
+        return (git("cat-file", "-e", f"HEAD:{path}")
+                and git("diff", "--quiet", "HEAD", "--", path))
     return committed
 
 
@@ -125,6 +132,11 @@ def _grade_run(routine: str, writes: list[str], run: dict, committed: Committed)
     evidence = str(run["evidence"] or "")
     if not evidence:
         return _row(routine, "unproven", None, reason="run record has no evidence")
+    record = run.get("record")
+    if not isinstance(record, str) or not record:
+        return _row(routine, "unproven", evidence, reason="run record location unknown (load it with load_runs)")
+    if record != evidence:
+        return _row(routine, "unproven", evidence, reason=f"run record {record} is not its evidence file {evidence}")
     snapshot = run["snapshot"]
     snap = FIXTURE_SNAPSHOT.fullmatch(snapshot) if isinstance(snapshot, str) else None
     if snap is None:
@@ -195,6 +207,15 @@ def routine_gap(parity: list[dict] | None) -> bool:
     return bool(parity) and any(r.get("status") == "failed" for r in parity)
 
 
+def parity_missing(parity: list[dict] | None, writers: list[str] | None) -> list[str]:
+    """Writing routines (from the unit's dependency analysis) with no row in the parity list; absent
+    parity is not clean parity, so any name here blocks merge (`routine_parity_missing`)."""
+    if not writers:
+        return []
+    listed = {str(r.get("routine", "")).lower() for r in parity or []}
+    return [w for w in writers if w.lower() not in listed]
+
+
 def check_parity(data: object, where: str, dependencies: object = None,
                  committed: Committed | None = None) -> list[dict]:
     """Validate a routine_parity list before result.json carries it. A `proven` row is a claim:
@@ -217,9 +238,12 @@ def check_parity(data: object, where: str, dependencies: object = None,
                 r = _row(r["routine"], "unproven", r["evidence"],
                          reason=f"{where}: evidence {r['evidence']} is not a committed file")
         rows.append(r)
+    seen = [str(r["routine"]).lower() for r in rows]
+    for name in seen:
+        if seen.count(name) > 1:
+            raise ConfigError(f"{where}: {name} appears twice")
     if writing is None:
         return rows
-    seen = [str(r["routine"]).lower() for r in rows]
     for name in seen:
         if name not in writing:
             raise ConfigError(f"{where}: {name} is not in the dependency analysis as a writing routine")
@@ -227,15 +251,22 @@ def check_parity(data: object, where: str, dependencies: object = None,
                    for routine in writing if routine not in seen]
 
 
-def load_runs(path: Path) -> list[dict]:
+def load_runs(path: Path, repo: Path = Path(".")) -> list[dict]:
+    """Read run records and stamp each with `record`, its path inside `repo` (never what the file
+    says about itself); a file outside the repository can be nobody's committed evidence."""
     files = sorted(path.glob("*.run.json")) if path.is_dir() else [path]
+    root = Path(repo).resolve()
     runs = []
     for f in files:
+        rel = Path(os.path.relpath(f.resolve(), root))
+        if ".." in rel.parts:
+            raise ConfigError(f"{f}: is outside the repository {root}")
         try:
             run = json.loads(f.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise ConfigError(f"{f}: cannot read run record: {exc}") from None
         if not isinstance(run, dict):
             raise ConfigError(f"{f}: run record must be a JSON object")
+        run["record"] = rel.as_posix()
         runs.append(run)
     return runs

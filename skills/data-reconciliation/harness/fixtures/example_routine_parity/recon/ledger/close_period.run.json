@@ -3,8 +3,8 @@
   "routine": "app_pkg.close_period",
   "target_family": "lakebase",
   "target_branch": "mig-ledger-exec",
-  "snapshot": "fixture:.migration/fixtures/ledger-2024q1.sql",
-  "evidence": ".migration/recon/ledger/close_period.run.json",
+  "snapshot": "fixture:fixtures/ledger-2024q1.sql",
+  "evidence": "recon/ledger/close_period.run.json",
   "golden": {
     "app.ledger_balance": [
       {

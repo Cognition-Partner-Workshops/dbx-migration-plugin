@@ -10,7 +10,7 @@ import json
 import re
 from pathlib import Path
 
-from .routines import routine_gap
+from .routines import parity_missing, routine_gap
 from .tiers import TierResult
 
 MAX_FINDINGS_IN_REPORT = 50
@@ -43,7 +43,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  provenance_warnings: list[str] | None = None,
                  depth: str = "threshold", cost: dict | None = None,
                  type_map: dict | None = None,
-                 routine_parity: list[dict] | None = None) -> dict:
+                 routine_parity: list[dict] | None = None,
+                 routine_writers: list[str] | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -58,10 +59,11 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     structural = next((t for t in tiers if t.name in ("structural_parity", "schema_parity")), None)
     checks = (structural.stats.get("structural_checks") or {}) if structural else {}
     structural_blind = any(v == "unsupported" for c, v in checks.items() if c != "indexes")
+    unlisted_writers = parity_missing(routine_parity, routine_writers)
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and not structural_blind
                       and (mode != "snapshot" or snapshot is not None)
-                      and not routine_gap(routine_parity))
+                      and not routine_gap(routine_parity) and not unlisted_writers)
     reasons = []
     if structural is not None and (structural.findings or structural.stats.get("unverified")
                                    or structural.stats.get("dictionary_unavailable")
@@ -71,6 +73,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         reasons.append("tier_failed")
     if routine_gap(routine_parity):
         reasons.append("routine_gap")
+    if unlisted_writers:
+        reasons.append("routine_parity_missing")
     if warnings:
         reasons.append("warnings")
     if mode not in ("live", "snapshot", "transactional"):
@@ -102,6 +106,9 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
 def _parity_lines(result: dict) -> list[str]:
     parity = result.get("routine_parity")
     if not parity:
+        if "routine_parity_missing" in result.get("merge_block_reasons", []):
+            return ["", "## Routine parity: routine_parity_missing (the unit has writing routines and no "
+                        "parity list; run `dbx-recon routine-parity` and pass `--routine-parity`)"]
         return []
     counts = {s: sum(1 for r in parity if r["status"] == s) for s in ("proven", "unproven", "failed")}
     lines = ["", f"## Routine parity: {counts['proven']} proven, {counts['unproven']} unproven, "

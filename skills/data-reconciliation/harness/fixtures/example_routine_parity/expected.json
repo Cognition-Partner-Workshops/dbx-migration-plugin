@@ -3,12 +3,12 @@
     {
       "routine": "app_pkg.close_period",
       "status": "proven",
-      "evidence": ".migration/recon/ledger/close_period.run.json"
+      "evidence": "recon/ledger/close_period.run.json"
     },
     {
       "routine": "app_pkg.archive_entries",
       "status": "failed",
-      "evidence": ".migration/recon/ledger/archive_entries.run.json",
+      "evidence": "recon/ledger/archive_entries.run.json",
       "findings": [
         {
           "table": "app.ledger_entry",

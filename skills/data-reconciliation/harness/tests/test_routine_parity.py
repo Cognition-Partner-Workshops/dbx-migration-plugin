@@ -4,6 +4,7 @@ to a golden set. A routine without such a run is `unproven`, never silently clea
 differ is `failed` and blocks merge (`routine_gap`)."""
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -41,10 +42,11 @@ COMMITTED = {EVIDENCE, SNAPSHOT[len("fixture:"):], "fixtures/ledger/2024q1.v2"}.
 
 
 def _run(routine="app_pkg.close_period", family="lakebase", branch="mig-ledger-exec",
-         observed=None, evidence=EVIDENCE, **extra):
+         observed=None, evidence=EVIDENCE, record=EVIDENCE, **extra):
     return {"routine": routine, "target_family": family, "target_branch": branch,
             "snapshot": SNAPSHOT, "golden": GOLDEN,
-            "observed": GOLDEN if observed is None else observed, "evidence": evidence, **extra}
+            "observed": GOLDEN if observed is None else observed, "evidence": evidence,
+            "record": record, **extra}
 
 
 def grade_routines(deps, runs, committed=COMMITTED):
@@ -147,10 +149,31 @@ def test_git_committed_is_true_only_for_a_file_present_on_disk_and_in_head(tmp_p
     assert not committed("recon/b.run.json")  # untracked
     _git(repo, "add", "recon/b.run.json")
     assert not committed("recon/b.run.json")  # staged, not in HEAD
+    (repo / "recon" / "a.run.json").write_text('{"edited": true}\n')
+    assert not committed("recon/a.run.json")  # in HEAD, edited on disk
+    _git(repo, "add", "recon/a.run.json")
+    assert not committed("recon/a.run.json")  # the edit staged, HEAD still differs
+    (repo / "recon" / "a.run.json").write_text("{}\n")
+    assert committed("recon/a.run.json")  # back to the committed blob
     (repo / "fixtures" / "snap").unlink()
     assert not committed("fixtures/snap")  # in HEAD, gone from disk
     assert not committed("../outside") and not committed("/etc/hostname") and not committed("")
     assert not git_committed(tmp_path / "not-a-repo")("recon/a.run.json")
+
+
+def test_a_run_record_is_graded_only_as_the_evidence_file_it_names():
+    """`--runs` content proves nothing by pointing at some other committed path: the record is
+    graded only when it is the committed evidence file itself (`record`, set by load_runs, equals
+    `evidence`), so a fabricated run cannot borrow another run's evidence."""
+    row = grade_routines(DEPS, [_run(record="scratch/close_period.run.json")])["routine_parity"][0]
+    assert row["status"] == "unproven" and row["evidence"] == EVIDENCE
+    assert row["reason"] == f"run record scratch/close_period.run.json is not its evidence file {EVIDENCE}"
+    run = _run()
+    del run["record"]
+    row = grade_routines(DEPS, [run])["routine_parity"][0]
+    assert row["status"] == "unproven" and row["reason"] == "run record location unknown (load it with load_runs)"
+    row = grade_routines(DEPS, [_run(record="scratch/x.run.json", observed={})])["routine_parity"][0]
+    assert row["status"] == "unproven"  # location before rows, like the committed-file checks
 
 
 def test_read_only_routines_are_out_of_scope():
@@ -283,6 +306,16 @@ def test_check_parity_downgrades_a_proven_row_whose_evidence_is_not_committed():
         check_parity(proven, "x")
 
 
+def test_check_parity_refuses_a_routine_listed_twice():
+    """Two rows for one routine (case aside) would let a `proven` row shadow a `failed` one."""
+    rows = [{"routine": "app_pkg.close_period", "status": "failed", "evidence": EVIDENCE, "findings": []},
+            {"routine": "APP_PKG.Close_Period", "status": "proven", "evidence": EVIDENCE}]
+    with pytest.raises(ConfigError, match="x: app_pkg.close_period appears twice"):
+        check_parity(rows, "x", dependencies=DEPS, committed=COMMITTED)
+    with pytest.raises(ConfigError, match="x: app_pkg.close_period appears twice"):
+        check_parity(rows, "x", committed=COMMITTED)
+
+
 def test_check_parity_validates_a_written_result():
     good = [{"routine": "r", "status": "proven", "evidence": "e"}]
     assert check_parity(good, "x", committed=lambda p: True) == good
@@ -293,15 +326,21 @@ def test_check_parity_validates_a_written_result():
 
 
 def test_load_runs_accepts_a_file_or_a_directory(tmp_path):
-    (tmp_path / "a.run.json").write_text(json.dumps(_run()))
-    (tmp_path / "b.run.json").write_text(json.dumps(_run("app_pkg.write_run_log")))
-    (tmp_path / "notes.txt").write_text("ignored")
-    assert [r["routine"] for r in load_runs(tmp_path)] == ["app_pkg.close_period",
-                                                           "app_pkg.write_run_log"]
-    assert load_runs(tmp_path / "a.run.json")[0]["routine"] == "app_pkg.close_period"
-    (tmp_path / "c.run.json").write_text("{")
+    runs = tmp_path / "recon" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "a.run.json").write_text(json.dumps(_run(record="lies")))
+    (runs / "b.run.json").write_text(json.dumps(_run("app_pkg.write_run_log")))
+    (runs / "notes.txt").write_text("ignored")
+    loaded = load_runs(runs, tmp_path)
+    assert [r["routine"] for r in loaded] == ["app_pkg.close_period", "app_pkg.write_run_log"]
+    # `record` is where the file sits in the repo, never what the file says about itself
+    assert [r["record"] for r in loaded] == ["recon/runs/a.run.json", "recon/runs/b.run.json"]
+    assert load_runs(runs / "a.run.json", tmp_path)[0]["record"] == "recon/runs/a.run.json"
+    with pytest.raises(ConfigError, match="a.run.json: is outside"):
+        load_runs(runs / "a.run.json", tmp_path / "elsewhere")
+    (runs / "c.run.json").write_text("{")
     with pytest.raises(ConfigError, match="c.run.json"):
-        load_runs(tmp_path)
+        load_runs(runs, tmp_path)
 
 
 # ---- result.json / merge -------------------------------------------------------------------
@@ -334,6 +373,30 @@ def test_result_without_parity_omits_it():
     source, target = make_green()
     result = run_recon("orders", "live", SPEC, TOL, RULES, source, target)
     assert result["routine_parity"] is None and "routine_gap" not in result["merge_block_reasons"]
+
+
+def test_a_unit_with_writing_routines_and_no_complete_parity_list_is_not_merge_eligible(tmp_path):
+    """Absent parity is not clean parity at the result level either: given the unit's writers,
+    `build_result` blocks with `routine_parity_missing` unless every writer has a row; `unproven`
+    rows in a complete list stay eligible (they are cutover exceptions, not merge blocks)."""
+    source, target = make_green()
+    writers_ = ["app_pkg.close_period", "app_pkg.write_run_log"]
+    result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, out_dir=tmp_path,
+                       routine_writers=writers_)
+    assert result["verdict"] == "PASS" and result["merge_eligible"] is False
+    assert result["merge_block_reasons"] == ["routine_parity_missing"]
+    assert "routine_parity_missing" in (tmp_path / "recon.summary.md").read_text()
+    partial = [{"routine": "APP_PKG.close_period", "status": "proven", "evidence": EVIDENCE}]
+    result = run_recon("orders", "live", FLAT, TOL, RULES, source, target,
+                       routine_parity=partial, routine_writers=writers_)
+    assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["routine_parity_missing"]
+    complete = partial + [{"routine": "app_pkg.write_run_log", "status": "unproven", "evidence": None,
+                           "reason": "no committed run"}]
+    result = run_recon("orders", "live", FLAT, TOL, RULES, source, target,
+                       routine_parity=complete, routine_writers=writers_)
+    assert result["merge_eligible"] is True and result["merge_block_reasons"] == []
+    result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, routine_writers=[])
+    assert result["merge_eligible"] is True  # the analysis says nothing writes
 
 
 def _cli_run(tmp_path, monkeypatch, *extra):
@@ -404,36 +467,66 @@ def test_cli_run_downgrades_proven_rows_whose_evidence_is_not_in_the_committed_t
 
 # ---- fixture -----------------------------------------------------------------------------
 
-FIXTURE_ARTIFACTS = (".migration/recon/ledger/close_period.run.json",
-                     ".migration/recon/ledger/archive_entries.run.json",
-                     ".migration/fixtures/ledger-2024q1.sql")
+# the example is laid out like a unit's repository: each run record sits at the path its
+# `evidence` names, next to the fixture snapshot it ran against
+FIXTURE_RUNS = "recon/ledger"
+FIXTURE_ARTIFACTS = (f"{FIXTURE_RUNS}/close_period.run.json", f"{FIXTURE_RUNS}/archive_entries.run.json",
+                     "fixtures/ledger-2024q1.sql")
 
 
 def test_example_fixture_has_one_of_each_status():
     deps = json.loads((FIXTURE / "dependencies.json").read_text())
-    out = grade_routines(deps, load_runs(FIXTURE / "runs"), committed=set(FIXTURE_ARTIFACTS).__contains__)
+    out = grade_routines(deps, load_runs(FIXTURE / FIXTURE_RUNS, FIXTURE),
+                         committed=set(FIXTURE_ARTIFACTS).__contains__)
     assert out == json.loads((FIXTURE / "expected.json").read_text())
     assert sorted(r["status"] for r in out["routine_parity"]) == ["failed", "proven", "unproven"]
+
+
+def _fixture_repo(path):
+    """The example committed as a repository: the artifacts are the fixture's own files."""
+    repo = _committed_repo(path)
+    for f in FIXTURE_ARTIFACTS:
+        (repo / f).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(FIXTURE / f, repo / f)
+        _git(repo, "add", f)
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", "artifacts")
+    return repo
 
 
 # ---- CLI ---------------------------------------------------------------------------------
 
 def test_cli_routine_parity_writes_the_result_and_exits_non_zero_on_failed(tmp_path, capsys):
-    repo = _committed_repo(tmp_path / "repo", *FIXTURE_ARTIFACTS)
+    repo = _fixture_repo(tmp_path / "repo")
     rc = cli.main(["routine-parity", "--dependencies", str(FIXTURE / "dependencies.json"),
-                   "--runs", str(FIXTURE / "runs"), "--out", str(tmp_path), "--repo", str(repo)])
+                   "--runs", str(repo / FIXTURE_RUNS), "--out", str(tmp_path), "--repo", str(repo)])
     assert rc == 1
     out = json.loads((tmp_path / "routine_parity.json").read_text())
     assert out == json.loads((FIXTURE / "expected.json").read_text())
     assert "1 failed" in capsys.readouterr().out
+    # the same records read from outside the repository cannot be its committed evidence
+    with pytest.raises(SystemExit, match="is outside"):
+        cli.main(["routine-parity", "--dependencies", str(FIXTURE / "dependencies.json"),
+                  "--runs", str(FIXTURE / FIXTURE_RUNS), "--out", str(tmp_path / "o2"), "--repo", str(repo)])
+    # and read from another place inside it, they are not the evidence they name
+    shutil.copytree(repo / FIXTURE_RUNS, repo / "scratch")
+    rc = cli.main(["routine-parity", "--dependencies", str(FIXTURE / "dependencies.json"),
+                   "--runs", str(repo / "scratch"), "--out", str(tmp_path / "o2"), "--repo", str(repo)])
+    assert rc == 2
+    out = json.loads((tmp_path / "o2" / "routine_parity.json").read_text())
+    assert [r["status"] for r in out["routine_parity"]] == ["unproven"] * 3
+    assert all("is not its evidence file" in r["reason"] for r in out["routine_parity"][:2])
 
 
 def test_cli_routine_parity_checks_artifacts_against_the_repo_it_runs_in(tmp_path, monkeypatch, capsys):
     """Without --repo the current directory is the repository; artifacts the fixture names but the
     tree does not hold leave every run `unproven`."""
-    monkeypatch.chdir(_committed_repo(tmp_path / "empty"))
+    repo = _committed_repo(tmp_path / "empty")
+    monkeypatch.chdir(repo)
+    for f in FIXTURE_ARTIFACTS[:2]:  # the records are in place, but nothing is committed
+        (repo / f).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(FIXTURE / f, repo / f)
     rc = cli.main(["routine-parity", "--dependencies", str(FIXTURE / "dependencies.json"),
-                   "--runs", str(FIXTURE / "runs"), "--out", str(tmp_path / "o")])
+                   "--runs", FIXTURE_RUNS, "--out", str(tmp_path / "o")])
     assert rc == 2
     out = json.loads((tmp_path / "o" / "routine_parity.json").read_text())
     assert [r["status"] for r in out["routine_parity"]] == ["unproven"] * 3
@@ -441,14 +534,25 @@ def test_cli_routine_parity_checks_artifacts_against_the_repo_it_runs_in(tmp_pat
 
 
 def test_cli_routine_parity_is_clean_only_when_every_writer_is_proven(tmp_path):
-    repo = _committed_repo(tmp_path / "repo", EVIDENCE, SNAPSHOT[len("fixture:"):])
+    repo = _committed_repo(tmp_path / "repo", SNAPSHOT[len("fixture:"):])
     (tmp_path / "deps.json").write_text(json.dumps(DEPS))
-    (tmp_path / "runs").mkdir()
-    (tmp_path / "runs" / "a.run.json").write_text(json.dumps(_run()))
+    runs = repo / "pr-42" / "recon" / "ledger"
+    runs.mkdir(parents=True)
+
+    def commit(name, run):
+        (runs / name).write_text(json.dumps(run))
+        _git(repo, "add", f"pr-42/recon/ledger/{name}")
+        _git(repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", name)
+
+    commit("close_period.run.json", _run())
     args = ["routine-parity", "--dependencies", str(tmp_path / "deps.json"),
-            "--runs", str(tmp_path / "runs"), "--out", str(tmp_path / "o"), "--repo", str(repo)]
+            "--runs", str(runs), "--out", str(tmp_path / "o"), "--repo", str(repo)]
     assert cli.main(args) == 2  # unproven: not a failure, not clean
-    (tmp_path / "runs" / "b.run.json").write_text(json.dumps(_run(
-        "app_pkg.write_run_log", observed={"app.run_log": []},
-        golden={"app.run_log": []})))
+    commit("write_run_log.run.json", _run(
+        "app_pkg.write_run_log", observed={"app.run_log": []}, golden={"app.run_log": []},
+        evidence="pr-42/recon/ledger/write_run_log.run.json"))
     assert cli.main(args) == 0
+    (runs / "write_run_log.run.json").write_text(json.dumps(_run(
+        "app_pkg.write_run_log", observed={"app.run_log": [{"run_id": 1}]}, golden={"app.run_log": []},
+        evidence="pr-42/recon/ledger/write_run_log.run.json")))
+    assert cli.main(args) == 2  # edited after the commit: not the committed run any more
