@@ -414,9 +414,15 @@ def validate_manifest(m, doctor=None):
         raise SystemExit("manifest has no batches")
     if (isinstance(m["wave"], bool) or not isinstance(m["wave"], int) or m["wave"] < 0):
         raise SystemExit("manifest key 'wave' must be a non-negative integer")
-    for key in ("width", "breaker_threshold", "max_minutes"):
+    for key in ("width", "breaker_threshold"):
         if key in m and (isinstance(m[key], bool) or not isinstance(m[key], int) or m[key] <= 0):
             raise SystemExit(f"manifest key '{key}' must be a positive integer")
+    if "max_minutes" in m and (isinstance(m["max_minutes"], bool) or not isinstance(m["max_minutes"], int)
+                              or not 0 < m["max_minutes"] <= 60):
+        raise SystemExit("manifest key 'max_minutes' must be a positive integer of at most 60 minutes")
+    if "secrets" in m and (not isinstance(m["secrets"], list)
+                           or not all(isinstance(s, str) for s in m["secrets"])):
+        raise SystemExit("wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
     if m["wave"] == 0 and m.get("width", 20) != 1:
         raise SystemExit("wave 0 is the serial shared-objects wave: set width to 1")
     if not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
@@ -457,8 +463,12 @@ def validate_manifest(m, doctor=None):
         if "verify_depth" in b and b["verify_depth"] not in VERIFY_DEPTHS:
             raise SystemExit(f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
         if "max_minutes" in b and (isinstance(b["max_minutes"], bool)
-                                   or not isinstance(b["max_minutes"], int) or b["max_minutes"] <= 0):
-            raise SystemExit(f"batch {b['id']} max_minutes must be a positive integer")
+                                   or not isinstance(b["max_minutes"], int)
+                                   or not 0 < b["max_minutes"] <= 60):
+            raise SystemExit(f"batch {b['id']} max_minutes must be a positive integer of at most 60 minutes")
+        if "secrets" in b and (not isinstance(b["secrets"], list)
+                               or not all(isinstance(s, str) for s in b["secrets"])):
+            raise SystemExit("wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
         bad = [u for u in b["units"] if not isinstance(u, str) or not UNIT_ID.fullmatch(u)]
         if bad:
             raise SystemExit(f"batch {b['id']} unit id(s) {bad!r} are not a plain directory name (letters, digits, "
@@ -1673,7 +1683,8 @@ async def run_batch(batch, sem, breaker):
         prompt = child_prompt(batch)
         try:
             out = await agent(prompt, phase="migrate", schema=CHILD_SCHEMA,
-                              label=batch["id"], repos=[REPO])
+                              label=batch["id"], repos=[REPO],
+                              soft_time_limit_minutes=batch_max_minutes(batch))
         except WorkflowAgentError as e:
             out = {"status": "FAIL", "recon_verdict": "NOT_RUN", "failure_class": "session_died",
                    "one_line_summary": f"child session died: {e}"}

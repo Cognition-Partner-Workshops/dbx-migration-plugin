@@ -2529,14 +2529,51 @@ def test_manifest_secret_names_collects_lists_and_brief_references():
     manifest = {
         "secrets": ["app/db-host"],
         "batches": [
-            {"id": "b-1", "secrets": ["app/db-user", 7],
+            {"id": "b-1", "secrets": ["app/db-user"],
              "brief": "read {{secrets/app/db-password}} then dbutils.secrets.get(scope=\"app\", key=\"db-token\")"},
             {"id": "b-2",
              "brief": "also secrets/warehouse/token and secrets.get(\"app\", \"db-host\")"},
         ],
     }
     assert doctor.manifest_secret_names(manifest) == [
-        "7", "app/db-host", "app/db-password", "app/db-token", "app/db-user", "warehouse/token"]
+        "app/db-host", "app/db-password", "app/db-token", "app/db-user", "warehouse/token"]
+
+
+def test_manifest_secret_names_parses_secrets_get_in_any_argument_order():
+    manifest = {"batches": [{"id": "b", "brief": (
+        'a = dbutils.secrets.get(key="password", scope="payments")\n'
+        'b = secrets.get("s", key="k")\n'
+        "c = dbutils.secrets.get(scope='app', key='db-token')\n"
+        'd = secrets.get("only")\n')}]}
+    assert doctor.manifest_secret_names(manifest) == ["app/db-token", "payments/password", "s/k"]
+
+
+@pytest.mark.parametrize("bad", ["a/b", 7, None, ["ok/k", 3]])
+def test_manifest_secret_names_rejects_a_non_list_of_strings(bad):
+    with pytest.raises(SystemExit, match="must be a list of scope/key strings"):
+        doctor.manifest_secret_names({"secrets": bad, "batches": []})
+    with pytest.raises(SystemExit, match="must be a list of scope/key strings"):
+        doctor.manifest_secret_names({"batches": [{"id": "b", "secrets": bad}]})
+
+
+def test_wave_manifest_with_bad_secrets_shape_exits_cleanly(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({
+        "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
+        "source": {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
+        "secrets": "app/db-user",
+    }))
+    result = subprocess.run(
+        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+         "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    assert "must be a list of scope/key strings" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not manifest.with_suffix(".doctor.json").exists()
 
 
 def test_manifest_secret_names_ignores_other_text():

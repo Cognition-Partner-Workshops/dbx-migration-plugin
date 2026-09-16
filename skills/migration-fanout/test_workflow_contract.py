@@ -160,7 +160,7 @@ async def register_workflow(meta):
     CALLS.write_text(json.dumps([{{"kind": "register", "meta": meta}}]))
 async def agent(prompt, **kwargs):
     calls = json.loads(CALLS.read_text()) if CALLS.exists() else []
-    calls.append({{"kind": "agent", "label": kwargs.get("label"), "prompt": prompt}})
+    calls.append({{"kind": "agent", "label": kwargs.get("label"), "prompt": prompt, "kwargs": kwargs}})
     CALLS.write_text(json.dumps(calls))
     reports = json.loads(REPORTS.read_text())
     report = reports.pop(0)
@@ -834,6 +834,18 @@ def test_batch_max_minutes_overrides_the_manifest_for_its_child(tmp_path):
     assert proc.returncode == 0
     assert "Time budget: 30 minutes" in [c for c in calls if c.get("label") == "b-1"][0]["prompt"]
     assert _migrate_limit(calls) == 30
+
+
+def test_migrate_agent_call_carries_the_batch_soft_time_limit(tmp_path):
+    ws, cwd = _workspace(tmp_path / "default")
+    proc, calls = _run(cwd, tmp_path / "default", [_pass_report()])
+    assert proc.returncode == 0
+    assert [c for c in calls if c.get("label") == "b-1"][0]["kwargs"]["soft_time_limit_minutes"] == 45
+
+    ws, cwd = _workspace(tmp_path / "thirty", batch_max_minutes=30)
+    proc, calls = _run(cwd, tmp_path / "thirty", [_pass_report()])
+    assert proc.returncode == 0
+    assert [c for c in calls if c.get("label") == "b-1"][0]["kwargs"]["soft_time_limit_minutes"] == 30
 
 
 def test_pointer_above_the_cwd_names_the_workspace(tmp_path):

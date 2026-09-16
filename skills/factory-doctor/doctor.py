@@ -1436,19 +1436,39 @@ def _norm_host(host: str) -> str:
 
 
 SECRET_REF = re.compile(r"(?:\{\{\s*secrets/|\bsecrets/)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
-SECRET_GET = re.compile(r"""secrets\.get\(\s*(?:scope\s*=\s*)?["']([^"']+)["']\s*,\s*(?:key\s*=\s*)?["']([^"']+)["']""")
+SECRET_GET_CALL = re.compile(r"secrets\.get\(([^()]*)\)")
+SECRET_GET_ARG = re.compile(r"""(?:(scope|key)\s*=\s*)?["']([^"']+)["']""")
+
+
+def _secret_get_names(text: str) -> set:
+    out = set()
+    for call in SECRET_GET_CALL.finditer(text):
+        got = {}
+        for arg in call.group(1).split(","):
+            m = SECRET_GET_ARG.fullmatch(arg.strip())
+            if m:
+                got.setdefault(m.group(1) or ("scope" if "scope" not in got else "key"), m.group(2))
+        if "scope" in got and "key" in got:
+            out.add(f"{got['scope']}/{got['key']}")
+    return out
+
 
 def manifest_secret_names(manifest: dict) -> list[str]:
-    names, briefs = [], []
+    lists, briefs = [manifest.get("secrets", [])], []
     for b in manifest.get("batches", []):
         if isinstance(b, dict):
-            names += list(b.get("secrets", []))
+            lists.append(b.get("secrets", []))
             briefs.append(b.get("brief") or "")
-    names += list(manifest.get("secrets", []))
-    found = {n if isinstance(n, str) else str(n) for n in names}
+    found = set()
+    for lst in lists:
+        if not isinstance(lst, list) or not all(isinstance(n, str) for n in lst):
+            raise SystemExit("wave manifest 'secrets' (top level or per batch) must be a list of "
+                             "scope/key strings")
+        found.update(lst)
     for brief in briefs:
-        for rx in (SECRET_REF, SECRET_GET):
-            found.update(f"{scope}/{key}" for scope, key in rx.findall(str(brief)))
+        text = str(brief)
+        found.update(f"{scope}/{key}" for scope, key in SECRET_REF.findall(text))
+        found.update(_secret_get_names(text))
     return sorted(found)
 
 
