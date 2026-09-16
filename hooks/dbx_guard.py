@@ -773,8 +773,12 @@ def _conn(seg: _Seg, cfg: GuardConfig, sql: str) -> tuple[list[str], list[str], 
     hosts = [(_host(v) if _SHELL_VAR.fullmatch(v) else _host(v).lower()) for v in raw_hosts if v]
     dbs = {v.strip("'\"") for v in raw_dbs if v.strip("'\"")}
     exact = seg.argv0 in _CASE_SENSITIVE_DB
+    on_target = bool(hosts) and all(
+        h in cfg.target_hosts if _SHELL_VAR.fullmatch(v) else h in {t.lower() for t in cfg.target_hosts}
+        for h, v in zip(hosts, raw_hosts)
+    )
     hits = [t for t in cfg.legacy_sources if t in secrets or any(h == t.lower() for h, v in zip(hosts, raw_hosts) if not _SHELL_VAR.fullmatch(v))
-            or any(d == t if exact else d.lower() == t.lower() for d in dbs)]
+            or (not on_target and any(d == t if exact else d.lower() == t.lower() for d in dbs))]
     return hits, hosts, secrets & set(hosts), dbs, unresolved
 
 def _check_unreadable(segs: list[_Seg], cfg: GuardConfig, text: str) -> list[str]:
@@ -1060,31 +1064,65 @@ def _strip_python_comments(text: str) -> str:
     return "".join(lines)
 
 def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
-    """Literal SQL handed to an executor in a program, judged by the connection it runs on: legacy (secret name, host, DSN) blocks a
-    write, a run-time connection blocks a write, a Databricks or unknown connection is held to the catalog allowlist."""
     text, unreadable = _python_texts(seg, root)
     if unreadable and seg.argv0 == "spark-submit":
         return [f"spark-submit script {unreadable!r} cannot be read; the guard cannot clear a Spark job it cannot inspect"]
     text = _strip_python_comments(text)
-    calls, env_names = list(_PY_CONNECT.finditer(text)), [m.group(1) or m.group(2) for m in _PY_ENV.finditer(text)]
-    conn = _PY_ENV.sub(" ", " ".join([*(m.group() for m in calls), *(m.group() for m in _PY_DSN.finditer(text))]))
+    calls = list(_PY_CONNECT.finditer(text))
+    env_names = [m.group(1) or m.group(2) for m in _PY_ENV.finditer(text)]
+    call_conn = " ".join(m.group(2) for m in calls)
+    conn = _PY_ENV.sub(" ", " ".join([call_conn, *(m.group() for m in _PY_DSN.finditer(text))]))
+    host_values = [m.group(1) or m.group(2) for m in re.finditer(
+        r"""(?i)(?:host|server|data source)\s*=\s*['"]?([^'";,\s)]+)|://(?:[^@/\s]*@)?([^:/?\s;'"}]+)""", conn)]
+    hosts = [h.lower() for h in host_values]
+    foreign = [h for h in hosts if h not in {t.lower() for t in cfg.target_hosts}]
+    resolved_target = bool(hosts) and not foreign or any(n in cfg.target_hosts for n in env_names)
+    db_values = [m.group(1) or m.group(2) for m in re.finditer(
+        r"""(?i)(?:dbname|database|initial catalog)\s*=\s*['"]?([^'";,\s)]+)|://[^/\s'"}]+/([^?\s'";]+)""", call_conn)]
+    dbs = [d.strip("'\"") for d in db_values if d.strip("'\"")]
+    default = _norm(dbs[0]) if len(set(dbs)) == 1 else None
+    db_free = conn
+    for db in dbs:
+        db_free = db_free.replace(db, " ")
     argv_words = [_host(w) for w in seg.argv[1:] if not w.startswith("-")]
-    hits = [t for t in cfg.legacy_sources if t in env_names or _is_token(conn, t) or any(w.lower() == t.lower() for w in argv_words)]
+    pg = bool(re.search(r"\b(?:psycopg2?|asyncpg|pg8000)\b", text, re.IGNORECASE))
+    hits = [t for t in cfg.legacy_sources if t in env_names or _is_token(db_free, t) or
+            any(w.lower() == t.lower() for w in argv_words) or
+            (not resolved_target and any(d == t if pg else d.lower() == t.lower() for d in dbs))]
     known = set(cfg.target_hosts) | set(cfg.legacy_sources)
     unresolved = any(n not in known for n in env_names) or any(
-        m.group(1).lower() in ("connect", "create_engine") and not re.search(r"""['"]""", m.group(2)) and not _PY_ENV.search(m.group(2)) for m in calls)
-    hosts = [h.lower() for h in re.findall(r"(?i)(?:host|server|data source)\s*=\s*['\"]?([^'\";,\s)]+)|://(?:[^@/\s]*@)?([^:/?\s;'\"]+)", conn) for h in h if h]
-    foreign = [h for h in hosts if h not in {t.lower() for t in cfg.target_hosts}]
-    resolved_target = (hosts and not foreign) or any(n in cfg.target_hosts for n in env_names)
-    dbs = {_norm(d) for d in re.findall(r"(?i)(?:dbname|database|initial catalog)\s*=\s*['\"]?([^'\";,\s)]+)|://[^/\s'\"]+/([^?\s'\";]+)", conn) for d in d if d}
-    default = next(iter(dbs)) if len(dbs) == 1 else None
+        m.group(1).lower() in ("connect", "create_engine") and not re.search(r"""['"]""", m.group(2))
+        and not _PY_ENV.search(m.group(2)) for m in calls)
     databricks = bool(re.search(r"\b(?:databricks|spark)\b", text + " " + " ".join(seg.argv), re.IGNORECASE))
     literals = list(_PY_LITERAL.finditer(text))
     if not (calls or env_names or _PY_DSN.search(text)):
         return [v for m in literals for v in _catalog_violations(m.group(2), cfg, None, "")]
+    statements = [m.group(2) for m in literals]
+    opaque = False
+    for match in re.finditer(_DYNAMIC_SQL_EXECUTOR, text, re.IGNORECASE):
+        if any(match.start() == literal.start() for literal in literals):
+            continue
+        tail = text[match.end():].lstrip()
+        name = None
+        if tail.startswith("("):
+            call = re.match(r"\(\s*([A-Za-z_]\w*)\s*\)", tail)
+            if call:
+                name = call.group(1)
+            else:
+                opaque = True
+        elif (call := re.match(r"([A-Za-z_]\w*)\b", tail)):
+            name = call.group(1)
+        else:
+            opaque = True
+        if name:
+            assignment = re.search(rf"\b{name}\s*=\s*[rbuf]*(['\"]{{3}}|['\"])(.*?)\1", text, re.S)
+            if assignment:
+                statements.append(assignment.group(2))
+            else:
+                opaque = True
     violations = []
-    for m in literals:
-        if bad := _non_reads(m.group(2)):
+    for statement in statements:
+        if bad := _non_reads(statement):
             if hits:
                 violations.append(_Legacy(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}`" + _LEGACY_TAIL))
             elif unresolved:
@@ -1094,13 +1132,12 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                 violations.append(f"non-read statement in a program to host(s) {sorted(set(hosts))} not in target_hosts {cfg.target_hosts}: "
                                   f"`{bad[0][:80]}`")
             elif databricks and not resolved_target:
-                violations += _catalog_violations(m.group(2), cfg, None, "Databricks client")
+                violations += _catalog_violations(statement, cfg, None, "Databricks client")
             else:
-                violations += _catalog_violations(m.group(2), cfg, default, "program")
-    opaque = len(re.findall(_DYNAMIC_SQL_EXECUTOR, text, re.IGNORECASE)) > len(literals)
+                violations += _catalog_violations(statement, cfg, default, "program")
     if opaque and hits:
         violations.append(_Legacy(f"statement built at run time against legacy source {hits} in a program" + _LEGACY_TAIL))
-    elif opaque and (foreign or (unresolved and (not literals or _non_reads(text)))):
+    elif opaque:
         violations.append("Python statement or connection is built at run time; the guard cannot resolve a non-read statement")
     return violations
 

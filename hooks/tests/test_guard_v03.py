@@ -62,7 +62,11 @@ def test_database_matching_depends_on_client():
     psql = block("psql -h lakebase-host -d ordersdb -c 'DELETE FROM t'")
     assert "legacy source" not in psql.reason
     assert "allowlist" in psql.reason
-    assert "legacy source" in block("sqlcmd -S lakebase-host -d ordersdb -Q 'DELETE FROM t'").reason
+    sqlcmd = block("sqlcmd -S lakebase-host -d ordersdb -Q 'DELETE FROM t'")
+    assert "legacy source" not in sqlcmd.reason and "ordersdb" in sqlcmd.reason
+    assert "legacy source" in block("sqlcmd -d OrdersDB -Q 'DELETE FROM t'").reason
+    assert "legacy source" in block("psql -d OrdersDb -c 'DELETE FROM t'").reason
+    assert "legacy source" not in block("psql -d ordersdb -c 'DELETE FROM t'").reason
 
 
 @pytest.mark.parametrize("command", [
@@ -172,7 +176,7 @@ def test_python_runtime_connection_only_blocks_writes(command, expected):
 def test_python_variable_sql_on_a_legacy_connection_fails_closed():
     verdict = block('python3 -c "c = psycopg2.connect(host=\'tdprod.corp\'); q = \'DROP TABLE t\'; c.cursor().execute(q)"')
     assert "legacy source" in verdict.reason
-    approve('python3 -c "c = psycopg2.connect(host=\'lakebase-host\', dbname=\'mig_cat\'); c.cursor().execute(q)"')
+    block('python3 -c "c = psycopg2.connect(host=\'lakebase-host\', dbname=\'mig_cat\'); c.cursor().execute(q)"')
 
 
 def test_python_foreign_host_is_checked_even_when_databricks_is_imported():
@@ -206,6 +210,11 @@ def test_python_databricks_destination_still_checks_catalog():
         "statement='INSERT INTO prod.s.t VALUES (1)', warehouse_id='x')\""
     )
     assert "prod" in verdict.reason
+
+
+def test_python_spark_sql_without_connection_uses_catalog_allowlist():
+    approve('python3 -c "spark.sql(\'CREATE TABLE mig_cat.s.t (x int)\')"')
+    block('python3 -c "spark.sql(\'CREATE TABLE prod.s.t (x int)\')"')
 
 
 @pytest.mark.parametrize("command", [
@@ -256,3 +265,33 @@ def test_force_push_decision_is_unchanged():
 def test_renamed_client_is_blocked():
     verdict = block("cp $(which sqlcmd) ./x && ./x -S tdprod.corp -Q 'DROP TABLE t'")
     assert "copies or renames client" in verdict.reason
+
+
+def test_target_host_decides_when_a_name_is_both_legacy_and_catalog():
+    cfg = g.GuardConfig.from_dict({"catalogs": ["otterorders"], "legacy_sources": ["OtterOrders", "sqlsrv.legacy.corp"],
+                                   "target_hosts": ["lakebase.example.net"], "guard_mode": "block"})
+    v = g.evaluate("python3 -c \"import psycopg; c=psycopg.connect(host='lakebase.example.net', dbname='otterorders'); "
+                   "c.execute('ALTER TABLE t ADD x int')\"", cfg)
+    assert v.decision == "approve", v.reason
+    v = g.evaluate("psql -h lakebase.example.net -d OtterOrders -c 'INSERT INTO t VALUES (1)'", cfg)
+    assert v.decision == "approve", v.reason
+    v = g.evaluate("psql -h lakebase.example.net -d nope -c 'INSERT INTO t VALUES (1)'", cfg)
+    assert v.decision == "block" and "legacy" not in v.reason and "nope" in v.reason, v.reason
+    v = g.evaluate("sqlcmd -S sqlsrv.legacy.corp -d otterorders -Q 'INSERT INTO t VALUES (1)'", cfg)
+    assert v.decision == "block" and "legacy" in v.reason, v.reason
+    v = g.evaluate("psql -d OtterOrders -c 'INSERT INTO t VALUES (1)'", cfg)
+    assert v.decision == "block" and "legacy" in v.reason, v.reason
+    v = g.evaluate("python3 -c \"import psycopg; c=psycopg.connect(dbname='OtterOrders'); c.execute('ALTER TABLE t ADD x int')\"", cfg)
+    assert v.decision == "block" and "legacy" in v.reason, v.reason
+    v = g.evaluate("python3 -c \"import pyodbc; c=pyodbc.connect('Server=x;Database=otterorders'); c.execute('ALTER TABLE t ADD x int')\"", cfg)
+    assert v.decision == "block" and "legacy" in v.reason, v.reason
+
+
+def test_python_default_database_comes_only_from_the_connection():
+    block("python3 -c \"c=psycopg2.connect(host='lakebase-host'); note='Database=mig_cat'; c.execute('DROP TABLE staging')\"")
+
+
+def test_python_variable_sql_on_a_target_connection_resolves_or_fails_closed():
+    block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); q='DROP TABLE prod.s.t'; c.execute(q)\"")
+    approve("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); q='DROP TABLE staging'; c.execute(q)\"")
+    block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); c.execute(build())\"")
