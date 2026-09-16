@@ -147,6 +147,19 @@ def test_declared_shape_fails_closed_on_an_alter_it_cannot_apply(alter):
         declared_shape(f"CREATE TABLE t (a INT, b INT); {alter};")
 
 
+@pytest.mark.parametrize("create", [
+    "CREATE TABLE derived AS SELECT id FROM anchor",
+    "CREATE OR REPLACE TABLE derived USING DELTA AS SELECT id FROM anchor",
+    "CREATE TABLE IF NOT EXISTS derived LIKE anchor",
+    "CREATE TABLE derived (LIKE anchor INCLUDING ALL)",
+])
+def test_declared_shape_fails_closed_on_a_create_table_without_a_column_list(create):
+    """CTAS and LIKE create a table whose columns the parser cannot derive; letting them fall
+    through as `other` would grade a shape that omits the table."""
+    with pytest.raises(ConfigError, match=r"CREATE TABLE.*derived.*--expected-shape"):
+        declared_shape(f"CREATE TABLE anchor (id INT); {create};")
+
+
 def test_declared_shape_lets_property_and_owner_alters_through_as_other():
     shape = declared_shape("CREATE TABLE t (a INT); ALTER TABLE t SET TBLPROPERTIES ('k' = 'v');\n"
                            "ALTER TABLE t UNSET TBLPROPERTIES ('k'); ALTER TABLE t SET OWNER TO `grp`;")
@@ -546,6 +559,22 @@ def test_databricks_target_reads_the_observed_shape_from_information_schema(monk
     with pytest.raises(SystemExit, match="not in"):
         cli.main(["shape", "--target-kind", "databricks", "--target-secret", "D", "--target-catalog", "prod",
                   "--target-schema", "sales", "--table", "orders", "--out", str(tmp_path / "s2.json")])
+
+
+def test_shape_refuses_an_absent_table_rather_than_recording_it_empty(monkeypatch, tmp_path):
+    """A catalog with no rows for the table means the table is not there; writing `[]` would let a
+    pre_shape claim the table existed and turn a fresh run into an `evolved` pass."""
+    from recon import adapters
+    conn = _StubConn([])
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
+    out = tmp_path / "shape.json"
+    with pytest.raises(SystemExit, match=r"shape: .*orders.* not (found|in) .*mig\.sales"):
+        cli.main(["shape", "--target-kind", "databricks", "--target-secret", "D", "--target-catalog", "mig",
+                  "--target-schema", "sales", "--table", "orders", "--out", str(out)])
+    assert not out.exists()
 
 
 def test_lakebase_target_reads_the_observed_shape_from_pg_attribute(monkeypatch):

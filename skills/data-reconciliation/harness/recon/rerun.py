@@ -45,6 +45,9 @@ _ALTER_NEUTRAL = re.compile(
     r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?[^\s(]+\s+(?:SET|UNSET)\s+(?:TBLPROPERTIES|OWNER)\b",
     re.IGNORECASE | re.DOTALL)
 _ALTER = re.compile(r"^ALTER\s+TABLE\b", re.IGNORECASE)
+_CREATE_ANY = re.compile(
+    r"^CREATE\s+(?:OR\s+REPLACE\s+)?(?:EXTERNAL\s+|TEMPORARY\s+|TEMP\s+|UNLOGGED\s+)?"
+    r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[^\s(]+)", re.IGNORECASE | re.DOTALL)
 _TABLE_PK = re.compile(r"^(?:CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\s*\(", re.IGNORECASE | re.DOTALL)
 
 
@@ -179,7 +182,11 @@ def declared_shape(sql: str) -> dict:
         if m:
             name = _ident(m.group("name"))
             end = _balanced(stmt, m.end() - 1)
-            tables[name] = _table_columns(stmt[m.end():end - 1])
+            body = stmt[m.end():end - 1]
+            if re.match(r"\s*LIKE\b", body, re.IGNORECASE):
+                raise ConfigError(f"CREATE TABLE {name} LIKE: the columns are not in the DDL; "
+                                  "pass --expected-shape instead")
+            tables[name] = _table_columns(body)
             counts["create_table"] += 1
             if m.group("ine") and name not in if_not_exists:
                 if_not_exists.append(name)
@@ -198,6 +205,10 @@ def declared_shape(sql: str) -> dict:
             if name not in altered:
                 altered.append(name)
             continue
+        m = _CREATE_ANY.match(stmt)
+        if m:
+            raise ConfigError(f"CREATE TABLE {_ident(m.group('name'))} without a column list (AS SELECT, "
+                              "LIKE): the columns are not in the DDL; pass --expected-shape instead")
         if _ALTER.match(stmt) and not _ALTER_NEUTRAL.match(stmt):
             raise ConfigError(f"cannot apply ALTER TABLE {stmt[12:60].strip()!r} to the declared shape "
                               "(only ADD COLUMN(S) is applied); pass --expected-shape instead")
