@@ -1635,13 +1635,31 @@ def validate_close(close, to_merge) -> list[str]:
     return problems
 
 
+def _patch_id(a, b):
+    git = ["git", "-C", str(ROOT)]
+    diff = subprocess.run(git + ["diff-tree", "-p", "-U0", "--no-color", a, b],
+                          check=True, capture_output=True, text=True, timeout=300).stdout
+    return subprocess.run(git + ["patch-id", "--stable"], input=diff, check=True,
+                          capture_output=True, text=True, timeout=300).stdout.split()[:1]
+
+
+def _same_change(parent, commit, head):
+    """Whether commit's change against parent is head's change against its merge base with parent: what a
+    squash/rebase of head onto parent produces, and what an unrelated commit cannot reproduce."""
+    base = subprocess.run(["git", "-C", str(ROOT), "merge-base", head, parent],
+                          check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+    want = _patch_id(base, head)
+    return bool(want) and want == _patch_id(parent, commit)
+
+
 def proven_merged(to_merge, reported):
     """({pr_url: merge_commit_sha}, {pr_url: reason}) — a merge counts only when the PR head still equals the
     gated head (a commit appended after verification is not the verified tree) and origin's base tip carries
     the merge: a merge_commit_sha the wave-close step recorded (`gh pr view` state MERGED, merged_head the
     gated head) must be on the tip and, when it has two parents, name the gated head as its PR-side parent
-    (a single-parent squash/rebase commit has no PR-side parent to check and is accepted on the recorded
-    merged_head). With no record — the step died, timed out, or dropped the PR — git alone still proves a
+    (a single-parent squash/rebase commit has no PR-side parent, so its change against its parent must be
+    the gated head's change against its merge base — git's patch-id of both, the record alone binds nothing).
+    With no record — the step died, timed out, or dropped the PR — git alone still proves a
     merge commit on the base's first-parent line whose PR-side parent is the gated head. Whatever the close
     step reported or failed to report is reconciled against git."""
     proven, reasons = {}, {}
@@ -1680,6 +1698,9 @@ def proven_merged(to_merge, reported):
                                          timeout=300).stdout.split()[1:]
                 if len(parents) >= 2 and parents[1] != head:
                     reasons[url] = f"merge commit's PR-side parent is {parents[1]}, not the gated head"
+                    continue
+                if len(parents) < 2 and not (parents and _same_change(parents[0], mc, head)):
+                    reasons[url] = f"commit {mc} does not carry the gated head's change"
                     continue
                 proven[url] = mc
                 continue

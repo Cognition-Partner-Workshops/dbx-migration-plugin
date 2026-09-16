@@ -1484,6 +1484,32 @@ def test_a_squash_merge_is_proven_only_from_the_close_steps_record(tmp_path):
             assert "not recorded" in result["close"]["unmerged"][0]["reason"]
 
 
+def test_a_single_parent_record_must_carry_the_gated_heads_change(tmp_path):
+    """A record naming some other single-parent commit on the base as the squash of the gated head is
+    not proof: the commit's change against its parent must be the PR's change against its merge base."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    (ws / "x.sql").write_text("select 1")
+    subprocess.run(["git", "-C", str(ws), "add", "x.sql"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "x"], check=True)
+    pr = _push_pr(ws)
+    git = ["git", "-C", str(ws)]
+    tip = subprocess.run(git + ["rev-parse", "origin/migration/x"],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["checkout", "-q", tip], check=True)
+    (ws / "y.sql").write_text("select 2")
+    subprocess.run(git + ["add", "y.sql"], check=True)
+    subprocess.run(git + ["commit", "-qm", "unrelated"], check=True)
+    other = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", f"{other}:refs/heads/migration/x"], check=True)
+    subprocess.run(git + ["checkout", "-q", _PR_HEADS[pr]], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, other)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
+
+
 def test_a_record_whose_merged_head_is_not_the_gated_head_is_not_proven(tmp_path):
     ws, cwd = _workspace(tmp_path, auto_merge=True)
     pr = _unproven_pr(ws)
