@@ -5,6 +5,8 @@ def read_text(path: Path) -> str | None:
     data = path.read_bytes()
     if data.startswith(b"\xef\xbb\xbf"):
         return data.decode("utf-8-sig")
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return data.decode("utf-32")
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         return data.decode("utf-16")
     if b"\x00" in data:
