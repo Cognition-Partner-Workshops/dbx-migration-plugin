@@ -16,10 +16,11 @@ What this script guarantees, so the orchestrator does not have to:
   - The verifier is a different session from every child. Only PRs the verifier marks
     PASS are merged, and only if the manifest says auto_merge (false by default; soft stop_mode
     may set true by a recorded STOP A decision).
-  - Merge authority is the harness (result.json merge_eligible=true) or a human: a unit whose
-    evidence says merge_eligible=false is recorded PASS only with merge_authority
-    {kind: human_override, decision_id: D-<n>} where that D-<n> row of .migration/06_decisions.md
-    names every unit of the batch and says merge_override. The result lists every override.
+  - Merge authority is the harness (every unit's .migration/recon/<unit>/result.json at the PR head
+    says merge_eligible=true) or a human: a batch with a unit whose evidence says otherwise is
+    recorded PASS only with merge_authority {kind: human_override, decision_id: D-<n>} where that
+    D-<n> row of .migration/06_decisions.md is a human's (user:), names every unit of the batch and
+    says merge_override. The result lists every override.
   - Re-running with the same run_id in the pointer replays finished children and only launches
     the rest.
 
@@ -199,6 +200,8 @@ PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
 PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
 # A row of the decision ledger (.migration/06_decisions.md).
 DECISION_ID = re.compile(r"D-[0-9]+")
+# Its provenance when a human wrote it (`user:<id>`), as the ledger convention names it.
+HUMAN_PROVENANCE = re.compile(r"(?<![A-Za-z0-9_])user:")
 
 
 def decision_ledger():
@@ -210,11 +213,13 @@ def decision_ledger():
 
 def override_decision(decision_id, units, ledger):
     """Whether the ledger holds the D-<n> row that lets a human merge past merge_eligible=false: one
-    line carrying that id, the word merge_override, and the id of every unit in the batch."""
+    line carrying that id, the word merge_override, the id of every unit in the batch, and human
+    provenance (`user:`; a default-accepted row is the orchestrator's, not a human's)."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
         return False
     words = [decision_id, "merge_override", *units]
-    return any(all(re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])", line) for w in words)
+    return any(HUMAN_PROVENANCE.search(line)
+               and all(re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])", line) for w in words)
                for line in ledger.splitlines())
 
 
@@ -440,6 +445,22 @@ def ref_changed_paths(ref):
         return None
 
 
+def unit_eligibility(head, units):
+    """{unit: merge_eligible} from each unit's own .migration/recon/<unit>/result.json at the gated PR
+    head. A batch reports one boolean for up to five units, so the per-unit evidence decides; a file
+    git cannot show, or one without a boolean merge_eligible, is None (not eligible)."""
+    out = {}
+    for u in units:
+        try:
+            text = subprocess.run(["git", "-C", str(ROOT), "show", f"{head}:.migration/recon/{u}/result.json"],
+                                  check=True, capture_output=True, text=True, timeout=300).stdout
+            got = json.loads(text).get("merge_eligible")
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            got = None
+        out[u] = got if isinstance(got, bool) else None
+    return out
+
+
 def pr_changed_paths(pr_url):
     """What the PR really changes: the head the host holds for that PR of this repo (refs/pull/N/head),
     so the branch name in the child's report never selects what is inspected."""
@@ -652,7 +673,8 @@ def child_prompt(batch):
         "- Do not merge your own PR.\n"
         f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
         "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
-        "evidence is never PASS. Copy result.json merge_eligible into merge_eligible as it is. If it is "
+        "evidence is never PASS. Report merge_eligible=true only when every unit's "
+        ".migration/recon/<unit>/result.json in your PR says so; the workflow reads each file. If any is "
         "false and a human recorded a merge_override row for exactly your units in .migration/06_decisions.md, "
         "report merge_authority {kind: human_override, decision_id: D-<n>}; the workflow checks the row and "
         "fails the unit if it is missing. Never write that row yourself.\n"
@@ -765,22 +787,6 @@ async def run_batch(batch, sem, breaker):
             out["one_line_summary"] = (
                 f"PASS downgraded: recon evidence was {out.get('recon_mode')}/"
                 f"{out.get('recon_verdict')}; " + out["one_line_summary"])
-        if out["status"] == "PASS":
-            claimed = out.get("merge_authority")
-            decision = claimed.get("decision_id") if isinstance(claimed, dict) else None
-            if out.get("merge_eligible") is True:
-                out["merge_authority"] = {"kind": "harness", "decision_id": None}
-            elif (isinstance(claimed, dict) and claimed.get("kind") == "human_override"
-                  and override_decision(decision, batch["units"], decision_ledger())):
-                out["merge_authority"] = {"kind": "human_override", "decision_id": decision}
-            else:
-                out["status"] = "FAIL"
-                out["failure_class"] = "merge_authority"
-                out.pop("merge_authority", None)
-                out["one_line_summary"] = (
-                    f"PASS downgraded: recon evidence is not merge_eligible=true (got {out.get('merge_eligible')!r}) "
-                    f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
-                    ".migration/06_decisions.md; " + out["one_line_summary"])
         if (out["status"] == "PASS"
                 and (not out.get("pr_url") or not out.get("branch"))):
             out["status"] = "FAIL"
@@ -815,6 +821,27 @@ async def run_batch(batch, sem, breaker):
                 "PASS downgraded: changed_paths "
                 + ("not reported" if not usable else "not verifiable from git (not a PR of this repo, or its fetch or diff failed)")
                 + ", ledger integrity unverified; " + out["one_line_summary"])
+        if out["status"] == "PASS":
+            claimed = out.get("merge_authority")
+            decision = claimed.get("decision_id") if isinstance(claimed, dict) else None
+            evidence = unit_eligibility(out["pr_head"], batch["units"])
+            ineligible = sorted(u for u, e in evidence.items() if e is not True)
+            if out.get("merge_eligible") is True and not ineligible:
+                out["merge_authority"] = {"kind": "harness", "decision_id": None}
+            elif (isinstance(claimed, dict) and claimed.get("kind") == "human_override"
+                  and override_decision(decision, batch["units"], decision_ledger())):
+                out["merge_authority"] = {"kind": "human_override", "decision_id": decision}
+            else:
+                out["status"] = "FAIL"
+                out["failure_class"] = "merge_authority"
+                out.pop("merge_authority", None)
+                why = "; ".join(f".migration/recon/{u}/result.json at the PR head "
+                                + ("is missing or malformed" if evidence[u] is None else f"has merge_eligible={evidence[u]!r}")
+                                for u in ineligible) or f"the child reported merge_eligible={out.get('merge_eligible')!r}"
+                out["one_line_summary"] = (
+                    f"PASS downgraded: recon evidence is not merge_eligible=true for every unit ({why}) "
+                    f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
+                    ".migration/06_decisions.md; " + out["one_line_summary"])
         # a replayed failure of this class was counted by the run being resumed; a replayed PASS (or FAIL of
         # another class) that the gate fails now was not
         if out["status"] != "PASS" and (record is None or (isinstance(record, dict) and (

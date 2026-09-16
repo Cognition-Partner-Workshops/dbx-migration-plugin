@@ -43,9 +43,11 @@ def _batch_runtime():
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID"} for t in node.targets))]
+                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE"}
+                    for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
+        "unit_eligibility": lambda head, units: {u: True for u in units},
         "Counter": Counter,
         "hashlib": hashlib,
         "re": re,
@@ -427,6 +429,36 @@ def test_override_decision_row_must_name_every_unit_and_say_merge_override():
     assert override_decision("D-70", ["u2"], LEDGER)
     assert not override_decision("D-7", ["orders"], "D-7 merge_override for orders_dim")
     assert not override_decision(None, ["u"], LEDGER) and not override_decision("D-", ["u"], LEDGER)
+
+
+def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
+    ns = _batch_runtime()
+    ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
+    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user: merge_override for u, u2, u3 |\n"
+
+    def run(report):
+        async def agent(prompt, **kwargs):
+            return dict(report)
+        ns["agent"] = agent
+        batch = {"id": "b", "units": ["u", "u2", "u3"], "write_targets": ["t"], "brief": "b"}
+        return asyncio.run(ns["run_batch"](batch, asyncio.Semaphore(1), ns["Breaker"](3)))
+
+    base = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
+            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": [], "one_line_summary": "ok"}
+    out = run(base)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "merge_authority" not in out
+    assert "recon/u2/result.json" in out["one_line_summary"] and "merge_eligible=False" in out["one_line_summary"]
+    assert "recon/u3/result.json" in out["one_line_summary"] and "missing or malformed" in out["one_line_summary"]
+    out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
+
+
+def test_override_decision_row_needs_human_provenance():
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-8", ["other_unit"], LEDGER)          # default-accepted is not a human
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "bot:"))
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "user"))
+    assert override_decision("D-7", ["u"], LEDGER.replace("user: merge", "user:a.b@x.io merge"))
 
 
 def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():
