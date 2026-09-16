@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -118,6 +119,124 @@ def _refresh_base_branch(path: Path):
     return base_branch
 
 
+def _landed(repo: Path, pr_head: str, base_ref: str, pr_url: str) -> bool:
+    head_check = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", f"{pr_head}^{{commit}}"],
+        check=False,
+        capture_output=True,
+    )
+    if head_check.returncode != 0:
+        subprocess.run(
+            ["git", "-C", str(repo), "fetch", "-q", "origin", pr_head],
+            check=False,
+            capture_output=True,
+        )
+        head_check = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", f"{pr_head}^{{commit}}"],
+            check=False,
+            capture_output=True,
+        )
+    if head_check.returncode == 0:
+        merged_head = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", pr_head, base_ref],
+            check=False,
+            capture_output=True,
+        )
+        if merged_head.returncode == 0:
+            return True
+        if merged_head.returncode != 1:
+            raise subprocess.SubprocessError(
+                f"merge-base rc={merged_head.returncode} for {pr_head}"
+            )
+
+        cherry = subprocess.run(
+            ["git", "-C", str(repo), "cherry", base_ref, pr_head],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if cherry.returncode == 0 and cherry.stdout.strip() and not any(
+            line.startswith("+") for line in cherry.stdout.splitlines()
+        ):
+            return True
+
+        merge_base = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", base_ref, pr_head],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if merge_base.returncode == 0:
+            mb = merge_base.stdout.strip()
+            diff = subprocess.run(
+                ["git", "-C", str(repo), "diff", mb, pr_head],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if diff.returncode == 0:
+                patch_id = subprocess.run(
+                    ["git", "-C", str(repo), "patch-id", "--stable"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    input=diff.stdout,
+                )
+                pid = patch_id.stdout.split()[0] if patch_id.returncode == 0 and patch_id.stdout.split() else ""
+                if pid:
+                    commits = subprocess.run(
+                        ["git", "-C", str(repo), "rev-list", "-n", "500", base_ref, f"^{mb}"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if commits.returncode == 0:
+                        for commit in commits.stdout.splitlines():
+                            commit_diff = subprocess.run(
+                                ["git", "-C", str(repo), "diff-tree", "-p", "--root", commit],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                            )
+                            if commit_diff.returncode != 0:
+                                continue
+                            commit_patch_id = subprocess.run(
+                                ["git", "-C", str(repo), "patch-id", "--stable"],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                                input=commit_diff.stdout,
+                            )
+                            if (
+                                commit_patch_id.returncode == 0
+                                and commit_patch_id.stdout.split()
+                                and commit_patch_id.stdout.split()[0] == pid
+                            ):
+                                return True
+
+    if shutil.which("gh") is None or not pr_url.startswith("https://github.com/"):
+        return False
+    base_branch = base_ref.removeprefix("origin/")
+    try:
+        provider = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "state,baseRefName"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if provider.returncode != 0:
+            return False
+        details = json.loads(provider.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return False
+    return (
+        isinstance(details, dict)
+        and details.get("state") == "MERGED"
+        and details.get("baseRefName") == base_branch
+    )
+
+
 def refresh_merged(mig: Path) -> None:
     waves = mig / "waves"
     repo = mig.parent
@@ -170,17 +289,8 @@ def refresh_merged(mig: Path) -> None:
         ).stdout.strip()
         merged = dict(merged_record["merged"]) if merged_record is not None else {}
         for pr_url, pr_head in candidates:
-            merged_head = subprocess.run(
-                ["git", "-C", str(repo), "merge-base", "--is-ancestor", pr_head, f"origin/{base_branch}"],
-                check=False,
-                capture_output=True,
-            )
-            if merged_head.returncode == 0:
+            if _landed(repo, pr_head, f"origin/{base_branch}", pr_url):
                 merged[pr_url] = pr_head
-            elif merged_head.returncode != 1:
-                raise subprocess.SubprocessError(
-                    f"merge-base rc={merged_head.returncode} for {pr_head}"
-                )
         if merged or merged_record is not None:
             _merged_path(path).write_text(json.dumps(
                 {"base": base_sha, "merged": merged},

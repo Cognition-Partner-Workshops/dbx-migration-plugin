@@ -1,5 +1,6 @@
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import progress
 from progress import main, refresh_merged, render_progress
 
 
@@ -384,6 +386,182 @@ def test_refresh_merged_records_ancestral_heads(tmp_path):
     lines = render_progress(mig).splitlines()
     assert f"| 1 | b1 | u1 | PASS |  |  | {url_1} | yes |  |" in lines
     assert f"| 1 | b2 | u2 | PASS (unmerged) |  |  | {url_2} | pending |  |" in lines
+
+
+def _refresh_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "base")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Progress Test")
+    (repo / "base.txt").write_text("base\n")
+    git("add", "base.txt")
+    git("commit", "-q", "-m", "base")
+    bare = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(repo), str(bare)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git("remote", "add", "origin", str(bare))
+    git("push", "-q", "origin", "base")
+    return repo, git
+
+
+def _refresh_result(repo, pr_head, pr_url):
+    mig = repo / ".migration"
+    waves = mig / "waves"
+    waves.mkdir(parents=True)
+    (waves / "wave-1.json").write_text(json.dumps({"wave": 1, "base_branch": "base"}))
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "auto_merge": False,
+        "batches": [{
+            "id": "b1",
+            "units": ["u1"],
+            "status": "PASS",
+            "pr_url": pr_url,
+            "pr_head": pr_head,
+        }],
+    })
+    return mig, waves
+
+
+def test_refresh_merged_detects_merge_commit(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "feature.txt").write_text("feature\n")
+    git("add", "feature.txt")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    git("merge", "--no-ff", "-q", "feature", "-m", "merge feature")
+    git("push", "-q", "origin", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/merge")
+
+    refresh_merged(mig)
+
+    assert json.loads((waves / "wave-1.merged.json").read_text())["merged"] == {
+        "https://example.invalid/merge": pr_head,
+    }
+
+
+def test_refresh_merged_detects_rebase_merge(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "feature.txt").write_text("feature\n")
+    git("add", "feature.txt")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    (repo / "base.txt").write_text("base update\n")
+    git("commit", "-q", "-am", "base update")
+    git("checkout", "-q", "feature")
+    git("rebase", "-q", "base")
+    git("checkout", "-q", "base")
+    git("merge", "--ff-only", "-q", "feature")
+    git("push", "-q", "origin", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/rebase")
+
+    refresh_merged(mig)
+
+    assert json.loads((waves / "wave-1.merged.json").read_text())["merged"] == {
+        "https://example.invalid/rebase": pr_head,
+    }
+
+
+def test_refresh_merged_detects_squash_merge(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "feature.txt").write_text("part one\n")
+    git("add", "feature.txt")
+    git("commit", "-q", "-m", "feature one")
+    (repo / "feature.txt").write_text("part one\npart two\n")
+    git("commit", "-q", "-am", "feature two")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    git("merge", "--squash", "-q", "feature")
+    git("commit", "-q", "-m", "squash feature")
+    git("push", "-q", "origin", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/squash")
+
+    refresh_merged(mig)
+
+    assert json.loads((waves / "wave-1.merged.json").read_text())["merged"] == {
+        "https://example.invalid/squash": pr_head,
+    }
+
+
+def test_refresh_merged_leaves_unmerged_pr_unrecorded(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "feature.txt").write_text("feature\n")
+    git("add", "feature.txt")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/open")
+
+    refresh_merged(mig)
+
+    assert not (waves / "wave-1.merged.json").exists()
+
+
+def test_refresh_merged_unknown_head_stays_unmerged(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    mig, waves = _refresh_result(
+        repo,
+        "ffffffffffffffffffffffffffffffffffffffff",
+        "https://example.invalid/unknown",
+    )
+
+    refresh_merged(mig)
+
+    assert not (waves / "wave-1.merged.json").exists()
+
+
+def test_refresh_merged_uses_gh_fallback(tmp_path, monkeypatch):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "feature.txt").write_text("feature\n")
+    git("add", "feature.txt")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    pr_url = "https://github.com/example/repo/pull/1"
+    mig, waves = _refresh_result(repo, pr_head, pr_url)
+    real_run = progress.subprocess.run
+    response = {"state": "MERGED", "baseRefName": "base"}
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh" if name == "gh" else None)
+
+    def run(*args, **kwargs):
+        if args and args[0][0] == "gh":
+            return subprocess.CompletedProcess(
+                args[0], 0, json.dumps(response), "",
+            )
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(progress.subprocess, "run", run)
+    refresh_merged(mig)
+    assert json.loads((waves / "wave-1.merged.json").read_text())["merged"] == {
+        pr_url: pr_head,
+    }
+
+    (waves / "wave-1.merged.json").unlink()
+    response["state"] = "OPEN"
+    refresh_merged(mig)
+    assert not (waves / "wave-1.merged.json").exists()
 
 
 def test_render_progress_rejects_invalid_verifier_unit_verdicts(tmp_path):
