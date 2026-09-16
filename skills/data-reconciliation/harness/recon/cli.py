@@ -30,6 +30,7 @@ from .config import (
 )
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
+from .typemap import apply_type_map, load_type_map
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres")
 # databricks: Delta under Unity Catalog (analytical track). lakebase: a schema in a Lakebase
@@ -245,6 +246,14 @@ def main(argv: list[str] | None = None) -> int:
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
 
+    type_map = None
+    tm = load_type_map(args.canonicalization, args.family)
+    if tm:
+        try:
+            spec, type_map = apply_type_map(tm, spec)
+        except ConfigError as exc:
+            raise SystemExit(f"type map: {exc}") from None
+
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
     try:
         ops = json.loads(args.ops.read_text()) if args.ops else None
@@ -272,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
-                       source_family=args.family, depth=args.depth)
+                       source_family=args.family, depth=args.depth, type_map=type_map)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")
