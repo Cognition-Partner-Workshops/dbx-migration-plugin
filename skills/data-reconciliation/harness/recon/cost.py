@@ -32,6 +32,14 @@ SCHEMA_FACT_STATEMENTS = 4
 def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
                   row_counts: dict[str, int] | None = None, ops: int = 0,
                   mode: str = "live") -> dict:
+    if mode == "structural":
+        # Tier 0 only: the catalog reads schema_parity makes per object and side, no row read.
+        src = {"tier0": sum(SCHEMA_FACT_STATEMENTS + (2 if c.identity_source else 0) for c in spec.objects)}
+        tgt = {"tier0": sum(SCHEMA_FACT_STATEMENTS + (2 if c.identity_target else 0) for c in spec.objects)}
+        src["total"], tgt["total"] = src["tier0"], tgt["tier0"]
+        return {"mode": mode, "depth": depth, "tier3_mode": {}, "source_statements": src,
+                "target_statements": tgt, "source_rows_fetched": 0, "target_rows_fetched": 0,
+                "row_counts_known": row_counts is not None}
     src: dict[str, int] = {"tier1": 0, "tier2": 0, "tier3": 0, "tier4": ops}
     tgt: dict[str, int] = {"tier1": 0, "tier2": 0, "tier3": 0, "tier4": ops}
     if mode == "transactional":

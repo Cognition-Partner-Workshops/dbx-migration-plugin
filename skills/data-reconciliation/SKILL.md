@@ -85,7 +85,8 @@ provenance warning and the run is not merge-eligible.
   isolation each side actually ran under.
 - `structural`: Tier 0 `structural_parity` only, both catalogs read and no row read on either
   side. The independent verifier's run on a wave the manifest declares `degraded`; never merge
-  evidence (`merge_block_reasons` names `mode`).
+  evidence: a clean run's `merge_block_reasons` is exactly `["mode"]` (no rerun proof applies, no
+  row tier ran), and `estimate` counts only Tier 0's catalog statements.
 
 
 

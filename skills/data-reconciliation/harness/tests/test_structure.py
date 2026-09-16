@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from recon.adapters import IdentityState, SchemaFacts
 from recon.config import ConfigError, Tolerances, load_mapping_spec
+from recon.cost import SCHEMA_FACT_STATEMENTS, estimate_cost
 from recon.engine import run_recon
 from recon.report import build_result
 from recon.structure import (
@@ -232,12 +233,29 @@ def test_structural_mode_runs_tier0_only_and_reads_no_source_rows():
     result = run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, target)
     assert [t["name"] for t in result["tiers"]] == ["structural_parity"]
     assert result["verdict"] == "PASS" and result["mode"] == "structural"
-    assert result["merge_eligible"] is False and "mode" in result["merge_block_reasons"]
+    assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["mode"]
     assert source.rows_fetched == 0 and not {"count", "fetch_keyed", "sample_keys"} & set(source.calls)
     bad = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
                      schema={"loans": BORROWER_FACTS, "borrowers": BORROWER_FACTS},
                      sequences={("loans", "loan_id"): 13})
     assert run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, bad)["verdict"] == "FAIL"
+
+
+def test_structural_estimate_counts_the_catalog_reads_only():
+    """`estimate --mode structural` describes the run it names: Tier 0's catalog statements per
+    object and side, no row tier, no rows transferred."""
+    spec = _spec()
+    est = estimate_cost(spec, Tolerances("t1"), row_counts={"dbo.loans": 1_000_000, "dbo.borrowers": 3},
+                        mode="structural")
+    assert est["mode"] == "structural" and est["tier3_mode"] == {}
+    assert est["source_statements"]["tier0"] == sum(
+        SCHEMA_FACT_STATEMENTS + (2 if c.identity_source else 0) for c in spec.objects)
+    assert est["target_statements"]["tier0"] == sum(
+        SCHEMA_FACT_STATEMENTS + (2 if c.identity_target else 0) for c in spec.objects)
+    for side in ("source_statements", "target_statements"):
+        assert est[side]["total"] == est[side]["tier0"]
+        assert {k for k, v in est[side].items() if v and k not in ("tier0", "total")} == set()
+    assert est["source_rows_fetched"] == 0 and est["target_rows_fetched"] == 0
 
 
 def test_tier0_unreadable_catalog_blocks_merge():
