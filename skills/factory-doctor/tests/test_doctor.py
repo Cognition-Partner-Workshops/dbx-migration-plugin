@@ -1813,9 +1813,12 @@ PLAYBOOKS_DIR = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
 def test_repo_playbooks_keys_are_macros_only():
     repo = doctor._repo_playbooks(PLUGIN_ROOT)
     assert all(m.startswith("!") for m in repo)
-    assert "0-README.md" not in repo and "00_intake_template.md" not in repo
+    assert "00_intake_template.md" not in repo and "index.json" not in repo
     assert "!dbx_migrate_pipeline" in repo
     assert len(repo) >= 14
+    index = json.loads((PLAYBOOKS_DIR / "index.json").read_text())["playbooks"]
+    assert [r["macro"] for r in index] == list(repo)
+    assert all(r["title"].startswith("[DBX v1] ") for r in index)
 
 
 def test_playbooks_in_sync_ok(tmp_path):
@@ -1885,7 +1888,7 @@ def test_playbooks_in_sync_unlisted_repo_file_is_a_finding(tmp_path, monkeypatch
         c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
     finally:
         stray.unlink()
-    assert c.status == "fail" and "15-unlisted.md" in c.detail and "0-README" in c.detail
+    assert c.status == "fail" and "15-unlisted.md" in c.detail and "index.json" in c.detail
 
 
 def test_playbooks_in_sync_ok_checks_the_live_export(tmp_path):

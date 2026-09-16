@@ -116,8 +116,8 @@ Reference details and factory placement: [references/checks.md](references/check
   that have a query — Databricks included); `unverified` for the other
   families, and it blocks `ready`.
 - `playbooks_in_sync` compares `.migration/playbooks.lock.json` against the repo playbook files
-  (sha256 each): a stale, missing or unknown macro, or a playbook file absent from the 0-README
-  Files table, fails the row. Re-running `install-dbx-factory` is the only fix; at setup (before
+  (sha256 each): a stale, missing or unknown macro, or a playbook file absent from `playbooks/index.json`,
+  fails the row. Re-running `install-dbx-factory` is the only fix; at setup (before
   the lock exists, `--role setup`) the row is `skipped` with the warning that the live library is
   unverified. With `.migration/live_playbooks.json` present (required under `--role orchestrator`,
   rejected after 15 minutes; written per run and gitignored) the row also compares each live
