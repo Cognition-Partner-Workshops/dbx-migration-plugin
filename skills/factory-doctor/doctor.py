@@ -59,6 +59,7 @@ OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines"
                    "databricks-lakebase")
 M2M_VARS = ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET")
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
+_RANK = {"ok": 0, "skipped": 1, "warn": 2, "unverified": 3, "fail": 4}
 # The adapters the harness can actually run (its other families fail fast, so no driver is probed for them).
 DRIVERS = {"databricks": "databricks.sql", "sqlserver": "pyodbc", "postgres": "psycopg"}
 # The families `dbx-recon run --family` accepts; only sqlserver and postgres have a privilege query.
@@ -238,7 +239,7 @@ def _issued_nonce(ws: Path) -> str | None:
     try:
         report = json.loads((ws / CAPABILITIES).read_text())
         checks = report.get("checks", [])
-        row = next(c for c in checks if c.get("id") == "hook_platform_loaded")
+        row = next(c for c in checks if c.get("id") == "hook_guard")
         nonce = row.get("data", {}).get("probe_nonce")
         generated_at = report.get("generated_at") or report.get("timestamp")
         if isinstance(generated_at, str):
@@ -246,6 +247,30 @@ def _issued_nonce(ws: Path) -> str | None:
         return fresh(nonce, generated_at)
     except (OSError, ValueError, StopIteration, AttributeError, KeyError, TypeError, OverflowError):
         return None
+
+
+def _merge(cid: str, subs: list[Check]) -> Check:
+    """One row from several sub-checks; sub_results keeps each one."""
+    data: dict = {}
+    for s in subs:
+        data.update(s.data or {})
+    data["sub_results"] = [asdict(s) for s in subs]
+    if any(s.status == "fail" for s in subs):
+        status = "fail"
+    else:
+        sec = [s for s in subs if s.id in SECURITY_CONTROLS and s.status != "ok"]
+        status = max((s.status for s in (sec or subs)), key=_RANK.__getitem__)
+    detail = "; ".join(f"{s.id}: {s.detail}" for s in subs)
+    return Check(cid, status, detail, data)
+
+
+def _flat(checks):
+    for row in checks:
+        sub_results = (row.data or {}).get("sub_results")
+        if sub_results:
+            yield from (Check(**d) for d in sub_results)
+        else:
+            yield row
 
 
 def check_hooks(plugin_root: Path, ws: Path, probe_result: str) -> list[Check]:
@@ -1527,21 +1552,24 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         lakebase_parent_branch: str | None = None, lakebase_dsn: str | None = None,
         lakebase_schema: str | None = None, analytical_schema: str | None = None,
         source_attested: str | None = None, live_playbooks: Path | None = None) -> dict:
-    checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root),
-                           check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs),
-                           check_playbooks_in_sync(ws, plugin_root, role, live_playbooks)]
-    checks += check_hooks(plugin_root, ws, probe_result)
-    checks.append(check_official_plugin(plugin_root))
-    checks.append(check_harness(plugin_root))
-    checks.append(check_drivers())
-    checks.append(check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
-                                            params=params))
-    checks.append(check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
-                                             plugin_root, params=params, attested=source_attested))
+    checks: list[Check] = [
+        _merge("workspace", [check_workspace(ws), check_stop_mode(ws)]),
+        _merge("allowed_targets", [check_allowed_targets(ws, plugin_root),
+                                   check_allowlist_matches_contract(ws, expect_catalogs)]),
+        check_allowlist_committed(ws),
+        check_playbooks_in_sync(ws, plugin_root, role, live_playbooks),
+        _merge("hook_guard", check_hooks(plugin_root, ws, probe_result)),
+        check_official_plugin(plugin_root),
+        _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
+        check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
+                                  params=params),
+        check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
+                                   plugin_root, params=params, attested=source_attested),
+    ]
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
-        checks += check_databricks(expect_identity, expect_host)
+        checks.append(_merge("databricks_identity", check_databricks(expect_identity, expect_host)))
     if lakebase_project or lakebase_parent_branch:
         if not lakebase_project or not lakebase_parent_branch:
             checks.append(Check("lakebase_branch_create", "fail",
@@ -1556,10 +1584,14 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     counts: dict[str, int] = {}
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
-    blocking = [f"{c.id}={c.status}" for c in checks
-                if c.status == "fail" or (c.id in SECURITY_CONTROLS and c.status != "ok")
-                or (c.id == "source_principal_read_only" and c.status == "unverified")]
-    identity = next((c.data for c in checks if c.id == "databricks_identity" and c.data), None)
+    blocking = []
+    for row in checks:
+        subs = list(_flat([row]))
+        if any(s.status == "fail" or (s.id in SECURITY_CONTROLS and s.status != "ok")
+               or (s.id == "source_principal_read_only" and s.status == "unverified")
+               for s in subs):
+            blocking.append(f"{row.id}={row.status}")
+    identity = next((c.data for c in _flat(checks) if c.id == "databricks_identity" and c.data), None)
     return {
         "identity": identity,
         "schema": "dbx-migration-factory/capabilities/1",
