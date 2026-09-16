@@ -144,6 +144,25 @@ Track: **A** analytical DBSQL, **L** Lakebase, **J** Lakeflow Jobs, **P** Lakefl
 | 24 | `DECODE(NULL,NULL,...)` | NULL matches NULL | Tier 3 on NULL-key rows | `CASE WHEN x IS NULL ...` |
 | 25 | `AVG`/`SUM` scale growth | full precision vs `+4` scale / `+10` precision, overflow -> NULL/error | Tier 2 last-digit rounding | `cast(sum(x) AS DECIMAL(38,s))`; `decimal_round` |
 
+## Dependency analysis output
+
+Before a unit is routed or planned, walk every routine in scope (package members, standalone procedures and
+functions, triggers, scheduler job actions) and write one row per routine to
+`.migration/units/<unit>/dependencies.json`; fixture: `fixtures/example_dependencies.json`.
+
+```json
+{"routines": [{"routine": "<schema>.<pkg>.<member>", "reads": ["<schema>.<table>"], "writes": ["<schema>.<table>"], "calls": ["<routine>"]}]}
+```
+
+`reads` = tables and views in `SELECT`/`FROM`/`JOIN`/`MERGE USING`/cursor bodies; `writes` = targets of
+`INSERT`/`UPDATE`/`DELETE`/`MERGE INTO`/`TRUNCATE`; `calls` = every routine invoked, including trigger-fired
+ones, `EXECUTE IMMEDIATE` targets from the allow-list, and the job action. Names are fully qualified, synonyms
+resolved, case-insensitive. The analysis must cover every callee it names (add the callee's row, even for a
+logger), or the fan-out check halts on it. The shape is dialect-neutral: every source-dialect skill that
+emits an analysis writes the same rows. `target-routing` routes from `reads`/`writes`; the fan-out workflow
+requires a batch's declared `write_targets` to equal the transitive `writes` (rule in
+`skills/migration-fanout/SKILL.md`, "Declared targets match the call graph").
+
 ## Examples
 
 Canonical shapes: `examples/03_bulk_collect_setbased/` is the DBSQL procedure shape (handlers, `assert_true` parity check, `BEGIN ATOMIC` + `MERGE`, `OUT` status); `examples/02_trigger_sequence_lakebase/` is the PL/pgSQL shape.

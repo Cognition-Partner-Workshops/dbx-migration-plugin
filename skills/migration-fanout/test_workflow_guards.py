@@ -29,7 +29,8 @@ def _functions():
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
-                                      "column_key", "predicate_slices", "reader_slices", "disjoint_slices"})
+                                      "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
+                                      "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
@@ -549,6 +550,386 @@ def test_unit_mapping_is_none_when_absent_and_halts_when_malformed(tmp_path):
     spec.write_text("{")
     with pytest.raises(SystemExit, match=r"u9/mapping_spec\.json.*JSON"):
         ns["unit_mapping"]("u9")
+
+
+# ---------------------------------------------------------------- route by call graph (WS3.4)
+
+FIXTURE = Path(__file__).resolve().parents[1] / "oracle-plsql" / "fixtures" / "example_dependencies.json"
+
+
+def _routine(name, reads=(), writes=(), calls=()):
+    return {"routine": name, "reads": list(reads), "writes": list(writes), "calls": list(calls)}
+
+
+CLOSE = _routine("app.close_period", reads=["src.ledger"], writes=["mig.ledger"], calls=["app.log_run"])
+LOG = _routine("app.log_run", writes=["mig.run_log"])
+LOOP = _routine("app.retry", calls=["app.close_period"])
+TARGETS = ["mig.ledger", "mig.run_log", "mig.close_period"]
+DEPLOYS = {"deploy_objects": ["mig.close_period"]}
+
+
+def _deps(**by_unit):
+    return lambda unit: by_unit.get(unit)
+
+
+def test_transitive_writes_follows_calls_and_tolerates_cycles():
+    writes = _functions()["transitive_writes"]
+    assert writes([CLOSE, LOG, LOOP]) == {"mig.ledger", "mig.run_log"}
+    assert writes([LOG]) == {"mig.run_log"}
+    assert writes([_routine("app.read_only", reads=["src.x"])]) == set()
+
+
+def test_transitive_writes_is_case_insensitive_on_routine_and_table_names():
+    writes = _functions()["transitive_writes"]
+    assert writes([_routine("APP.A", writes=["MIG.T"], calls=["app.b"]), _routine("app.B", writes=["mig.t"])]) == {"mig.t"}
+
+
+def test_transitive_writes_halts_on_a_callee_the_analysis_does_not_cover():
+    writes = _functions()["transitive_writes"]
+    with pytest.raises(SystemExit, match=r"app\.close_period.*app\.log_run"):
+        writes([CLOSE])
+
+
+def test_check_dependencies_passes_when_declared_targets_equal_transitive_writes():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["MIG.ledger", "mig.run_log", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    retry = {**b, "units": ["u", "v"], "write_targets": b["write_targets"] + ["mig.retry"],
+             "deploy_objects": ["mig.close_period", "mig.retry"]}
+    check([retry], _deps(u=[CLOSE, LOG], v=[LOOP]), namespace="mig")
+    check([{**b, "units": ["u", "v"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+
+
+def test_every_root_of_the_call_graph_is_a_declared_deploy_object():
+    """The analysis lists the routines a unit converts; the ones nothing else in the batch calls are its
+    entry points and ship as deployed objects (procedures, jobs, views), which collide like any table.
+    An entry point absent from deploy_objects (its bare name under target_namespace, case-folded) is a mismatch;
+    a callee may be inlined into its caller and needs no row."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-8", "units": ["u"], "write_targets": TARGETS, **DEPLOYS, "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    check([{**b, "deploy_objects": ["MIG.Close_Period"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    check([{**b, "write_targets": TARGETS + ["mig.log_run"], "deploy_objects": ["mig.close_period", "mig.log_run"]}],
+          _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-8.*app\.close_period.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.ledger", "mig.run_log", "mig.other"], "deploy_objects": ["mig.other"]}],
+              _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-8.*app\.retry.*deploy_objects"):
+        check([{**b, "units": ["u", "v"]}], _deps(u=[CLOSE, LOG], v=[LOOP]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-8.*app\.close_period.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.ledger", "mig.run_log"], "deploy_objects": []}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-8.*app\.read_only.*deploy_objects"):
+        check([{**b, "write_targets": [], "deploy_objects": []}], _deps(u=[READ_ONLY]), namespace="mig")
+
+
+def test_same_named_roots_in_different_schemas_each_need_a_deploy_object_of_their_own():
+    """Two entry points whose trailing names agree (`app.close` and `legacy.close`) are two deployed objects:
+    one deploy_objects row cannot stand for both, a row qualified like one of them is that one's, a row
+    qualified like neither (`mig.other.close`) is nobody's, and a bare `mig.close` stands in only for a root
+    whose trailing name no other root shares."""
+    check = _functions()["check_dependencies"]
+    roots = [_routine("app.close", writes=["mig.a"]), _routine("legacy.close", writes=["mig.b"])]
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["mig.a", "mig.b", "mig.close"], "deploy_objects": ["mig.close"], "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-9.*close.*deploy_objects"):
+        check([b], _deps(u=roots), namespace="mig")
+    check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.legacy.close"],
+            "deploy_objects": ["mig.app.close", "mig.legacy.close"]}], _deps(u=roots), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*legacy\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.close"],
+                "deploy_objects": ["mig.app.close", "mig.close"]}], _deps(u=roots), namespace="mig")
+    check([{**b, "write_targets": ["mig.a", "mig.close"], "deploy_objects": ["mig.close"]}], _deps(u=[roots[0]]),
+          namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*legacy\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.other.close"],
+                "deploy_objects": ["mig.app.close", "mig.other.close"]}], _deps(u=roots), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.other.close"], "deploy_objects": ["mig.other.close"]}],
+              _deps(u=[roots[0]]), namespace="mig")
+
+
+@pytest.mark.parametrize("row", ["prod.app.close", "cat.other.app.close", "prod.close", "other.mig.app.close"])
+def test_a_deploy_object_outside_target_namespace_never_stands_for_a_root(row):
+    """A deploy_objects row is the root's only under target_namespace: `cat.mig.app.close` or the bare
+    `cat.mig.close` for `app.close`, never an object of some other catalog or schema that happens to end in
+    the same name (that is a production object the plan must not launch against)."""
+    check = _functions()["check_dependencies"]
+    root = _routine("app.close", writes=["cat.mig.a"])
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["cat.mig.a", row], "deploy_objects": [row], "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([b], _deps(u=[root]), namespace="cat.mig")
+    for good in ("cat.mig.app.close", "cat.mig.close", "close"):
+        check([{**b, "write_targets": ["cat.mig.a", good], "deploy_objects": [good]}], _deps(u=[root]),
+              namespace="cat.mig")
+
+
+def test_a_bare_root_takes_the_one_row_of_its_name_and_halts_when_several_could_be_it():
+    """A root the analysis names without a schema (`close`) is the deploy_objects row under target_namespace
+    whose trailing name is `close`: exactly one (`mig.close` or `mig.app.close`) is its row; two candidates
+    (`mig.app.close` and `mig.legacy.close`) make the root ambiguous, which halts like an undeclared one rather
+    than guessing; a qualified root (`app.close`) still takes only its exact spelling or the bare row."""
+    check = _functions()["check_dependencies"]
+    root = _routine("close", writes=["mig.a"])
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["mig.a", "mig.close"], "deploy_objects": ["mig.close"], "brief": "b"}
+    check([b], _deps(u=[root]), namespace="mig")
+    check([{**b, "write_targets": ["mig.a", "mig.app.close"], "deploy_objects": ["mig.app.close"]}], _deps(u=[root]),
+          namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*close.*ambiguous.*mig\.app\.close.*mig\.legacy\.close"):
+        check([{**b, "write_targets": ["mig.a", "mig.app.close", "mig.legacy.close"],
+                "deploy_objects": ["mig.app.close", "mig.legacy.close"]}], _deps(u=[root]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.legacy.close"], "deploy_objects": ["mig.legacy.close"]}],
+              _deps(u=[_routine("app.close", writes=["mig.a"])]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*ambiguous.*x\.app\.close.*y\.app\.close"):
+        check([{**b, "write_targets": ["a", "x.app.close", "y.app.close"], "deploy_objects": ["x.app.close", "y.app.close"]}],
+              _deps(u=[_routine("app.close", writes=["a"])]))
+
+
+def test_a_complete_analysis_with_no_routines_is_a_graph_that_writes_and_deploys_nothing():
+    """Every unit analysed and none converting a routine is a real (empty) graph: a declared table is then
+    an extra nothing writes, the same mismatch as with routines. A deploy object is not: the analysis has
+    rows for routines only, and a view or job the unit deploys is a deploy_objects row with no routine."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-0", "units": ["u", "v"], "write_targets": [], "brief": "b"}
+    check([b], _deps(u=[], v=[]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-0.*extra.*mig\.t"):
+        check([{**b, "write_targets": ["mig.t"]}], _deps(u=[], v=[]), namespace="mig")
+    check([{**b, "write_targets": ["mig.customer_v"], "deploy_objects": ["mig.customer_v"]}], _deps(u=[], v=[]),
+          namespace="mig")
+
+
+def test_check_dependencies_skips_a_batch_with_no_analysis_at_all():
+    check = _functions()["check_dependencies"]
+    check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"], "brief": "b"}], _deps(), namespace="mig")
+
+
+def test_check_dependencies_names_missing_and_extra_tables():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-7", "units": ["u"], "write_targets": ["mig.ledger", "mig.stale", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    with pytest.raises(SystemExit) as e:
+        check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    msg = str(e.value)
+    assert "b-7" in msg
+    assert re.search(r"missing.*mig\.run_log", msg)
+    assert re.search(r"extra.*mig\.stale", msg)
+    assert "mig.ledger" not in msg.split("missing", 1)[1].split("extra", 1)[0]
+
+
+def test_check_dependencies_halts_when_the_analysis_writes_nothing_the_batch_declared():
+    check = _functions()["check_dependencies"]
+    with pytest.raises(SystemExit, match=r"b.*extra.*mig\.t"):
+        check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"], "brief": "b"}],
+              _deps(u=[_routine("app.read_only", reads=["src.x"])]), namespace="mig")
+
+
+READ_ONLY = _routine("app.read_only", reads=["src.x"])
+
+
+def test_read_only_batch_may_declare_no_targets_only_when_every_unit_is_analysed_and_writes_nothing():
+    """A read-only routine still ships as a deployed object (a view, say), so the only batch with no write
+    targets at all is one whose every unit is analysed and converts no routine."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-3", "units": ["u"], "write_targets": [], "brief": "b"}
+    check([b], _deps(u=[]), namespace="mig")
+    check([{**b, "units": ["u", "v"]}], _deps(u=[], v=[]), namespace="mig")
+    view = {**b, "write_targets": ["mig.read_only"], "deploy_objects": ["mig.read_only"]}
+    check([view], _deps(u=[READ_ONLY]), namespace="mig")
+    check([{**view, "units": ["u", "v"], "write_targets": ["mig.read_only", "mig.v"], "deploy_objects": ["mig.read_only", "mig.v"]}],
+          _deps(u=[READ_ONLY], v=[_routine("app.v", reads=["src.y"])]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-3.*write_targets.*analysis"):
+        check([b], _deps(), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-3.*write_targets.*analysis"):
+        check([{**b, "units": ["u", "v"]}], _deps(u=[]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-3.*missing.*mig\.run_log"):
+        check([b], _deps(u=[LOG]), namespace="mig")
+
+
+def test_check_dependencies_with_an_unanalysed_unit_checks_only_missing_tables():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-4", "units": ["u", "v"], "write_targets": TARGETS + ["mig.v_only"], **DEPLOYS, "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-4.*missing.*mig\.run_log") as e:
+        check([{**b, "write_targets": ["mig.ledger", "mig.close_period", "mig.v_only"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    assert "mig.v_only" not in str(e.value)
+    with pytest.raises(SystemExit, match=r"b-4.*extra.*mig\.v_only"):
+        check([{**b, "deploy_objects": ["mig.close_period", "mig.read_only"], "write_targets": b["write_targets"] + ["mig.read_only"]}],
+              _deps(u=[CLOSE, LOG], v=[READ_ONLY]), namespace="mig")
+
+
+def test_check_dependencies_compares_targets_as_one_case_insensitive_identity():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["`MIG`.`Ledger`", " mig.RUN_LOG ", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    assert _functions()["transitive_writes"]([_routine("a", writes=['"MIG"."T"', "mig.t"])]) == {"mig.t"}
+
+
+def _spec(*pairs):
+    return {"objects": [{"object": tgt, "root_table": src, "key": ["id"]} for src, tgt in pairs]}
+
+
+def _maps(**by_unit):
+    return lambda unit: by_unit.get(unit)
+
+
+SRC_CLOSE = _routine("app.close_period", reads=["app.period"], writes=["APP.LEDGER"], calls=["app.log_run"])
+SRC_LOG = _routine("app.log_run", writes=["app.run_log"])
+
+
+def test_check_dependencies_resolves_source_writes_through_the_units_mapping_spec():
+    """The analysis names the legacy tables a routine writes; the manifest names what the child deploys.
+    A written source table is the target its mapping object (root_table -> object) gives it, and the
+    manifest's bare names are the manifest's target_namespace, so a renamed target compares as itself."""
+    check = _functions()["check_dependencies"]
+    spec = _spec(("app.ledger", "finance.ledger"), ("APP.RUN_LOG", "run_log"))
+    b = {"id": "b", "units": ["u"], "write_targets": ["mig.finance.ledger", "MIG.app.run_log", "close_period"],
+         "deploy_objects": ["close_period"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=spec), "mig.app")
+    with pytest.raises(SystemExit, match=r"b.*missing.*mig\.finance\.ledger.*extra.*mig\.app\.ledger"):
+        check([{**b, "write_targets": ["app.ledger", "run_log", "close_period"]}], _deps(u=[SRC_CLOSE, SRC_LOG]),
+              _maps(u=spec), "mig.app")
+
+
+def test_check_dependencies_resolves_a_callees_writes_through_the_callees_own_unit():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u", "v"], "write_targets": ["mig.app.ledger", "mig.audit.run_log", "close_period"],
+         "deploy_objects": ["close_period"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE], v=[SRC_LOG]),
+          _maps(u=_spec(("app.ledger", "ledger")), v=_spec(("app.run_log", "audit.run_log"))), "mig.app")
+    with pytest.raises(SystemExit, match=r"missing.*mig\.app\.run_log"):
+        check([b], _deps(u=[SRC_CLOSE], v=[SRC_LOG]),
+              _maps(u=_spec(("app.ledger", "ledger")), v=_spec(("app.run_log", "run_log"))), "mig.app")
+
+
+def test_check_dependencies_halts_when_a_mapped_unit_writes_a_source_table_its_mapping_does_not_name():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-2", "units": ["u"], "write_targets": TARGETS, **DEPLOYS, "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-2.*u.*app\.run_log.*mapping_spec"):
+        check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=_spec(("app.ledger", "ledger"))), "mig")
+
+
+def test_mapped_target_reads_the_legacy_tables_mapping_like_the_harness():
+    """The harness accepts both `objects` (object/root_table) and the older `tables`
+    (target_table/source_table) mapping shape; the call-graph check resolves through either."""
+    mapped = _functions()["mapped_target"]
+    legacy = {"tables": [{"source_table": "public.orders", "target_table": "orders", "key": ["id"]}]}
+    assert mapped(legacy, "PUBLIC.ORDERS", "cat.mig") == {"cat.mig.orders"}
+    assert mapped(legacy, "public.other", "cat.mig") == set()
+    assert mapped({"objects": [], "tables": legacy["tables"]}, "public.orders", "mig") == {"mig.orders"}
+    assert mapped({"tables": "nope"}, "public.orders") == set()
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["cat.mig.orders", "p"], "deploy_objects": ["p"], "brief": "b"}
+    check([b], _deps(u=[{"routine": "p", "reads": [], "writes": ["public.orders"], "calls": []}]),
+          _maps(u=legacy), "cat.mig")
+
+
+def test_a_source_table_split_over_several_mapping_objects_writes_every_one_of_them():
+    """One legacy table can feed several target objects (a table and its search copy, say); a write to
+    it is a write to all of them, whichever the mapping lists first, so each must be declared."""
+    mapped = _functions()["mapped_target"]
+    spec = _spec(("src.customer", "customer"), ("src.other", "other"), ("SRC.CUSTOMER", "customer_search"))
+    assert mapped(spec, "src.customer", "mig") == {"mig.customer", "mig.customer_search"}
+    check = _functions()["check_dependencies"]
+    deps = _deps(u=[_routine("app.upsert", writes=["src.customer"])])
+    b = {"id": "b", "units": ["u"], "write_targets": ["mig.customer", "mig.customer_search", "upsert"],
+         "deploy_objects": ["upsert"], "brief": "b"}
+    check([b], deps, _maps(u=spec), "mig")
+    with pytest.raises(SystemExit, match=r"b.*missing.*mig\.customer_search"):
+        check([{**b, "write_targets": ["mig.customer", "upsert"]}], deps, _maps(u=spec), "mig")
+
+
+def test_check_dependencies_without_a_mapping_spec_keeps_the_source_name():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["app.ledger", "app.run_log", "close_period"],
+         "deploy_objects": ["close_period"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(), "mig")
+
+
+def test_deploy_objects_are_declared_targets_outside_the_table_comparison():
+    """A procedure, view or job the unit deploys is a write target (it collides like any other) but no
+    routine's DML writes it; the batch lists it in deploy_objects so the graph comparison leaves it alone.
+    A deploy object that is also a written table halts (one outside write_targets fails the manifest check)."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-5", "units": ["u"], "write_targets": ["mig.ledger", "mig.run_log", "MIG.close_period"],
+         "deploy_objects": ["mig.close_period"], "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-5.*extra.*mig\.close_period"):
+        check([{**b, "deploy_objects": []}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-5.*deploy_objects.*mig\.ledger.*writes"):
+        check([{**b, "deploy_objects": ["mig.close_period", "mig.ledger"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+
+
+@pytest.mark.parametrize("value", ["x", [1], [""], ["mig.p", "MIG.P"]])
+def test_manifest_deploy_objects_must_be_a_list_of_distinct_names_in_write_targets(value):
+    m = _manifest()
+    m["batches"][0]["deploy_objects"] = value
+    m["batches"][0]["write_targets"] = m["batches"][0]["write_targets"] + ["mig.p"]
+    with pytest.raises(SystemExit, match=r"deploy_objects"):
+        _functions()["validate_manifest"](m)
+
+
+def test_manifest_deploy_objects_outside_write_targets_halt():
+    m = _manifest()
+    m["batches"][0]["deploy_objects"] = ["mig.p"]
+    with pytest.raises(SystemExit, match=r"deploy_objects.*mig\.p.*write_targets"):
+        _functions()["validate_manifest"](m)
+    m["batches"][0]["write_targets"] = m["batches"][0]["write_targets"] + ["MIG.P"]
+    _functions()["validate_manifest"](m)
+
+
+def test_check_dependencies_halts_on_an_uncovered_callee_naming_the_unit():
+    check = _functions()["check_dependencies"]
+    with pytest.raises(SystemExit, match=r"u.*app\.close_period.*app\.log_run"):
+        check([{"id": "b", "units": ["u"], "write_targets": ["mig.ledger"], "brief": "b"}], _deps(u=[CLOSE]))
+
+
+@pytest.mark.parametrize("body", ["{", "[]", "{}", '{"routines": {}}', '{"routines": ["x"]}',
+                                  '{"routines": [{"reads": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": "t", "writes": [], "calls": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": [1], "calls": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": [], "calls": []}, '
+                                  '{"routine": "A", "reads": [], "writes": [], "calls": []}]}'])
+def test_unit_dependencies_halts_on_a_malformed_analysis(tmp_path, body):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    p = tmp_path / ".migration" / "units" / "u9" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(body)
+    with pytest.raises(SystemExit, match=r"u9/dependencies\.json"):
+        ns["unit_dependencies"]("u9")
+
+
+def test_unit_dependencies_is_none_when_absent_and_returns_the_routine_rows(tmp_path):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    assert ns["unit_dependencies"]("u9") is None
+    p = tmp_path / ".migration" / "units" / "u9" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"routines": [CLOSE, LOG]}))
+    assert ns["unit_dependencies"]("u9") == [CLOSE, LOG]
+    p.write_text(json.dumps({"routines": []}))
+    assert ns["unit_dependencies"]("u9") == []
+
+
+def test_example_fixture_is_a_valid_analysis_whose_writes_the_check_accepts(tmp_path):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    p = tmp_path / ".migration" / "units" / "example" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(FIXTURE.read_text())
+    routines = ns["unit_dependencies"]("example")
+    assert routines and all(set(r) == {"routine", "reads", "writes", "calls"} for r in routines)
+    assert any(r["calls"] for r in routines) and any(r["reads"] for r in routines)
+    writes = ns["transitive_writes"](routines)
+    assert len(writes) > 1 and writes > set().union(*(map(str.casefold, r["writes"]) for r in routines[:1]))
+    called = {c.casefold() for r in routines for c in r["calls"]}
+    roots = [r["routine"].rsplit(".", 1)[-1] for r in routines if r["routine"].casefold() not in called]
+    assert roots and len(roots) < len(routines)
+    b = {"id": "b", "units": ["example"], "write_targets": sorted(writes) + roots, "deploy_objects": roots, "brief": "b"}
+    ns["check_dependencies"]([b])
+    with pytest.raises(SystemExit, match="missing"):
+        ns["check_dependencies"]([{**b, "write_targets": sorted(writes)[1:] + roots}])
+    with pytest.raises(SystemExit, match="deploy_objects"):
+        ns["check_dependencies"]([{**b, "write_targets": sorted(writes), "deploy_objects": []}])
 
 
 # ---------------------------------------------------------------- gates as manifest rows (WS3.3)
@@ -1699,7 +2080,7 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
     with pytest.raises(SystemExit, match="mode: rerun"):
         ns["launch_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = launch_base\(\)\nDOCTOR = signed_doctor_report", src)
+    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
     assert 'BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")' in src and '"base_sha": BASE_SHA' in src
 
 
