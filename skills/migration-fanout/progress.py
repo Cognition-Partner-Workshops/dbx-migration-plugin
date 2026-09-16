@@ -74,7 +74,10 @@ def _manifest_units(manifest_path: Path, manifest: dict) -> dict:
         batch_units = batch.get("units")
         if not isinstance(batch_units, list):
             raise ValueError(f"{manifest_path}: manifest batch {batch_id!r} has no units")
-        units[_text(batch_id)] = batch_units
+        batch_id = _text(batch_id)
+        if batch_id in units:
+            raise ValueError(f"{manifest_path}: duplicate batch id {batch_id!r}")
+        units[batch_id] = batch_units
     return units
 
 
@@ -105,24 +108,6 @@ def _result(path: Path) -> dict:
     if not isinstance(result, dict):
         raise ValueError(f"{path}: not a JSON object")
     return result
-
-
-def _refresh_base_branch(path: Path):
-    manifest_path = path.with_name(path.name[:-len(_RESULT_SUFFIX)] + ".json")
-    if not manifest_path.is_file():
-        print(f"{path}: skipping merged refresh; manifest base_branch is missing", file=sys.stderr)
-        return None
-    try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, UnicodeDecodeError, ValueError):
-        raise ValueError(f"{manifest_path}: manifest is unreadable") from None
-    if not isinstance(manifest, dict):
-        raise ValueError(f"{manifest_path}: manifest is not an object")
-    base_branch = manifest.get("base_branch")
-    if not isinstance(base_branch, str) or not base_branch:
-        print(f"{path}: skipping merged refresh; manifest base_branch is missing", file=sys.stderr)
-        return None
-    return base_branch
 
 
 def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
@@ -226,6 +211,7 @@ def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
 def refresh_merged(mig: Path) -> None:
     waves = mig / "waves"
     repo = mig.parent
+    refreshes = []
     for path in sorted(waves.glob("*.result.json")):
         result = _result(path)
         if result.get("auto_merge") is not False:
@@ -251,10 +237,16 @@ def refresh_merged(mig: Path) -> None:
             and batch.get("pr_url") not in merged_prs
         ]
         merged_record = _merged_record(path)
-        if not candidates:
+        manifest_path, manifest_bytes = _manifest_bytes(path, result.get("manifest_sha"))
+        manifest = _manifest(manifest_path, manifest_bytes)
+        base_branch = manifest.get("base_branch")
+        if not isinstance(base_branch, str) or not base_branch:
+            print(f"{path}: skipping merged refresh; manifest base_branch is missing", file=sys.stderr)
             continue
-        base_branch = _refresh_base_branch(path)
-        if base_branch is None:
+        refreshes.append((path, candidates, merged_record, base_branch))
+
+    for path, candidates, merged_record, base_branch in refreshes:
+        if not candidates:
             continue
         fetch = subprocess.run(
             [
@@ -343,6 +335,8 @@ def render_progress(mig: Path) -> str:
             if batch_id in (None, ""):
                 raise ValueError(f"{path}: result batch has no id")
             batch_id = _text(batch_id)
+            if batch_id in result_batches:
+                raise ValueError(f"{path}: duplicate batch id {batch_id!r}")
             result_batches[batch_id] = batch
             result_order.append((batch_id, batch))
 
@@ -371,12 +365,13 @@ def render_progress(mig: Path) -> str:
                 if isinstance(unit_verdicts, dict) and batch_id in unit_verdicts
                 else ""
             )
+            batch_status = _text(batch.get("status"))
             status = (
                 verifier_verdict
-                if verifier_verdict
+                if batch_status == "PASS" and verifier_verdict
                 else "UNVERIFIED"
-                if _text(batch.get("status")) == "PASS"
-                else _text(batch.get("status"))
+                if batch_status == "PASS"
+                else batch_status
             )
             pr_url = batch.get("pr_url")
             record_head = (

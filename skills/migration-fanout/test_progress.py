@@ -91,6 +91,39 @@ def test_render_progress_normalizes_numeric_batch_ids(tmp_path):
     assert "| 1 | 1 | u1 | FAIL | PASS | FAIL |  |  |" in text
 
 
+def test_manifest_batch_ids_colliding_after_normalization_are_rejected(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 1, [
+        {"id": 1, "units": ["u1"]},
+        {"id": "1", "units": ["u2"]},
+    ])
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [
+            {"id": 1, "units": ["u1"]},
+            {"id": "1", "units": ["u2"]},
+        ],
+    })
+
+    with pytest.raises(ValueError, match=r"wave-1\.json: duplicate batch id"):
+        render_progress(mig)
+
+
+def test_result_batch_ids_colliding_after_normalization_are_rejected(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_manifest(mig, 1, [{"id": "1", "units": ["u1"]}])
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [
+            {"id": 1, "units": ["u1"]},
+            {"id": "1", "units": ["u1"]},
+        ],
+    })
+
+    with pytest.raises(ValueError, match=r"wave-1\.result\.json: duplicate batch id"):
+        render_progress(mig)
+
+
 def test_render_progress_rejects_empty_batch_id(tmp_path):
     mig = tmp_path / ".migration"
     manifest_sha = _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}])
@@ -411,6 +444,19 @@ def test_render_progress_includes_verifier_verdicts(tmp_path):
     assert "| 1 | other | u2 | PASS | PASS | PASS |  | pending |  |" in lines
 
 
+def test_verifier_verdict_does_not_revive_failed_batch(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"id": "b1", "units": ["u1"], "status": "FAIL"}],
+        "verify": {"unit_verdicts": {"b1": "PASS"}},
+    })
+
+    lines = render_progress(mig).splitlines()
+
+    assert "| 1 | b1 | u1 | FAIL |  | PASS |  |  |  |" in lines
+
+
 def test_render_progress_marks_missing_verifier_batch_unverified(tmp_path):
     mig = tmp_path / ".migration"
     result = {
@@ -607,6 +653,29 @@ def test_refresh_merged_rebuilds_stale_record(tmp_path):
 
     assert json.loads((waves / "wave-1.merged.json").read_text())["merged"] == {}
     assert "| 1 | b1 | u1 | PASS (unmerged) | PASS | PASS | https://example.invalid/stale | pending | {} |" in render_progress(mig)
+
+
+def test_refresh_merged_leaves_record_when_manifest_is_stale(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "feature.txt").write_text("feature\n")
+    git("add", "feature.txt")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    git("merge", "--no-ff", "-q", "feature", "-m", "merge feature")
+    git("push", "-q", "origin", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/stale-manifest")
+
+    refresh_merged(mig)
+    original = json.loads((waves / "wave-1.merged.json").read_text())
+
+    _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}], base_branch="other")
+
+    with pytest.raises(ValueError, match=r"manifest_sha does not match"):
+        refresh_merged(mig)
+
+    assert json.loads((waves / "wave-1.merged.json").read_text()) == original
 
 
 def _refresh_repo(tmp_path):
