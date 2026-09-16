@@ -17,7 +17,7 @@ Verifies byte equality of `allowed_targets.json` and `03_recon_tolerances.json` 
 decision and commit, never a working-copy edit.
 ### `playbooks_in_sync`
 Verifies string `sha256`, `repo_file`, and `installed_at` for every lock macro; flags stale,
-missing, unknown, malformed, or README-unlisted playbooks. A missing lock skips only for setup;
+missing, unknown, malformed, or playbooks absent from `playbooks/index.json`. A missing lock skips only for setup;
 orchestrator/child rerun `install-dbx-factory`. Orchestrators also require fresh (<15 minutes)
 `.migration/live_playbooks.json`; absent/stale/malformed, missing, or duplicate records fail, and
 a fresh export proves live bodies equal repo files after line-ending/trailing-newline normalization

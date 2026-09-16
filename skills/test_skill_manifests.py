@@ -1,6 +1,8 @@
 """Every SKILL.md frontmatter must parse as YAML with a name matching its directory; an
 unquoted `: ` in a description is what the installer reports as "Skill malformed"."""
 import json
+import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,14 @@ import pytest
 yaml = pytest.importorskip("yaml")
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILLS = sorted(p for p in (ROOT / "skills").glob("*/SKILL.md"))
+sys.path.insert(0, str(ROOT / "skills" / "data-reconciliation" / "harness"))
+
+from recon.config import load_canon_rules
+
+
+SKILLS = sorted((ROOT / "skills").glob("*/SKILL.md"))
+EXTRA_SKILLS = sorted((ROOT / "skills-extra").glob("*/SKILL.md"))
+ALL_SKILLS = SKILLS + EXTRA_SKILLS
 # https://docs.devinenterprise.com/cli/extensibility/skills/creating-skills#frontmatter-reference
 FRONTMATTER_FIELDS = {
     "name", "description", "argument-hint", "model", "subagent", "agent",
@@ -16,7 +25,11 @@ FRONTMATTER_FIELDS = {
 }
 
 
-@pytest.mark.parametrize("path", SKILLS, ids=lambda p: p.parent.name)
+@pytest.mark.parametrize(
+    "path",
+    ALL_SKILLS,
+    ids=lambda p: f"extra/{p.parent.name}" if p.parent.parent.name == "skills-extra" else p.parent.name,
+)
 def test_frontmatter_parses(path):
     text = path.read_text()
     assert text.startswith("---\n"), "missing frontmatter"
@@ -26,6 +39,33 @@ def test_frontmatter_parses(path):
     assert meta["name"] == path.parent.name
     assert isinstance(meta["description"], str) and meta["description"].strip()
     assert set(meta) <= FRONTMATTER_FIELDS, set(meta) - FRONTMATTER_FIELDS
+
+
+def test_extra_skills_are_not_in_core():
+    core = {p.name for p in (ROOT / "skills").iterdir() if p.is_dir()}
+    extra = {p.name for p in (ROOT / "skills-extra").iterdir() if p.is_dir()}
+    assert core.isdisjoint(extra)
+    assert {"teradata-bteq", "informatica-xml", "tsql-ssis", "lakebridge"} <= extra
+    assert "redshift-sql" not in core | extra
+
+
+def test_extra_canonicalization_rules_load():
+    paths = sorted((ROOT / "skills-extra").glob("*/canonicalization.json"))
+    paths += sorted((ROOT / "skills").glob("*/canonicalization.json"))
+    for path in paths:
+        load_canon_rules(path)
+
+
+def test_no_stale_core_paths_to_optional_skills():
+    pattern = re.compile(
+        r"skills/(lakebridge|informatica-xml|tsql-ssis|teradata-bteq|redshift-sql)\b"
+    )
+    paths = list((ROOT / "skills").rglob("*.md"))
+    paths += list((ROOT / "skills-extra").rglob("*.md"))
+    paths += [ROOT / name for name in ("README.md", "OVERVIEW.md") if (ROOT / name).exists()]
+    assert not [
+        path for path in paths if pattern.search(path.read_text())
+    ]
 
 
 def test_required_databricks_plugin_is_pinned():
