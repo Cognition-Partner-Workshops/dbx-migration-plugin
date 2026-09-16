@@ -1016,9 +1016,60 @@ VERIFY_SCHEMA = {
 }
 
 
-def check_write_targets(batches):
-    """Two batches writing the same table or collection means the lineage missed an edge.
-    Refuse to launch anything; the plan must be fixed first."""
+def other_wave_manifests(waves_dir, current):
+    """{file name: batches} for every other wave-*.json in .migration/waves/. A wave the plan wrote
+    is part of the collision picture whether or not it has run, so one that cannot be read halts."""
+    out = {}
+    for p in sorted(waves_dir.glob("wave-*.json")):
+        if p.name == current or p.name.endswith((".result.json", ".doctor.json")):
+            continue
+        try:
+            m = json.loads(p.read_text())
+        except ValueError as e:
+            raise SystemExit(f"{p} is not valid JSON ({e}); every wave manifest is read for cross-wave "
+                             "write-target collisions, so fix or remove it, then re-run") from None
+        batches = m.get("batches") if isinstance(m, dict) else None
+        if not isinstance(batches, list) or not all(
+                isinstance(b, dict) and isinstance(b.get("id"), str)
+                and isinstance(b.get("units"), list) and all(isinstance(u, str) for u in b["units"])
+                and isinstance(b.get("write_targets"), list) and all(isinstance(t, str) for t in b["write_targets"])
+                for b in batches):
+            raise SystemExit(f"{p} has no 'batches' list of {{id, units, write_targets}} rows; every wave manifest is "
+                             "read for cross-wave write-target collisions, so fix or remove it, then re-run")
+        out[p.name] = batches
+    return out
+
+
+def unit_mapping(unit):
+    """The unit's recon mapping spec, None when the child has not written it yet."""
+    p = ROOT / ".migration" / "units" / unit / "mapping_spec.json"
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except ValueError as e:
+        raise SystemExit(f"{p} is not valid JSON ({e})") from None
+
+
+def bounded_readers(spec, table):
+    """Whether every object in a mapping spec that reads `table` carries a non-empty target_where;
+    None when the spec has no object for the table (or no object list at all)."""
+    objects = spec.get("objects", spec.get("tables")) if isinstance(spec, dict) else None
+    if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
+        raise SystemExit("mapping spec 'objects' must be a list of object rows")
+    mine = [o for o in objects
+            if str(o.get("object") or o.get("target_table") or "").casefold() == table.casefold()]
+    if not mine:
+        return None
+    return all(isinstance(o.get("target_where"), str) and o["target_where"].strip() for o in mine)
+
+
+def check_write_targets(batches, other_waves, mapping=None):
+    """Two batches in one wave writing the same table means the lineage missed an edge: refuse to launch.
+    A table written by units in different waves is shared: whole-table recon of the earlier unit is
+    undone by the later one's rows, so every mapping that reads it must be bounded (target_where to the
+    unit's own partition or run date), or this wave does not launch."""
+    mapping = unit_mapping if mapping is None else mapping
     owners = {}
     for b in batches:
         for t in b.get("write_targets", []):
@@ -1026,6 +1077,34 @@ def check_write_targets(batches):
                 raise SystemExit(f"write-target collision before launch: '{t}' is claimed by "
                                  f"{owners[t]} and {b['id']}. Fix the wave plan, then re-run.")
             owners[t] = b["id"]
+    elsewhere = {}
+    for name, others in other_waves.items():
+        for b in others:
+            for t in b["write_targets"]:
+                elsewhere.setdefault(t, []).append((name, b))
+    for t, mine in owners.items():
+        if t not in elsewhere:
+            continue
+        batch = next(b for b in batches if b["id"] == mine)
+        shared = ", ".join(f"{name} {b['id']} (units {', '.join(b['units'])})" for name, b in elsewhere[t])
+        why = (f"shared write target '{t}' is written by {mine} in this wave and by {shared}; every mapping "
+               f"that reads it needs a non-empty target_where bounded to the unit's own partition or run date")
+        for wave, b in ((None, batch), *elsewhere[t]):
+            for u in b["units"]:
+                spec = mapping(u)
+                path = f".migration/units/{u}/mapping_spec.json"
+                if spec is None:
+                    if wave is None:
+                        raise SystemExit(f"{why}: {path} is missing, so unit {u} cannot be scoped")
+                    continue
+                try:
+                    bounded = bounded_readers(spec, t)
+                except SystemExit as e:
+                    raise SystemExit(f"{why}: {path}: {e}") from None
+                if bounded is None and wave is None:
+                    raise SystemExit(f"{why}: {path} has no object reading '{t}'")
+                if bounded is False:
+                    raise SystemExit(f"{why}: {path} (unit {u}) reads '{t}' without target_where")
 
 
 def child_prompt(batch):
@@ -1352,7 +1431,7 @@ async def main():
     if not resume:
         RUN_ID_PATH.unlink(missing_ok=True)
     await register_workflow(META)
-    check_write_targets(BATCHES)
+    check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name))
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}")
 
     sem = asyncio.Semaphore(WIDTH)

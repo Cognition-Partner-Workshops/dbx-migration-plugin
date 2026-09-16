@@ -27,13 +27,14 @@ def _functions():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
-                                      "validate_gates", "gates_approved"})
+                                      "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
+                                      "unit_mapping", "bounded_readers"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
                                                          "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED"}
                     for t in node.targets))]
-    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json}
+    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent")}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -127,6 +128,106 @@ def _manifest(**extra):
     m.setdefault("stop_c", "D-2")
     m.setdefault("gates_sha", _functions()["declared_gates_sha"](m["wave"], m["batches"]))
     return m
+
+
+# ---------------------------------------------------------------- shared tables across waves (WS3.9)
+
+B1 = {"id": "b-1", "units": ["u1"], "write_targets": ["mig.t"], "brief": "b"}
+B2 = {"id": "b-2", "units": ["u2"], "write_targets": ["mig.t", "mig.other"], "brief": "b"}
+BOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"],
+                        "root_where": "run_date = '${as_of}'", "target_where": "run_date = '${as_of}'"}]}
+UNBOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"]}]}
+
+
+def _specs(**by_unit):
+    return lambda unit: by_unit.get(unit)
+
+
+def test_same_wave_collision_still_halts_naming_both_batches():
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"collision.*'mig.t'.*b-1.*b-2"):
+        check([B1, B2], {}, _specs(u1=BOUNDED, u2=BOUNDED))
+
+
+@pytest.mark.parametrize("spec", [UNBOUNDED,
+                                  {"objects": [{**UNBOUNDED["objects"][0], "target_where": ""}]},
+                                  {"objects": [{**UNBOUNDED["objects"][0], "target_where": "  "}]},
+                                  {"objects": [{**UNBOUNDED["objects"][0], "target_where": 1}]}])
+def test_shared_table_across_waves_needs_a_bounded_target_where(spec):
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1=spec))
+
+
+def test_shared_table_across_waves_passes_when_every_reader_is_bounded():
+    check = _functions()["check_write_targets"]
+    check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED, u2=BOUNDED))
+    check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED))
+    check([B1], {"wave-1.json": [{**B2, "write_targets": ["mig.other"]}]}, _specs())
+
+
+def test_shared_table_other_wave_unbounded_mapping_also_halts():
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u2.*target_where"):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED, u2=UNBOUNDED))
+
+
+@pytest.mark.parametrize("spec, message", [
+    (None, "mapping_spec.json"),
+    ({"objects": []}, "mig.t"),
+    ({"objects": [{"object": "mig.other", "target_where": "x = 1"}]}, "mig.t"),
+    ({"objects": "mig.t"}, "objects"),
+    ([], "objects"),
+])
+def test_shared_table_current_unit_without_a_mapping_for_it_halts(spec, message):
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=message):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1=spec))
+
+
+def test_shared_table_matches_tables_key_and_target_table_spelling():
+    check = _functions()["check_write_targets"]
+    legacy = {"tables": [{"target_table": "MIG.T", "source_table": "dbo.t", "target_where": "run_date = '${as_of}'"}]}
+    check([B1], {"wave-1.json": [B2]}, _specs(u1=legacy))
+    with pytest.raises(SystemExit, match="target_where"):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1={"tables": [{"target_table": "MIG.T", "source_table": "dbo.t"}]}))
+
+
+def test_other_wave_manifests_reads_every_wave_but_the_current_and_fails_closed(tmp_path):
+    read = _functions()["other_wave_manifests"]
+    (tmp_path / "wave-0.json").write_text(json.dumps({"batches": [B1]}))
+    (tmp_path / "wave-1.json").write_text(json.dumps({"batches": [B2]}))
+    (tmp_path / "wave-1.result.json").write_text("{")
+    (tmp_path / "wave-1.doctor.json").write_text("{")
+    (tmp_path / "wave-2.brief.md").write_text("x")
+    assert read(tmp_path, "wave-0.json") == {"wave-1.json": [B2]}
+    assert read(tmp_path, "wave-1.json") == {"wave-0.json": [B1]}
+    (tmp_path / "wave-2.json").write_text("{")
+    with pytest.raises(SystemExit, match=r"wave-2\.json.*JSON"):
+        read(tmp_path, "wave-0.json")
+
+
+@pytest.mark.parametrize("manifest", [[], {}, {"batches": {}}, {"batches": ["b"]}, {"batches": [{"id": "b"}]},
+                                      {"batches": [{"id": "b", "units": ["u"], "write_targets": "t"}]},
+                                      {"batches": [{"id": "b", "units": "u", "write_targets": ["t"]}]}])
+def test_other_wave_manifest_without_batch_rows_halts(tmp_path, manifest):
+    read = _functions()["other_wave_manifests"]
+    (tmp_path / "wave-3.json").write_text(json.dumps(manifest))
+    with pytest.raises(SystemExit, match=r"wave-3\.json.*batches"):
+        read(tmp_path, "wave-0.json")
+
+
+def test_unit_mapping_is_none_when_absent_and_halts_when_malformed(tmp_path):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    assert ns["unit_mapping"]("u9") is None
+    spec = tmp_path / ".migration" / "units" / "u9" / "mapping_spec.json"
+    spec.parent.mkdir(parents=True)
+    spec.write_text(json.dumps(BOUNDED))
+    assert ns["unit_mapping"]("u9") == BOUNDED
+    spec.write_text("{")
+    with pytest.raises(SystemExit, match=r"u9/mapping_spec\.json.*JSON"):
+        ns["unit_mapping"]("u9")
 
 
 # ---------------------------------------------------------------- gates as manifest rows (WS3.3)
