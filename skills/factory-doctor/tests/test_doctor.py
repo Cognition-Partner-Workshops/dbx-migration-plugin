@@ -220,7 +220,8 @@ def test_run_core_rows_are_ten(tmp_path):
     optional = {"lakebase_branch_create", "lakebase_target_grants", "analytical_target_grants"}
     assert [c["id"] for c in report["checks"] if c["id"] not in optional] == [
         "workspace", "allowed_targets", "allowlist_committed", "playbooks_in_sync", "hook_guard",
-        "official_databricks_plugin", "recon_harness", "recon_family_supported", "delete_evidence",
+        "official_databricks_plugin", "recon_harness", "recon_family_supported", "type_map_audit",
+        "delete_evidence",
         "source_principal_read_only", "databricks_identity",
     ]
 
