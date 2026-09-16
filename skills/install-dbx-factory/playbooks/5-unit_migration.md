@@ -24,6 +24,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 ### Review and deliver
 - [ ] Self-review every gate, tolerance, unverified path, owner, severity, and closure gate; stop after three review rounds and escalate.
 - [ ] Run the live or snapshot merge verdict exactly once as specified; fixture PASS is not merge eligibility.
+- [ ] Treat a structural gap (missing constraint, trigger, index, identity, or grant; `structural_gap` in `merge_block_reasons`) as a merge blocker like a row-tier failure; `unsupported` in `structural_checks` is unchecked, not clean.
 - [ ] Keep the source principal read-only, use one warehouse window, and report connector/live budget and recon cost in the evidence.
 - [ ] Open one PR with changed paths, full recon JSON, short summary, three-part body, cost, write targets, and SKILL FEEDBACK.
 
