@@ -40,7 +40,7 @@ def test_load_dictionary_reads_each_family_fixture(family):
     assert d.family == family and d.tables
     assert all(isinstance(f, SchemaFacts) for f in d.tables.values())
     if family == "databricks":
-        assert d.unsupported == frozenset({"indexes", "sequences_identity"})
+        assert d.unsupported == frozenset({"indexes"})
         assert all(f.unsupported == d.unsupported for f in d.tables.values())
     loans = next(f for f in d.tables.values() if f.primary_key or f.primary_key_informational)
     assert loans.identity_columns
@@ -76,7 +76,7 @@ def test_structural_checks_mark_a_reader_hole():
     d = load_dictionary(FIXTURES / "example_databricks" / "dictionary.json")
     t = next(iter(d.tables.values()))
     sc = structural_checks([(full, t)])
-    assert sc["indexes"] == "unsupported" and sc["sequences_identity"] == "unsupported"
+    assert sc["indexes"] == "unsupported"
     assert sc["triggers"] == sc["constraints"] == sc["grants"] == "checked"
     assert set(structural_checks([]).values()) == {"unsupported"}
 
@@ -290,7 +290,8 @@ def test_databricks_fixture_marks_triggers_checked_not_a_hole():
     d = load_dictionary(FIXTURES / "example_databricks" / "dictionary.json")
     t = next(iter(d.tables.values()))
     sc = structural_checks([(t, t)])
-    assert sc["triggers"] == "checked" and sc["indexes"] == "unsupported"
+    # Delta reads every category but indexes (identity comes from SHOW CREATE TABLE DDL)
+    assert sc == {c: "unsupported" if c == "indexes" else "checked" for c in sc}
 
 
 def test_tier0_informational_source_keys_must_exist_on_the_target():
@@ -514,7 +515,11 @@ def test_databricks_schema_facts_maps_information_schema():
             if "table_privileges" in sql:
                 return [("svc_app", "SELECT"), ("svc_app", "MODIFY")]
             if "columns" in sql:
-                return [("loan_id", "NO", "YES"), ("note", "YES", "NO")]
+                return [("loan_id", "NO"), ("note", "YES")]
+            if "SHOW CREATE" in sql:
+                return [("CREATE TABLE `mig`.`s`.`loans` (\n"
+                         "  `loan_id` BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 5 "
+                         "INCREMENT BY 1),\n  `note` STRING)",)]
             return []
     a._sql = Sql()
     facts = a.schema_facts("loans")
@@ -526,11 +531,11 @@ def test_databricks_schema_facts_maps_information_schema():
     assert facts.not_null == {"loan_id"} and facts.identity_columns == {"loan_id"}
     assert facts.checks == {"current_balance >= 0"} and facts.check_count == 1
     assert facts.grants == {"svc_app": frozenset({"select", "modify"})}
-    assert facts.unsupported == frozenset({"indexes", "sequences_identity"})
+    assert facts.unsupported == frozenset({"indexes"})
     assert facts.triggers == {}
-    import pytest as _pt
-    with _pt.raises(NotImplementedError):
-        a.identity_state("loans", "loan_id")
+    state = a.identity_state("loans", "loan_id")
+    assert (state.next, state.increment) == (5, 1)
+    assert a.identity_state("loans", "note") is None
     joined = " ".join(answers)
     for view in ("table_constraints", "key_column_usage", "referential_constraints",
                  "columns", "check_constraints", "table_privileges"):
@@ -573,8 +578,7 @@ def test_databricks_source_adapter_reads_uc_dictionary():
     facts = a.schema_facts("cat.s.loans")
     assert facts.primary_key_informational == ("loan_id",)
     assert "information_schema.table_constraints" in " ".join(answers)
-    with pytest.raises(NotImplementedError):
-        a.identity_state("cat.s.loans", "loan_id")
+    assert a.identity_state("cat.s.loans", "loan_id") is None
 
 
 def test_schema_facts_driver_errors_are_dictionary_errors_without_secrets():

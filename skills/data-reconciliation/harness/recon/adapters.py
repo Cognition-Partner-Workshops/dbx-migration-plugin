@@ -827,12 +827,13 @@ def _pg_trigger_shape(tgtype: int) -> tuple[str, tuple[str, ...], str]:
 
 
 def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> SchemaFacts:
-    """One table's Unity Catalog facts over information_schema, shared by the Databricks
-    adapters. Delta has no indexes or triggers, so both are declared unsupported rather than
-    silently empty. UC foreign keys are informational: no actions to read."""
+    """One table's Unity Catalog facts, shared by the Databricks adapters: constraints and
+    grants over information_schema, identity columns from the SHOW CREATE TABLE DDL (the
+    GENERATED ... AS IDENTITY clause; information_schema marks them reserved). Delta has no
+    indexes or triggers; UC foreign keys and primary keys are informational: no actions to read."""
     facts = SchemaFacts(table=f"{catalog}.{schema}.{table}",
-                        # indexes and sequences are unreadable on UC; triggers are provably absent
-                        unsupported=frozenset({"indexes", "sequences_identity"}))
+                        # indexes are unreadable on UC; triggers are provably absent
+                        unsupported=frozenset({"indexes"}))
 
     def q(view: str, sql: str, params: dict) -> list[tuple]:
         try:
@@ -884,14 +885,16 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         elif kind == "CHECK":
             facts.check_count += 1
     rows = q("information_schema.columns",
-        f"SELECT column_name, is_nullable, is_identity FROM {catalog}.information_schema.columns "
+        f"SELECT column_name, is_nullable FROM {catalog}.information_schema.columns "
         "WHERE table_catalog = %(catalog)s AND table_schema = %(schema)s AND table_name = %(table)s",
         {"catalog": catalog, "schema": schema, "table": table})
-    for col, nullable, identity in rows:
+    for col, nullable in rows:
         if str(nullable).upper() == "NO":
             facts.not_null.add(col)
-        if str(identity).upper() == "YES":
-            facts.identity_columns.add(col)
+    facts.identity_columns = set(_uc_identity_columns(
+        q("SHOW CREATE TABLE",
+          f"SHOW CREATE TABLE {quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
+          f"{quote_ident(table, '`')}", {})))
     rows = q("information_schema.check_constraints",
         f"SELECT cc.check_clause FROM {catalog}.information_schema.check_constraints cc "
         f"JOIN {catalog}.information_schema.table_constraints tc "
@@ -917,6 +920,49 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
     facts.grants = {g: frozenset(p) for g, p in grants.items()}
     return facts
+
+
+_UC_IDENTITY_RE = re.compile(
+    r"^\s*(?:`(?P<bt>[^`]+)`|\"(?P<dq>[^\"]+)\"|(?P<plain>[A-Za-z_][\w$]*))"
+    r".*?\bGENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY"
+    r"(?:\s*\((?P<opts>[^)]*)\))?",
+    re.IGNORECASE)
+
+
+def _uc_identity_columns(ddl_rows) -> dict[str, tuple[int, int]]:
+    """column -> (start, increment), parsed from the SHOW CREATE TABLE DDL: each column line's
+    GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY clause, defaulting to (1, 1) when the
+    parenthesised START WITH / INCREMENT BY clause is absent."""
+    out: dict[str, tuple[int, int]] = {}
+    for (ddl,) in ddl_rows:
+        for line in str(ddl).splitlines():
+            m = _UC_IDENTITY_RE.match(line)
+            if not m:
+                continue
+            col = m.group("bt") or m.group("dq") or m.group("plain")
+            opts = m.group("opts") or ""
+            start = re.search(r"START\s+WITH\s+(-?\d+)", opts, re.IGNORECASE)
+            inc = re.search(r"INCREMENT\s+BY\s+(-?\d+)", opts, re.IGNORECASE)
+            out[col] = (int(start.group(1)) if start else 1,
+                        int(inc.group(1)) if inc else 1)
+    return out
+
+
+def _uc_identity_state(run_query, catalog: str, schema: str, table: str,
+                       column: str) -> IdentityState | None:
+    """The declared start/step for one UC identity column (Delta exposes no last_value, so the
+    declared START WITH is what is readable); None when the column is not identity."""
+    try:
+        rows = run_query(
+            f"SHOW CREATE TABLE {quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
+            f"{quote_ident(table, '`')}", {})
+    except (DictionaryError, NotImplementedError):
+        raise
+    except Exception as exc:
+        raise DictionaryError(
+            f"{table}: SHOW CREATE TABLE read failed ({type(exc).__name__})") from exc
+    state = _uc_identity_columns(rows).get(column)
+    return IdentityState(state[0], state[1]) if state else None
 
 
 def _split_table(table: str, default_schema: str | None) -> tuple[str | None, str]:
@@ -1202,7 +1248,12 @@ class DatabricksSourceAdapter(_SqlAdapterBase):
         return _uc_schema_facts(lambda sql, params: self._rows(sql, params), *parts)
 
     def identity_state(self, table: str, column: str) -> IdentityState | None:
-        raise NotImplementedError("Delta identity columns expose no readable sequence state")
+        parts = table.replace("`", "").split(".")
+        if len(parts) != 3:
+            raise NotImplementedError(
+                f"{type(self).__name__} needs a catalog.schema.table name, got {table!r}")
+        return _uc_identity_state(
+            lambda sql, params: self._rows(sql, params), *parts, column)
 
 
 SOURCE_ADAPTERS = {
@@ -1261,7 +1312,9 @@ class DatabricksTargetAdapter:
                                 self._catalog, self._schema, object)
 
     def identity_state(self, object: str, column: str) -> IdentityState | None:
-        raise NotImplementedError("Delta identity columns expose no readable sequence state")
+        return _uc_identity_state(
+            lambda sql, params: self._sql._rows(sql, params),
+            self._catalog, self._schema, object, column)
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:

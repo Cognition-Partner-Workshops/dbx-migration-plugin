@@ -1,9 +1,8 @@
 {
   "family": "databricks",
-  "note": "Example Unity Catalog shape for --target-dictionary. UC exposes no indexes or sequence state, so those stay unsupported; triggers are provably absent on Delta (an empty dictionary, not a hole) and constraints are informational.",
+  "note": "Example Unity Catalog shape for --target-dictionary. UC exposes no indexes, so that category stays unsupported; triggers are provably absent on Delta (an empty dictionary, not a hole), constraints are informational, and identity columns come from the SHOW CREATE TABLE DDL.",
   "unsupported": [
-    "indexes",
-    "sequences_identity"
+    "indexes"
   ],
   "tables": {
     "loans": {
