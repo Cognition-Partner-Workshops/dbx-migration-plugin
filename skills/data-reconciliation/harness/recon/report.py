@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from .rerun import rerun_gap, rerun_missing, rerun_unsupported
+from .routines import parity_missing, routine_gap
 from .tiers import TierResult
 
 MAX_FINDINGS_IN_REPORT = 50
@@ -55,7 +56,12 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  snapshot: dict | None = None,
                  provenance_warnings: list[str] | None = None,
                  depth: str = "threshold", cost: dict | None = None,
-                 type_map: dict | None = None, rerun_proof: dict | None = None) -> dict:
+                 type_map: dict | None = None,
+                 routine_parity: list[dict] | None = None,
+                 routine_writers: list[str] | None = None,
+                 routine_analysis_missing: bool = False,
+                 routine_dependencies: str | None = None,
+                 rerun_proof: dict | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -70,9 +76,12 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     structural = next((t for t in tiers if t.name in ("structural_parity", "schema_parity")), None)
     checks = (structural.stats.get("structural_checks") or {}) if structural else {}
     structural_blind = any(v == "unsupported" for c, v in checks.items() if c != "indexes")
+    unlisted_writers = parity_missing(routine_parity, routine_writers)
+    parity_gap = bool(unlisted_writers) or routine_analysis_missing
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and not structural_blind
                       and (mode != "snapshot" or snapshot is not None)
+                      and not routine_gap(routine_parity) and not parity_gap
                       and not rerun_missing(rerun_proof)
                       and not rerun_gap(rerun_proof) and not rerun_unsupported(rerun_proof))
     reasons = []
@@ -82,6 +91,10 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         reasons.append("structural_gap")
     if verdict == "FAIL":
         reasons.append("tier_failed")
+    if routine_gap(routine_parity):
+        reasons.append("routine_gap")
+    if parity_gap:
+        reasons.append("routine_parity_missing")
     if warnings:
         reasons.append("warnings")
     if mode not in ("live", "snapshot", "transactional"):
@@ -113,7 +126,35 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "type_map": type_map,
         "rerun_proof": rerun_proof,
         "merge_block_reasons": reasons,
+        "routine_parity": routine_parity,
+        "routine_writers": routine_writers,
+        "routine_dependencies": routine_dependencies,
+        **({"routine_analysis_missing": True} if routine_analysis_missing else {}),
     }
+
+
+def _parity_lines(result: dict) -> list[str]:
+    parity = result.get("routine_parity")
+    if not parity:
+        if result.get("routine_analysis_missing"):
+            return ["", "## Routine parity: routine_parity_missing (no dependency analysis; commit "
+                        f".migration/units/{result['unit']}/dependencies.json, an empty `routines` list "
+                        "for a unit that writes nothing, or pass `--routine-dependencies`)"]
+        if "routine_parity_missing" in result.get("merge_block_reasons", []):
+            return ["", "## Routine parity: routine_parity_missing (the unit has writing routines and no "
+                        "parity list; run `dbx-recon routine-parity` and pass `--routine-parity`)", ""] + [
+                        f"- `{w}` no row" for w in result.get("routine_writers") or []]
+        return []
+    counts = {s: sum(1 for r in parity if r["status"] == s) for s in ("proven", "unproven", "failed")}
+    lines = ["", f"## Routine parity: {counts['proven']} proven, {counts['unproven']} unproven, "
+                 f"{counts['failed']} failed", ""]
+    for r in parity:
+        if r["status"] == "proven":
+            continue
+        why = r.get("reason") or "; ".join(f"{f['table']} {f['check']}: {f['detail']}"
+                                           for f in r.get("findings", []))
+        lines.append(f"- `{r['routine']}` {r['status']}: {why}")
+    return lines
 
 
 def render_report(result: dict) -> str:
@@ -134,6 +175,7 @@ def render_report(result: dict) -> str:
     ]
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
+    lines += _parity_lines(result)
     if result.get("cost"):
         lines.append(f"- Cost: `{json.dumps(result['cost'], default=str)}`")
     if _rerun_line(result):
@@ -190,6 +232,7 @@ def render_summary(result: dict) -> str:
         lines.append(f"- Cost: source {cost['source_statements']} statements / "
                      f"{cost['source_rows_fetched']} rows fetched; target {cost['target_statements']} "
                      f"statements / {cost['target_rows_fetched']} rows; {cost['elapsed_s']}s")
+    lines += _parity_lines(result)
     structural = next((t for t in result["tiers"] if t["name"] in ("structural_parity", "schema_parity")), None)
     if structural is not None and structural["stats"].get("structural_checks"):
         checks = ", ".join(f"{k}={v}" for k, v in structural["stats"]["structural_checks"].items())
