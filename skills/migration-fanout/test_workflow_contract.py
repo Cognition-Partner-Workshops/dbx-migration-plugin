@@ -12,10 +12,12 @@ DOCTOR = Path(__file__).parents[1] / "factory-doctor" / "doctor.py"
 
 def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
-               doctor_hook_probe=None, doctor_source=None):
+               doctor_hook_probe=None, doctor_source=None, decisions=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
+    if decisions is not None:
+        (ws / ".migration" / "06_decisions.md").write_text(decisions)
     source = {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}}
     manifest = {
         "wave": 0,
@@ -115,7 +117,9 @@ async def agent(prompt, **kwargs):
     calls.append({{"kind": "agent", "label": kwargs.get("label"), "prompt": prompt}})
     CALLS.write_text(json.dumps(calls))
     reports = json.loads(REPORTS.read_text())
-    return reports.pop(0)
+    report = reports.pop(0)
+    REPORTS.write_text(json.dumps(reports))
+    return report
 def log(message):
     print(message)
 """
@@ -127,10 +131,62 @@ def log(message):
     return proc, calls
 
 
-def _pass_report(pr_url=""):
-    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live",
+def _pass_report(pr_url="", **extra):
+    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": pr_url, "branch": "feature/x", "changed_paths": [],
-            "write_targets": ["mig.t"], "one_line_summary": "ok"}
+            "write_targets": ["mig.t"], "one_line_summary": "ok", **extra}
+
+
+def _push_pr(ws, n=1):
+    subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", f"HEAD:refs/pull/{n}/head", "HEAD:recon/wave-0"], check=True)
+    return f"https://github.com/acme/target/pull/{n}"
+
+
+def _verify_report(**extra):
+    return {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS"}, "merged_prs": [],
+            "findings": [], "changed_paths": [], **extra}
+
+
+def test_merge_eligible_false_is_recorded_as_merged_only_by_a_ledger_override(tmp_path):
+    ledger = "| D-3 | user: merge_override for u, watermark gap accepted |\n"
+    override = {"kind": "human_override", "decision_id": "D-3"}
+    ws, cwd = _workspace(tmp_path, decisions=ledger)
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=override),
+                                       _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
+    assert result["batches"][0]["status"] == "PASS"
+    assert result["batches"][0]["merge_authority"] == override
+    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "D-3"}]
+    assert result["closed"] is True
+    assert "D-3" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert "D-3" in [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+
+    ws, cwd = _workspace(tmp_path / "no_row", decisions="| D-3 | user: widen tolerance for u |\n")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "no_row", [_pass_report(pr, merge_eligible=False, merge_authority=override)])
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
+    assert result["batches"][0]["status"] == "FAIL" and result["batches"][0]["failure_class"] == "merge_authority"
+    assert result["merge_overrides"] == [] and result["closed"] is False
+
+    ws, cwd = _workspace(tmp_path / "no_ledger")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "no_ledger", [_pass_report(pr, merge_eligible=False, merge_authority=override)])
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
+    assert result["batches"][0]["failure_class"] == "merge_authority"
+
+
+def test_harness_pass_records_harness_authority_and_no_overrides(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
+    assert result["batches"][0]["merge_authority"] == {"kind": "harness", "decision_id": None}
+    assert result["merge_overrides"] == [] and result["closed"] is True
 
 
 def test_start_launches_children_and_writes_the_result(tmp_path):
