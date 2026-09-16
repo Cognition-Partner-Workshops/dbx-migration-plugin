@@ -36,7 +36,7 @@ redoes finished work.
    `result.json`/`brief.md`, and post the brief. At every wave close,
    `skills/migration-fanout/progress.py` renders `.migration/05_progress.md` from the wave result.
    Use `--refresh-merged` to record manual merges from git in `wave-<N>.merged.json`.
-   Detects merge-commit, rebase, and squash merges from git; equivalence requires the exact changed lines, including whitespace, and a head git cannot prove merged stays unmerged.
+   Detects merge-commit, rebase, and squash merges from git; a candidate counts only when its tree equals the PR head over the PR's paths (whitespace included); anything git cannot prove stays unmerged.
    For resume, rewrite the pointer with
    `mode: "resume"` and that run ID, re-run the doctor with `--wave` (fresh signature),
    and call `run_workflow` with the same run ID. Start, rerun, and smoke pointers carry
