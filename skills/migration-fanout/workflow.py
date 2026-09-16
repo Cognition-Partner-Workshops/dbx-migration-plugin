@@ -1501,7 +1501,8 @@ def validate_close(close, to_merge) -> list[str]:
 def proven_merged(to_merge):
     """({proven pr_url}, {pr_url: reason}) — a merge counts only when the PR head still equals the gated
     head (a commit appended after verification is not the verified tree) and that head is on origin's
-    base tip, directly or as a commit carrying the same tree for the PR's paths (a squash/rebase merge).
+    base tip, directly or because the tip itself carries the head's tree for the PR's paths (a squash/rebase
+    merge nothing has since undone; a historical match the base later reverted is not the verified code).
     Whatever the close step reported or failed to report is reconciled against git."""
     proven, reasons = set(), {}
     try:
@@ -1535,15 +1536,14 @@ def proven_merged(to_merge):
             if not paths:
                 reasons[url] = "PR diff is empty"
                 continue
-            commits = subprocess.run(git + ["rev-list", "-n", "500", tip, f"^{mb}"],
-                                     check=True, capture_output=True, text=True,
-                                     timeout=300).stdout.split()
-            if not any(subprocess.run(git + ["diff", "--quiet", c, head, "--", *paths],
-                                      check=False, capture_output=True, timeout=300).returncode == 0
-                       for c in commits):
+            same = subprocess.run(git + ["diff", "--quiet", tip, head, "--", *paths],
+                                  check=False, capture_output=True, timeout=300).returncode
+            if same == 0:
+                proven.add(url)
+            elif same == 1:
                 reasons[url] = f"head not on origin/{BASE_BRANCH}"
             else:
-                proven.add(url)
+                raise subprocess.SubprocessError(f"diff rc={same}")
         except (OSError, subprocess.SubprocessError) as e:
             reasons[url] = f"merge proof failed ({e})"
     return proven, reasons

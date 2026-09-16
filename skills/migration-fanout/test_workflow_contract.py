@@ -1215,6 +1215,28 @@ def test_a_squash_merged_pr_counts_as_merged(tmp_path):
     assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
 
 
+def test_a_historical_tree_match_that_the_base_since_reverted_is_not_a_merge(tmp_path):
+    """The base once carried the PR's tree on its paths and then reverted it: the verified code is not on
+    the tip, so the PR is unmerged and the wave stays open."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    (ws / "x.sql").write_text("select 1")
+    subprocess.run(["git", "-C", str(ws), "add", "x.sql"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "x"], check=True)
+    pr = _push_pr(ws)
+    _squash_merge_to_base(ws)
+    git = ["git", "-C", str(ws)]
+    tip = subprocess.run(git + ["rev-parse", "origin/migration/x"], check=True, capture_output=True, text=True).stdout.strip()
+    tree = subprocess.run(git + [f"rev-parse", f"{tip}^^{{tree}}"], check=True, capture_output=True, text=True).stdout.strip()
+    revert = subprocess.run(git + ["commit-tree", tree, "-p", tip, "-m", "revert"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", f"{revert}:refs/heads/migration/x"], check=True)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _close_report(merged_prs=[pr])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert result["close"]["unmerged"][0]["reason"] == "head not on origin/migration/x"
+
+
 def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
     """Resume replays the PASS gated at head A; the PR has since moved to B (B merged, A's verdict stands
     for nothing): the wave cannot close over a commit it never gated."""
