@@ -572,6 +572,22 @@ def test_a_hand_run_wave_reserves_nothing_while_a_shared_table_is_unbounded(tmp_
     assert json.loads(proc.stdout)["reserved"] is True
 
 
+def test_a_hand_run_wave_reserves_nothing_while_its_declared_targets_differ_from_the_call_graph(tmp_path):
+    """`preflight` is advice about a manifest that may change before `reserve` runs; `reserve` checks the
+    manifest it spends the STOP C row on, call graph included."""
+    ws, cwd = _workspace(tmp_path / "drift", doctor=False, dependencies={"u": _analysis("mig.t", "mig.audit")})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "Traceback" not in proc.stderr
+    assert "b-1" in proc.stderr and "mig.audit" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+
+    ws, cwd = _workspace(tmp_path / "ok", doctor=False, dependencies={"u": _analysis("MIG.T")},
+                         write_targets=("mig.t", "mig.run"), deploy_objects=("mig.run",))
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["reserved"] is True
+
+
 def test_malformed_sibling_wave_manifest_halts_before_launch(tmp_path):
     ws, cwd = _workspace(tmp_path, other_waves={"wave-1.json": "{"})
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])

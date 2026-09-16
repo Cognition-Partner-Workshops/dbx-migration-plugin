@@ -622,6 +622,38 @@ def test_every_root_of_the_call_graph_is_a_declared_deploy_object():
         check([{**b, "write_targets": [], "deploy_objects": []}], _deps(u=[READ_ONLY]))
 
 
+def test_same_named_roots_in_different_schemas_each_need_a_deploy_object_of_their_own():
+    """Two entry points whose trailing names agree (`app.close` and `legacy.close`) are two deployed objects:
+    one deploy_objects row cannot stand for both, and a row qualified like one of them is that one's."""
+    check = _functions()["check_dependencies"]
+    roots = [_routine("app.close", writes=["mig.a"]), _routine("legacy.close", writes=["mig.b"])]
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["mig.a", "mig.b", "mig.close"], "deploy_objects": ["mig.close"], "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-9.*close.*deploy_objects"):
+        check([b], _deps(u=roots))
+    check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.legacy.close"],
+            "deploy_objects": ["mig.app.close", "mig.legacy.close"]}], _deps(u=roots))
+    check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.close"],
+            "deploy_objects": ["mig.app.close", "mig.close"]}], _deps(u=roots))
+    with pytest.raises(SystemExit, match=r"b-9.*legacy\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.b", "mig.app.close", "mig.other.close"],
+                "deploy_objects": ["mig.app.close", "mig.other.close"]}], _deps(u=roots))
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.other.close"], "deploy_objects": ["mig.other.close"]}],
+              _deps(u=[roots[0]]))
+
+
+def test_a_complete_analysis_with_no_routines_is_a_graph_that_writes_and_deploys_nothing():
+    """Every unit analysed and none converting a routine is a real (empty) graph: a declared table or
+    deploy object is then an extra nothing writes or ships, the same mismatch as with routines."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-0", "units": ["u", "v"], "write_targets": [], "brief": "b"}
+    check([b], _deps(u=[], v=[]))
+    with pytest.raises(SystemExit, match=r"b-0.*extra.*mig\.t"):
+        check([{**b, "write_targets": ["mig.t"]}], _deps(u=[], v=[]))
+    with pytest.raises(SystemExit, match=r"b-0.*deploy_objects.*mig\.p"):
+        check([{**b, "write_targets": ["mig.p"], "deploy_objects": ["mig.p"]}], _deps(u=[], v=[]))
+
+
 def test_check_dependencies_skips_a_batch_with_no_analysis_at_all():
     check = _functions()["check_dependencies"]
     check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"], "brief": "b"}], _deps())
