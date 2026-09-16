@@ -41,7 +41,7 @@ def _batch_runtime():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
-                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision"})
+                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA"}
                     for t in node.targets))]
@@ -447,6 +447,28 @@ def test_override_decision_row_names_units_in_its_text_not_in_its_metadata():
     assert not override_decision("D-7", ["2024-05-02"], "| D-7 | 2024-05-02 | user:U1 | merge_override for u |")
     assert not override_decision("D-7", ["U1"], "| D-7 | user:U1 | merge_override for u |")
     assert not override_decision("D-7", ["u"], "| D-7 | user:u | merge_override for v |")
+
+
+def test_override_decision_is_the_row_whose_id_cell_is_the_decision_not_a_row_that_mentions_it():
+    """A decision id authorizes only through its own row: one that cites it in prose (supersedes D-7,
+    see D-7) is another decision, and D-7 must be looked up as a row of its own."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u, supersedes D-7 |")
+    assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u | D-7 |")
+    assert not override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u")   # not a table row
+    assert override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for v |\n| D-7 | user:U1 | merge_override for u |")
+
+
+def test_override_decision_counts_a_unit_named_like_metadata_when_the_row_names_it_in_its_text():
+    """Ids, dates and provenance are excluded by cell, not by shape: a unit called D-7, 2024-05-02 or
+    default-accepted is named like any other when it appears in the row's text."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert override_decision("D-9", ["D-7"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for D-7 |")
+    assert override_decision("D-9", ["2024-05-02"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for 2024-05-02 |")
+    assert override_decision("D-9", ["default-accepted"], "| D-9 | user:evt-1 | merge_override for default-accepted |")
+    assert not override_decision("D-9", ["D-7"], "| D-9 | D-7 | user:evt-1 | merge_override for u |")   # a cell that is only an id
+    assert not override_decision("D-9", ["2026-09-16"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for u |")
+    assert not override_decision("D-9", ["evt-1"], "| D-9 | user:evt-1 merge_override for u |")
 
 
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():

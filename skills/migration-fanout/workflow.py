@@ -202,9 +202,9 @@ PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-
 DECISION_ID = re.compile(r"D-[0-9]+")
 # Its provenance when a human wrote it (`user:<message/event id>`), as the ledger convention names it.
 HUMAN_PROVENANCE = re.compile(r"(?<![\w-])user:[\w][\w.@/-]*")
-# The parts of a ledger row that are about the row, not about units: its ids, dates/times and provenance.
-LEDGER_METADATA = re.compile(rf"(?<![\w-])D-[0-9]+(?![\w-])|(?<![\w-])\d{{4}}-\d{{2}}-\d{{2}}(?:[T ][\d:.]+Z?(?:[+-]\d{{2}}:?\d{{2}})?)?"
-                             rf"|{HUMAN_PROVENANCE.pattern}|(?<![\w-])default-accepted(?![\w-])")
+# A cell of a ledger row that is about the row, not about units: an id, a date/time or the provenance.
+LEDGER_METADATA = re.compile(rf"D-[0-9]+|\d{{4}}-\d{{2}}-\d{{2}}(?:[T ][\d:.]+Z?(?:[+-]\d{{2}}:?\d{{2}})?)?"
+                             rf"|{HUMAN_PROVENANCE.pattern}|default-accepted")
 
 
 def decision_ledger():
@@ -214,22 +214,37 @@ def decision_ledger():
         return ""
 
 
+def ledger_rows(ledger):
+    """Each markdown table row of the ledger as (decision id, its cells): the id is the first cell that is
+    one alone, so a row that cites another decision in prose or a later column is not that decision's."""
+    for line in ledger.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [" ".join(c.split()) for c in line.strip("|").split("|")]
+        ids = [c for c in cells if DECISION_ID.fullmatch(c)]
+        if ids:
+            yield ids[0], cells
+
+
 def override_decision(decision_id, units, ledger):
-    """Whether the ledger holds the D-<n> row that lets a human merge past merge_eligible=false: one
-    line carrying that id, human provenance (`user:<id>`; a default-accepted row is the orchestrator's,
-    not a human's), the word merge_override and the id of every unit in the batch, in whatever column
-    order the ledger keeps. Units are looked for in the row's text only: its decision ids, dates and
-    provenance are blanked first, so none of those stands in for a unit the row did not name; nor does
-    the marker stand in for a unit that happens to be called merge_override (the row names it again)."""
+    """Whether the ledger holds the D-<n> row that lets a human merge past merge_eligible=false: the row
+    whose id cell is that id, with human provenance (`user:<id>`; a default-accepted row is the
+    orchestrator's, not a human's), the word merge_override and the id of every unit in the batch, in
+    whatever column order the ledger keeps. Units are looked for in the row's text cells only: a cell
+    that is an id, a date or the provenance alone is about the row and is skipped, and a provenance token
+    inside a text cell is blanked, so none of those stands in for a unit the row did not name, while a
+    unit that happens to be called like one counts when the text names it; nor does the marker stand in
+    for a unit that happens to be called merge_override (the row names it again)."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
         return False
 
     def word(w):
         return rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])"
 
-    for line in ledger.splitlines():
-        if HUMAN_PROVENANCE.search(line) and re.search(word(decision_id), line):
-            text = LEDGER_METADATA.sub(" ", line)
+    for row_id, cells in ledger_rows(ledger):
+        if row_id == decision_id and any(HUMAN_PROVENANCE.search(c) for c in cells):
+            text = " | ".join(HUMAN_PROVENANCE.sub(" ", c) for c in cells if not LEDGER_METADATA.fullmatch(c))
             need = Counter(("merge_override", *units))
             if all(len(re.findall(word(w), text)) >= n for w, n in need.items()):
                 return True
