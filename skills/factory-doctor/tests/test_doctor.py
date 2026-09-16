@@ -1700,6 +1700,94 @@ def test_wave_manifest_family_reaches_recon_family_supported(tmp_path):
     assert any(l.startswith("fail") and "recon_family_supported" in l for l in result.stdout.splitlines())
 
 
+# ------------------------------------------------------------------ type_map_audit (WS3.5)
+
+def _typed_unit_mapping(ws: Path, unit: str, fields: list[dict]) -> Path:
+    p = ws / ".migration" / "units" / unit / "mapping_spec.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"version": "m1", "objects": [{
+        "object": "orders", "root_table": "ORDERS",
+        "key": {"source": ["ORDER_ID"], "target": ["order_id"]},
+        "fields": fields}]}))
+    return p
+
+
+def _field(source, source_type, target_type):
+    return {"source": source, "target": source.lower(),
+            "source_type": source_type, "target_type": target_type}
+
+
+def test_type_map_audit_skipped_at_setup(tmp_path):
+    ws = make_workspace(tmp_path)
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], None, PLUGIN_ROOT)
+    assert c.status == "skipped" and "not applicable" in c.detail
+
+
+def test_type_map_audit_unverified_without_a_family(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], None, PLUGIN_ROOT)
+    assert c.status == "unverified" and "--source-family" in c.detail
+
+
+def test_type_map_audit_ok_fills_in_the_undeclared_count(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [
+        _field("ORDER_ID", "NUMBER(18,0)", "bigint"),
+        _field("AMOUNT", "NUMBER(12,2)", "decimal(12,2)"),
+        _field("CREATED_AT", "TIMESTAMP(6)", "timestamp_ntz"),
+        _field("NOTE", "VARCHAR2(200)", ""),
+    ])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "ok"
+    assert c.data["map"].endswith("oracle-plsql/canonicalization.json")
+    assert c.data["undeclared"] == 1 and c.data["fields"] == 4
+
+
+def test_type_map_audit_fails_on_a_forbidden_target_and_blocks_the_run(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [
+        _field("AMOUNT", "NUMBER(12,2)", "double"),
+        _field("CREATED_AT", "TIMESTAMP", "timestamptz"),
+    ])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail"
+    for needle in ("orders.AMOUNT", "double", "decimal(12,2)", "orders.CREATED_AT"):
+        assert needle in c.detail, needle
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_family="oracle")
+    assert "type_map_audit=fail" in report["blocking"] and report["ready"] is False
+
+
+def test_type_map_audit_warns_for_a_family_with_no_map(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "sqlserver", PLUGIN_ROOT)
+    assert c.status == "warn" and "sqlserver" in c.detail
+    assert c.data["families_with_maps"] == ["oracle"]
+
+
+def test_type_map_audit_fails_when_two_files_claim_the_family(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)  # primes the import
+    fake_root = tmp_path / "fake_root"
+    for name in ("a", "b"):
+        d = fake_root / "skills" / name
+        d.mkdir(parents=True)
+        (d / "canonicalization.json").write_text(json.dumps(
+            {"rules": [], "type_map": {"oracle": {"types": [{"source": "NUMBER", "target": "decimal(38,10)"}]}}}))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", fake_root)
+    assert c.status == "fail" and "a" in c.detail and "b" in c.detail
+
+
+def test_type_map_audit_carries_the_resolve_problem_for_a_missing_child_unit(tmp_path):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True,
+                        units=["ghost"], source_family="oracle")
+    row = by_id(report)["type_map_audit"]
+    assert row["status"] == "fail" and "ghost" in row["detail"]
+
+
 # ------------------------------------------------------------------ ledger integrity rows (A2c)
 
 def test_allowlist_committed_is_ok_only_when_both_contract_files_equal_head(tmp_path):

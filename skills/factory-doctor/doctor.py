@@ -603,6 +603,7 @@ def check_drivers() -> Check:
                  {"drivers": present})
 
 
+<<<<<<< HEAD
 def check_recon_family_supported(plugin_root: Path, source_family: str | None) -> Check:
     """Whether the harness can reconcile the declared source family, asked of the same harness
     `recon_harness` ran (dbx-recon on PATH, else the checkout). Deliberately not folded into
@@ -640,6 +641,77 @@ def check_recon_family_supported(plugin_root: Path, source_family: str | None) -
     return Check(cid, "ok", f"{source_family}: live-tested source adapter ({how})", data)
 
 
+||||||| parent of 17dcfe2 (doctor: type_map_audit row — fail on spec targets the family type map forbids)
+=======
+def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[Path], source_family: str | None,
+                         plugin_root: Path, params: dict[str, str] | None = None) -> Check:
+    """Committed specs' declared target types against the dialect skill's type_map for the
+    source family: the same table the harness fills undeclared targets from and refuses
+    contradictions on at run time."""
+    cid = "type_map_audit"
+    _, todo, problem = resolve_mappings(ws, role, units, mappings)
+    if problem:
+        return Check(cid, *problem)
+    if not todo:
+        return Check(cid, "skipped",
+                     f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}")
+    if not source_family:
+        return Check(cid, "unverified", "pass --source-family (or run with --wave): target types "
+                     "cannot be audited without the source family")
+    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
+    try:
+        from recon.config import ConfigError, load_mapping_spec
+        from recon.typemap import audit_spec, load_type_map, type_map_families
+    except ImportError as e:
+        return Check(cid, "fail", f"harness typemap not importable: {_redact(str(e))}",
+                     {"family": source_family})
+    maps = []
+    families = set()
+    for p in sorted(plugin_root.glob("skills/*/canonicalization.json")):
+        families.update(type_map_families(p))
+        tm = load_type_map(p, source_family)
+        if tm:
+            maps.append((p, tm))
+    if not maps:
+        return Check(cid, "warn", f"no type map for {source_family} in any "
+                     "skills/*/canonicalization.json; the spec's target types are unaudited "
+                     "(adding a family is JSON)", {"families_with_maps": sorted(families)})
+    if len(maps) > 1:
+        return Check(cid, "fail", f"{source_family}: multiple canonicalization.json files carry "
+                     f"a type_map for it: {', '.join(str(p) for p, _ in maps)}")
+    map_path, tm = maps[0]
+    contradictions, unmapped, undeclared, fields = [], [], 0, 0
+    for _, p in sorted(todo.items(), key=lambda kv: str(kv[1])):
+        try:
+            spec = load_mapping_spec(p, params)
+        except (ConfigError, OSError, ValueError) as e:
+            return Check(cid, "fail", f"{p}: {_redact(str(e))}")
+        for row in audit_spec(tm, spec):
+            fields += 1
+            if row["status"] == "contradiction":
+                contradictions.append(row)
+            elif row["status"] == "unmapped":
+                unmapped.append(row)
+            elif row["status"] == "undeclared":
+                undeclared += 1
+    rel = str(map_path.relative_to(plugin_root)) if map_path.is_relative_to(plugin_root) else str(map_path)
+    if contradictions:
+        shown = "; ".join(f"{r['object']}.{r['source']} {r['source_type']} -> declared "
+                          f"{r['target_type']}, map says {r['expected']}"
+                          for r in contradictions[:5])
+        more = f" …and {len(contradictions) - 5} more" if len(contradictions) > 5 else ""
+        return Check(cid, "fail", f"{len(contradictions)} field(s) declare a target type the "
+                     f"{source_family} type map forbids: {shown}{more}",
+                     {"map": rel, "contradictions": contradictions,
+                      "unmapped": [f"{r['object']}.{r['source']}" for r in unmapped]})
+    return Check(cid, "ok", f"{fields} typed fields agree with {rel}; {len(unmapped)} unmapped "
+                 f"source types recorded, {undeclared} undeclared targets the harness fills at run time",
+                 {"map": rel, "fields": fields,
+                  "unmapped": [f"{r['object']}.{r['source']}" for r in unmapped],
+                  "undeclared": undeclared})
+
+
+>>>>>>> 17dcfe2 (doctor: type_map_audit row — fail on spec targets the family type map forbids)
 # ------------------------------------------------------------------ delete evidence (source CDC)
 
 _CDC_QUERIES = {
@@ -1607,6 +1679,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         check_official_plugin(plugin_root),
         _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
         check_recon_family_supported(plugin_root, source_family),
+        check_type_map_audit(ws, role, units or [], mappings or [], source_family,
+                             plugin_root, params=params),
         check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
                                   params=params),
         check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
