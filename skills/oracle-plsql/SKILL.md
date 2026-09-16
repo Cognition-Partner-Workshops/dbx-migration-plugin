@@ -47,7 +47,7 @@ column below names the rule per type).
 | `BOOLEAN` (PL/SQL; 23ai SQL) | `BOOLEAN` (`CHAR(1) 'Y'/'N'` stays string unless decided) | `BOOLEAN` | none | `identity` |
 | `BFILE`, `SDO_GEOMETRY`, `ANYDATA` | path `STRING` via Volumes; `GEOMETRY`/`GEOGRAPHY` via WKT/WKB; `STRING`/`VARIANT` | `TEXT`; WKT unless PostGIS is on the Lakebase extension list; `TEXT`/`JSONB` | external file; SRID | `GAP` |
 
-`canonicalization.json`'s `type_map` marks `bigint` for `INTEGER`/`INT`/`SMALLINT` and `date` for `DATE` as conditional alternatives: the spec's field must carry rule `census_fits_int64` (census proved the values fit in 64 bits) or `census_midnight_only` (census proved `TRUNC(col)=col` on every row) or the declared type is a contradiction.
+`canonicalization.json`'s `type_map` marks `bigint` for `INTEGER`/`INT`/`SMALLINT` and `date` for `DATE` as conditional alternatives: the spec's field must carry the token `census_fits_int64` (census proved the values fit in 64 bits) or `census_midnight_only` (census proved `TRUNC(col)=col` on every row) in its `evidence` list — never `rules`, which is reserved for canon rules — or the declared type is a contradiction.
 
 ## Function / operator map
 

@@ -317,21 +317,69 @@ def test_unrepresentable_precision_fails_instead_of_filling(oracle_map, oracle_l
         apply_type_map(oracle_map, spec)
 
 
-def test_conditional_targets_need_their_census_rule(oracle_map):
+def test_conditional_targets_need_their_census_evidence(oracle_map):
     status, detail = audit_field(oracle_map, "INTEGER", "bigint")
     assert status == "contradiction" and "census_fits_int64" in detail
-    assert audit_field(oracle_map, "INTEGER", "bigint", rules=["census_fits_int64"])[0] == "ok"
-    assert audit_field(oracle_map, "INT", "bigint", rules=["census_fits_int64"])[0] == "ok"
-    assert audit_field(oracle_map, "SMALLINT", "bigint", rules=["census_fits_int64"])[0] == "ok"
+    for src in ("INTEGER", "INT", "SMALLINT"):
+        assert audit_field(oracle_map, src, "bigint", evidence=["census_fits_int64"])[0] == "ok"
     status, detail = audit_field(oracle_map, "DATE", "date")
     assert status == "contradiction" and "census_midnight_only" in detail
-    assert audit_field(oracle_map, "DATE", "date", rules=["census_midnight_only"])[0] == "ok"
+    assert audit_field(oracle_map, "DATE", "date", evidence=["census_midnight_only"])[0] == "ok"
     with pytest.raises(ConfigError, match="census_midnight_only"):
         apply_type_map(oracle_map, _spec([FieldMapping("D", "d", "DATE", "date")]))
-    # declared with the rule audits ok through the whole-spec path too
-    spec = _spec([FieldMapping("N", "n", "INTEGER", "bigint", rules=["census_fits_int64"])])
+    # declared with the evidence audits ok through the whole-spec path too
+    spec = _spec([FieldMapping("N", "n", "INTEGER", "bigint", evidence=["census_fits_int64"])])
     apply_type_map(oracle_map, spec)
     assert audit_spec(oracle_map, spec)[0]["status"] == "ok"
+
+
+def test_conditional_tokens_in_rules_do_not_satisfy_the_map(oracle_map):
+    # a census token in `rules` would also reach the Canonicalizer, which rejects unknown
+    # rule names: the token must live in `evidence` and `rules` stays a contradiction
+    spec = _spec([FieldMapping("N", "n", "INTEGER", "bigint", rules=["census_fits_int64"])])
+    row = audit_spec(oracle_map, spec)[0]
+    assert row["status"] == "contradiction" and "census_fits_int64" in row["expected"]
+
+
+def test_evidence_field_runs_a_full_recon_without_canon_error(oracle_map):
+    from recon.engine import run_recon
+    from recon.config import Tolerances
+    from tests.fakes import FakeSource, FakeTarget
+    spec = _spec([FieldMapping("N", "n", "INTEGER", "bigint", evidence=["census_fits_int64"])])
+    source = FakeSource({"ORDERS": [{"ORDER_ID": 1, "N": 7}]})
+    target = FakeTarget({"orders": [{"order_id": 1, "n": 7}]})
+    result = run_recon("u", "live", spec, Tolerances(version="t"), [], source, target)
+    assert result["verdict"] == "PASS"
+
+
+def test_mapping_spec_loads_field_evidence(tmp_path):
+    from recon.config import load_mapping_spec
+    spec = {"version": "m1", "objects": [{
+        "object": "orders", "root_table": "ORDERS",
+        "key": {"source": ["N"], "target": "n"},
+        "fields": [{"source": "N", "target": "n", "evidence": ["census_fits_int64"]}]}]}
+    p = tmp_path / "m.json"
+    p.write_text(json.dumps(spec))
+    f = load_mapping_spec(p, {}).objects[0].fields[0]
+    assert f.evidence == ["census_fits_int64"]
+    spec["objects"][0]["fields"][0]["evidence"] = ["ok", 3]
+    p.write_text(json.dumps(spec))
+    with pytest.raises(ConfigError, match="evidence"):
+        load_mapping_spec(p, {})
+
+
+def test_lakebase_timestamp_precision_caps_at_six(oracle_map, oracle_lakebase_map):
+    for n in (7, 8, 9):
+        assert expected_target(oracle_lakebase_map, f"TIMESTAMP({n})")[0] == "timestamp(6)"
+        assert audit_field(oracle_lakebase_map, f"TIMESTAMP({n})", "timestamp(6)")[0] == "ok"
+        assert audit_field(oracle_lakebase_map, f"TIMESTAMP({n})", "timestamp(9)")[0] == "contradiction"
+    assert expected_target(oracle_lakebase_map, "TIMESTAMP(3)")[0] == "timestamp(3)"
+    # undeclared fills to the capped type
+    spec = _spec([FieldMapping("T", "t", "TIMESTAMP(9)", "")])
+    new_spec, summary = apply_type_map(oracle_lakebase_map, spec)
+    assert new_spec.objects[0].fields[0].target_type == "timestamp(6)"
+    # databricks unaffected
+    assert expected_target(oracle_map, "TIMESTAMP(9)")[0] == "timestamp_ntz"
 
 
 def test_lakebase_parses_timestamp_without_time_zone_as_timestamp(oracle_map, oracle_lakebase_map):

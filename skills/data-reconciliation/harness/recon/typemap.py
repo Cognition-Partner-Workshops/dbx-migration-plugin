@@ -47,7 +47,7 @@ class TypeRule:
     # alternative spellings accepted only when the field carries the named canonicalization
     # rule: (alternative, required rule name)
     conditional: tuple[tuple[str, str], ...] = ()
-    p_max: int | None = None
+    arg_max: tuple[tuple[str, int], ...] = ()  # bound pattern arg -> max value
 
 
 @dataclass(frozen=True)
@@ -111,8 +111,9 @@ def _match(rule: TypeRule, name: str, args: tuple) -> dict | None:
             bound[pat] = arg
         else:
             return None
-    if rule.p_max is not None and bound.get("p", 0) > rule.p_max:
-        return None
+    for key, mx in rule.arg_max:
+        if bound.get(key, 0) > mx:
+            return None
     return bound
 
 
@@ -153,10 +154,13 @@ def load_type_map(path: Path, family: str, target_kind: str) -> TypeMap | None:
     for r in entry.get("types", []):
         if not isinstance(r, dict) or not r.get("source") or not r.get("target"):
             raise ConfigError(f"{path}: type_map.{family}.{target_kind} entry missing source/target: {r}")
+        arg_max = dict(r.get("arg_max") or {})
+        if r.get("p_max") is not None:
+            arg_max.setdefault("p", r["p_max"])
         rules.append(TypeRule(source=r["source"], target=r["target"],
                               accepts=tuple(r.get("accepts", ())),
                               conditional=tuple(sorted((r.get("conditional") or {}).items())),
-                              p_max=r.get("p_max")))
+                              arg_max=tuple(sorted(arg_max.items()))))
     return TypeMap(family=family, target_kind=target_kind, note=entry.get("note", ""),
                    rules=tuple(rules), decimal_max_precision=entry.get("decimal_max_precision"))
 
@@ -203,7 +207,7 @@ def expected_target(tm: TypeMap, source_type: str) -> tuple[str, tuple[str, ...]
 
 
 def audit_field(tm: TypeMap, source_type: str, target_type: str,
-                rules: tuple | list = ()) -> tuple[str, str | None]:
+                evidence: tuple | list = ()) -> tuple[str, str | None]:
     if (err := _precision_error(tm, source_type)) is not None:
         return "unrepresentable", err
     found = expected_target(tm, source_type)
@@ -218,7 +222,7 @@ def audit_field(tm: TypeMap, source_type: str, target_type: str,
             return "ok", expected
     for alt, token in conditional:
         if _target_matches(dname, dargs, alt, tm.target_kind):
-            if token in rules:
+            if token in evidence:
                 return "ok", expected
             return "contradiction", f"{expected} ({alt} needs rule {token} on the field)"
     return "contradiction", expected
@@ -235,7 +239,7 @@ def audit_spec(tm: TypeMap, spec: MappingSpec) -> list[dict]:
     rows = []
     for _container, label, fields in _each_field(spec):
         for f in fields:
-            status, expected = audit_field(tm, f.source_type, f.target_type, f.rules)
+            status, expected = audit_field(tm, f.source_type, f.target_type, f.evidence)
             rows.append({"object": label, "source": f.source, "source_type": f.source_type,
                          "read_as": read_as(f.source_type),
                          "target_type": f.target_type, "expected": expected, "status": status})
@@ -255,7 +259,7 @@ def apply_type_map(tm: TypeMap, spec: MappingSpec) -> tuple[MappingSpec, dict]:
             unmapped.append(name)
             return f
         expected, accepts, _cond = found
-        status, detail = audit_field(tm, f.source_type, f.target_type, f.rules)
+        status, detail = audit_field(tm, f.source_type, f.target_type, f.evidence)
         if status == "undeclared":
             filled.append(name)
             return replace(f, target_type=expected)

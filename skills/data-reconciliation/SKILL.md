@@ -145,7 +145,7 @@ The output is a machine-readable table of object, class, method, partition key, 
    selects the table; `estimate --family/--canonicalization` applies it too, so the plan counts
    the statements the run will issue): empty `target_type`s are
    filled from it, a declared type it forbids — including a `conditional` alternative the
-   field's `rules` does not carry (the map names the rule, e.g. `census_fits_int64`,
+   field's `evidence` list does not carry (the map names the token, e.g. `census_fits_int64`,
    `census_midnight_only`) — stops the run before any query (`type map:` on
    stderr), and `result.json` records the outcome under `type_map` (`null` when the family has
    no map, so unaudited is never mistaken for clean).

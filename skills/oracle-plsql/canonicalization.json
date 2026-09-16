@@ -13,7 +13,7 @@
     "oracle": {
       "databricks": {
         "decimal_max_precision": 38,
-        "note": "Delta targets, lower case; first matching entry wins. NUMBER without a scale keeps fractions, so it is decimal(38,10) (any decimal(38,s) accepted; raise s when the census shows MAX(scale) > 10) and never decimal(38,0), double or float. NUMBER(p)/NUMBER(p,0) is whole: bigint for p<=18, decimal(p,0) above. TIMESTAMP is zone-less: timestamp_ntz, timestamp accepted, never a zoned type. Anything not listed is reported as unmapped, not passed.",
+        "note": "Delta targets, lower case; first matching entry wins. NUMBER without a scale keeps fractions, so it is decimal(38,10) (any decimal(38,s) accepted; raise s when the census shows MAX(scale) > 10) and never decimal(38,0), double or float. NUMBER(p)/NUMBER(p,0) is whole: bigint for p<=18, decimal(p,0) above. TIMESTAMP is zone-less: timestamp_ntz, timestamp accepted, never a zoned type. Anything not listed is reported as unmapped, not passed. A `conditional` alternative needs the named token in the field's `evidence` list.",
         "types": [
           {"source": "NUMBER(p,0)", "p_max": 18, "target": "bigint", "accepts": ["decimal(p,0)"]},
           {"source": "NUMBER(p,s)", "target": "decimal(p,s)"},
@@ -53,7 +53,7 @@
       },
       "lakebase": {
         "decimal_max_precision": 1000,
-        "note": "Lakebase Postgres targets, lower case; first matching entry wins. NUMBER without a scale keeps fractions, so it is numeric (any numeric(38,s) accepted) and never double precision/real. NUMBER(p)/NUMBER(p,0) is whole: bigint for p<=18, numeric(p,0) above. TIMESTAMP is zone-less. Anything not listed is reported as unmapped, not passed.",
+        "note": "Lakebase Postgres targets, lower case; first matching entry wins. NUMBER without a scale keeps fractions, so it is numeric (any numeric(38,s) accepted) and never double precision/real. NUMBER(p)/NUMBER(p,0) is whole: bigint for p<=18, numeric(p,0) above. TIMESTAMP is zone-less. Anything not listed is reported as unmapped, not passed. A `conditional` alternative needs the named token in the field's `evidence` list.",
         "types": [
         {"source": "NUMBER(p,0)", "p_max": 18, "target": "bigint", "accepts": ["numeric(p,0)"]},
         {"source": "NUMBER(p,s)", "target": "numeric(p,s)"},
@@ -81,7 +81,8 @@
         {"source": "LONG RAW", "target": "bytea"},
         {"source": "DATE", "target": "timestamp(0)", "accepts": ["timestamp"], "conditional": {"date": "census_midnight_only"}},
         {"source": "TIMESTAMP", "target": "timestamp"},
-        {"source": "TIMESTAMP(n)", "target": "timestamp(n)", "accepts": ["timestamp"]},
+        {"source": "TIMESTAMP(n)", "arg_max": {"n": 6}, "target": "timestamp(n)", "accepts": ["timestamp"]},
+        {"source": "TIMESTAMP(n)", "target": "timestamp(6)", "accepts": ["timestamp"]},
         {"source": "TIMESTAMP WITH TIME ZONE", "target": "timestamp with time zone"},
         {"source": "TIMESTAMP(n) WITH TIME ZONE", "target": "timestamp with time zone"},
         {"source": "TIMESTAMP WITH LOCAL TIME ZONE", "target": "timestamp with time zone"},
