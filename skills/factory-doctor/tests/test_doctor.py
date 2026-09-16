@@ -622,6 +622,14 @@ def test_workspace_rejects_glossary_directory(tmp_path):
     assert "Glossary" in c["workspace"]["detail"]
 
 
+def test_workspace_rejects_context_directory(tmp_path):
+    ws = make_workspace(tmp_path, omit=("00_context.md",))
+    (ws / ".migration" / "00_context.md").mkdir()
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "fail"
+    assert "00_context.md" in c["workspace"]["detail"]
+
+
 def test_setup_outputs_tolerances_json_is_required(tmp_path):
     ws = make_workspace(tmp_path, omit=("03_recon_tolerances.json",))
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
