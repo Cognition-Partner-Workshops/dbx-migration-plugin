@@ -527,6 +527,23 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
     assert _result(ws)["closed"] is True
 
 
+def test_a_hand_run_wave_reserves_nothing_while_a_shared_table_is_unbounded(tmp_path):
+    """`reserve` is the small wave's launch: it runs the same cross-wave collision check the workflow does
+    before it spends the STOP C row, so an unbounded mapping on a shared table launches nothing by hand either."""
+    ws, cwd = _workspace(tmp_path / "open", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": MAPPING, "v": BOUNDED_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "Traceback" not in proc.stderr
+    assert "'mig.t'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr and "target_where" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+
+    ws, cwd = _workspace(tmp_path / "bounded", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": BOUNDED_MAPPING, "v": BOUNDED_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["reserved"] is True
+
+
 def test_malformed_sibling_wave_manifest_halts_before_launch(tmp_path):
     ws, cwd = _workspace(tmp_path, other_waves={"wave-1.json": "{"})
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])

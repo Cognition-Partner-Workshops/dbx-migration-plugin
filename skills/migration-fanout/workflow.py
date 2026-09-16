@@ -778,8 +778,229 @@ def hand_run_state():
     return state
 
 
+def other_wave_manifests(waves_dir, current):
+    """{file name: {target_namespace, batches}} for every other wave-*.json in .migration/waves/: a bare
+    write target means the table in the namespace of the manifest that declares it, so each wave's is kept
+    with its batches. A wave the plan wrote is part of the collision picture whether or not it has run, so
+    one that cannot be read halts."""
+    out = {}
+    for p in sorted(waves_dir.glob("wave-*.json")):
+        if p.name == current or p.name.endswith((".result.json", ".doctor.json")):
+            continue
+        try:
+            m = json.loads(p.read_text())
+        except ValueError as e:
+            raise SystemExit(f"{p} is not valid JSON ({e}); every wave manifest is read for cross-wave "
+                             "write-target collisions, so fix or remove it, then re-run") from None
+        batches = m.get("batches") if isinstance(m, dict) else None
+        if not isinstance(batches, list) or not all(
+                isinstance(b, dict) and isinstance(b.get("id"), str)
+                and isinstance(b.get("units"), list) and all(isinstance(u, str) for u in b["units"])
+                and isinstance(b.get("write_targets"), list) and all(isinstance(t, str) for t in b["write_targets"])
+                for b in batches):
+            raise SystemExit(f"{p} has no 'batches' list of {{id, units, write_targets}} rows; every wave manifest is "
+                             "read for cross-wave write-target collisions, so fix or remove it, then re-run")
+        namespace = m.get("target_namespace", "")
+        if "target_namespace" in m and not valid_namespace(namespace):
+            raise SystemExit(f"{p} 'target_namespace' must be the dotted catalog.schema (or schema) its harness run is "
+                             "given; every wave manifest is read for cross-wave write-target collisions, so fix it, "
+                             "then re-run")
+        out[p.name] = {"target_namespace": namespace, "batches": batches}
+    return out
+
+
+def unit_mapping(unit):
+    """The unit's recon mapping spec, None when the child has not written it yet."""
+    p = ROOT / ".migration" / "units" / unit / "mapping_spec.json"
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except ValueError as e:
+        raise SystemExit(f"{p} is not valid JSON ({e})") from None
+
+
+_SEGMENT = r'(?:[A-Za-z_][\w$]*|\[[^\]]+\]|"(?:[^"]|"")+"|`[^`]+`)'
+PREDICATE_TOKEN = re.compile(
+    r"\s+|(?P<string>'(?:[^']|'')*')|(?P<param>\$\{\w+\})|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    rf"|(?P<word>{_SEGMENT}(?:\.{_SEGMENT})*)|(?P<punct><>|!=|<=|>=|[=<>(),])")
+PREDICATE_WORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "true", "false"}
+
+
+def column_key(name):
+    """A column however a predicate or scope list spells it: the last segment, unquoted, case-folded."""
+    return re.sub(r'^[`"\[]|[`"\]]$', "", str(name).strip().split(".")[-1].strip()).casefold()
+
+
+def bounded_predicate(where, scope):
+    """Whether a target_where bounds the rows recon reads to the unit's own slice: it tokenizes under the
+    harness's predicate grammar and parses the AND/OR/NOT/parenthesis structure. A comparison bounds when
+    it pins one of the mapping's declared scope columns to a literal or parameter with =, <, <=, >, >=, IN,
+    LIKE or BETWEEN; an OR bounds only when every branch does, an AND when any operand does, at every
+    depth. `1 = 1`, TRUE, `col = col`, `col IS NOT NULL`, `col <> x`, NOT (...), a column outside the
+    scope list, `col = x OR 1 = 1` and `(col = x OR 1 = 1)` select more than the slice and are no bound.
+    Anything unparsable is no bound."""
+    if not isinstance(where, str):
+        return False
+    scope = {column_key(c) for c in scope}
+    tokens, pos = [], 0
+    while pos < len(where):
+        m = PREDICATE_TOKEN.match(where, pos)
+        if not m:
+            return False
+        if m.lastgroup:
+            tokens.append((m.lastgroup, m.group()))
+        pos = m.end()
+
+    def keyword(i, *words):
+        return i < len(tokens) and tokens[i][0] == "word" and tokens[i][1].lower() in words
+
+    def pins(toks):
+        words = [t.lower() for k, t in toks if k == "word"]
+        columns = [t for i, (k, t) in enumerate(toks) if k == "word" and t.lower() not in PREDICATE_WORDS
+                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")]
+        values = any(k in ("string", "number", "param") for k, _ in toks)
+        operator = (any(k == "punct" and t in ("=", "<", "<=", ">", ">=") for k, t in toks)
+                    or any(w in ("in", "like", "between") for w in words))
+        wildcard = "like" in words and all(re.fullmatch(r"'[%_]*'", t) for k, t in toks if k == "string")
+        return (len(columns) == 1 and column_key(columns[0]) in scope and values and operator and not wildcard
+                and not any(w in ("is", "not") for w in words)
+                and not any(k == "punct" and t in ("<>", "!=") for k, t in toks))
+
+    def expr(i):  # -> (bounded, next index); raises ValueError on a malformed predicate
+        bounded, i = term(i)
+        while keyword(i, "or"):
+            b, i = term(i + 1)
+            bounded = bounded and b
+        return bounded, i
+
+    def term(i):
+        bounded, i = factor(i)
+        while keyword(i, "and"):
+            b, i = factor(i + 1)
+            bounded = bounded or b
+        return bounded, i
+
+    def factor(i):
+        if keyword(i, "not"):
+            return False, factor(i + 1)[1]
+        if i < len(tokens) and tokens[i] == ("punct", "("):
+            bounded, i = expr(i + 1)
+            if i >= len(tokens) or tokens[i] != ("punct", ")"):
+                raise ValueError
+            return bounded, i + 1
+        start, depth = i, 0
+        while i < len(tokens) and not (depth == 0 and (keyword(i, "and", "or") or tokens[i] == ("punct", ")"))):
+            depth += (tokens[i] == ("punct", "(")) - (tokens[i] == ("punct", ")"))
+            if depth < 0:
+                raise ValueError
+            i += 1
+        atom = tokens[start:i]
+        if not atom or depth:
+            raise ValueError
+        return pins(atom), i
+
+    try:
+        bounded, end = expr(0)
+    except ValueError:
+        return False
+    return bounded and end == len(tokens)
+
+
+def bounded_readers(spec, table, namespace=""):
+    """Why the mapping spec's readers of `table` are not bounded to the unit's slice, '' when every one is,
+    None when the spec has no object for the table. Each reading object declares scope_columns (its
+    partition or run-date columns) and pins one of them in target_where; each of its embeds pins one of
+    its own scope_columns, or the object's, in its own target_where (the harness scopes an embed's nested
+    reads by the embed's predicate, not the object's)."""
+    objects = spec.get("objects", spec.get("tables")) if isinstance(spec, dict) else None
+    if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
+        raise SystemExit("mapping spec 'objects' must be a list of object rows")
+    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
+    if not mine:
+        return None
+
+    def columns(row, inherited=None):
+        scope = row.get("scope_columns", inherited)
+        if not (isinstance(scope, list) and scope and all(isinstance(c, str) and c.strip() for c in scope)):
+            return None
+        return scope
+
+    for o in mine:
+        scope = columns(o)
+        if scope is None:
+            return "declares no scope_columns (non-empty list of the table's partition or run-date columns)"
+        if not bounded_predicate(o.get("target_where"), scope):
+            return "reads it without a target_where pinning one of its scope_columns"
+        embeds = o.get("embeds", [])
+        if not isinstance(embeds, list) or not all(isinstance(e, dict) for e in embeds):
+            return "has 'embeds' that is not a list of embed rows"
+        for e in embeds:
+            escope = columns(e, scope)
+            if escope is None or not bounded_predicate(e.get("target_where"), escope):
+                return (f"embed '{e.get('array_path')}' reads it without its own target_where pinning one of its "
+                        "scope_columns (or the object's)")
+    return ""
+
+
+def check_write_targets(batches, other_waves, mapping=None, namespace=""):
+    """Two batches in one wave writing the same table means the lineage missed an edge: refuse to launch.
+    A table written by units in different waves is shared: whole-table recon of the earlier unit is
+    undone by the later one's rows, so every mapping that reads it must be bounded (target_where to the
+    unit's own partition or run date), or this wave does not launch. Every name here, written or read,
+    goes through target_key with the target_namespace of the wave that declares or reads it, so one table
+    has one identity and a bare name is never read in another wave's namespace."""
+    mapping = unit_mapping if mapping is None else mapping
+    owners, spelled = {}, {}
+    for b in batches:
+        for t in b.get("write_targets", []):
+            k = target_key(t, namespace)
+            if k in owners:
+                raise SystemExit(f"write-target collision before launch: '{t}' is claimed by "
+                                 f"{owners[k]} and {b['id']}. Fix the wave plan, then re-run.")
+            owners[k], spelled[k] = b["id"], t
+    elsewhere, namespaces = {}, {None: namespace}
+    for name, other in other_waves.items():
+        if not (isinstance(other, dict) and isinstance(other.get("batches"), list) and "target_namespace" in other
+                and (other["target_namespace"] == "" or valid_namespace(other["target_namespace"]))):
+            raise SystemExit(f"{name} has no {{target_namespace, batches}} record; every wave manifest is read for "
+                             "cross-wave write-target collisions, so fix it, then re-run")
+        namespaces[name] = other["target_namespace"]
+        for b in other["batches"]:
+            for t in b["write_targets"]:
+                elsewhere.setdefault(target_key(t, namespaces[name]), []).append((name, b))
+    for k, mine in owners.items():
+        if k not in elsewhere:
+            continue
+        t = spelled[k]
+        batch = next(b for b in batches if b["id"] == mine)
+        shared = ", ".join(f"{name} {b['id']} (units {', '.join(b['units'])})" for name, b in elsewhere[k])
+        why = (f"shared write target '{t}' is written by {mine} in this wave and by {shared}; every mapping "
+               f"that reads it, in every wave, declares the object's scope_columns and a target_where pinning "
+               f"one of them to the unit's own partition or run date (`1 = 1`, `col = col`, IS NOT NULL, <> and "
+               f"columns outside scope_columns are no bound)")
+        for wave, b in ((None, batch), *elsewhere[k]):
+            for u in b["units"]:
+                spec = mapping(u)
+                path = f".migration/units/{u}/mapping_spec.json"
+                where = "" if wave is None else f" ({wave} {b['id']})"
+                if spec is None:
+                    raise SystemExit(f"{why}: {path} is missing, so unit {u}{where} cannot be scoped")
+                try:
+                    problem = bounded_readers(spec, k, namespaces[wave])
+                except SystemExit as e:
+                    raise SystemExit(f"{why}: {path}: {e}") from None
+                if problem is None:
+                    raise SystemExit(f"{why}: {path}{where} has no object reading '{t}'")
+                if problem:
+                    raise SystemExit(f"{why}: {path} (unit {u}{where}) {problem}")
+
+
 if sys.argv[1:2] == ["reserve"]:
     validate_manifest(MANIFEST)
+    check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
+                        other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
+                        namespace=MANIFEST.get("target_namespace", ""))
     record_run("reserve")
     print(json.dumps({"wave": MANIFEST["wave"], "stop_c": MANIFEST["stop_c"], "reserved": True}))
     sys.exit(0)
@@ -1042,224 +1263,6 @@ VERIFY_SCHEMA = {
     },
     "required": ["wave_verdict", "unit_verdicts", "findings", "changed_paths"],
 }
-
-
-def other_wave_manifests(waves_dir, current):
-    """{file name: {target_namespace, batches}} for every other wave-*.json in .migration/waves/: a bare
-    write target means the table in the namespace of the manifest that declares it, so each wave's is kept
-    with its batches. A wave the plan wrote is part of the collision picture whether or not it has run, so
-    one that cannot be read halts."""
-    out = {}
-    for p in sorted(waves_dir.glob("wave-*.json")):
-        if p.name == current or p.name.endswith((".result.json", ".doctor.json")):
-            continue
-        try:
-            m = json.loads(p.read_text())
-        except ValueError as e:
-            raise SystemExit(f"{p} is not valid JSON ({e}); every wave manifest is read for cross-wave "
-                             "write-target collisions, so fix or remove it, then re-run") from None
-        batches = m.get("batches") if isinstance(m, dict) else None
-        if not isinstance(batches, list) or not all(
-                isinstance(b, dict) and isinstance(b.get("id"), str)
-                and isinstance(b.get("units"), list) and all(isinstance(u, str) for u in b["units"])
-                and isinstance(b.get("write_targets"), list) and all(isinstance(t, str) for t in b["write_targets"])
-                for b in batches):
-            raise SystemExit(f"{p} has no 'batches' list of {{id, units, write_targets}} rows; every wave manifest is "
-                             "read for cross-wave write-target collisions, so fix or remove it, then re-run")
-        namespace = m.get("target_namespace", "")
-        if "target_namespace" in m and not valid_namespace(namespace):
-            raise SystemExit(f"{p} 'target_namespace' must be the dotted catalog.schema (or schema) its harness run is "
-                             "given; every wave manifest is read for cross-wave write-target collisions, so fix it, "
-                             "then re-run")
-        out[p.name] = {"target_namespace": namespace, "batches": batches}
-    return out
-
-
-def unit_mapping(unit):
-    """The unit's recon mapping spec, None when the child has not written it yet."""
-    p = ROOT / ".migration" / "units" / unit / "mapping_spec.json"
-    if not p.is_file():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except ValueError as e:
-        raise SystemExit(f"{p} is not valid JSON ({e})") from None
-
-
-_SEGMENT = r'(?:[A-Za-z_][\w$]*|\[[^\]]+\]|"(?:[^"]|"")+"|`[^`]+`)'
-PREDICATE_TOKEN = re.compile(
-    r"\s+|(?P<string>'(?:[^']|'')*')|(?P<param>\$\{\w+\})|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
-    rf"|(?P<word>{_SEGMENT}(?:\.{_SEGMENT})*)|(?P<punct><>|!=|<=|>=|[=<>(),])")
-PREDICATE_WORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "true", "false"}
-
-
-def column_key(name):
-    """A column however a predicate or scope list spells it: the last segment, unquoted, case-folded."""
-    return re.sub(r'^[`"\[]|[`"\]]$', "", str(name).strip().split(".")[-1].strip()).casefold()
-
-
-def bounded_predicate(where, scope):
-    """Whether a target_where bounds the rows recon reads to the unit's own slice: it tokenizes under the
-    harness's predicate grammar and parses the AND/OR/NOT/parenthesis structure. A comparison bounds when
-    it pins one of the mapping's declared scope columns to a literal or parameter with =, <, <=, >, >=, IN,
-    LIKE or BETWEEN; an OR bounds only when every branch does, an AND when any operand does, at every
-    depth. `1 = 1`, TRUE, `col = col`, `col IS NOT NULL`, `col <> x`, NOT (...), a column outside the
-    scope list, `col = x OR 1 = 1` and `(col = x OR 1 = 1)` select more than the slice and are no bound.
-    Anything unparsable is no bound."""
-    if not isinstance(where, str):
-        return False
-    scope = {column_key(c) for c in scope}
-    tokens, pos = [], 0
-    while pos < len(where):
-        m = PREDICATE_TOKEN.match(where, pos)
-        if not m:
-            return False
-        if m.lastgroup:
-            tokens.append((m.lastgroup, m.group()))
-        pos = m.end()
-
-    def keyword(i, *words):
-        return i < len(tokens) and tokens[i][0] == "word" and tokens[i][1].lower() in words
-
-    def pins(toks):
-        words = [t.lower() for k, t in toks if k == "word"]
-        columns = [t for i, (k, t) in enumerate(toks) if k == "word" and t.lower() not in PREDICATE_WORDS
-                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")]
-        values = any(k in ("string", "number", "param") for k, _ in toks)
-        operator = (any(k == "punct" and t in ("=", "<", "<=", ">", ">=") for k, t in toks)
-                    or any(w in ("in", "like", "between") for w in words))
-        wildcard = "like" in words and all(re.fullmatch(r"'[%_]*'", t) for k, t in toks if k == "string")
-        return (len(columns) == 1 and column_key(columns[0]) in scope and values and operator and not wildcard
-                and not any(w in ("is", "not") for w in words)
-                and not any(k == "punct" and t in ("<>", "!=") for k, t in toks))
-
-    def expr(i):  # -> (bounded, next index); raises ValueError on a malformed predicate
-        bounded, i = term(i)
-        while keyword(i, "or"):
-            b, i = term(i + 1)
-            bounded = bounded and b
-        return bounded, i
-
-    def term(i):
-        bounded, i = factor(i)
-        while keyword(i, "and"):
-            b, i = factor(i + 1)
-            bounded = bounded or b
-        return bounded, i
-
-    def factor(i):
-        if keyword(i, "not"):
-            return False, factor(i + 1)[1]
-        if i < len(tokens) and tokens[i] == ("punct", "("):
-            bounded, i = expr(i + 1)
-            if i >= len(tokens) or tokens[i] != ("punct", ")"):
-                raise ValueError
-            return bounded, i + 1
-        start, depth = i, 0
-        while i < len(tokens) and not (depth == 0 and (keyword(i, "and", "or") or tokens[i] == ("punct", ")"))):
-            depth += (tokens[i] == ("punct", "(")) - (tokens[i] == ("punct", ")"))
-            if depth < 0:
-                raise ValueError
-            i += 1
-        atom = tokens[start:i]
-        if not atom or depth:
-            raise ValueError
-        return pins(atom), i
-
-    try:
-        bounded, end = expr(0)
-    except ValueError:
-        return False
-    return bounded and end == len(tokens)
-
-
-def bounded_readers(spec, table, namespace=""):
-    """Why the mapping spec's readers of `table` are not bounded to the unit's slice, '' when every one is,
-    None when the spec has no object for the table. Each reading object declares scope_columns (its
-    partition or run-date columns) and pins one of them in target_where; each of its embeds pins one of
-    its own scope_columns, or the object's, in its own target_where (the harness scopes an embed's nested
-    reads by the embed's predicate, not the object's)."""
-    objects = spec.get("objects", spec.get("tables")) if isinstance(spec, dict) else None
-    if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
-        raise SystemExit("mapping spec 'objects' must be a list of object rows")
-    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
-    if not mine:
-        return None
-
-    def columns(row, inherited=None):
-        scope = row.get("scope_columns", inherited)
-        if not (isinstance(scope, list) and scope and all(isinstance(c, str) and c.strip() for c in scope)):
-            return None
-        return scope
-
-    for o in mine:
-        scope = columns(o)
-        if scope is None:
-            return "declares no scope_columns (non-empty list of the table's partition or run-date columns)"
-        if not bounded_predicate(o.get("target_where"), scope):
-            return "reads it without a target_where pinning one of its scope_columns"
-        embeds = o.get("embeds", [])
-        if not isinstance(embeds, list) or not all(isinstance(e, dict) for e in embeds):
-            return "has 'embeds' that is not a list of embed rows"
-        for e in embeds:
-            escope = columns(e, scope)
-            if escope is None or not bounded_predicate(e.get("target_where"), escope):
-                return (f"embed '{e.get('array_path')}' reads it without its own target_where pinning one of its "
-                        "scope_columns (or the object's)")
-    return ""
-
-
-def check_write_targets(batches, other_waves, mapping=None, namespace=""):
-    """Two batches in one wave writing the same table means the lineage missed an edge: refuse to launch.
-    A table written by units in different waves is shared: whole-table recon of the earlier unit is
-    undone by the later one's rows, so every mapping that reads it must be bounded (target_where to the
-    unit's own partition or run date), or this wave does not launch. Every name here, written or read,
-    goes through target_key with the target_namespace of the wave that declares or reads it, so one table
-    has one identity and a bare name is never read in another wave's namespace."""
-    mapping = unit_mapping if mapping is None else mapping
-    owners, spelled = {}, {}
-    for b in batches:
-        for t in b.get("write_targets", []):
-            k = target_key(t, namespace)
-            if k in owners:
-                raise SystemExit(f"write-target collision before launch: '{t}' is claimed by "
-                                 f"{owners[k]} and {b['id']}. Fix the wave plan, then re-run.")
-            owners[k], spelled[k] = b["id"], t
-    elsewhere, namespaces = {}, {None: namespace}
-    for name, other in other_waves.items():
-        if not (isinstance(other, dict) and isinstance(other.get("batches"), list) and "target_namespace" in other
-                and (other["target_namespace"] == "" or valid_namespace(other["target_namespace"]))):
-            raise SystemExit(f"{name} has no {{target_namespace, batches}} record; every wave manifest is read for "
-                             "cross-wave write-target collisions, so fix it, then re-run")
-        namespaces[name] = other["target_namespace"]
-        for b in other["batches"]:
-            for t in b["write_targets"]:
-                elsewhere.setdefault(target_key(t, namespaces[name]), []).append((name, b))
-    for k, mine in owners.items():
-        if k not in elsewhere:
-            continue
-        t = spelled[k]
-        batch = next(b for b in batches if b["id"] == mine)
-        shared = ", ".join(f"{name} {b['id']} (units {', '.join(b['units'])})" for name, b in elsewhere[k])
-        why = (f"shared write target '{t}' is written by {mine} in this wave and by {shared}; every mapping "
-               f"that reads it, in every wave, declares the object's scope_columns and a target_where pinning "
-               f"one of them to the unit's own partition or run date (`1 = 1`, `col = col`, IS NOT NULL, <> and "
-               f"columns outside scope_columns are no bound)")
-        for wave, b in ((None, batch), *elsewhere[k]):
-            for u in b["units"]:
-                spec = mapping(u)
-                path = f".migration/units/{u}/mapping_spec.json"
-                where = "" if wave is None else f" ({wave} {b['id']})"
-                if spec is None:
-                    raise SystemExit(f"{why}: {path} is missing, so unit {u}{where} cannot be scoped")
-                try:
-                    problem = bounded_readers(spec, k, namespaces[wave])
-                except SystemExit as e:
-                    raise SystemExit(f"{why}: {path}: {e}") from None
-                if problem is None:
-                    raise SystemExit(f"{why}: {path}{where} has no object reading '{t}'")
-                if problem:
-                    raise SystemExit(f"{why}: {path} (unit {u}{where}) {problem}")
 
 
 def child_prompt(batch):
