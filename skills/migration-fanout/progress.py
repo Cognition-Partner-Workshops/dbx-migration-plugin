@@ -2,7 +2,6 @@ import argparse
 import hashlib
 import json
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -126,7 +125,7 @@ def _refresh_base_branch(path: Path):
     return base_branch
 
 
-def _landed(repo: Path, pr_head: str, base_ref: str, pr_url: str) -> bool:
+def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
     head_check = subprocess.run(
         ["git", "-C", str(repo), "cat-file", "-e", f"{pr_head}^{{commit}}"],
         check=False,
@@ -221,28 +220,7 @@ def _landed(repo: Path, pr_head: str, base_ref: str, pr_url: str) -> bool:
                             ):
                                 return True
 
-    if shutil.which("gh") is None or not pr_url.startswith("https://github.com/"):
-        return False
-    base_branch = base_ref.removeprefix("origin/")
-    try:
-        provider = subprocess.run(
-            ["gh", "pr", "view", pr_url, "--json", "state,baseRefName,headRefOid"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if provider.returncode != 0:
-            return False
-        details = json.loads(provider.stdout)
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
-        return False
-    return (
-        isinstance(details, dict)
-        and details.get("state") == "MERGED"
-        and details.get("baseRefName") == base_branch
-        and details.get("headRefOid") == pr_head
-    )
+    return False
 
 
 def refresh_merged(mig: Path) -> None:
@@ -297,7 +275,7 @@ def refresh_merged(mig: Path) -> None:
         ).stdout.strip()
         merged = dict(merged_record["merged"]) if merged_record is not None else {}
         for pr_url, pr_head in candidates:
-            if _landed(repo, pr_head, f"origin/{base_branch}", pr_url):
+            if _landed(repo, pr_head, f"origin/{base_branch}"):
                 merged[pr_url] = pr_head
         if merged or merged_record is not None:
             _merged_path(path).write_text(json.dumps(
@@ -356,36 +334,38 @@ def render_progress(mig: Path) -> str:
         if merged_prs is not None and not isinstance(merged_prs, list):
             raise ValueError(f"{path}: verify merged_prs is not a list")
         manifest_units = _manifest_units(manifest_path, manifest)
-        result_ids = []
+        result_batches = {}
+        result_order = []
         for batch in result["batches"]:
             if not isinstance(batch, dict):
                 raise ValueError(f"{path}: result batch is not an object")
             batch_id = batch.get("id")
             if batch_id in (None, ""):
                 raise ValueError(f"{path}: result batch has no id")
-            result_ids.append(_text(batch_id))
-        missing = sorted(set(manifest_units) - set(result_ids))
-        extra = sorted(set(result_ids) - set(manifest_units))
-        if missing or extra:
-            raise ValueError(
-                f"{path}: result batches do not match the manifest "
-                f"(missing {missing}, extra {extra})"
-            )
-        for batch in result["batches"]:
-            batch_id = _text(batch["id"])
+            batch_id = _text(batch_id)
+            result_batches[batch_id] = batch
+            result_order.append((batch_id, batch))
+
+        for batch_id, units in manifest_units.items():
+            if not units:
+                raise ValueError(f"{path}: batch {batch_id!r} has no units")
+            batch = result_batches.get(batch_id)
+            embedded_units = batch.get("units") if batch is not None else None
+            if isinstance(embedded_units, list):
+                embedded_ids = {_text(unit) for unit in embedded_units}
+                planned_ids = {_text(unit) for unit in units}
+                unplanned_units = [
+                    unit for unit in embedded_units if _text(unit) not in planned_ids
+                ]
+            else:
+                unplanned_units = []
+            if batch is None:
+                for unit in units:
+                    rows.append((wave, batch_id, _text(unit), "MISSING", "", "", "", "", ""))
+                continue
             cost = batch.get("recon_cost")
             cost_text = json.dumps(cost, sort_keys=True, separators=(",", ":")) \
                 if isinstance(cost, dict) else ""
-            embedded_units = batch.get("units")
-            if isinstance(embedded_units, list) and sorted(embedded_units) != sorted(
-                manifest_units[batch_id]
-            ):
-                raise ValueError(
-                    f"{path}: batch {batch_id!r} units do not match the manifest"
-                )
-            units = manifest_units[batch_id]
-            if not units:
-                raise ValueError(f"{path}: batch {batch_id!r} has no units")
             verifier_verdict = (
                 _text(unit_verdicts[batch_id])
                 if isinstance(unit_verdicts, dict) and batch_id in unit_verdicts
@@ -414,19 +394,35 @@ def render_progress(mig: Path) -> str:
             )
             if result.get("auto_merge") is False and status == "PASS" and merged != "yes":
                 status = "PASS (unmerged)"
-            for unit_index, unit in enumerate(sorted(units, key=_text)):
+            normal_index = 0
+            for unit in units:
+                if isinstance(embedded_units, list) and _text(unit) not in embedded_ids:
+                    rows.append((wave, batch_id, _text(unit), "MISSING", "", "", "", "", ""))
+                    continue
                 rows.append((
                     wave,
-                    _text(batch_id),
+                    batch_id,
                     _text(unit),
                     status,
                     _text(batch.get("recon_verdict")),
                     verifier_verdict,
                     _text(pr_url),
                     merged,
-                    cost_text if unit_index == 0 else "",
+                    cost_text if normal_index == 0 else "",
                 ))
-    rows.sort(key=lambda row: (_wave_key(row[0]), row[1], row[2]))
+                normal_index += 1
+            for unit in unplanned_units:
+                rows.append((wave, batch_id, _text(unit), "UNPLANNED", "", "", "", "", ""))
+        for batch_id, batch in result_order:
+            if batch_id in manifest_units:
+                continue
+            embedded_units = batch.get("units")
+            if not isinstance(embedded_units, list):
+                raise ValueError(f"{path}: batch {batch_id!r} is not in the manifest")
+            for unit in embedded_units:
+                rows.append((wave, batch_id, _text(unit), "UNPLANNED", "", "", "", "", ""))
+
+    rows.sort(key=lambda row: _wave_key(row[0]))
 
     lines = [_HEADER, _TABLE_HEADER, _TABLE_DIVIDER]
     lines.extend("| " + " | ".join(_text(value) for value in row) + " |" for row in rows)
