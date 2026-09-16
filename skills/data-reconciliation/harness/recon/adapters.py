@@ -348,8 +348,8 @@ class _SqlAdapterBase:
 
     def _execute(self, sql: str, params=()):
         cur = self._conn.cursor()
+        self.statements += 1  # sent is spent: a rejected statement still reached the source
         cur.execute(sql, params)
-        self.statements += 1
         return cur
 
     def _rows(self, sql: str, params=()) -> list[tuple]:

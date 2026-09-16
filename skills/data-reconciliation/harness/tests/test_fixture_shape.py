@@ -495,6 +495,30 @@ def test_sql_column_profile_is_one_scoped_statement_with_no_sum_probe():
     assert "WHERE" not in conn.cursors[1].sql
 
 
+def test_a_statement_the_engine_rejects_still_counts_against_the_cap():
+    """The cap bounds what is sent to the legacy source, so a rejected profile or catalog read is
+    one statement spent, not a free retry of the budget slot."""
+    from recon.adapters import SqlServerSourceAdapter
+
+    class Rejecting(_Conn):
+        def cursor(self):
+            class Cur(_Cur):
+                def execute(self, sql, params=()):
+                    raise RuntimeError("could not identify an equality operator for type json")
+            c = Cur(self.rows)
+            self.cursors.append(c)
+            return c
+
+    ad = SqlServerSourceAdapter.__new__(SqlServerSourceAdapter)
+    ad._conn, ad.statements, ad.rows_fetched = Rejecting([]), 0, 0
+    with pytest.raises(RuntimeError):
+        ad.column_profile("dbo.Orders", "payload")
+    assert ad.statements == 1
+    with pytest.raises(RuntimeError):
+        ad.column_shape("dbo.Orders")
+    assert ad.statements == 2
+
+
 def test_databricks_source_column_shape_reads_information_schema():
     from recon.adapters import DatabricksSourceAdapter
     conn = _Conn([("id", "BIGINT", "NO", 1), ("tags", "ARRAY<STRING>", "YES", 2)])
