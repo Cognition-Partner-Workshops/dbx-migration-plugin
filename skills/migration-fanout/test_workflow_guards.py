@@ -2699,6 +2699,10 @@ def test_close_prompt_and_schema_carry_the_wave_close_review_round():
     ns = _prompt_ns(_manifest())
     prompt = ns["close_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1", "pr_head": "c" * 40}], 10)
     assert "one Devin Review round" in prompt and "review_findings" in prompt and "not a merge blocker" in prompt
+    review_only = ns["close_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1", "pr_head": "c" * 40}],
+                                     10, merge=False)
+    assert "Do not merge anything" in review_only and "one Devin Review round" in review_only
+    assert "Merge exactly these PRs" not in review_only
     tree = ast.parse(WORKFLOW.read_text())
     schema = next(ast.literal_eval(n.value) for n in tree.body
                   if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CLOSE_SCHEMA" for t in n.targets))
@@ -2850,6 +2854,7 @@ def test_validate_close_lists_each_verified_pr_in_exactly_one_bucket_and_nothing
     ok = {"merged_prs": [row("u1")], "unmerged": [{"pr_url": "u2", "reason": "head moved"}],
           "changed_paths": []}
     assert validate_close(ok, to_merge) == []
+    assert any("merged with auto_merge off" in p for p in validate_close(ok, to_merge, merge=False))
     assert "expected an object" in validate_close([], to_merge)[0]
     problems = validate_close({**ok, "merged_prs": ["u1"]}, to_merge)
     assert any("merged_prs rows must be" in p for p in problems)

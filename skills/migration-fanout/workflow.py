@@ -1346,7 +1346,7 @@ def validate_verify(verify, passed, wave=None, observed=None) -> list[str]:
     return problems
 
 
-def validate_close(close, to_merge) -> list[str]:
+def validate_close(close, to_merge, merge=True) -> list[str]:
     problems = []
     if not isinstance(close, dict):
         return ["expected an object"]
@@ -1361,6 +1361,8 @@ def validate_close(close, to_merge) -> list[str]:
         problems.append("merged_prs rows must be {pr_url, merge_commit_sha, merged_head}")
         merged = []
     merged_urls = [u["pr_url"] for u in merged]
+    if not merge and merged:
+        problems.append("merged with auto_merge off")
     unmerged = close.get("unmerged")
     if not isinstance(unmerged, list) or not all(
             isinstance(u, dict) and isinstance(u.get("pr_url"), str) and isinstance(u.get("reason"), str)
@@ -1507,7 +1509,7 @@ META = {
             "count": 1, "soft_time_limit_minutes": 30}] if RESYNC else []),
         {"title": "verify", "detail": "independent recon over the wave",
          "count": 1, "soft_time_limit_minutes": 60},
-        {"title": "close", "detail": "one review round, then merge verifier-PASS PRs within the deadline",
+        {"title": "close", "detail": "review round over verifier-PASS PRs; merges them when auto_merge is on",
          "count": 1, "soft_time_limit_minutes": CLOSE_MINUTES},
     ],
 }
@@ -1750,7 +1752,20 @@ def verify_prompt(passed):
     )
 
 
-def close_prompt(to_merge, deadline_minutes):
+def close_prompt(to_merge, deadline_minutes, merge=True):
+    review = ("First run one Devin Review round over these PRs and report each open finding as one line "
+              "in review_findings; a finding is not a merge blocker unless a human says so in "
+              ".migration/06_decisions.md. ")
+    tail = (f"Do it within {deadline_minutes} minutes; when time is up, stop and list the rest as unmerged. "
+            "Write nothing: no commits, no files, no other PR; report `git diff --name-only` of anything you "
+            "changed in changed_paths (it must be empty). The orchestrator commits the wave's ledger artifacts "
+            "in one wave-close PR afterwards.")
+    if not merge:
+        return (f"You are the wave-close review step for wave {WAVE}. Repo: {REPO}. Do not merge anything: "
+                "auto_merge is off and a human merges at wave close. Review exactly these PRs, nothing else: "
+                f"{json.dumps(to_merge, sort_keys=True)}. " + review +
+                "merged_prs must be []; list every PR in unmerged with the reason "
+                "'auto_merge off; human merges at wave close'. " + tail)
     return (
         f"You are the wave-close step for wave {WAVE}. Repo: {REPO}. Merge exactly these PRs, nothing else: "
         f"{json.dumps(to_merge, sort_keys=True)}. Each was verified PASS by the independent verifier at "
@@ -1759,13 +1774,7 @@ def close_prompt(to_merge, deadline_minutes):
         "is not exactly the verified pr_head, and never push to the PR branch. After each merge run "
         "`gh pr view <url> --json state,mergeCommit,headRefOid`: put {pr_url, merge_commit_sha: "
         "mergeCommit.oid, merged_head: headRefOid} in merged_prs only when state is MERGED — anything else "
-        "goes to unmerged. First run one Devin Review round over these PRs and report each open finding as one line "
-        "in review_findings; a finding is not a merge blocker unless a human says so in .migration/06_decisions.md. "
-        "Do it within "
-        f"{deadline_minutes} minutes; when time is up, stop and list the rest as unmerged. Write nothing: "
-        "no commits, no files, no other PR; report `git diff --name-only` of anything you changed in "
-        "changed_paths (it must be empty). The orchestrator commits the wave's ledger artifacts in one "
-        "wave-close PR afterwards."
+        "goes to unmerged. " + review + tail
     )
 
 
@@ -1972,16 +1981,27 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, 
                   f"{report.get('status', 'no report')}. {report.get('one_line_summary', '')}".rstrip()]
         lines += [f"- {r['object']}: {r['before']} -> {r['after']}" for r in report.get("sequences") or []]
         lines += [f"- problem: {p}" for p in resync.get("problems", [])]
+        if resync.get("held_batches"):
+            lines.append("- held from merge this run: " + ", ".join(resync["held_batches"]))
     if close is not None:
-        lines += ["", f"Wave close: {len(close.get('merged_prs', []))} of {len(to_merge or [])} verified PRs merged "
-                  f"within {CLOSE_MINUTES} min."]
-        lines += [f"Not merged: {u['pr_url']} ({u['reason']})" for u in close.get("unmerged", [])]
+        if auto_merge:
+            lines += ["", f"Wave close: {len(close.get('merged_prs', []))} of {len(to_merge or [])} verified "
+                      f"PRs merged within {CLOSE_MINUTES} min."]
+            lines += [f"Not merged: {u['pr_url']} ({u['reason']})" for u in close.get("unmerged", [])]
+        else:
+            lines += ["", f"Wave-close review over {len(to_merge or [])} verified PRs "
+                      "(auto-merge off, nothing merged)."]
         lines += [f"- review: {f}" for f in (close.get("review_findings") or [])]
     if not auto_merge:
         urls = [r["pr_url"] for r in results if r["status"] == "PASS" and r.get("pr_url")]
         lines.append("Awaiting manual merge: " + (", ".join(urls) or "none reported"))
-    elif isinstance(close, dict) and close.get("unmerged"):
-        lines.append("Awaiting manual merge: " + ", ".join(u["pr_url"] for u in close["unmerged"]))
+    else:
+        held = set((resync or {}).get("held_batches") or [])
+        urls = ([u["pr_url"] for u in close["unmerged"]] if isinstance(close, dict) else [])
+        urls += [r["pr_url"] for b, r in zip(BATCHES, results)
+                 if b["id"] in held and r["status"] == "PASS" and r.get("pr_url") and r["pr_url"] not in urls]
+        if urls:
+            lines.append("Awaiting manual merge: " + ", ".join(urls))
     findings = (verify or {}).get("findings") or []
     lines += ["", "Verifier findings:" if findings else "Verifier findings: none."] + [f"- {f}" for f in findings]
     feedback = sorted({s for r in results for s in r.get("skill_feedback", []) if isinstance(s, str)})
@@ -2036,13 +2056,14 @@ async def main():
             problems = validate_resync(report)
         except WorkflowAgentError as e:
             report, problems = None, [f"resync session died: {e}"]
-        resync = {"command": RESYNC["command"], "units": RESYNC["units"], "report": report, "problems": problems}
+        held = [b["id"] for b in BATCHES if set(b["units"]) & set(RESYNC["units"])] if problems else []
+        resync = {"command": RESYNC["command"], "units": RESYNC["units"], "report": report,
+                  "problems": problems, "held_batches": held}
         for problem in problems:
             log(f"WARNING: {problem}")
-        if problems:
-            auto_merge = False
-            log("HALT: identity resync did not complete cleanly: " + "; ".join(problems)
-                + ". Auto-merge is off for this wave; a human decides at wave close.")
+        if held:
+            log("HALT: identity resync did not complete cleanly (" + "; ".join(problems)
+                + f"): {held} are held from merge this run.")
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
@@ -2067,13 +2088,15 @@ async def main():
     to_merge = []
     if not verify_problems and isinstance(verify, dict) and isinstance(verify.get("unit_verdicts"), dict):
         verify["unit_verdicts"] = batch_verdicts(verify["unit_verdicts"], passed)
+        held = set((resync or {}).get("held_batches") or [])
         to_merge = [{"batch": p["batch"], "units": p["units"], "pr_url": p["pr_url"], "pr_head": p.get("pr_head")}
-                    for p in passed if verify["unit_verdicts"].get(p["batch"]) == "PASS" and p.get("pr_url")]
+                    for p in passed if (verify["unit_verdicts"].get(p["batch"]) == "PASS" and p.get("pr_url")
+                                        and p["batch"] not in held)]
     close = None
-    if auto_merge and to_merge:
+    if to_merge:
         try:
             close = await asyncio.wait_for(
-                agent(close_prompt(to_merge, CLOSE_MINUTES), phase="close", schema=CLOSE_SCHEMA,
+                agent(close_prompt(to_merge, CLOSE_MINUTES, merge=auto_merge), phase="close", schema=CLOSE_SCHEMA,
                       label=f"close-wave-{TAG}", repos=[REPO], soft_time_limit_minutes=CLOSE_MINUTES),
                 timeout=CLOSE_MINUTES * 60)
         except (asyncio.TimeoutError, WorkflowAgentError) as e:
@@ -2082,7 +2105,7 @@ async def main():
                                    "reason": f"wave-close step did not finish within {CLOSE_MINUTES} minutes: {e}"}
                                   for p in to_merge],
                      "changed_paths": []}
-    close_problems = validate_close(close, to_merge) if close is not None else []
+    close_problems = validate_close(close, to_merge, merge=auto_merge) if close is not None else []
     if close is not None:
         raw = close
         reported = {}
@@ -2120,7 +2143,8 @@ async def main():
     if close_problems:
         verify = _verify_sink(verify, [f"wave close invalid: {p}" for p in close_problems])
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported
-              and not verify_problems and not close_problems and (close is None or not close["unmerged"])
+              and not verify_problems and not close_problems and not (resync or {}).get("held_batches")
+              and (close is None or not auto_merge or not close["unmerged"])
               and verify is not None and verify["wave_verdict"] == "PASS"
               and all(r["status"] == "PASS" for r in results))
     _tmp_write(RESULT_PATH, json.dumps({
