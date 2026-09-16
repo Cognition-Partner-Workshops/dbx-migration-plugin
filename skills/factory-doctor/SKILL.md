@@ -54,9 +54,19 @@ change the exit code. `--reuse-record` takes the source block from the manifest:
 it refuses `--wave`, `--no-databricks`, a non-child role, and a missing `--expect-identity`.
 `ready` requires no `fail`, the security rows `hook_guard` and `databricks_identity` to have every
 security sub-result at `ok`, and `source_principal_read_only` not `unverified` once mappings exist.
-Other warnings are advisory. Sub-results live in `data.sub_results`; `--no-databricks` leaves
-`databricks_identity=skipped` and never authorizes a wave. The report identity, host, catalogs,
-guard mode, and stop mode are the workflow capability contract.
+
+The orchestrator proves the platform once per wave: `hook_platform_loaded` is live-probed only by
+`--role orchestrator` and signed into `wave-N.doctor.json`. A child proves the guard script and its
+identity (`hook_guard_functional`, `databricks_identity`) and inherits `hook_platform_loaded`
+through `--reuse-record`, which is the normal child path. In a child report every non-security
+`fail` is softened to an advisory `warn` (the orchestrator gated it before launch), so a child is
+ready when its two security controls are `ok` and no unit-mapping problem blocks it; a missing or
+unreadable unit mapping still blocks. `playbooks_in_sync` findings are `warn` for every role —
+only a missing lock at setup is `skipped`. `--source-attested D-<id>` yields an `ok` row whose
+data carries `attested`/`decision` when the ledger line qualifies. Sub-results live in
+`data.sub_results`; `--no-databricks` leaves `databricks_identity=skipped` and never authorizes a
+wave. The report identity, host, catalogs, guard mode, and stop mode are the workflow capability
+contract.
 
 ## The hook probe
 
@@ -64,6 +74,11 @@ guard mode, and stop mode are the workflow capability contract.
 2. A guard refusal naming `__dbx_guard_probe__<nonce>` proves hooks are live.
 3. Re-run with `--hook-probe-result blocked:<nonce>`; the nonce is in the `hook_guard` row.
 4. If the echo prints, re-run with `not-blocked`, register a D10, and do not launch children.
+
+One nonce per report serves both the functional row and the probe command, so `blocked:<nonce>`
+can only come from a session that saw the live block. While `hook_platform_loaded` is `unverified`,
+the run's last stdout line is `PROBE_COMMAND (run in the lead session's exec tool, not a sidekick
+shell): <probe_command>` — run it in the lead session's exec tool, never a sidekick shell.
 
 | row | fails when | fix |
 |---|---|---|

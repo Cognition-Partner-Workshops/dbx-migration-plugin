@@ -2,7 +2,9 @@
 Setup runs the doctor after committing the allowlist, tolerances, and hook probe. Plan reruns it
 with `--expect-catalogs` before each wave; the manifest copies identity, host, catalogs, guard mode,
 and stop mode, which `workflow.py` compares before launch. Children and the verifier use expected
-identity and host and stop on any fail or unverified hook/security result.
+identity and host; a child blocks only on its security controls (`hook_guard_functional`,
+`databricks_identity`) not being `ok` or a unit-mapping problem — every other `fail` is reported as
+an advisory `warn`.
 
 ### `workspace`
 Sub-checks: `workspace` verifies every required `.migration` setup file from `1-migration_setup` and requires a `## Glossary` section in `00_context.md` or legacy `02_glossary.md`;
@@ -17,16 +19,22 @@ Verifies byte equality of `allowed_targets.json` and `03_recon_tolerances.json` 
 decision and commit, never a working-copy edit.
 ### `playbooks_in_sync`
 Verifies string `sha256`, `repo_file`, and `installed_at` for every lock macro; flags stale,
-missing, unknown, malformed, or playbooks absent from `playbooks/index.json`. A missing lock skips only for setup;
-orchestrator/child rerun `install-dbx-factory`. Orchestrators also require fresh (<15 minutes)
-`.migration/live_playbooks.json`; absent/stale/malformed, missing, or duplicate records fail, and
+missing, unknown, malformed, or playbooks absent from `playbooks/index.json`. Every finding is a
+wave-brief `warn` for every role — the sync problem is reported, never a blocker — except a
+missing lock at setup, which is `skipped`. Orchestrators also require fresh (<15 minutes)
+`.migration/live_playbooks.json`; absent/stale/malformed, missing, or duplicate records warn, and
 a fresh export proves live bodies equal repo files after line-ending/trailing-newline normalization
-(`live_stale`, `live_missing`, and `duplicate` identify those failures).
+(`live_stale`, `live_missing`, and `duplicate` identify those findings).
 ### `hook_guard`
 Sub-checks: `hooks_files` verifies `hooks.json` registers `hooks/dbx_guard.py` as `PreToolUse`;
-`hook_guard_functional` directly sends a fresh nonce probe and requires a block naming the full
+`hook_guard_functional` directly sends a probe and requires a block naming the full
 `__dbx_guard_probe__<nonce>`; `hook_platform_loaded` is `unverified` until the session blocks the
-pending nonce, or fails when the echo runs. The nonce and command are in `data`.
+pending nonce, or fails when the echo runs. One nonce per report serves the functional row and the
+probe command, which are in `data`. The platform row is orchestrator-only: the orchestrator's live
+probe proves the platform once per wave and is signed into `wave-N.doctor.json`; a child never runs
+the live probe and inherits the signed sub-result through `--reuse-record` (a `warn` row when no
+record is reused). While the row is `unverified`, the run's last stdout line is
+`PROBE_COMMAND (run in the lead session's exec tool, not a sidekick shell): <probe_command>`.
 ### `official_databricks_plugin`
 Verifies routed official skills are visible locally: partial visibility is `warn`, none is
 `unverified`; platform `requiredPlugins` is the source of truth.
@@ -53,7 +61,8 @@ the secret's host/token with inherited `DATABRICKS_*` stripped except host/token
 `grants get-effective` on each catalog/schema/table; ownership or anything beyond `SELECT`,
 `USE_CATALOG`, `USE_SCHEMA`, `BROWSE`, and `READ_VOLUME` fails, owner-less/malformed assignments
 are `unverified`. Unsupported/uninferred families are `unverified`; `--source-attested D-<id>`
-is `attested` only for families without a query and a human-provenance decision line. Rows name
+yields `ok` with `attested`/`decision` in `data` only for families without a query and a
+human-provenance decision line. Rows name
 objects/privileges, never credentials; `readonly=True`/`default_transaction_read_only` are hints.
 ### `recon_family_supported`
 
