@@ -179,6 +179,10 @@ def test_python_variable_sql_on_a_legacy_connection_fails_closed():
     block('python3 -c "c = psycopg2.connect(host=\'lakebase-host\'); c.cursor().execute(q)"')
     verdict = block("python3 -c \"c=psycopg2.connect(host='tdprod.corp', dbname='corp'); c.execute('DROP TABLE t')\"")
     assert "legacy source" in verdict.reason
+    verdict = block("python3 -c \"c=psycopg2.connect(host='tdprod.corp'); q='SELECT 1'; q='DROP TABLE t'; c.execute(q)\"")
+    assert "legacy source" in verdict.reason
+    block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); q='DROP TABLE staging'; q='DROP TABLE prod.s.t'; c.execute(q)\"")
+    block("python3 -c \"c=psycopg2.connect(host='tdprod.corp'); c.execute(q); q='SELECT 1'\"")
 
 
 def test_python_foreign_host_is_checked_even_when_databricks_is_imported():
@@ -193,6 +197,8 @@ def test_python_connection_database_is_the_default_catalog():
     approve('python3 -c "c = psycopg2.connect(host=\'lakebase-host\', dbname=\'mig_cat\'); c.cursor().execute(\'DROP TABLE staging\')"')
     approve('python3 -c "c = psycopg2.connect(\'postgresql://u@lakebase-host:5432/mig_cat\'); c.cursor().execute(\'DROP TABLE staging\')"')
     block('python3 -c "c = psycopg2.connect(host=\'lakebase-host\', dbname=\'other\'); c.cursor().execute(\'DROP TABLE staging\')"')
+    approve("python3 -c \"import pyodbc; a=pyodbc.connect('Server=lakebase-host;Database=mig_cat'); b=pyodbc.connect('Server=lakebase-host;Database=MIG_CAT'); a.execute('DROP TABLE staging')\"")
+    block("python3 -c \"import psycopg2; a=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); b=psycopg2.connect(host='lakebase-host', dbname='MIG_CAT'); a.execute('DROP TABLE staging')\"")
 
 
 def test_python_allowlisted_secret_is_a_resolved_target():

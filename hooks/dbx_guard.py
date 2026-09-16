@@ -1080,14 +1080,15 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     db_pattern = r"""(?i)(?:dbname|database|initial catalog)\s*=\s*['"]?([^'";,\s)]+)|://[^/\s'"}]+/([^?\s'";]+)"""
     db_values = [m.group(1) or m.group(2) for m in re.finditer(db_pattern, call_conn)]
     dbs = [d.strip("'\"") for d in db_values if d.strip("'\"")]
-    default = _norm(dbs[0]) if len(set(dbs)) == 1 else None
+    pg = bool(re.search(r"\b(?:psycopg2?|asyncpg|pg8000)\b", text, re.IGNORECASE))
+    keys = set(dbs) if pg else {d.lower() for d in dbs}
+    default = _norm(dbs[0]) if len(keys) == 1 else None
     def blank_db(match):
         value = match.group(1) or match.group(2)
         start = (match.start(1) if match.group(1) else match.start(2)) - match.start()
         return match.group(0)[:start] + " " * len(value) + match.group(0)[start + len(value):]
     db_free = re.sub(db_pattern, blank_db, conn)
     argv_words = [_host(w) for w in seg.argv[1:] if not w.startswith("-")]
-    pg = bool(re.search(r"\b(?:psycopg2?|asyncpg|pg8000)\b", text, re.IGNORECASE))
     hits = [t for t in cfg.legacy_sources if t in env_names or _is_token(db_free, t) or
             any(w.lower() == t.lower() for w in argv_words) or
             (not resolved_target and any(d == t if pg else d.lower() == t.lower() for d in dbs))]
@@ -1117,9 +1118,23 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         else:
             opaque = True
         if name:
-            assignment = re.search(rf"\b{name}\s*=\s*[rbuf]*(['\"]{{3}}|['\"])(.*?)\1", text, re.S)
-            if assignment:
-                statements.append(assignment.group(2))
+            prefix = text[:match.start()]
+            assignments = list(re.finditer(
+                rf"(?<![\w.]){name}\s*(?:(?P<plain>=(?!=))|(?P<compound>[+\-*/%|&]=))", prefix))
+            literals = []
+            for assignment in assignments:
+                if not assignment.group("plain"):
+                    literals = []
+                    break
+                literal = re.match(
+                    rf"{re.escape(name)}\s*=\s*[rbuf]*(['\"]{{3}}|['\"])(.*?)\1",
+                    prefix[assignment.start():], re.S)
+                if literal is None:
+                    literals = []
+                    break
+                literals.append(literal.group(2))
+            if assignments and literals and len(assignments) == len(literals):
+                statements.extend(literals)
             else:
                 opaque = True
     violations = []
