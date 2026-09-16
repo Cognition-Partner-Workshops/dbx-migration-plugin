@@ -1077,13 +1077,15 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     hosts = [h.lower() for h in host_values]
     foreign = [h for h in hosts if h not in {t.lower() for t in cfg.target_hosts}]
     resolved_target = bool(hosts) and not foreign or any(n in cfg.target_hosts for n in env_names)
-    db_values = [m.group(1) or m.group(2) for m in re.finditer(
-        r"""(?i)(?:dbname|database|initial catalog)\s*=\s*['"]?([^'";,\s)]+)|://[^/\s'"}]+/([^?\s'";]+)""", call_conn)]
+    db_pattern = r"""(?i)(?:dbname|database|initial catalog)\s*=\s*['"]?([^'";,\s)]+)|://[^/\s'"}]+/([^?\s'";]+)"""
+    db_values = [m.group(1) or m.group(2) for m in re.finditer(db_pattern, call_conn)]
     dbs = [d.strip("'\"") for d in db_values if d.strip("'\"")]
     default = _norm(dbs[0]) if len(set(dbs)) == 1 else None
-    db_free = conn
-    for db in dbs:
-        db_free = db_free.replace(db, " ")
+    def blank_db(match):
+        value = match.group(1) or match.group(2)
+        start = (match.start(1) if match.group(1) else match.start(2)) - match.start()
+        return match.group(0)[:start] + " " * len(value) + match.group(0)[start + len(value):]
+    db_free = re.sub(db_pattern, blank_db, conn)
     argv_words = [_host(w) for w in seg.argv[1:] if not w.startswith("-")]
     pg = bool(re.search(r"\b(?:psycopg2?|asyncpg|pg8000)\b", text, re.IGNORECASE))
     hits = [t for t in cfg.legacy_sources if t in env_names or _is_token(db_free, t) or
@@ -1137,7 +1139,7 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                 violations += _catalog_violations(statement, cfg, default, "program")
     if opaque and hits:
         violations.append(_Legacy(f"statement built at run time against legacy source {hits} in a program" + _LEGACY_TAIL))
-    elif opaque and not (not databricks and resolved_target and default and
+    elif opaque and not (not databricks and not unresolved and not foreign and resolved_target and default and
                          default in {_norm(c) for c in cfg.catalogs}):
         violations.append("Python statement or connection is built at run time; the guard cannot resolve a non-read statement")
     return violations
