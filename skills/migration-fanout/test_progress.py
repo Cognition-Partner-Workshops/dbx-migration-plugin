@@ -520,6 +520,38 @@ def test_render_reports_unproven_verifier_merge(tmp_path):
     ) in render_progress(mig)
 
 
+def test_render_reports_a_wave_close_merge_as_reported_unproven(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{
+            "id": "b1", "units": ["u1"], "status": "PASS",
+            "pr_url": "https://example.invalid/1", "pr_head": "head-1",
+        }],
+        "verify": {"unit_verdicts": {"b1": "PASS"}},
+        "close": {"merged_prs": ["https://example.invalid/1"], "unmerged": [], "changed_paths": []},
+    })
+
+    assert (
+        "| 1 | b1 | u1 | PASS (unmerged) |  | PASS | https://example.invalid/1 | "
+        "REPORTED, UNPROVEN |  |"
+    ) in render_progress(mig)
+
+
+def test_render_rejects_a_malformed_close_record(tmp_path):
+    for i, close in enumerate(("nope", {"merged_prs": "nope", "unmerged": [], "changed_paths": []})):
+        mig = tmp_path / str(i) / ".migration"
+        _write_result(mig, "wave-1.result.json", {
+            "wave": 1,
+            "batches": [{"id": "b1", "units": ["u1"], "status": "PASS",
+                         "pr_url": "https://example.invalid/1", "pr_head": "head-1"}],
+            "verify": {"unit_verdicts": {"b1": "PASS"}},
+            "close": close,
+        })
+        with pytest.raises(ValueError, match="close"):
+            render_progress(mig)
+
+
 def test_render_progress_uses_matching_merged_record_head(tmp_path):
     mig = tmp_path / ".migration"
     _write_result(mig, "wave-1.result.json", {

@@ -108,6 +108,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -166,6 +167,7 @@ MANIFEST = json.loads(MANIFEST_BYTES)
 BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
+MERGES_PATH = MANIFEST_PATH.with_suffix(".merges.json")
 RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
@@ -305,19 +307,24 @@ def override_decision(decision_id, units, ledger, word="merge_override"):
     return False
 
 
+def rows_after(ledger, stop_c):
+    """The ledger lines below this run's STOP C row. A run's STOP C row is its own, so a human row above it was
+    an earlier run's and does not carry into this one; no stop_c row in the ledger, no lines."""
+    lines = ledger.splitlines()
+    for n, line in enumerate(lines):
+        if any(row_id == stop_c for row_id, _ in ledger_rows(line)):
+            return lines[n + 1:]
+    return []
+
+
 def ledger_waiver(gate_id, units, ledger, stop_c):
     """The D-<n> of the human row, written after this run's STOP C row, that waives this gate for every unit
     of the batch, or None. The declaration is frozen by gates_sha, so a waiver decided after STOP C is found
-    here, not in the manifest; and a run's STOP C row is its own, so a waiver above it was an earlier run's
-    and does not carry. No stop_c row in the ledger, no waiver."""
-    after = False
-    for line in ledger.splitlines():
-        if after:
-            for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
-                if override_decision(decision_id, [gate_id, *units], line, word="waive"):
-                    return decision_id
-        elif any(row_id == stop_c for row_id, _ in ledger_rows(line)):
-            after = True
+    here, not in the manifest."""
+    for line in rows_after(ledger, stop_c):
+        for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
+            if override_decision(decision_id, [gate_id, *units], line, word="waive"):
+                return decision_id
     return None
 
 
@@ -436,6 +443,9 @@ def validate_manifest(m, doctor=None):
     if "max_minutes" in m and (isinstance(m["max_minutes"], bool) or not isinstance(m["max_minutes"], int)
                               or not 0 < m["max_minutes"] <= 60):
         raise SystemExit("manifest key 'max_minutes' must be a positive integer of at most 60 minutes")
+    if "close_minutes" in m and (isinstance(m["close_minutes"], bool) or not isinstance(m["close_minutes"], int)
+                               or not 0 < m["close_minutes"] <= 60):
+        raise SystemExit("manifest key 'close_minutes' must be a positive integer of at most 60 minutes")
     if "doctor_max_age" in m and (isinstance(m["doctor_max_age"], bool)
                                  or not isinstance(m["doctor_max_age"], int)
                                  or not 0 < m["doctor_max_age"] <= 1440):
@@ -746,11 +756,31 @@ def gate_outcomes(batch, reported, ledger, head):
     return list(declared.values()), unmet
 
 
+def review_outcome(report, units, ledger, head, stop_c):
+    """The review-clean rule at a PR head, for a workflow child and a hand-gathered report alike: the report
+    says review_clean=true for review_head equal to the gated head, or a human's review_waived D-<n> row,
+    below this run's STOP C row, names that head and every unit. A waiver dismisses one wrong finding on one
+    PR head, so a row for an earlier head or an earlier run does not carry a new dirty review. Returns
+    (waiver, reason): the waiver row that carries a dirty review, or why the PASS falls."""
+    if report.get("review_clean") is True and report.get("review_head") == head:
+        return None, None
+    waiver = report.get("review_waiver")
+    decision = waiver.get("decision_id") if isinstance(waiver, dict) else None
+    if isinstance(head, str) and any(override_decision(decision, [head, *units], line, word="review_waived")
+                                     for line in rows_after(ledger, stop_c)):
+        return {"decision_id": decision}, None
+    why = ("Devin Review is not clean at the PR head" if report.get("review_clean") is not True else
+           f"review_head {report.get('review_head')!r} is not the gated PR head {head!r}")
+    return None, (f"{why} and no review_waived row {decision or 'D-<n>'} below STOP C row {stop_c} naming "
+                  f"{head} and {', '.join(units)} is in .migration/06_decisions.md")
+
+
 def gates_command(path):
     """`workflow.py gates <results.json>`: the wave-close gate rule for a wave the orchestrator gathered by
     hand. The file holds the children's [{batch, pr_url, gates}] reports; every manifest batch must be in it
-    once, and passed evidence is checked at each PR's head as the workflow path does. Prints {closed, batches:
-    {id: {gates, unmet}}} and exits 1 unless every gate is passed or waived."""
+    once, and passed evidence and the review-clean rule are checked at each PR's head as the workflow path does.
+    Prints {closed, batches: {id: {gates, review_waiver, unmet}}} and exits 1 unless every gate is passed or
+    waived and every review is clean or waived."""
     try:
         reports = json.loads(Path(path).read_text())
     except (OSError, ValueError) as e:
@@ -767,7 +797,7 @@ def gates_command(path):
     ledger = decision_ledger()
     out = {}
     for b in sorted(MANIFEST["batches"], key=lambda b: b["id"]):
-        report = next((r for r in reports if r["batch"] == b["id"]), None)
+        report, waiver = next((r for r in reports if r["batch"] == b["id"]), None), None
         if report is None:
             gates, unmet = [dict(g, decision_id=g.get("decision_id")) for g in b["gates"]], [f"batch {b['id']} was not gathered"]
         else:
@@ -775,7 +805,10 @@ def gates_command(path):
             gates, unmet = gate_outcomes(b, report.get("gates"), ledger, head)
             if head is None:
                 unmet.append(f"{report['pr_url']} is not a PR of {MANIFEST['repo']} whose head git can fetch; no evidence stands")
-        out[b["id"]] = {"gates": gates, "unmet": unmet}
+            waiver, reason = review_outcome(report, b["units"], ledger, head, MANIFEST["stop_c"])
+            if reason:
+                unmet.append(reason)
+        out[b["id"]] = {"gates": gates, "review_waiver": waiver, "unmet": unmet}
     closed = not any(v["unmet"] for v in out.values())
     print(json.dumps({"wave": MANIFEST["wave"], "tag": TAG, "closed": closed, "batches": out}, indent=2, sort_keys=True))
     return 0 if closed else 1
@@ -1562,7 +1595,7 @@ def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
             if p.startswith(".migration/") and not p.startswith(allowed)]
 
 
-def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> list[str]:
+def validate_verify(verify, passed, wave=None, observed=None) -> list[str]:
     """Return verifier-output problems without reading files or mutating input. `observed` is what git
     says the verifier itself changed on recon/wave-N (None: it could not be fetched or diffed)."""
     problems = []
@@ -1593,18 +1626,6 @@ def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> lis
             problems.append(f"verifier output invalid: wave PASS contradicts {batch}={verdict}")
     if wave_verdict == "FAIL" and expected and all(verdicts.get(b) == "PASS" for b in expected):
         problems.append("verifier output invalid: wave FAIL contradicts all unit verdicts PASS")
-    merged = verify.get("merged_prs")
-    if merged is not None and not isinstance(merged, list):
-        problems.append("verifier output invalid: merged_prs must be a list")
-        merged = []
-    if auto_merge:
-        if merged is None:
-            problems.append("verifier output invalid: merged_prs must be a list when auto_merge is on")
-            merged = []
-        for batch in passed:
-            url = batch.get("pr_url")
-            if url and url not in merged:
-                problems.append(f"verifier output invalid: merged_prs is missing {url} for {batch['batch']}")
     if not isinstance(verify.get("findings"), list):
         problems.append("verifier output invalid: findings must be a list")
     changed = verify.get("changed_paths")
@@ -1618,6 +1639,159 @@ def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> lis
                  for p in ledger_violations(sorted({*changed, *(observed or [])}), [], wave)]
     return problems
 
+
+def validate_close(close, to_merge) -> list[str]:
+    """Wave-close output problems without reading anything: every verified PR is in exactly one of
+    merged_prs/unmerged, nothing outside the wave is merged, and the step changed nothing (it writes
+    no files)."""
+    problems = []
+    if not isinstance(close, dict):
+        return ["expected an object"]
+    merged = close.get("merged_prs")
+    if not isinstance(merged, list) or not all(
+            isinstance(u, dict) and isinstance(u.get("pr_url"), str)
+            and isinstance(u.get("merge_commit_sha"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", u["merge_commit_sha"])
+            and isinstance(u.get("merged_head"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", u["merged_head"])
+            for u in merged):
+        problems.append("merged_prs rows must be {pr_url, merge_commit_sha, merged_head}")
+        merged = []
+    merged_urls = [u["pr_url"] for u in merged]
+    unmerged = close.get("unmerged")
+    if not isinstance(unmerged, list) or not all(
+            isinstance(u, dict) and isinstance(u.get("pr_url"), str) and isinstance(u.get("reason"), str)
+            for u in unmerged):
+        problems.append("unmerged must be a list of {pr_url, reason} rows")
+        unmerged = []
+    want = {p.get("pr_url") for p in to_merge}
+    for url in merged_urls:
+        if url not in want:
+            problems.append(f"merged a PR outside the wave ({url})")
+    listed = Counter([*merged_urls, *(u["pr_url"] for u in unmerged)])
+    for url in sorted(want):
+        if listed.get(url, 0) != 1:
+            problems.append(f"{url} is in {listed.get(url, 0)} of merged_prs/unmerged, expected exactly one")
+    changed = close.get("changed_paths")
+    if not isinstance(changed, list) or not all(isinstance(p, str) for p in changed):
+        problems.append("changed_paths must be a list of paths (git diff --name-only)")
+        changed = []
+    for p in changed:
+        problems.append(f"wave-close step changed {p}; it writes nothing")
+    return problems
+
+
+def _applies_to(start, delta, commit):
+    """Whether applying delta (a `diff-tree -p --binary --full-index` patch) onto start's tree in a
+    scratch index yields exactly commit's tree."""
+    git = ["git", "-C", str(ROOT)]
+    with tempfile.TemporaryDirectory() as d:
+        env = {"GIT_INDEX_FILE": str(Path(d) / "index")}
+        subprocess.run(git + ["read-tree", start], check=True, env=env, capture_output=True,
+                       text=True, timeout=300)
+        ok = subprocess.run(git + ["apply", "--cached", "--whitespace=nowarn"], input=delta, env=env,
+                            capture_output=True, text=True, timeout=300)
+        if ok.returncode:
+            return False
+        tree = subprocess.run(git + ["write-tree"], check=True, env=env, capture_output=True,
+                              text=True, timeout=300).stdout.strip()
+    landed = subprocess.run(git + ["rev-parse", f"{commit}^{{tree}}"], check=True, capture_output=True,
+                            text=True, timeout=300).stdout.strip()
+    return tree == landed
+
+
+def _same_change(parent, commit, head):
+    """Whether commit is a squash or rebase of head: the gated head's exact change against its merge
+    base (bytes, whitespace and binaries included), applied onto what precedes the squash commit or
+    the N first-parent rebased commits ending at it, must produce the landed tree."""
+    git = ["git", "-C", str(ROOT)]
+    base = subprocess.run(git + ["merge-base", head, commit],
+                          check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+    n = int(subprocess.run(git + ["rev-list", "--count", f"{base}..{head}"],
+                           check=True, capture_output=True, text=True, timeout=300).stdout)
+    delta = subprocess.run(git + ["diff-tree", "-p", "--binary", "--full-index", "--no-color", base, head],
+                           check=True, capture_output=True, text=True, timeout=300).stdout
+    if not delta.strip():
+        return False
+    if _applies_to(parent, delta, commit):
+        return True
+    start = subprocess.run(git + ["rev-parse", "--verify", "--quiet", f"{commit}~{n}"],
+                           check=False, capture_output=True, text=True, timeout=300)
+    return n > 1 and start.returncode == 0 and _applies_to(start.stdout.strip(), delta, commit)
+
+
+def proven_merged(to_merge, reported):
+    """({pr_url: merge_commit_sha}, {pr_url: reason}) — a merge counts only when the PR head still equals the
+    gated head (a commit appended after verification is not the verified tree) and origin's base tip carries
+    the merge: a merge_commit_sha the wave-close step recorded (`gh pr view` state MERGED, merged_head the
+    gated head) must be on the tip and, when it has two parents, name the gated head as its PR-side parent
+    (a single-parent squash/rebase commit has no PR-side parent, so the gated head's exact change
+    against its merge base, applied to what precedes the squash commit or the N rebased commits ending
+    at it, must reproduce the landed tree — git apply into a scratch index; whitespace, bytes and
+    binaries count, the record alone binds nothing).
+    With no record — the step died, timed out, or dropped the PR — git alone still proves a
+    merge commit on the base's first-parent line whose PR-side parent is the gated head. Whatever the close
+    step reported or failed to report is reconciled against git."""
+    proven, reasons = {}, {}
+    try:
+        tip = _base_tip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return proven, {p["pr_url"]: f"cannot resolve origin/{BASE_BRANCH} ({e})" for p in to_merge}
+    git = ["git", "-C", str(ROOT)]
+    merges = None
+    for p in to_merge:
+        url, head = p["pr_url"], p.get("pr_head")
+        if not (isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head)):
+            reasons[url] = "no gated PR head"
+            continue
+        current = pr_head(url)
+        if current != head:
+            reasons[url] = ("PR head unreadable" if current is None
+                            else f"PR head moved from {head} to {current} after verification")
+            continue
+        record = reported.get(url)
+        try:
+            if record is not None:
+                mc = record.get("merge_commit_sha")
+                if record.get("merged_head") != head:
+                    reasons[url] = f"merged head {record.get('merged_head')} is not the gated head {head}"
+                    continue
+                on_base = (isinstance(mc, str) and re.fullmatch(r"[0-9a-f]{40}", mc)
+                           and subprocess.run(git + ["merge-base", "--is-ancestor", mc, tip],
+                                              check=False, capture_output=True,
+                                              timeout=300).returncode == 0)
+                if not on_base:
+                    reasons[url] = f"merge commit {mc} is not on origin/{BASE_BRANCH}"
+                    continue
+                parents = subprocess.run(git + ["rev-list", "--parents", "-n1", mc],
+                                         check=True, capture_output=True, text=True,
+                                         timeout=300).stdout.split()[1:]
+                if len(parents) >= 2 and parents[1] != head:
+                    reasons[url] = f"merge commit's PR-side parent is {parents[1]}, not the gated head"
+                    continue
+                if len(parents) < 2 and not (parents and _same_change(parents[0], mc, head)):
+                    reasons[url] = f"commit {mc} does not carry the gated head's change"
+                    continue
+                proven[url] = mc
+                continue
+            if merges is None:
+                merges = {}
+                for line in subprocess.run(
+                        git + ["rev-list", "--merges", "--first-parent", "--parents",
+                               f"{BASE_SHA}..{tip}"],
+                        check=True, capture_output=True, text=True, timeout=300).stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        merges[parts[2]] = parts[0]
+            if head in merges:
+                proven[url] = merges[head]
+            else:
+                reasons[url] = (f"merge not recorded by the wave-close step and no merge commit on "
+                                f"origin/{BASE_BRANCH} has the gated head as its PR-side parent")
+        except (OSError, subprocess.SubprocessError) as e:
+            reasons[url] = f"merge proof failed ({e})"
+    return proven, reasons
+
 WAVE = MANIFEST["wave"]
 REPO = MANIFEST["repo"]
 BATCHES = sorted(MANIFEST["batches"], key=lambda b: b["id"])
@@ -1625,6 +1799,7 @@ WIDTH = int(MANIFEST.get("width", 20))
 BREAKER = int(MANIFEST.get("breaker_threshold", 3))
 AUTO_MERGE = bool(MANIFEST.get("auto_merge", False))
 MAX_MINUTES = int(MANIFEST.get("max_minutes", 45))
+CLOSE_MINUTES = int(MANIFEST.get("close_minutes", 10))
 VERIFY_DEPTH = MANIFEST.get("verify_depth", "sampled")
 
 
@@ -1642,8 +1817,10 @@ META = {
         {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
          "labels": [b["id"] for b in BATCHES],
          "soft_time_limit_minutes": max(batch_max_minutes(b) for b in BATCHES)},
-        {"title": "verify", "detail": "independent recon over the wave, merge green PRs",
+        {"title": "verify", "detail": "independent recon over the wave",
          "count": 1, "soft_time_limit_minutes": 60},
+        {"title": "close", "detail": "merge verifier-PASS PRs within the deadline",
+         "count": 1, "soft_time_limit_minutes": CLOSE_MINUTES},
     ],
 }
 
@@ -1662,6 +1839,17 @@ CHILD_SCHEMA = {
                            "decision_id": {"type": "string"}},
             "description": "human_override with the D-<n> row of .migration/06_decisions.md that says merge_override "
                            "for your units; the workflow verifies the row. harness otherwise."},
+        "review_clean": {"type": "boolean",
+                         "description": "Devin Review on your PR has zero open actionable findings at pr_head"},
+        "review_head": {"type": "string",
+                        "description": "the 40-hex PR head sha Devin Review cleared; the workflow fails a "
+                                       "review_clean whose review_head is not the gated PR head"},
+        "review_waiver": {
+            "type": "object",
+            "properties": {"decision_id": {"type": "string"}},
+            "description": "the D-<n> row of .migration/06_decisions.md, below this wave's STOP C row, that says "
+                           "review_waived for your units at your PR head sha when a finding is wrong; the workflow "
+                           "verifies the row"},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
         "changed_paths": {"type": "array", "items": {"type": "string"},
@@ -1680,7 +1868,7 @@ CHILD_SCHEMA = {
         "one_line_summary": {"type": "string"},
     },
     "required": ["status", "recon_verdict", "recon_mode", "merge_eligible", "write_targets", "changed_paths",
-                 "one_line_summary"],
+                 "review_clean", "one_line_summary"],
 }
 
 VERIFY_SCHEMA = {
@@ -1688,7 +1876,6 @@ VERIFY_SCHEMA = {
     "properties": {
         "wave_verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
         "unit_verdicts": {"type": "object"},
-        "merged_prs": {"type": "array", "items": {"type": "string"}},
         "findings": {"type": "array", "items": {"type": "string"}},
         "report_path": {"type": "string"},
         "changed_paths": {"type": "array", "items": {"type": "string"},
@@ -1697,6 +1884,26 @@ VERIFY_SCHEMA = {
                        "description": "summed result.json['cost'] over the verifier's re-runs"},
     },
     "required": ["wave_verdict", "unit_verdicts", "findings", "changed_paths"],
+}
+
+CLOSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "merged_prs": {"type": "array",
+                       "items": {"type": "object",
+                                 "properties": {"pr_url": {"type": "string"},
+                                                "merge_commit_sha": {"type": "string"},
+                                                "merged_head": {"type": "string"}},
+                                 "required": ["pr_url", "merge_commit_sha", "merged_head"]},
+                       "description": "from `gh pr view <url> --json state,mergeCommit,headRefOid` after "
+                                      "the merge; state must be MERGED"},
+        "unmerged": {"type": "array",
+                     "items": {"type": "object",
+                               "properties": {"pr_url": {"type": "string"}, "reason": {"type": "string"}},
+                               "required": ["pr_url", "reason"]}},
+        "changed_paths": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["merged_prs", "unmerged", "changed_paths"],
 }
 
 
@@ -1724,6 +1931,11 @@ def child_prompt(batch):
         "- Report every path your PR changes in changed_paths (`git diff --name-only <base>...<head>`); "
         "any other .migration/ path in it turns your PASS into FAIL ledger_tampered.\n"
         "- Do not merge your own PR.\n"
+        "- status=PASS also requires review_clean=true: finish the Devin Review round on your PR and fix "
+        "every actionable finding before reporting done, then report review_head as the exact 40-hex PR head "
+        "sha Devin Review cleared (a push after the review needs a new clean round); a wrong finding is "
+        "waived only by a human's review_waived row in .migration/06_decisions.md, written below this wave's "
+        "STOP C row, naming your units and the exact PR head sha it clears, reported as review_waiver.\n"
         f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
         "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
         "evidence is never PASS. Report merge_eligible=true only when every unit's "
@@ -1769,17 +1981,11 @@ def capability_block(units):
     )
 
 
-def verify_prompt(passed, auto_merge):
+def verify_prompt(passed):
     by_id = {b["id"]: b for b in BATCHES}
     depths = {p["batch"]: batch_verify_depth(by_id[p["batch"]]) for p in passed}
-    merge_line = (
-        "Merge every PR you mark PASS and list it in merged_prs, even if another unit in the wave failed; "
-        "failed units are reopened next launch."
-        if auto_merge else
-        "Do not merge anything; return per-unit verdicts. The orchestrator surfaces the PASS PRs in the "
-        "wave brief, merges them at wave close (or records the human's decision in the kit's decision log "
-        "under .migration/), "
-        "and the next wave does not launch until that is done.")
+    merge_line = ("Do not merge anything; return per-unit verdicts. The workflow's wave-close step merges "
+                  "the PRs you mark PASS (or the brief lists them for the merge owner in hard mode).")
     return (
         f"You are the independent verifier for wave {WAVE}. Repo: {REPO}. You did not write "
         f"any of this code.\nRun the playbook {MANIFEST['verify_macro']} exactly as written over "
@@ -1817,6 +2023,23 @@ def verify_prompt(passed, auto_merge):
         "report_path. Do not edit any other file under .migration/; report your branch's "
         "`git diff --name-only <base>...<head>` in changed_paths. Each finding is one plain "
         "sentence a lead can read without opening anything."
+    )
+
+
+def close_prompt(to_merge, deadline_minutes):
+    return (
+        f"You are the wave-close step for wave {WAVE}. Repo: {REPO}. Merge exactly these PRs, nothing else: "
+        f"{json.dumps(to_merge, sort_keys=True)}. Each was verified PASS by the independent verifier at "
+        "pr_head; before merging, check the PR head still equals it and the PR is open and mergeable, "
+        "otherwise leave it and list it in unmerged with a one-sentence reason. Merge nothing whose head "
+        "is not exactly the verified pr_head, and never push to the PR branch. After each merge run "
+        "`gh pr view <url> --json state,mergeCommit,headRefOid`: put {pr_url, merge_commit_sha: "
+        "mergeCommit.oid, merged_head: headRefOid} in merged_prs only when state is MERGED — anything else "
+        "goes to unmerged. Do it within "
+        f"{deadline_minutes} minutes; when time is up, stop and list the rest as unmerged. Write nothing: "
+        "no commits, no files, no other PR; report `git diff --name-only` of anything you changed in "
+        "changed_paths (it must be empty). The orchestrator commits the wave's ledger artifacts in one "
+        "wave-close PR afterwards."
     )
 
 
@@ -1927,6 +2150,15 @@ async def _run_batch(batch, sem, breaker):
                     f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
                     ".migration/06_decisions.md; " + out["one_line_summary"])
         if out["status"] == "PASS":
+            waiver, reason = review_outcome(out, batch["units"], decision_ledger(), out["pr_head"], MANIFEST["stop_c"])
+            if reason:
+                out["status"] = "FAIL"
+                out["failure_class"] = "review_open"
+                out.pop("review_waiver", None)
+                out["one_line_summary"] = f"PASS downgraded: {reason}; " + out["one_line_summary"]
+            elif waiver:
+                out["review_waiver"] = waiver
+        if out["status"] == "PASS":
             out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger(), out["pr_head"])
             if unmet:
                 out["status"] = "FAIL"
@@ -1994,7 +2226,7 @@ def merge_overrides(results):
             if r["status"] == "PASS" and (r.get("merge_authority") or {}).get("kind") == "human_override"]
 
 
-def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
+def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close=None, to_merge=None):
     """Ten lines a lead reads in one minute. The orchestrator posts this at wave close."""
     n = len(BATCHES)
     passed = sum(1 for r in results if r["status"] == "PASS")
@@ -2006,8 +2238,7 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
         f"# Wave {WAVE} close",
         "",
         f"Landed: {passed} of {n} batches passed their own recon.",
-        f"Independent verify: {verify['wave_verdict'] if verify else 'NOT RUN'}"
-        + (f", {len(verify.get('merged_prs', []))} PRs merged." if verify else "."),
+        f"Independent verify: {verify['wave_verdict'] if verify else 'NOT RUN'}.",
         f"Failed: {', '.join(failed) or 'none'}.",
         f"Blocked on missing inputs: {', '.join(blocked) or 'none'}.",
         f"Held back by circuit breaker: {', '.join(held) or 'none'}.",
@@ -2030,10 +2261,19 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
     if overrides:
         lines.append("Human override authority (merge_eligible=false; merged only if listed above): "
                      + "; ".join(f"{o['batch']} ({', '.join(o['units'])}) by {o['decision_id']}" for o in overrides) + ".")
+    if close is not None:
+        merged_n = len(close.get("merged_prs", [])) if isinstance(close, dict) else 0
+        lines.append(f"Wave close: {merged_n} of {len(to_merge or [])} verified PRs merged within "
+                     f"{CLOSE_MINUTES} min.")
+        unmerged = close.get("unmerged", []) if isinstance(close, dict) else []
+        if unmerged:
+            lines.append("Not merged: " + "; ".join(f"{u['pr_url']} ({u['reason']})" for u in unmerged) + ".")
     if not auto_merge:
         urls = [r["pr_url"] for r in results
                 if r["status"] == "PASS" and r.get("pr_url")]
         lines.append("Awaiting manual merge: " + (", ".join(urls) or "none reported"))
+    elif isinstance(close, dict) and close.get("unmerged"):
+        lines.append("Awaiting manual merge: " + ", ".join(u["pr_url"] for u in close["unmerged"]))
     lines.append(cost_line(results, verify))
     lines += [
         "",
@@ -2097,13 +2337,15 @@ async def main():
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
+               "review_clean": r.get("review_clean"), "review_head": r.get("review_head"),
+               "review_waiver": r.get("review_waiver"),
                "gates": r.get("gates", [])}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
     verify = None
     if passed:
         log(f"verify: {len(passed)} batches to an independent session")
         try:
-            verify = await agent(verify_prompt(passed, auto_merge), phase="verify", schema=VERIFY_SCHEMA,
+            verify = await agent(verify_prompt(passed), phase="verify", schema=VERIFY_SCHEMA,
                                  label=f"verify-wave-{TAG}", repos=[REPO])
         except WorkflowAgentError as e:
             verify = {"wave_verdict": "FAIL", "unit_verdicts": {},
@@ -2111,7 +2353,7 @@ async def main():
     else:
         log("verify: skipped, no batch passed")
 
-    verify_problems = (validate_verify(verify, passed, auto_merge, TAG, verifier_changed_paths(TAG, passed))
+    verify_problems = (validate_verify(verify, passed, TAG, verifier_changed_paths(TAG, passed))
                        if verify is not None else [])
     if verify_problems:
         if not isinstance(verify, dict):
@@ -2120,8 +2362,67 @@ async def main():
         if not isinstance(verify.get("findings"), list):
             verify["findings"] = []
         verify["findings"].extend(verify_problems)
+    to_merge = []
+    if not verify_problems and isinstance(verify, dict) and isinstance(verify.get("unit_verdicts"), dict):
+        to_merge = [{"batch": p["batch"], "units": p["units"], "pr_url": p["pr_url"], "pr_head": p.get("pr_head")}
+                    for p in passed if verify["unit_verdicts"].get(p["batch"]) == "PASS" and p.get("pr_url")]
+    close = None
+    if auto_merge and to_merge:
+        try:
+            close = await asyncio.wait_for(
+                agent(close_prompt(to_merge, CLOSE_MINUTES), phase="close", schema=CLOSE_SCHEMA,
+                      label=f"close-wave-{TAG}", repos=[REPO], soft_time_limit_minutes=CLOSE_MINUTES),
+                timeout=CLOSE_MINUTES * 60)
+        except (asyncio.TimeoutError, WorkflowAgentError) as e:
+            close = {"merged_prs": [],
+                     "unmerged": [{"pr_url": p["pr_url"],
+                                   "reason": f"wave-close step did not finish within {CLOSE_MINUTES} minutes: {e}"}
+                                  for p in to_merge],
+                     "changed_paths": []}
+    close_problems = validate_close(close, to_merge) if close is not None else []
+    if close is not None:
+        raw = close
+        reported = {}
+        if resume and MERGES_PATH.exists():
+            try:
+                stored = json.loads(MERGES_PATH.read_text())
+            except ValueError:
+                stored = {}
+            gated = {p["pr_url"]: p.get("pr_head") for p in to_merge}
+            reported.update({u: {"merge_commit_sha": mc, "merged_head": gated[u]}
+                             for u, mc in stored.items()
+                             if u in gated and isinstance(mc, str)} if isinstance(stored, dict) else {})
+        rows = raw.get("merged_prs") if isinstance(raw, dict) else None
+        if isinstance(rows, list):
+            reported.update({u["pr_url"]: u for u in rows
+                             if isinstance(u, dict) and isinstance(u.get("pr_url"), str)})
+        proven, proof = proven_merged(to_merge, reported)
+        reasons = {u["pr_url"]: u["reason"] for u in raw.get("unmerged", [])
+                   if isinstance(u, dict) and isinstance(u.get("pr_url"), str)
+                   and isinstance(u.get("reason"), str)} if isinstance(raw, dict) else {}
+        changed = raw.get("changed_paths") if isinstance(raw, dict) else None
+        close = {"merged_prs": [p["pr_url"] for p in to_merge if p["pr_url"] in proven],
+                 "merges": [{"pr_url": p["pr_url"], "merge_commit_sha": proven[p["pr_url"]]}
+                            for p in to_merge if p["pr_url"] in proven],
+                 "unmerged": [{"pr_url": p["pr_url"],
+                               "reason": (proof.get(p["pr_url"]) or reasons.get(p["pr_url"])
+                                          or "wave-close output invalid")}
+                              for p in to_merge if p["pr_url"] not in proven],
+                 "changed_paths": changed if isinstance(changed, list) else []}
+        merges_tmp = MERGES_PATH.with_suffix(".merges.json.tmp")
+        merges_tmp.write_text(json.dumps(proven, indent=2, sort_keys=True) + "\n")
+        merges_tmp.replace(MERGES_PATH)
+        if close_problems:
+            close["invalid"] = raw
+    if close_problems:
+        if not isinstance(verify, dict):
+            verify = {"wave_verdict": "FAIL", "unit_verdicts": {}, "findings": []}
+        if not isinstance(verify.get("findings"), list):
+            verify["findings"] = []
+        verify["findings"].extend(f"wave close invalid: {p}" for p in close_problems)
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported
-              and not verify_problems and verify is not None and verify["wave_verdict"] == "PASS"
+              and not verify_problems and not close_problems and (close is None or not close["unmerged"])
+              and verify is not None and verify["wave_verdict"] == "PASS"
               and all(r["status"] == "PASS" for r in results))
     result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
     result_tmp.write_text(json.dumps({
@@ -2137,10 +2438,10 @@ async def main():
         "merge_overrides": merge_overrides(results),
         "waived_gates": waived_gates(results),
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
-        "verify": verify,
+        "verify": verify, "close": close, "close_minutes": CLOSE_MINUTES,
     }, indent=2, sort_keys=True) + "\n")
     result_tmp.replace(RESULT_PATH)
-    write_brief(results, verify, surprises, undeclared, unreported, auto_merge)
+    write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close, to_merge)
     log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 

@@ -30,7 +30,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
                other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
                deploy_objects=None, max_minutes=None, batch_max_minutes=None, manifest_name="wave-0.json", wave=0,
-               pipelines=None, lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1):
+               pipelines=None, auto_merge=None, close_minutes=None, other_batch=None,
+               lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -79,6 +80,12 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         manifest["max_minutes"] = max_minutes
     if batch_max_minutes is not None:
         manifest["batches"][0]["max_minutes"] = batch_max_minutes
+    if auto_merge is not None:
+        manifest["auto_merge"] = auto_merge
+    if close_minutes is not None:
+        manifest["close_minutes"] = close_minutes
+    if other_batch is not None:
+        manifest["batches"].append(other_batch)
     if namespace is not None:
         manifest["target_namespace"] = namespace
     if pipelines is not None:
@@ -161,6 +168,7 @@ def _run(cwd, tmp_path, agent_reports):
     reports.write_text(json.dumps(agent_reports))
     shim = f"""
 import json
+import subprocess
 from pathlib import Path
 REPORTS = Path({str(reports)!r})
 CALLS = Path({str(calls)!r})
@@ -175,6 +183,10 @@ async def agent(prompt, **kwargs):
     reports = json.loads(REPORTS.read_text())
     report = reports.pop(0)
     REPORTS.write_text(json.dumps(reports))
+    for cmd in report.pop("__run__", []):
+        subprocess.run(cmd, check=True, capture_output=True)
+    if report.get("error"):
+        raise WorkflowAgentError(report["error"])
     return report
 def log(message):
     print(message)
@@ -191,7 +203,8 @@ def _pass_report(pr_url="", **extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": pr_url, "branch": "feature/x", "changed_paths": [],
             "gates": [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}],
-            "write_targets": ["mig.t"], "one_line_summary": "ok", **extra}
+            "write_targets": ["mig.t"], "review_clean": True, "review_head": _PR_HEADS.get(pr_url, ""),
+            "one_line_summary": "ok", **extra}
 
 
 def _result(ws):
@@ -320,14 +333,52 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
     assert proc.returncode != 0 and "{batch, pr_url, gates}" in proc.stderr
     runs = ws / ".migration/waves/wave-0.runs.jsonl"
     assert [json.loads(l)["mode"] for l in runs.read_text().splitlines()] == ["reserve"]  # unmet gates: the run stays open
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    clean = {"review_clean": True, "review_head": _PR_HEADS[pr]}
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed], **clean}])
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
-    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == []
+    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == [] and out["batches"]["b-1"]["review_waiver"] is None
     assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
     assert [(json.loads(l)["stop_c"], json.loads(l)["mode"]) for l in runs.read_text().splitlines()] == [("D-2", "reserve"), ("D-2", "gates")]
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed], **clean}])
     assert proc.returncode != 0 and "closed" in proc.stderr and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_gates_subcommand_applies_the_review_clean_rule_at_the_pr_head(tmp_path):
+    """A hand-gathered small wave is held to the same review-clean rule as a workflow child: review_clean=true
+    for review_head equal to the PR head git fetches, or a human's review_waived row, below this run's STOP C row,
+    naming that head and the units."""
+    ws, cwd = _workspace(tmp_path, doctor=False)
+    results = tmp_path / "results.json"
+    assert _workflow(cwd, "reserve").returncode == 0
+    pr = _push_pr(ws)
+    _waive_review(ws, "D-5", "d" * 40)
+    passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
+
+    def run(**report):
+        results.write_text(json.dumps([{"batch": "b-1", "pr_url": pr, "gates": [passed], **report}]))
+        proc = _workflow(cwd, "gates", str(results))
+        assert "Traceback" not in proc.stderr, proc.stderr
+        return proc.returncode, json.loads(proc.stdout)["batches"]["b-1"]
+
+    for dirty in ({}, {"review_clean": False, "review_head": _PR_HEADS[pr]}, {"review_clean": "yes", "review_head": _PR_HEADS[pr]},
+                  {"review_clean": True}, {"review_clean": True, "review_head": "d" * 40},
+                  {"review_clean": False, "review_waiver": {"decision_id": "D-4"}},
+                  {"review_clean": False, "review_waiver": {"decision_id": "D-5"}}):
+        rc, b = run(**dirty)
+        assert rc != 0 and len(b["unmet"]) == 1 and "review_waived" in b["unmet"][0] and b["review_waiver"] is None, dirty
+        assert ("is not the gated PR head" in b["unmet"][0]) == (dirty.get("review_clean") is True), dirty
+        assert _PR_HEADS[pr] in b["unmet"][0] and "D-2" in b["unmet"][0], dirty
+    rc, b = run(review_clean=True, review_head=_PR_HEADS[pr])
+    assert rc == 0 and b["unmet"] == [] and b["review_waiver"] is None
+
+    ws, cwd = _workspace(tmp_path / "waived", doctor=False)
+    assert _workflow(cwd, "reserve").returncode == 0
+    pr = _push_pr(ws)
+    _waive_review(ws, "D-5", _PR_HEADS[pr])
+    rc, b = run(review_clean=False, review_waiver={"decision_id": "D-5"})
+    assert rc == 0 and b["unmet"] == [] and b["review_waiver"] == {"decision_id": "D-5"}
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
 
@@ -760,13 +811,71 @@ def test_malformed_dependency_analysis_halts_before_launch(tmp_path):
     assert not [c for c in calls if c["kind"] == "agent"]
 
 
+_PR_HEADS = {}
+
+
 def _push_pr(ws, n=1):
+    head = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", f"HEAD:refs/pull/{n}/head", "HEAD:recon/wave-0"], check=True)
-    return f"https://github.com/acme/target/pull/{n}"
+    url = f"https://github.com/acme/target/pull/{n}"
+    _PR_HEADS[url] = head
+    return url
+
+
+def _unproven_pr(ws, n=1):
+    """A pushed PR whose head is not yet an ancestor of origin's base tip."""
+    (ws / f"pr-{n}.sql").write_text("select 1")
+    subprocess.run(["git", "-C", str(ws), "add", f"pr-{n}.sql"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "x"], check=True)
+    head = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", f"HEAD:refs/pull/{n}/head",
+                    "HEAD~1:refs/heads/recon/wave-0"], check=True)
+    url = f"https://github.com/acme/target/pull/{n}"
+    _PR_HEADS[url] = head
+    return url
+
+
+def _squash_merge_to_base(ws):
+    """What a host's squash-merge leaves: a new commit on the base tip carrying the PR head's tree."""
+    git = ["git", "-C", str(ws)]
+    tip = subprocess.run(git + ["rev-parse", "origin/migration/x"],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    tree = subprocess.run(git + ["rev-parse", "HEAD^{tree}"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    merged = subprocess.run(git + ["commit-tree", tree, "-p", tip, "-m", "squash"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", f"{merged}:refs/heads/migration/x"], check=True)
+
+
+def _merge_commit(ws, head, second_parent=None):
+    """The merge commit a host records: a commit on top of the base tip whose second (PR-side) parent
+    is the PR head."""
+    git = ["git", "-C", str(ws)]
+    tip = subprocess.run(git + ["rev-parse", "origin/migration/x"],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    tree = subprocess.run(git + ["rev-parse", f"{head}^{{tree}}"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(git + ["commit-tree", tree, "-p", tip, "-p", second_parent or head, "-m", "merge"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _merge_row(url, mc, head=None):
+    return {"pr_url": url, "merge_commit_sha": mc, "merged_head": head or _PR_HEADS[url]}
+
+
+def _merged(ws, pr, **extra):
+    """A close report that merged pr through a real merge commit pushed to origin/migration/x."""
+    mc = _merge_commit(ws, _PR_HEADS[pr])
+    close = _close_report(merged_prs=[_merge_row(pr, mc)], **extra)
+    close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
+                         f"{mc}:refs/heads/migration/x"]]
+    return close
 
 
 def _verify_report(**extra):
-    return {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS"}, "merged_prs": [],
+    return {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS"},
             "findings": [], "changed_paths": [], **extra}
 
 
@@ -913,6 +1022,8 @@ def test_pipeline_manifest_tags_the_verifier_branch_and_workflow(tmp_path):
     ws, cwd = _workspace(tmp_path, manifest_name="wave-p2-1.json", wave=1, pipelines={"p2": 1})
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
                     "HEAD:recon/wave-p2-1"], check=True)
+    _PR_HEADS["https://github.com/acme/target/pull/1"] = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1"),
                                      _verify_report()])
     assert proc.returncode == 0, proc.stderr
@@ -1057,6 +1168,666 @@ def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tm
     assert proc.returncode != 0 and "doctor" in proc.stderr
     proc = run(tmp_path / "stopc", stop_c=False)
     assert proc.returncode != 0 and "gates_sha" in proc.stderr
+
+
+def _close_report(**extra):
+    return {"merged_prs": [], "unmerged": [], "changed_paths": [], **extra}
+
+
+def test_a_pass_needs_review_clean_or_a_review_waived_ledger_row(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False)])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
+    assert "review_waived" in batch["one_line_summary"] and "review_waiver" not in batch
+
+    ws, cwd = _workspace(tmp_path / "missing")
+    pr = _push_pr(ws)
+    report = _pass_report(pr)
+    del report["review_clean"]
+    proc, _ = _run(cwd, tmp_path / "missing", [report])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["batches"][0]["failure_class"] == "review_open"
+
+
+def _waive_review(ws, decision_id, head, above_stop_c=False):
+    ledger = ws / ".migration" / "06_decisions.md"
+    row = f"| {decision_id} | user:U1 | review_waived for u at {head}, the finding is a false positive |\n"
+    ledger.write_text(row + ledger.read_text() if above_stop_c else ledger.read_text() + row)
+
+
+def test_a_review_waived_ledger_row_carries_a_dirty_review(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    _waive_review(ws, "D-5", _PR_HEADS[pr])
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False,
+                                                   review_waiver={"decision_id": "D-5"}), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "PASS" and batch["review_waiver"] == {"decision_id": "D-5"}
+    verify_prompt = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+    assert "review_waiver" in verify_prompt
+
+
+@pytest.mark.parametrize("stale", ["other_head", "earlier_run"])
+def test_a_review_waiver_binds_the_reviewed_head_and_this_runs_stop_c(tmp_path, stale):
+    """A review_waived row dismisses one wrong finding: it names the PR head it was written for and sits below
+    this run's STOP C row, so a waiver for an earlier PR or an earlier run does not carry a new dirty review."""
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    _waive_review(ws, "D-5", "d" * 40 if stale == "other_head" else _PR_HEADS[pr], above_stop_c=stale == "earlier_run")
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False, review_waiver={"decision_id": "D-5"})])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open" and "review_waiver" not in batch
+    assert _PR_HEADS[pr] in batch["one_line_summary"] and "D-2" in batch["one_line_summary"]
+
+
+def test_a_merge_override_row_does_not_waive_the_review(tmp_path):
+    ws, cwd = _workspace(tmp_path, decisions="| D-5 | user:U1 | merge_override for u |\n")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False, review_waiver={"decision_id": "D-5"})])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["batches"][0]["failure_class"] == "review_open"
+
+
+def test_a_clean_review_must_name_the_pr_head_it_cleared(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_head="0" * 40)])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
+    assert "0" * 40 in batch["one_line_summary"] and _PR_HEADS[pr] in batch["one_line_summary"]
+
+    ws, cwd = _workspace(tmp_path / "missing")
+    pr = _push_pr(ws)
+    report = _pass_report(pr)
+    del report["review_head"]
+    proc, _ = _run(cwd, tmp_path / "missing", [report])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
+
+    ws, cwd = _workspace(tmp_path / "waived")
+    pr = _push_pr(ws)
+    _waive_review(ws, "D-5", _PR_HEADS[pr])
+    proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr, review_head="0" * 40,
+                                                               review_waiver={"decision_id": "D-5"}),
+                                                _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "PASS" and batch["review_waiver"] == {"decision_id": "D-5"}
+
+
+def test_the_wave_close_step_merges_the_verifier_pass_prs(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _merged(ws, pr)])
+    assert proc.returncode == 0, proc.stderr
+    register = [c for c in calls if c["kind"] == "register"][0]
+    close_phase = [p for p in register["meta"]["phases"] if p["title"] == "close"][0]
+    assert close_phase["soft_time_limit_minutes"] == 10
+    verify_prompt = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+    assert "Merge every PR" not in verify_prompt and "wave-close" in verify_prompt
+    assert verify_prompt.count("commit it on branch recon/wave-0, push, and give") == 1
+    close = [c for c in calls if c.get("label") == "close-wave-0"]
+    assert close and close[0]["kwargs"]["soft_time_limit_minutes"] == 10 and pr in close[0]["prompt"]
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["close_minutes"] == 10
+    assert result["closed"] is True
+
+
+def test_close_minutes_from_the_manifest_propagates_and_a_bad_one_halts(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True, close_minutes=20)
+    pr = _unproven_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _merged(ws, pr)])
+    assert proc.returncode == 0, proc.stderr
+    close = [c for c in calls if c.get("label") == "close-wave-0"][0]
+    assert close["kwargs"]["soft_time_limit_minutes"] == 20 and "20 minutes" in close["prompt"]
+    assert _result(ws)["close_minutes"] == 20
+    for i, bad in enumerate((0, "10", True, 61)):
+        ws, cwd = _workspace(tmp_path / f"bad{i}", auto_merge=True, close_minutes=bad)
+        proc, calls = _run(cwd, tmp_path / f"bad{i}", [_pass_report()])
+        assert proc.returncode != 0 and "close_minutes" in proc.stderr
+        assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_hard_mode_runs_no_close_step_and_the_brief_lists_the_prs(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert not [c for c in calls if c.get("label") == "close-wave-0"]
+    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert f"Awaiting manual merge: {pr}" in brief
+    assert _result(ws)["close"] is None
+
+
+def test_a_failed_sibling_does_not_hold_back_a_verified_pr_merge(tmp_path):
+    """The verifier sees only PASS children; a wave FAIL on one still leaves the other's PR to merge."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
+                         other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
+                                      "brief": "b", "gates": [GATE], "lakeflow_pipelines": []})
+    pr, pr2 = _unproven_pr(ws), _push_pr(ws, 2)
+    pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
+                                                             "evidence": ".migration/recon/v/result.json"}])
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), pass2,
+                                       {"wave_verdict": "FAIL", "unit_verdicts": {"b-1": "PASS", "b-2": "FAIL"},
+                                        "findings": [], "changed_paths": []},
+                                       _merged(ws, pr)])
+    assert proc.returncode == 0, proc.stderr
+    close = [c for c in calls if c.get("label") == "close-wave-0"]
+    assert close and pr in close[0]["prompt"] and "b-2" not in close[0]["prompt"] and pr2 not in close[0]["prompt"]
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is False
+
+
+def test_wave_close_output_is_validated(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    close = _merged(ws, pr)
+    close["merged_prs"].append({"pr_url": "https://github.com/acme/target/pull/9",
+                                "merge_commit_sha": "f" * 40, "merged_head": "e" * 40})
+    close["changed_paths"] = ["x.sql"]
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    result = _result(ws)
+    assert result["closed"] is False
+    findings = " ".join(result["verify"]["findings"])
+    assert "wave close invalid" in findings and "outside the wave" in findings and "x.sql" in findings
+
+
+def test_a_verified_pr_the_close_step_dropped_is_a_finding(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _close_report()])
+    result = _result(ws)
+    assert result["closed"] is False
+    assert any("wave close invalid" in f and pr in f for f in result["verify"]["findings"])
+
+
+def test_an_unmerged_verified_pr_keeps_the_wave_open_and_lands_in_the_brief(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(),
+                                     _close_report(unmerged=[{"pr_url": pr, "reason": "head moved"}])])
+    result = _result(ws)
+    assert result["closed"] is False
+    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert f"Not merged: {pr}" in brief and f"Awaiting manual merge: {pr}" in brief
+
+
+def test_a_malformed_close_reply_still_writes_the_brief(tmp_path):
+    for i, bad in enumerate(({"merged_prs": [], "unmerged": [{"pr_url": "x"}], "changed_paths": []},
+                            {"merged_prs": [], "unmerged": "nope", "changed_paths": []})):
+        ws, cwd = _workspace(tmp_path / f"bad{i}", auto_merge=True)
+        pr = _unproven_pr(ws)
+        proc, _ = _run(cwd, tmp_path / f"bad{i}", [_pass_report(pr), _verify_report(), bad])
+        assert proc.returncode == 0, proc.stderr
+        result = _result(ws)
+        assert result["closed"] is False
+        assert any("wave close invalid" in f for f in result["verify"]["findings"])
+        brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+        assert f"Awaiting manual merge: {pr}" in brief
+
+
+def test_a_dead_close_session_leaves_every_verified_pr_unmerged(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), {"error": "boom"}])
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["close"]["unmerged"][0]["pr_url"] == pr
+    assert result["closed"] is False
+
+
+def test_the_close_reply_is_reconciled_against_git(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(),
+                                 _close_report(merged_prs=[_merge_row(pr, "f" * 40)])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    unmerged = result["close"]["unmerged"]
+    assert unmerged[0]["pr_url"] == pr and "not on origin" in unmerged[0]["reason"]
+
+    ws, cwd = _workspace(tmp_path / "proven", auto_merge=True)
+    pr = _unproven_pr(ws)
+    mc = _merge_commit(ws, _PR_HEADS[pr])
+    proc, _ = _run(cwd, tmp_path / "proven",
+                   [_pass_report(pr), _verify_report(),
+                    {"error": "died mid-merge",
+                     "__run__": [["git", "-C", str(ws), "push", "-q", "origin",
+                                  f"{mc}:refs/heads/migration/x"]]}])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["close"]["unmerged"] == []
+    assert result["closed"] is True
+
+
+def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
+    """Resume replays the PASS gated at head A; the PR has since moved to B (B merged, A's verdict stands
+    for nothing): the wave cannot close over a commit it never gated."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr),
+                                 {"wave_verdict": "FAIL", "unit_verdicts": {"b-1": "FAIL"},
+                                  "findings": [], "changed_paths": []}])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["closed"] is False and result["batches"][0]["status"] == "PASS"
+
+    pointer = ws / ".migration/waves/current.json"
+    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
+                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
+    subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "b"], check=True)
+    subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
+                    "HEAD:migration/x"], check=True)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(),
+                                 _close_report(merged_prs=[_merge_row(pr, "b" * 40)])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["batches"][0]["status"] == "PASS"
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    unmerged = result["close"]["unmerged"]
+    assert unmerged[0]["pr_url"] == pr and "PR head moved" in unmerged[0]["reason"]
+
+
+def test_a_close_reply_is_reconciled_against_git_per_pr(tmp_path):
+    """The close step died after merging b-1's PR: git proves that one merged, b-2's stays unmerged."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
+                         other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
+                                      "brief": "b", "gates": [GATE], "lakeflow_pipelines": []})
+    pr = _unproven_pr(ws)
+    pr2 = _unproven_pr(ws, 2)
+    pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
+                                                             "evidence": ".migration/recon/v/result.json"}])
+    mc = _merge_commit(ws, _PR_HEADS[pr])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), pass2,
+                                   {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+                                    "findings": [], "changed_paths": []},
+                                   {"error": "died mid-merge",
+                                    "__run__": [["git", "-C", str(ws), "push", "-q", "origin",
+                                                 f"{mc}:refs/heads/migration/x"]]}])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr]
+    assert result["close"]["unmerged"] == [{"pr_url": pr2, "reason": result["close"]["unmerged"][0]["reason"]}]
+    assert "not recorded" in result["close"]["unmerged"][0]["reason"]
+    assert result["closed"] is False
+
+
+def test_a_merge_commit_whose_pr_side_parent_is_the_gated_head_is_proven(tmp_path):
+    """The close step's `gh pr view` record plus a merge commit on origin's base that names the gated
+    head as its PR-side parent proves the merge."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _merged(ws, pr)])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+    mc = result["close"]["merges"][0]["merge_commit_sha"]
+    parents = subprocess.run(["git", "-C", str(ws), "rev-list", "--parents", "-n1", mc],
+                             check=True, capture_output=True, text=True).stdout.split()
+    assert parents[2] == _PR_HEADS[pr]
+
+
+def test_a_merge_commit_on_the_base_proves_a_pr_the_close_step_never_recorded(tmp_path):
+    """The close step reported no merge for the PR, but a merge commit on origin's base names the gated
+    head as its PR-side parent: the merge is proven from git alone."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    mc = _merge_commit(ws, _PR_HEADS[pr])
+    close = _close_report(unmerged=[{"pr_url": pr, "reason": "merge failed to confirm"}])
+    close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
+                         f"{mc}:refs/heads/migration/x"]]
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+
+
+def test_a_merge_commit_whose_pr_side_parent_is_a_later_commit_is_not_proven(tmp_path):
+    """B appended after gating A and a merge commit naming B as its PR-side parent merged something the
+    wave never verified."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "b"], check=True)
+    head_b = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "-C", str(ws), "reset", "-q", "--hard", "HEAD~1"], check=True)
+    mc = _merge_commit(ws, _PR_HEADS[pr], second_parent=head_b)
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
+                         f"{mc}:refs/heads/migration/x"]]
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    unmerged = result["close"]["unmerged"]
+    assert unmerged[0]["pr_url"] == pr and "PR-side parent" in unmerged[0]["reason"]
+
+
+def test_a_squash_merge_is_proven_only_from_the_close_steps_record(tmp_path):
+    """A squash/rebase merge leaves a single-parent commit: git alone cannot tie it to the PR, so only
+    the close step's record (merged_head == the gated head) proves it."""
+    for i, merged in enumerate((True, False)):
+        ws, cwd = _workspace(tmp_path / f"sq{i}", auto_merge=True)
+        (ws / "x.sql").write_text("select 1")
+        subprocess.run(["git", "-C", str(ws), "add", "x.sql"], check=True)
+        subprocess.run(["git", "-C", str(ws), "commit", "-qm", "x"], check=True)
+        pr = _push_pr(ws)
+        _squash_merge_to_base(ws)
+        mc = subprocess.run(["git", "-C", str(ws), "rev-parse", "origin/migration/x"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+        close = (_close_report(merged_prs=[_merge_row(pr, mc)]) if merged else
+                 _close_report(unmerged=[{"pr_url": pr, "reason": "squash merged, record lost"}]))
+        proc, _ = _run(cwd, tmp_path / f"sq{i}", [_pass_report(pr), _verify_report(), close])
+        assert proc.returncode == 0, proc.stderr
+        result = _result(ws)
+        if merged:
+            assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+        else:
+            assert result["close"]["merged_prs"] == [] and result["closed"] is False
+            assert "not recorded" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_single_parent_record_must_carry_the_gated_heads_change(tmp_path):
+    """A record naming some other single-parent commit on the base as the squash of the gated head is
+    not proof: the commit's change against its parent must be the PR's change against its merge base."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    (ws / "x.sql").write_text("select 1")
+    subprocess.run(["git", "-C", str(ws), "add", "x.sql"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "x"], check=True)
+    pr = _push_pr(ws)
+    git = ["git", "-C", str(ws)]
+    tip = subprocess.run(git + ["rev-parse", "origin/migration/x"],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["checkout", "-q", tip], check=True)
+    (ws / "y.sql").write_text("select 2")
+    subprocess.run(git + ["add", "y.sql"], check=True)
+    subprocess.run(git + ["commit", "-qm", "unrelated"], check=True)
+    other = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", f"{other}:refs/heads/migration/x"], check=True)
+    subprocess.run(git + ["checkout", "-q", _PR_HEADS[pr]], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, other)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
+
+
+def _three_commit_pr(ws):
+    """A pushed PR of three commits (a.sql, b.sql, c.sql) still off the base; returns (url, A, head)."""
+    git = ["git", "-C", str(ws)]
+    for name, text in (("a.sql", "select 1"), ("b.sql", "select 2"), ("c.sql", "select 3")):
+        (ws / name).write_text(text)
+        subprocess.run(git + ["add", name], check=True)
+        subprocess.run(git + ["commit", "-qm", name], check=True)
+        if name == "a.sql":
+            sha_a = subprocess.run(git + ["rev-parse", "HEAD"],
+                                   check=True, capture_output=True, text=True).stdout.strip()
+    head = subprocess.run(git + ["rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:refs/pull/1/head", "HEAD:recon/wave-0"],
+                   check=True)
+    url = "https://github.com/acme/target/pull/1"
+    _PR_HEADS[url] = head
+    return url, sha_a, head
+
+
+def _advance_base(ws, commits):
+    """Move origin/migration/x past the PR's fork point with unrelated commits; returns the new tip."""
+    git = ["git", "-C", str(ws)]
+    subprocess.run(git + ["reset", "-q", "--hard", "origin/migration/x"], check=True)
+    for name, text in commits:
+        (ws / name).write_text(text)
+        subprocess.run(git + ["add", name], check=True)
+        subprocess.run(git + ["commit", "-qm", name], check=True)
+    tip = subprocess.run(git + ["rev-parse", "HEAD"],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    return tip
+
+
+def test_a_rebase_merge_of_several_commits_is_proven_by_the_rebased_range(tmp_path):
+    """A host's rebase merge lands the PR's commits one by one on the base and records the last as
+    mergeCommit: the N commits ending at the record must carry the gated head's whole change."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    git = ["git", "-C", str(ws)]
+    fork = subprocess.run(git + ["rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    pr, sha_a, head = _three_commit_pr(ws)
+    _advance_base(ws, [("u.sql", "select 0")])
+    subprocess.run(git + ["cherry-pick", f"{fork}..{head}"], check=True, capture_output=True)
+    mc = subprocess.run(git + ["rev-parse", "HEAD"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+
+
+def test_a_rebase_range_that_is_not_the_prs_change_is_not_proof(tmp_path):
+    """The last N first-parent commits ending at the record carry a different change than the gated
+    head's, so the record proves nothing."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    git = ["git", "-C", str(ws)]
+    pr, sha_a, head = _three_commit_pr(ws)
+    _advance_base(ws, [("u.sql", "select 0"), ("v.sql", "select -1")])
+    subprocess.run(git + ["cherry-pick", sha_a], check=True, capture_output=True)
+    (ws / "d.sql").write_text("select 9")
+    subprocess.run(git + ["add", "d.sql"], check=True)
+    subprocess.run(git + ["commit", "-qm", "d"], check=True)
+    mc = subprocess.run(git + ["rev-parse", "HEAD"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_multi_commit_squash_is_still_proven(tmp_path):
+    """A squash of a multi-commit PR is one commit carrying the head's whole tree; the single-parent
+    check compares its full change, not the head's last commit."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr, sha_a, head = _three_commit_pr(ws)
+    _squash_merge_to_base(ws)
+    mc = subprocess.run(["git", "-C", str(ws), "rev-parse", "origin/migration/x"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+
+
+def _commit_file(ws, name, data, msg=None):
+    git = ["git", "-C", str(ws)]
+    (ws / name).write_bytes(data if isinstance(data, bytes) else data.encode())
+    subprocess.run(git + ["add", name], check=True)
+    subprocess.run(git + ["commit", "-qm", msg or name], check=True)
+
+
+def _tip(ws):
+    return subprocess.run(["git", "-C", str(ws), "rev-parse", "origin/migration/x"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_a_squash_that_differs_only_by_whitespace_is_not_proof(tmp_path):
+    """patch-id ignores whitespace; the landed commit's tree must be the gated head's exact change
+    applied to what precedes it, so a squash adding one space is no merge of this PR."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    git = ["git", "-C", str(ws)]
+    _commit_file(ws, "q.sql", "SELECT a\n")
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    _commit_file(ws, "q.sql", "SELECT a, b\n")
+    pr = _push_pr(ws)
+    subprocess.run(git + ["reset", "-q", "--hard", "origin/migration/x"], check=True)
+    _commit_file(ws, "q.sql", "SELECT  a, b\n")
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, _tip(ws))])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_rebase_range_that_differs_only_by_whitespace_is_not_proof(tmp_path):
+    """The rebased range must carry the gated head's change exactly; a last commit landing 'select  3'
+    where the head has 'select 3' is not the PR's merge."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    git = ["git", "-C", str(ws)]
+    fork = subprocess.run(git + ["rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    pr, sha_a, head = _three_commit_pr(ws)
+    _advance_base(ws, [("u.sql", "select 0")])
+    subprocess.run(git + ["cherry-pick", f"{fork}..{head}~1"], check=True, capture_output=True)
+    _commit_file(ws, "c.sql", "select  3\n")
+    mc = subprocess.run(git + ["rev-parse", "HEAD"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_binary_change_is_proven_exactly(tmp_path):
+    """A squash landing the gated head's binary bytes proves; the same commit shape landing different
+    bytes does not."""
+    for i, landed in enumerate((b"\x00\x02", b"\x00\x03")):
+        ws, cwd = _workspace(tmp_path / f"bin{i}", auto_merge=True)
+        git = ["git", "-C", str(ws)]
+        _commit_file(ws, "m.bin", b"\x00\x01")
+        subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+        _commit_file(ws, "m.bin", b"\x00\x02")
+        pr = _push_pr(ws)
+        subprocess.run(git + ["reset", "-q", "--hard", "origin/migration/x"], check=True)
+        # a same-bytes/same-message commit would dedupe to the PR head's sha; the landed commit must differ
+        _commit_file(ws, "m.bin", landed, msg="squash merge")
+        subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+        close = _close_report(merged_prs=[_merge_row(pr, _tip(ws))])
+        proc, _ = _run(cwd, tmp_path / f"bin{i}", [_pass_report(pr), _verify_report(), close])
+        assert proc.returncode == 0, proc.stderr
+        result = _result(ws)
+        if landed == b"\x00\x02":
+            assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+        else:
+            assert result["close"]["merged_prs"] == [] and result["closed"] is False
+            assert "does not carry" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_record_whose_merged_head_is_not_the_gated_head_is_not_proven(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    close = _close_report(merged_prs=[_merge_row(pr, _merge_commit(ws, _PR_HEADS[pr]), head="e" * 40)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "is not the gated head" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_record_whose_merge_commit_is_not_on_the_base_is_not_proven(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    mc = _merge_commit(ws, _PR_HEADS[pr])  # never pushed to origin/migration/x
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(),
+                                 _close_report(merged_prs=[_merge_row(pr, mc)])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "is not on origin/migration/x" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_moved_pr_head_is_not_proven_even_with_a_record(tmp_path):
+    """Resume replays the PASS gated at head A; the PR head has since moved to B, so even a well-formed
+    merge record for A cannot prove the merge."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr),
+                                 {"wave_verdict": "FAIL", "unit_verdicts": {"b-1": "FAIL"},
+                                  "findings": [], "changed_paths": []}])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is False
+
+    subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "b"], check=True)
+    subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
+                    "HEAD:migration/x"], check=True)
+    mc = _merge_commit(ws, _PR_HEADS[pr])
+    pointer = ws / ".migration/waves/current.json"
+    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
+                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
+                         f"{mc}:refs/heads/migration/x"]]
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "PR head moved" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_proven_merges_are_recorded_before_the_result_and_reused_on_resume(tmp_path):
+    """The run writes .migration/waves/wave-0.merges.json with the proven {pr_url: merge_commit_sha}; a
+    resume whose close step dies with no record still proves the PR from that file."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
+                         other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
+                                      "brief": "b", "gates": [GATE], "lakeflow_pipelines": []})
+    pr = _unproven_pr(ws)
+    pr2 = _unproven_pr(ws, 2)
+    pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
+                                                             "evidence": ".migration/recon/v/result.json"}])
+    verify = {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+              "findings": [], "changed_paths": []}
+    mc = _merge_commit(ws, _PR_HEADS[pr])
+    close = _close_report(merged_prs=[_merge_row(pr, mc)],
+                          unmerged=[{"pr_url": pr2, "reason": "not mergeable"}])
+    close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
+                         f"{mc}:refs/heads/migration/x"]]
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), pass2, verify, close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is False
+    merges = ws / ".migration/waves/wave-0.merges.json"
+    assert json.loads(merges.read_text()) == {pr: mc}
+
+    pointer = ws / ".migration/waves/current.json"
+    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
+                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), pass2, verify, {"error": "boom"}])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr]
+    assert result["close"]["merges"] == [{"merge_commit_sha": mc, "pr_url": pr}]
+    assert result["close"]["unmerged"][0]["pr_url"] == pr2
+
+
+def test_validate_close_rejects_bare_url_rows_in_merged_prs(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(),
+                                 _close_report(merged_prs=[pr])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["closed"] is False
+    findings = " ".join(result["verify"]["findings"])
+    assert "wave close invalid" in findings and "merged_prs rows" in findings
 
 
 def test_the_playbooks_produce_the_pipeline_check_inputs_the_workflow_needs():
