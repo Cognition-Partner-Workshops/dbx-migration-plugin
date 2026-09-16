@@ -2052,7 +2052,7 @@ def main(argv: list[str] | None = None) -> int:
         a.source_family = source.get("family") if isinstance(source, dict) else None
         a.source_secret = source.get("secret") if isinstance(source, dict) else None
         a.param = [f"{k}={v}" for k, v in (source.get("params") or {}).items()] if isinstance(source, dict) else []
-        a.secret += manifest_secret_names(manifest)
+        a.secret = sorted({*a.secret, *manifest_secret_names(manifest)})
 
     params = None
     if a.param:
