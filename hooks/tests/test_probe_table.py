@@ -402,7 +402,7 @@ PROBES2 = [
     ("bundle deploy -t migration --var (approve)", "databricks bundle deploy -t migration --var=\"catalog=prod\"", "approve"),
     ("bundle deploy -t migration from other dir (approve)", "cd /tmp/otherbundle && databricks bundle deploy -t migration", "approve"),
     ("legacy client via alias def + use", "alias q=sqlcmd; q -S sqlserver-demo -Q 'DROP TABLE t'", "block"),
-    ("function wrapper", "f(){ sqlcmd \"$@\"; }; f -S sqlserver-demo -Q 'DROP TABLE t'", "approve"),
+    ("function wrapper", "f(){ sqlcmd \"$@\"; }; f -S sqlserver-demo -Q 'DROP TABLE t'", "block"),
     ("function wrapper, function keyword", "function f { sqlcmd \"$@\"; }\nf -S sqlserver-demo -Q 'DROP TABLE t'", "block"),
     ("legacy client renamed via cp", "cp $(which sqlcmd) ./x && ./x -S sqlserver-demo -Q 'DROP TABLE t'", "block"),
     ("legacy client via variable", "C=sqlcmd; $C -S sqlserver-demo -Q 'DROP TABLE t'", "block"),

@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Command guard for migration-safe shell and client operations.
-
-The public API evaluates commands, edits, and working-directory policy.
-"""
+"""PreToolUse write-scope guard: tokens -> connection positions -> resolved destinations -> writes -> verdict."""
 from __future__ import annotations
 
 import fnmatch
@@ -23,10 +20,10 @@ DEFAULT_FORBIDDEN_BUNDLE_TARGETS = ("prod", "production")
 PROBE_SENTINEL = "__dbx_guard_probe__"
 _PROBE = re.compile(re.escape(PROBE_SENTINEL) + r"\w*")
 
-_SEG = r"(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$-]*)"   # one identifier part, quoted or bare
+_SEG = r"(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$-]*)"
 _OBJ = r"TABLE|VIEW|FUNCTION|PROCEDURE|VOLUME|INDEX|TRIGGER|SEQUENCE"
 _METASTORE = (r"METASTORE|ANY\s+FILE|SHARE|RECIPIENT|PROVIDER|CONNECTION|EXTERNAL\s+LOCATION|STORAGE\s+CREDENTIAL|SERVICE\s+CREDENTIAL"
-              r"|CLEAN\s+ROOM")   # catalog-less securables
+              r"|CLEAN\s+ROOM")
 _WRITE = re.compile(
     rf"""(?:\b(?:
         INSERT(?:\s+(?:INTO|OVERWRITE))?(?:\s+TABLE)?(?=\s+[\w`"\[])
@@ -45,7 +42,7 @@ _WRITE = re.compile(
       | (?:^|(?<=[;\n]))\s*(?:EXEC(?:UTE)?|CALL)\s+(?!IMMEDIATE\b)(?=[\[@`\w])
     )\s*""", re.IGNORECASE | re.VERBOSE)
 _TARGET = re.compile(rf"(?:(CATALOG|SCHEMA|DATABASE)\s+)?(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({_SEG})((?:\.{_SEG})*)(?![\w`.])", re.IGNORECASE)
-_USE_CATALOG = r"\bUSE\s+(?:(?:{c})\s+){opt}(?!SCHEMA\b)(" + _SEG + ")"   # {c}: container words; {opt}: `?` where `USE x` switches too
+_USE_CATALOG = r"\bUSE\s+(?:(?:{c})\s+){opt}(?!SCHEMA\b)(" + _SEG + ")"
 _IDENTIFIER_LITERAL = re.compile(r"\bIDENTIFIER\s*\(\s*'([^']*)'\s*\)", re.IGNORECASE)
 _IDENTIFIER_DYNAMIC = re.compile(r"\bIDENTIFIER\s*\(", re.IGNORECASE)
 _EXEC_IMMEDIATE_DYNAMIC = re.compile(r"\bEXEC(?:UTE)?\s+IMMEDIATE\s+(?!')\S", re.IGNORECASE)
@@ -54,20 +51,22 @@ _PERMISSION = r"^\s*(?:GRANT|REVOKE|DENY)\b.*\bON\s+(?:{c})\b|^\s*(?:CREATE|ALTE
 
 _LEGACY_ONLY = ("bteq", "sqlplus", "sqlldr", "snowsql", "mload", "fastload", "fastexport", "tbuild", "tdload")
 _LOADERS = ("sqlldr", "mload", "fastload", "tbuild", "tdload")
-_WRITERS = ("pg_restore", "pgloader", "liquibase", "flyway", "sqitch")   # migration tools: every run writes
+_WRITERS = ("pg_restore", "pgloader", "liquibase", "flyway", "sqitch")
 _GENERIC = ("psql", "pgcli", "sqlcmd", "osql", "isql", "tsql", "mysql", "mariadb", "sqlite3", "bcp", "beeline", "trino", "presto",
             "mssql-cli", "go-sqlcmd", "usql", *_WRITERS)
+_CASE_SENSITIVE_DB = ("psql", "pgcli", "mysql", "mariadb", "usql")
 _DBX_CLIENTS = ("databricks", "dbx-recon", "spark-sql", "dbsqlcli")
+_SQL_CLIENTS = (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC)
 _IDENTITY_CLIENTS = ("databricks", "dbx-recon", "spark-sql")
 _PYTHON = re.compile(r"python[0-9.]*|spark-submit")
 _REST_CLIENTS = ("curl", "wget", "http", "https", "xh")
-_CLIENT_WORD = re.compile(r"(?<![\w-])(?:" + "|".join(map(re.escape, (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC))) + r")(?![\w-])")
+_CLIENT_WORD = re.compile(r"(?<![\w-])(?:" + "|".join(map(re.escape, _SQL_CLIENTS)) + r")(?![\w-])")
 _SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
 _DECLARERS = ("export", "declare", "typeset", "readonly", "local")
-_FIXERS = ("ruff", "black", "isort", "autopep8", "yapf", "autoflake")   # rewrite their operands in place
+_FIXERS = ("ruff", "black", "isort", "autopep8", "yapf", "autoflake")
 _DBT_RUNS = ("run", "build", "seed", "snapshot", "run-operation")
-_KNOWN = frozenset((*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC, *_REST_CLIENTS, *_SHELLS, *_DECLARERS, *_FIXERS, "dbt", "eval", "source",
-                    ".", "docker", "podman", "nerdctl", "kubectl", "perl", "ruby", "node", "java", "patch", "xargs", "for", "select"))
+_KNOWN = frozenset((*_SQL_CLIENTS, *_REST_CLIENTS, *_SHELLS, *_DECLARERS, *_FIXERS, "dbt", "eval", "source", ".", "docker", "podman",
+                    "nerdctl", "kubectl", "perl", "ruby", "node", "java", "patch", "xargs", "for", "select"))
 _PREFIX_VALUE_FLAGS = {
     "sudo": ("-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D", "-T"), "doas": ("-u", "-C"), "nohup": (),
     "env": ("-u", "--unset", "-C", "-S", "--split-string", "--chdir"), "nice": ("-n", "--adjustment"),
@@ -79,6 +78,7 @@ _PREFIX_VALUE_FLAGS = {
 }
 _RESERVED_PREFIXES = frozenset(("do", "then", "else", "elif", "if", "while", "until", "!", "time"))
 _ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
+_NAME = re.compile(r"[A-Za-z_]\w*")
 _ENV_DEFAULTS = {"HOME": "~", "TMPDIR": "/tmp"}
 _SHELL_VAR = re.compile(r"\$\{(\w+)\}|\$(\w+)")
 _READERS = frozenset(("cat", "less", "more", "head", "tail", "grep", "rg", "egrep", "fgrep", "zgrep", "diff", "cmp", "ls", "stat", "wc",
@@ -91,19 +91,23 @@ _INERT = _READERS | frozenset(("man", "info", "whereis", "whatis", "apt", "apt-g
                                "mamba", "git", "help", "hash", "alias", "unalias", "complete", "apropos", "tldr", "locate", "ldd",
                                "pg_dump", "pg_dumpall", "mysqldump"))
 _IDENTITY_VAR = re.compile(r"^(?:DATABRICKS_\w+|ARM_CLIENT_\w+|ARM_TENANT_ID|AZURE_\w+|GOOGLE_CREDENTIALS|GOOGLE_APPLICATION_CREDENTIALS)$")
-_CONFIG_HOME_VAR = ("HOME", "XDG_CONFIG_HOME")   # where ~/.databrickscfg is looked up
-_FUNCTION_DEF = re.compile(r"(?:^|[;&|\n{}()]\s*)(?:function\s+[\w.-]+|[\w.-]+\s*\(\s*\))")
+_CONFIG_HOME_VAR = ("HOME", "XDG_CONFIG_HOME")
+_FUNCTION_DEF = re.compile(r"(?:^|[;&|\n{}()]\s*)(?:function\s+[\w.-]+|[\w.-]+\s*\(\s*\))\s*\{?([^}]*)")
 _SQL_VALUE_FLAGS = ("-c", "-Q", "-q", "-e", "--query", "--sql", "--statement", "--execute", "--command")
 _SCRIPT_FLAGS = ("-f", "-i", "--file", "--input")
 _HOST_FLAGS = ("-S", "-h", "-H", "--host", "--server", "--hostname", "--url", "-url", "--dsn")
+_DB_FLAGS = ("-d", "-D", "--dbname", "--database")
 _HOST_ENV = ("PGHOST", "PGHOSTADDR", "PGSERVICE", "MYSQL_HOST", "SQLCMDSERVER")
-_DSN_POSITIONAL = ("isql", "usql", "pgloader")   # first positional is the DSN / URL, not a database
+_DSN_POSITIONAL = ("isql", "usql", "pgloader")
 _RECONNECT = re.compile(r"(?im)^[ \t]*(\\c(?:onnect)?|connect|\\r|:connect)[ \t]+([^;\n]*)")
 _RUN_FILE = re.compile(r"(?<!\S)@(\S+)|^\s*\.RUN\s+FILE\s*=?\s*(\S+)", re.IGNORECASE | re.MULTILINE)
 _DYNAMIC_SQL_EXECUTOR = (r"(?:\bEXEC(?:UTE)?\s+IMMEDIATE|\bsp_executesql|\bEXEC(?:UTE)?\s*\(|"
                          r"\.(?:execute|executemany|sql|run_query|execute_statement)\s*\(|\bstatement\s*=)")
 _DYNAMIC_SQL_CALLER = re.compile(_DYNAMIC_SQL_EXECUTOR + r"\s*N?\s*$", re.IGNORECASE)
 _PY_LITERAL = re.compile(_DYNAMIC_SQL_EXECUTOR + r"\s*[rbuf]*(['\"]{3}|['\"])(.*?)\1", re.IGNORECASE | re.DOTALL)
+_PY_CONNECT = re.compile(r"\b(connect|create_engine|Connection|connection|WorkspaceClient|SparkSession)\s*\(([^)]*)\)", re.IGNORECASE | re.DOTALL)
+_PY_ENV = re.compile(r"(?:environ\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]|getenv\s*\(\s*['\"]([A-Za-z_]\w*)['\"])", re.IGNORECASE)
+_PY_DSN = re.compile(r"""['"][^'"]*(?:://|jdbc:|Server=|host=|Database=|Initial Catalog=)[^'"]*['"]""", re.IGNORECASE)
 _PY_WRITE = re.compile(r"""['"](?:[wax]\+?|\+?>>?|\+<)['"]|\.write\w*\(|json\.dump\(|os\.(?:remove|unlink|rename|replace|chmod|rmdir|makedirs|mkdir)\(|"""
                        r"""shutil\.|\.(?:unlink|rename|rmdir|mkdir|touch|chmod)\(|\bunlink\b|\bwriteFile\w*\(""")
 _MIGRATION_PATH = re.compile(r"[^\s'\"()]*\.migration(?:/[^\s'\"()]*)?")
@@ -112,13 +116,9 @@ _DECISION_ID = re.compile(r"D-[A-Za-z0-9][\w.-]*")
 _WRITE_OBJECT = re.compile(
     r"(?is)^\s*(?:DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|UPDATE(?:\s+TOP\s*\([^)]*\)(?:\s+PERCENT)?|\s+STATISTICS|\s+(?:ONLY|LOW_PRIORITY|IGNORE))*|TRUNCATE(?:\s+TABLE)?|"
     r"(?:CREATE|ALTER|DROP)(?:\s+\w+)*?\s+INDEX(?:\s+IF\s+(?:NOT\s+)?EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
-    r"CREATE(?:\s+OR\s+REPLACE)?\s+(?:\w+\s+)*?"
-    r"(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
-    r"(?:ALTER|DROP)(?:\s+\w+)*?\s+"
-    r"(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+EXISTS)?|"
-    r"(?:GRANT|REVOKE)\b.*?\bON\s+ALL\s+\w+\s+IN\s+SCHEMA|"
-    r"GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)"
-)
+    r"CREATE(?:\s+OR\s+REPLACE)?\s+(?:\w+\s+)*?(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
+    r"(?:ALTER|DROP)(?:\s+\w+)*?\s+(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+EXISTS)?|"
+    r"(?:GRANT|REVOKE)\b.*?\bON\s+ALL\s+\w+\s+IN\s+SCHEMA|GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)")
 _WRITE_OBJECT_NEXT = re.compile(r"\s*,\s*([\w.$\"\[\]`]+)")
 _AUTHORIZED = "authorized: decision "
 _LEGACY_TAIL = " (legacy is read-only in every phase)"
@@ -129,12 +129,12 @@ class _Legacy(str):
 _RMTREE = re.compile(r"rmtree\(\s*(?:['\"]([^'\"]*)['\"]|(os\.getcwd\(\)|Path\.cwd\(\)|Path\(\s*(?:['\"]\.?['\"])?\s*\)))")
 _SQL_OUT_PATH = re.compile(r"(?i)(?:\bTO\s+|\\[ow]\s+|:out\s+|\bSPOOL\s+|\bFILE\s*=\s*)'?([^\s'\"]*\.migration(?:/[^\s'\"]*)?)")
 _SQL_OPAQUE = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)|'(?:[^']|'')*(?:'|\Z)", re.DOTALL)
+_SQL_COMMENT = re.compile(r"'(?:[^']|'')*'|\"[^\"]*\"|`[^`]*`|(--[^\n]*|/\*.*?(?:\*/|\Z))", re.DOTALL)
 _CLOUD_FAMILY = {
     "aws": (("AWS_",), re.compile(r"(?<![\w.-])(?:aws|boto3|botocore|s3fs|awscli)(?![\w-])|\bs3://")),
     "azure": (("AZURE_", "AZURITE_"), re.compile(r"(?<![\w.-])az(?![\w-])|azure[.-]storage|\babfss://")),
-    "gcp": (("GOOGLE_", "GCLOUD_", "GCS_", "CLOUDSDK_", "STORAGE_EMULATOR_HOST", "PUBSUB_EMULATOR_HOST",
-              "FIRESTORE_EMULATOR_HOST"),
-             re.compile(r"(?<![\w.-])(?:gcloud|gsutil)(?![\w-])|google(?:[.-]cloud[.-]storage|\.cloud\s+import\s+storage)|\bgs://")),
+    "gcp": (("GOOGLE_", "GCLOUD_", "GCS_", "CLOUDSDK_", "STORAGE_EMULATOR_HOST", "PUBSUB_EMULATOR_HOST", "FIRESTORE_EMULATOR_HOST"),
+            re.compile(r"(?<![\w.-])(?:gcloud|gsutil)(?![\w-])|google(?:[.-]cloud[.-]storage|\.cloud\s+import\s+storage)|\bgs://")),
 }
 
 _READ_HEAD = ("SELECT", "WITH", "SET", "USE", "DECLARE")
@@ -173,7 +173,7 @@ _DBX_READ = {
         "list-roles", "get-branch", "get-catalog", "get-cdf-config", "get-cdf-status", "get-database", "get-endpoint",
         "get-operation", "get-project", "get-role", "get-synced-table", "generate-database-credential"},
     "auth": {"describe", "profiles"}, "fs": {"ls", "cat", "head"}, "api": {"get"}, "bundle": {"validate", "summary"}}
-_TOKEN_PRINTERS = ("auth token", "auth env")   # print the bearer token into the session log
+_TOKEN_PRINTERS = ("auth token", "auth env")
 _LIFECYCLE = ("catalogs create", "catalogs update", "catalogs delete", "schemas delete", "grants update", "grants delete",
               "postgres create-project", "postgres delete-project", "postgres undelete-project", "postgres update-project")
 _CLI_CATALOG_ARG = {"schemas create": 1, "schemas update": 0, "tables delete": 0, "volumes create": 0, "volumes delete": 0,
@@ -190,9 +190,9 @@ _DBX_VALUE_FLAGS = {"-o", "--output", "--log-level", "--log-file", "--log-format
 _UC_PATH = re.compile(r"unity-catalog/(?:tables|schemas|volumes|functions)/([^/?\s]+)")
 _VOLUME_PATH = re.compile(r"^(?:dbfs:)?/Volumes/([^/]+)/")
 _DBX_HOST = re.compile(r"\$\{?DATABRICKS_HOST\b|\.(?:cloud\.databricks\.com|azuredatabricks\.net|gcp\.databricks\.com)\b", re.IGNORECASE)
-_DBX_API_PATH = re.compile(r"^\$[^/\s]*/api/\d")   # `$H/api/2.1/...`: an unresolved host in front of an API path
+_DBX_API_PATH = re.compile(r"^\$[^/\s]*/api/\d")
 _HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
-_CURL_VALUE_SHORT = "dFTHouAebcmwxEKUyYzCDQrtPO"   # short options that take a value (end a bundled cluster)
+_CURL_VALUE_SHORT = "dFTHouAebcmwxEKUyYzCDQrtPO"
 _OP = re.compile(r"[<>]\(|<<<|<<-|&>>|<<|<>|<&|>>|>&|>\||&>|\|&|\|\||&&|[;|&()<>\n]")
 _REDIRECT_OP = re.compile(r"\d*(?:<{1,3}-?|<>|<&|>{1,2}|>&|>\||&>{1,2})")
 _STDIN_OP = re.compile(r"0?<")
@@ -201,21 +201,15 @@ _FLAG_WORD = re.compile(r"-{1,2}[\w.-]+(?:=\S*)?")
 _UNREADABLE = (f"{{who}} fed script(s) {{files}} that the guard cannot read in full (missing, unreadable or over "
                f"{_MAX_SCRIPT_BYTES >> 20} MiB); inline the SQL or split it so it can be inspected")
 
-_IN, _ALL = ("inside", "self"), ("inside", "self", "above")   # the `.migration/` relations a write blocks on
+_IN, _ALL = ("inside", "self"), ("inside", "self", "above")
 _WRITE_LAST_OPERAND = ("cp", "rsync", "install", "ln", "scp")
 _RECURSIVE_HEADS = ("rm", "chmod", "chown", "chgrp", "rsync", "chattr", "setfacl")
 _DESTRUCTIVE = ("mv", "truncate", "dd", "shred", *_WRITE_LAST_OPERAND, *_RECURSIVE_HEADS, *_FIXERS)
 _IN_PLACE = {"sed": (re.compile(r"-[nEersuz]*i.*"), re.compile(r"--in-place.*")), "perl": (re.compile(r"-[a-zA-Z]*i.*"),),
              "awk": (re.compile(r"(?:--?)?inplace"),), "gawk": (re.compile(r"(?:--?)?inplace"),), "mawk": (re.compile(r"(?:--?)?inplace"),),
              "ruff": (re.compile(r"--fix|--fix-only|--unsafe-fixes|format"),)}
-
-def _mutates(base: str, argv: list[str]) -> bool:
-    inplace = any(rx.fullmatch(w) for w in argv[1:] for rx in _IN_PLACE.get(base, ())) and not any(w in ("--check", "--diff") for w in argv)
-    return inplace or base == "find" and any(w in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls") or w.startswith("-fprint")
-                                             for w in argv[1:])
-
 _IDENTITY_FILE = re.compile(r"(?:^|/)(?:\.databrickscfg|\.databricks(?:/.*)?|\.config/databricks(?:/.*)?)$")
-_GUARD_TREE = Path(os.path.realpath(__file__)).parent.parent   # the running plugin
+_GUARD_TREE = Path(os.path.realpath(__file__)).parent.parent
 _GUARD_FILE = Path(__file__).name
 _PATH_LITERAL = re.compile(r"['\"]((?:[~./$]|/)[^'\"\n]{0,300})['\"]")
 _GUARD_LITERAL = re.compile(r"['\"]((?:[^'\"\n/]*/)*(?:hooks(?:/[^'\"\n]*)?|hooks\.json|" + re.escape(_GUARD_FILE) + r"))['\"]")
@@ -231,6 +225,13 @@ _GIT_LIST_FLAGS = ("-l", "--list", "--contains", "--no-contains", "--merged", "-
 _GIT_SHOW_FLAGS = ("-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--show-current", "--column", "--no-column")
 _GIT_CONFIG_READS = ("-l", "--list", "--get", "--get-all", "--get-regexp", "--get-urlmatch")
 _GIT_DIR_VALUE = re.compile(r"(?:^|/)\.git/?$")
+_MAX_ALTS = 64
+_MAX_DEPTH = 4
+
+def _mutates(base: str, argv: list[str]) -> bool:
+    inplace = any(rx.fullmatch(w) for w in argv[1:] for rx in _IN_PLACE.get(base, ())) and not any(w in ("--check", "--diff") for w in argv)
+    return inplace or base == "find" and any(w in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls") or w.startswith("-fprint")
+                                             for w in argv[1:])
 
 @dataclass
 class GuardConfig:
@@ -257,14 +258,11 @@ class GuardConfig:
             if not isinstance(value, list):
                 raise ValueError(f"'{key}' must be a list")
             lists[key] = [str(x).strip() for x in value if str(x).strip()]
-        lists["lakebase_projects"] = [p.removeprefix("projects/") for p in lists["lakebase_projects"]]
-        mode = str(data.get("guard_mode", "block")).lower()
+        mode, run_mode, endpoints = str(data.get("guard_mode", "block")).lower(), data.get("run_mode", "live"), data.get("fixture_endpoints", [])
         if mode not in ("block", "warn"):
             raise ValueError("'guard_mode' must be 'block' or 'warn'")
-        run_mode = data.get("run_mode", "live")
-        if not isinstance(run_mode, str) or run_mode not in ("live", "fixture"):
+        if run_mode not in ("live", "fixture"):
             raise ValueError("'run_mode' must be 'live' or 'fixture'")
-        endpoints = data.get("fixture_endpoints", [])
         if not isinstance(endpoints, list) or not all(isinstance(v, str) for v in endpoints):
             raise ValueError("'fixture_endpoints' must be a list of strings")
         for endpoint in endpoints:
@@ -273,8 +271,8 @@ class GuardConfig:
         return cls(catalogs=[_norm(c) for c in catalogs], legacy_sources=lists["legacy_sources"], mode=mode,
                    forbidden_bundle_targets=tuple(t.lower() for t in lists["forbidden_bundle_targets"]),
                    target_hosts=lists["target_hosts"], bundle_targets=lists["bundle_targets"],
-                   lakebase_projects=lists["lakebase_projects"], lakebase_branches=lists["lakebase_branches"],
-                   run_mode=run_mode, fixture_endpoints=tuple(endpoints), path=path)
+                   lakebase_projects=[p.removeprefix("projects/") for p in lists["lakebase_projects"]],
+                   lakebase_branches=lists["lakebase_branches"], run_mode=run_mode, fixture_endpoints=tuple(endpoints), path=path)
 
 @dataclass
 class Verdict:
@@ -287,8 +285,7 @@ class Verdict:
         notes = [v for v in violations if v.startswith(_AUTHORIZED)]
         real = [v for v in violations if not v.startswith(_AUTHORIZED)]
         if not real:
-            reason = "dbx-migration-factory guard: " + "; ".join(notes) if notes else ""
-            return cls("approve", reason, violations)
+            return cls("approve", "dbx-migration-factory guard: " + "; ".join(notes) if notes else "", violations)
         reason = ("dbx-migration-factory guard: " + "; ".join(violations) + ". Fix the command or, if the target is legitimate, add "
                   "it to .migration/allowed_targets.json via a recorded decision (.migration/06_decisions.md); never work around the guard.")
         if cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
@@ -309,6 +306,7 @@ def load_config(start: Path) -> GuardConfig | None:
     return GuardConfig.from_dict(data, path)
 
 def _sql_view(text: str) -> str:
+    """Blank comments and string literals, keeping a literal that is the argument of a dynamic-SQL executor."""
     out, tail, pos = [], "", 0
     for m in _SQL_OPAQUE.finditer(text):
         out.append(text[pos:m.start()])
@@ -321,6 +319,9 @@ def _sql_view(text: str) -> str:
         pos = m.end()
     out.append(text[pos:])
     return "".join(out)
+
+def _strip_sql_comments(sql: str) -> str:
+    return _SQL_COMMENT.sub(lambda m: m.group() if m.group(1) is None else re.sub(r"[^\n]", " ", m.group(1)), sql)
 
 def _shell_tokens(cmd: str) -> tuple[list[str], list[str]]:
     toks: list[list[str]] = []   # [word, raw word]
@@ -361,7 +362,7 @@ def _shell_tokens(cmd: str) -> tuple[list[str], list[str]]:
                         break
                     tag, lines = toks[idx][0], cmd[i:].split("\n")
                     body = lines[:next((k for k, ln in enumerate(lines) if (ln.lstrip("\t") if tabs else ln).rstrip() == tag), len(lines))]
-                    i += sum(len(ln) + 1 for ln in lines[:len(body) + 1])   # the body and its delimiter line
+                    i += sum(len(ln) + 1 for ln in lines[:len(body) + 1])
                     text = "\n".join(body) + "\n"
                     toks[idx] = [text, f"'{text}'" if quoted else text]
                 pending.clear()
@@ -373,33 +374,32 @@ def _shell_tokens(cmd: str) -> tuple[list[str], list[str]]:
 
 @dataclass
 class _Seg:
-    """One simple command: its words (redirections and heredoc bodies included) and their raw forms, the producers feeding its
-    stdin, and -- once `_segments` has read it -- the program it runs, under which prefixes, and where."""
+    """One simple command: words and raw words (redirections and heredoc bodies included), what feeds its stdin, and what it runs."""
     words: list[str] = field(default_factory=list)
     raw: list[str] = field(default_factory=list)
     feeds: list[_Seg] = field(default_factory=list)
-    argv: list[str] = field(default_factory=list)      # program and arguments after assignments, prefixes, aliases, redirections
-    assigns: list[str] = field(default_factory=list)   # VAR=value prefixes (`env -u X` recorded as `X=`, `env -C d` as `PWD=d`)
-    stdin: list[str] = field(default_factory=list)     # literal text piped in (echo/printf words, cat heredocs)
-    opaque: str | None = None                          # a piped producer whose output the guard cannot read
-    scripts: list[str] = field(default_factory=list)   # files it executes
-    ctx: str = ""                                      # text of the prefixes / wrapper (`ssh host`) it runs under
-    remote: str = ""                                   # remote execution wrapper, when the command runs outside this workspace
-    env: dict[str, str] = field(default_factory=dict)  # environment inherited by this command after shell assignments and unset
-    multi: frozenset[str] = frozenset()
-    at: str | None = ""                                # directory it runs in ('' the workspace root, None unresolvable)
-    alts: list[str] = field(default_factory=list)      # the directories it may run in when `at` is None because of `x || cd d`
-    sub: int = 0                                       # how many `( )` subshells enclose it
-    after: str = ""                                    # the operator before it (`&&`, `||`, `;`, ...; '' for the first command)
-    bg: int = 0                                        # the `&`-terminated list it belongs to (runs in a subshell); 0 for none
-    lost: bool = False                                 # the possible directories overflowed _MAX_ALTS and were dropped
+    argv: list[str] = field(default_factory=list)
+    assigns: list[str] = field(default_factory=list)   # VAR=value prefixes (`env -u X` as `X=`, `env -C d` as `PWD=d`)
+    stdin: list[str] = field(default_factory=list)     # literal text piped in
+    opaque: str | None = None                          # a piped producer the guard cannot read
+    scripts: list[str] = field(default_factory=list)
+    ctx: str = ""                                      # prefixes / wrapper it runs under
+    remote: str = ""                                   # remote execution wrapper
+    env: dict[str, str] = field(default_factory=dict)
+    multi: frozenset[str] = frozenset()                # `for` variables: every value at once
+    at: str | None = ""                                # directory ('' the root, None unresolvable)
+    alts: list[str] = field(default_factory=list)      # candidates when `at` is None after `x || cd d`
+    sub: int = 0
+    after: str = ""
+    bg: int = 0
+    lost: bool = False
     unreadable: str = ""
 
     argv0 = property(lambda s: s.argv[0].rsplit("/", 1)[-1] if s.argv else "")
     heredocs = property(lambda s: [f for op, f in s.redirects() if op.endswith(("<<", "<<-"))])
     herestring = property(lambda s: next((f for op, f in s.redirects() if op.endswith("<<<")), None))
     text = property(lambda s: " ".join([*s.words, *s.stdin, s.herestring or "", s.ctx]))
-    args = property(lambda s: [w for i, w in enumerate(s.words)   # the words without redirections and their operands
+    args = property(lambda s: [w for i, w in enumerate(s.words)
                                if not (_REDIRECT_OP.fullmatch(w) or (i and _REDIRECT_OP.fullmatch(s.words[i - 1])))])
 
     def redirects(self) -> list[tuple[str, str]]:
@@ -408,23 +408,20 @@ class _Seg:
     def raw_of(self, word: str) -> str:
         return self.raw[self.words.index(word)] if word in self.words else word
 
-_MAX_ALTS = 64   # possible directories tracked through `x || cd d` chains before the guard gives up resolving them
-_MAX_DEPTH = 4
-
 def _commands(cmd: str) -> list[_Seg]:
     toks, raws = _shell_tokens(cmd)
     out: list[_Seg] = []
     groups: list[tuple[int, list[_Seg]]] = []   # (index of the first member, stdin the group inherits)
     feed: list[_Seg] = []                        # what the next command's stdin receives
     closed: list[_Seg] = []                      # members of the group just closed
-    lists: list[int] = [0]                       # index of the first member of the and/or list open at each group level
+    lists: list[int] = [0]                       # first member of the and/or list open at each group level
     cur, i, sub, after, bgs = None, 0, 0, "", 0
     while i < len(toks):
-        tok, n = toks[i], 1 + bool(_REDIRECT_OP.fullmatch(toks[i]))   # a redirection travels with its operand
+        tok, n = toks[i], 1 + bool(_REDIRECT_OP.fullmatch(toks[i]))
         if n == 1 and tok == "\n" and cur is None and feed and not closed:
             pass                                        # a line break after `|` continues the pipeline
         elif n == 1 and tok in _SEPARATORS and (tok not in ("{", "}") or cur is None):
-            if tok == "&":                              # `&` backgrounds the whole and/or list before it
+            if tok == "&":
                 bgs += 1
                 for c in out[lists[-1]:]:
                     c.bg = c.bg or bgs
@@ -461,24 +458,14 @@ def _expands(text: str, subst: bool = False) -> bool:
         bool(re.search(r"\$\(|(?<![\w])[<>]\(", live)) if subst else "$" in live)
 
 def _lakebase(verb: str, project: str | None, branch: str | None, cfg: GuardConfig) -> list[str]:
-    if project is None:
-        if branch == "production":
-            return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project ?; migration sessions "
-                    "write only per-batch branches (production is repointed at STOP E)"]
-        if branch is not None and cfg.lakebase_branches and not any(fnmatch.fnmatchcase(branch, pattern)
-                                                                    for pattern in cfg.lakebase_branches):
-            return [f"`databricks postgres {verb}` on branch {branch!r} of Lakebase project ?; allowed lakebase_branches "
-                    f"{cfg.lakebase_branches}"]
-        return []
-    if project not in cfg.lakebase_projects:
+    if project is not None and project not in cfg.lakebase_projects:
         return [f"`databricks postgres {verb}` targets Lakebase project {project!r} outside allowed lakebase_projects "
                 f"{cfg.lakebase_projects} (empty = every Lakebase write blocks)"]
     if branch == "production":
-        return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project {project}; migration sessions "
+        return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project {project or '?'}; migration sessions "
                 "write only per-batch branches (production is repointed at STOP E)"]
-    if branch is not None and cfg.lakebase_branches and not any(fnmatch.fnmatchcase(branch, pattern)
-                                                                for pattern in cfg.lakebase_branches):
-        return [f"`databricks postgres {verb}` on branch {branch!r} of Lakebase project {project}; allowed lakebase_branches "
+    if branch is not None and cfg.lakebase_branches and not any(fnmatch.fnmatchcase(branch, p) for p in cfg.lakebase_branches):
+        return [f"`databricks postgres {verb}` on branch {branch!r} of Lakebase project {project or '?'}; allowed lakebase_branches "
                 f"{cfg.lakebase_branches}"]
     return []
 
@@ -488,44 +475,21 @@ def _json(text: str):
     except (TypeError, json.JSONDecodeError):
         return None
 
+def _lines(value) -> str | None:
+    return value if isinstance(value, str) else "\n".join(value) if isinstance(value, list) and all(isinstance(x, str) for x in value) else None
+
 def _remote_payload(words: list[str]) -> str | None:
-    if words[:3] == ["aws", "ssm", "send-command"]:
-        if "--cli-input-json" in words:
-            return None
+    if words[:3] == ["aws", "ssm", "send-command"] and "--cli-input-json" not in words:
         params = next((words[i + 1] for i, w in enumerate(words[:-1]) if w == "--parameters"), None)
         if params is None or params.startswith(("file://", "@")):
             return None
         if params.startswith("commands="):
             value = params.split("=", 1)[1]
-            if value.startswith("["):
-                parsed = _json(value)
-                if parsed is None:
-                    return None
-                return "\n".join(parsed) if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed) else None
-            if value.startswith('"') and value.endswith('"'):
-                parsed = _json(value)
-                if parsed is None:
-                    return None
-                return parsed if isinstance(parsed, str) else None
-            return value
-        if params.startswith("{"):
-            parsed = _json(params)
-            if parsed is None:
-                return None
-            value = parsed.get("commands") if isinstance(parsed, dict) else None
-            return "\n".join(value) if isinstance(value, list) and all(isinstance(x, str) for x in value) else value if isinstance(value, str) else None
-        return None
-    if words[:4] == ["az", "vm", "run-command", "invoke"]:
-        if any(w.startswith("@") for w in words):
-            return None
-        scripts = []
-        try:
-            i = words.index("--scripts") + 1
-        except ValueError:
-            return None
-        while i < len(words) and not words[i].startswith("-"):
-            scripts.append(words[i])
-            i += 1
+            return _lines(_json(value)) if value[:1] in ('[', '"') else value
+        parsed = _json(params) if params.startswith("{") else None
+        return _lines(parsed.get("commands")) if isinstance(parsed, dict) else None
+    if words[:4] == ["az", "vm", "run-command", "invoke"] and not any(w.startswith("@") for w in words) and "--scripts" in words:
+        scripts = list(itertools.takewhile(lambda w: not w.startswith("-"), words[words.index("--scripts") + 1:]))
         return "\n".join(scripts) if scripts else None
     return None
 
@@ -543,9 +507,7 @@ def _program(words: list[str], assigns: list[str]) -> tuple[list[str], str]:
         w = "docker" if w in ("podman", "nerdctl") else w
         if words[i:i + 3] == ["aws", "ssm", "send-command"] or words[i:i + 4] == ["az", "vm", "run-command", "invoke"]:
             payload = _remote_payload(words[i:])
-            if payload is None:
-                return words, ""
-            return ["sh", "-c", payload], " ".join(words)
+            return (words, "") if payload is None else (["sh", "-c", payload], " ".join(words))
         if w == "docker":
             i += 1
             while i < len(words) and words[i].startswith("-"):
@@ -571,7 +533,6 @@ def _program(words: list[str], assigns: list[str]) -> tuple[list[str], str]:
 def _scripts_of(seg: _Seg, argv: list[str] | None = None) -> list[str]:
     def at_files(texts: list[str]) -> list[str]:
         return [(m.group(1) or m.group(2)).lstrip("@") for t in texts for m in _RUN_FILE.finditer(t)]
-
     files = []
     for p in seg.feeds:
         args, base = p.args, p.args[0].rsplit("/", 1)[-1] if p.args else ""
@@ -612,12 +573,13 @@ def _read_script(f: str, root: Path, at: str | None = "") -> str | None:
         return None
 
 def _shell_runs(seg: _Seg) -> tuple[str | None, str | None, bool]:
+    """(inline text a shell would run, script file it would run, whether the text is built at run time)."""
     argv, base = seg.argv, seg.argv0
     if base == "eval" and len(argv) > 1:
         return (None if (built := any(_expands(seg.raw_of(w)) for w in argv[1:])) else " ".join(argv[1:])), None, built
     if base in ("source", ".") and len(argv) > 1:
         return None, argv[1], False
-    if argv and (argv[0].startswith(("./", "../")) and base not in _KNOWN or base.endswith(".sh")):   # a script run by name
+    if argv and (argv[0].startswith(("./", "../")) and base not in _KNOWN or base.endswith(".sh")):
         return None, argv[0], False
     if base not in _SHELLS:
         return None, None, False
@@ -632,59 +594,50 @@ def _shell_runs(seg: _Seg) -> tuple[str | None, str | None, bool]:
 
 def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | None = None,
               at: str | None = "", multi: set[str] | None = None, root: Path | None = None) -> list[_Seg]:
+    """Every simple command the text runs (scripts it sources or runs included), with directory and environment resolved."""
     text = re.sub(r"\\\r?\n", " ", text)
     aliases: dict[str, list[str]] = {}
     env = dict(_ENV_DEFAULTS) if env is None else env
     multi = set() if multi is None else multi
     out: list[_Seg] = []
     dirs: list[str | None] = []
-    alts: list[str] = []                                      # the directories `at` may be when it is None after `x || cd d`
-    scopes: list[tuple[str | None, list[str], list[str | None], dict[str, str], set[str]]] = []   # state outside each open subshell
-    bg, saved = 0, (at, alts, dirs, dict(env), set(multi))     # the background list being read and the state before it
-    before: list[str | None] = [at]                           # where the shell was before the previous command
-    lost = False
+    alts: list[str] = []
+    scopes: list[tuple] = []                                   # state outside each open subshell
+    snapshot = lambda: (at, list(alts), list(dirs), dict(env), set(multi))  # noqa: E731
+    bg, saved, before, lost = 0, snapshot(), [at], False
+
     def restore(state):
-        nonlocal at, alts, dirs
+        nonlocal at, alts, dirs, before
         at, alts, dirs, saved_env, saved_multi = state
         env.clear(); env.update(saved_env)
         multi.clear(); multi.update(saved_multi)
+        before = [at] if at is not None else alts
     for seg in _commands(text):
         if seg.bg != bg:                                      # a `&` list runs in a subshell: what it changes ends with it
             if bg:
                 restore(saved)
-                before = [at] if at is not None else alts
-            bg, saved = seg.bg, (at, list(alts), list(dirs), dict(env), set(multi))
+            bg, saved = seg.bg, snapshot()
         while len(scopes) < seg.sub:
-            scopes.append((at, list(alts), list(dirs), dict(env), set(multi)))
+            scopes.append(snapshot())
         while len(scopes) > seg.sub:                          # `( ... ) || cd d`: the parent is where it was before the group
             restore(scopes.pop())
-            before = [at] if at is not None else alts
         seg.words = [w if not env or "$" not in w or "$" not in re.sub(r"\\.|'[^']*'?", "", r) else
                      _SHELL_VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group()), w) for w, r in zip(seg.words, seg.raw)]
         seg.argv, seg.ctx = _program(aliases.get(seg.args[0] if seg.args else "", seg.args[:1]) + seg.args[1:], seg.assigns)
         seg.ctx = " ".join(x for x in (ctx, seg.ctx) if x)
         wrapper = seg.ctx.split()[:1]
-        seg.remote = wrapper[0] if wrapper and (
-            wrapper[0] in ("ssh", "aws", "az") or
-            wrapper[0] in ("docker", "podman", "nerdctl", "kubectl") and
-            any(w in seg.ctx.split() for w in ("exec", "run"))
-        ) else ""
-        if not seg.remote and seg.argv[:3] == ["aws", "ssm", "send-command"] or not seg.remote and seg.argv[:4] == [
-                "az", "vm", "run-command", "invoke"]:
+        if wrapper and (wrapper[0] in ("ssh", "aws", "az") or wrapper[0] in ("docker", "podman", "nerdctl", "kubectl")
+                        and any(w in seg.ctx.split() for w in ("exec", "run"))):
+            seg.remote = wrapper[0]
+        elif seg.argv[:3] == ["aws", "ssm", "send-command"] or seg.argv[:4] == ["az", "vm", "run-command", "invoke"]:
             seg.remote = seg.argv0
-        assignments = (seg.assigns if not seg.argv else seg.argv[1:] if seg.argv0 in _DECLARERS else ())
-        for assignment in assignments:
-            if _ASSIGN.match(assignment):
-                name, value = assignment.split("=", 1)
-                if name not in multi:
-                    env[name] = value
-                else:
-                    env[name] = f"{env.get(name, '')} {value}".strip()
+        for a in (seg.assigns if not seg.argv else seg.argv[1:] if seg.argv0 in _DECLARERS else ()):
+            if _ASSIGN.match(a):
+                name, value = a.split("=", 1)
+                env[name] = value if name not in multi else f"{env.get(name, '')} {value}".strip()
         if seg.argv0 == "unset":
-            env.update((name, "") for name in seg.argv[1:]
-                       if re.fullmatch(r"[A-Za-z_]\w*", name) and name not in multi)
-        seg.env = dict(env)
-        seg.multi = frozenset(multi)
+            env.update((name, "") for name in seg.argv[1:] if _NAME.fullmatch(name) and name not in multi)
+        seg.env, seg.multi = dict(env), frozenset(multi)
         for p in seg.feeds:
             pargs, base = p.args, p.args[0].rsplit("/", 1)[-1] if p.args else ""
             if base not in ("cat", "echo", "printf", "tee") or _expands(" ".join(p.raw)):
@@ -694,30 +647,26 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
             elif base == "cat":
                 seg.stdin.extend(p.heredocs)
         seg.scripts = _scripts_of(seg, seg.argv + [w for op, f in seg.redirects() for w in (op, f)] if seg.ctx else None)
-        seg.at = next((_join(at, a[4:]) for a in reversed(seg.assigns) if a.startswith("PWD=")), at)   # `env -C dir`: this command alone
+        seg.at = next((_join(at, a[4:]) for a in reversed(seg.assigns) if a.startswith("PWD=")), at)   # `env -C dir`
         seg.alts, seg.lost = list(alts), lost
         now: list[str | None] = [at] if at is not None else alts
         if seg.argv0 in ("cd", "pushd"):
             args = [w for w in seg.argv[1:] if not (w.startswith("-") and len(w) > 1)]
             dirs += [at] if seg.argv0 == "pushd" else []
-            moved = now + [_join(p, args[0] if args else "~") for p in before] if seg.after == "||" else \
-                [_join(p, args[0] if args else "~") for p in now]
-            moved = list(dict.fromkeys(moved))
+            moved = list(dict.fromkeys((now if seg.after == "||" else []) + [_join(p, args[0] if args else "~") for p in (before if seg.after == "||" else now)]))
             at = moved[0] if len(moved) == 1 else None
             alts = [] if at is not None else [p for p in moved if p is not None]
-            if len(alts) > _MAX_ALTS:                         # too many to enumerate: unresolvable from here on
+            if len(alts) > _MAX_ALTS:
                 alts, lost = [], True
         elif seg.argv0 == "popd":
             at, alts = (dirs.pop() if dirs else None), []
         elif seg.argv0 == "alias":
             aliases.update((a.split("=", 1)[0], shlex.split(a.split("=", 1)[1])) for a in seg.argv[1:] if "=" in a)
+        elif seg.argv0 == "for" and len(seg.argv) >= 4 and seg.argv[2] == "in" and _NAME.fullmatch(seg.argv[1]):
+            env[seg.argv[1]] = " ".join(seg.argv[3:])
+            multi.add(seg.argv[1])
         before = now
         out.append(seg)
-        if seg.argv0 == "for" and len(seg.argv) >= 4 and seg.argv[2] == "in":
-            var, values = seg.argv[1], seg.argv[3:]
-            if re.fullmatch(r"[A-Za-z_]\w*", var) and values:
-                env[var] = " ".join(values)
-                multi.add(var)
         nested, file, _ = _shell_runs(seg)
         if nested is not None:
             out.extend(_segments(nested, seg.ctx, depth + 1, dict(env), seg.at, set(multi), root))
@@ -728,18 +677,16 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
                 seg.unreadable = file
             else:
                 shared = seg.argv0 in ("source", ".")
-                out.extend(_segments(body, seg.ctx, depth + 1, env if shared else dict(env),
-                                     seg.at, multi if shared else set(multi), root))
+                out.extend(_segments(body, seg.ctx, depth + 1, env if shared else dict(env), seg.at, multi if shared else set(multi), root))
     return out
 
+def _is_token(word: str, token: str) -> bool:
+    return bool(re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", word, re.IGNORECASE))
+
 def _mentions(seg: _Seg, cfg: GuardConfig) -> bool:
-    for word in seg.argv or seg.args:
-        if _CLIENT_WORD.search(word) or "--target-catalog" in word:
-            return True
-        if any(re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", word, re.IGNORECASE)
-               for token in cfg.legacy_sources):
-            return True
-    return False
+    """Whether the command names a client or a legacy source anywhere in its arguments (the coarse gate for opacity rules)."""
+    return any(_CLIENT_WORD.search(w) or "--target-catalog" in w or any(_is_token(w, t) for t in cfg.legacy_sources)
+               for w in (seg.argv or seg.args))
 
 def _flag_values(argv: list[str], flags: tuple[str, ...]) -> list[str]:
     return [argv[i + 1] if w in flags else w.split("=", 1)[1] for i, w in enumerate(argv[1:], 1)
@@ -766,166 +713,88 @@ def _non_reads(sql: str) -> list[str]:
 def _write_objects(statements: list[str]) -> list[list[str]]:
     objects = []
     for statement in statements:
-        match = _WRITE_OBJECT.match(statement)
-        names = [re.sub(r'["`\[\]]', "", match.group(1))] if match else []
+        match, names = _WRITE_OBJECT.match(statement), []
         while match:
+            names.append(re.sub(r'["`\[\]]', "", match.group(1)))
             match = _WRITE_OBJECT_NEXT.match(statement, match.end())
-            if match:
-                names.append(re.sub(r'["`\[\]]', "", match.group(1)))
         objects.append(names)
     return objects
 
 def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None, str | None]:
-    decision_id = next((a.split("=", 1)[1] for a in reversed(seg.assigns) if a.startswith("DBX_DECISION=")), None)
-    if not decision_id:
+    """(decision id, why it does not authorize these statements; None when it does)."""
+    did = next((a.split("=", 1)[1] for a in reversed(seg.assigns) if a.startswith("DBX_DECISION=")), None)
+    if not did:
         return None, "no `DBX_DECISION=D-<id>` prefix on the command"
-    if not _DECISION_ID.fullmatch(decision_id):
-        return decision_id, f"`{decision_id}` is not a row in .migration/06_decisions.md"
     try:
-        ledger = (root / ".migration" / "06_decisions.md").read_text(errors="replace")
+        ledger = (root / ".migration" / "06_decisions.md").read_text(errors="replace") if _DECISION_ID.fullmatch(did) else ""
     except OSError:
-        return decision_id, "cannot read .migration/06_decisions.md"
-    row = next((line for line in ledger.splitlines()
-                if (match := _DECISION_ROW.search(line)) and match.group(1).lower() == decision_id.lower()), None)
+        return did, "cannot read .migration/06_decisions.md"
+    row = next((ln for ln in ledger.splitlines() if (m := _DECISION_ROW.search(ln)) and m.group(1).lower() == did.lower()), None)
     if row is None:
-        return decision_id, f"`{decision_id}` is not a row in .migration/06_decisions.md"
+        return did, f"`{did}` is not a row in .migration/06_decisions.md"
     if "legacy_write_authorized" not in row.lower():
-        return decision_id, f"row `{decision_id}` does not contain `legacy_write_authorized`"
-    normalized_row = re.sub(r'["`\[\]]', "", row)
+        return did, f"row `{did}` does not contain `legacy_write_authorized`"
     objects = _write_objects(statements)
-    if len(objects) != len(statements) or any(not names for names in objects):
-        statement = next(statement for statement in statements if not _WRITE_OBJECT.match(statement))
-        return decision_id, f"cannot tell which object `{statement[:60]}` writes"
     for names, statement in zip(objects, statements):
+        if not names:
+            return did, f"cannot tell which object `{statement[:60]}` writes"
         for obj in names:
             if obj.startswith("$") or obj.endswith("$") or re.search(r"[$:&@]\{?\(", statement):
-                return decision_id, f"`{obj}` is a run-time substitution; the decision must name the literal object"
-    for names in objects:
-        for obj in names:
-            if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", normalized_row, re.IGNORECASE):
-                return decision_id, f"row `{decision_id}` does not name `{obj}`"
-    return decision_id, None
+                return did, f"`{obj}` is a run-time substitution; the decision must name the literal object"
+            if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", re.sub(r'["`\[\]]', "", row), re.IGNORECASE):
+                return did, f"row `{did}` does not name `{obj}`"
+    return did, None
 
-def _strip_sql_comments(sql: str) -> str:
-    out = list(sql)
-    quote = ""
-    i = 0
-    while i < len(sql):
-        if quote:
-            if sql[i] == quote:
-                if i + 1 < len(sql) and sql[i + 1] == quote and quote == "'":
-                    i += 2
-                    continue
-                quote = ""
-            i += 1
-            continue
-        if sql[i] in "'\"`":
-            quote = sql[i]
-            i += 1
-        elif sql.startswith("--", i):
-            end = sql.find("\n", i)
-            end = len(sql) if end < 0 else end
-            for j in range(i, end):
-                out[j] = " "
-            i = end
-        elif sql.startswith("/*", i):
-            end = sql.find("*/", i + 2)
-            end = len(sql) if end < 0 else end + 2
-            for j in range(i, end):
-                if sql[j] != "\n":
-                    out[j] = " "
-            i = end
-        else:
-            i += 1
-    return "".join(out)
+def _host(value: str) -> str:
+    value = re.sub(r"^(?:tcp|np|lpc):", "", value, flags=re.IGNORECASE)
+    return re.split(r"[,:\\]", re.sub(r"^\$\{?(\w+)\}?$", r"\1", value), 1)[0]
 
-def _conn(seg: _Seg, cfg: GuardConfig, sql: str) -> tuple[list[str], list[str], set[str], bool]:
-    argv = seg.argv
-    stripped = _strip_sql_comments(sql)
-    host_values = list(_flag_values(argv, _HOST_FLAGS))
-    host_values += [a.split("=", 1)[1] for a in seg.assigns if a.split("=", 1)[0] in _HOST_ENV]
-    host_values += [w for w in argv[1:2] if seg.argv0 in _DSN_POSITIONAL and not w.startswith("-")]
-    host_values += [
-        w for i, w in enumerate(argv[1:], 1)
-        if re.fullmatch(r"\$\{?\w+\}?", w) and (not argv[i - 1].startswith("-") or argv[i - 1] in _HOST_FLAGS)
-    ]
-    for match in _RECONNECT.finditer(stripped):
-        words = match.group(2).split()
-        candidate = words[:1] if match.group(1).lower() == ":connect" else words[1:2]
-        host_values += [value for value in candidate if not re.search(r"=|://", value)]
-    joined = " ".join(argv[1:] + list(seg.assigns))
-    host_values += re.findall(r"://(?:[^@/\s]*@)?([^:/?\s;]+)", joined + " " + stripped)
-    host_values += re.findall(r"(?i)\b(?:host|hostaddr|server|data source|addr)=([^;\s]+)", joined + " " + stripped)
-    host_values += re.findall(r"(?im)^\s*\.LOGON\s+([^/\s;]+)", stripped)
+def _conn(seg: _Seg, cfg: GuardConfig, sql: str) -> tuple[list[str], list[str], set[str], set[str], list[str]]:
+    """Connection positions of a SQL client: (legacy hits, hosts, secret names among the hosts, databases, unresolved values).
+    Hosts are lower-cased literals or case-preserved `$SECRET` names; databases keep their case for dialect-aware matching."""
+    argv, stripped = seg.argv, _strip_sql_comments(sql)
+    joined = " ".join([*argv[1:], *seg.assigns, stripped])
+    recon = [(v.lower(), a.split()) for v, a in _RECONNECT.findall(stripped)]
+    raw_hosts = [*_flag_values(argv, _HOST_FLAGS), *(a.split("=", 1)[1] for a in seg.assigns if a.split("=", 1)[0] in _HOST_ENV),
+                 *(w for w in argv[1:2] if seg.argv0 in _DSN_POSITIONAL and not w.startswith("-")),
+                 *(w for i, w in enumerate(argv[1:], 1) if re.fullmatch(r"\$\{?\w+\}?", w) and (not argv[i - 1].startswith("-") or argv[i - 1] in _HOST_FLAGS)),
+                 *(w for v, ws in recon for w in (ws[:1] if v == ":connect" else ws[1:2]) if not re.search(r"=|://", w)),
+                 *re.findall(r"://(?:[^@/\s]*@)?([^:/?\s;]+)", joined),
+                 *re.findall(r"(?i)\b(?:host|hostaddr|server|data source|addr)=([^;\s]+)", joined),
+                 *re.findall(r"(?im)^\s*\.LOGON\s+([^/\s;]+)", stripped)]
+    raw_dbs = [*(v for v in _flag_values(argv, _DB_FLAGS) if "=" not in v),
+               *(ws[0] for v, ws in recon if v != ":connect" and ws and not re.search(r"=|://", ws[0])),
+               *re.findall(r"(?i)(?<![-\w])(?:database|dbname|initial catalog)=([^;\s]+)", joined),
+               *re.findall(r"(?i)\bUSE\s+(?:\[?DATABASE\]?\s+)?([A-Za-z_][\w$.-]*)", stripped),
+               *re.findall(r"://[^/\s]+/([^/?\s;]+)", " ".join(argv[1:]))]
+    known = set(cfg.target_hosts) | set(cfg.legacy_sources)
+    secrets = {m.group(1) or m.group(2) for w in [*argv, *seg.assigns] for m in _SHELL_VAR.finditer(w)}
+    unresolved = [v for v in raw_hosts + raw_dbs if "`" in v or "$(" in v or any((m.group(1) or m.group(2)) not in known for m in _SHELL_VAR.finditer(v))]
+    hosts = [(_host(v) if _SHELL_VAR.fullmatch(v) else _host(v).lower()) for v in raw_hosts if v]
+    dbs = {v.strip("'\"") for v in raw_dbs if v.strip("'\"")}
+    exact = seg.argv0 in _CASE_SENSITIVE_DB
+    hits = [t for t in cfg.legacy_sources if t in secrets or any(h == t.lower() for h, v in zip(hosts, raw_hosts) if not _SHELL_VAR.fullmatch(v))
+            or any(d == t if exact else d.lower() == t.lower() for d in dbs)]
+    return hits, hosts, secrets & set(hosts), dbs, unresolved
 
-    def host_value(value: str) -> str:
-        value = re.sub(r"^(?:tcp|np|lpc):", "", value, flags=re.IGNORECASE)
-        value = re.sub(r"^\$\{?(\w+)\}?$", r"\1", value)
-        return re.split(r"[,:\\]", value, 1)[0].lower()
-
-    hosts = [host_value(value) for value in host_values if value]
-    literal_hosts = [host for value, host in zip(host_values, hosts)
-                     if not _SHELL_VAR.fullmatch(value)]
-    db_values = [value for value in _flag_values(argv, ("-d", "-D", "--dbname", "--database")) if "=" not in value]
-    db_values += [
-        words[0]
-        for verb, value in _RECONNECT.findall(stripped)
-        for words in [value.split()]
-        if verb.lower() != ":connect" and words and "=" not in words[0] and "://" not in words[0]
-    ]
-    db_values += re.findall(r"(?i)(?<![-\w])(?:database|dbname|initial catalog)=([^;\s]+)", joined + " " + stripped)
-    db_values += re.findall(r"(?i)\bUSE\s+(?:\[?DATABASE\]?\s+)?([A-Za-z_][\w$.-]*)", stripped)
-    db_values += re.findall(r"://[^/\s]+/([^/?\s;]+)", joined)
-    dbs = {value.strip("'\"") for value in db_values if value.strip("'\"")}
-
-    secret_names = {
-        match.group(1) or match.group(2)
-        for word in [*argv, *seg.assigns]
-        for match in [_SHELL_VAR.fullmatch(word.split("=", 1)[-1])]
-        if match
-    }
-    secret_names.update(
-        match.group(1) or match.group(2)
-        for word in argv
-        for match in [_SHELL_VAR.search(word)]
-        if match
-    )
-    secret_names.update(word for word in argv if "jdbc:" in word.lower() or "://" in word)
-    known_names = set(cfg.target_hosts) | set(cfg.legacy_sources)
-    def unknown(value: str) -> bool:
-        match = _SHELL_VAR.search(value)
-        return bool(match and (match.group(1) or match.group(2)) not in known_names)
-    unresolved = any(
-        unknown(value)
-        or "`" in value or "$(" in value
-        for value in [*host_values, *db_values]
-    )
-
-    hits = []
-    for token in cfg.legacy_sources:
-        if token in secret_names:
-            hits.append(token)
-        if any(token.lower() == host.lower() for host in literal_hosts):
-            hits.append(token)
-        if any((token == db if seg.argv0 in ("psql", "pgcli", "mysql", "mariadb", "usql") else
-                token.lower() == db.lower()) for db in dbs):
-            hits.append(token)
-    return list(dict.fromkeys(hits)), hosts, dbs, unresolved
-
-def _check_unreadable(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
-    violations = []
+def _check_unreadable(segs: list[_Seg], cfg: GuardConfig, text: str) -> list[str]:
+    """Constructs that only produce the statement at run time, plus scripts the guard could not read."""
+    violations, defined = [], {s.argv0 for s in segs if len(s.argv) == 1}
     for index, s in enumerate(segs):
         ctx = _mentions(s, cfg)
         base, _, _, built = s.argv0, *_shell_runs(s)
+        if s.unreadable == "depth":
+            violations.append(f"scripts nested more than {_MAX_DEPTH} deep; the guard cannot clear what it does not read")
+        elif s.unreadable:
+            violations.append(f"shell script(s) {[s.unreadable]} the command would run cannot be read in full (missing, unreadable or over "
+                              f"{_MAX_SCRIPT_BYTES >> 20} MiB); the guard cannot clear what it cannot read")
         if built:
             violations.append(f"`{base}{' -c' if base in _SHELLS else ''}` on a runtime-built string; the guard cannot read what it would run")
-        if base in ("cp", "ln", "mv", "install"):
-            raw = " ".join(s.raw_of(word) for word in s.argv[1:])
-            match = _CLIENT_WORD.search(raw)
-            if not match and any("$" in word for word in s.raw):
-                match = _CLIENT_WORD.search(" ".join(word for later in segs[index + 1:] for word in later.argv))
-            if match:
-                violations.append(f"`{base}` copies or renames client `{match.group()}` under another name; run the client by its own name so "
+        if base in ("cp", "ln", "mv", "install"):   # `cp $(which sqlcmd) x`: `$(` splits into later segments
+            raw = " ".join(s.raw_of(w) for w in s.argv[1:])
+            later = " ".join(w for other in segs[index + 1:] for w in other.argv) if any("$" in w for w in s.raw) else ""
+            if m := _CLIENT_WORD.search(raw) or _CLIENT_WORD.search(later):
+                violations.append(f"`{base}` copies or renames client `{m.group()}` under another name; run the client by its own name so "
                                   "the guard can read the call")
         if base in _SHELLS:
             if s.opaque:
@@ -941,8 +810,8 @@ def _check_unreadable(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
                               "run (same class as `eval`)")
         elif s.argv and base not in _KNOWN and not _PYTHON.fullmatch(base) and (
                 base not in _INERT or base == "find" and any(w.startswith(("-exec", "-ok")) for w in s.argv)) \
-                and (wrapped := next((m.group() for m in _CLIENT_WORD.finditer(" ".join(s.argv[1:]))), None)):
-            violations.append(f"unrecognised wrapper `{base}` in front of client `{wrapped[0]}`; the guard has no rule for `{base}`, so "
+                and (wrapped := _CLIENT_WORD.search(" ".join(s.argv[1:]))):
+            violations.append(f"unrecognised wrapper `{base}` in front of client `{wrapped.group()}`; the guard has no rule for `{base}`, so "
                               "it cannot tell how or where the client would run (run the client directly)")
         for i, (r, w, prev) in enumerate(zip(s.raw, s.words, ["", *s.words])):   # an expansion inside what is (or looks like) SQL
             if (prev in _SQL_VALUE_FLAGS or w.split("=", 1)[0] in _SQL_VALUE_FLAGS or
@@ -953,27 +822,25 @@ def _check_unreadable(segs: list[_Seg], cfg: GuardConfig) -> list[str]:
                 break
         if any(re.fullmatch(r"\d*<<-?", w) and _expands(s.raw[i + 1]) for i, w in enumerate(s.words[:-1])):
             violations.append("unquoted heredoc expands `$`/backticks in its body; quote the delimiter (<<'EOF') or inline the values")
-        defined = {later.argv0 for later in segs if len(later.argv) == 1}
-        if ctx and base not in _KNOWN and base not in _INERT and base not in defined and not _PYTHON.fullmatch(base):
-            hits, _, _, _ = _conn(s, cfg, "")
-            if hits:
-                violations.append(f"unrecognised command `{base}` names legacy connection {hits}; the guard cannot verify its operation")
+        if base not in _KNOWN and base not in _INERT and base not in defined and not _PYTHON.fullmatch(base) and (hits := _conn(s, cfg, "")[0]):
+            violations.append(f"unrecognised command `{base}` names legacy connection {hits}; the guard cannot verify its operation")
+    if any(_CLIENT_WORD.search(m.group(1)) for m in _FUNCTION_DEF.finditer(re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', " ", text))):
+        violations.append("shell function wrapping a SQL client; the guard cannot follow what a call of it would run (same class as `eval`)")
     return violations
 
 def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
+    """A legacy-only client or a legacy connection runs read shapes only; elsewhere a write needs every host in target_hosts and an
+    allowlisted catalog / database."""
     base, tail = seg.argv0, _LEGACY_TAIL
-    if seg.remote:
-        return []
     if base in _LOADERS:
         return [_Legacy(f"`{base}` is a loader: nothing but reads ever runs against a legacy source" + tail)]
     sql, unreadable = _sql_text(seg, root, [seg.argv[1]] if base == "bcp" and len(seg.argv) > 2 and "queryout" in seg.argv[2:4] else [])
-    hits, hosts, dbs, unresolved = _conn(seg, cfg, sql)
-    legacy = base in _LEGACY_ONLY
-    non_reads = _non_reads(sql)
+    hits, hosts, secrets, dbs, unresolved = _conn(seg, cfg, sql)
+    legacy, non_reads, loading = base in _LEGACY_ONLY, _non_reads(sql), base == "bcp" and "in" in seg.argv[1:4]
     bad = [b.split("\n", 1)[0][:80] for b in [
         *([f"stdin from `{seg.opaque}`, a program or expansion the guard cannot read"] if seg.opaque else []),
         *([f"{base} (a migration tool: every run writes its target)"] if base in _WRITERS else []),
-        *(["bcp ... in (loader)"] if base == "bcp" and "in" in seg.argv[1:4] else []), *non_reads]]
+        *(["bcp ... in (loader)"] if loading else []), *non_reads]]
     violations = [_Legacy(_UNREADABLE.format(who="legacy client", files=unreadable) + tail)] if unreadable and (legacy or hits) else []
     if unreadable and not violations:
         bad.insert(0, f"script(s) {unreadable} the guard cannot read")
@@ -982,8 +849,7 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     if legacy or hits:
         violation = (f"non-read statement through a legacy-only client `{base}`" if legacy
                      else f"non-read statement against legacy source {hits}") + f": `{bad[0]}`"
-        plain = non_reads and not unreadable and not seg.opaque and base not in _WRITERS and not (
-            base == "bcp" and "in" in seg.argv[1:4])
+        plain = non_reads and not unreadable and not seg.opaque and base not in _WRITERS and not loading
         did, missing = _decision(seg, non_reads, root) if plain else (None, "the statement is not a readable SQL write")
         if missing is None:
             objects = [obj for names in _write_objects(non_reads) for obj in names]
@@ -991,31 +857,23 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                               "(legacy_write_authorized row in .migration/06_decisions.md)")
         else:
             violations.append(_Legacy(f"{violation}; a recorded decision would allow it, but {missing}{tail}"))
-    elif unresolved and bad:
-        violations.append(f"non-read statement through `{base}` to a connection built at run time (`{bad[0]}`); spell the host and database "
-                          f"out so the guard can resolve them: `{bad[0]}` (`target_hosts` cannot resolve it)")
-    elif not hosts or not all(
-        (host in cfg.target_hosts if host in {
-            match.group(1) or match.group(2)
-            for word in [*seg.argv, *seg.assigns]
-            for match in [_SHELL_VAR.search(word)]
-            if match
-        } else any(host.lower() == target.lower() for target in cfg.target_hosts))
-        for host in hosts
-    ):
+    elif unresolved:
+        violations.append(f"non-read statement through `{base}` to a connection built at run time ({sorted(set(unresolved))[:4]} is not a "
+                          f"literal and not a name in target_hosts / legacy_sources): `{bad[0]}`; spell the host and database out so the guard "
+                          "can resolve them")
+    elif not hosts or not all(h in cfg.target_hosts if h in secrets else h in {t.lower() for t in cfg.target_hosts} for h in hosts):
         violations.append(f"non-read statement through `{base}` to a host that is not a literal in target_hosts {cfg.target_hosts} "
                           f"(seen: {sorted(set(hosts))[:6]}; every host must be listed, an empty list blocks every write): `{bad[0]}`")
     else:
-        explicit_dbs = [value for value in _flag_values(seg.argv, ("-d", "-D", "--dbname", "--database"))
-                        if "=" not in value]
-        use_dbs = set(re.findall(r"(?i)\bUSE\s+(?:\[?DATABASE\]?\s+)?([A-Za-z_][\w$.-]*)", _strip_sql_comments(sql)))
-        extra_dbs = dbs - set(explicit_dbs) - use_dbs
-        default_value = explicit_dbs[0] if explicit_dbs and not extra_dbs else next(iter(dbs)) if len(dbs) == 1 else None
-        default = _norm(default_value) if default_value else None
-        violations += _catalog_violations(sql, cfg, default, f"`{base}` client")
+        flagged = [v for v in _flag_values(seg.argv, _DB_FLAGS) if "=" not in v]
+        used = set(re.findall(r"(?i)\bUSE\s+(?:\[?DATABASE\]?\s+)?([A-Za-z_][\w$.-]*)", _strip_sql_comments(sql)))
+        default = flagged[0] if flagged and not dbs - set(flagged) - used else next(iter(dbs)) if len(dbs) == 1 else None
+        violations += _catalog_violations(sql, cfg, _norm(default) if default else None, f"`{base}` client")
     return violations
 
 def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, who: str) -> list[str]:
+    """Writes whose catalog (three-part name, `USE CATALOG`, or `default`) is outside the allowlist; `who` '' checks only explicit
+    catalogs, a Databricks client also blocks catalog grants, any other client blocks every grant and container change."""
     allowed, in_dbx = set(cfg.catalogs), who in ("Databricks client", "Databricks SQL client")
     cats = ("CATALOG", "DATABASE") if who and not in_dbx else ("CATALOG",)
     use = re.compile(_USE_CATALOG.format(c="|".join(cats), opt="?" * (len(cats) > 1)), re.IGNORECASE)
@@ -1031,13 +889,12 @@ def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, who: st
         kind, parts = ((t.group(1) or "").upper(), 1 + t.group(3).count(".")) if t else ("", 0)
         cat = _norm(t.group(2)) if t and (kind in cats or (kind and parts >= 2) or parts >= 3) else None
         head = stmt.strip().split("\n", 1)[0][:80]
+        grant = re.match(r"^\s*(?:GRANT|REVOKE|DENY)\b", stmt, re.IGNORECASE)
         if _IDENTIFIER_DYNAMIC.search(stmt):
             violations.append(f"IDENTIFIER(<non-literal>) names the target of a write at run time: `{head}`")
-        elif (who == "Databricks client" and re.match(r"^\s*(?:GRANT|REVOKE|DENY)\b.*\bON\s+CATALOG\b", stmt,
-                                                        re.IGNORECASE | re.DOTALL)) or (
+        elif (who == "Databricks client" and grant and re.search(r"\bON\s+CATALOG\b", stmt, re.IGNORECASE)) or (
                 who and who != "Databricks client" and (
-                (who != "Databricks SQL client" or not re.search(r"\bON\s+TABLE\b", stmt, re.IGNORECASE)) and
-                re.match(r"^\s*(?:GRANT|REVOKE|DENY)\b", stmt, re.IGNORECASE) or
+                grant and (who != "Databricks SQL client" or not re.search(r"\bON\s+TABLE\b", stmt, re.IGNORECASE)) or
                 re.match(_PERMISSION.format(c="|".join((*cats, _METASTORE))), stmt, re.IGNORECASE | re.DOTALL))):
             violations.append(f"catalog / metastore lifecycle or permission change `{head}`; the allowlist authorizes object writes "
                               "inside a catalog, never grants or the containers themselves (those happen at STOP E)")
@@ -1049,6 +906,17 @@ def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, who: st
             violations.append(f"write with unresolvable catalog (not three-part qualified, no USE CATALOG, no database default) "
                               f"through a {who}: `{head}`")
     return violations
+
+def _strings(value, key: str = ""):
+    """(lower-cased key, string) pairs of a JSON document."""
+    if isinstance(value, str):
+        yield key, value
+    elif isinstance(value, dict):
+        for k, child in value.items():
+            yield from _strings(child, str(k).lower())
+    elif isinstance(value, list):
+        for child in value:
+            yield from _strings(child, key)
 
 def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     argv, base = seg.argv[1:], seg.argv0
@@ -1069,10 +937,9 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         return [f"`{kind}` target {t!r} {bad}; allowed bundle_targets {cfg.bundle_targets} (empty = every deploy blocks)"] if bad else []
     if (group, verb) == ("sql", "execute") or path[:4] == ["experimental", "aitools", "tools", "query"] or (
             not path and _flag_values(seg.argv, _SQL_VALUE_FLAGS)):
-        sql, unreadable = _sql_text(seg, root, [w for w in path[4 if group == "experimental" else 2:] if w != "--"])   # positionals
+        sql, unreadable = _sql_text(seg, root, [w for w in path[4 if group == "experimental" else 2:] if w != "--"])
         return ([_UNREADABLE.format(who="Databricks client", files=unreadable)] if unreadable else []) + _catalog_violations(
-            sql, cfg, next(map(_norm, _flag_values(seg.argv, ("--catalog",))), None),
-            "Databricks SQL client" if group == "sql" else "Databricks client")
+            sql, cfg, next(map(_norm, _flag_values(seg.argv, ("--catalog",))), None), "Databricks SQL client" if group == "sql" else "Databricks client")
     if group == "api" and verb != "get":
         if (m := _UC_PATH.search(" ".join(args))) and _norm(m.group(1).split(".")[0]) in cfg.catalogs:
             return []
@@ -1092,40 +959,19 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         if not name or _norm(name.split(".")[0]) not in cfg.catalogs:
             return [f"CLI mutation of securable {name!r} outside allowlist {sorted(cfg.catalogs)}"]
         if group == "postgres":
-            json_raw = [seg.raw_of(argv[n + 1]) for n, w in enumerate(argv[:-1]) if w == "--json"]
-            json_vals = [argv[n + 1] for n, w in enumerate(argv[:-1]) if w == "--json"]
-            json_raw += [seg.raw_of(w) for w in argv if w.startswith("--json=")]
-            json_vals += [w.removeprefix("--json=") for w in argv if w.startswith("--json=")]
-            if _expands(" ".join(json_raw)) or any(value.startswith("@") for value in json_vals):
+            payloads = [argv[n + 1] for n, w in enumerate(argv[:-1]) if w == "--json"] + [w.removeprefix("--json=") for w in argv if w.startswith("--json=")]
+            if _expands(" ".join(map(seg.raw_of, payloads))) or any(v.startswith("@") for v in payloads):
                 return [f"`databricks postgres {verb}` JSON payload must be literal (fail closed): no expansion, no `@file`"]
-            def _strings(value):
-                if isinstance(value, str):
-                    yield "", value
-                elif isinstance(value, dict):
-                    for key, child in value.items():
-                        if isinstance(child, str):
-                            yield str(key).lower(), child
-                        else:
-                            yield from _strings(child)
-                elif isinstance(value, list):
-                    for child in value:
-                        yield from _strings(child)
-            for json_value in json_vals:
-                parsed = _json(json_value)
-                if parsed is None:
+            for payload in payloads:
+                if (parsed := _json(payload)) is None:
                     return [f"`databricks postgres {verb}` JSON payload is not parseable JSON (fail closed)"]
-                for key, value in _strings(parsed):
-                    if value.startswith("projects/"):
-                        if violation := _lakebase(verb, value.removeprefix("projects/").split("/")[0], None, cfg):
+                for k, value in _strings(parsed):
+                    ref = _LAKEBASE_REFERENCE.search(value)
+                    for project, branch in ((value.removeprefix("projects/").split("/")[0], None) if value.startswith("projects/") else (None, None),
+                                            ref.groups() if ref else (None, None), (value if "project" in k else None, None),
+                                            (None, value if "branch" in k and not k.startswith("source") else None)):
+                        if (project, branch) != (None, None) and (violation := _lakebase(verb, project, branch, cfg)):
                             return violation
-                    if (match := _LAKEBASE_REFERENCE.search(value)) and (
-                            violation := _lakebase(verb, *match.groups(), cfg)):
-                        return violation
-                    if "project" in key and (violation := _lakebase(verb, value, None, cfg)):
-                        return violation
-                    if "branch" in key and not key.startswith("source") and (
-                            violation := _lakebase(verb, None, value, cfg)):
-                        return violation
             for match in _LAKEBASE_REFERENCE.finditer(seg.text):
                 if violation := _lakebase(verb, *match.groups(), cfg):
                     return violation
@@ -1172,18 +1018,16 @@ def _check_rest(seg: _Seg) -> list[str]:
         f"REST {method}{' with a request body' if body else ''} to a Databricks workspace through `{seg.argv0}`; only GET without a body passes"]
 
 def _check_identity(segs: list[_Seg], cfg: GuardConfig | None = None) -> list[str]:
-    violations = []
-    tail = "; the session runs as the doctor-verified migration principal only"
-    trusted = {n.lower() for n in [*cfg.target_hosts, *cfg.legacy_sources] if re.fullmatch(r"[A-Za-z_]\w*", n)} if cfg else set()
+    violations, tail = [], "; the session runs as the doctor-verified migration principal only"
+    trusted = {n.lower() for n in [*cfg.target_hosts, *cfg.legacy_sources] if _NAME.fullmatch(n)} if cfg else set()
     for s in segs:
         client = s.argv0 in _IDENTITY_CLIENTS
-        persistent = s.argv0 in ("export", "unset", "declare", "typeset", "setenv") or not s.argv   # outlives the command
+        persistent = s.argv0 in ("export", "unset", "declare", "typeset", "setenv") or not s.argv
         names = [a.split("=", 1)[0] for a in s.assigns] + ([w.split("=", 1)[0] for w in s.argv[1:] if not w.startswith("-")] if persistent else [])
         for n in names:
             if n.lower() in trusted:
                 violations.append(f"`{n}` is a name the allowlist trusts (target_hosts / legacy_sources); "
-                                  f"{'unsetting' if s.argv0 == 'unset' else 'assigning'} it would make that name stand for a different "
-                                  "endpoint" + tail)
+                                  f"{'unsetting' if s.argv0 == 'unset' else 'assigning'} it would make that name stand for a different endpoint" + tail)
             elif _IDENTITY_VAR.match(n) and (client or persistent):
                 violations.append(f"identity swap: `{n}=` {'around `' + s.argv0 + '`' if client else 'changed for the session'}" + tail)
             elif n in _CONFIG_HOME_VAR and client:
@@ -1196,11 +1040,9 @@ def _check_identity(segs: list[_Seg], cfg: GuardConfig | None = None) -> list[st
 
 def _python_texts(seg: _Seg, root: Path) -> tuple[str, str | None]:
     argv = seg.argv
-    texts = [*_flag_values(argv, ("-c",)), *seg.heredocs]
-    unreadable = None
+    texts, unreadable = [*_flag_values(argv, ("-c",)), *seg.heredocs], None
     if "-m" not in argv and not texts and (script := next((w for w in argv[1:] if w.endswith(".py")), None)):
-        body = _read_script(script, root, seg.at)
-        if body is None:
+        if (body := _read_script(script, root, seg.at)) is None:
             unreadable = script
         else:
             texts.append(body)
@@ -1209,203 +1051,149 @@ def _python_texts(seg: _Seg, root: Path) -> tuple[str, str | None]:
 def _strip_python_comments(text: str) -> str:
     lines = text.splitlines(keepends=True)
     try:
-        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
-        for token in tokens:
-            if token.type == tokenize.COMMENT:
-                line, col = token.start
-                end_line, end_col = token.end
-                if line == end_line:
-                    lines[line - 1] = lines[line - 1][:col] + " " * (end_col - col) + lines[line - 1][end_col:]
-    except (IndentationError, tokenize.TokenError):
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                (line, col), (_, end) = tok.start, tok.end
+                lines[line - 1] = lines[line - 1][:col] + " " * (end - col) + lines[line - 1][end:]
+    except (IndentationError, tokenize.TokenError, SyntaxError):
         pass
     return "".join(lines)
 
 def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
+    """Literal SQL handed to an executor in a program, judged by the connection it runs on: legacy (secret name, host, DSN) blocks a
+    write, a run-time connection blocks a write, a Databricks or unknown connection is held to the catalog allowlist."""
     text, unreadable = _python_texts(seg, root)
     if unreadable and seg.argv0 == "spark-submit":
         return [f"spark-submit script {unreadable!r} cannot be read; the guard cannot clear a Spark job it cannot inspect"]
     text = _strip_python_comments(text)
-    calls = list(re.finditer(r"\b(connect|create_engine|Connection|connection|WorkspaceClient|SparkSession)\s*\(([^)]*)\)",
-                             text, re.IGNORECASE | re.DOTALL))
-    env_refs = list(re.finditer(r"(?:environ\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]|getenv\s*\(\s*['\"]([A-Za-z_]\w*)['\"])",
-                                text, re.IGNORECASE))
+    calls, env_names = list(_PY_CONNECT.finditer(text)), [m.group(1) or m.group(2) for m in _PY_ENV.finditer(text)]
+    conn = _PY_ENV.sub(" ", " ".join([*(m.group() for m in calls), *(m.group() for m in _PY_DSN.finditer(text))]))
+    argv_words = [_host(w) for w in seg.argv[1:] if not w.startswith("-")]
+    hits = [t for t in cfg.legacy_sources if t in env_names or _is_token(conn, t) or any(w.lower() == t.lower() for w in argv_words)]
+    known = set(cfg.target_hosts) | set(cfg.legacy_sources)
+    unresolved = any(n not in known for n in env_names) or any(
+        m.group(1).lower() in ("connect", "create_engine") and not re.search(r"""['"]""", m.group(2)) and not _PY_ENV.search(m.group(2)) for m in calls)
+    databricks = bool(re.search(r"\b(?:databricks|spark)\b", text + " " + " ".join(seg.argv), re.IGNORECASE))
     literals = list(_PY_LITERAL.finditer(text))
-    conn_spans = [m.group(0) for m in calls]
-    conn_spans += [m.group(0) for m in re.finditer(
-        r"""['"][^'"]*(?:://|jdbc:|Server=|host=|Database=|Initial Catalog=)[^'"]*['"]""", text, re.IGNORECASE)]
-    conn_text = " ".join(conn_spans)
-    env_names = [m.group(1) or m.group(2) for m in env_refs]
-    conn_text_no_env = re.sub(r"(?:environ\s*\[\s*['\"][A-Za-z_]\w*['\"]\s*\]|getenv\s*\(\s*['\"][A-Za-z_]\w*['\"])",
-                              " ", conn_text, flags=re.IGNORECASE)
-    argv_text = re.sub(r"(?:environ\s*\[\s*['\"][A-Za-z_]\w*['\"]\s*\]|getenv\s*\(\s*['\"][A-Za-z_]\w*['\"])",
-                       " ", " ".join(seg.argv), flags=re.IGNORECASE)
-    hits = [token for token in cfg.legacy_sources
-            if token in env_names or any(re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", conn_text_no_env, re.IGNORECASE)
-                                         for _ in [0])
-            or re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", argv_text, re.IGNORECASE)]
-    known_connection_names = set(cfg.target_hosts) | set(cfg.legacy_sources)
-    unresolved = any(name not in known_connection_names for name in env_names)
-    unresolved = unresolved or any(
-        not re.search(r"""['"][^'"]*['"]""", m.group(2)) and not re.search(
-            r"(?:environ\s*\[|getenv\s*\()", m.group(2), re.IGNORECASE)
-        for m in calls if m.group(1).lower() in ("connect", "create_engine"))
-    databricks = bool(re.search(r"\b(?:databricks|spark)\b", text, re.IGNORECASE) or
-                      any(re.search(r"\b(?:databricks|spark)\b", word, re.IGNORECASE) for word in seg.argv))
-    has_connection = bool(calls or conn_spans or env_refs)
+    if not (calls or env_names or _PY_DSN.search(text)):
+        return [v for m in literals for v in _catalog_violations(m.group(2), cfg, None, "")]
     violations = []
     for m in literals:
-        if not has_connection:
-            continue
         if bad := _non_reads(m.group(2)):
-            if unresolved:
-                violations.append(f"non-read statement in Python uses a connection built at run time; spell the connection out so the guard "
-                                  f"can resolve it: `{bad[0][:80]}`")
+            if hits:
+                violations.append(_Legacy(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}`" + _LEGACY_TAIL))
+            elif unresolved:
+                violations.append(f"non-read statement in a program on a connection built at run time: `{bad[0][:80]}`; spell the connection "
+                                  "out (a literal host or a secret name in target_hosts) so the guard can resolve it")
             elif databricks:
                 violations += _catalog_violations(m.group(2), cfg, None, "Databricks client")
-            elif hits:
-                violations.append(_Legacy(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}` "
-                                          + _LEGACY_TAIL))
+            else:
+                hosts = [h.lower() for h in re.findall(r"(?i)(?:host|server|data source)\s*=\s*['\"]?([^'\";,\s)]+)|://(?:[^@/\s]*@)?([^:/?\s;'\"]+)", conn) for h in h if h]
+                if not hosts or any(h not in {t.lower() for t in cfg.target_hosts} for h in hosts):
+                    violations.append(f"non-read statement in a program to host(s) {sorted(set(hosts))} not in target_hosts {cfg.target_hosts}: "
+                                      f"`{bad[0][:80]}`")
+                else:
+                    violations += _catalog_violations(m.group(2), cfg, None, "program")
     if not literals and unresolved and _non_reads(text):
         violations.append("Python connection is built at run time; the guard cannot resolve a non-read statement")
     return violations
 
 def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
-    if cfg.run_mode != "fixture" or not cfg.fixture_endpoints or seg.argv0 in _INERT:
+    if cfg.run_mode != "fixture" or not cfg.fixture_endpoints or seg.argv0 in _INERT or (
+            seg.argv0 in (*_SHELLS, "eval") and _shell_runs(seg)[0] is not None):
         return []
-    if seg.argv0 in _SHELLS or seg.argv0 == "eval":
-        text, _, _ = _shell_runs(seg)
-        if text is not None:
-            return []
-    text = seg.text
-    if _PYTHON.fullmatch(seg.argv0):
-        pytext, _ = _python_texts(seg, root)
-        text += "\n" + pytext
+    text = seg.text + ("\n" + _python_texts(seg, root)[0] if _PYTHON.fullmatch(seg.argv0) else "")
+    local: dict[str, str] = {}
+    for a in seg.assigns:   # `X=$Y Y=1 cmd`: a prefix sees only the prefixes before it
+        if _ASSIGN.match(a):
+            name, value = a.split("=", 1)
+            local[name] = _SHELL_VAR.sub(lambda m: {**os.environ, **seg.env, **local}.get(m.group(1) or m.group(2), m.group()), value)
     violations = []
     for family, (prefixes, pattern) in _CLOUD_FAMILY.items():
-        declared = [name for name in cfg.fixture_endpoints if any(name.startswith(prefix) for prefix in prefixes)]
-        match = pattern.search(text)
-        command_values: dict[str, str] = {}
-        for assignment in seg.assigns:
-            if _ASSIGN.match(assignment):
-                name, value = assignment.split("=", 1)
-                lookup = {**os.environ, **seg.env, **command_values}
-                command_values[name] = _SHELL_VAR.sub(
-                    lambda m: lookup.get(m.group(1) or m.group(2), m.group()), value)
-        effective = {**os.environ, **seg.env, **command_values}
-        for name in declared:
-            if name in seg.env and name not in command_values:
-                lookup = {**os.environ, **{k: v for k, v in seg.env.items() if k != name}}
-                effective[name] = _SHELL_VAR.sub(
-                    lambda m: lookup.get(m.group(1) or m.group(2), m.group()), seg.env[name])
-        missing = [name for name in declared if not effective.get(name)]
-        unresolved = [name for name in declared if (name in command_values or name in seg.env)
-                      and effective.get(name) and ("$" in effective[name] or "`" in effective[name])]
-        if match and unresolved:
-            violations.append(f"run_mode is fixture and the command names {family} tooling (`{match.group()}`) but {unresolved} is set "
-                              "to an expansion the guard cannot resolve for this command; a fixture must fail closed rather than reach "
-                              f"the live {family} account (declared in fixture_endpoints)")
+        if not (match := pattern.search(text)):
             continue
-        if match and missing:
+        declared = [n for n in cfg.fixture_endpoints if n.startswith(prefixes)]
+        effective = {}
+        for name in declared:
+            lookup = {**os.environ, **{k: v for k, v in seg.env.items() if k != name}}
+            effective[name] = local[name] if name in local else _SHELL_VAR.sub(
+                lambda m: lookup.get(m.group(1) or m.group(2), m.group()), seg.env.get(name, os.environ.get(name, "")))
+        missing = [n for n in declared if not effective[n]]
+        unresolved = [n for n in declared if (n in local or n in seg.env) and effective[n] and ("$" in effective[n] or "`" in effective[n])]
+        if unresolved:
+            violations.append(f"run_mode is fixture and the command names {family} tooling (`{match.group()}`) but {unresolved} is set "
+                              f"to an expansion the guard cannot resolve for this command; a fixture must fail closed rather than reach "
+                              f"the live {family} account (declared in fixture_endpoints)")
+        elif missing:
             violations.append(f"run_mode is fixture and the command names {family} tooling (`{match.group()}`) but {missing} is unset "
                               f"for this command; a fixture must fail closed rather than reach the live {family} account "
                               "(declared in fixture_endpoints)")
     return violations
 
+def _writes_output(seg: _Seg, root: Path) -> bool:
+    """Whether a REST or SQL client run remotely writes a file where it runs."""
+    base, words = seg.argv0, seg.argv[1:]
+    if base in _REST_CLIENTS:
+        flags = ("-o", "--output", "-O", "--remote-name", "--remote-name-all", "--output-document", "-D", "--dump-header", "-c", "--cookie-jar")
+        flags += () if base == "curl" else ("-d", "--download")
+        output = bool(_flag_values(seg.argv, flags)) or any(w in flags for w in words)
+        if base == "curl":
+            output = output or any(next((c in "oODc" for c in m.group()[1:] if c in _CURL_VALUE_SHORT), False) for w in words if (m := re.match(r"^-[A-Za-z]+", w)))
+        elif base in ("http", "https", "xh"):
+            output = output or any(w.startswith(("-o", "-d")) and len(w) > 2 for w in words)
+        stdout = any(w in ("-O-", "--output-document=-") or w == "-O" and words[i + 1:i + 2] == ["-"] or re.fullmatch(r"-[A-Za-z]*O-", w)
+                     for i, w in enumerate(words))
+        return output or (base == "wget" and not stdout)
+    flags = ("-o", "--output", "-L", "--log-file", "--tee")
+    sql = _sql_text(seg, root)[0]
+    return (bool(_flag_values(seg.argv, flags)) or any(w in flags for w in words) or (base == "bcp" and any(w in ("out", "queryout") for w in words[:3]))
+            or bool(re.search(r"(?im)(?:^|[\s;])(?::out|SPOOL(?!\s+OFF\b)|\.EXPORT)\s+\S", sql)))
+
 def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
+    """A remote execution on a legacy host is read like a direct command; what would run only there (an interactive session, a
+    script or SQL file, a payload from a file, any file written) blocks."""
     violations = []
     for seg in segs:
         if not seg.remote:
             continue
-        inner = seg.argv[seg.argv.index("--") + 1:] if "--" in seg.argv else seg.argv
-        inner_seg = _Seg(argv=inner, words=inner, raw=inner)
-        outer_words = [word.rsplit("@", 1)[-1] for word in (*seg.ctx.split(), *seg.argv)]
-        hits = [token for token in cfg.legacy_sources
-                if any(word.lower() == token.lower() for word in outer_words)]
-        remote_sql = "\n".join((seg.text, *seg.heredocs))
-        inner_hits, _, _, _ = _conn(inner_seg, cfg, remote_sql)
-        hits = list(dict.fromkeys([*hits, *inner_hits]))
+        outer = [w.rsplit("@", 1)[-1].lower() for w in seg.ctx.split()]
+        if seg.remote == seg.argv0:                            # `aws ssm ... --instance-ids H` / `--targets ...,Values=H`: H is the target
+            outer += [p.lower() for w in seg.argv[1:] for p in re.split(r"[=,]", w)]
+        hits = list(dict.fromkeys([*(t for t in cfg.legacy_sources if t.lower() in outer), *_conn(seg, cfg, "\n".join(seg.heredocs))[0]]))
         if not hits:
-            if inner_seg.argv0 in (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC):
-                violations += _check_sql_client(inner_seg, cfg, root)
-            continue
-        if not seg.argv:
-            violations.append(f"`{seg.remote}` opens an interactive session on legacy source {hits}; the guard cannot read what would run")
-            continue
-        if seg.argv0 in ("aws", "az") and _remote_payload(seg.args) is None:
-            violations.append(f"remote `{seg.argv0}` payload cannot be read (file://, @file, --cli-input-json); the guard cannot clear a "
-                              "remote command it cannot read")
-            continue
-        file = _shell_runs(seg)[1]
-        if seg.scripts or file or (_PYTHON.fullmatch(seg.argv0) and any(w.endswith(".py") for w in seg.argv[1:])):
-            name = file or (seg.scripts[0] if seg.scripts else next(w for w in seg.argv[1:] if w.endswith(".py")))
-            violations.append(f"remote command `{seg.argv0}` runs `{name}` on legacy host {hits}; a script on the remote host cannot be "
-                              "read by the guard (run the statements inline)")
             continue
         base = seg.argv0
-        if any(">" in op and not (op.endswith("&") and re.fullmatch(r"\d+|-", f))
-               for op, f in seg.redirects()):
-            violations.append(f"remote command `{base}` on legacy host {hits} redirects output to a file on the legacy host; "
-                              "legacy hosts are read-only")
-            continue
-        if _PYTHON.fullmatch(base):
-            text, _ = _python_texts(seg, root)
+        if not seg.argv:
+            violations.append(f"`{seg.remote}` opens an interactive session on legacy source {hits}; the guard cannot read what would run")
+        elif base in ("aws", "az") and _remote_payload(seg.args) is None:
+            violations.append(f"remote `{base}` payload cannot be read (file://, @file, --cli-input-json); the guard cannot clear a "
+                              "remote command it cannot read")
+        elif seg.scripts or _shell_runs(seg)[1] or (_PYTHON.fullmatch(base) and any(w.endswith(".py") for w in seg.argv[1:])):
+            name = _shell_runs(seg)[1] or next((w for w in [*seg.scripts, *seg.argv[1:]] if w in seg.scripts or w.endswith(".py")))
+            violations.append(f"remote command `{base}` runs `{name}` on legacy host {hits}; a script on the remote host cannot be "
+                              "read by the guard (run the statements inline)")
+        elif any(">" in op and not (op.endswith("&") and re.fullmatch(r"\d+|-", f)) for op, f in seg.redirects()):
+            violations.append(f"remote command `{base}` on legacy host {hits} redirects output to a file on the legacy host; legacy hosts are read-only")
+        elif _PYTHON.fullmatch(base):
+            text = _python_texts(seg, root)[0]
             if _PY_WRITE.search(text) or re.search(r"\bsubprocess\b|\bos\.(?:system|popen|exec\w*|spawn\w*)\s*\(", text):
                 violations.append(f"remote python `{base}` on legacy host {hits} contains a write or subprocess; legacy hosts are read-only")
-            continue
-        if base in _REST_CLIENTS:
-            flags = ("-o", "--output", "-O", "--remote-name", "--remote-name-all", "--output-document", "-D",
-                     "--dump-header", "-c", "--cookie-jar", "-d", "--download")
-            words = seg.argv[1:]
-            if base == "curl":
-                flags = tuple(flag for flag in flags if flag not in ("-d", "--download"))
-            output = bool(_flag_values(seg.argv, flags)) or any(w in flags for w in words)
-            if base == "curl":
-                for word in words:
-                    if match := re.match(r"^-[A-Za-z]+", word):
-                        walked = match.group()[1:]
-                        for letter in walked:
-                            if letter in _CURL_VALUE_SHORT:
-                                output = output or letter in "oODc"
-                                break
-            elif base in ("http", "https", "xh"):
-                output = output or any(w.startswith(("-o", "-d")) and len(w) > 2 for w in words)
-            stdout = any(w in ("-O-", "--output-document=-") or
-                         w == "-O" and i + 1 < len(words) and words[i + 1] == "-" or
-                         re.fullmatch(r"-[A-Za-z]*O-", w)
-                         for i, w in enumerate(words))
-            if base == "wget" and not stdout:
-                output = True
-            if output:
+        elif base in _REST_CLIENTS:
+            if _writes_output(seg, root):
                 violations.append(f"remote client `{base}` on legacy host {hits} writes output to a file; legacy hosts are read-only")
-            continue
-        sql_client = base in (*_LEGACY_ONLY, *_GENERIC, "spark-sql", "dbsqlcli")
-        if sql_client:
-            flags = ("-o", "--output", "-L", "--log-file", "--tee")
-            words = seg.argv[1:]
-            output = bool(_flag_values(seg.argv, flags)) or any(w in flags for w in words)
-            output = output or (base == "bcp" and any(w in ("out", "queryout") for w in seg.argv[1:4]))
-            sql, _ = _sql_text(seg, root)
-            output = output or bool(re.search(r"(?im)(?:^|[\s;])(?::out|SPOOL(?!\s+OFF\b)|\.EXPORT)\s+\S", sql))
-            if output:
-                violations.append(f"remote client `{base}` on legacy host {hits} writes query output to a file on the legacy host; "
-                                  "legacy hosts are read-only")
-                continue
-            if _non_reads(sql):
-                violations.append(f"remote client `{base}` on legacy host {hits} is not read-only; legacy hosts are read-only")
-                continue
-        modelled = (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC, *_REST_CLIENTS)
-        read_shape = base in _READERS and not _mutates(base, seg.argv)
-        if base == "tar" and any(re.search(r"^-.*[cxru]", w) for w in seg.argv[1:]):
-            read_shape = False
-        if base in ("unzip", "tee"):
-            read_shape = False
-        if (base not in modelled and not _PYTHON.fullmatch(base) and base not in _SHELLS
-                and not read_shape):
-            violations.append(f"remote command `{base}` on legacy host {hits} is not a read shape the guard models; "
-                              "legacy hosts are read-only")
+        elif base in (*_LEGACY_ONLY, *_GENERIC, "spark-sql", "dbsqlcli") and _writes_output(seg, root):
+            violations.append(f"remote client `{base}` on legacy host {hits} writes query output to a file on the legacy host; legacy hosts are read-only")
+        elif base in (*_LEGACY_ONLY, *_GENERIC, "spark-sql", "dbsqlcli") and _non_reads(_sql_text(seg, root)[0]):
+            violations.append(f"remote client `{base}` on legacy host {hits} is not read-only; legacy hosts are read-only")
+        elif base not in (*_SQL_CLIENTS, *_REST_CLIENTS, *_SHELLS) and not _PYTHON.fullmatch(base) and not (
+                base in _READERS and not _mutates(base, seg.argv) and base not in ("unzip", "tee")
+                and not (base == "tar" and any(re.search(r"^-.*[cxru]", w) for w in seg.argv[1:]))):
+            violations.append(f"remote command `{base}` on legacy host {hits} is not a read shape the guard models; legacy hosts are read-only")
     return [_Legacy(v) for v in violations]
 
 def _touch(path: str, at: str | None, root: Path) -> str:
+    """How a path relates to what must not be written: 'inside'/'self'/'above' `.migration/`, 'identity', 'guard', 'guard-above',
+    'unresolved', or ''."""
     p = os.path.expanduser(re.sub(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", "*", re.sub(r"\$\{?PWD\}?|\$\(pwd\)", ".", path)))
     if p in ("", "-") or p.isdigit():
         return ""
@@ -1414,11 +1202,10 @@ def _touch(path: str, at: str | None, root: Path) -> str:
     p = os.path.normpath(p if p.startswith("/") else os.path.join(at or "", p))
     parts = [x for x in p.split("/") if x not in ("", ".")]
 
-    def like(name: str, part: str, spelled: bool = False) -> bool:   # a glob counts when it could match (`spelled`: and spells part of) the name
+    def like(name: str, part: str, spelled: bool = False) -> bool:
         return part == name or (bool(re.search(r"[*?\[]", part)) and fnmatch.fnmatchcase(name, part)
                                 and (not spelled or any(len(w) >= 3 and w in name for w in re.findall(r"\w+", part))))
-
-    for i, part in enumerate(parts):   # a literal `.migration` anywhere; a glob only at the top of the workspace, where the ledger lives
+    for i, part in enumerate(parts):   # a literal `.migration` anywhere; a glob only at the top of the workspace
         if part == ".migration" or (i == 0 and not p.startswith("/") and like(".migration", part)):
             rest = parts[i + 1:]
             return "self" if not rest else "" if len(rest) > 1 and rest[0] in ("recon", "waves") else "inside"
@@ -1430,8 +1217,7 @@ def _touch(path: str, at: str | None, root: Path) -> str:
         return "identity"
     if not p.startswith("/"):
         named = parts[next((i for i, x in enumerate(parts) if x != ".."), len(parts)):]
-        if named and (like("hooks", named[0], True) or like(_GUARD_FILE, named[-1], True)
-                      or (len(named) == 1 and like("hooks.json", named[0], True))):
+        if named and (like("hooks", named[0], True) or like(_GUARD_FILE, named[-1], True) or (len(named) == 1 and like("hooks.json", named[0], True))):
             return "guard"
     real = os.path.realpath(p if p.startswith("/") else os.path.join(root, p)).strip("/").split("/")
     tree = [*_GUARD_TREE.parts[1:], "hooks"]
@@ -1468,7 +1254,9 @@ def _git_reads(gargv: list[str]) -> bool:
             w == "-e" or w.startswith(("--unset", "--add", "--replace", "--edit", "--rename", "--remove")) for w in flags)
     return verb in _GIT_READS
 
-def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[tuple[str, str, tuple[str, ...], bool, str | None]]:
+_Write = tuple[str, str, tuple[str, ...], bool, str | None]   # (path, how, .migration relations that block, destructive, directory)
+
+def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[_Write]:
     argv, env, i, tree = s.argv, dict(a.split("=", 1) for a in s.assigns), 1, {}
     d = env.get("GIT_WORK_TREE") or _GIT_DIR_VALUE.sub("", env.get("GIT_DIR", ""))
     delta: str | None = _join("", d) if d else ""
@@ -1488,7 +1276,7 @@ def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[tuple[st
     run_in, at = (None, None) if delta is None else (_join(_join(here, s.at or "."), delta), _join(s.at, delta))
     gargv = argv[i:]
     verb, gops = (gargv[0] if gargv else ""), [w for w in gargv[1:] if not w.startswith("-")]
-    if verb == "push" and any(o in ("--force", "-f", "--force-with-lease") for o in gargv[1:]):
+    if verb == "push" and any(o in ("--force", "-f", "--force-with-lease") or o.startswith("--force-with-lease=") for o in gargv[1:]):
         out.append("`git push --force` rewrites protected remote history; force pushes are never allowed")
     w = [(".", f"git {verb}", (), True, run_in)] if gargv and not _git_reads(gargv) else []
     if verb in ("clone", "init") or (verb == "worktree" and gops[:1] == ["add"]):
@@ -1505,23 +1293,18 @@ def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[tuple[st
 def _multi_paths(s: _Seg, path: str) -> list[str]:
     paths = [path]
     for name in s.multi:
-        joined = s.env.get(name, "")
-        if not joined:
-            continue
-        values = joined.split()
-        paths = ([*values] if path == joined else
-                 [value + path[len(joined):] for value in values] if path.startswith(joined + "/") else paths)
+        if joined := s.env.get(name, ""):
+            values = joined.split()
+            paths = values if path == joined else [v + path[len(joined):] for v in values] if path.startswith(joined + "/") else paths
     return paths
 
-def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[tuple[str, str, tuple[str, ...], bool, str | None]]:
+def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[_Write]:
     base, argv, at = s.argv0, s.argv, s.at
     ops = [w for w in argv[1:] if not w.startswith("-")]
     values = ops + [w.split("=", 1)[1] for w in argv[1:] if "=" in w]   # `dd of=`, `--output=`
     inplace = _mutates(base, argv)
-    w = [(path, f"{op} {path}", _IN, False, at) for op, f in s.redirects() if ">" in op
-         for path in _multi_paths(s, f)]
-    w += [(path, f"{base} {flag}", _IN, False, at) for flag, v in itertools.pairwise(argv) if flag in _OUTPUT_FLAGS
-          for path in _multi_paths(s, v)]
+    w = [(path, f"{op} {path}", _IN, False, at) for op, f in s.redirects() if ">" in op for path in _multi_paths(s, f)]
+    w += [(path, f"{base} {flag}", _IN, False, at) for flag, v in itertools.pairwise(argv) if flag in _OUTPUT_FLAGS for path in _multi_paths(s, v)]
     if base == "git":
         return w + _git_writes(s, here, root, out)
     if base == "patch":
@@ -1532,26 +1315,21 @@ def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[tuple[str, s
             w += [(p, f"{base} script", _IN, False, at)
                   for p in [*_MIGRATION_PATH.findall(text), *_PATH_LITERAL.findall(text), *_GUARD_LITERAL.findall(text)]]
             w += [(m.group(1) if m.group(1) is not None else ".", f"{base} rmtree", _ALL, False, at) for m in _RMTREE.finditer(text)]
-    elif base == "find" and _mutates(base, argv):
+    elif base == "find" and inplace:
         w += [(path, "find with an action", _ALL, False, at) for o in ops for path in _multi_paths(s, o)]
     elif base in ("tar", "bsdtar") and (any(re.match(r"-?[a-zA-Z]*x", x) for x in argv[1:2]) or "--extract" in argv or "--get" in argv):
-        w += [(path, f"{base} extract into", _ALL, False, at)
-              for d in _flag_values(argv, ("-C", "--directory")) or ["."] for path in _multi_paths(s, d)]
+        w += [(path, f"{base} extract into", _ALL, False, at) for d in _flag_values(argv, ("-C", "--directory")) or ["."] for path in _multi_paths(s, d)]
     elif base == "unzip" and not any(x in argv for x in ("-l", "-t", "-p", "-z", "-Z")):
-        w += [(path, "unzip into", _ALL, False, at)
-              for d in _flag_values(argv, ("-d",)) or ["."] for path in _multi_paths(s, d)]
+        w += [(path, "unzip into", _ALL, False, at) for d in _flag_values(argv, ("-d",)) or ["."] for path in _multi_paths(s, d)]
     elif base in _GENERIC or base in _LEGACY_ONLY:
         sql = " ".join([*_flag_values(argv, _SQL_VALUE_FLAGS), *s.heredocs, *s.stdin, s.herestring or ""])
-        w += [(path, f"{base} output", _IN, False, at)
-              for p in [*values, *_SQL_OUT_PATH.findall(sql)] for path in _multi_paths(s, p)]
+        w += [(path, f"{base} output", _IN, False, at) for p in [*values, *_SQL_OUT_PATH.findall(sql)] for path in _multi_paths(s, p)]
     elif base not in _READERS or inplace:
-        recursive = base in _RECURSIVE_HEADS and any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*", x) or x in ("--recursive", "--delete")
-                                                    for x in argv[1:])
+        recursive = base in _RECURSIVE_HEADS and any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*", x) or x in ("--recursive", "--delete") for x in argv[1:])
         if "xargs" in s.words and any(_touch(x, at, root) for p in s.feeds for x in p.words):
             out.append(f"`xargs {base}` on names listed from .migration/; ledgers and the allowlist change only through a recorded decision")
         w += [(path, base, _ALL if recursive else _IN, base in _DESTRUCTIVE, at)
-              for o in (values[-1:] if base in _WRITE_LAST_OPERAND else values)
-              for path in _multi_paths(s, o)]
+              for o in (values[-1:] if base in _WRITE_LAST_OPERAND else values) for path in _multi_paths(s, o)]
     return w
 
 def _check_integrity(segs: list[_Seg], root: Path, here: str = "") -> list[str]:
@@ -1574,20 +1352,14 @@ def _check_integrity(segs: list[_Seg], root: Path, here: str = "") -> list[str]:
     return violations
 
 def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str = "", here: str = "") -> Verdict:
+    """The verdict on a command in the workspace at `root`, run from `cwd` (the event's; '' for the root) by a guard process in `here`."""
     root = root or Path.cwd()
     violations: list[str] = []
     if m := _PROBE.search(command):
         violations.append(f"`{m.group()}` is the factory-doctor's hook probe; it always blocks so the doctor can tell the "
                           "hook is loaded without touching Databricks")
     segs = _segments(command, at=cwd, root=root)
-    violations += _check_unreadable(segs, cfg)
-    for seg in segs:
-        if seg.unreadable == "depth":
-            violations.append(f"scripts nested more than {_MAX_DEPTH} deep; the guard cannot clear what it does not read")
-        elif seg.unreadable:
-            violations.append(f"shell script(s) {[seg.unreadable]} the command would run cannot be read in full (missing, unreadable or over "
-                              f"{_MAX_SCRIPT_BYTES >> 20} MiB); the guard cannot clear what it cannot read")
-    violations += _check_identity(segs, cfg) + _check_integrity(segs, root, here) + _check_remote(segs, cfg, root)
+    violations += _check_unreadable(segs, cfg, command) + _check_identity(segs, cfg) + _check_integrity(segs, root, here) + _check_remote(segs, cfg, root)
     for seg in segs:
         violations += _check_fixture(seg, cfg, root)
         base = seg.argv0
@@ -1596,7 +1368,7 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
         elif base in ("spark-sql", "dbsqlcli"):
             sql, unreadable = _sql_text(seg, root)
             violations += ([_UNREADABLE.format(who="Databricks client", files=unreadable)] if unreadable else []) + _catalog_violations(
-                sql, cfg, None, True)
+                sql, cfg, None, f"`{base}` client")
         elif base == "dbx-recon":
             violations += [f"--target-catalog {_norm(c)!r} outside allowlist {sorted(cfg.catalogs)}"
                            for c in _flag_values(seg.argv, ("--target-catalog",)) if _norm(c) not in cfg.catalogs]
@@ -1609,44 +1381,34 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd: str) -> Verdict:
+    """File-edit tools: `.migration/` accepts only an appended `D-<id>` row in 06_decisions.md; the credential store and the guard tree never."""
     file_path = tool_input.get("file_path")
     if not isinstance(file_path, str) or not file_path:
         return Verdict.of([], cfg)
-    new = tool_input.get("content") or tool_input.get("new_string") or "\n".join(
-        e.get("new_string", "") for e in tool_input.get("edits", []) if isinstance(e, dict)
-    )
-    if tool == "MultiEdit":
-        old = "\n".join(e.get("old_string", "") for e in tool_input.get("edits", []) if isinstance(e, dict))
-    else:
-        old = tool_input.get("old_string", "")
+    edits = [e for e in tool_input.get("edits", []) if isinstance(e, dict)]
+    new = tool_input.get("content") or tool_input.get("new_string") or "\n".join(e.get("new_string", "") for e in edits)
+    old = "\n".join(e.get("old_string", "") for e in edits) if tool == "MultiEdit" else tool_input.get("old_string", "")
     if tool == "write" and not old:
-        path = Path(file_path) if os.path.isabs(file_path) else Path(cwd or root) / file_path
         try:
-            old = path.read_text(errors="replace")
+            old = (Path(file_path) if os.path.isabs(file_path) else Path(cwd or root) / file_path).read_text(errors="replace")
         except OSError:
             old = ""
-    kind = _touch(file_path, cwd or "", root)
-    violations = []
-    decision = False
+    kind, violations = _touch(file_path, cwd or "", root), []
     if kind in ("inside", "self"):
-        ledger = Path(file_path).name == "06_decisions.md"
-        added = new[len(old):] if new.startswith(old) else new
+        ledger, added = Path(file_path).name == "06_decisions.md", new[len(old):] if new.startswith(old) else new
         authorized = "legacy_write_authorized" in added.lower()
-        decision = bool(ledger and tool != "MultiEdit" and new.startswith(old) and added and _DECISION_ROW.search(added)
-                        and not authorized)
-        if not decision:
-            if ledger and authorized:
-                violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
-            elif ledger:
-                violations.append("06_decisions.md is append-only: the edit must keep the existing text and only add `D-<id>` rows")
-            else:
-                violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
-                                  ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
-                                  "decision — 06_decisions.md accepts only an added `D-<id>` row)")
+        if ledger and authorized:
+            violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
+        elif ledger and not (tool != "MultiEdit" and new.startswith(old) and added and _DECISION_ROW.search(added)):
+            violations.append("06_decisions.md is append-only: the edit must keep the existing text and only add `D-<id>` rows")
+        elif not ledger:
+            violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
+                              ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
+                              "decision — 06_decisions.md accepts only an added `D-<id>` row)")
     elif kind == "identity":
         violations.append(f"file-edit tool `{tool}` writes `{file_path}`, the Databricks CLI's credential store; the session runs as the "
                           "doctor-verified migration principal only")
-    elif kind == "guard" or kind == "guard-above":
+    elif kind in ("guard", "guard-above"):
         violations.append(f"file-edit tool `{tool}` on `{file_path}` inside the running guard's plugin tree ({_GUARD_TREE}); the hook is "
                           "never edited, disabled or removed from a session (a block is a finding to report)")
     return Verdict.of(violations, cfg)
@@ -1674,18 +1436,16 @@ def _workspace_from_cd(command: str, start: str) -> tuple[Path, GuardConfig | No
     return directory, None
 
 def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str = "", here: str = "") -> Verdict:
+    """`evaluate`, plus the allowlist of every other workspace the command changes into."""
     first = evaluate(command, cfg, root, cwd, here)
     violations = first.violations or ([first.reason] if first.decision == "block" else [])
     seen = {cfg.path}
     segments = _segments(command, at=cwd or str(root))
     if any(s.lost for s in segments):
         violations.append(f"command has more than {_MAX_ALTS} possible working directories; the allowlist in force is unknown")
-    unknown_clients = (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC, "dbt")
-    for seg in segments:
-        if seg.at is None and (seg.argv0 in unknown_clients or _PYTHON.fullmatch(seg.argv0)):
-            violations.append("command changes to a directory the guard cannot resolve before running a Databricks or "
-                              "legacy client; the allowlist in force there is unknown")
-            break
+    if any(s.at is None and (s.argv0 in (*_SQL_CLIENTS, "dbt") or _PYTHON.fullmatch(s.argv0)) for s in segments):
+        violations.append("command changes to a directory the guard cannot resolve before running a Databricks or "
+                          "legacy client; the allowlist in force there is unknown")
     for d in _run_dirs(command, cwd or str(root)):
         if d is None:
             continue
@@ -1696,8 +1456,7 @@ def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str 
             continue
         if other is not None and other.path not in seen:
             seen.add(other.path)
-            violations += [type(x)(f"[{other.path}] {x}") for x in evaluate(command, other, d).violations
-                           if not x.startswith(_AUTHORIZED)]
+            violations += [type(x)(f"[{other.path}] {x}") for x in evaluate(command, other, d).violations if not x.startswith(_AUTHORIZED)]
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 def _dirs(event: dict, tool_input: dict) -> tuple[Path, str, str]:
@@ -1715,16 +1474,17 @@ def main(stdin_text: str | None = None) -> int:
     except json.JSONDecodeError:
         return 0
     tool_input = event.get("tool_input") or {} if isinstance(event, dict) else {}
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
-    if (not isinstance(command, str) or not command.strip()) and (not isinstance(file_path, str) or not file_path):
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    command, file_path = tool_input.get("command"), tool_input.get("file_path")
+    command = command if isinstance(command, str) and command.strip() else None
+    if command is None and not (isinstance(file_path, str) and file_path):
         return 0
     root, cwd, here = _dirs(event, tool_input)
     try:
         cfg = load_config(root)
         if cfg is None and isinstance(file_path, str) and os.path.isabs(file_path):
             cfg = load_config(Path(file_path).parent)
-        if cfg is None and isinstance(command, str) and command.strip():
+        if cfg is None and command is not None:
             cwd = cwd or here
             root, cfg = _workspace_from_cd(command, cwd)
     except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
@@ -1732,9 +1492,8 @@ def main(stdin_text: str | None = None) -> int:
     else:
         if cfg is None:
             return 0
-        verdict = evaluate_edit(event.get("tool_name", ""), tool_input, cfg, root, cwd) if (
-            not isinstance(command, str) or not command.strip()
-        ) else evaluate_with_workdirs(command, cfg, root, cwd, here)
+        verdict = evaluate_with_workdirs(command, cfg, root, cwd, here) if command is not None else evaluate_edit(
+            event.get("tool_name", ""), tool_input, cfg, root, cwd)
     if verdict.reason:
         print(json.dumps({"decision": verdict.decision, "reason": verdict.reason}))
     if verdict.decision == "block":

@@ -221,9 +221,6 @@ def test_expectations_flipped_by_the_red_team_review(cmd):
     "python3 - <<'EOF'\ncur.execute('INSERT INTO prod_cat.s.t SELECT 1')\nEOF",
 ])
 def test_sql_text_reaching_a_client_is_still_enforced(cmd):
-    if cmd.startswith("python3"):
-        approve(cmd)
-        return
     v = block(cmd)
     assert "prod_cat" in v.reason or "other_db" in v.reason or "substitution" in v.reason
 
