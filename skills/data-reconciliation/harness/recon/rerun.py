@@ -49,10 +49,18 @@ _CREATE_ANY = re.compile(
     r"^CREATE\s+(?:OR\s+REPLACE\s+)?(?:EXTERNAL\s+|TEMPORARY\s+|TEMP\s+|UNLOGGED\s+)?"
     r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[^\s(]+)", re.IGNORECASE | re.DOTALL)
 _TABLE_PK = re.compile(r"^(?:CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\s*\(", re.IGNORECASE | re.DOTALL)
+_DROP = re.compile(r"^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<name>[^\s;]+)", re.IGNORECASE | re.DOTALL)
+
+
+_SERIAL = {"serial": "int", "serial4": "int", "bigserial": "bigint", "serial8": "bigint",
+           "smallserial": "smallint", "serial2": "smallint"}
+# PostgreSQL format_type puts the precision before the zone words: timestamp(6) without time zone
+_TZ = re.compile(r"\b(timestamp|time)(\(\d+\))? (with|without) time zone")
 
 
 def normalize_type(raw: str) -> str:
     t = re.sub(r"\s+", " ", str(raw).strip().lower())
+    t = _TZ.sub(lambda m: m.group(1) + ("tz" if m.group(3) == "with" else "") + (m.group(2) or ""), t)
     for long, short in _TYPE_ALIASES.items():
         t = re.sub(rf"\b{re.escape(long)}\b", short, t)
     return re.sub(r"\s*([<>(),:])\s*", r"\1", t).replace(" ", "")
@@ -155,7 +163,10 @@ def _column(defn: str) -> dict | None:
                     or re.search(r"\bPRIMARY\s+KEY\b", tail, re.IGNORECASE))
     if not type_text.strip():
         raise ConfigError(f"column {name} has no type")
-    return {"name": name, "type": normalize_type(type_text), "nullable": not not_null}
+    kind = normalize_type(type_text)
+    if kind in _SERIAL:
+        return {"name": name, "type": _SERIAL[kind], "nullable": False}
+    return {"name": name, "type": kind, "nullable": not not_null}
 
 
 def _table_columns(body: str) -> list[dict]:
@@ -283,6 +294,13 @@ def declared_shape(sql: str) -> dict:
             if m.group("ine") and name not in if_not_exists:
                 if_not_exists.append(name)
             continue
+        m = _DROP.match(stmt)
+        if m:
+            name = _ident(m.group("name"))
+            created.discard(name)
+            tables.pop(name, None)
+            counts["other"] += 1
+            continue
         m = _ALTER_ADD.match(stmt)
         if m:
             name = _ident(m.group("name"))
@@ -384,23 +402,39 @@ def _candidates(observed: dict[str, list[dict]], name: str) -> list[str]:
 
 def _resolve_tables(expected: dict[str, list[dict]], observed: dict[str, list[dict]]) -> dict[str, str | None]:
     """Expected table -> the one observed table it names, one-to-one: exact names first, then a
-    trailing-name match when one side is less qualified. An observed table two expected tables
-    could both claim is a match for neither (`None`), never a shared observation."""
+    trailing-name match when one side is less qualified, kept only when every maximum one-to-one
+    matching agrees on it. An observation that could belong to either of two expected tables is a
+    match for neither (`None`), never a shared one."""
     out: dict[str, str | None] = {}
     taken: set[str] = set()
-    pending = {}
+    pending: dict[str, list[str]] = {}
     for table in expected:
         if table in observed:
             out[table] = table
             taken.add(table)
         else:
-            pending[table] = _candidates(observed, table)
-    for table, cands in pending.items():
-        free = [c for c in cands if c not in taken]
-        rivals = [t for t, cs in pending.items() if t != table and any(c in cs for c in free)]
-        out[table] = free[0] if len(free) == 1 and not rivals else None
-        if out[table]:
-            taken.add(out[table])
+            pending[table] = [c for c in _candidates(observed, table) if c not in taken]
+    names = list(pending)
+    best: list[dict[str, str]] = []
+
+    def walk(i: int, used: set[str], picked: dict[str, str]) -> None:
+        if i == len(names):
+            if not best or len(picked) > len(best[0]):
+                best[:] = [dict(picked)]
+            elif len(picked) == len(best[0]):
+                best.append(dict(picked))
+            return
+        for c in pending[names[i]]:
+            if c not in used:
+                picked[names[i]] = c
+                walk(i + 1, used | {c}, picked)
+                del picked[names[i]]
+        walk(i + 1, used, picked)
+
+    walk(0, set(), {})
+    for table in names:
+        picks = {m.get(table) for m in best}
+        out[table] = picks.pop() if len(picks) == 1 else None
     return out
 
 
