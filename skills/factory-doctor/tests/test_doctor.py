@@ -2724,7 +2724,7 @@ def _signed_record(manifest, *, identity="sp-1", host="https://adb-1", rows=None
         {"id": rid, "status": "ok", "detail": f"{rid} done", "data": {"k": rid}}
         for rid in doctor.REUSABLE_ROWS]
     report = {"schema": "dbx-migration-factory/capabilities/1", "role": "orchestrator",
-              "ready": True, "identity": {"userName": identity, "host": host},
+              "ready": True, "identity": {"userName": identity, "host": host}, "inputs_sha": "inputs-a",
               "checks": rows, "summary": {}, "blocking": [], **overrides}
     return doctor.sign_wave_report(report, manifest_bytes,
                                   signed_at=overrides.pop("signed_at", None)), manifest_bytes
@@ -2799,19 +2799,36 @@ def test_reusable_record_rejects_non_orchestrator_not_ready_and_malformed():
     assert got is None
 
 
+SAFETY_ROWS = ("source_principal_read_only", "named_secrets_exist", "recon_family_supported")
+
+
+def test_reusable_rows_are_the_non_safety_ones():
+    """Reuse is policy, not the signature: a record any manifest reader could forge may only stand in
+    for rows whose failure the child's own run would catch anyway (package, type map, dictionary,
+    delete evidence); the rows that guard the source and the secrets always run in the child."""
+    assert set(doctor.REUSABLE_ROWS) == {"recon_harness", "type_map_audit", "delete_evidence",
+                                         "dictionary_readable"}
+    assert not set(doctor.REUSABLE_ROWS) & set(SAFETY_ROWS)
+
+
 def test_run_reuses_the_signed_source_side_rows_and_keeps_identity_fresh(tmp_path, monkeypatch):
     manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1"}}
-    record, manifest_bytes = _signed_record(manifest)
+    rows = [{"id": rid, "status": "ok", "detail": f"{rid} done", "data": {"k": rid}}
+            for rid in (*doctor.REUSABLE_ROWS, *SAFETY_ROWS)]
+    record, manifest_bytes = _signed_record(manifest, rows=rows)
     reused, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
     assert reused is record
 
     def boom(*a, **k):
         raise AssertionError("computed a reusable row")
 
-    for name in ("check_harness", "check_drivers", "check_recon_family_supported",
-                 "check_type_map_audit", "check_delete_evidence_all", "check_source_principal_all",
-                 "check_dictionary_readable_all", "check_named_secrets"):
+    for name in ("check_harness", "check_drivers", "check_type_map_audit", "check_delete_evidence_all",
+                 "check_dictionary_readable_all"):
         monkeypatch.setattr(doctor, name, boom)
+    for name, rid in (("check_recon_family_supported", "recon_family_supported"),
+                      ("check_source_principal_all", "source_principal_read_only"),
+                      ("check_named_secrets", "named_secrets_exist")):
+        monkeypatch.setattr(doctor, name, lambda *a, _rid=rid, **k: doctor.Check(_rid, "ok", "fresh"))
     monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
         doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1",
                                                           "host": "https://adb-1"})])
@@ -2822,6 +2839,10 @@ def test_run_reuses_the_signed_source_side_rows_and_keeps_identity_fresh(tmp_pat
         assert rows[rid]["status"] == "ok", rid
         assert rows[rid]["detail"].startswith("reused from the orchestrator's record signed"), rid
         assert rows[rid]["data"]["reused_from"] == reused["signed_at"]
+        assert rows[rid]["reusable"] is True
+    for rid in SAFETY_ROWS:
+        assert rows[rid]["detail"] == "fresh" and rows[rid]["reusable"] is False, rid
+    assert rows["databricks_identity"]["reusable"] is False
     assert report["reused_doctor"] == reused["signed_at"]
     assert "reused from" not in rows["databricks_identity"]["detail"]
 
@@ -2847,6 +2868,7 @@ def _reuse_ws(tmp_path, manifest=None, **record_overrides):
     manifest = manifest or {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1",
                                                         "catalogs": ["mig_cat"]}}
     manifest_path = waves / "wave-1.json"
+    record_overrides.setdefault("inputs_sha", doctor.inputs_sha(ws))
     record, manifest_bytes = _signed_record(manifest, **record_overrides)
     manifest_path.write_bytes(manifest_bytes)
     record_path = waves / "wave-1.doctor.json"
@@ -2883,3 +2905,81 @@ def test_reuse_record_falls_back_to_a_full_run_when_not_reusable(tmp_path):
                        capture_output=True, text=True, check=False)
     assert "doctor record not reused:" in r.stderr
     assert "reused from the orchestrator's record" not in r.stdout
+
+
+def test_reusable_record_requires_the_checkouts_inputs_to_match():
+    """The record binds the inputs its source-side rows were computed from; a child whose
+    .migration/units or top-level .migration/*.json differ runs in full."""
+    manifest = {"wave": 1}
+    record, manifest_bytes = _signed_record(manifest)
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1",
+                                      inputs_sha="inputs-a")
+    assert got is record and why == ""
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1",
+                                      inputs_sha="inputs-b")
+    assert got is None and "inputs" in why
+    record, manifest_bytes = _signed_record(manifest, inputs_sha=None)
+    got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1",
+                                      inputs_sha="inputs-a")
+    assert got is None and "inputs_sha" in why
+
+
+def test_inputs_sha_follows_unit_mappings_and_migration_json_not_the_doctors_own_output(tmp_path):
+    ws = make_workspace(tmp_path)
+    before = doctor.inputs_sha(ws)
+    (ws / ".migration" / "09_capabilities.json").write_text("{}")
+    assert doctor.inputs_sha(ws) == before
+    unit = ws / ".migration" / "units" / "u1"
+    unit.mkdir(parents=True)
+    (unit / "mapping_spec.json").write_text('{"target_type": "STRING"}')
+    changed = doctor.inputs_sha(ws)
+    assert changed != before
+    (unit / "mapping_spec.json").write_text('{"target_type": "DOUBLE"}')
+    assert doctor.inputs_sha(ws) not in (before, changed)
+    (ws / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["other"]}')
+    assert doctor.inputs_sha(ws) not in (before, changed)
+
+
+def test_orchestrator_wave_record_carries_the_inputs_sha(tmp_path):
+    ws = make_workspace(tmp_path)
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"capabilities": {"identity": "sp-1", "host": "https://h",
+                                                      "catalogs": ["mig_cat"]}}))
+    subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+                    "--hook-probe-result", probed(ws), "--wave", str(manifest)],
+                   capture_output=True, text=True, check=False)
+    record = json.loads(manifest.with_suffix(".doctor.json").read_text())
+    assert record["inputs_sha"] == doctor.inputs_sha(ws)
+    assert record["signature"] == doctor.wave_signature(record, manifest.read_bytes())
+
+
+def test_reuse_record_falls_back_to_a_full_run_when_the_checkout_inputs_differ(tmp_path):
+    ws, manifest_path, record_path = _reuse_ws(tmp_path)
+    unit = ws / ".migration" / "units" / "u1"
+    unit.mkdir(parents=True)
+    (unit / "mapping_spec.json").write_text('{"target_type": "STRING"}')
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
+                        "--role", "child", "--reuse-record", str(record_path), "--expect-identity", "sp-1",
+                        "--expect-host", "https://adb-1", "--out", "-"],
+                       capture_output=True, text=True, check=False)
+    assert "doctor record not reused:" in r.stderr and "inputs" in r.stderr
+    assert "reused from the orchestrator's record" not in r.stdout
+
+
+def test_reuse_record_accepts_the_manifests_own_source_flags(tmp_path):
+    """The child brief names --source-family/--source-secret/--param from the manifest; the same
+    values beside --reuse-record are fine, different ones are the error."""
+    manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1", "catalogs": ["mig_cat"]},
+                "source": {"family": "oracle", "secret": "LEGACY_DSN", "params": {"db": "loans"}}}
+    ws, manifest_path, record_path = _reuse_ws(tmp_path, manifest=manifest)
+    base = [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--role", "child",
+            "--reuse-record", str(record_path), "--expect-identity", "sp-1", "--expect-host", "https://adb-1",
+            "--out", "-"]
+    r = subprocess.run(base + ["--source-family", "oracle", "--source-secret", "LEGACY_DSN", "--param", "db=loans"],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode != 2, r.stderr
+    assert "reused from the orchestrator's record" in r.stdout
+    for extra in (["--source-family", "sqlserver"], ["--source-secret", "OTHER"], ["--param", "db=cards"]):
+        r = subprocess.run(base + extra, capture_output=True, text=True, check=False)
+        assert r.returncode == 2 and "manifest" in r.stderr, (extra, r.stderr)

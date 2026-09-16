@@ -30,7 +30,9 @@ from .transactional import (
 # its one live run.
 # transactional: the operational track (OLTP source, Lakebase target), both sides live; adds
 # the consistency-window, PK-set, CDC-lag/ordering and schema-parity tiers.
-MODES = ("fixture", "live", "snapshot", "continuous", "transactional")
+# structural: Tier 0 only, both catalogs read, no row read on either side; the independent verifier's
+# run on a wave declared DEGRADED. Never merge evidence.
+MODES = ("fixture", "live", "snapshot", "continuous", "transactional", "structural")
 # Modes named in the docs but not runnable in this harness version (none at present).
 PLANNED_MODES: tuple[str, ...] = ()
 
@@ -56,7 +58,7 @@ def _cost(source, target, started: float, ctx=None) -> dict:
 
 def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | None,
                                   spec: MappingSpec, tier1) -> list[str]:
-    if snapshot is None:
+    if snapshot is None or tier1 is None:
         return []
     warnings = []
     if snapshot.get("source") != source_family:
@@ -79,6 +81,8 @@ def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | No
 def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source, target,
                seed: int, depth: str, mode: str, ops: list[dict] | None, run_source, run_target,
                ctx) -> list:
+    if mode == "structural":
+        return [tier0_structural_parity(spec, tol, source, target)]
     tiers = [tier1_counts(spec, source, target, ctx=ctx)]
     if tiers[0].passed:
         # Tier 1 failures are load defects or mapping-spec violations; nothing else runs.
@@ -158,7 +162,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
                 _report_release_failure(exc, str(err))
         raise
     provenance_warnings = _snapshot_provenance_warnings(
-        snapshot, source_family, spec, next(t for t in tiers if t.tier == 1))
+        snapshot, source_family, spec, next((t for t in tiers if t.tier == 1), None))
     result = build_result(unit, mode, spec.version, tol.version, tiers,
                           seed=seed, params=params, snapshot=snapshot,
                           provenance_warnings=provenance_warnings, depth=depth,

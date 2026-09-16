@@ -131,14 +131,32 @@ def sign_wave_report(report: dict, manifest_bytes: bytes, signed_at: str | None 
     return body
 
 
-REUSABLE_ROWS = ("recon_harness", "recon_family_supported", "type_map_audit", "delete_evidence",
-                 "source_principal_read_only", "dictionary_readable", "named_secrets_exist")
+# Rows a child may take from the orchestrator's signed record: the ones whose failure the child's own
+# run would surface anyway (a package, a type map, a dictionary, delete evidence). The rows that guard the
+# source and the secrets (source_principal_read_only, named_secrets_exist, recon_family_supported) and
+# databricks_identity always run in the child: the record's key is derivable from the manifest, so reuse
+# is a policy on cost, not a trust decision.
+REUSABLE_ROWS = ("recon_harness", "type_map_audit", "delete_evidence", "dictionary_readable")
 DOCTOR_MAX_AGE_MINUTES = 15
 
 
+def inputs_sha(ws: Path) -> str:
+    """Digest of what the source-side rows read from the checkout: every file under .migration/units and
+    every top-level .migration/*.json except the doctor's own 09_capabilities.json, by relative path."""
+    mig = ws / ".migration"
+    files = sorted({*mig.joinpath("units").rglob("*"), *mig.glob("*.json")} - {mig / "09_capabilities.json"})
+    h = hashlib.sha256()
+    for f in files:
+        if f.is_file():
+            h.update(f.relative_to(mig).as_posix().encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
 def reusable_record(record, manifest, manifest_bytes: bytes, expect_identity: str | None,
-                    expect_host: str | None, now: datetime.datetime | None = None) -> tuple:
-    """(record, "") when a child may reuse the orchestrator's signed record, else (None, why)."""
+                    expect_host: str | None, now: datetime.datetime | None = None,
+                    inputs_sha: str | None = None) -> tuple:
+    """(record, "") when a child may reuse the orchestrator's signed record, else (None, why). inputs_sha
+    is this checkout's digest; the record's must equal it (the rows were computed from those files)."""
     if not isinstance(record, dict):
         return None, "record is not an object"
     if record.get("role") != "orchestrator":
@@ -169,6 +187,10 @@ def reusable_record(record, manifest, manifest_bytes: bytes, expect_identity: st
         return None, "record identity is not --expect-identity"
     if not expect_host or ident.get("host") != expect_host:
         return None, "record host is not --expect-host"
+    if not isinstance(record.get("inputs_sha"), str):
+        return None, "record carries no inputs_sha"
+    if inputs_sha is not None and record["inputs_sha"] != inputs_sha:
+        return None, "workspace inputs differ from the record's (units or .migration/*.json changed since it was signed)"
     return record, ""
 
 
@@ -1977,7 +1999,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         target_kind: str = "databricks", secret_names: list[str] | None = None,
         list_secrets=None, reused: dict | None = None) -> dict:
     def _row(row_id, thunk):
-        if isinstance(reused, dict):
+        if isinstance(reused, dict) and row_id in REUSABLE_ROWS:
             row = next((c for c in reused.get("checks") or []
                         if isinstance(c, dict) and c.get("id") == row_id), None)
             if isinstance(row, dict) and isinstance(row.get("status"), str) and isinstance(row.get("detail"), str):
@@ -2052,7 +2074,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         "ready": not blocking,
         "blocking": blocking,
         "reused_doctor": reused["signed_at"] if isinstance(reused, dict) else None,
-        "checks": [asdict(c) for c in checks],
+        "checks": [{**asdict(c), "reusable": c.id in REUSABLE_ROWS} for c in checks],
     }
 
 
@@ -2163,16 +2185,21 @@ def main(argv: list[str] | None = None) -> int:
         if a.expect_catalogs is None:
             catalogs = caps.get("catalogs")
             a.expect_catalogs = catalogs if isinstance(catalogs, list) else None
-        if a.source_family is not None or a.source_secret is not None or a.param:
-            p.error("--reuse-record takes source settings from the manifest; drop "
-                    "--source-family/--source-secret/--param")
         source = manifest.get("source") if isinstance(manifest, dict) else None
-        a.source_family = source.get("family") if isinstance(source, dict) else None
-        a.source_secret = source.get("secret") if isinstance(source, dict) else None
-        a.param = [f"{k}={v}" for k, v in (source.get("params") or {}).items()] if isinstance(source, dict) else []
+        family = source.get("family") if isinstance(source, dict) else None
+        secret = source.get("secret") if isinstance(source, dict) else None
+        params = [f"{k}={v}" for k, v in (source.get("params") or {}).items()] if isinstance(source, dict) else []
+        for flag, given, want in (("--source-family", a.source_family, family),
+                                  ("--source-secret", a.source_secret, secret),
+                                  ("--param", sorted(a.param or []), sorted(params))):
+            if given not in (None, [], want):
+                p.error(f"{flag} differs from the manifest's source block; --reuse-record takes source settings "
+                        "from the manifest, so pass the same values or none")
+        a.source_family, a.source_secret, a.param = family, secret, params
         a.secret = sorted({*a.secret, *manifest_secret_names(manifest)})
         reused, reuse_why = reusable_record(record, manifest if isinstance(manifest, dict) else {},
-                                            manifest_bytes, a.expect_identity, a.expect_host)
+                                            manifest_bytes, a.expect_identity, a.expect_host,
+                                            inputs_sha=inputs_sha(a.workspace.resolve()))
 
     params = None
     if a.param:
@@ -2205,8 +2232,8 @@ def main(argv: list[str] | None = None) -> int:
           + (f"  -> {out}" if str(out) != "-" else ""))
     if a.wave:
         a.wave.with_suffix(".doctor.json").write_text(json.dumps(
-            sign_wave_report({**report, "hook_probe": a.hook_probe_result, "source": manifest.get("source")},
-                             manifest_bytes),
+            sign_wave_report({**report, "hook_probe": a.hook_probe_result, "source": manifest.get("source"),
+                              "inputs_sha": inputs_sha(a.workspace.resolve())}, manifest_bytes),
             indent=2, sort_keys=True) + "\n")
     return 0 if report["ready"] else 1
 

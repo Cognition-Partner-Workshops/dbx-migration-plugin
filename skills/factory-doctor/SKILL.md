@@ -35,16 +35,21 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
 Writes `.migration/09_capabilities.json` and prints one line per row. Exit 0 means `ready`.
 
 A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the orchestrator's signed
-record beside the wave manifest). When the record is an orchestrator's, `ready`, signed for the
-same manifest bytes, fresher than the manifest's `doctor_max_age` minutes (default 15), and signed
-for the `--expect-identity`/`--expect-host` principal, the source-side rows (`recon_harness`,
-`recon_family_supported`, `type_map_audit`, `delete_evidence`, `source_principal_read_only`,
-`dictionary_readable`, `named_secrets_exist`) are taken from it — anything else in the report, and
-the whole run when the record fails any check, is computed fresh. `databricks_identity` and the
-workspace/hook/allowlist rows always run fresh. The `doctor_record` row says what happened; a
-rejected record prints `doctor record not reused: <why>` on stderr and does not change the exit
-code. `--reuse-record` refuses `--wave`, `--no-databricks`, a non-child role, and a missing
-`--expect-identity`.
+record, committed beside the wave manifest). When the record is an orchestrator's, `ready`, signed
+for the same manifest bytes, fresher than the manifest's `doctor_max_age` minutes (default 15),
+signed for the `--expect-identity`/`--expect-host` principal, and its `inputs_sha` equals this
+checkout's (sha256 over `.migration/units/**` and `.migration/*.json` except `09_capabilities.json`,
+by relative path), the rows marked `reusable` (`recon_harness`, `type_map_audit`, `delete_evidence`,
+`dictionary_readable`) are taken from it — every other row, and the whole run when the record fails
+any check, is computed fresh. The signature's key is derivable from the manifest and the identity
+(see the module docstring of `doctor.py`), so reuse is a cost policy, not trust: the rows that guard
+the source and the secrets (`source_principal_read_only`, `named_secrets_exist`,
+`recon_family_supported`), `databricks_identity`, and the workspace/hook/allowlist rows always run
+in the child; each row of the report carries `reusable: true|false`. The `doctor_record` row says
+what happened; a rejected record prints `doctor record not reused: <why>` on stderr and does not
+change the exit code. `--reuse-record` takes the source block from the manifest: pass the same
+`--source-family`/`--source-secret`/`--param` values or none (different values are an error), and
+it refuses `--wave`, `--no-databricks`, a non-child role, and a missing `--expect-identity`.
 `ready` requires no `fail`, the security rows `hook_guard` and `databricks_identity` to have every
 security sub-result at `ok`, and `source_principal_read_only` not `unverified` once mappings exist.
 Other warnings are advisory. Sub-results live in `data.sub_results`; `--no-databricks` leaves

@@ -1619,12 +1619,16 @@ def test_capability_block_points_children_at_the_signed_wave_doctor_record():
 
 
 def test_a_degraded_wave_runs_only_the_structural_tier_in_verify():
+    """A declared-DEGRADED wave's verifier runs the harness in `--mode structural` (Tier 0 only, no
+    source rows) and marks PASS on that run's verdict; the merge-eligible full run is not asked for."""
     text = _prompt_ns(_manifest(degraded=True))["verify_prompt"](
         [{"batch": "b", "units": ["u"], "pr_url": ""}], True)
-    assert "structural_parity" in text and "Tier 0" in text and "structural_drift" in text
+    assert "--mode structural" in text and "Tier 0" in text and "structural_drift" in text
+    assert "merge_eligible=true" not in text and "--depth" not in text
+    assert "Mark a unit PASS only if you re-ran the harness in one of" not in text
     text = _prompt_ns(_manifest())["verify_prompt"](
         [{"batch": "b", "units": ["u"], "pr_url": ""}], True)
-    assert "structural_parity" not in text
+    assert "--mode structural" not in text and "merge_eligible=true" in text
 
 
 def test_cost_line_compares_estimate_with_summed_actuals():

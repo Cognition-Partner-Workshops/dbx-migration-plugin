@@ -219,6 +219,27 @@ def test_tier0_unsupported_indexes_are_not_a_warning():
     assert result["merge_eligible"] is (result["verdict"] == "PASS")
 
 
+def test_structural_mode_runs_tier0_only_and_reads_no_source_rows():
+    """`--mode structural` is the declared-DEGRADED verifier's run: the structural tier against both
+    catalogs, no row tier, never merge evidence."""
+    loans, borrowers = _rows(12)
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 13})
+    target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                        schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS},
+                        sequences={("loans", "loan_id"): 13})
+    result = run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, target)
+    assert [t["name"] for t in result["tiers"]] == ["structural_parity"]
+    assert result["verdict"] == "PASS" and result["mode"] == "structural"
+    assert result["merge_eligible"] is False and "mode" in result["merge_block_reasons"]
+    assert source.rows_fetched == 0 and not {"count", "fetch_keyed", "sample_keys"} & set(source.calls)
+    bad = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                     schema={"loans": BORROWER_FACTS, "borrowers": BORROWER_FACTS},
+                     sequences={("loans", "loan_id"): 13})
+    assert run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, bad)["verdict"] == "FAIL"
+
+
 def test_tier0_unreadable_catalog_blocks_merge():
     loans, borrowers = _rows(12)
     source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers})
