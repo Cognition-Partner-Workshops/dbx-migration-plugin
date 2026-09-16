@@ -431,6 +431,17 @@ def test_override_decision_row_must_name_every_unit_and_say_merge_override():
     assert not override_decision(None, ["u"], LEDGER) and not override_decision("D-", ["u"], LEDGER)
 
 
+def test_override_decision_row_names_units_after_merge_override_not_in_its_metadata():
+    override_decision = _batch_runtime()["override_decision"]
+    row = "| D-7 | 2024-05-02 | user:U1 merge_override for u |\n"
+    assert override_decision("D-7", ["u"], row)
+    assert not override_decision("D-7", ["U1"], row)                 # the provenance id is not a unit
+    assert not override_decision("D-7", ["2024-05-02"], row)         # nor the date
+    assert not override_decision("D-7", ["u", "U1"], row)
+    assert not override_decision("D-7", ["orders"], "| D-7 | orders | user:U1 merge_override for u |")
+    assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 merge_override for u and v (feed gap) |")
+
+
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
     ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}

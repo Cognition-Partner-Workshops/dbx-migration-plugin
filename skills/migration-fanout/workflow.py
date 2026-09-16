@@ -213,14 +213,22 @@ def decision_ledger():
 
 def override_decision(decision_id, units, ledger):
     """Whether the ledger holds the D-<n> row that lets a human merge past merge_eligible=false: one
-    line carrying that id, the word merge_override, the id of every unit in the batch, and human
-    provenance (`user:<id>`; a default-accepted row is the orchestrator's, not a human's)."""
+    line carrying that id, human provenance (`user:<id>`; a default-accepted row is the orchestrator's,
+    not a human's), and the word merge_override followed by the id of every unit in the batch. Units
+    count only in that clause, so a row's date, id or author never stands in for a unit it did not name."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
         return False
-    words = [decision_id, "merge_override", *units]
-    return any(HUMAN_PROVENANCE.search(line)
-               and all(re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])", line) for w in words)
-               for line in ledger.splitlines())
+
+    def word(w):
+        return rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])"
+
+    for line in ledger.splitlines():
+        clause = re.split(word("merge_override"), line, maxsplit=1)
+        if len(clause) == 2 and HUMAN_PROVENANCE.search(line) and re.search(word(decision_id), line):
+            scope = HUMAN_PROVENANCE.sub(" ", clause[1])
+            if all(re.search(word(u), scope) for u in units):
+                return True
+    return False
 
 
 def validate_manifest(m, doctor=None):
@@ -924,7 +932,7 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
                      "a human confirms what they wrote before any PR lands.")
     overrides = merge_overrides(results)
     if overrides:
-        lines.append("Merged on human override, not harness evidence: "
+        lines.append("Human override authority (merge_eligible=false; merged only if listed above): "
                      + "; ".join(f"{o['batch']} ({', '.join(o['units'])}) by {o['decision_id']}" for o in overrides) + ".")
     if not auto_merge:
         urls = [r["pr_url"] for r in results
