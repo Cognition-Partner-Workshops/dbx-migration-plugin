@@ -127,6 +127,15 @@ def test_compare_grants_folds_many_to_one_principal_map():
     assert compare_grants("o", s, t, {"reader": "app", "writer": "app"}) == []
 
 
+def test_compare_grants_missing_folds_many_to_one():
+    s = SchemaFacts(grants={"reader": frozenset({"select"}), "writer": frozenset({"insert"})})
+    t = SchemaFacts(grants={"app": frozenset({"select"})})
+    missing = compare_grants("o", s, t, {"reader": "app", "writer": "app"})
+    assert [f.check for f in missing] == ["grant_missing"]
+    assert "insert" in missing[0].detail
+    assert "reader" in missing[0].detail and "writer" in missing[0].detail
+
+
 def test_compare_identity_columns():
     colmap = {"loan_id": "loan_id"}
     s = SchemaFacts(identity_columns={"loan_id"})
@@ -265,6 +274,21 @@ def test_tier0_informational_target_fk_is_a_finding_not_a_pass():
     assert t0["stats"]["structural_diff"]["loans"]["constraints"]
     assert result["merge_eligible"] is False
     assert "structural_gap" in result["merge_block_reasons"]
+
+
+def test_tier0_informational_target_pk_still_counts_for_a_blind_source():
+    src = _facts(LOANS_FACTS, unsupported=frozenset({"constraints"}),
+                 primary_key=(), unique=frozenset(), foreign_keys=set(),
+                 foreign_keys_informational=set(), not_null=frozenset(),
+                 checks=frozenset(), check_count=0, expression_unique=frozenset())
+    tgt = _facts(TARGET_LOANS_FACTS, primary_key=(),
+                 primary_key_informational=("loan_id",))
+    result = _live(loans_src_facts=src, loans_tgt_facts=tgt)
+    t0 = result["tiers"][0]
+    assert t0["passed"] is True
+    assert any("target has" in n and "constraints" in n for n in t0["stats"]["unverified"])
+    assert result["merge_eligible"] is False
+    assert t0["stats"]["loans"]["target"]["primary_key_informational"] == ["loan_id"]
 
 
 def test_tier0_informational_target_pk_is_a_finding_not_a_pass():

@@ -115,16 +115,17 @@ def compare_grants(obj: str, s: SchemaFacts, t: SchemaFacts,
     mapped: dict[str, list[str]] = {}
     for g in s.grants:
         mapped.setdefault(principal_map.get(g, g), []).append(g)
-    for g in sorted(s.grants):
-        tg, s_privs = principal_map.get(g, g), _capabilities(s.grants[g])
+    for tg in sorted(mapped):
+        names = ",".join(sorted(mapped[tg]))
+        union = set().union(*(_capabilities(s.grants[g]) for g in mapped[tg]))
         if tg not in t.grants:
             findings.append(Finding(obj, "grant_missing",
-                                    f"source grant {g} ({','.join(sorted(s_privs))}) has no target "
-                                    f"grant for {tg}"))
-        elif missing := sorted(s_privs - _capabilities(t.grants[tg])):
+                                    f"source grant {names} ({','.join(sorted(union))}) has no "
+                                    f"target grant for {tg}"))
+        elif missing := sorted(union - _capabilities(t.grants[tg])):
             findings.append(Finding(obj, "grant_missing",
-                                    f"source grant {g} is missing {','.join(missing)} on target "
-                                    f"grantee {tg}"))
+                                    f"source grant {names} is missing {','.join(missing)} on "
+                                    f"target grantee {tg}"))
     for tg in sorted(t.grants):
         if tg in mapped:
             union = set().union(*(_capabilities(s.grants[g]) for g in mapped[tg]))

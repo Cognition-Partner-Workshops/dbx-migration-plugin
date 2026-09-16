@@ -1328,7 +1328,8 @@ def _category_content(f: SchemaFacts, cat: str) -> int:
         return len(f.indexes) + len(f.partial) + len(f.expression_indexes)
     if cat == "sequences_identity":
         return len(f.identity_columns)
-    return (bool(f.primary_key) + len(f.unique) + len(f.foreign_keys) + len(f.checks)
+    return (bool(f.primary_key) + bool(f.primary_key_informational) + len(f.unique)
+            + len(f.foreign_keys) + len(f.foreign_keys_informational) + len(f.checks)
             + len(f.not_null) + len(f.expression_unique))
 
 
@@ -1722,7 +1723,9 @@ def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any
 
 
 def _facts_dict(f: SchemaFacts) -> dict:
-    return {"primary_key": list(f.primary_key), "unique": sorted(map(list, f.unique)),
+    return {"primary_key": list(f.primary_key),
+            "primary_key_informational": list(f.primary_key_informational),
+            "unique": sorted(map(list, f.unique)),
             "unique_nulls_equal": sorted(map(list, f.unique_nulls_equal)),
             "foreign_keys": sorted([list(c), r, list(rc), *f.foreign_key_actions.get((c, r, rc), ())]
                                    for c, r, rc in f.foreign_keys),
