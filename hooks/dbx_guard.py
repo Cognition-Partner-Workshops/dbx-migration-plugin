@@ -8,7 +8,10 @@ bundle targets fail closed when empty; Lakebase writes use allowlisted projects 
 simple command by its program: Databricks clients pass `_DBX_READ`
 shapes and mutate only allowlisted securables; REST to a workspace host is GET without a body; deploys need a listed target;
 identity is never changed. Legacy-only clients and generic clients naming a legacy source run read shapes only; a generic
-client elsewhere writes when every host candidate is in `target_hosts` and the write resolves to a listed catalog / database.
+client elsewhere writes when every host candidate is in `target_hosts` and the write resolves to a listed catalog / database. A
+legacy write approves only with `DBX_DECISION=D-<id>` matching a `legacy_write_authorized` row in
+`06_decisions.md` that names the object; warn mode never downgrades a legacy write. Decision rows that authorize legacy writes
+are added by a human via PR; the edit tool cannot add them.
 Nothing writes `.migration/` or the running guard's tree (git there is the `_git_reads` allowlist). Scripts and SQL files are
 read in the command's effective directory (event cwd, cd / pushd / env -C / git -C); what the guard cannot read blocks where a
 client is involved. No `.migration/` up the tree approves everything, one without a readable allowlist blocks everything, and the
@@ -124,6 +127,26 @@ _PY_WRITE = re.compile(r"""['"](?:[wax]\+?|\+?>>?|\+<)['"]|\.write\w*\(|json\.du
                        r"""shutil\.|\.(?:unlink|rename|rmdir|mkdir|touch|chmod)\(|\bunlink\b|\bwriteFile\w*\(""")
 _MIGRATION_PATH = re.compile(r"[^\s'\"()]*\.migration(?:/[^\s'\"()]*)?")
 _DECISION_ROW = re.compile(r"(?m)^\s*(?:\|\s*|#{1,6}\s*)?(D-[A-Za-z0-9][\w.-]*)\b")
+_DECISION_ID = re.compile(r"D-[A-Za-z0-9][\w.-]*")
+_WRITE_OBJECT = re.compile(
+    r"(?is)^\s*(?:DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|UPDATE(?:\s+TOP\s*\([^)]*\)(?:\s+PERCENT)?|\s+STATISTICS|\s+(?:ONLY|LOW_PRIORITY|IGNORE))*|TRUNCATE(?:\s+TABLE)?|"
+    r"(?:CREATE|ALTER|DROP)(?:\s+\w+)*?\s+INDEX(?:\s+IF\s+(?:NOT\s+)?EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
+    r"CREATE(?:\s+OR\s+REPLACE)?\s+(?:\w+\s+)*?"
+    r"(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
+    r"(?:ALTER|DROP)(?:\s+\w+)*?\s+"
+    r"(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+EXISTS)?|"
+    r"(?:GRANT|REVOKE)\b.*?\bON\s+ALL\s+\w+\s+IN\s+SCHEMA|"
+    r"GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)"
+)
+_WRITE_OBJECT_NEXT = re.compile(r"\s*,\s*([\w.$\"\[\]`]+)")
+_AUTHORIZED = "authorized: decision "
+_LEGACY_TAIL = " (legacy is read-only in every phase)"
+
+
+class _Legacy(str):
+    """A violation on a legacy source; never downgraded by warn mode."""
+
+
 _RMTREE = re.compile(r"rmtree\(\s*(?:['\"]([^'\"]*)['\"]|(os\.getcwd\(\)|Path\.cwd\(\)|Path\(\s*(?:['\"]\.?['\"])?\s*\)))")
 _SQL_OUT_PATH = re.compile(r"(?i)(?:\bTO\s+|\\[ow]\s+|:out\s+|\bSPOOL\s+|\bFILE\s*=\s*)'?([^\s'\"]*\.migration(?:/[^\s'\"]*)?)")
 _SQL_OPAQUE = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)|'(?:[^']|'')*(?:'|\Z)", re.DOTALL)
@@ -296,11 +319,17 @@ class Verdict:
 
     @classmethod
     def of(cls, violations: list[str], cfg: GuardConfig) -> Verdict:
-        if not violations:
-            return cls("approve")
+        """Warn mode downgrades ordinary violations, never an unauthorized legacy write."""
+        notes = [v for v in violations if v.startswith(_AUTHORIZED)]
+        real = [v for v in violations if not v.startswith(_AUTHORIZED)]
+        if not real:
+            reason = "dbx-migration-factory guard: " + "; ".join(notes) if notes else ""
+            return cls("approve", reason, violations)
         reason = ("dbx-migration-factory guard: " + "; ".join(violations) + ". Fix the command or, if the target is legitimate, add "
                   "it to .migration/allowed_targets.json via a recorded decision (.migration/06_decisions.md); never work around the guard.")
-        return cls("approve", "WARN (guard_mode=warn): " + reason, violations) if cfg.mode == "warn" else cls("block", reason, violations)
+        if cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
+            return cls("approve", "WARN (guard_mode=warn): " + reason, violations)
+        return cls("block", reason, violations)
 
 
 def _norm(ident: str) -> str:
@@ -807,6 +836,53 @@ def _non_reads(sql: str) -> list[str]:
     return bad
 
 
+def _write_objects(statements: list[str]) -> list[list[str]]:
+    """The normalized object names matched by the write statements."""
+    objects = []
+    for statement in statements:
+        match = _WRITE_OBJECT.match(statement)
+        names = [re.sub(r'["`\[\]]', "", match.group(1))] if match else []
+        while match:
+            match = _WRITE_OBJECT_NEXT.match(statement, match.end())
+            if match:
+                names.append(re.sub(r'["`\[\]]', "", match.group(1)))
+        objects.append(names)
+    return objects
+
+
+def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None, str | None]:
+    """The decision token, and the missing condition when its ledger row cannot authorize every write."""
+    decision_id = next((a.split("=", 1)[1] for a in reversed(seg.assigns) if a.startswith("DBX_DECISION=")), None)
+    if not decision_id:
+        return None, "no `DBX_DECISION=D-<id>` prefix on the command"
+    if not _DECISION_ID.fullmatch(decision_id):
+        return decision_id, f"`{decision_id}` is not a row in .migration/06_decisions.md"
+    try:
+        ledger = (root / ".migration" / "06_decisions.md").read_text(errors="replace")
+    except OSError:
+        return decision_id, "cannot read .migration/06_decisions.md"
+    row = next((line for line in ledger.splitlines()
+                if (match := _DECISION_ROW.search(line)) and match.group(1).lower() == decision_id.lower()), None)
+    if row is None:
+        return decision_id, f"`{decision_id}` is not a row in .migration/06_decisions.md"
+    if "legacy_write_authorized" not in row.lower():
+        return decision_id, f"row `{decision_id}` does not contain `legacy_write_authorized`"
+    normalized_row = re.sub(r'["`\[\]]', "", row)
+    objects = _write_objects(statements)
+    if len(objects) != len(statements) or any(not names for names in objects):
+        statement = next(statement for statement in statements if not _WRITE_OBJECT.match(statement))
+        return decision_id, f"cannot tell which object `{statement[:60]}` writes"
+    for names, statement in zip(objects, statements):
+        for obj in names:
+            if obj.startswith("$") or obj.endswith("$") or re.search(r"[$:&@]\{?\(", statement):
+                return decision_id, f"`{obj}` is a run-time substitution; the decision must name the literal object"
+    for names in objects:
+        for obj in names:
+            if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", normalized_row, re.IGNORECASE):
+                return decision_id, f"row `{decision_id}` does not name `{obj}`"
+    return decision_id, None
+
+
 def _hosts(seg: _Seg, recon: list[list[str]] = ()) -> list[str]:
     """Every host / DSN candidate of a generic client: host flags and variables, URI / conninfo hosts on the line or in a reconnect
     (`recon`), the words a reconnect names after its database, a bare `$VAR` where a DSN stands, a `_DSN_POSITIONAL` client's first."""
@@ -873,25 +949,34 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     """A legacy-only client, or a generic one whose command names a legacy source, runs read shapes only; a generic client
     elsewhere may write when every host candidate (line and reconnect meta-commands) is allowlisted and the write resolves to an
     allowlisted catalog / database (default: the one database named by `-d`/`-D`/`--dbname`, URI, `dbname=` or a reconnect)."""
-    base, tail = seg.argv0, " (legacy is read-only in every phase)"
+    base, tail = seg.argv0, _LEGACY_TAIL
     legacy, hits = base in _LEGACY_ONLY, _context(seg.text, cfg, legacy_only=True)
     if base in _LOADERS:
-        return [f"`{base}` is a loader: nothing but reads ever runs against a legacy source" + tail]
+        return [_Legacy(f"`{base}` is a loader: nothing but reads ever runs against a legacy source" + tail)]
     sql, unreadable = _sql_text(seg, root, [seg.argv[1]] if base == "bcp" and len(seg.argv) > 2 and "queryout" in seg.argv[2:4] else [])
+    non_reads = _non_reads(sql)
     bad = [b.split("\n", 1)[0][:80] for b in [
         *([f"stdin from `{seg.opaque}`, a program or expansion the guard cannot read"] if seg.opaque else []),
         *([f"{base} (a migration tool: every run writes its target)"] if base in _WRITERS else []),
-        *(["bcp ... in (loader)"] if base == "bcp" and "in" in seg.argv[1:4] else []), *_non_reads(sql)]]
-    violations = [_UNREADABLE.format(who="legacy client", files=unreadable) + tail] if unreadable and (legacy or hits) else []
+        *(["bcp ... in (loader)"] if base == "bcp" and "in" in seg.argv[1:4] else []), *non_reads]]
+    violations = [_Legacy(_UNREADABLE.format(who="legacy client", files=unreadable) + tail)] if unreadable and (legacy or hits) else []
     if unreadable and not violations:
         bad.insert(0, f"script(s) {unreadable} the guard cannot read")
     if not bad:
         return violations
     recon = [re.sub(r"(?<!\S)-(?:\w(?:\s+[^-\s]\S*)?|\S\S+)|['\"]", " ", f"{v} {a}").split() for v, a in _RECONNECT.findall(sql)]
-    if legacy:
-        violations.append(f"non-read statement through a legacy-only client `{base}`: `{bad[0]}`" + tail)
-    elif hits:
-        violations.append(f"non-read statement against legacy source {hits}: `{bad[0]}`" + tail)
+    if legacy or hits:
+        violation = (f"non-read statement through a legacy-only client `{base}`" if legacy
+                     else f"non-read statement against legacy source {hits}") + f": `{bad[0]}`"
+        plain = non_reads and not unreadable and not seg.opaque and base not in _WRITERS and not (
+            base == "bcp" and "in" in seg.argv[1:4])
+        did, missing = _decision(seg, non_reads, root) if plain else (None, "the statement is not a readable SQL write")
+        if missing is None:
+            objects = [obj for names in _write_objects(non_reads) for obj in names]
+            violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {', '.join(objects)} "
+                              "(legacy_write_authorized row in .migration/06_decisions.md)")
+        else:
+            violations.append(_Legacy(f"{violation}; a recorded decision would allow it, but {missing}{tail}"))
     elif not (hosts := _hosts(seg, recon)) or not all(h in cfg.target_hosts for h in hosts):
         violations.append(f"non-read statement through `{base}` to a host that is not a literal in target_hosts {cfg.target_hosts} "
                           f"(seen: {sorted(set(hosts))[:6]}; every host must be listed, an empty list blocks every write): `{bad[0]}`")
@@ -1120,8 +1205,8 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         if not hits:
             violations += _catalog_violations(m.group(2), cfg, None, "")
         elif bad := _non_reads(m.group(2)):
-            violations.append(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}` "
-                              "(legacy is read-only in every phase)")
+            violations.append(_Legacy(f"non-read statement against legacy source {hits} in a program: `{bad[0][:80]}` "
+                                     + _LEGACY_TAIL))
     return violations
 
 
@@ -1252,7 +1337,7 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
                 and not read_shape):
             violations.append(f"remote command `{base}` on legacy host {hits} is not a read shape the guard models; "
                               "legacy hosts are read-only")
-    return violations
+    return [_Legacy(v) for v in violations]
 
 
 # ---------------------------------------------------------------- writes: .migration/, the credential store, the running guard
@@ -1521,11 +1606,20 @@ def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd
     violations = []
     decision = False
     if kind in ("inside", "self"):
-        decision = Path(file_path).name == "06_decisions.md" and len(_DECISION_ROW.findall(new)) > len(_DECISION_ROW.findall(old))
+        ledger = Path(file_path).name == "06_decisions.md"
+        added = new[len(old):] if new.startswith(old) else new
+        authorized = "legacy_write_authorized" in added.lower()
+        decision = bool(ledger and tool != "MultiEdit" and new.startswith(old) and added and _DECISION_ROW.search(added)
+                        and not authorized)
         if not decision:
-            violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
-                              ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
-                              "decision — 06_decisions.md accepts only an added `D-<id>` row)")
+            if ledger and authorized:
+                violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
+            elif ledger:
+                violations.append("06_decisions.md is append-only: the edit must keep the existing text and only add `D-<id>` rows")
+            else:
+                violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
+                                  ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
+                                  "decision — 06_decisions.md accepts only an added `D-<id>` row)")
     elif kind == "identity":
         violations.append(f"file-edit tool `{tool}` writes `{file_path}`, the Databricks CLI's credential store; the session runs as the "
                           "doctor-verified migration principal only")
@@ -1586,7 +1680,8 @@ def evaluate_with_workdirs(command: str, cfg: GuardConfig, root: Path, cwd: str 
             continue
         if other is not None and other.path not in seen:
             seen.add(other.path)
-            violations += [f"[{other.path}] {x}" for x in evaluate(command, other, d).violations]
+            violations += [type(x)(f"[{other.path}] {x}") for x in evaluate(command, other, d).violations
+                           if not x.startswith(_AUTHORIZED)]
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 

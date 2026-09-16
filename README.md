@@ -109,3 +109,14 @@ for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row the
 `tool_name`; the guard reads `tool_input.file_path` and its new content. It blocks writes under `.migration/` except
 `recon/` and `waves/`, and permits `06_decisions.md` only when the edit adds a `D-<id>` row. This covers only file-edit
 tools the platform routes through PreToolUse under those names.
+
+**Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
+`DBX_DECISION=D-<id>` prefix matching a `legacy_write_authorized` row in `.migration/06_decisions.md` that names every
+object written. `guard_mode: warn` never downgrades an unauthorized legacy write. Decision rows that authorize legacy writes
+are added by a human via PR; the edit tool cannot add them.
+
+The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
+`.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
+plugin to, or installation fails with "Conflicting version pins"; when the org bumps its pin, bump
+this one in the same change. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
+`databricks/databricks-agent-skills` explicitly; transitive dependencies are not exempt.
