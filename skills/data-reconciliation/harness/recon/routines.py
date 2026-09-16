@@ -289,17 +289,32 @@ def _regrade(claim: dict, where: str, writing: dict[str, list[str]], committed: 
     return graded
 
 
+def _walk(path: Path) -> Path:
+    """The absolute path, `..` folded lexically as long as no symlink was crossed before it; after a
+    symlink `..` means the link target's parent on disk and some other directory on paper."""
+    parts = Path(os.path.join(os.getcwd(), path)).parts
+    node, crossed = Path(parts[0]), None
+    for part in parts[1:]:
+        if part == "..":
+            if crossed is not None:
+                raise ConfigError(f"{path}: .. after the symlink {crossed} leaves the repository unseen")
+            node = node.parent
+        elif part != ".":
+            node = node / part
+            if crossed is None and node.is_symlink():
+                crossed = node
+    return node
+
+
 def load_runs(path: Path, repo: Path = Path(".")) -> list[dict]:
     """Read run records and stamp each with `record`, its path inside `repo` (never what the file
     says about itself); a file outside the repository, or reached through a symlink, can be nobody's
     committed evidence and is refused before it is read."""
-    if ".." in Path(path).parts:
-        raise ConfigError(f"{path}: has a .. component; a symlink before it would leave the repository unseen")
     files = sorted(path.glob("*.run.json")) if path.is_dir() else [path]
-    root = Path(os.path.abspath(repo))
+    root = _walk(Path(repo))
     runs = []
     for f in files:
-        rel = Path(os.path.relpath(os.path.abspath(f), root))
+        rel = Path(os.path.relpath(_walk(f), root))
         if ".." in rel.parts:
             raise ConfigError(f"{f}: is outside the repository {root}")
         node = root
@@ -307,6 +322,9 @@ def load_runs(path: Path, repo: Path = Path(".")) -> list[dict]:
             node = node / part
             if node.is_symlink():
                 raise ConfigError(f"{rel.as_posix()}: is a symlink; a committed run record is a regular file")
+        real_root, real = os.path.realpath(root), os.path.realpath(f)
+        if os.path.commonpath([real_root, real]) != real_root:
+            raise ConfigError(f"{f}: is outside the repository {root} (really {real})")
         try:
             run = json.loads(f.read_text())
         except (OSError, json.JSONDecodeError) as exc:

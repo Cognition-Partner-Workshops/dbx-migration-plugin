@@ -409,10 +409,13 @@ def test_load_runs_refuses_a_symlinked_record_before_reading_it(tmp_path):
     (repo / "link").symlink_to(elsewhere, target_is_directory=True)
     (elsewhere / "recon").mkdir()
     (elsewhere / "recon" / "b.run.json").write_text(json.dumps(_run("app_pkg.write_run_log")))
-    with pytest.raises(ConfigError, match=r"link/\.\./recon/runs/b.run.json: has a \.\. component"):
+    with pytest.raises(ConfigError, match=r"link/\.\./recon/runs/b.run.json: \.\. after the symlink .*link"):
         load_runs(repo / "link" / ".." / "recon" / "runs" / "b.run.json", repo)
-    with pytest.raises(ConfigError, match=r"has a \.\. component"):
+    with pytest.raises(ConfigError, match=r"\.\. after the symlink"):
         load_runs(repo / "link" / ".." / "recon" / "runs", repo)
+    # a plain `..` that stays inside the repository is an ordinary path
+    assert load_runs(repo / "recon" / ".." / "recon" / "runs" / "b.run.json", repo)[0]["record"] == "recon/runs/b.run.json"
+    assert load_runs(repo / "recon" / ".." / "recon" / "runs", repo / "recon" / "..")[0]["record"] == "recon/runs/b.run.json"
 
 
 # ---- result.json / merge -------------------------------------------------------------------
