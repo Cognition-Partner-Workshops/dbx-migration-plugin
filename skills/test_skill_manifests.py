@@ -34,3 +34,33 @@ def test_required_databricks_plugin_is_pinned():
     assert dep["url"] == "https://github.com/databricks/databricks-agent-skills"
     assert dep["path"] == "plugins/databricks/claude"
     assert len(dep.get("sha", "")) == 40
+
+
+def test_source_access_folded_into_recon():
+    assert not (ROOT / "skills" / "lakehouse-federation").exists()
+    assert not (ROOT / "skills" / "backfill-planner").exists()
+    recon = (ROOT / "skills" / "data-reconciliation" / "SKILL.md").read_text()
+    assert "## Source access" in recon
+    assert "### Live mode prerequisites (Lakehouse Federation)" in recon
+    assert "### Load posture (materialize)" in recon
+    forbidden = ("lakehouse-federation", "backfill-planner")
+    allowed = ROOT / "skills" / "install-dbx-factory" / "playbooks" / "0-README.md"
+    for path in ROOT.glob("**/*.md"):
+        if path == allowed or ".git" in path.parts:
+            continue
+        text = path.read_text()
+        assert not any(term in text for term in forbidden), path
+
+
+def test_source_access_keeps_live_and_materialize_rules():
+    recon = (ROOT / "skills" / "data-reconciliation" / "SKILL.md").read_text()
+    for phrase in (
+        "CREATE CONNECTION ... OPTIONS (... secret(...))",
+        "legacy-query concurrency cap",
+        "CTAS from the foreign catalog",
+        "machine-readable table of object, class, method",
+        "drop and recopy any unverified partial partition",
+        "connector output never self-certifies",
+        "timestamp/SCN/LSN",
+    ):
+        assert phrase in recon
