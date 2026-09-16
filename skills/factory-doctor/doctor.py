@@ -615,7 +615,8 @@ def check_recon_family_supported(plugin_root: Path, source_family: str | None) -
         except ValueError:
             pass
     if not isinstance(reg, dict) or not isinstance(reg.get("live_tested"), list) \
-            or not isinstance(reg.get("untested"), list):
+            or not isinstance(reg.get("untested"), list) \
+            or not all(isinstance(f, str) for f in reg["live_tested"] + reg["untested"]):
         return Check(cid, "fail", f"cannot ask the harness which families it supports "
                      f"({how} families rc={rc}): {_redact(err or out)}", {"family": source_family})
     live = sorted(reg["live_tested"])

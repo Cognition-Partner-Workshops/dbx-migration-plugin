@@ -1660,6 +1660,14 @@ def test_recon_family_supported_fails_when_the_harness_cannot_answer(monkeypatch
     assert c.status == "fail" and "cannot ask the harness" in c.detail
 
 
+def test_recon_family_supported_fails_on_a_malformed_registry_instead_of_raising(monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which",
+                        lambda name: "/usr/bin/dbx-recon" if name == "dbx-recon" else None)
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, '{"live_tested": ["sqlserver", 1], "untested": [null]}', ""))
+    c = doctor.check_recon_family_supported(PLUGIN_ROOT, "sqlserver")
+    assert c.status == "fail" and "cannot ask the harness" in c.detail
+
+
 def test_recon_family_supported_is_its_own_row_beside_an_attested_principal(tmp_path):
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
