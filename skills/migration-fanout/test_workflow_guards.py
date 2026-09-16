@@ -46,7 +46,7 @@ def _batch_runtime():
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
                                                                          "gate_outcomes", "ledger_waiver"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA"}
+                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA", "DEFAULT_ACCEPTED"}
                     for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
