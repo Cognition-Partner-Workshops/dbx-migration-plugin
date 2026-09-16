@@ -730,8 +730,28 @@ def _push_pr(ws, n=1):
 
 def _unproven_pr(ws, n=1):
     """A pushed PR whose head is not yet an ancestor of origin's base tip."""
-    subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "x"], check=True)
-    return _push_pr(ws, n)
+    (ws / f"pr-{n}.sql").write_text("select 1")
+    subprocess.run(["git", "-C", str(ws), "add", f"pr-{n}.sql"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "x"], check=True)
+    head = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", f"HEAD:refs/pull/{n}/head",
+                    "HEAD~1:refs/heads/recon/wave-0"], check=True)
+    url = f"https://github.com/acme/target/pull/{n}"
+    _PR_HEADS[url] = head
+    return url
+
+
+def _squash_merge_to_base(ws):
+    """What a host's squash-merge leaves: a new commit on the base tip carrying the PR head's tree."""
+    git = ["git", "-C", str(ws)]
+    tip = subprocess.run(git + ["rev-parse", "origin/migration/x"],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    tree = subprocess.run(git + ["rev-parse", "HEAD^{tree}"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    merged = subprocess.run(git + ["commit-tree", tree, "-p", tip, "-m", "squash"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", f"{merged}:refs/heads/migration/x"], check=True)
 
 
 def _verify_report(**extra):
@@ -1179,6 +1199,48 @@ def test_the_close_reply_is_reconciled_against_git(tmp_path):
     result = _result(ws)
     assert result["close"]["merged_prs"] == [pr] and result["close"]["unmerged"] == []
     assert result["closed"] is True
+
+
+def test_a_squash_merged_pr_counts_as_merged(tmp_path):
+    """A squash/rebase merge leaves the gated head off the base history but its tree on it."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    (ws / "x.sql").write_text("select 1")
+    subprocess.run(["git", "-C", str(ws), "add", "x.sql"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "x"], check=True)
+    pr = _push_pr(ws)
+    _squash_merge_to_base(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _close_report(merged_prs=[pr])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+
+
+def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
+    """Resume replays the PASS gated at head A; the PR has since moved to B (B merged, A's verdict stands
+    for nothing): the wave cannot close over a commit it never gated."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr),
+                                 {"wave_verdict": "FAIL", "unit_verdicts": {"b-1": "FAIL"},
+                                  "findings": [], "changed_paths": []}])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["closed"] is False and result["batches"][0]["status"] == "PASS"
+
+    pointer = ws / ".migration/waves/current.json"
+    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
+                                   "hook_probe": "blocked:0123abcd"}))
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
+    subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "b"], check=True)
+    subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
+                    "HEAD:migration/x"], check=True)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _close_report(merged_prs=[pr])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["batches"][0]["status"] == "PASS"
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    unmerged = result["close"]["unmerged"]
+    assert unmerged[0]["pr_url"] == pr and "PR head moved" in unmerged[0]["reason"]
 
 
 def test_a_close_reply_is_reconciled_against_git_per_pr(tmp_path):

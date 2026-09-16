@@ -1498,27 +1498,55 @@ def validate_close(close, to_merge) -> list[str]:
     return problems
 
 
-def merged_on_base(to_merge):
-    """{pr_url} of the verified PRs whose gated head is already an ancestor of origin's base tip — the only
-    proof a merge happened; whatever the close step reported or failed to report is reconciled against git."""
+def proven_merged(to_merge):
+    """({proven pr_url}, {pr_url: reason}) — a merge counts only when the PR head still equals the gated
+    head (a commit appended after verification is not the verified tree) and that head is on origin's
+    base tip, directly or as a commit carrying the same tree for the PR's paths (a squash/rebase merge).
+    Whatever the close step reported or failed to report is reconciled against git."""
+    proven, reasons = set(), {}
     try:
         tip = _base_tip()
-    except (OSError, subprocess.SubprocessError):
-        return set()
+    except (OSError, subprocess.SubprocessError) as e:
+        return proven, {p["pr_url"]: f"cannot resolve origin/{BASE_BRANCH} ({e})" for p in to_merge}
     git = ["git", "-C", str(ROOT)]
-    proven = set()
     for p in to_merge:
-        head = p.get("pr_head")
+        url, head = p["pr_url"], p.get("pr_head")
         if not (isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head)):
+            reasons[url] = "no gated PR head"
+            continue
+        current = pr_head(url)
+        if current != head:
+            reasons[url] = ("PR head unreadable" if current is None
+                            else f"PR head moved from {head} to {current} after verification")
             continue
         try:
-            rc = subprocess.run(git + ["merge-base", "--is-ancestor", head, tip],
-                                check=False, capture_output=True, timeout=300).returncode
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if rc == 0:
-            proven.add(p["pr_url"])
-    return proven
+            merged = subprocess.run(git + ["merge-base", "--is-ancestor", head, tip],
+                                    check=False, capture_output=True, timeout=300).returncode
+            if merged == 0:
+                proven.add(url)
+                continue
+            if merged != 1:
+                raise subprocess.SubprocessError(f"merge-base rc={merged}")
+            mb = subprocess.run(git + ["merge-base", tip, head],
+                                check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+            out = subprocess.run(git + ["diff", "--name-only", "-z", mb, head],
+                                 check=True, capture_output=True, text=True, timeout=300).stdout
+            paths = [q for q in out.split("\0") if q]
+            if not paths:
+                reasons[url] = "PR diff is empty"
+                continue
+            commits = subprocess.run(git + ["rev-list", "-n", "500", tip, f"^{mb}"],
+                                     check=True, capture_output=True, text=True,
+                                     timeout=300).stdout.split()
+            if not any(subprocess.run(git + ["diff", "--quiet", c, head, "--", *paths],
+                                      check=False, capture_output=True, timeout=300).returncode == 0
+                       for c in commits):
+                reasons[url] = f"head not on origin/{BASE_BRANCH}"
+            else:
+                proven.add(url)
+        except (OSError, subprocess.SubprocessError) as e:
+            reasons[url] = f"merge proof failed ({e})"
+    return proven, reasons
 
 WAVE = MANIFEST["wave"]
 REPO = MANIFEST["repo"]
@@ -1735,7 +1763,8 @@ def close_prompt(to_merge, deadline_minutes):
         f"You are the wave-close step for wave {WAVE}. Repo: {REPO}. Merge exactly these PRs, nothing else: "
         f"{json.dumps(to_merge, sort_keys=True)}. Each was verified PASS by the independent verifier at "
         "pr_head; before merging, check the PR head still equals it and the PR is open and mergeable, "
-        "otherwise leave it and list it in unmerged with a one-sentence reason. Do it within "
+        "otherwise leave it and list it in unmerged with a one-sentence reason. Merge nothing whose head "
+        "is not exactly the verified pr_head, and never push to the PR branch. Do it within "
         f"{deadline_minutes} minutes; when time is up, stop and list the rest as unmerged. Write nothing: "
         "no commits, no files, no other PR; report `git diff --name-only` of anything you changed in "
         "changed_paths (it must be empty). The orchestrator commits the wave's ledger artifacts in one "
@@ -2072,7 +2101,7 @@ async def main():
                      "changed_paths": []}
     close_problems = validate_close(close, to_merge) if close is not None else []
     if close is not None:
-        raw, proven = close, merged_on_base(to_merge)
+        raw, (proven, proof) = close, proven_merged(to_merge)
         reported = raw.get("merged_prs") if isinstance(raw, dict) else None
         reported = {u for u in reported if isinstance(u, str)} if isinstance(reported, list) else set()
         reasons = {u["pr_url"]: u["reason"] for u in raw.get("unmerged", [])
@@ -2081,7 +2110,7 @@ async def main():
         changed = raw.get("changed_paths") if isinstance(raw, dict) else None
         close = {"merged_prs": [p["pr_url"] for p in to_merge if p["pr_url"] in proven],
                  "unmerged": [{"pr_url": p["pr_url"],
-                               "reason": (f"reported merged but head not on origin/{BASE_BRANCH}"
+                               "reason": (proof.get(p["pr_url"], "merge not proven")
                                           if p["pr_url"] in reported
                                           else reasons.get(p["pr_url"], "wave-close output invalid"))}
                               for p in to_merge if p["pr_url"] not in proven],
