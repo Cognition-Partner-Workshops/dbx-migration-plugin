@@ -167,6 +167,14 @@ def check_workspace(ws: Path) -> Check:
     missing = [f for f in REQUIRED_FILES if not (mig / f).exists()]
     if missing:
         return Check("workspace", "fail", f".migration/ incomplete: missing {missing}", {"missing": missing})
+    context = (mig / "00_context.md").read_text(errors="replace")
+    if not re.search(r"(?m)^##\s+Glossary\b", context) and not (mig / "02_glossary.md").exists():
+        return Check(
+            "workspace",
+            "fail",
+            "00_context.md has no '## Glossary' section (02_glossary.md was folded into it)",
+            {"missing": ["00_context.md#Glossary"]},
+        )
     return Check("workspace", "ok", f".migration/ has all {len(REQUIRED_FILES)} required files")
 
 

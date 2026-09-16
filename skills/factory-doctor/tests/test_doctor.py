@@ -39,7 +39,9 @@ def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), c
             mig.joinpath(f).write_text(json.dumps(allowed if allowed is not None else
                                                   {"catalogs": ["mig_cat"], "legacy_sources": ["LEGACY_DSN"]}))
         elif f == "00_context.md":
-            mig.joinpath(f).write_text(f"# context\n\nstop_mode: {stop_mode}\n")
+            mig.joinpath(f).write_text(
+                f"# context\n\nstop_mode: {stop_mode}\n\n## Glossary\n- term: meaning\n"
+            )
         else:
             mig.joinpath(f).write_text(f"# {f}\n")
     if with_lock:
@@ -584,9 +586,31 @@ def test_generated_and_folded_files_are_not_required(tmp_path):
     ws = make_workspace(tmp_path, omit=("02_glossary.md", "05_progress.md"))
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
     assert c["workspace"]["status"] == "ok"
-    (ws / ".migration" / "00_context.md").write_text("# no mode here\n")
+    (ws / ".migration" / "00_context.md").write_text("# no mode here\n\n## Glossary\n- term: meaning\n")
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
     assert sub_by_id({"checks": [c["workspace"]]}, "workspace")["stop_mode"]["status"] == "fail"
+
+
+def test_workspace_requires_glossary_section(tmp_path):
+    ws = make_workspace(tmp_path, omit=("02_glossary.md",))
+    (ws / ".migration" / "00_context.md").write_text("stop_mode: hard\n")
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "fail"
+    assert "Glossary" in c["workspace"]["detail"]
+
+    (ws / ".migration" / "00_context.md").write_text(
+        "stop_mode: hard\n\n## Glossary\n- term: meaning\n"
+    )
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "ok"
+
+
+def test_workspace_accepts_legacy_glossary_file(tmp_path):
+    ws = make_workspace(tmp_path)
+    (ws / ".migration" / "02_glossary.md").write_text("# legacy glossary\n")
+    (ws / ".migration" / "00_context.md").write_text("stop_mode: hard\n")
+    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
+    assert c["workspace"]["status"] == "ok"
 
 
 def test_setup_outputs_tolerances_json_is_required(tmp_path):
