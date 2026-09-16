@@ -455,7 +455,9 @@ def test_override_decision_is_the_row_whose_id_cell_is_the_decision_not_a_row_th
     override_decision = _batch_runtime()["override_decision"]
     assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u, supersedes D-7 |")
     assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u | D-7 |")
-    assert not override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u")   # not a table row
+    assert not override_decision("D-7", ["u"], "D-7 user:U1 merge_override for u")   # prose, not a table row
+    assert override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u")   # edge pipes are optional
+    assert override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u |")
     assert override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for v |\n| D-7 | user:U1 | merge_override for u |")
 
 

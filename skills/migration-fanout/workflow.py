@@ -216,10 +216,11 @@ def decision_ledger():
 
 def ledger_rows(ledger):
     """Each markdown table row of the ledger as (decision id, its cells): the id is the first cell that is
-    one alone, so a row that cites another decision in prose or a later column is not that decision's."""
+    one alone, so a row that cites another decision in prose or a later column is not that decision's.
+    Edge pipes are optional, as in markdown and the guard's ledger reading; a line without a pipe is prose."""
     for line in ledger.splitlines():
         line = line.strip()
-        if not line.startswith("|"):
+        if "|" not in line:
             continue
         cells = [" ".join(c.split()) for c in line.strip("|").split("|")]
         ids = [c for c in cells if DECISION_ID.fullmatch(c)]
