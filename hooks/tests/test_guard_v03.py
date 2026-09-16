@@ -307,6 +307,10 @@ def test_python_variable_sql_on_a_target_connection_resolves_or_fails_closed():
     block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); q='DROP TABLE staging'; c.execute(q); "
           "c.execute('DROP TABLE prod.s.t')\"")
     approve("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); c.execute(build())\"")
+    approve("python3 -c \"import asyncpg; c=asyncpg.connect(host='lakebase-host', database='mig_cat'); c.execute(build())\"")
+    block("python3 -c \"import pyodbc; c=pyodbc.connect('Server=lakebase-host;Database=mig_cat'); c.execute(build())\"")
+    block("python3 -c \"import pymssql; c=pymssql.connect(server='lakebase-host', database='mig_cat'); c.execute(build())\"")
+    assert "legacy" in block("python3 -c \"c=psycopg2.connect(host='tdprod.corp'); q='SELECT 1'; q='SELECT 2'; c.execute(q)\"").reason
     block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat', password=os.environ['PW']); c.execute(build())\"")
     block("python3 -c \"c=psycopg2.connect(host='lakebase-host'); c.execute(build())\"")
     block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='other'); c.execute(build())\"")

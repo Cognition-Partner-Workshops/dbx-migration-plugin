@@ -1133,9 +1133,9 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                     values = []
                     break
                 values.append(literal.group(2))
-            if assignments and values and len(assignments) == len(values):
-                statements.extend(values)
-            else:
+            if assignments and len(values) == len(assignments):
+                statements.extend(set(values))
+            if len(set(values)) != 1:
                 opaque = True
     violations = []
     for statement in statements:
@@ -1154,7 +1154,7 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                 violations += _catalog_violations(statement, cfg, default, "program")
     if opaque and hits:
         violations.append(_Legacy(f"statement built at run time against legacy source {hits} in a program" + _LEGACY_TAIL))
-    elif opaque and not (not databricks and not unresolved and not foreign and resolved_target and default and
+    elif opaque and not (pg and not databricks and not unresolved and not foreign and resolved_target and default and
                          default in {_norm(c) for c in cfg.catalogs}):
         violations.append("Python statement or connection is built at run time; the guard cannot resolve a non-read statement")
     return violations
