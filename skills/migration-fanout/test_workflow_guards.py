@@ -480,6 +480,17 @@ def test_override_decision_row_needs_human_provenance():
     assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 merge", "user:a.b@x.io merge"))
 
 
+def test_override_decision_marker_does_not_stand_in_for_a_unit_of_that_name():
+    """A unit may be called merge_override (UNIT_ID allows it); the row's one authority marker is not then
+    also the mention of that unit. The row has to name it a second time."""
+    override_decision = _batch_runtime()["override_decision"]
+    row = "| D-9 | 2024-05-03 | user:U2 | merge_override for an accepted feed gap |\n"
+    assert not override_decision("D-9", ["merge_override"], row)
+    assert not override_decision("D-9", ["merge_override", "u"], row.replace("gap", "gap in u"))
+    assert override_decision("D-9", ["merge_override"], row.replace("gap", "gap in merge_override"))
+    assert override_decision("D-9", ["merge_override", "u"], row.replace("gap", "gap in merge_override and u"))
+
+
 def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():
     src = WORKFLOW.read_text()
     tree = ast.parse(src)

@@ -219,7 +219,8 @@ def override_decision(decision_id, units, ledger):
     line carrying that id, human provenance (`user:<id>`; a default-accepted row is the orchestrator's,
     not a human's), the word merge_override and the id of every unit in the batch, in whatever column
     order the ledger keeps. Units are looked for in the row's text only: its decision ids, dates and
-    provenance are blanked first, so none of those stands in for a unit the row did not name."""
+    provenance are blanked first, so none of those stands in for a unit the row did not name; nor does
+    the marker stand in for a unit that happens to be called merge_override (the row names it again)."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
         return False
 
@@ -229,7 +230,8 @@ def override_decision(decision_id, units, ledger):
     for line in ledger.splitlines():
         if HUMAN_PROVENANCE.search(line) and re.search(word(decision_id), line):
             text = LEDGER_METADATA.sub(" ", line)
-            if all(re.search(word(w), text) for w in ("merge_override", *units)):
+            need = Counter(("merge_override", *units))
+            if all(len(re.findall(word(w), text)) >= n for w, n in need.items()):
                 return True
     return False
 
