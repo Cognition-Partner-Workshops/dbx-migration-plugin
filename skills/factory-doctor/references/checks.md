@@ -71,4 +71,6 @@ token is not in the field's `evidence` list — or when two `canonicalization.js
 the family or the spec will not load; `unverified` when no family is declared;
 `warn` when no dialect skill carries a map for the family or the chosen `--target-kind`;
 `ok` counts typed fields and records unmapped source types plus undeclared targets the
-harness fills; `skipped` only at setup.
+harness fills; `skipped` only at setup. The audit runs on the same harness `recon_harness`
+ran (`dbx-recon` on PATH, else the checkout's `python -m recon.cli type-map-audit`); a
+missing harness or unreadable output also fails.

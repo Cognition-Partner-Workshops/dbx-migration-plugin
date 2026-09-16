@@ -658,66 +658,67 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
     if not source_family:
         return Check(cid, "unverified", "pass --source-family (or run with --wave): target types "
                      "cannot be audited without the source family")
-    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
-    try:
-        from recon.config import ConfigError, load_mapping_spec
-        from recon.typemap import audit_spec, load_type_map, type_map_families, type_map_targets
-    except ImportError as e:
-        return Check(cid, "fail", f"harness typemap not importable: {_redact(str(e))}",
-                     {"family": source_family, "target_kind": target_kind})
-    maps = []
-    families = set()
-    kinds = set()
-    for p in sorted(plugin_root.glob("skills/*/canonicalization.json")):
-        families.update(type_map_families(p))
-        kinds.update(type_map_targets(p, source_family))
-        tm = load_type_map(p, source_family, target_kind)
-        if tm:
-            maps.append((p, tm))
-    if not maps:
-        if kinds:
+    cmd = _harness_command(plugin_root)
+    if cmd is None:
+        return Check(cid, "fail", "cannot audit target types: dbx-recon not on PATH and no "
+                     "checkout harness", {"family": source_family, "target_kind": target_kind})
+    argv, cwd, how = cmd
+    canon = sorted(plugin_root.glob("skills/*/canonicalization.json"))
+    cargs = [a for c in canon for a in ("--canonicalization", str(c))]
+    pargs = [a for k, v in (params or {}).items() for a in ("--param", f"{k}={v}")]
+    data = {"family": source_family, "target_kind": target_kind, "harness": how}
+    contradictions, unmapped, undeclared, fields = [], [], 0, 0
+    family_known = target_known = False
+    rel = None
+    for _, p_ in sorted(todo.items(), key=lambda kv: str(kv[1])):
+        rc, out, err = _run(argv + ["type-map-audit", "--spec", str(p_), "--family", source_family,
+                                  "--target-kind", target_kind, *cargs, *pargs],
+                            **({"cwd": cwd} if cwd else {}))
+        reg = None
+        if rc == 0:
+            try:
+                reg = json.loads(out)
+            except ValueError:
+                pass
+        if not isinstance(reg, dict) or not isinstance(reg.get("findings"), list)                 or not all(isinstance(f.get("verdict"), str) for f in reg["findings"]):
+            return Check(cid, "fail", f"cannot audit target types ({how} type-map-audit rc={rc}): "
+                         f"{_redact(err or out)}", data)
+        if reg.get("error"):
+            return Check(cid, "fail", f"{p_}: {_redact(str(reg['error']))} ({how})", data)
+        family_known |= bool(reg.get("family_known"))
+        target_known |= bool(reg.get("target_known"))
+        if reg.get("map"):
+            mp = Path(reg["map"])
+            rel = str(mp.relative_to(plugin_root)) if mp.is_relative_to(plugin_root) else str(mp)
+        for row in reg["findings"]:
+            fields += 1
+            if row["verdict"] in ("contradiction", "unrepresentable"):
+                contradictions.append(row)
+            elif row["verdict"] == "unmapped":
+                unmapped.append(row)
+            elif row["verdict"] == "undeclared":
+                undeclared += 1
+    if not target_known:
+        if family_known:
             return Check(cid, "warn", f"no {source_family}->{target_kind} type map in any "
-                         f"skills/*/canonicalization.json (the family maps to: {', '.join(sorted(kinds))}); "
-                         "the spec's target types are unaudited",
-                         {"families_with_maps": sorted(families), "target_kind": target_kind,
-                          "kinds_with_map": sorted(kinds)})
+                         f"skills/*/canonicalization.json ({how}); the spec's target types are "
+                         "unaudited", {**data, "family_known": True})
         return Check(cid, "warn", f"no type map for {source_family} in any "
                      "skills/*/canonicalization.json; the spec's target types are unaudited "
-                     "(adding a family is JSON)", {"families_with_maps": sorted(families),
-                                                    "target_kind": target_kind})
-    if len(maps) > 1:
-        return Check(cid, "fail", f"{source_family}: multiple canonicalization.json files carry "
-                     f"a type_map for it: {', '.join(str(p) for p, _ in maps)}")
-    map_path, tm = maps[0]
-    contradictions, unmapped, undeclared, fields = [], [], 0, 0
-    for _, p in sorted(todo.items(), key=lambda kv: str(kv[1])):
-        try:
-            spec = load_mapping_spec(p, params)
-        except (ConfigError, OSError, ValueError) as e:
-            return Check(cid, "fail", f"{p}: {_redact(str(e))}")
-        for row in audit_spec(tm, spec):
-            fields += 1
-            if row["status"] in ("contradiction", "unrepresentable"):
-                contradictions.append(row)
-            elif row["status"] == "unmapped":
-                unmapped.append(row)
-            elif row["status"] == "undeclared":
-                undeclared += 1
-    rel = str(map_path.relative_to(plugin_root)) if map_path.is_relative_to(plugin_root) else str(map_path)
+                     "(adding a family is JSON)", {**data, "family_known": False})
+    data.update({"map": rel, "fields": fields,
+                 "unmapped": [r["field"] for r in unmapped], "undeclared": undeclared})
     if contradictions:
-        shown = "; ".join(f"{r['object']}.{r['source']} {r['source_type']} -> declared "
-                          f"{r['target_type']}, map says {r['expected']}"
+        shown = "; ".join(f"{r['field']} {r['source_type']} -> declared "
+                          f"{r['target_type']}, map says {r['detail']}"
                           for r in contradictions[:5])
         more = f" …and {len(contradictions) - 5} more" if len(contradictions) > 5 else ""
         return Check(cid, "fail", f"{len(contradictions)} field(s) declare a target type the "
-                     f"{source_family} type map forbids: {shown}{more}",
-                     {"map": rel, "target_kind": target_kind, "contradictions": contradictions,
-                      "unmapped": [f"{r['object']}.{r['source']}" for r in unmapped]})
+                     f"{source_family} type map forbids: {shown}{more} ({how})",
+                     {**data, "contradictions": contradictions})
     return Check(cid, "ok", f"{fields} typed fields agree with {rel}; {len(unmapped)} unmapped "
-                 f"source types recorded, {undeclared} undeclared targets the harness fills at run time",
-                 {"map": rel, "target_kind": target_kind, "fields": fields,
-                  "unmapped": [f"{r['object']}.{r['source']}" for r in unmapped],
-                  "undeclared": undeclared})
+                 f"source types recorded, {undeclared} undeclared targets the harness fills at run "
+                 f"time ({how})", data)
 
 
 # ------------------------------------------------------------------ delete evidence (source CDC)

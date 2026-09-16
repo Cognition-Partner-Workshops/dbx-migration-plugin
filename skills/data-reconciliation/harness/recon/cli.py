@@ -156,6 +156,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="verify the harness install (no connections needed)")
     sub.add_parser("families", help="print the live-tested vs refused source families as JSON")
+    t = sub.add_parser("type-map-audit", help="audit a spec's declared target types against the "
+                       "family type_map (JSON, no connections)")
+    t.add_argument("--spec", required=True, type=Path)
+    t.add_argument("--family", required=True)
+    t.add_argument("--target-kind", default="databricks", choices=TARGET_KINDS)
+    t.add_argument("--canonicalization", action="append", type=Path, default=[])
+    t.add_argument("--param", action="append", default=[])
     e = sub.add_parser("estimate", help="statements/rows a run would cost (no connections); "
                                         "summed per wave for the STOP C cost line")
     e.add_argument("--mapping", required=True, type=Path)
@@ -219,6 +226,36 @@ def main(argv: list[str] | None = None) -> int:
             "live_tested": sorted(f for f in SOURCE_ADAPTERS if not is_untested_source_family(f)),
             "untested": sorted(f for f in SOURCE_ADAPTERS if is_untested_source_family(f)),
         }))
+        return 0
+
+    if args.cmd == "type-map-audit":
+        from .typemap import audit_spec, load_type_map, type_map_families, type_map_targets
+        out = {"family_known": False, "target_known": False, "map": None,
+               "findings": [], "error": None}
+        try:
+            maps = []
+            for c in args.canonicalization:
+                if args.family in type_map_families(c):
+                    out["family_known"] = True
+                    if args.target_kind in type_map_targets(c, args.family):
+                        out["target_known"] = True
+                tm = load_type_map(c, args.family, args.target_kind)
+                if tm:
+                    maps.append((c, tm))
+            if len(maps) > 1:
+                out["error"] = (f"multiple canonicalization files carry a type_map for "
+                                f"{args.family}")
+            elif maps:
+                out["map"] = str(maps[0][0])
+                spec = load_mapping_spec(args.spec, parse_params(args.param))
+                for row in audit_spec(maps[0][1], spec):
+                    out["findings"].append({"field": f"{row['object']}.{row['source']}",
+                                            "verdict": row["status"], "detail": row["expected"],
+                                            "source_type": row["source_type"],
+                                            "target_type": row["target_type"]})
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+        print(json.dumps(out))
         return 0
 
     if args.cmd == "run" and args.mode in PLANNED_MODES:

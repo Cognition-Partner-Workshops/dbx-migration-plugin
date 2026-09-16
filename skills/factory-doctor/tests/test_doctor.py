@@ -1764,7 +1764,6 @@ def test_type_map_audit_warns_for_a_family_with_no_map(tmp_path):
     _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
     c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "sqlserver", PLUGIN_ROOT)
     assert c.status == "warn" and "sqlserver" in c.detail
-    assert c.data["families_with_maps"] == ["oracle"]
 
 
 def test_type_map_audit_audits_against_the_declared_target_kind(tmp_path):
@@ -1780,39 +1779,53 @@ def test_type_map_audit_audits_against_the_declared_target_kind(tmp_path):
     assert c.status == "fail" and c.data["target_kind"] == "databricks"
 
 
-def test_type_map_audit_warns_when_the_family_maps_a_different_kind(tmp_path):
+def test_type_map_audit_warns_when_the_family_maps_a_different_kind(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
     _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
-    fake_root = tmp_path / "fake_root"
-    (fake_root / "skills" / "x").mkdir(parents=True)
-    (fake_root / "skills" / "x" / "canonicalization.json").write_text(json.dumps(
-        {"rules": [], "type_map": {"sqlserver": {"databricks": {"types": []}}}}))
-    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "sqlserver", fake_root,
+    payload = json.dumps({"family_known": True, "target_known": False, "map": None,
+                          "findings": [], "error": None})
+    monkeypatch.setattr(doctor.shutil, "which",
+                        lambda name: "/usr/bin/dbx-recon" if name == "dbx-recon" else None)
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, payload, ""))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "sqlserver", PLUGIN_ROOT,
                                     target_kind="lakebase")
     assert c.status == "warn" and "sqlserver->lakebase" in c.detail
-    assert c.data["kinds_with_map"] == ["databricks"]
+    assert c.data["harness"] == "dbx-recon"
 
 
-def test_type_map_audit_fails_when_two_files_claim_the_family(tmp_path):
+def test_type_map_audit_fails_when_the_harness_reports_an_error(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
     _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
-    doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)  # primes the import
-    fake_root = tmp_path / "fake_root"
-    for name in ("a", "b"):
-        d = fake_root / "skills" / name
-        d.mkdir(parents=True)
-        (d / "canonicalization.json").write_text(json.dumps(
-            {"rules": [], "type_map": {"oracle": {"databricks": {"types": [{"source": "NUMBER", "target": "decimal(38,10)"}]}}}}))
-    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", fake_root)
-    assert c.status == "fail" and "a" in c.detail and "b" in c.detail
+    payload = json.dumps({"family_known": True, "target_known": True, "map": None,
+                          "findings": [], "error": "ConfigError: multiple canonicalization "
+                          "files carry a type_map for oracle"})
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, payload, ""))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and "multiple canonicalization" in c.detail
 
 
-def test_type_map_audit_carries_the_resolve_problem_for_a_missing_child_unit(tmp_path):
+def test_type_map_audit_fails_on_malformed_harness_output(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
-    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True,
-                        units=["ghost"], source_family="oracle")
-    row = by_id(report)["type_map_audit"]
-    assert row["status"] == "fail" and "ghost" in row["detail"]
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, "not json", ""))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and "cannot audit" in c.detail
+
+
+def test_type_map_audit_asks_the_installed_harness_first(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    payload = json.dumps({"family_known": True, "target_known": True,
+                          "map": "/x/canonicalization.json",
+                          "findings": [{"field": "orders.ORDER_ID", "verdict": "ok",
+                                        "detail": "bigint", "source_type": "NUMBER(18,0)",
+                                        "target_type": "bigint"}], "error": None})
+    monkeypatch.setattr(doctor.shutil, "which",
+                        lambda name: "/usr/bin/dbx-recon" if name == "dbx-recon" else None)
+    monkeypatch.setattr(doctor, "_run", lambda cmd, **kw: (0, payload, ""))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "ok" and c.data["harness"] == "dbx-recon" and c.data["fields"] == 1
+
 
 
 # ------------------------------------------------------------------ ledger integrity rows (A2c)

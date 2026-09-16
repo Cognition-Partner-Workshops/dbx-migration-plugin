@@ -230,6 +230,8 @@ def audit_field(tm: TypeMap, source_type: str, target_type: str,
     if not (target_type or "").strip():
         return "undeclared", expected
     dname, dargs = _parse(target_type, kind=tm.target_kind)
+    if dname in _DECIMAL_SOURCES and len(dargs) == 1 and isinstance(dargs[0], int):
+        dargs = (dargs[0], 0)  # decimal(p) is scale-zero shorthand on both kinds
     # a declared decimal-family (p,s) that can't exist on the kind is a contradiction even
     # when a wildcard pattern would swallow it
     if (dname in _DECIMAL_SOURCES and len(dargs) == 2

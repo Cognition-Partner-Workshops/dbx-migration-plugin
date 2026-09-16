@@ -91,6 +91,8 @@ def test_expected_target(oracle_map, source_type, expected):
     ("TIMESTAMP", "timestamp_ltz", "contradiction"),
     ("TIMESTAMP WITH TIME ZONE", "timestamp", "ok"),
     ("NUMBER(10,2)", "NUMERIC(10,2)", "ok"),
+    ("NUMBER(7,0)", "decimal(7)", "ok"),       # single-arg decimal is scale-zero shorthand
+    ("NUMBER(7,0)", "decimal(39)", "contradiction"),  # still over the databricks ceiling
     ("NUMBER(10,2)", "", "undeclared"),
     ("SDO_GEOMETRY", "string", "unmapped"),
     ("", "string", "unmapped"),
@@ -254,6 +256,7 @@ def test_expected_target_lakebase(oracle_lakebase_map, source_type, expected):
     ("BINARY_DOUBLE", "float", "ok"),
     ("BINARY_DOUBLE", "double precision", "ok"),
     ("NUMBER(10,2)", "numeric(10,2)", "ok"),
+    ("NUMBER(7,0)", "numeric(7)", "ok"),
     ("NUMBER(10,2)", "double precision", "contradiction"),
 ])
 def test_audit_field_lakebase(oracle_lakebase_map, source_type, target_type, status):
