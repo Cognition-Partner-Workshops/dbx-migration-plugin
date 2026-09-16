@@ -22,7 +22,7 @@ from recon.config import (
 )
 from recon.engine import run_recon
 
-from tests.fakes import FakeSource, FakeTarget
+from tests.fakes import PROVEN_RERUN, FakeSource, FakeTarget
 
 RULES = [CanonRule("rstrip_spaces", "*"), CanonRule("empty_string_is_null", "*"),
          CanonRule("null_missing_equiv", "*"), CanonRule("identity", "*")]
@@ -516,15 +516,17 @@ def test_merge_eligibility_by_mode():
     from recon.report import build_result
     from recon.tiers import TierResult
     tier = TierResult(1, "x", True, 1, [])
-    assert build_result("u", "fixture", "m", "t", [tier])["merge_eligible"] is False
-    assert build_result("u", "continuous", "m", "t", [tier])["merge_eligible"] is False
-    assert build_result("u", "live", "m", "t", [tier])["merge_eligible"] is True
-    assert build_result("u", "snapshot", "m", "t", [tier])["merge_eligible"] is False
-    assert build_result("u", "snapshot", "m", "t", [tier],
+    proven = {"rerun_proof": PROVEN_RERUN}
+    assert build_result("u", "fixture", "m", "t", [tier], **proven)["merge_eligible"] is False
+    assert build_result("u", "continuous", "m", "t", [tier], **proven)["merge_eligible"] is False
+    assert build_result("u", "live", "m", "t", [tier], **proven)["merge_eligible"] is True
+    assert build_result("u", "live", "m", "t", [tier])["merge_eligible"] is False
+    assert build_result("u", "snapshot", "m", "t", [tier], **proven)["merge_eligible"] is False
+    assert build_result("u", "snapshot", "m", "t", [tier], **proven,
                         snapshot={"source": "s", "extracted_at": "2024-01-01T00:00:00Z",
                                   "row_counts": {"x": 1}})["merge_eligible"] is True
     assert build_result("u", "live", "m", "t",
-                        [TierResult(1, "x", False, 1, [])])["merge_eligible"] is False
+                        [TierResult(1, "x", False, 1, [])], **proven)["merge_eligible"] is False
 
 
 def test_result_names_the_harness_as_merge_authority():
@@ -594,7 +596,7 @@ def test_snapshot_manifest_and_merge_eligibility(tmp_path: Path, monkeypatch):
     assert set(snapshot) == {"source", "extracted_at", "row_counts"}
     result = build_result("u", "snapshot", "m", "t",
                           [TierResult(1, "counts", True, 1, [])],
-                          snapshot=snapshot)
+                          snapshot=snapshot, rerun_proof=PROVEN_RERUN)
     assert result["snapshot"] == snapshot and result["merge_eligible"] is True
     with pytest.raises(SystemExit, match="snapshot-manifest"):
         _load_snapshot(None, "snapshot")
@@ -626,7 +628,7 @@ def test_snapshot_provenance_matching_is_merge_eligible():
         "u", "snapshot", spec, TOL, RULES, source, target,
         snapshot={"source": "oracle", "extracted_at": "2024-01-01T00:00:00Z",
                   "row_counts": {"ORDERS": 2}},
-        source_family="oracle")
+        source_family="oracle", rerun_proof=PROVEN_RERUN)
     assert result["verdict"] == "PASS"
     assert result["merge_eligible"] is True
 

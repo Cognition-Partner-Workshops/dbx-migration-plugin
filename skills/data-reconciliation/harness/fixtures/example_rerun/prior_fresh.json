@@ -1,0 +1,26 @@
+{
+  "run": "fresh",
+  "status": "pass",
+  "evidence": "job-run/example-wave1-fresh",
+  "shape": {
+    "tables": {
+      "orders": [
+        {
+          "name": "order_id",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "amount",
+          "type": "decimal(18,2)",
+          "nullable": true
+        },
+        {
+          "name": "tags",
+          "type": "array<struct<k:string,v:string>>",
+          "nullable": true
+        }
+      ]
+    }
+  }
+}
