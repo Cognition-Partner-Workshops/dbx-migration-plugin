@@ -168,9 +168,8 @@ def reusable_record(record, manifest, manifest_bytes: bytes, expect_identity: st
     return record, ""
 
 
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(password|passwd|pwd|pass|token|access[_-]?token|secret|api[_-]?key|client[_-]?secret|"
-    r"private[_-]?key|sas|signature|sig|authorization)\b\s*[:=]\s*(?:bearer\s+|basic\s+)?"
+_SECRET_ASSIGNMENT = re.compile(r"(?i)\b(password|passwd|pwd|pass|token|access[_-]?token|secret|api[_-]?key|"
+    r"client[_-]?secret|private[_-]?key|sas|signature|sig|authorization)\b\s*[:=]\s*(?:bearer\s+|basic\s+)?"
     r"(\"[^\"]*\"|'[^']*'|[^\s;,&]+)")
 _BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
 _URL_USERINFO = re.compile(r"(://[^/\s:@]+):([^@\s]+)@")
@@ -337,14 +336,14 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
 
     if role == "child":
         # A child never live-probes the platform hook: it inherits the orchestrator's signed row.
-        row = next((c for c in (reused or {}).get("checks") or [] if isinstance(c, dict) and c.get(
-            "id") == "hook_guard"), None)
-        sub = next((s for s in ((row or {}).get("data") or {}).get("sub_results") or [] if isinstance(s, dict) and
-            s.get("id") == "hook_platform_loaded"), None)
+        signed_rows = (reused or {}).get("checks") or []
+        row = next((c for c in signed_rows if isinstance(c, dict) and c.get("id") == "hook_guard"), None)
+        subs = ((row or {}).get("data") or {}).get("sub_results") or []
+        sub = next((s for s in subs if isinstance(s, dict) and s.get("id") == "hook_platform_loaded"), None)
         if sub and isinstance(sub.get("status"), str) and isinstance(sub.get("detail"), str):
             out.append(Check("hook_platform_loaded", sub["status"],
-                f"reused from the orchestrator's record signed {reused.get('signed_at')}: {sub['detail']}", {**(
-                sub.get("data") or {}), "reused_from": reused.get("signed_at")}))
+                f"reused from the orchestrator's record signed {reused.get('signed_at')}: {sub['detail']}",
+                {**(sub.get("data") or {}), "reused_from": reused.get("signed_at")}))
         else:
             out.append(Check("hook_platform_loaded", "warn",
                 "orchestrator-only: the platform hook is proven once per wave by the orchestrator's live probe "
@@ -366,8 +365,8 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
                 (ws / HOOK_PROBE_NONCE).write_text(f"{nonce} {int(time.time())}\n")
             except OSError:
                 pass
-        why = ("the nonce did not match the one this workspace's last report issued; " if probe_result.startswith(
-            "blocked:") else "")
+        mismatched = probe_result.startswith("blocked:")
+        why = "the nonce did not match the one this workspace's last report issued; " if mismatched else ""
         out.append(Check("hook_platform_loaded", "unverified",
             why + "run the probe command in this session's shell; the guard's block message names "
             "__dbx_guard_probe__<nonce>; re-run the doctor with --hook-probe-result blocked:<nonce> "
@@ -398,8 +397,9 @@ def check_allowlist_committed(ws: Path) -> Check:
         states[rel] = "untracked" if not in_head else "clean" if disk == r.stdout else "modified since HEAD"
     bad = [f"{rel} {state}" for rel, state in states.items() if state != "clean"]
     if bad:
-        return Check("allowlist_committed", "fail", "the working copy is not the committed contract: " + "; ".join(
-            bad) + ". Restore HEAD's copy, or commit the change through a recorded decision, then re-run", states)
+        shown = "; ".join(bad)
+        return Check("allowlist_committed", "fail", "the working copy is not the committed contract: " + shown
+            + ". Restore HEAD's copy, or commit the change through a recorded decision, then re-run", states)
     return Check("allowlist_committed", "ok",
         "allowed_targets.json and 03_recon_tolerances.json are byte-equal to HEAD", states)
 
@@ -518,10 +518,10 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str, live_playboo
                 grouped: dict[str, list[dict]] = {}
                 for r in records:
                     grouped.setdefault(r["macro"], []).append(r)
-                data["duplicate"] = {m: [r.get("playbook_id") for r in rs] for m, rs in grouped.items() if len(
-                    rs) > 1}
-                findings += [f"duplicate: {m} ({', '.join(str(i) for i in ids)})" for m, ids in data[
-                    "duplicate"].items()]
+                data["duplicate"] = {
+                    m: [r.get("playbook_id") for r in rs] for m, rs in grouped.items() if len(rs) > 1}
+                for m, ids in data["duplicate"].items():
+                    findings.append(f"duplicate: {m} ({', '.join(str(i) for i in ids)})")
                 for macro, (f, _sha) in repo.items():
                     rs = grouped.get(macro)
                     if not rs:
@@ -535,8 +535,8 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str, live_playboo
     if findings:
         detail = "; ".join(findings) + ("; duplicates: archive the extra" if data["duplicate"] else "")
         return Check(cid, "warn", detail + " — re-run install-dbx-factory", data)
-    installed = [e["installed_at"] for e in lock_data.values() if isinstance(e, dict) and isinstance(e.get(
-        "installed_at"), str)]
+    installed = [e["installed_at"] for e in lock_data.values() if isinstance(e, dict) and
+        isinstance(e.get("installed_at"), str)]
     installed_at = max(installed) if installed else "unknown"
     detail = f"{len(repo)} playbooks match the lock written at the last install-dbx-factory sync ({installed_at})"
     if data["live"]:
@@ -612,10 +612,10 @@ def _module_present(dotted: str) -> bool:
 
 def check_drivers() -> Check:
     present = {k: _module_present(v) for k, v in DRIVERS.items()}
-    return Check("recon_drivers", "ok" if present["databricks"] else "warn",
-        f"installed adapters: {sorted(k for k, v in present.items() if v) or 'none'}" + ("" if present[
-        "databricks"] else "; databricks-sql-connector missing, live/snapshot recon cannot run"), {
-        "drivers": present})
+    names = sorted(k for k, v in present.items() if v) or "none"
+    note = "" if present["databricks"] else "; databricks-sql-connector missing, live/snapshot recon cannot run"
+    detail = f"installed adapters: {names}{note}"
+    return Check("recon_drivers", "ok" if present["databricks"] else "warn", detail, {"drivers": present})
 
 
 def check_recon_family_supported(plugin_root: Path, source_family: str | None) -> Check:
@@ -630,8 +630,9 @@ def check_recon_family_supported(plugin_root: Path, source_family: str | None) -
             "not on PATH and no checkout harness", {"family": source_family})
     argv, cwd, how = cmd
     reg, rc, shown = _harness_json(cmd, ["families"])
-    if (not isinstance(reg, dict) or not isinstance(reg.get("live_tested"), list) or not isinstance(reg.get(
-        "untested"), list) or not all(isinstance(f, str) for f in reg["live_tested"] + reg["untested"])):
+    if (not isinstance(reg, dict) or not isinstance(reg.get("live_tested"), list) or
+            not isinstance(reg.get("untested"), list) or
+            not all(isinstance(f, str) for f in reg["live_tested"] + reg["untested"])):
         return Check(cid, "fail", f"cannot ask the harness which families it supports "
             f"({how} families rc={rc}): {shown}", {"family": source_family})
     live = sorted(reg["live_tested"])
@@ -717,8 +718,8 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
         for _, p_ in sorted(todo.items(), key=lambda kv: str(kv[1])):
             reg, rc, shown = _harness_json(cmd, ["type-map-audit", "--spec", str(p_), "--family", source_family,
                 "--target-kind", target_kind, *cargs, *pargs])
-            if (not isinstance(reg, dict) or not isinstance(reg.get("findings"), list) or not all(isinstance(f.get(
-                "verdict"), str) for f in reg["findings"])):
+            if (not isinstance(reg, dict) or not isinstance(reg.get("findings"), list) or
+                    not all(isinstance(f.get("verdict"), str) for f in reg["findings"])):
                 return Check(cid, "fail", f"cannot audit target types ({how} type-map-audit rc={rc}): {shown}", data)
             if reg.get("error"):
                 return Check(cid, "fail", f"{p_}: {_redact(str(reg['error']))} ({how})", data)
@@ -854,8 +855,8 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
             cur.execute(_CDC_QUERIES["captures"])
             names = [d[0].lower() for d in cur.description]
             cap_i, cols_i = names.index("capture_instance"), names.index("captured_column_list")
-            visible = {str(r[cap_i]).casefold(): [c.casefold() for c in _captured_columns(r[
-                cols_i])] for r in cur.fetchall()}
+            rows = cur.fetchall()
+            visible = {str(r[cap_i]).casefold(): [c.casefold() for c in _captured_columns(r[cols_i])] for r in rows}
             data["missing"] = [c for c in wanted if c.casefold() not in visible]
             if data["missing"]:
                 return Check(*fail, "declared capture instance(s) not present or not readable by this identity "
@@ -909,14 +910,14 @@ _TABLE_PRIVILEGES = {"sqlserver": ("INSERT", "UPDATE", "DELETE", "ALTER"), "post
     "TRUNCATE", "CREATE on schema")}
 _PG_ROLE_COLS = ", ".join([*_PG_ATTRS, *(f"pg_has_role(current_user, '{r}', 'MEMBER')" for r in _PG_ROLES)])
 _PG_TABLE_COLS = ", ".join(f"has_table_privilege(%s, '{p}')" for p in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"))
+_SQLSRV_TABLE_COLS = ", ".join(f"HAS_PERMS_BY_NAME(?, 'OBJECT', '{p}')" for p in _TABLE_PRIVILEGES["sqlserver"])
 _PRIVILEGE_QUERIES = {
     "sqlserver": {
         "roles": "SELECT " + ", ".join([*(f"IS_SRVROLEMEMBER('{r}')" for r in _SRV_ROLES),
             *(f"IS_MEMBER('{r}')" for r in _DB_ROLES),
             *(f"HAS_PERMS_BY_NAME(NULL, NULL, '{p}')" for p in _SRV_PERMS)]),
         "exists": "SELECT OBJECT_ID(?)",
-        "table": "SELECT " + ", ".join(
-            f"HAS_PERMS_BY_NAME(?, 'OBJECT', '{p}')" for p in _TABLE_PRIVILEGES["sqlserver"]),
+        "table": f"SELECT {_SQLSRV_TABLE_COLS}",
         "columns": ("SELECT QUOTENAME(subentity_name), permission_name FROM fn_my_permissions(?, 'OBJECT') "
             "WHERE subentity_name <> '' AND permission_name = 'UPDATE' ORDER BY 1"),
         "indirect": (
@@ -957,8 +958,8 @@ def _databricks_sql_connect(secret_value: str):
     except ImportError:
         raise RuntimeError("databricks-sql-connector is not installed") from None
     cfg = json.loads(secret_value)
-    return sql.connect(server_hostname=cfg["server_hostname"], http_path=cfg["http_path"], access_token=cfg[
-        "access_token"])
+    return sql.connect(server_hostname=cfg["server_hostname"], http_path=cfg["http_path"],
+        access_token=cfg["access_token"])
 
 
 _READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect,
@@ -1033,8 +1034,8 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
             conn.close()
     except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
         return Check(cid, "fail", f"source query failed: {_redact(str(e))}", data)
-    can_write = ([f"role {r}" for r in data["roles"]] + [f"{t}: {', '.join(p)}" for t, p in data["writable"].items(
-        )] + data["indirect"])
+    can_write = [f"role {r}" for r in data["roles"]]
+    can_write += [f"{t}: {', '.join(p)}" for t, p in data["writable"].items()] + data["indirect"]
     if can_write:
         shown = "; ".join(can_write[:6]) + (f"; +{len(can_write) - 6} more in data" if len(can_write) > 6 else "")
         return Check(cid, "fail", f"{family}: the source principal can write in scope ({shown}); the "
@@ -1223,8 +1224,8 @@ def _quote_ident(part: str) -> str:
     return "`" + part.replace("`", "``") + "`"
 
 
-def check_dictionary_readable(tables: list[str], family: str, source_secret: str | None, connect=None, views: list[
-    tuple] | None = None) -> Check:
+def check_dictionary_readable(tables: list[str], family: str, source_secret: str | None, connect=None,
+    views: list[tuple] | None = None) -> Check:
     """Catalog visibility is not data SELECT (references/checks.md); `views` is the harness's probe table."""
     cid = "dictionary_readable"
     q = _TRIGGER_CENSUS.get(family)
@@ -1256,8 +1257,8 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
                         probes = [(t, sql.format(catalog=_quote_ident(p_[0]), schema=_quote_ident(p_[1]),
                             table= _quote_ident(p_[2]))) for t, p_ in parts.items()]
                     else:  # {catalog} only: information_schema is catalog-scoped, probe per catalog
-                        probes = [(None, sql.format(catalog=_quote_ident(c))) for c in sorted({p_[
-                            0] for p_ in parts.values()})]
+                        cats = sorted({p_[0] for p_ in parts.values()})
+                        probes = [(None, sql.format(catalog=_quote_ident(c))) for c in cats]
                 for table, probe in probes:
                     try:
                         cur.execute(probe).fetchall()
@@ -1330,8 +1331,8 @@ def classify_identity(who: dict) -> tuple[str, bool]:
     """(userName, is_service_principal) from a SCIM `current-user me` document; human unless proven otherwise."""
     name = str(who.get("userName") or who.get("displayName") or "?")
     schemas = [str(s) for s in who.get("schemas") or []]
-    is_sp = (bool(who.get("applicationId")) or any(_SP_SCHEMA.lower() in s.lower() for s in schemas) or bool(
-        _APPLICATION_ID.fullmatch(name)))
+    is_sp = (bool(who.get("applicationId")) or
+        any(_SP_SCHEMA.lower() in s.lower() for s in schemas) or bool(_APPLICATION_ID.fullmatch(name)))
     return name, is_sp
 
 
@@ -1397,15 +1398,15 @@ def check_named_secrets(names: list[str], list_secrets=None) -> Check:
     list_secrets = list_secrets or _list_secrets
     keys = {scope: list_secrets(scope) for scope in {n.split("/", 1)[0] for n in names}}
     data["unreadable_scopes"] = sorted(s for s, k in keys.items() if k is None)
-    data["missing"] = [n for n in names if keys[n.split("/", 1)[0]] is None or n.split("/", 1)[1] not in keys[n.split(
-        "/", 1)[0]]]
+    parts = [n.split("/", 1) for n in names]
+    data["missing"] = [n for n, (scope, key) in zip(names, parts) if keys[scope] is None or key not in keys[scope]]
     if data["missing"]:
-        detail = (
-            "missing named secrets (STOP C blocker: create them before launch; values are never read): " + ", ".join(
-            data["missing"]))
+        detail = ("missing named secrets (STOP C blocker: create them before launch; values are never "
+            "read): " + ", ".join(data["missing"]))
         if data["unreadable_scopes"]:
-            detail += "; " + "; ".join(f"scope {s} not readable via `databricks secrets list-secrets`" for s in data[
-                "unreadable_scopes"])
+            scope_msgs = "; ".join(f"scope {s} not readable via `databricks secrets list-secrets`"
+                for s in data["unreadable_scopes"])
+            detail += "; " + scope_msgs
         return Check(cid, "fail", detail, data)
     return Check(cid, "ok", f"{len(names)} named secret(s) exist in {len(keys)} scope(s), names only", data)
 
@@ -1421,9 +1422,10 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
 
     set_vars = [v for v in M2M_VARS if os.environ.get(v)]
     token, profile = os.environ.get("DATABRICKS_TOKEN"), os.environ.get("DATABRICKS_CONFIG_PROFILE")
-    auth_kind = next(kind for cond, kind in ((token and len(set_vars) == len(M2M_VARS), "conflict (env)"), (len(
-        set_vars) == len(M2M_VARS), "oauth-m2m (env)"), (token, "pat (env)"), (profile, f"profile {profile}"), (True,
-        "unknown (CLI default chain)")) if cond)
+    auth_kind = next(kind for cond, kind in (
+        (token and len(set_vars) == len(M2M_VARS), "conflict (env)"),
+        (len(set_vars) == len(M2M_VARS), "oauth-m2m (env)"),
+        (token, "pat (env)"), (profile, f"profile {profile}"), (True, "unknown (CLI default chain)")) if cond)
     if auth_kind == "conflict (env)":
         status, detail = "fail", (
             "auth: conflicting env — DATABRICKS_TOKEN is set beside DATABRICKS_CLIENT_ID/SECRET; "
@@ -1542,8 +1544,9 @@ def check_lakebase_target_grants(dsn_name: str, schema: str | None = None, conne
 def _effective_privileges(payload) -> set[str]:
     """Privilege names from effective-assignment or plain grant payloads ({privilege: name} dicts or bare strings)."""
     if isinstance(payload, dict):
-        items = [p for a in payload.get("privilege_assignments") or [] if isinstance(a, dict) for p in a.get(
-            "privileges") or []] + list(payload.get("privileges") or [])
+        assigns = [a for a in payload.get("privilege_assignments") or [] if isinstance(a, dict)]
+        items = [p for a in assigns for p in a.get("privileges") or []]
+        items += list(payload.get("privileges") or [])
     elif isinstance(payload, list):
         items = list(payload)
     else:
@@ -1579,16 +1582,16 @@ _SCHEMA_REQUIRED = [("USE_SCHEMA", "USE SCHEMA"), ("CREATE_TABLE", "CREATE TABLE
     "SELECT")]
 
 
-def _grant_statements(catalog: str, full_name: str, principal: str, missing_catalog: list[str], missing_schema: list[
-    str]) -> str:
+def _grant_statements(catalog: str, full_name: str, principal: str, missing_catalog: list[str],
+    missing_schema: list[str]) -> str:
     statements = []
     if missing_catalog:
         statements.append(f"GRANT USE CATALOG ON CATALOG {_sql_ident(catalog)} TO `{principal}`")
     if missing_schema:
         display = ", ".join(label for name, label in _SCHEMA_REQUIRED if name in missing_schema)
         schema_catalog, schema_name = full_name.split(".", 1)
-        statements.append(
-            f"GRANT {display} ON SCHEMA {_sql_ident(schema_catalog)}.{_sql_ident(schema_name)} TO `{principal}`")
+        statements.append(f"GRANT {display} ON SCHEMA {_sql_ident(schema_catalog)}.{_sql_ident(schema_name)} "
+            f"TO `{principal}`")
     return "; ".join(statements)
 
 
@@ -1645,8 +1648,8 @@ def check_analytical_target_grants(full_name: str) -> Check:
 
     catalog_privileges, catalog_owner, catalog_error = _catalog_privileges(cli, catalog, principal)
     if catalog_error:
-        return row("fail", catalog_error, principal=principal, owner=owner, catalog_owner=catalog_owner, exists=bool(
-            exists))
+        return row("fail", catalog_error, principal=principal, owner=owner, catalog_owner=catalog_owner,
+            exists=bool(exists))
     assert catalog_privileges is not None
     has = lambda p: "ALL_PRIVILEGES" in catalog_privileges or p in catalog_privileges
     has_schema = lambda p: "ALL_PRIVILEGES" in schema_privileges or p in schema_privileges
@@ -1686,6 +1689,14 @@ def check_analytical_target_grants(full_name: str) -> Check:
     return row("ok", f"principal {principal} can create and write tables in {full_name} (owner {owner})", **data)
 
 
+def _advisory(c: Check) -> Check:
+    """In a child, non-security `fail` rows are advisory `warn` (the orchestrator gated them at launch)."""
+    if c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and not (c.data or {}).get("units_problem"):
+        return Check(c.id, "warn", "advisory in a child (the orchestrator gates it before launch): " + c.detail,
+            c.data)
+    return c
+
+
 def _blocking(role: str, checks: list[Check]) -> list[str]:
     """The readiness rule per role: security controls `ok`; a child also blocks on a unit-mapping problem,
     orchestrator/setup on any `fail` or an unverified `source_principal_read_only`."""
@@ -1703,7 +1714,7 @@ def _blocking(role: str, checks: list[Check]) -> list[str]:
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None, no_databricks: bool,
     units: list[str] | None = None, mappings: list[Path] | None = None, source_secret: str | None = None,
-    params: dict [str, str] | None = None, expect_catalogs: list[str] | None = None, source_family: str | None = None,
+    params: dict[str, str] | None = None, expect_catalogs: list[str] | None = None, source_family: str | None = None,
     expect_host: str | None = None, lakebase_project: str | None = None, lakebase_parent_branch: str | None = None,
     lakebase_dsn: str | None = None, lakebase_schema: str | None = None, analytical_schema: str | None = None,
     source_attested: str | None = None, live_playbooks: Path | None = None, target_kind: str = "databricks",
@@ -1713,30 +1724,41 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         if isinstance(reused, dict) and row_id in REUSABLE_ROWS:
             row = next((c for c in reused.get("checks") or [] if isinstance(c, dict) and c.get("id") == row_id), None)
             data = row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {}
-            if (isinstance(row, dict) and isinstance(row.get("status"), str) and isinstance(row.get("detail"),
-                str) and all(data.get(k) == v for k, v in binds.items())):
+            if (isinstance(row, dict) and isinstance(row.get("status"), str) and
+                    isinstance(row.get("detail"), str) and all(data.get(k) == v for k, v in binds.items())):
                 return Check(row["id"], row["status"],
-                    f"reused from the orchestrator's record signed {reused.get('signed_at')}: {row['detail']}", {**(
-                    row.get("data") or {}), "reused_from": reused.get("signed_at")})
+                    f"reused from the orchestrator's record signed {reused.get('signed_at')}: {row['detail']}",
+                    {**(row.get("data") or {}), "reused_from": reused.get("signed_at")})
         return thunk()
 
     units, mappings = units or [], mappings or []
     sec = security_controls(role)
-    checks: list[Check] = [_merge("workspace", [check_workspace(ws), check_stop_mode(ws)]), _merge("allowed_targets",
-        [check_allowed_targets(ws, plugin_root), check_allowlist_matches_contract(ws, expect_catalogs)]),
-        check_allowlist_committed(ws), check_playbooks_in_sync(ws, plugin_root, role, live_playbooks), _merge(
-        "hook_guard", check_hooks(plugin_root, ws, probe_result, role, reused), sec), check_official_plugin(
-        plugin_root), _merge("recon_harness", [check_harness(plugin_root), check_drivers()]), _row(
-        "recon_family_supported", lambda: check_recon_family_supported(plugin_root, source_family)), _row(
-        "type_map_audit", lambda: check_type_map_audit(ws, role, units, mappings, source_family, plugin_root,
-        params=params, target_kind=target_kind), target_kind=target_kind), _row("delete_evidence",
-        lambda: check_delete_evidence_all(ws, role, units, mappings, source_secret, plugin_root, params=params)),
-        _row("source_principal_read_only", lambda: check_source_principal_all(ws, role, units, mappings,
-        source_secret, source_family, plugin_root, params=params, attested=source_attested)), _row(
-        "dictionary_readable", lambda: check_dictionary_readable_all(ws, role, units, mappings, source_secret,
-        source_family, plugin_root, params=params)), _row("named_secrets_exist", lambda: (Check(
-        "named_secrets_exist", "skipped", "--no-databricks") if no_databricks else check_named_secrets(secret_names or
-        [], list_secrets)))]
+    checks: list[Check] = [
+        _merge("workspace", [check_workspace(ws), check_stop_mode(ws)]),
+        _merge("allowed_targets", [check_allowed_targets(ws, plugin_root),
+            check_allowlist_matches_contract(ws, expect_catalogs)]),
+        check_allowlist_committed(ws),
+        check_playbooks_in_sync(ws, plugin_root, role, live_playbooks),
+        _merge("hook_guard", check_hooks(plugin_root, ws, probe_result, role, reused), sec),
+        check_official_plugin(plugin_root),
+        _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
+        _row("recon_family_supported",
+            lambda: check_recon_family_supported(plugin_root, source_family)),
+        _row("type_map_audit",
+            lambda: check_type_map_audit(ws, role, units, mappings, source_family, plugin_root,
+                params=params, target_kind=target_kind), target_kind=target_kind),
+        _row("delete_evidence",
+            lambda: check_delete_evidence_all(ws, role, units, mappings, source_secret, plugin_root,
+                params=params)),
+        _row("source_principal_read_only",
+            lambda: check_source_principal_all(ws, role, units, mappings, source_secret, source_family,
+                plugin_root, params=params, attested=source_attested)),
+        _row("dictionary_readable",
+            lambda: check_dictionary_readable_all(ws, role, units, mappings, source_secret, source_family,
+                plugin_root, params=params)),
+        _row("named_secrets_exist",
+            lambda: (Check("named_secrets_exist", "skipped", "--no-databricks") if no_databricks
+                else check_named_secrets(secret_names or [], list_secrets)))]
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -1754,24 +1776,30 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
             "--no-databricks") if no_databricks else check_analytical_target_grants(analytical_schema))
     if role == "child":  # non-security failures are advisory; the orchestrator gated them at launch
 
-        def _advisory(c: Check) -> Check:
-            if c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and not (c.data or {}).get("units_problem"):
-                return Check(c.id, "warn",
-                    "advisory in a child (the orchestrator gates it before launch): " + c.detail, c.data)
-            return c
+        def softened(row: Check) -> Check:
+            subs = (row.data or {}).get("sub_results")
+            if not subs:
+                return _advisory(row)
+            return _merge(row.id, [_advisory(Check(**d)) for d in subs], sec)
 
-        checks = [(_merge(row.id, [_advisory(Check(**d)) for d in row.data["sub_results"]], sec) if (row.data or {
-            }).get("sub_results") else _advisory(row)) for row in checks]
+        checks = [softened(row) for row in checks]
     counts: dict[str, int] = {}
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
     blocking = _blocking(role, checks)
     identity = next((c.data for c in _flat(checks) if c.id == "databricks_identity" and c.data), None)
-    return {"identity": identity, "schema": "dbx-migration-factory/capabilities/1", "generated_at": time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "role": role, "workspace": str(ws), "plugin_root": str(plugin_root),
-        "summary": counts, "ready": not blocking, "blocking": blocking, "reused_doctor": reused[
-        "signed_at"] if isinstance(reused, dict) else None, "checks": [{**asdict(c),
-        "reusable": c.id in REUSABLE_ROWS} for c in checks]}
+    return {
+        "identity": identity,
+        "schema": "dbx-migration-factory/capabilities/1",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "role": role,
+        "workspace": str(ws),
+        "plugin_root": str(plugin_root),
+        "summary": counts,
+        "ready": not blocking,
+        "blocking": blocking,
+        "reused_doctor": reused["signed_at"] if isinstance(reused, dict) else None,
+        "checks": [{**asdict(c), "reusable": c.id in REUSABLE_ROWS} for c in checks]}
 
 
 def _manifest_source(manifest) -> tuple:
@@ -1917,18 +1945,20 @@ def main(argv: list[str] | None = None) -> int:
         out.write_text(text + "\n")
     for c in report["checks"]:
         print(f"{c['status']:<10} {c['id']:<28} {c['detail']}")
-    print(f"\nready={report['ready']} {report['summary']}" + (f" blocking={report['blocking']}" if report[
-        "blocking"] else "") + (f"  -> {out}" if str(out) != "-" else ""))
+    tail = f"\nready={report['ready']} {report['summary']}"
+    tail += f" blocking={report['blocking']}" if report["blocking"] else ""
+    print(tail + (f"  -> {out}" if str(out) != "-" else ""))
     if a.wave:
-        a.wave.with_suffix(".doctor.json").write_text(json.dumps(sign_wave_report({**report,
-            "hook_probe": a.hook_probe_result, "source": manifest.get("source"), "inputs_sha": inputs_sha(
-            a.workspace.resolve())}, manifest_bytes), indent=2, sort_keys=True) + "\n")
+        signed = sign_wave_report({**report, "hook_probe": a.hook_probe_result,
+            "source": manifest.get("source"), "inputs_sha": inputs_sha(a.workspace.resolve())}, manifest_bytes)
+        a.wave.with_suffix(".doctor.json").write_text(json.dumps(signed, indent=2, sort_keys=True) + "\n")
     if a.role != "child":
-        probe = next((s for c in report["checks"] for s in (c.get("data") or {}).get("sub_results") or [] if s.get(
-            "id") == "hook_platform_loaded"), None)
+        probe = next((s for c in report["checks"]
+            for s in (c.get("data") or {}).get("sub_results") or []
+            if s.get("id") == "hook_platform_loaded"), None)
         if probe and probe.get("status") == "unverified":
-            print("PROBE_COMMAND (run in the lead session's exec tool, not a sidekick shell): " + probe["data"][
-                "probe_command"])
+            cmd = probe["data"]["probe_command"]
+            print("PROBE_COMMAND (run in the lead session's exec tool, not a sidekick shell): " + cmd)
     return 0 if report["ready"] else 1
 
 
