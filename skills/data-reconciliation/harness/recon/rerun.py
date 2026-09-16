@@ -26,7 +26,7 @@ STATUSES = ("pass", "fail")
 _TYPE_ALIASES = {
     "integer": "int", "character varying": "varchar", "timestamp without time zone": "timestamp",
     "timestamp with time zone": "timestamptz", "double precision": "double", "boolean": "boolean",
-    "numeric": "decimal",
+    "numeric": "decimal", "character": "char",
 }
 # tokens that end a column's type in a column definition
 _COLUMN_CLAUSE = re.compile(
@@ -34,26 +34,27 @@ _COLUMN_CLAUSE = re.compile(
     r"CONSTRAINT|MASK|IDENTITY)\b", re.IGNORECASE)
 _CONSTRAINT_START = re.compile(r"^(CONSTRAINT|PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK|LIKE)\b",
                                re.IGNORECASE)
+_QNAME = r"(?:`[^`]+`|\"[^\"]+\"|\[(?:[^\]]|\]\])+\]|[A-Za-z_][\w$]*)"
+_TNAME = rf"(?:{_QNAME}\.)*{_QNAME}"
+_NAME = re.compile(rf"^{_TNAME}$")
 _CREATE = re.compile(
     r"^CREATE\s+(?P<replace>OR\s+REPLACE\s+)?(?:EXTERNAL\s+|TEMPORARY\s+|TEMP\s+|UNLOGGED\s+)?"
-    r"TABLE\s+(?P<ine>IF\s+NOT\s+EXISTS\s+)?(?P<name>[^\s(]+)\s*\(", re.IGNORECASE | re.DOTALL)
+    rf"TABLE\s+(?P<ine>IF\s+NOT\s+EXISTS\s+)?(?P<name>{_TNAME})\s*\(", re.IGNORECASE | re.DOTALL)
 _ALTER_ADD = re.compile(
-    r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<name>[^\s(]+)\s+ADD\s+COLUMNS?\s+(?P<ine>IF\s+NOT\s+EXISTS\s+)?"
+    rf"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<name>{_TNAME})\s+ADD\s+COLUMNS?\s+(?P<ine>IF\s+NOT\s+EXISTS\s+)?"
     r"(?P<body>.*)$", re.IGNORECASE | re.DOTALL)
 # ALTER TABLE forms that leave the column shape alone; any other ALTER TABLE is a refusal
 _ALTER_NEUTRAL = re.compile(
-    r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?[^\s(]+\s+(?:SET|UNSET)\s+(?:TBLPROPERTIES|OWNER)\b",
+    rf"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?{_TNAME}\s+(?:SET|UNSET)\s+(?:TBLPROPERTIES|OWNER)\b",
     re.IGNORECASE | re.DOTALL)
 _ALTER = re.compile(r"^ALTER\s+TABLE\b", re.IGNORECASE)
 _CREATE_ANY = re.compile(
     r"^CREATE\s+(?:OR\s+REPLACE\s+)?(?:EXTERNAL\s+|TEMPORARY\s+|TEMP\s+|UNLOGGED\s+)?"
-    r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[^\s(]+)", re.IGNORECASE | re.DOTALL)
+    rf"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>{_TNAME})", re.IGNORECASE | re.DOTALL)
 _TABLE_PK = re.compile(r"^(?:CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\s*\(", re.IGNORECASE | re.DOTALL)
 _DROP = re.compile(r"^DROP\s+TABLE\b(?P<rest>.*)$", re.IGNORECASE | re.DOTALL)
 _DROP_HEAD = re.compile(r"^\s*(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?", re.IGNORECASE)
 _DROP_TAIL = re.compile(r"\s+(?:CASCADE|RESTRICT)\s*$", re.IGNORECASE)
-_QNAME = r"(?:`[^`]+`|\"[^\"]+\"|\[(?:[^\]]|\]\])+\]|[A-Za-z_][\w$]*)"
-_NAME = re.compile(rf"^(?:{_QNAME}\.)*{_QNAME}$")
 
 
 _SERIAL = {"serial": "int", "serial4": "int", "bigserial": "bigint", "serial8": "bigint",
@@ -220,10 +221,14 @@ def _strip_comments(sql: str) -> str:
         if quote:
             out.append(ch)
             if ch == quote:
+                if quote == "]" and sql[i + 1:i + 2] == "]":
+                    out.append("]")
+                    i += 2
+                    continue
                 quote = None
             i += 1
-        elif ch in "'\"`":
-            quote = ch
+        elif ch in "'\"`[":
+            quote = "]" if ch == "[" else ch
             out.append(ch)
             i += 1
         elif sql.startswith("--", i):
@@ -265,20 +270,15 @@ def _add_column(cols: list[dict], defn: str) -> None:
 def _collapse_ws(stmt: str) -> str:
     """Whitespace between tokens folded to one space; quoted literals and identifiers kept as
     written, so two statements hash equal only when they say the same thing."""
-    out, quote, i, n = [], None, 0, len(stmt)
+    out, i, n = [], 0, len(stmt)
+    quoted = [q for _, q in _chars(stmt)]
     while i < n:
         ch = stmt[i]
-        if quote:
-            out.append(ch)
-            if ch == quote:
-                quote = None
-            i += 1
-        elif ch in "'\"`":
-            quote = ch
+        if quoted[i]:
             out.append(ch)
             i += 1
         elif ch.isspace():
-            while i < n and stmt[i].isspace():
+            while i < n and stmt[i].isspace() and not quoted[i]:
                 i += 1
             out.append(" ")
         else:
@@ -433,15 +433,10 @@ def _resolve_tables(expected: dict[str, list[dict]], observed: dict[str, list[di
     trailing-name match when one side is less qualified, kept only when every maximum one-to-one
     matching agrees on it. An observation that could belong to either of two expected tables is a
     match for neither (`None`), never a shared one."""
-    out: dict[str, str | None] = {}
-    taken: set[str] = set()
-    pending: dict[str, list[str]] = {}
-    for table in expected:
-        if table in observed:
-            out[table] = table
-            taken.add(table)
-        else:
-            pending[table] = [c for c in _candidates(observed, table) if c not in taken]
+    exact = {table for table in expected if table in observed}
+    out: dict[str, str | None] = {table: table for table in exact}
+    pending = {table: [c for c in _candidates(observed, table) if c not in exact]
+               for table in expected if table not in exact}
     full = _matching_size(pending)
     for table, cands in pending.items():
         # an edge every maximum matching uses is the one whose removal shrinks the maximum
