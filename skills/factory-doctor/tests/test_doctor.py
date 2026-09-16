@@ -1766,6 +1766,32 @@ def test_type_map_audit_warns_for_a_family_with_no_map(tmp_path):
     assert c.data["families_with_maps"] == ["oracle"]
 
 
+def test_type_map_audit_audits_against_the_declared_target_kind(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [
+        _field("CREATED_AT", "TIMESTAMP WITH TIME ZONE", "timestamp with time zone"),
+        _field("NOTE", "VARCHAR2(200)", "text"),
+    ])
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT,
+                                    target_kind="lakebase")
+    assert c.status == "ok" and c.data["target_kind"] == "lakebase"
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and c.data["target_kind"] == "databricks"
+
+
+def test_type_map_audit_warns_when_the_family_maps_a_different_kind(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    fake_root = tmp_path / "fake_root"
+    (fake_root / "skills" / "x").mkdir(parents=True)
+    (fake_root / "skills" / "x" / "canonicalization.json").write_text(json.dumps(
+        {"rules": [], "type_map": {"sqlserver": {"databricks": {"types": []}}}}))
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "sqlserver", fake_root,
+                                    target_kind="lakebase")
+    assert c.status == "warn" and "sqlserver->lakebase" in c.detail
+    assert c.data["kinds_with_map"] == ["databricks"]
+
+
 def test_type_map_audit_fails_when_two_files_claim_the_family(tmp_path):
     ws = make_workspace(tmp_path)
     _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
@@ -1775,7 +1801,7 @@ def test_type_map_audit_fails_when_two_files_claim_the_family(tmp_path):
         d = fake_root / "skills" / name
         d.mkdir(parents=True)
         (d / "canonicalization.json").write_text(json.dumps(
-            {"rules": [], "type_map": {"oracle": {"types": [{"source": "NUMBER", "target": "decimal(38,10)"}]}}}))
+            {"rules": [], "type_map": {"oracle": {"databricks": {"types": [{"source": "NUMBER", "target": "decimal(38,10)"}]}}}}))
     c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", fake_root)
     assert c.status == "fail" and "a" in c.detail and "b" in c.detail
 

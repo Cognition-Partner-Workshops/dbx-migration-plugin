@@ -141,7 +141,9 @@ The output is a machine-readable table of object, class, method, partition key, 
    `--mode live` exactly once inside the granted window. If live fails, go back to fixture.
 2. Pass the source-dialect skill's canonicalization JSON verbatim. If a rule is missing, that
    goes in the PR under "Skill feedback" for the parent to fold into the dialect skill, not an ad-hoc patch.
-   The same file's `type_map.<family>` is applied when the spec loads: empty `target_type`s are
+   The same file's `type_map.<family>.<target_kind>` is applied when the spec loads (`--target-kind`
+   selects the table; `estimate --family/--canonicalization` applies it too, so the plan counts
+   the statements the run will issue): empty `target_type`s are
    filled from it, a declared type it forbids stops the run before any query (`type map:` on
    stderr), and `result.json` records the outcome under `type_map` (`null` when the family has
    no map, so unaudited is never mistaken for clean).
