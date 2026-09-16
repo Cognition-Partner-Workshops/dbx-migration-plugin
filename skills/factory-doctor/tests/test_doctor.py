@@ -1382,6 +1382,113 @@ def test_source_families_are_the_harness_families_and_databricks_without_cli_is_
     assert "source_principal_read_only=unverified" in report["blocking"] and report["ready"] is False
 
 
+# ------------------------------------------------------------------ dictionary_readable (WS3.1)
+
+class FakeDictConn:
+    """A source seen through the doctor's dictionary probes. `fail_views` names catalog views
+    whose probe raises; `census` maps a table to (declared, listed) trigger answers. Records
+    every statement."""
+
+    def __init__(self, *, fail_views=(), census=None):
+        self.fail_views, self.census, self.statements = set(fail_views), census or {}, []
+
+    def cursor(self):
+        outer = self
+
+        class Cur:
+            def execute(self, sql, params=()):
+                outer.statements.append(sql)
+                sql_l = sql.lower()
+                for label in outer.fail_views:
+                    if label.lower() in sql_l:
+                        raise RuntimeError(f"permission denied for {label} secret=DSN://leak")
+                outer.result = [(1,)]
+                if "tablehasinserttrigger" in sql_l or "relhastriggers" in sql_l:
+                    outer.result = [(outer.census.get(params[0], (0, 0))[0],)]
+                elif "count(*)" in sql_l:
+                    outer.result = [(outer.census.get(params[0], (0, 0))[1],)]
+                return self
+
+            def fetchall(self):
+                return outer.result
+        return Cur()
+
+    def close(self):
+        pass
+
+
+def test_dictionary_readable_unverified_for_unprobed_families(monkeypatch):
+    for family in ("teradata", "databricks"):
+        c = doctor.check_dictionary_readable(TABLES, family, "LEGACY_ODBC")
+        assert c.status == "unverified" and "unsupported" in c.detail
+
+
+def test_dictionary_readable_fails_without_the_secret(monkeypatch):
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", None)
+    assert c.status == "fail" and "--source-secret" in c.detail
+    monkeypatch.delenv("LEGACY_ODBC", raising=False)
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC")
+    assert c.status == "fail" and "not set" in c.detail
+
+
+def test_dictionary_readable_fails_when_a_catalog_view_is_unreadable(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"sys.triggers"})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    assert c.status == "fail" and "sys.triggers" in c.detail and "DSN" not in c.detail
+
+
+def test_dictionary_readable_fails_when_sqlserver_hides_triggers(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"raw.loans": (1, 0), "raw.payments": (0, 0)})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    assert c.status == "fail" and "raw.loans" in c.detail and "filtered by permission" in c.detail
+    assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 0}
+
+
+def test_dictionary_readable_warns_on_a_postgres_census_lag(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"public.loans": (1, 0)})
+    c = doctor.check_dictionary_readable(["public.loans"], "postgres", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn)
+    assert c.status == "warn" and "relhastriggers" in c.detail
+
+
+def test_dictionary_readable_ok_with_data(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"raw.loans": (1, 2), "raw.payments": (0, 0)})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    assert c.status == "ok"
+    assert "sys.triggers" in c.data["views"] and "sys.database_permissions" in c.data["views"]
+    assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 2}
+
+
+def test_dictionary_readable_all_resolves_units_and_children(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    row = by_id(report)["dictionary_readable"]
+    assert row["status"] == "skipped"
+    _unit_mapping(ws, "loans")
+    seen = {}
+    monkeypatch.setattr(doctor, "check_dictionary_readable",
+                        lambda tables, family, secret, **kw: seen.update(tables=tables) or
+                        doctor.Check("dictionary_readable", "ok", "stub"))
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    assert by_id(report)["dictionary_readable"]["status"] == "ok" and seen["tables"]
+
+
+def test_dictionary_readable_fail_blocks_the_run(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans")
+    monkeypatch.setattr(doctor, "check_dictionary_readable",
+                        lambda *a, **k: doctor.Check("dictionary_readable", "fail", "stub"))
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    assert "dictionary_readable=fail" in report["blocking"] and report["ready"] is False
+
+
 # ------------------------------------------------------------------ databricks source principal + attested
 
 DBX_TABLES = ["mig.raw.loans", "mig.raw.payments"]

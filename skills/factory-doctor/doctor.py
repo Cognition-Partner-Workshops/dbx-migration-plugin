@@ -1235,6 +1235,129 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
     return check_source_principal(list(tables), family, source_secret)
 
 
+# ------------------------------------------------------------------ catalog dictionary (structural parity)
+
+# The structural tier reads these catalog objects; a principal whose view of them is filtered by
+# permission passes the tier on an empty dictionary. `views` probes readability; `trigger_census`
+# cross-checks what the table declares against what the principal can list, per in-scope table.
+_DICTIONARY_QUERIES = {
+    "sqlserver": {
+        "views": [
+            ("sys.triggers", "SELECT TOP 1 1 FROM sys.triggers"),
+            ("sys.trigger_events", "SELECT TOP 1 1 FROM sys.trigger_events"),
+            ("sys.database_permissions", "SELECT TOP 1 1 FROM sys.database_permissions"),
+            ("sys.database_principals", "SELECT TOP 1 1 FROM sys.database_principals"),
+        ],
+        "trigger_census": (
+            "SELECT CASE WHEN OBJECTPROPERTY(OBJECT_ID(?), 'TableHasInsertTrigger') = 1 "
+            "OR OBJECTPROPERTY(OBJECT_ID(?), 'TableHasUpdateTrigger') = 1 "
+            "OR OBJECTPROPERTY(OBJECT_ID(?), 'TableHasDeleteTrigger') = 1 THEN 1 ELSE 0 END",
+            "SELECT COUNT(*) FROM sys.triggers WHERE parent_id = OBJECT_ID(?)"),
+    },
+    "postgres": {
+        "views": [
+            ("pg_trigger", "SELECT 1 FROM pg_trigger LIMIT 1"),
+            ("information_schema.table_privileges",
+             "SELECT 1 FROM information_schema.table_privileges LIMIT 1"),
+        ],
+        "trigger_census": (
+            "SELECT relhastriggers::int FROM pg_class WHERE oid = to_regclass(%s)",
+            "SELECT COUNT(*) FROM pg_trigger WHERE tgrelid = to_regclass(%s) AND NOT tgisinternal"),
+    },
+}
+
+
+def check_dictionary_readable(tables: list[str], family: str, source_secret: str | None,
+                              connect=None) -> Check:
+    """SELECT on the data is not visibility of the catalog: sys.triggers/pg_trigger rows are
+    filtered by permission, so a principal that sees none grades the trigger comparison on an
+    empty view — the missing-trigger defect reported as clean. Deliberately separate from
+    source_principal_read_only; a failure names the view, never the credential."""
+    cid = "dictionary_readable"
+    q = _DICTIONARY_QUERIES.get(family)
+    if q is None:
+        return Check(cid, "unverified", f"{family}: no dictionary probe for this family; structural "
+                     "parity will record its categories as unsupported",
+                     {"family": family, "tables": tables})
+    if not source_secret:
+        return Check(cid, "fail", f"{family} source with {len(tables)} in-scope table(s); pass "
+                     "--source-secret NAME so catalog visibility can be checked",
+                     {"family": family, "tables": tables})
+    if not os.environ.get(source_secret):
+        return Check(cid, "fail", f"source secret {source_secret} is not set in the environment")
+    data: dict = {"family": family, "tables": tables, "views": [], "trigger_census": {}}
+    try:
+        conn = (connect or _READ_ONLY_CONNECT[family])(os.environ[source_secret])
+        try:
+            cur = conn.cursor()
+            for label, sql in q["views"]:
+                try:
+                    cur.execute(sql).fetchall()
+                except Exception as e:  # noqa: BLE001
+                    return Check(cid, "fail", f"cannot read {label}: {_redact(str(e))}: the "
+                                 "structural tier would grade on an incomplete dictionary", data)
+                data["views"].append(label)
+            declared_sql, listed_sql = q["trigger_census"]
+            mismatched = []
+            for t in tables:
+                n = declared_sql.count("?") or declared_sql.count("%s")
+                declared = cur.execute(declared_sql, (t,) * n).fetchall()[0][0]
+                listed = cur.execute(listed_sql, (t,)).fetchall()[0][0]
+                data["trigger_census"][t] = {"declared": declared, "listed": listed}
+                if family == "sqlserver":
+                    if declared and not listed:
+                        mismatched.append(t)
+                elif bool(declared) != bool(listed):
+                    mismatched.append(t)
+            if mismatched and family == "sqlserver":
+                return Check(cid, "fail", f"{mismatched[0]} has triggers the principal cannot "
+                             "list: sys.triggers is filtered by permission, so the trigger tier "
+                             "would pass on an empty view", data)
+            if mismatched:
+                return Check(cid, "warn", f"declared vs listed trigger census differs on "
+                             f"{', '.join(mismatched[:3])}: relhastriggers can stay true after a "
+                             "drop until vacuum", data)
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - a driver failure is a finding, never a DSN traceback
+        return Check(cid, "fail", f"dictionary probe failed: {_redact(str(e))}", data)
+    return Check(cid, "ok", f"{family}: catalog views readable and the trigger census agrees on "
+                 f"{len(tables)} in-scope table(s)", data)
+
+
+def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mappings: list[Path],
+                                  source_secret: str | None, source_family: str | None,
+                                  plugin_root: Path, params: dict[str, str] | None = None) -> Check:
+    """Every source table the resolved mappings read (root and embedded child tables), against
+    --source-family, or the family the mappings' delete_evidence kind implies."""
+    cid = "dictionary_readable"
+    _, todo, problem = resolve_mappings(ws, role, units, mappings)
+    if problem:
+        return Check(cid, *problem)
+    if not todo:
+        return Check(cid, "skipped",
+                     f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}")
+    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
+    from recon.config import ConfigError, load_mapping_spec
+    tables: dict[str, None] = {}
+    kinds: set[str] = set()
+    for p in todo.values():
+        try:
+            spec = load_mapping_spec(p, params)
+        except (ConfigError, OSError, ValueError) as e:
+            return Check(cid, "fail", f"{p}: {_redact(str(e))}")
+        for o in spec.objects:
+            tables.update(dict.fromkeys([o.root_table, *(e.child_table for e in o.embeds)]))
+            if o.delete_evidence is not None:
+                kinds.add(o.delete_evidence.kind)
+    family = source_family or ("sqlserver" if kinds == {"sqlserver_cdc"} else None)
+    if not family:
+        return Check(cid, "unverified", "source family not declared: pass --source-family "
+                     f"{'|'.join(SOURCE_FAMILIES)} so catalog visibility can be checked",
+                     {"tables": list(tables)})
+    return check_dictionary_readable(list(tables), family, source_secret)
+
+
 # ------------------------------------------------------------------ databricks identity
 
 _APPLICATION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
@@ -1695,6 +1818,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
                                   params=params),
         check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
                                    plugin_root, params=params, attested=source_attested),
+        check_dictionary_readable_all(ws, role, units or [], mappings or [], source_secret,
+                                      source_family, plugin_root, params=params),
     ]
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
