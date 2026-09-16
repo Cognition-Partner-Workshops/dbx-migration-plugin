@@ -1,7 +1,7 @@
 Playbook: Deep, source-grounded analysis of ONE user-chosen pipeline, producing the unit inventory, the wave structure, the field/type dictionary, the dependency entries, and the fan-out batch plan that everything downstream consumes.
 
 ## Overview
-The user picked one pipeline at STOP B. This playbook analyzes exactly that pipeline: what executes, in what order, over what data, for which consumers, and above all **where it crosses a dependency and how wide each wave can fan out**. Analysis only: no plan, no code, no child sessions.
+The user picked one pipeline at STOP B (skipped if the intake fixed pipeline order). This playbook analyzes exactly that pipeline: what executes, in what order, over what data, for which consumers, and above all **where it crosses a dependency and how wide each wave can fan out**. Analysis only: no plan, no code, no child sessions.
 
 ```
 [user-chosen pipeline]  ->  pinned scope  ->  unit inventory + lineage DAG  ->  per-unit workload type

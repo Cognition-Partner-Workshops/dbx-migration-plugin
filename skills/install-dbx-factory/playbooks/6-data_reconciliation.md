@@ -1,4 +1,4 @@
-Playbook: Independent reconciliation pass over a completed wave: re-run the parity evidence with fresh eyes, catch what the migrating children graded themselves too kindly on, and produce the wave's recon report for STOP D.
+Playbook: Independent reconciliation pass over a completed wave: re-run the parity evidence with fresh eyes, catch what the migrating children graded themselves too kindly on, and produce the wave's recon report for wave close.
 
 ## Overview
 Every unit PR already carries its own recon evidence, but the author grading their own work is not the whole story. This playbook runs in a session that did **not** convert any unit in the wave. It re-executes the gates, probes beyond them, and writes the wave-level report. It is the data-migration analogue of an independent test pass: cheap because the harness is machine-checkable, valuable because it is adversarial.
@@ -7,7 +7,7 @@ Every unit PR already carries its own recon evidence, but the author grading the
 [wave complete: all batch PRs recon-green]  ->  re-run every gate independently
                                             ->  adversarial probes beyond the gate
                                             ->  cross-unit consistency checks
-                                            ->  <Pipeline>_wave<N>_recon.md  ->  STOP D (notify)
+                                            ->  <Pipeline>_wave<N>_recon.md  ->  wave close (notify)
 ```
 
 ## What's Needed From User (or from the orchestrator)
@@ -20,7 +20,7 @@ Every unit PR already carries its own recon evidence, but the author grading the
 3. **Cross-unit consistency**: units in a wave share tables; check referential consistency across batch boundaries (the classic parallel failure: two batches each green alone, jointly inconsistent because both dual-wrote a shared dimension).
 4. **ML-SCORING units** (prediction parity; there is no separate harness, this step is the method): re-run both scorers on the pinned sample (a fixed, versioned input with a manifest: source, extraction time, row count, checksum) with seeds set on both sides, and compare per the user-confirmed parity tolerance in `.migration/03_recon_tolerances.md`: exact (bitwise/decimal), numeric (abs/relative diff per score) or rank-order (Spearman/Kendall, top-k overlap where the consumer is a ranking). Never invent a tolerance. Before any conversion effort the legacy scorer is run twice on the same sample: if it is not bit-stable with itself an exact-match tolerance is structurally unachievable, so report that and get the tolerance revised. When scores diverge compare the intermediate feature values first; most divergence is in the feature pipeline, not the model. Evidence: sample manifest, both run commands/environments, per-metric table, verdict against the named tolerance version, divergence diagnosis. Verify the tolerance math, seeds and sample provenance rather than trusting the child's summary; no re-modeling, retraining or tolerance relaxation without explicit user approval, and whether a drift is acceptable is the customer's call, not the verifier's.
 5. **Write `<Pipeline>_wave<N>_recon.md`**: per-unit verdict table (PASS / FAIL / DRIFT-EXPLAINED), probe results, any finding with evidence, and the wave verdict. FAIL routes back to the orchestrator to reopen the unit; never fix converted code here, and never touch legacy.
-6. Update the ledger and hand the report to the orchestrator for **STOP D** (notify: PRs, recon report, findings, in batch).
+6. Update the ledger and hand the report to the orchestrator for **wave close** (notify: PRs, recon report, findings, in batch).
 
 ## Specifications
 - Gate re-runs use the `dbx-recon` CLI (`data-reconciliation` skill; its SKILL.md holds the one tier table and finding-code reference, which this playbook does not restate) with the unit's committed mapping and tolerance files, in `live` or `snapshot` mode. Gate on `result.json`, not on the PR text or the CLI stdout.

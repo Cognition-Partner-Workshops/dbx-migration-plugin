@@ -13,7 +13,7 @@ The plan is the contract between the human stops and the parallel execution mach
 - Presence at STOP C: this playbook ends in the single most consequential approval of the engagement.
 - **A decision on every UNDECIDED dependency** (via `!dbx_dependency_resolution` decide mode).
 - **Fan-out width confirmation**: proposed default 20 concurrent children (bounded by the D10 concurrency facts); the user may widen or narrow per wave.
-- **Gate posture**: recon-green-required-to-merge per unit (default, strongly recommended) vs batch-level gating; STOP D posture (notify per wave vs pause per wave).
+- **Gate posture**: recon-green-required-to-merge per unit (default, strongly recommended) vs batch-level gating; wave-close posture (notify per wave vs pause per wave).
 - Data-load posture for the coexistence window: federation-only reads (default) vs materialized backfill of input tables, per the DATA/DEPENDENCY profile.
 - **The review contract**: who reviews and merges the wave PRs, their turnaround SLA, and the review tiering. Propose as the default: recon-green plus independent-recon-pass earns a lighter review tier (spot-check plus evidence-format check), with full review reserved for recon-flagged units and the first unit of each pattern class. Reviewer throughput is a real term in the wall-clock math, not an externality; review effort follows risk, not uniformity.
 
