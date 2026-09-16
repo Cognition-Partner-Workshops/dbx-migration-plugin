@@ -803,6 +803,31 @@ def test_refresh_merged_detects_squash_merge(tmp_path):
     }
 
 
+def test_refresh_merged_accepts_partial_then_squash(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "a.txt").write_text("a\n")
+    (repo / "b.txt").write_text("b\n")
+    git("add", "a.txt", "b.txt")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    (repo / "a.txt").write_text("a\n")
+    git("add", "a.txt")
+    git("commit", "-q", "-m", "base a")
+    (repo / "b.txt").write_text("b\n")
+    git("add", "b.txt")
+    git("commit", "-q", "-m", "base b")
+    git("push", "-q", "origin", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/partial-squash")
+
+    refresh_merged(mig)
+
+    assert json.loads((waves / "wave-1.merged.json").read_text())["merged"] == {
+        "https://example.invalid/partial-squash": pr_head,
+    }
+
+
 def test_refresh_merged_rejects_whitespace_equivalent_commit(tmp_path):
     repo, git = _refresh_repo(tmp_path)
     git("checkout", "-q", "-b", "feature")
@@ -816,6 +841,25 @@ def test_refresh_merged_rejects_whitespace_equivalent_commit(tmp_path):
     git("commit", "-q", "-m", "base equivalent")
     git("push", "-q", "origin", "base")
     mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/whitespace")
+
+    refresh_merged(mig)
+
+    assert not (waves / "wave-1.merged.json").exists()
+
+
+def test_refresh_merged_rejects_whitespace_equivalent_commit_with_quoted_path(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "café.sql").write_text("before\n    x = 1\n")
+    git("add", "café.sql")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    (repo / "café.sql").write_text("before\nx = 1\n")
+    git("add", "café.sql")
+    git("commit", "-q", "-m", "base equivalent")
+    git("push", "-q", "origin", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/quoted-whitespace")
 
     refresh_merged(mig)
 

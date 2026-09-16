@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -149,118 +150,55 @@ def _landed(repo: Path, pr_head: str, base_ref: str) -> bool:
         if merge_base.returncode == 0:
             mb = merge_base.stdout.strip()
             paths = subprocess.run(
-                ["git", "-C", str(repo), "diff", "--name-only", mb, pr_head],
+                ["git", "-C", str(repo), "diff", "--name-only", "-z", mb, pr_head],
                 check=False,
                 capture_output=True,
-                text=True,
             )
-            if paths.returncode != 0 or not paths.stdout.strip():
+            path_bytes = [path for path in paths.stdout.split(b"\0") if path]
+            if paths.returncode != 0 or not path_bytes:
                 return False
-            diff = subprocess.run(
-                ["git", "-C", str(repo), "diff", mb, pr_head],
+            path_args = [os.fsdecode(path) for path in path_bytes]
+            commits = subprocess.run(
+                ["git", "-C", str(repo), "rev-list", "-n", "500", base_ref, f"^{mb}"],
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            if diff.returncode == 0:
-                patch_id = subprocess.run(
-                    ["git", "-C", str(repo), "patch-id", "--stable"],
+            if commits.returncode != 0:
+                return False
+            for commit in commits.stdout.splitlines():
+                candidate_ancestor = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "merge-base",
+                        "--is-ancestor",
+                        commit,
+                        base_ref,
+                    ],
                     check=False,
                     capture_output=True,
-                    text=True,
-                    input=diff.stdout,
                 )
-                pid = patch_id.stdout.split()[0] if patch_id.returncode == 0 and patch_id.stdout.split() else ""
-                if pid:
-                    pr_commits = subprocess.run(
-                        ["git", "-C", str(repo), "rev-list", "--reverse", f"{mb}..{pr_head}"],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if pr_commits.returncode != 0:
-                        return False
-                    pr_pids = []
-                    for commit in pr_commits.stdout.splitlines():
-                        commit_diff = subprocess.run(
-                            ["git", "-C", str(repo), "diff-tree", "-p", "--root", commit],
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                        )
-                        if commit_diff.returncode != 0:
-                            continue
-                        commit_patch_id = subprocess.run(
-                            ["git", "-C", str(repo), "patch-id", "--stable"],
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                            input=commit_diff.stdout,
-                        )
-                        if commit_patch_id.returncode == 0 and commit_patch_id.stdout.split():
-                            pr_pids.append(commit_patch_id.stdout.split()[0])
-                    if not pr_pids:
-                        return False
-                    commits = subprocess.run(
-                        ["git", "-C", str(repo), "rev-list", "-n", "500", base_ref, f"^{mb}"],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if commits.returncode == 0:
-                        for commit in commits.stdout.splitlines():
-                            commit_diff = subprocess.run(
-                                ["git", "-C", str(repo), "diff-tree", "-p", "--root", commit],
-                                check=False,
-                                capture_output=True,
-                                text=True,
-                            )
-                            if commit_diff.returncode != 0:
-                                continue
-                            commit_patch_id = subprocess.run(
-                                ["git", "-C", str(repo), "patch-id", "--stable"],
-                                check=False,
-                                capture_output=True,
-                                text=True,
-                                input=commit_diff.stdout,
-                            )
-                            if commit_patch_id.returncode != 0 or not commit_patch_id.stdout.split():
-                                continue
-                            candidate_pid = commit_patch_id.stdout.split()[0]
-                            if candidate_pid not in {pid, pr_pids[-1]}:
-                                continue
-                            candidate_ancestor = subprocess.run(
-                                [
-                                    "git",
-                                    "-C",
-                                    str(repo),
-                                    "merge-base",
-                                    "--is-ancestor",
-                                    commit,
-                                    base_ref,
-                                ],
-                                check=False,
-                                capture_output=True,
-                            )
-                            if candidate_ancestor.returncode != 0:
-                                continue
-                            same_paths = subprocess.run(
-                                [
-                                    "git",
-                                    "-C",
-                                    str(repo),
-                                    "diff",
-                                    "--quiet",
-                                    commit,
-                                    pr_head,
-                                    "--",
-                                    *paths.stdout.splitlines(),
-                                ],
-                                check=False,
-                                capture_output=True,
-                            )
-                            if same_paths.returncode == 0:
-                                return True
+                if candidate_ancestor.returncode != 0:
+                    continue
+                same_paths = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "diff",
+                        "--quiet",
+                        commit,
+                        pr_head,
+                        "--",
+                        *path_args,
+                    ],
+                    check=False,
+                    capture_output=True,
+                )
+                if same_paths.returncode == 0:
+                    return True
 
     return False
 

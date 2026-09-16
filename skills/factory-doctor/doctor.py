@@ -168,7 +168,7 @@ def check_workspace(ws: Path) -> Check:
     if missing:
         return Check("workspace", "fail", f".migration/ incomplete: missing {missing}", {"missing": missing})
     context = (mig / "00_context.md").read_text(errors="replace")
-    if not re.search(r"(?m)^##\s+Glossary\b", context) and not (mig / "02_glossary.md").exists():
+    if not re.search(r"(?m)^##\s+Glossary\b", context) and not (mig / "02_glossary.md").is_file():
         return Check(
             "workspace",
             "fail",
