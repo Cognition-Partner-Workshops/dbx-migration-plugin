@@ -9,6 +9,16 @@
           "timeout": 10
         }
       ]
+    },
+    {
+      "matcher": "^(edit|write|MultiEdit)$",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dbx_guard.py\"",
+          "timeout": 10
+        }
+      ]
     }
   ]
 }
