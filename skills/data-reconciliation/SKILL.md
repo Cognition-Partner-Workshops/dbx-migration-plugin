@@ -101,6 +101,26 @@ provenance warning and the run is not merge-eligible.
   tier has findings or unverifiable objects. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
+- Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --source <job file>... --prior-proof
+  <last committed rerun_proof.json> --fresh <record> --evolved <record> --out <dir>` grades the idempotency job twice
+  from two run records (`dbx-recon shape` reads a target's observed columns, read-only; it refuses a
+  table the target does not have rather than recording it empty). The catalog is the source of truth,
+  never the DDL: the shape the fresh run landed is the expected shape and the evolved run, against the
+  table pre-created in its previous committed shape, must land the identical one (`harness/fixtures/example_rerun/`
+  is the canonical failing case, a `CREATE TABLE IF NOT EXISTS` that never lands the new column).
+  The previous shape is the last committed proof's observed `shape` (`--prior-proof`), or on a unit's
+  first run the manifest-declared old shape (`--prior-shape`). `rerun_proof.json` carries
+  `{fresh: pass|fail, evolved: pass|fail|unsupported, findings, shape, shape_digest, source_digest}`;
+  without an evolved record, without a prior, when the pre-created shape equals the fresh one or
+  differs from the prior one, or when the fresh leg failed, `evolved` is `unsupported` with the reason,
+  never clean; a reordered column is a `column_order` finding; a fresh run that recorded no table fails
+  (`no_tables`). `--ddl` is a hint only: tables its `CREATE TABLE` statements name that the fresh run did
+  not record become notes, never findings. `run --rerun-proof <file> --rerun-source <job file>...` copies
+  it into `result.json` after checking its `source_digest` against the job's files as committed now (any
+  edit to the DDL, notebook or SQL makes the proof stale and refused); a
+  failed leg adds `rerun_gap` to `merge_block_reasons`, an unsupported evolved leg adds
+  `rerun_unsupported`, a `run` without `--rerun-proof` adds `rerun_missing` (every migrated unit
+  writes its tables, so no proof is a missing control), and any of them sets `merge_eligible=false`.
 - Tiers 5-7 run even when tier 1 fails, so a FAIL names the keys, lag, and schema gaps rather than just a count.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.
@@ -167,10 +187,12 @@ routine with no run, a run off a dedicated target, without evidence or a snapsho
 dedicated-target rule is `unproven` (exit 2), never silently clean; rows that differ, or a written table
 absent from either set, are `failed` (exit 1); table names compare case-insensitively. Pass the file to
 `run --routine-parity <file>` so `result.json` carries it. `run` reads the unit's dependency analysis
-(`.migration/units/<unit>/dependencies.json`, or `--routine-dependencies`) and regrades every `proven` or
-`failed` row from the committed run record its evidence names: a row the run does not support is refused,
-an unreadable or uncommitted record is `unproven`. A writing routine the file lacks is carried as `unproven`; a
-row for a routine the analysis does not know, or a routine listed twice, is refused. A `failed` routine sets
+(`.migration/units/<unit>/dependencies.json`, or `--routine-dependencies`), which must be a committed file
+of the repository (an outside, untracked or edited file is refused; `result.json` records the path as
+`routine_dependencies`), and regrades every row that names evidence from the committed run record: a
+`proven`/`failed` claim the run does not support is refused, an unreadable or uncommitted record is
+`unproven`, and an `unproven` row whose run grades `failed` is carried as failed. A writing routine the
+file lacks is carried as `unproven`; a row for a routine the analysis does not know, or a routine listed twice, is refused. A `failed` routine sets
 `merge_eligible=false` with reason `routine_gap`; `unproven` routines are listed in `recon.summary.md` and
 become cutover exceptions (`8-cutover_signoff.md`). No analysis, or writers with no parity file, is
 `merge_eligible=false` with reason `routine_parity_missing` (only an analysis with zero writers needs no file):

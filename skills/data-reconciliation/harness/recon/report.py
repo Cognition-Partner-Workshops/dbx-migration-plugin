@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 
+from .rerun import rerun_gap, rerun_missing, rerun_unsupported
 from .routines import parity_missing, routine_gap
 from .tiers import TierResult
 
@@ -25,6 +26,19 @@ MODE_NOTES = {
 
 def _mode_note(mode: str) -> str:
     return MODE_NOTES.get(mode, "")
+
+
+def _rerun_line(result: dict) -> str | None:
+    proof = result.get("rerun_proof")
+    if proof is None:
+        return None
+    line = f"- Rerun proof: fresh `{proof.get('fresh')}`, evolved `{proof.get('evolved')}`"
+    if proof.get("unsupported_reason"):
+        line += f" ({proof['unsupported_reason']})"
+    for f in proof.get("findings", [])[:MAX_FINDINGS_IN_SUMMARY]:
+        line += (f"\n  - {f.get('run')} `{f.get('table')}` {f.get('check')}"
+                 + (f" `{f['column']}`" if f.get("column") else "") + f": {f.get('detail', '')}")
+    return line
 
 
 def _authority_line(result: dict) -> str:
@@ -45,7 +59,9 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  type_map: dict | None = None,
                  routine_parity: list[dict] | None = None,
                  routine_writers: list[str] | None = None,
-                 routine_analysis_missing: bool = False) -> dict:
+                 routine_analysis_missing: bool = False,
+                 routine_dependencies: str | None = None,
+                 rerun_proof: dict | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -65,7 +81,9 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and not structural_blind
                       and (mode != "snapshot" or snapshot is not None)
-                      and not routine_gap(routine_parity) and not parity_gap)
+                      and not routine_gap(routine_parity) and not parity_gap
+                      and not rerun_missing(rerun_proof)
+                      and not rerun_gap(rerun_proof) and not rerun_unsupported(rerun_proof))
     reasons = []
     if structural is not None and (structural.findings or structural.stats.get("unverified")
                                    or structural.stats.get("dictionary_unavailable")
@@ -83,6 +101,12 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         reasons.append("mode")
     if mode == "snapshot" and snapshot is None:
         reasons.append("snapshot_missing")
+    if rerun_missing(rerun_proof):
+        reasons.append("rerun_missing")
+    if rerun_gap(rerun_proof):
+        reasons.append("rerun_gap")
+    if rerun_unsupported(rerun_proof):
+        reasons.append("rerun_unsupported")
     return {
         "unit": unit,
         "mode": mode,
@@ -100,9 +124,11 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "merge_eligible": merge_eligible,
         "merge_authority": {"kind": "harness", "decision_id": None},
         "type_map": type_map,
+        "rerun_proof": rerun_proof,
         "merge_block_reasons": reasons,
         "routine_parity": routine_parity,
         "routine_writers": routine_writers,
+        "routine_dependencies": routine_dependencies,
         **({"routine_analysis_missing": True} if routine_analysis_missing else {}),
     }
 
@@ -152,6 +178,8 @@ def render_report(result: dict) -> str:
     lines += _parity_lines(result)
     if result.get("cost"):
         lines.append(f"- Cost: `{json.dumps(result['cost'], default=str)}`")
+    if _rerun_line(result):
+        lines.append(_rerun_line(result))
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [
@@ -225,6 +253,8 @@ def render_summary(result: dict) -> str:
         lines.append(f"- Consistency window: source isolation {side('source')}, target isolation "
                      f"{side('target')}, {state}"
                      + (f"; in flight at open: `{json.dumps(in_flight)}`" if in_flight else ""))
+    if _rerun_line(result):
+        lines.append(_rerun_line(result))
     for w in result.get("warnings", []):
         lines.append(f"- **WARNING: {w}**")
     lines += [

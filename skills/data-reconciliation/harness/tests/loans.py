@@ -13,7 +13,7 @@ from recon.adapters import (
 from recon.config import CanonRule, FieldMapping, MappingSpec, ObjectMapping, Tolerances
 from recon.engine import run_recon
 
-from tests.fakes import FakeSource, FakeTarget
+from tests.fakes import PROVEN_RERUN, FakeSource, FakeTarget
 
 T0 = dt.datetime(2026, 9, 1, 12, 0, 0)  # noqa: DTZ001  naive = UTC by contract
 EPOCH = dt.datetime(1970, 1, 1)  # noqa: DTZ001
@@ -138,6 +138,7 @@ def _sides(loans_src, loans_tgt, borrowers, *, src_seq=None, tgt_seq=None, tgt_f
 
 
 def _run(source, target, spec=None, tol=None, **kw):
+    kw.setdefault("rerun_proof", PROVEN_RERUN)
     return run_recon("u1", "transactional", spec or _spec(), tol or Tolerances("t1"),
                      [CanonRule("decimal_round", "money", {"places": 4})], source, target, **kw)
 

@@ -16,6 +16,8 @@ from recon.engine import run_recon
 from recon.routines import (check_parity, git_committed, grade_routines, load_runs, routine_gap,
                             writers)
 
+from recon.rerun import shape_digest, source_digest
+from tests.fakes import PROVEN_RERUN
 from tests.test_tiers import RULES, SPEC, TOL, make_green
 
 # a flat mapping: the embedded `items` in the shared green fixture are an ungraded-embed warning
@@ -159,6 +161,35 @@ def test_git_committed_is_true_only_for_a_file_present_on_disk_and_in_head(tmp_p
     assert not committed("fixtures/snap")  # in HEAD, gone from disk
     assert not committed("../outside") and not committed("/etc/hostname") and not committed("")
     assert not git_committed(tmp_path / "not-a-repo")("recon/a.run.json")
+
+
+def test_git_committed_refuses_symlinks_even_when_the_link_itself_is_committed(tmp_path):
+    """A committed symlink is a committed *pointer*: what it reads is whatever the link target holds
+    now, so neither a linked file nor a file under a linked directory is committed evidence."""
+    repo = _committed_repo(tmp_path / "r", "recon/a.run.json")
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere" / "b.run.json").write_text("{}\n")
+    (repo / "recon" / "link.run.json").symlink_to(tmp_path / "elsewhere" / "b.run.json")
+    (repo / "linked_dir").symlink_to(tmp_path / "elsewhere")
+    (repo / "recon" / "inner.run.json").symlink_to("a.run.json")
+    _git(repo, "add", "recon/link.run.json", "linked_dir", "recon/inner.run.json")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", "links")
+    committed = git_committed(repo)
+    assert committed("recon/a.run.json")
+    assert not committed("recon/link.run.json")  # symlink to a file outside the tree
+    assert not committed("recon/inner.run.json")  # symlink to a committed file: still a link
+    assert not committed("linked_dir/b.run.json")  # regular file reached through a linked directory
+
+
+def test_rows_must_be_objects_so_malformed_evidence_cannot_compare_equal(tmp_path):
+    """golden and observed tables are lists of row objects; a scalar or a list on both sides would
+    serialize and compare equal, so anything but an object row is refused, never graded."""
+    for bad in ([1], ["a"], [[1, 2]], [None], [{"period_id": 1}, 2]):
+        with pytest.raises(ConfigError, match="lists of row objects"):
+            grade_routines(DEPS, [_run(golden={**GOLDEN, "app.run_log": bad}, observed={**GOLDEN, "app.run_log": bad})])
+    with pytest.raises(ConfigError, match="lists of row objects"):
+        grade_routines(DEPS, [_run(observed={**GOLDEN, "app.run_log": {"run_id": 7}})])
+    assert grade_routines(DEPS, [_run()])["failed"] == []
 
 
 def test_a_run_record_is_graded_only_as_the_evidence_file_it_names():
@@ -357,7 +388,7 @@ def test_result_carries_routine_parity_and_a_failed_run_blocks_merge(tmp_path):
     failed = [{"routine": "r", "status": "failed", "evidence": "e",
                "findings": [{"table": "t", "check": "rows_differ", "detail": "d"}]}]
     result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, out_dir=tmp_path,
-                       routine_parity=failed)
+                       routine_parity=failed, rerun_proof=PROVEN_RERUN)
     assert result["verdict"] == "PASS" and result["merge_eligible"] is False
     assert result["merge_block_reasons"] == ["routine_gap"]
     assert result["routine_parity"] == failed
@@ -371,7 +402,7 @@ def test_unproven_routines_do_not_block_merge_but_are_listed(tmp_path):
     source, target = make_green()
     parity = [{"routine": "r", "status": "unproven", "evidence": None, "reason": "no committed run"}]
     result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, out_dir=tmp_path,
-                       routine_parity=parity)
+                       routine_parity=parity, rerun_proof=PROVEN_RERUN)
     assert result["merge_eligible"] is True and result["merge_block_reasons"] == []
     assert "unproven" in (tmp_path / "recon.summary.md").read_text()
 
@@ -389,21 +420,23 @@ def test_a_unit_with_writing_routines_and_no_complete_parity_list_is_not_merge_e
     source, target = make_green()
     writers_ = ["app_pkg.close_period", "app_pkg.write_run_log"]
     result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, out_dir=tmp_path,
-                       routine_writers=writers_)
+                       routine_writers=writers_, rerun_proof=PROVEN_RERUN)
     assert result["verdict"] == "PASS" and result["merge_eligible"] is False
     assert result["merge_block_reasons"] == ["routine_parity_missing"]
     assert "routine_parity_missing" in (tmp_path / "recon.summary.md").read_text()
     partial = [{"routine": "APP_PKG.close_period", "status": "proven", "evidence": EVIDENCE}]
     result = run_recon("orders", "live", FLAT, TOL, RULES, source, target,
-                       routine_parity=partial, routine_writers=writers_)
+                       routine_parity=partial, routine_writers=writers_, rerun_proof=PROVEN_RERUN)
     assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["routine_parity_missing"]
     complete = partial + [{"routine": "app_pkg.write_run_log", "status": "unproven", "evidence": None,
                            "reason": "no committed run"}]
     result = run_recon("orders", "live", FLAT, TOL, RULES, source, target,
-                       routine_parity=complete, routine_writers=writers_)
+                       routine_parity=complete, routine_writers=writers_, rerun_proof=PROVEN_RERUN)
     assert result["merge_eligible"] is True and result["merge_block_reasons"] == []
-    result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, routine_writers=[])
+    result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, routine_writers=[],
+                       rerun_proof=PROVEN_RERUN, routine_dependencies=".migration/units/orders/dependencies.json")
     assert result["merge_eligible"] is True  # the analysis says nothing writes
+    assert result["routine_dependencies"] == ".migration/units/orders/dependencies.json"
 
 
 def test_a_unit_with_no_dependency_analysis_at_all_is_not_merge_eligible(tmp_path):
@@ -411,7 +444,7 @@ def test_a_unit_with_no_dependency_analysis_at_all_is_not_merge_eligible(tmp_pat
     dependency analysis `build_result` blocks with `routine_parity_missing` and says what to commit."""
     source, target = make_green()
     result = run_recon("orders", "live", FLAT, TOL, RULES, source, target, out_dir=tmp_path,
-                       routine_analysis_missing=True)
+                       routine_analysis_missing=True, rerun_proof=PROVEN_RERUN)
     assert result["verdict"] == "PASS" and result["merge_eligible"] is False
     assert result["merge_block_reasons"] == ["routine_parity_missing"]
     text = (tmp_path / "recon.summary.md").read_text()
@@ -454,6 +487,13 @@ def test_check_parity_regrades_every_claim_from_its_committed_run_record(tmp_pat
     claim[0] = {"routine": "app_pkg.close_period", "status": "proven", "evidence": "nowhere/x.run.json"}
     rows = check_parity(claim, "p", DEPS, git_committed(repo), repo)
     assert rows[0]["status"] == "unproven" and "cannot read" in rows[0]["reason"]
+    # an `unproven` row that names evidence is graded from it too: a failed committed run cannot
+    # hide behind the softer label
+    _committed_run(repo, observed={**GOLDEN, "app.run_log": []})
+    claim[0] = {"routine": "app_pkg.close_period", "status": "unproven", "evidence": EVIDENCE, "reason": "tbd"}
+    rows = check_parity(claim, "p", DEPS, git_committed(repo), repo)
+    assert rows[0]["status"] == "failed" and rows[0]["findings"][0]["table"] == "app.run_log"
+    assert routine_gap(rows)
     with pytest.raises(ConfigError, match="repository root"):
         check_parity(claim, "p", DEPS, git_committed(repo))
 
@@ -471,17 +511,35 @@ def _cli_run(tmp_path, monkeypatch, *extra):
     monkeypatch.setattr(cli, "load_mapping_spec", lambda path, params: FLAT)
     monkeypatch.setattr(cli, "load_tolerances", lambda path: TOL)
     monkeypatch.setattr(cli, "load_canon_rules", lambda path: RULES)
+    job = tmp_path / "job.sql"
+    job.write_text("CREATE TABLE IF NOT EXISTS mig.s.orders (id INT)\n")
+    shape = {"tables": {"orders": [{"name": "id", "type": "int", "nullable": True}]}}
+    proof = tmp_path / "rerun_proof.json"
+    proof.write_text(json.dumps({**PROVEN_RERUN, "unit": "u", "notes": [], "prior_digest": "p",
+                                 "evidence": {"fresh": "j/1", "evolved": "j/2"}, "source_digest": source_digest([job]),
+                                 "shape": shape, "shape_digest": shape_digest(shape)}))
     rc = cli.main(["run", "--unit", "u", "--family", "oracle", "--mode", "live", "--mapping", "m", "--tolerances", "t",
                    "--canonicalization", "c", "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
-                   "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out"), *extra])
+                   "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out"),
+                   "--rerun-proof", str(proof), "--rerun-source", str(job), *extra])
     return rc, json.loads((tmp_path / "out" / "result.json").read_text())
+
+
+def _commit_deps(repo, deps=DEPS, path="analysis/dependencies.json"):
+    """The unit's dependency analysis committed at a repository path; returns that path."""
+    if not (repo / ".git").exists():
+        _committed_repo(repo, EVIDENCE)
+    (repo / path).parent.mkdir(parents=True, exist_ok=True)
+    (repo / path).write_text(json.dumps(deps) + "\n")
+    _git(repo, "add", path)
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", "deps")
+    return path
 
 
 def test_cli_run_grades_the_parity_file_against_the_unit_dependency_analysis(tmp_path, monkeypatch):
     """`run --routine-parity` needs the unit's dependency analysis: a parity file missing a writer,
     or no parity file at all, lists that writer as `unproven` instead of leaving the unit clean."""
-    deps = tmp_path / "dependencies.json"
-    deps.write_text(json.dumps(DEPS))
+    deps = _commit_deps(tmp_path)
     parity = tmp_path / "routine_parity.json"
     parity.write_text(json.dumps({"routine_parity": [
         {"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}]}))
@@ -489,14 +547,42 @@ def test_cli_run_grades_the_parity_file_against_the_unit_dependency_analysis(tmp
         _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity))
     _committed_run(tmp_path)
     rc, result = _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity),
-                          "--routine-dependencies", str(deps))
+                          "--routine-dependencies", deps)
     assert rc == 0 and result["merge_eligible"] is True
     assert [(r["routine"], r["status"]) for r in result["routine_parity"]] == [
         ("app_pkg.close_period", "proven"), ("app_pkg.write_run_log", "unproven")]
+    assert result["routine_dependencies"] == deps
     parity.write_text(json.dumps({"routine_parity": [
         {"routine": "other_pkg.x", "status": "proven", "evidence": EVIDENCE}]}))
     with pytest.raises(SystemExit, match="other_pkg.x.*not in the dependency analysis"):
-        _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity), "--routine-dependencies", str(deps))
+        _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity), "--routine-dependencies", deps)
+
+
+def test_cli_run_takes_the_dependency_analysis_only_as_a_committed_file_of_the_repository(tmp_path, monkeypatch):
+    """The analysis decides who the writers are, so it must be the committed one: a path outside the
+    repository, an untracked file, or an edited copy of the committed file is refused (never read
+    as an empty writer set), and the result names the committed file it used."""
+    deps = _commit_deps(tmp_path)
+    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", deps)
+    assert result["routine_dependencies"] == deps and result["routine_writers"] == [
+        "app_pkg.close_period", "app_pkg.write_run_log"]
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.json"
+    outside.write_text(json.dumps({"routines": []}))
+    with pytest.raises(SystemExit, match="not a committed file of the repository"):
+        _cli_run(tmp_path, monkeypatch, "--routine-dependencies", str(outside))
+    (tmp_path / "scratch.json").write_text(json.dumps({"routines": []}))
+    with pytest.raises(SystemExit, match="scratch.json.*not a committed file of the repository"):
+        _cli_run(tmp_path, monkeypatch, "--routine-dependencies", "scratch.json")
+    (tmp_path / deps).write_text(json.dumps({"routines": []}))
+    with pytest.raises(SystemExit, match="not a committed file of the repository"):
+        _cli_run(tmp_path, monkeypatch, "--routine-dependencies", deps)
+    (tmp_path / deps).write_text(json.dumps(DEPS) + "\n")
+    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", str(tmp_path / deps))
+    assert result["routine_dependencies"] == deps  # an absolute path inside the repository is recorded relative
+    unit = _commit_deps(tmp_path, {"routines": []}, ".migration/units/u/dependencies.json")
+    (tmp_path / unit).write_text(json.dumps(DEPS))
+    with pytest.raises(SystemExit, match="not a committed file of the repository"):
+        _cli_run(tmp_path, monkeypatch)  # the default analysis is held to the same rule
 
 
 def test_cli_run_with_no_parity_file_blocks_and_names_every_writer_from_the_analysis(tmp_path, monkeypatch):
@@ -504,10 +590,9 @@ def test_cli_run_with_no_parity_file_blocks_and_names_every_writer_from_the_anal
     writes (directly or through a callee) is a writer without a row, so the unit blocks with
     `routine_parity_missing` and the summary names them; `unproven` rows stay eligible only when a
     parity file carries them."""
-    deps = tmp_path / "dependencies.json"
-    deps.write_text(json.dumps({"routines": DEPS["routines"] + [
-        {"routine": "app_pkg.month_end", "writes": [], "calls": ["app_pkg.close_period"]}]}))
-    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", str(deps))
+    deps = _commit_deps(tmp_path, {"routines": DEPS["routines"] + [
+        {"routine": "app_pkg.month_end", "writes": [], "calls": ["app_pkg.close_period"]}]})
+    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", deps)
     assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["routine_parity_missing"]
     assert result["routine_parity"] is None
     text = (tmp_path / "out" / "recon.summary.md").read_text()
@@ -517,7 +602,7 @@ def test_cli_run_with_no_parity_file_blocks_and_names_every_writer_from_the_anal
     parity.write_text(json.dumps({"routine_parity": [
         {"routine": r, "status": "unproven", "evidence": None, "reason": "no committed run"}
         for r in ("app_pkg.close_period", "app_pkg.write_run_log", "app_pkg.month_end")]}))
-    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", str(deps), "--routine-parity", str(parity))
+    rc, result = _cli_run(tmp_path, monkeypatch, "--routine-dependencies", deps, "--routine-parity", str(parity))
     assert rc == 0 and result["merge_eligible"] is True
 
 
@@ -528,38 +613,35 @@ def test_cli_run_loads_the_units_committed_dependency_analysis_by_default(tmp_pa
     at all blocks too, naming the file to commit."""
     rc, result = _cli_run(tmp_path, monkeypatch)
     assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["routine_parity_missing"]
+    assert result["routine_dependencies"] is None
     assert ".migration/units/u/dependencies.json" in (tmp_path / "out" / "recon.summary.md").read_text()
-    unit = tmp_path / ".migration" / "units" / "u"
-    unit.mkdir(parents=True)
-    (unit / "dependencies.json").write_text(json.dumps(DEPS))
+    unit = _commit_deps(tmp_path, DEPS, ".migration/units/u/dependencies.json")
     rc, result = _cli_run(tmp_path, monkeypatch)
     assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["routine_parity_missing"]
     assert result["routine_parity"] is None and result["routine_writers"] == ["app_pkg.close_period", "app_pkg.write_run_log"]
-    (unit / "dependencies.json").write_text(json.dumps({"routines": [DEPS["routines"][2]]}))
+    assert result["routine_dependencies"] == unit
+    _commit_deps(tmp_path, {"routines": [DEPS["routines"][2]]}, unit)
     rc, result = _cli_run(tmp_path, monkeypatch)
     assert rc == 0 and result["merge_eligible"] is True and result["routine_parity"] == []
 
 
 def test_cli_run_refuses_a_parity_row_whose_committed_run_grades_differently(tmp_path, monkeypatch):
-    deps = tmp_path / "dependencies.json"
-    deps.write_text(json.dumps(DEPS))
-    _committed_repo(tmp_path)
+    deps = _commit_deps(tmp_path)
     _committed_run(tmp_path, observed={**GOLDEN, "app.run_log": []})
     parity = tmp_path / "routine_parity.json"
     parity.write_text(json.dumps({"routine_parity": [
         {"routine": "app_pkg.close_period", "status": "proven", "evidence": EVIDENCE}]}))
     with pytest.raises(SystemExit, match="claims proven.*grades failed"):
-        _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity), "--routine-dependencies", str(deps))
+        _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity), "--routine-dependencies", deps)
 
 
 def test_cli_run_downgrades_proven_rows_whose_evidence_is_not_in_the_committed_tree(tmp_path, monkeypatch):
-    deps = tmp_path / "dependencies.json"
-    deps.write_text(json.dumps(DEPS))
+    deps = _commit_deps(tmp_path)
     parity = tmp_path / "routine_parity.json"
     parity.write_text(json.dumps({"routine_parity": [
         {"routine": "app_pkg.close_period", "status": "proven", "evidence": "scratch/close_period.run.json"}]}))
     rc, result = _cli_run(tmp_path, monkeypatch, "--routine-parity", str(parity),
-                          "--routine-dependencies", str(deps))
+                          "--routine-dependencies", deps)
     assert result["routine_parity"][0]["status"] == "unproven"
     assert "not a committed file" in result["routine_parity"][0]["reason"]
 

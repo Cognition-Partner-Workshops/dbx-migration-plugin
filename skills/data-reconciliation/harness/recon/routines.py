@@ -42,7 +42,8 @@ Committed = Callable[[str], bool]
 def git_committed(repo: Path) -> Committed:
     """`committed(path)`: the file is in HEAD's tree of `repo`, present on disk at that path and
     byte-identical to the committed blob. Untracked, staged-only, edited, deleted and out-of-tree
-    paths are not committed artifacts."""
+    paths are not committed artifacts, and neither is anything reached through a symlink (the link
+    may be committed; what it points at is not)."""
     repo = Path(repo)
 
     def git(*args: str) -> bool:
@@ -54,6 +55,11 @@ def git_committed(repo: Path) -> Committed:
     def committed(path: str) -> bool:
         if not path or Path(path).is_absolute() or ".." in Path(path).parts or not (repo / path).is_file():
             return False
+        node = repo
+        for part in Path(path).parts:
+            node = node / part
+            if node.is_symlink():
+                return False
         return (git("cat-file", "-e", f"HEAD:{path}")
                 and git("diff", "--quiet", "HEAD", "--", path))
     return committed
@@ -115,7 +121,7 @@ def _tables(mapping: object, routine: str, which: str) -> dict[str, object]:
 
 
 def _canon(rows) -> list[str]:
-    if not isinstance(rows, list):
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
         raise ConfigError("golden and observed tables must be lists of row objects")
     return sorted(json.dumps(r, sort_keys=True, default=str) for r in rows)
 
@@ -218,10 +224,11 @@ def parity_missing(parity: list[dict] | None, writers: list[str] | None) -> list
 
 def check_parity(data: object, where: str, dependencies: object = None,
                  committed: Committed | None = None, repo: Path | None = None) -> list[dict]:
-    """Validate a routine_parity list before result.json carries it. A `proven` or `failed` row is
+    """Validate a routine_parity list before result.json carries it. A row that names evidence is
     a claim about a committed run: the run record its evidence names is read again from `repo` and
-    graded again (`_grade_run`), the recomputed row is what gets carried, and a claim the run does
-    not support is refused. With the unit's dependency analysis, every writing routine gets a row:
+    graded again (`_grade_run`), the recomputed row is what gets carried (an `unproven` row whose
+    run grades `failed` is carried as failed), and a `proven`/`failed` claim the run does not
+    support is refused. With the unit's dependency analysis, every writing routine gets a row:
     one the list lacks is `unproven`, and a row for a routine the analysis does not know (another
     unit's file) is refused."""
     if not isinstance(data, list):
@@ -238,7 +245,7 @@ def check_parity(data: object, where: str, dependencies: object = None,
             raise ConfigError(f"{where}: {name} appears twice")
     rows = []
     for r in data:
-        if r["status"] != "unproven":
+        if r["status"] != "unproven" or r.get("evidence"):
             if committed is None or writing is None:
                 raise ConfigError(f"{where}: {r['routine']} is {r['status']}; the dependency analysis and a "
                                   "committed-file check are needed to grade its run again")
@@ -273,7 +280,7 @@ def _regrade(claim: dict, where: str, writing: dict[str, list[str]], committed: 
         return _row(routine, "unproven", evidence,
                     reason=f"{where}: evidence {evidence} is a run of {run.get('routine')!r}, not {routine}")
     graded = _grade_run(routine.lower(), writes, run, committed)
-    if graded["status"] != claim["status"] and graded["status"] != "unproven":
+    if claim["status"] != "unproven" and graded["status"] not in (claim["status"], "unproven"):
         raise ConfigError(f"{where}: {routine} claims {claim['status']}; its committed run {evidence} "
                           f"grades {graded['status']}")
     return graded
