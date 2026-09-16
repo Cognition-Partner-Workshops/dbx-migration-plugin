@@ -53,7 +53,12 @@ Manifest shape (written by the plan playbook, read here):
   "base_branch": "migration/loan-servicing", # engagement feature branch; PR diffs are taken against it.
   "batches": [
     {"id": "w2-b01", "units": ["orders_load", "orders_dim"],
-     "write_targets": ["mig.orders", "mig.orders_dim"],
+     "write_targets": ["mig.orders", "mig.orders_dim", "mig.load_orders"],  # must equal the transitive writes of
+                                              #   every .migration/units/<unit>/dependencies.json the batch's units
+                                              #   ship, each source table taken to the target its unit's mapping_spec
+                                              #   gives it, plus the batch's deploy_objects
+     "deploy_objects": ["mig.load_orders"],   # optional; procedures, views, jobs the batch deploys (no DML writes
+                                              #   them); each must also be in write_targets
      "verify_depth": "full",                  # optional per-batch override
      "gates": [                               # required; the acceptance gates STOP C approved for these units
        {"id": "rows", "kind": "row_parity",  # kind: byte_compare | export_file | publish_leg | row_parity |
@@ -365,6 +370,37 @@ def validate_gates(b):
                              "(required for a waived gate)")
 
 
+def target_key(name, namespace=""):
+    """The one identity of a table however a manifest or mapping spells it: trimmed, unquoted, case-folded
+    segments, a name shorter than the manifest's target_namespace plus a table qualified with the leading
+    segments it lacks (the harness qualifies a bare object with the run's catalog and schema the same
+    way). So MIG.T, `mig`.`t` and, under namespace cat.mig, t and cat.mig.t are one target while other.t
+    is another. Without a namespace a bare name is only itself."""
+    def segments(s):
+        return [re.sub(r'^[`"\[]|[`"\]]$', "", p.strip()).casefold() for p in str(s).strip().split(".")] \
+            if str(s).strip() else []
+    parts, prefix = segments(name), segments(namespace)
+    if parts and all(parts) and len(parts) <= len(prefix):
+        parts = prefix[:len(prefix) + 1 - len(parts)] + parts
+    return ".".join(parts)
+
+
+def valid_namespace(value):
+    return isinstance(value, str) and all(re.fullmatch(r"[a-z_][\w$]*", s) for s in target_key(value).split("."))
+
+
+def reads_target(obj, table, namespace=""):
+    """A mapping object reads the target when both resolve to the same identity; with no namespace to
+    resolve a bare name in, a bare object is the table whose trailing name it is (the harness qualifies
+    it with the run's catalog and schema)."""
+    o, t = target_key(obj, namespace), target_key(table, namespace)
+    if not o:
+        return False
+    if not namespace and ("." not in o or "." not in t):
+        return o.rsplit(".", 1)[-1] == t.rsplit(".", 1)[-1]
+    return o == t
+
+
 def validate_manifest(m, doctor=None):
     """Fail here, in one line, instead of 20 children failing on a missing field. With the doctor's
     report (.migration/09_capabilities.json) the capability contract must repeat what the doctor
@@ -385,6 +421,9 @@ def validate_manifest(m, doctor=None):
     if not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
             and ".." not in m["base_branch"]):
         raise SystemExit("manifest 'base_branch' must be a plain branch name (letters, digits, _ . / -)")
+    if "target_namespace" in m and not valid_namespace(m["target_namespace"]):
+        raise SystemExit("manifest 'target_namespace' must be the dotted catalog.schema (or schema) the harness run is "
+                         "given, so a bare write target or mapping object is that table and no other")
     if m["base_branch"] in ("main", "master") and not (
             isinstance(m.get("trunk_base_decision"), str) and m["trunk_base_decision"].strip()):
         raise SystemExit("base_branch 'main' is the trunk: migration ledgers and unit PRs land on the engagement "
@@ -396,10 +435,24 @@ def validate_manifest(m, doctor=None):
         raise SystemExit(f"batch ids must be unique and non-empty: {dupes}")
     owners = {}
     for b in m["batches"]:
-        for key in ("units", "write_targets", "brief"):
+        for key in ("units", "brief"):
             if not b.get(key):
-                raise SystemExit(f"batch {b['id']} is missing '{key}' (a child with no brief or "
-                                 "no declared write targets cannot be launched safely)")
+                raise SystemExit(f"batch {b['id']} is missing '{key}' (a child with no brief cannot be launched safely)")
+        if not isinstance(b.get("write_targets"), list) or not all(isinstance(t, str) and t.strip()
+                                                                    for t in b["write_targets"]):
+            raise SystemExit(f"batch {b['id']} needs 'write_targets', a list of table names (empty only for a batch "
+                             "whose dependency analysis writes nothing)")
+        ns = m.get("target_namespace", "") if isinstance(m.get("target_namespace", ""), str) else ""
+        deploy = b.get("deploy_objects", [])
+        if not isinstance(deploy, list) or not all(isinstance(t, str) and t.strip() for t in deploy) \
+                or len({target_key(t, ns) for t in deploy}) != len(deploy):
+            raise SystemExit(f"batch {b['id']} 'deploy_objects' must be a list of distinct names: the procedures, views "
+                             "and jobs the batch deploys, which no routine's DML writes")
+        declared = {target_key(t, ns) for t in b["write_targets"]}
+        outside = sorted(t for t in deploy if target_key(t, ns) not in declared)
+        if outside:
+            raise SystemExit(f"batch {b['id']} 'deploy_objects' {outside} are not in its write_targets; every object a "
+                             "child deploys is a write target (it collides like any other)")
         if "verify_depth" in b and b["verify_depth"] not in VERIFY_DEPTHS:
             raise SystemExit(f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
         bad = [u for u in b["units"] if not isinstance(u, str) or not UNIT_ID.fullmatch(u)]
@@ -750,8 +803,473 @@ def hand_run_state():
     return state
 
 
+def other_wave_manifests(waves_dir, current):
+    """{file name: {target_namespace, batches}} for every other wave-*.json in .migration/waves/: a bare
+    write target means the table in the namespace of the manifest that declares it, so each wave's is kept
+    with its batches. A wave the plan wrote is part of the collision picture whether or not it has run, so
+    one that cannot be read halts."""
+    out = {}
+    for p in sorted(waves_dir.glob("wave-*.json")):
+        if p.name == current or p.name.endswith((".result.json", ".doctor.json")):
+            continue
+        try:
+            m = json.loads(p.read_text())
+        except ValueError as e:
+            raise SystemExit(f"{p} is not valid JSON ({e}); every wave manifest is read for cross-wave "
+                             "write-target collisions, so fix or remove it, then re-run") from None
+        batches = m.get("batches") if isinstance(m, dict) else None
+        if not isinstance(batches, list) or not all(
+                isinstance(b, dict) and isinstance(b.get("id"), str)
+                and isinstance(b.get("units"), list) and all(isinstance(u, str) for u in b["units"])
+                and isinstance(b.get("write_targets"), list) and all(isinstance(t, str) for t in b["write_targets"])
+                for b in batches):
+            raise SystemExit(f"{p} has no 'batches' list of {{id, units, write_targets}} rows; every wave manifest is "
+                             "read for cross-wave write-target collisions, so fix or remove it, then re-run")
+        namespace = m.get("target_namespace", "")
+        if "target_namespace" in m and not valid_namespace(namespace):
+            raise SystemExit(f"{p} 'target_namespace' must be the dotted catalog.schema (or schema) its harness run is "
+                             "given; every wave manifest is read for cross-wave write-target collisions, so fix it, "
+                             "then re-run")
+        out[p.name] = {"target_namespace": namespace, "batches": batches}
+    return out
+
+
+def unit_mapping(unit):
+    """The unit's recon mapping spec, None when the child has not written it yet."""
+    p = ROOT / ".migration" / "units" / unit / "mapping_spec.json"
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except ValueError as e:
+        raise SystemExit(f"{p} is not valid JSON ({e})") from None
+
+
+_SEGMENT = r'(?:[A-Za-z_][\w$]*|\[[^\]]+\]|"(?:[^"]|"")+"|`[^`]+`)'
+PREDICATE_TOKEN = re.compile(
+    r"\s+|(?P<string>'(?:[^']|'')*')|(?P<param>\$\{\w+\})|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    rf"|(?P<word>{_SEGMENT}(?:\.{_SEGMENT})*)|(?P<punct><>|!=|<=|>=|[=<>(),])")
+PREDICATE_WORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "true", "false"}
+
+
+def column_key(name):
+    """A column however a predicate or scope list spells it: the last segment, unquoted, case-folded."""
+    return re.sub(r'^[`"\[]|[`"\]]$', "", str(name).strip().split(".")[-1].strip()).casefold()
+
+
+def predicate_slices(where, scope):
+    """The rows a target_where bounds recon to, as slices: a list of boxes, each a scope column -> the
+    constraints an AND pins it with; None when the predicate is no bound. It tokenizes under the harness's
+    predicate grammar and parses the AND/OR/NOT/parenthesis structure. A comparison bounds when it pins
+    one of the mapping's declared scope columns to a literal or parameter with =, <, <=, >, >=, IN, LIKE or
+    BETWEEN; an OR bounds only when every branch does (its boxes are the branches'), an AND when any
+    operand does (one box per combination), at every depth. `1 = 1`, TRUE, `col = col`, `col IS NOT NULL`,
+    `col <> x`, NOT (...), a column outside the scope list, `col = x OR 1 = 1` and `(col = x OR 1 = 1)`
+    select more than the slice and are no bound. Anything unparsable is no bound. A constraint is
+    ("eq", values) for = and IN, ("range", low, high) with (value, inclusive) ends for the others, or
+    ("like",); a value is ("n", number), ("s", text) or ("p", parameter name)."""
+    if not isinstance(where, str):
+        return None
+    scope = {column_key(c) for c in scope}
+    tokens, pos = [], 0
+    while pos < len(where):
+        m = PREDICATE_TOKEN.match(where, pos)
+        if not m:
+            return None
+        if m.lastgroup:
+            tokens.append((m.lastgroup, m.group()))
+        pos = m.end()
+
+    def keyword(i, *words):
+        return i < len(tokens) and tokens[i][0] == "word" and tokens[i][1].lower() in words
+
+    def value(kind, text):
+        if kind == "number":
+            return "n", float(text)
+        if kind == "param":
+            return "p", text[2:-1]
+        text = text[1:-1].replace("''", "'")
+        return ("p", text[2:-1]) if re.fullmatch(r"\$\{\w+\}", text) else ("s", text)
+
+    def pins(toks):  # -> (column, constraint) or None when the atom is no bound
+        words = [t.lower() for k, t in toks if k == "word"]
+        columns = [i for i, (k, t) in enumerate(toks) if k == "word" and t.lower() not in PREDICATE_WORDS
+                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")]
+        values = [(i, value(k, t)) for i, (k, t) in enumerate(toks) if k in ("string", "number", "param")]
+        ops = [t for k, t in toks if k == "punct" and t in ("=", "<", "<=", ">", ">=")]
+        wildcard = "like" in words and all(re.fullmatch(r"'[%_]*'", t) for k, t in toks if k == "string")
+        if not (len(columns) == 1 and column_key(toks[columns[0]][1]) in scope and values and (ops or any(
+                w in ("in", "like", "between") for w in words)) and not wildcard
+                and not any(w in ("is", "not") for w in words)
+                and not any(k == "punct" and t in ("<>", "!=") for k, t in toks)):
+            return None
+        col = column_key(toks[columns[0]][1])
+        if "like" in words:
+            return col, ("like",)
+        if "in" in words or ops == ["="]:
+            return col, ("eq", frozenset(v for _, v in values))
+        if "between" in words and len(values) == 2 and not ops:
+            return col, ("range", (values[0][1], True), (values[1][1], True))
+        if len(ops) == 1 and len(values) == 1:
+            op, (at, v) = ops[0], values[0]
+            if at < columns[0]:
+                op = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}[op]
+            return col, (("range", None, (v, op == "<=")) if op in ("<", "<=") else ("range", (v, op == ">="), None))
+        return col, ("like",)
+
+    def both(a, b):
+        return [{c: x.get(c, []) + y.get(c, []) for c in {*x, *y}} for x in a for y in b]
+
+    def expr(i):  # -> (boxes or None, next index); raises ValueError on a malformed predicate
+        boxes, i = term(i)
+        while keyword(i, "or"):
+            b, i = term(i + 1)
+            boxes = None if boxes is None or b is None else boxes + b
+        return boxes, i
+
+    def term(i):
+        boxes, i = factor(i)
+        while keyword(i, "and"):
+            b, i = factor(i + 1)
+            boxes = b if boxes is None else boxes if b is None else both(boxes, b)
+        return boxes, i
+
+    def factor(i):
+        if keyword(i, "not"):
+            return None, factor(i + 1)[1]
+        if i < len(tokens) and tokens[i] == ("punct", "("):
+            boxes, i = expr(i + 1)
+            if i >= len(tokens) or tokens[i] != ("punct", ")"):
+                raise ValueError
+            return boxes, i + 1
+        start, depth, between = i, 0, False
+        while i < len(tokens) and not (depth == 0 and not between and (keyword(i, "and", "or") or tokens[i] == ("punct", ")"))):
+            depth += (tokens[i] == ("punct", "(")) - (tokens[i] == ("punct", ")"))
+            if depth < 0:
+                raise ValueError
+            between = (between and not keyword(i, "and")) or keyword(i, "between")
+            i += 1
+        atom = tokens[start:i]
+        if not atom or depth:
+            raise ValueError
+        pin = pins(atom)
+        return (None if pin is None else [{pin[0]: [pin[1]]}]), i
+
+    try:
+        boxes, end = expr(0)
+    except ValueError:
+        return None
+    return boxes if end == len(tokens) else None
+
+
+def bounded_predicate(where, scope):
+    """Whether a target_where bounds the rows recon reads to the unit's own slice (predicate_slices)."""
+    return predicate_slices(where, scope) is not None
+
+
+def disjoint_slices(a, b):
+    """Whether two readers' slices can never select the same row: every box of one against every box of
+    the other has a scope column both pin with constraints that are provably apart. Apart is: = or IN with
+    no value in common (a parameter is its own value: differently named parameters are different slices,
+    the same name the same one, and a parameter against a literal cannot be told apart); a literal range
+    or value entirely below or above another literal range of the same kind. LIKE separates nothing."""
+    def literal(v, kind):
+        return v[0] == kind and kind != "p"
+
+    def below(hi, lo):  # the (value, inclusive) high end of one range is under the low end of the other
+        return (hi is not None and lo is not None and hi[0][0] == lo[0][0] and literal(hi[0], hi[0][0])
+                and (hi[0][1] < lo[0][1] or (hi[0][1] == lo[0][1] and not (hi[1] and lo[1]))))
+
+    def apart(x, y):
+        if x[0] == "like" or y[0] == "like":
+            return False
+        if x[0] == "eq" and y[0] == "eq":
+            params = {v for v in x[1] | y[1] if v[0] == "p"}
+            return not (x[1] & y[1]) and (not params or params == x[1] | y[1])
+        if x[0] == "range" and y[0] == "range":
+            return below(x[2], y[1]) or below(y[2], x[1])
+        eq, rng = (x, y) if x[0] == "eq" else (y, x)
+        return all(below((v, True), rng[1]) or below(rng[2], (v, True)) for v in eq[1])
+
+    return all(any(apart(x, y) for c in set(p) & set(q) for x in p[c] for y in q[c]) for p in a for q in b)
+
+
+def bounded_readers(spec, table, namespace=""):
+    """Why the mapping spec's readers of `table` are not bounded to the unit's slice, '' when every one is,
+    None when the spec has no object for the table. Each reading object declares scope_columns (its
+    partition or run-date columns) and pins one of them in target_where; each of its embeds pins one of
+    its own scope_columns, or the object's, in its own target_where (the harness scopes an embed's nested
+    reads by the embed's predicate, not the object's)."""
+    objects = spec.get("objects", spec.get("tables")) if isinstance(spec, dict) else None
+    if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
+        raise SystemExit("mapping spec 'objects' must be a list of object rows")
+    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
+    if not mine:
+        return None
+
+    def columns(row, inherited=None):
+        scope = row.get("scope_columns", inherited)
+        if not (isinstance(scope, list) and scope and all(isinstance(c, str) and c.strip() for c in scope)):
+            return None
+        return scope
+
+    for o in mine:
+        scope = columns(o)
+        if scope is None:
+            return "declares no scope_columns (non-empty list of the table's partition or run-date columns)"
+        if not bounded_predicate(o.get("target_where"), scope):
+            return "reads it without a target_where pinning one of its scope_columns"
+        embeds = o.get("embeds", [])
+        if not isinstance(embeds, list) or not all(isinstance(e, dict) for e in embeds):
+            return "has 'embeds' that is not a list of embed rows"
+        for e in embeds:
+            escope = columns(e, scope)
+            if escope is None or not bounded_predicate(e.get("target_where"), escope):
+                return (f"embed '{e.get('array_path')}' reads it without its own target_where pinning one of its "
+                        "scope_columns (or the object's)")
+    return ""
+
+
+def reader_slices(spec, table, namespace=""):
+    """The slices of `table` the spec's readers recon, every reading object's boxes and each of its embeds'
+    together (the harness scopes an embed's nested reads by the embed's own predicate, so each is a read of
+    its own; call after bounded_readers found them all bounded); None when no object reads it."""
+    objects = spec.get("objects", spec.get("tables"))
+    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
+    if not mine:
+        return None
+    return [box for o in mine for row in (o, *o.get("embeds", []))
+            for box in predicate_slices(row.get("target_where"), row.get("scope_columns", o.get("scope_columns", [])))]
+
+
+def check_write_targets(batches, other_waves, mapping=None, namespace=""):
+    """Two batches in one wave writing the same table means the lineage missed an edge: refuse to launch.
+    A table written by units in different waves is shared: whole-table recon of the earlier unit is
+    undone by the later one's rows, so every mapping that reads it must be bounded (target_where to the
+    unit's own partition or run date), or this wave does not launch, and the readers' slices must be
+    provably disjoint pairwise (disjoint_slices), whichever waves they are in: two units whose predicates
+    may select the same row halt, named with their predicates. Every name here, written or read, goes
+    through target_key with the target_namespace of the wave that declares or reads it, so one table has
+    one identity and a bare name is never read in another wave's namespace. Only the units whose mapping
+    has an object for the table are its readers; a writing batch with no reader at all halts."""
+    mapping = unit_mapping if mapping is None else mapping
+    owners, spelled = {}, {}
+    for b in batches:
+        for t in b.get("write_targets", []):
+            k = target_key(t, namespace)
+            if k in owners:
+                raise SystemExit(f"write-target collision before launch: '{t}' is claimed by "
+                                 f"{owners[k]} and {b['id']}. Fix the wave plan, then re-run.")
+            owners[k], spelled[k] = b["id"], t
+    elsewhere, namespaces = {}, {None: namespace}
+    for name, other in other_waves.items():
+        if not (isinstance(other, dict) and isinstance(other.get("batches"), list) and "target_namespace" in other
+                and (other["target_namespace"] == "" or valid_namespace(other["target_namespace"]))):
+            raise SystemExit(f"{name} has no {{target_namespace, batches}} record; every wave manifest is read for "
+                             "cross-wave write-target collisions, so fix it, then re-run")
+        namespaces[name] = other["target_namespace"]
+        for b in other["batches"]:
+            for t in b["write_targets"]:
+                elsewhere.setdefault(target_key(t, namespaces[name]), []).append((name, b))
+    for k, mine in owners.items():
+        if k not in elsewhere:
+            continue
+        t = spelled[k]
+        batch = next(b for b in batches if b["id"] == mine)
+        shared = ", ".join(f"{name} {b['id']} (units {', '.join(b['units'])})" for name, b in elsewhere[k])
+        why = (f"shared write target '{t}' is written by {mine} in this wave and by {shared}; every mapping "
+               f"that reads it, in every wave, declares the object's scope_columns and a target_where pinning "
+               f"one of them to the unit's own partition or run date (`1 = 1`, `col = col`, IS NOT NULL, <> and "
+               f"columns outside scope_columns are no bound)")
+        readers = []
+        for wave, b in ((None, batch), *elsewhere[k]):
+            where = "" if wave is None else f" ({wave} {b['id']})"
+            before = len(readers)
+            for u in b["units"]:
+                spec = mapping(u)
+                path = f".migration/units/{u}/mapping_spec.json"
+                if spec is None:
+                    raise SystemExit(f"{why}: {path} is missing, so unit {u}{where} cannot be scoped")
+                try:
+                    problem = bounded_readers(spec, k, namespaces[wave])
+                except SystemExit as e:
+                    raise SystemExit(f"{why}: {path}: {e}") from None
+                if problem is None:
+                    continue
+                if problem:
+                    raise SystemExit(f"{why}: {path} (unit {u}{where}) {problem}")
+                readers.append((f"unit {u}{where}", reader_slices(spec, k, namespaces[wave])))
+            if len(readers) == before:
+                paths = ", ".join(f".migration/units/{u}/mapping_spec.json" for u in b["units"])
+                raise SystemExit(f"{why}: no unit of {b['id']}{where} reads '{t}': no object reading '{t}' in {paths}")
+        for i, (a, slices_a) in enumerate(readers):
+            for c, slices_c in readers[i + 1:]:
+                if not disjoint_slices(slices_a, slices_c):
+                    raise SystemExit(f"shared write target '{t}': the slices {a} and {c} recon may overlap; their "
+                                     f"target_where must pin a common scope column to values that cannot both hold "
+                                     f"(=/IN with no value in common, differently named parameters, or literal ranges "
+                                     f"that do not meet; LIKE, a parameter against a literal, or different columns "
+                                     f"prove nothing). Fix the mapping specs, then re-run.")
+
+
+def unit_dependencies(unit):
+    """The unit's dependency analysis ({routine, reads, writes, calls} rows, shape in the source-dialect
+    skill; an empty list for a unit that converts no routine), None when the dialect emits none. Anything
+    else is a halt."""
+    p = ROOT / ".migration" / "units" / unit / "dependencies.json"
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except ValueError as e:
+        raise SystemExit(f"{p} is not valid JSON ({e})") from None
+    rows = data.get("routines") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not all(
+            isinstance(r, dict) and isinstance(r.get("routine"), str) and r["routine"]
+            and all(isinstance(r.get(k), list) and all(isinstance(t, str) and t for t in r[k])
+                    for k in ("reads", "writes", "calls"))
+            for r in rows):
+        raise SystemExit(f"{p} needs a 'routines' list of {{routine, reads, writes, calls}} rows "
+                         "(string name, lists of names)")
+    names = Counter(r["routine"].casefold() for r in rows)
+    if any(n > 1 for n in names.values()):
+        raise SystemExit(f"{p} names a routine twice: {', '.join(sorted(k for k, n in names.items() if n > 1))}")
+    return rows
+
+
+def transitive_writes(routines, resolve=None):
+    """Every table written by the routines or anything they call, transitively, each through `resolve(row,
+    table)` -> the set of targets it is (the source name itself by default). A callee the analysis does
+    not cover means unknown writes, so it halts."""
+    resolve = resolve or (lambda r, t: {target_key(t)})
+    by_name = {r["routine"].casefold(): r for r in routines}
+    seen, writes = set(), set()
+    todo = list(by_name)
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        r = by_name[name]
+        for t in r["writes"]:
+            writes |= resolve(r, t)
+        for callee in r["calls"]:
+            if callee.casefold() not in by_name:
+                raise SystemExit(f"routine {r['routine']} calls {callee}, which the dependency analysis does not cover, "
+                                 "so its writes are unknown")
+            todo.append(callee.casefold())
+    return writes
+
+
+def mapped_target(spec, table, namespace=""):
+    """The targets the unit's mapping spec gives a source table: every object whose root_table or
+    source_table it is (one legacy table can feed several), empty when no object names it."""
+    k = target_key(table)
+    objects = (spec.get("objects") or spec.get("tables") or []) if isinstance(spec, dict) else []
+    return {target_key(o.get("object") or o.get("target_table") or "", namespace)
+            for o in (objects if isinstance(objects, list) else [])
+            if isinstance(o, dict) and target_key(o.get("root_table") or o.get("source_table") or "") == k}
+
+
+def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
+    """Where a unit ships a dependency analysis, the batch's declared write_targets, less its
+    deploy_objects (procedures, views, jobs: deployed, written by no DML), must equal the call graph's
+    transitive writes as target tables. The analysis names legacy tables; each is the object its own
+    unit's mapping_spec.json gives it (root_table -> object; a written table the spec does not map is a
+    halt, its target unknown), or keeps its name when the unit has no spec yet, and bare names are the
+    manifest's target_namespace. A table the code writes but the plan did not declare escapes the
+    collision check; a declared table nothing writes hides a dropped step. Either halts. With a unit
+    the dialect did not analyse in the batch only the first check is possible (its targets are
+    indistinguishable from extras). No declared targets is allowed only when every unit is analysed
+    and the graph writes nothing; every unit analysed and none converting a routine is that empty graph,
+    so anything declared is extra. The routines nothing else in the batch calls are its entry points and
+    ship as deployed objects: each takes a deploy_objects row of its own, the one spelled with its own
+    trailing segments under target_namespace (`mig.app.close` for `app.close`), or a bare one there (`mig.close`)
+    when no other root ends in that name (`mig.other.close` and `prod.app.close` are somebody else's); a root
+    named without a schema (`close`) takes the one row ending in its name, and halts as ambiguous when several
+    could be it; a callee may be inlined into its
+    caller and keep its row. A root left without a row is the same mismatch as an undeclared table. A row no
+    root takes is a view or job the analysis has no routine for; it stays a declared target and the collision
+    check's business."""
+    analysis = unit_dependencies if analysis is None else analysis
+    mapping = unit_mapping if mapping is None else mapping
+    for b in batches:
+        by_unit = {u: analysis(u) for u in b["units"]}
+        complete = all(rows is not None for rows in by_unit.values())
+        if not b["write_targets"] and not complete:
+            raise SystemExit(f"batch {b['id']} declares no write_targets, which only a dependency analysis for every "
+                             f"unit ({', '.join(u for u, rows in by_unit.items() if rows is None)}) that writes "
+                             "nothing can justify. Fix the wave plan, then re-run.")
+        routines = [r for rows in by_unit.values() for r in rows or []]
+        if not routines and not complete:
+            continue
+        where = f"batch {b['id']} (units {', '.join(b['units'])})"
+        names = Counter(r["routine"].casefold() for r in routines)
+        if any(n > 1 for n in names.values()):
+            raise SystemExit(f"{where}: two units analyse the same routine: "
+                             f"{', '.join(sorted(k for k, n in names.items() if n > 1))}")
+        owner = {r["routine"].casefold(): u for u, rows in by_unit.items() for r in rows or []}
+        specs = {u: mapping(u) for u, rows in by_unit.items() if rows}
+
+        def resolve(r, t):
+            u = owner[r["routine"].casefold()]
+            if specs[u] is None:
+                return {target_key(t, namespace)}
+            targets = mapped_target(specs[u], t, namespace)
+            if not targets:
+                raise SystemExit(f"unit {u}'s routine {r['routine']} writes '{t}', which no object of its "
+                                 "mapping_spec.json has as root_table, so its target is unknown")
+            return targets
+
+        try:
+            actual = transitive_writes(routines, resolve)
+        except SystemExit as e:
+            raise SystemExit(f"{where}: {e}") from None
+        deploy = {target_key(t, namespace) for t in b.get("deploy_objects", [])}
+        written = sorted(deploy & actual)
+        if written:
+            raise SystemExit(f"batch {b['id']}: deploy_objects {written} are tables the call graph writes, not "
+                             "deployed objects. Fix the wave plan, then re-run.")
+        declared = {target_key(t, namespace) for t in b["write_targets"]} - deploy
+        extra = sorted(declared - actual) if complete else []
+        if actual - declared or extra:
+            raise SystemExit(f"batch {b['id']}: declared write_targets differ from the call graph's transitive writes; "
+                             f"missing from the declaration: {sorted(actual - declared) or '-'}; "
+                             f"extra in the declaration: {extra or '-'}. Fix the wave plan, then re-run.")
+        called = {c.casefold() for r in routines for c in r["calls"]}
+        roots = sorted(r["routine"] for r in routines if r["routine"].casefold() not in called)
+        free = set(deploy)
+        prefix = target_key(namespace).split(".") if namespace else []
+
+        def take(root, fits):
+            segs = target_key(root).split(".")
+            found = sorted(d for d in free if d.split(".")[:len(prefix)] == prefix
+                           and fits(d.split(".")[len(prefix):], segs))
+            if len(found) > 1:
+                raise SystemExit(f"batch {b['id']}: analysed routine {root} is ambiguous: deploy_objects {found} could "
+                                 "each be it. Spell the routine and its row alike, then re-run.")
+            if found:
+                free.discard(found[0])
+            return bool(found)
+
+        trailing = Counter(target_key(root).rsplit(".", 1)[-1] for root in roots)
+        exact = {root for root in roots
+                 if take(root, lambda d, s: d == s if prefix and len(s) > 1 else d[-len(s):] == s)}
+        undeclared = [root for root in roots if root not in exact
+                      and not take(root, lambda d, s: d[-1] == s[-1] and len(d) < len(s) and trailing[s[-1]] == 1)]
+        if undeclared:
+            raise SystemExit(f"batch {b['id']}: analysed routine(s) {undeclared} are entry points nothing in the batch "
+                             "calls, so the unit deploys them, but deploy_objects has no object of that name left for "
+                             "them (one row stands for one routine). Fix the wave plan, then re-run.")
+
+
 if sys.argv[1:2] == ["reserve"]:
     validate_manifest(MANIFEST)
+    check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
+                        other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
+                        namespace=MANIFEST.get("target_namespace", ""))
+    check_dependencies(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
+                       namespace=MANIFEST.get("target_namespace", ""))
     record_run("reserve")
     print(json.dumps({"wave": MANIFEST["wave"], "stop_c": MANIFEST["stop_c"], "reserved": True}))
     sys.exit(0)
@@ -776,8 +1294,9 @@ if sys.argv[1:2] == ["gates"]:
     sys.exit(code)
 if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
     raise spent_halt()
+PREFLIGHT = sys.argv[1:] == ["preflight"]
 validate_manifest(MANIFEST)
-BASE_SHA = launch_base()
+BASE_SHA = None if PREFLIGHT else launch_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
 if not SMOKE:
     validate_manifest(MANIFEST, DOCTOR)
@@ -1014,18 +1533,6 @@ VERIFY_SCHEMA = {
     },
     "required": ["wave_verdict", "unit_verdicts", "findings", "changed_paths"],
 }
-
-
-def check_write_targets(batches):
-    """Two batches writing the same table or collection means the lineage missed an edge.
-    Refuse to launch anything; the plan must be fixed first."""
-    owners = {}
-    for b in batches:
-        for t in b.get("write_targets", []):
-            if t in owners:
-                raise SystemExit(f"write-target collision before launch: '{t}' is claimed by "
-                                 f"{owners[t]} and {b['id']}. Fix the wave plan, then re-run.")
-            owners[t] = b["id"]
 
 
 def child_prompt(batch):
@@ -1352,22 +1859,26 @@ async def main():
     if not resume:
         RUN_ID_PATH.unlink(missing_ok=True)
     await register_workflow(META)
-    check_write_targets(BATCHES)
+    check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
+                        namespace=MANIFEST.get("target_namespace", ""))
+    check_dependencies(BATCHES, namespace=MANIFEST.get("target_namespace", ""))
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}")
 
     sem = asyncio.Semaphore(WIDTH)
     breaker = Breaker(BREAKER)
     results = await asyncio.gather(*(run_batch(b, sem, breaker) for b in BATCHES))
 
-    reported = Counter(t for r in results for t in r.get("write_targets", []))
-    surprises = [t for t, c in reported.items() if c > 1]
+    namespace = MANIFEST.get("target_namespace", "")
+    reported = Counter(t for r in results for t in {target_key(t, namespace) for t in r.get("write_targets", [])})
+    surprises = sorted(t for t, c in reported.items() if c > 1)
     undeclared = {}
     for b, r in zip(BATCHES, results):
-        extra = sorted(set(r.get("write_targets", [])) - set(b["write_targets"]))
+        declared = {target_key(t, namespace) for t in b["write_targets"]}
+        extra = sorted({t for t in r.get("write_targets", []) if target_key(t, namespace) not in declared})
         if extra:
             undeclared[b["id"]] = extra
     unreported = [b["id"] for b, r in zip(BATCHES, results)
-                  if r["status"] == "PASS" and not r.get("write_targets")]
+                  if r["status"] == "PASS" and b["write_targets"] and not r.get("write_targets")]
     auto_merge = AUTO_MERGE
     if surprises:
         auto_merge = False
@@ -1431,6 +1942,12 @@ async def main():
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 
 
+if PREFLIGHT:  # `workflow.py preflight`: the launch checks for a wave launched by hand; writes nothing
+    check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
+                        namespace=MANIFEST.get("target_namespace", ""))
+    check_dependencies(BATCHES, namespace=MANIFEST.get("target_namespace", ""))
+    print(json.dumps({"wave": WAVE, "ready": True, "batches": [b["id"] for b in BATCHES]}, sort_keys=True))
+    sys.exit(0)
 if not resume and not SMOKE:
     record_run(MODE, RUN_ID)
 asyncio.run(main())

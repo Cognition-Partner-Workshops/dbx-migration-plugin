@@ -26,7 +26,9 @@ def _gates_sha(batches, wave=0):
 def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
-               gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft"):
+               gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
+               other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
+               deploy_objects=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -36,6 +38,16 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         d.mkdir(parents=True)
         (d / "result.json").write_text(eligible if isinstance(eligible, str) else json.dumps(
             {"verdict": "PASS", "merge_eligible": eligible, "merge_authority": {"kind": "harness", "decision_id": None}}))
+    for name, text in (other_waves or {}).items():
+        (waves / name).write_text(text)
+    for unit, spec in (mappings or {}).items():
+        path = ws / ".migration" / "units" / unit / "mapping_spec.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(spec))
+    for unit, text in (dependencies or {}).items():
+        path = ws / ".migration" / "units" / unit / "dependencies.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
     source = {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}}
     manifest = {
         "wave": 0,
@@ -53,9 +65,13 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "stop_mode": stop_mode,
             "ready": True,
         },
-        "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief",
+        "batches": [{"id": "b-1", "units": list(units), "write_targets": list(write_targets), "brief": "brief",
                      "gates": gates if gates is not None else [GATE]}],
     }
+    if deploy_objects is not None:
+        manifest["batches"][0]["deploy_objects"] = list(deploy_objects)
+    if namespace is not None:
+        manifest["target_namespace"] = namespace
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
     manifest["stop_c"] = "D-2"
     ledger = f"| D-2 | 2026-01-05 | user:U0 | STOP C wave-0 gates_sha {manifest['gates_sha']} | plan approved |\n" if stop_c else ""
@@ -462,6 +478,230 @@ def test_a_rerun_over_a_result_that_cannot_say_which_stop_c_it_spent_halts(tmp_p
     assert (ws / ".migration/waves/wave-0.result.json").read_text() == prior
 
 
+WAVE_1 = json.dumps({"wave": 1, "batches": [{"id": "b-2", "units": ["v"], "write_targets": ["mig.t"], "brief": "b"}]})
+MAPPING = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"]}]}
+BOUNDED_MAPPING = {"objects": [{**MAPPING["objects"][0], "root_where": "run_date = '${as_of}'",
+                                "target_where": "run_date = '${as_of}'"}]}
+PRIOR_MAPPING = {"objects": [{**MAPPING["objects"][0], "root_where": "run_date = '${prior_as_of}'",
+                              "target_where": "run_date = '${prior_as_of}'"}]}
+
+
+def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_bounded(tmp_path):
+    ws, cwd = _workspace(tmp_path / "open", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": MAPPING, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "open", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0
+    assert "'mig.t'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr and "target_where" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+    tautology = {"objects": [{**MAPPING["objects"][0], "root_where": "1 = 1", "target_where": "1 = 1"}]}
+    ws, cwd = _workspace(tmp_path / "taut", other_waves={"wave-1.json": WAVE_1.replace("mig.t", "MIG.T")},
+                         mappings={"u": tautology, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "taut", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "target_where" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    bounded = {"objects": [{**BOUNDED_MAPPING["objects"][0], "object": "T"}]}
+    unbounded = {"objects": [{**MAPPING["objects"][0], "object": "T"}]}
+    ws, cwd = _workspace(tmp_path / "bare", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": unbounded, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "bare", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "(unit u) reads it without a target_where" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    ws, cwd = _workspace(tmp_path / "elsewhere", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": {"objects": [{**MAPPING["objects"][0], "object": "other.t"}]}, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "elsewhere", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "no unit of b-1 reads 'mig.t'" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    sibling_bare = WAVE_1.replace('"mig.t"', '"t"').replace('"wave": 1', '"wave": 1, "target_namespace": "mig"')
+    ws, cwd = _workspace(tmp_path / "prior", other_waves={"wave-1.json": sibling_bare},
+                         mappings={"u": bounded}, namespace="MIG")
+    proc, calls = _run(cwd, tmp_path / "prior", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "units/v/mapping_spec.json is missing" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "other_ns", other_waves={"wave-1.json": WAVE_1.replace('"mig.t"', '"t"')},
+                         mappings={"u": bounded}, namespace="MIG")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "other_ns", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "bad_ns", other_waves={"wave-1.json": sibling_bare.replace('"mig"', '"cat."')},
+                         mappings={"u": bounded}, namespace="MIG")
+    proc, calls = _run(cwd, tmp_path / "bad_ns", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "wave-1.json" in proc.stderr and "target_namespace" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "overlap", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": bounded, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "overlap", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "unit u and unit v (wave-1.json b-2)" in proc.stderr
+    assert "overlap" in proc.stderr and not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": bounded, "v": PRIOR_MAPPING})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "bounded", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+
+def test_a_hand_run_wave_reserves_nothing_while_a_shared_table_is_unbounded(tmp_path):
+    """`reserve` is the small wave's launch: it runs the same cross-wave collision check the workflow does
+    before it spends the STOP C row, so an unbounded mapping on a shared table launches nothing by hand either."""
+    ws, cwd = _workspace(tmp_path / "open", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": MAPPING, "v": BOUNDED_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "Traceback" not in proc.stderr
+    assert "'mig.t'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr and "target_where" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+
+    ws, cwd = _workspace(tmp_path / "overlap", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": BOUNDED_MAPPING, "v": BOUNDED_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "overlap" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+
+    ws, cwd = _workspace(tmp_path / "bounded", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": BOUNDED_MAPPING, "v": PRIOR_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["reserved"] is True
+
+
+def test_a_hand_run_wave_reserves_nothing_while_its_declared_targets_differ_from_the_call_graph(tmp_path):
+    """`preflight` is advice about a manifest that may change before `reserve` runs; `reserve` checks the
+    manifest it spends the STOP C row on, call graph included."""
+    ws, cwd = _workspace(tmp_path / "drift", doctor=False, dependencies={"u": _analysis("mig.t", "mig.audit")})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "Traceback" not in proc.stderr
+    assert "b-1" in proc.stderr and "mig.audit" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+
+    ws, cwd = _workspace(tmp_path / "ok", doctor=False, dependencies={"u": _analysis("MIG.T")},
+                         write_targets=("mig.t", "mig.run"), deploy_objects=("mig.run",), namespace="mig")
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["reserved"] is True
+
+
+def test_malformed_sibling_wave_manifest_halts_before_launch(tmp_path):
+    ws, cwd = _workspace(tmp_path, other_waves={"wave-1.json": "{"})
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "wave-1.json" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def _analysis(*writes):
+    return json.dumps({"routines": [
+        {"routine": "app.run", "reads": ["src.t"], "writes": [], "calls": ["app.write"]},
+        {"routine": "app.write", "reads": [], "writes": list(writes), "calls": []}]})
+
+
+def test_declared_write_targets_must_equal_the_call_graphs_transitive_writes(tmp_path):
+    ws, cwd = _workspace(tmp_path / "drift", dependencies={"u": _analysis("mig.t", "mig.audit")})
+    proc, calls = _run(cwd, tmp_path / "drift", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0
+    assert "b-1" in proc.stderr and "missing" in proc.stderr and "mig.audit" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+    ws, cwd = _workspace(tmp_path / "same", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
+                         deploy_objects=("mig.run",), namespace="mig")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "same", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "undeployed", dependencies={"u": _analysis("MIG.T")})
+    proc, calls = _run(cwd, tmp_path / "undeployed", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "['app.run']" in proc.stderr and "deploy_objects" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_call_graph_writes_are_compared_as_the_mapping_specs_target_names(tmp_path):
+    """The analysis names legacy tables; the manifest names deployed targets. A source write resolves
+    through the unit's mapping object (root_table -> object) before the comparison, and a deployed
+    procedure listed in deploy_objects is a write target no DML has to produce."""
+    spec = {"objects": [{"object": "t", "root_table": "SRC.LEDGER", "key": ["id"]}]}
+    ws, cwd = _workspace(tmp_path / "ok", dependencies={"u": _analysis("src.ledger")}, mappings={"u": spec},
+                         namespace="mig", write_targets=("mig.t", "mig.run"), deploy_objects=("MIG.run",))
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["mig.t", "mig.run"]), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "raw", dependencies={"u": _analysis("src.ledger")}, mappings={"u": spec},
+                         namespace="mig", write_targets=("src.ledger",))
+    proc, calls = _run(cwd, tmp_path / "raw", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "missing from the declaration: ['mig.t']" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "unmapped", dependencies={"u": _analysis("src.ledger", "src.other")},
+                         mappings={"u": spec}, namespace="mig", write_targets=("mig.t", "mig.other"))
+    proc, calls = _run(cwd, tmp_path / "unmapped", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "'src.other'" in proc.stderr and "mapping_spec.json" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "proc", dependencies={"u": _analysis("mig.t")}, write_targets=("mig.t", "mig.run"))
+    proc, calls = _run(cwd, tmp_path / "proc", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "extra in the declaration: ['mig.run']" in proc.stderr
+
+    ws, cwd = _workspace(tmp_path / "outside", write_targets=("mig.t",), deploy_objects=("mig.run",))
+    proc, calls = _run(cwd, tmp_path / "outside", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "deploy_objects" in proc.stderr and "write_targets" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_child_reported_targets_compare_under_the_manifests_namespace_after_the_run(tmp_path):
+    """The manifest declares `orders` under target_namespace `cat.mig`; a child reports the same table
+    as `CAT.MIG.orders`. That is one declared target, not an undeclared write and not an overlap."""
+    ws, cwd = _workspace(tmp_path / "ok", namespace="cat.mig", write_targets=("orders",))
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["CAT.MIG.orders", "orders"]),
+                                           _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert "outside their declared targets" not in proc.stdout and "overlapping" not in proc.stdout
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "other", namespace="cat.mig", write_targets=("orders",))
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "other", [_pass_report(pr, write_targets=["cat.mig.orders", "cat.mig.other"]),
+                                              _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert "outside their declared targets" in proc.stdout and "cat.mig.other" in proc.stdout
+    assert "cat.mig.orders" not in proc.stdout.split("outside their declared targets")[1].splitlines()[0]
+    assert "cat.mig.other" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+
+
+def test_read_only_batch_declares_no_targets_only_with_an_analysis_that_writes_nothing(tmp_path):
+    ws, cwd = _workspace(tmp_path / "bare", write_targets=())
+    proc, calls = _run(cwd, tmp_path / "bare", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "b-1" in proc.stderr and "write_targets" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "ro", write_targets=(), dependencies={"u": json.dumps({"routines": []})})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "ro", [_pass_report(pr, write_targets=[]), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "view", write_targets=(), dependencies={"u": _analysis()})
+    proc, calls = _run(cwd, tmp_path / "view", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "['app.run']" in proc.stderr and "deploy_objects" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_malformed_dependency_analysis_halts_before_launch(tmp_path):
+    ws, cwd = _workspace(tmp_path, dependencies={"u": '{"routines": [{"routine": "a"}]}'})
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "u/dependencies.json" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
 def _push_pr(ws, n=1):
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", f"HEAD:refs/pull/{n}/head", "HEAD:recon/wave-0"], check=True)
     return f"https://github.com/acme/target/pull/{n}"
@@ -642,3 +882,26 @@ def test_docs_describe_the_pointer_and_doctor_wave_steps():
         assert "run_id" in doc
         assert '"workspace"' in doc or "workspace" in doc
         assert "W" + "AVE_" not in doc
+
+
+def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tmp_path):
+    def run(ws_dir, **kw):
+        ws, cwd = _workspace(ws_dir, **kw)
+        proc = subprocess.run([sys.executable, str(WORKFLOW), "preflight"], cwd=cwd, env={},
+                              capture_output=True, text=True)
+        assert not (ws / ".migration/waves/wave-0.result.json").exists()
+        assert not (ws / ".migration/waves/wave-0.base_sha").exists()
+        return proc
+
+    proc = run(tmp_path / "ok", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
+               deploy_objects=("mig.run",), namespace="mig")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"wave": 0, "ready": True, "batches": ["b-1"]}
+    proc = run(tmp_path / "drift", dependencies={"u": _analysis("mig.t", "mig.audit")})
+    assert proc.returncode != 0 and "b-1" in proc.stderr and "mig.audit" in proc.stderr
+    proc = run(tmp_path / "shared", other_waves={"wave-1.json": WAVE_1}, mappings={"u": MAPPING})
+    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "target_where" in proc.stderr
+    proc = run(tmp_path / "nodoctor", doctor=False)
+    assert proc.returncode != 0 and "doctor" in proc.stderr
+    proc = run(tmp_path / "stopc", stop_c=False)
+    assert proc.returncode != 0 and "gates_sha" in proc.stderr

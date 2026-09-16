@@ -58,6 +58,9 @@ def make_green():
             {"order_id": 2, "customer": {}, "total": 20.0, "items": [{"sku": "c"}]},
         ],
     })
+    from recon.adapters import SchemaFacts
+    source.schema["ORDERS"] = SchemaFacts(table="ORDERS", primary_key=("ORDER_ID",))
+    target.schema["orders"] = SchemaFacts(table="orders", primary_key=("order_id",))
     return source, target
 
 
@@ -68,7 +71,7 @@ def run(source, target, mode="live"):
 def test_green_estate_passes():
     result = run(*make_green())
     assert result["verdict"] == "PASS"
-    assert [t["tier"] for t in result["tiers"]] == [1, 2, 3]
+    assert [t["tier"] for t in result["tiers"]] == [0, 1, 2, 3]
     assert result["mapping_version"] == "map-v1" and result["tolerance_version"] == "tol-v1"
 
 
@@ -77,15 +80,15 @@ def test_tier1_root_count_and_gate():
     target.objects["orders"] = target.objects["orders"][:1]
     result = run(source, target)
     assert result["verdict"] == "FAIL"
-    assert len(result["tiers"]) == 1  # nothing else ran: Tier 1 gates
-    assert any(f["check"] == "root_count" for f in result["tiers"][0]["findings"])
+    assert len(result["tiers"]) == 2  # structural parity plus the gating Tier 1
+    assert any(f["check"] == "root_count" for f in result["tiers"][1]["findings"])
 
 
 def test_tier1_embed_cardinality():
     source, target = make_green()
     target.objects["orders"][0]["items"].pop()
     result = run(source, target)
-    checks = {f["check"] for f in result["tiers"][0]["findings"]}
+    checks = {f["check"] for f in result["tiers"][1]["findings"]}
     assert checks == {"embed_cardinality"}
 
 
@@ -93,7 +96,7 @@ def test_tier2_aggregate_mismatch():
     source, target = make_green()
     target.objects["orders"][0]["total"] = 999.0  # sum/min/max drift
     result = run(source, target)
-    t2 = result["tiers"][1]
+    t2 = result["tiers"][2]
     assert not t2["passed"]
     assert any(f["check"].startswith("aggregate_") for f in t2["findings"])
 
@@ -102,7 +105,7 @@ def test_tier3_field_diff_reports_rule_evidence():
     source, target = make_green()
     target.objects["orders"][0]["customer"]["name"] = "Bob"
     result = run(source, target)
-    t3 = result["tiers"][2]
+    t3 = result["tiers"][3]
     diffs = [f for f in t3["findings"] if f["check"] == "field_diff"]
     assert diffs and "rstrip_spaces" in diffs[0]["rules_applied"]
 
@@ -117,7 +120,7 @@ def test_tier3_missing_doc():
     source, target = make_green()
     source.tables["ORDERS"][1] = {"ORDER_ID": 99, "CUST_NAME": "", "TOTAL": 20.0}
     result = run(source, target)
-    t3 = result["tiers"][2]
+    t3 = result["tiers"][3]
     assert {f["check"] for f in t3["findings"]} >= {"missing_doc", "extra_doc"}
 
 
@@ -125,7 +128,7 @@ def test_tier3_sampling_above_threshold():
     source, target = make_green()
     tol = Tolerances(version="tol-v1", full_diff_row_threshold=1, sample_size=1)
     result = run_recon("u", "live", SPEC, tol, RULES, source, target)
-    stats = result["tiers"][2]["stats"]["orders"]
+    stats = result["tiers"][3]["stats"]["orders"]
     assert stats["mode"] == "stratified_sample" and 0 < stats["coverage"] <= 1
 
 
@@ -136,10 +139,10 @@ def test_tier4_parity():
     bad = lambda op: [{"name": "Zed"}]
     result = run_recon("u", "live", SPEC, TOL, RULES, source, target,
                        ops=ops, run_source=good, run_target=lambda op: [{"name": "Ada"}])
-    assert result["verdict"] == "PASS" and len(result["tiers"]) == 4
+    assert result["verdict"] == "PASS" and len(result["tiers"]) == 5
     result = run_recon("u", "live", SPEC, TOL, RULES, source, target,
                        ops=ops, run_source=good, run_target=bad)
-    assert result["tiers"][3]["findings"][0]["check"] == "parity_mismatch"
+    assert result["tiers"][4]["findings"][0]["check"] == "parity_mismatch"
 
 
 def test_continuous_mode_samples_tier3_and_skips_tier4():
@@ -210,6 +213,9 @@ def make_graded():
         {"order_id": 1, "items": [{"sku": "a", "qty": 2}, {"sku": "b", "qty": 1}]},
         {"order_id": 2, "items": [{"sku": "c", "qty": 5}]},
     ]})
+    from recon.adapters import SchemaFacts
+    source.schema["ORDERS"] = SchemaFacts(table="ORDERS", primary_key=("ORDER_ID",))
+    target.schema["orders"] = SchemaFacts(table="orders", primary_key=("order_id",))
     return source, target
 
 
@@ -217,7 +223,7 @@ def test_embed_values_graded_green():
     result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, *make_graded())
     assert result["verdict"] == "PASS"
     assert result["warnings"] == []
-    assert result["tiers"][2]["stats"]["embeds_graded"]["orders.items"] == 3
+    assert result["tiers"][3]["stats"]["embeds_graded"]["orders.items"] == 3
 
 
 def test_embed_value_diff_caught():
@@ -225,7 +231,7 @@ def test_embed_value_diff_caught():
     target.objects["orders"][0]["items"][1]["qty"] = 99
     result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, source, target)
     assert result["verdict"] == "FAIL"
-    checks = {f["check"] for f in result["tiers"][2]["findings"]}
+    checks = {f["check"] for f in result["tiers"][3]["findings"]}
     assert "embed_field_diff" in checks
 
 
@@ -234,14 +240,14 @@ def test_missing_embedded_elem_caught():
     # same cardinality (Tier 1 green) but wrong element key
     target.objects["orders"][0]["items"][1]["sku"] = "zzz"
     result = run_recon("u", "live", GRADED_SPEC, TOL, RULES, source, target)
-    checks = {f["check"] for f in result["tiers"][2]["findings"]}
+    checks = {f["check"] for f in result["tiers"][3]["findings"]}
     assert "missing_embedded_elem" in checks
 
 
 def test_ungraded_embed_is_loud():
     result = run(*make_green())  # SPEC's embed declares no key/fields
     assert result["verdict"] == "PASS"
-    assert result["tiers"][2]["stats"]["embeds_ungraded"] == ["orders.items"]
+    assert result["tiers"][3]["stats"]["embeds_ungraded"] == ["orders.items"]
     assert any("UNGRADED" in w for w in result["warnings"])
     from recon.report import render_summary
     assert "UNGRADED" in render_summary(result)
@@ -480,7 +486,7 @@ def test_rewriting_aggregate_defers_to_tier3():
     result = run_recon("u", "live", spec, TOL,
                        RULES + [CanonRule("collation_casefold", "*")], source, target)
     assert result["verdict"] == "PASS"
-    assert "c.name" in result["tiers"][1]["stats"]["deferred_to_tier3"]
+    assert "c.name" in result["tiers"][2]["stats"]["deferred_to_tier3"]
 
 
 def test_sampling_is_deterministic_and_pushes_keys():
@@ -496,7 +502,7 @@ def test_sampling_is_deterministic_and_pushes_keys():
                                       "items": []} for i in range(10)]})
     r2 = run_recon("u", "live", SPEC, tol, RULES, source2, target2, seed=9)
     assert keys1 == source2.last_fetch_keyed["keys"]
-    assert r1["tiers"][2]["stats"] == r2["tiers"][2]["stats"]
+    assert r1["tiers"][3]["stats"] == r2["tiers"][3]["stats"]
 
 
 def test_ops_require_executors():
@@ -641,7 +647,7 @@ def test_composite_key_full_and_sampled_diff():
                                       sample_size=1),
                            RULES, source, target)
         assert result["verdict"] == "FAIL"
-        assert any(f["check"] == "missing_doc" for f in result["tiers"][2]["findings"])
+        assert any(f["check"] == "missing_doc" for f in result["tiers"][3]["findings"])
 
 
 def test_tier4_multiset_matching_canonicalizes_decimal_and_order():
@@ -699,4 +705,4 @@ def test_sampling_unique_keys_retains_bounded_duplicate_state():
         for i in range(200)]})
     tol = Tolerances(version="t", full_diff_row_threshold=1, sample_size=3)
     result = run_recon("u", "live", SPEC, tol, RULES, source, target)
-    assert result["tiers"][2]["stats"]["orders"]["duplicate_source_key_count"] == 0
+    assert result["tiers"][3]["stats"]["orders"]["duplicate_source_key_count"] == 0

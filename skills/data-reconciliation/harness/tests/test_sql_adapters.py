@@ -1,6 +1,7 @@
 """SQL adapter statements, identifiers, literals and the source-family registry, offline."""
 import datetime as dt
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,47 @@ from tests.loans import (
 )
 
 UNTESTED_FAMILIES = ("redshift", "snowflake", "teradata", "oracle")
+
+
+_CATALOG_OBJECT_RE = re.compile(
+    r"\b(sys\.[a-z_]+|pg_[a-z_]+|information_schema\.[a-z_]+)\b(?!\()")
+
+
+_STRUCTURAL_READERS = {"schema_facts", "identity_state", "_uc_schema_facts",
+                       "_uc_identity_state"}
+
+
+def test_dictionary_objects_cover_every_reader_view():
+    """Every catalog object named in the structural readers' SQL (schema_facts / identity_state)
+    must be probed by DICTIONARY_OBJECTS, so doctor's dictionary_readable table cannot drift
+    behind a new reader query. Change-token reads are not dictionary reads."""
+    import ast, inspect
+    tree = ast.parse(Path(adapters.__file__).read_text())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                node.name in _STRUCTURAL_READERS:
+            names.update(_CATALOG_OBJECT_RE.findall(ast.get_source_segment(
+                Path(adapters.__file__).read_text(), node) or ""))
+    used = names | {"SHOW CREATE TABLE", "server_version_num", "pg_get_serial_sequence",
+                    "pg_get_indexdef", "pg_get_constraintdef", "pg_get_userbyid"}
+    have = {label for views in adapters.DICTIONARY_OBJECTS.values() for label, _ in views}
+    assert used <= have
+    for family, views in adapters.DICTIONARY_OBJECTS.items():
+        assert all(isinstance(label, str) and isinstance(sql, str) and sql
+                   for label, sql in views), family
+
+
+def test_cli_dictionary_objects_subcommand(capsys):
+    rc = cli.main(["dictionary-objects", "--family", "postgres"])
+    assert rc == 0
+    d = json.loads(capsys.readouterr().out)
+    assert d["family_known"] is True and ("pg_trigger", "SELECT 1 FROM pg_trigger LIMIT 1") in \
+        [tuple(x) for x in d["objects"]]
+    rc = cli.main(["dictionary-objects", "--family", "db2"])
+    assert rc == 0
+    d = json.loads(capsys.readouterr().out)
+    assert d["family_known"] is False and d["objects"] == []
 
 
 def test_every_cli_family_is_either_live_tested_or_refused():

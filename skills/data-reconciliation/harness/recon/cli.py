@@ -156,6 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="verify the harness install (no connections needed)")
     sub.add_parser("families", help="print the live-tested vs refused source families as JSON")
+    d = sub.add_parser("dictionary-objects", help="print the catalog objects a family's "
+                       "dictionary readers probe as JSON (doctor's dictionary_readable table)")
+    d.add_argument("--family", required=True)
     t = sub.add_parser("type-map-audit", help="audit a spec's declared target types against the "
                        "family type_map (JSON, no connections)")
     t.add_argument("--spec", required=True, type=Path)
@@ -206,6 +209,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--target-schema", required=True)
     r.add_argument("--ops", type=Path, help="recorded representative queries for Tier 4")
     r.add_argument("--snapshot-manifest", type=Path)
+    r.add_argument("--source-dictionary", type=Path,
+                   help="fixture dictionary JSON (harness/fixtures/example_<family>/dictionary.json): "
+                        "structural facts read from the file, not the live catalog; never merge-eligible")
+    r.add_argument("--target-dictionary", type=Path,
+                   help="same, for the target side")
     r.add_argument("--seed", type=int, default=0,
                    help="sampling seed (recorded in result.json for re-runnability)")
     r.add_argument("--depth", choices=DEPTHS, default="threshold",
@@ -225,6 +233,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "live_tested": sorted(f for f in SOURCE_ADAPTERS if not is_untested_source_family(f)),
             "untested": sorted(f for f in SOURCE_ADAPTERS if is_untested_source_family(f)),
+        }))
+        return 0
+
+    if args.cmd == "dictionary-objects":
+        from .adapters import DICTIONARY_OBJECTS
+        print(json.dumps({
+            "family": args.family,
+            "family_known": args.family in DICTIONARY_OBJECTS,
+            "objects": [list(x) for x in DICTIONARY_OBJECTS.get(args.family, ())],
         }))
         return 0
 
@@ -331,6 +348,15 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(str(exc)) from None
     else:
         target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
+    if args.source_dictionary or args.target_dictionary:
+        from .structure import DictionaryOverlay, load_dictionary
+        try:
+            if args.source_dictionary:
+                source = DictionaryOverlay(source, load_dictionary(args.source_dictionary))
+            if args.target_dictionary:
+                target = DictionaryOverlay(target, load_dictionary(args.target_dictionary))
+        except ConfigError as exc:
+            raise SystemExit(f"dictionary: {exc}") from None
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,

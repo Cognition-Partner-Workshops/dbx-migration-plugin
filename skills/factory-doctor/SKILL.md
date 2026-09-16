@@ -58,6 +58,7 @@ guard mode, and stop mode are the workflow capability contract.
 | `recon_family_supported` | the harness refuses the declared source family (asked of the same harness `recon_harness` ran) | reconcile through a family the harness supports |
 | `delete_evidence` | mapped CDC evidence is absent, incomplete, or unreadable | provide source CDC evidence; never enable it here |
 | `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a user-attested decision |
+| `dictionary_readable` | the source principal cannot read a catalog view the structural tier needs, or hides declared triggers | fix the principal's catalog visibility |
 | `databricks_identity` | CLI/auth/host/identity is missing, human, or mismatched | use the expected OAuth M2M principal and host |
 | `lakebase_branch_create` | optional branch probe cannot create/delete a one-hour child | fix Lakebase project/parent permissions |
 | `lakebase_target_grants` | optional DSN role lacks database/schema `CREATE` | grant target create permission |
