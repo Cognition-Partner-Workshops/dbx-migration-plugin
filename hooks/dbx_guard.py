@@ -10,7 +10,8 @@ shapes and mutate only allowlisted securables; REST to a workspace host is GET w
 identity is never changed. Legacy-only clients and generic clients naming a legacy source run read shapes only; a generic
 client elsewhere writes when every host candidate is in `target_hosts` and the write resolves to a listed catalog / database. A
 legacy write approves only with `DBX_DECISION=D-<id>` matching a `legacy_write_authorized` row in
-`06_decisions.md` that names the object; warn mode never downgrades a legacy write.
+`06_decisions.md` that names the object; warn mode never downgrades a legacy write. Decision rows that authorize legacy writes
+are added by a human via PR; the edit tool cannot add them.
 Nothing writes `.migration/` or the running guard's tree (git there is the `_git_reads` allowlist). Scripts and SQL files are
 read in the command's effective directory (event cwd, cd / pushd / env -C / git -C); what the guard cannot read blocks where a
 client is involved. No `.migration/` up the tree approves everything, one without a readable allowlist blocks everything, and the
@@ -129,9 +130,13 @@ _DECISION_ROW = re.compile(r"(?m)^\s*(?:\|\s*|#{1,6}\s*)?(D-[A-Za-z0-9][\w.-]*)\
 _DECISION_ID = re.compile(r"D-[A-Za-z0-9][\w.-]*")
 _WRITE_OBJECT = re.compile(
     r"(?is)^\s*(?:DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|UPDATE(?:\s+TOP\s*\([^)]*\)(?:\s+PERCENT)?|\s+STATISTICS|\s+(?:ONLY|LOW_PRIORITY|IGNORE))*|TRUNCATE(?:\s+TABLE)?|"
-    r"DROP\s+\w+(?:\s+IF\s+EXISTS)?|CREATE(?:\s+OR\s+REPLACE)?\s+(?:\w+\s+)*?"
-    r"(?:TABLE|VIEW|INDEX|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
-    r"ALTER\s+\w+|GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)"
+    r"DROP\s+INDEX(?:\s+IF\s+EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
+    r"DROP\s+(?!INDEX\b)\w+(?:\s+IF\s+EXISTS)?|"
+    r"CREATE(?:\s+\w+)*?\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
+    r"CREATE(?:\s+OR\s+REPLACE)?\s+(?:\w+\s+)*?"
+    r"(?:TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|SCHEMA)(?:\s+IF\s+NOT\s+EXISTS)?|"
+    r"ALTER\s+\w+|(?:GRANT|REVOKE)\b.*?\bON\s+ALL\s+\w+\s+IN\s+SCHEMA|"
+    r"GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)"
 )
 _WRITE_OBJECT_NEXT = re.compile(r"\s*,\s*([\w.$\"\[\]`]+)")
 _AUTHORIZED = "authorized: decision "
@@ -862,6 +867,7 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
         return decision_id, f"`{decision_id}` is not a row in .migration/06_decisions.md"
     if "legacy_write_authorized" not in row.lower():
         return decision_id, f"row `{decision_id}` does not contain `legacy_write_authorized`"
+    normalized_row = re.sub(r'["`\[\]]', "", row)
     objects = _write_objects(statements)
     if len(objects) != len(statements) or any(not names for names in objects):
         statement = next(statement for statement in statements if not _WRITE_OBJECT.match(statement))
@@ -872,7 +878,7 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
                 return decision_id, f"`{obj}` is a run-time substitution; the decision must name the literal object"
     for names in objects:
         for obj in names:
-            if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", row, re.IGNORECASE):
+            if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", normalized_row, re.IGNORECASE):
                 return decision_id, f"row `{decision_id}` does not name `{obj}`"
     return decision_id, None
 
@@ -1601,6 +1607,9 @@ def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd
     decision = False
     if kind in ("inside", "self"):
         decision = Path(file_path).name == "06_decisions.md" and len(_DECISION_ROW.findall(new)) > len(_DECISION_ROW.findall(old))
+        if decision and new.lower().count("legacy_write_authorized") > old.lower().count("legacy_write_authorized"):
+            violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
+            decision = False
         if not decision:
             violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
                               ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "

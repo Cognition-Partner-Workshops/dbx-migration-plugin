@@ -168,7 +168,7 @@ FILES2 = {
     "fix.sh": "cat /etc/hosts\n",
     "q.sql": "SELECT 1;\n",
     "capture_baseline.py": "import boto3\ns3 = boto3.client(\"s3\")\nprint(s3.list_buckets())\n",
-    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n| D-11 | 2026-01-05 | legacy_write_authorized: approved modifiers TOP and STATISTICS |\n| D-12 | 2026-01-06 | legacy_write_authorized: approved DROP TABLE on dbo.orders and dbo.customers |\n",
+    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n| D-11 | 2026-01-05 | legacy_write_authorized: approved modifiers TOP and STATISTICS |\n| D-12 | 2026-01-06 | legacy_write_authorized: approved DROP TABLE on dbo.orders and dbo.customers |\n| D-13 | 2026-01-07 | legacy_write_authorized: approved CDC index on \"dbo\".\"customers\" |\n| D-14 | 2026-01-08 | legacy_write_authorized: read grant on schema billing |\n",
     "d.patch": "--- a/.migration/allowed_targets.json\n+++ b/.migration/allowed_targets.json\n",
     "ok.patch": "--- a/notes.md\n+++ b/notes.md\n",
 }
@@ -713,6 +713,13 @@ PROBES2 = [
     ("R4 decision runtime substitution quoted", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE \"$(TABLE)\" SET x=1'", "block"),
     ("R4 decision runtime substitution braced", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE ${TABLE} SET x=1'", "block"),
     ("R4 decision literal object remains authorized", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'UPDATE dbo.orders SET x=1'", "approve"),
+    ("R5 bracketed object matches plain ledger row", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'ALTER TABLE [dbo].[orders] ADD x INT'", "approve"),
+    ("R5 quoted ledger row matches plain object", "DBX_DECISION=D-13 sqlcmd -S sqlserver-demo -Q 'ALTER TABLE dbo.customers ADD x INT'", "approve"),
+    ("R5 bracketed object boundary still blocks", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'ALTER TABLE [dbo].[orders_archive] ADD x INT'", "block"),
+    ("R5 create index authorizes the table", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'CREATE INDEX ix_orders ON dbo.orders (id)'", "approve"),
+    ("R5 create index name does not authorize table", "DBX_DECISION=D-13 sqlcmd -S sqlserver-demo -Q 'CREATE INDEX ix_orders ON dbo.orders (id)'", "block"),
+    ("R5 grant on all tables authorizes schema", "DBX_DECISION=D-14 psql -h tdprod.corp -c 'GRANT SELECT ON ALL TABLES IN SCHEMA billing TO r'", "approve"),
+    ("R5 grant on another schema blocks", "DBX_DECISION=D-7 psql -h tdprod.corp -c 'GRANT SELECT ON ALL TABLES IN SCHEMA billing TO r'", "block"),
 ]
 
 WARN_PROBES = [

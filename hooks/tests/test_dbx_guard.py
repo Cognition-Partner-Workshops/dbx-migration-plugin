@@ -47,6 +47,14 @@ def block(cmd: str, cfg=CFG):
     return v
 
 
+def test_write_objects_normalize_index_and_schema_targets():
+    assert g._write_objects([
+        "CREATE UNIQUE INDEX ix ON dbo.t (a)",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA s TO r",
+        "REVOKE ALL ON ALL SEQUENCES IN SCHEMA s FROM r",
+    ]) == [["dbo.t"], ["s"], ["s"]]
+
+
 # ---------------------------------------------------------------- allowed shapes
 
 @pytest.mark.parametrize("cmd", [

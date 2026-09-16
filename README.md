@@ -132,7 +132,8 @@ tools the platform routes through PreToolUse under those names.
 
 **Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
 `DBX_DECISION=D-<id>` prefix matching a `legacy_write_authorized` row in `.migration/06_decisions.md` that names every
-object written. `guard_mode: warn` never downgrades an unauthorized legacy write.
+object written. `guard_mode: warn` never downgrades an unauthorized legacy write. Decision rows that authorize legacy writes
+are added by a human via PR; the edit tool cannot add them.
 
 The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
 `.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same

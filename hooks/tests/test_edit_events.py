@@ -58,6 +58,9 @@ def decide(tool: str, tool_input: dict, ws: Path, env: dict[str, str] | None = N
     ("write", ".migration/waves/wave-1.json", {"content": "{}"}, "approve"),
     ("edit", "src/etl.py", {"old_string": "ok", "new_string": "better"}, "approve"),
     ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "| D-7 | 2026-01-01 | accept tolerances |"}, "approve"),
+    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "| D-7 | 2026-01-01 | legacy_write_authorized: drop dbo.orders |"}, "block"),
+    ("write", ".migration/06_decisions.md", {"content": "| D-7 | 2026-01-01 | legacy_write_authorized: drop dbo.orders |"}, "block"),
+    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "| D-7 | 2026-01-01 | Legacy_Write_Authorized: drop dbo.orders |"}, "block"),
     ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\nmore prose\n"}, "block"),
     ("edit", ".migration/06_decisions.md", {"old_string": "| D-7 | old | decision |\n", "new_string": "| D-7 | new | changed |\n"}, "block"),
 ])
