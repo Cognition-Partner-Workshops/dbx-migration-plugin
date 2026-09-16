@@ -1,30 +1,16 @@
 # dbx-migration-factory (Devin plugin)
 
-Private, installable Devin plugin for Databricks migrations: source-dialect skills (Redshift,
-Teradata BTEQ, Informatica XML), a reconciliation harness, a Lakebridge
-wrapper, enforcement hooks, a preflight doctor, always-on guardrail rules, and a bootstrap skill
-that imports the DBX playbook chain into the org.
+Private, installable Devin plugin for Databricks migrations. What it is and how a migration runs:
+`OVERVIEW.md`. This file covers installation and the write-scope guard's policy file.
 
-The factory owns the *migration* problem: source dialects, lineage, reconciliation, fan-out, human
-stops, and the analytical (Delta + Unity Catalog) and operational (Lakebase) tracks. Databricks
-product knowledge is **not** duplicated here: the manifest declares the official
-[`databricks` plugin](https://github.com/databricks/databricks-agent-skills) as a required plugin,
-and the `target-routing` skill maps every Databricks-side step to the official skill that owns it
-(DBSQL, Lakeflow Pipelines/Jobs/Connect, bundles, Unity Catalog, Lakebase, serverless).
-
-The repo root *is* the plugin, so the repo itself is the installable unit.
+The repo root *is* the plugin:
 
 ```
-.devin-plugin/plugin.json   plugin manifest (name, version, requiredPlugins -> official databricks plugin)
+.devin-plugin/plugin.json   manifest (name, version, requiredPlugins -> official databricks plugin)
 AGENTS.md                   always-on guardrails
 hooks.json, hooks/          PreToolUse write-scope guard (fail closed, see below)
-skills/                     one directory per skill
-skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills (child-session brief)
-skills/lakebridge/          analyzer/transpiler invocation, dialect flags, seeded coverage table
-skills/target-routing/      step -> official databricks skill map, plus migration-only deltas
-skills/factory-doctor/      read-only preflight: CLI, identity + host, harness, .migration/ integrity,
-                            committed allowlist/tolerances, source principal cannot write, hooks (nonce probe)
-skills/install-dbx-factory/ bootstrap skill; carries the 14 DBX playbooks in playbooks/
+skills/                     one directory per skill; install-dbx-factory/playbooks/ carries the playbook chain
+skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills
 ```
 
 ## Install (private repo is fine)
@@ -58,21 +44,13 @@ Pin a version instead of tracking the default branch:
 devin plugins install Cognition-Partner-Workshops/dbx-migration-plugin
 ```
 
-## After installing
+The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
+`.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
+plugin to, or installation fails with "Conflicting version pins"; when the org bumps its pin, bump
+this one in the same change. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
+`databricks/databricks-agent-skills` explicitly; transitive dependencies are not exempt.
 
-Run the `install-dbx-factory` skill once per org in a dedicated setup session: it imports the
-14 playbooks into the org playbook library and proposes the migration environment blueprint —
-the two things a plugin cannot carry itself.
-
-Then start an engagement with one front door: `!dbx_migrate_etl`, `!dbx_migrate_warehouse`,
-`!dbx_migrate_code`, or `!dbx_migrate_oltp` (operational databases; splits the estate into a
-Lakebase operational track and a Delta analytical track). Operational-track units reconcile with
-`dbx-recon --mode transactional --target-kind lakebase`: both sides under a consistency window,
-in-flight CDC rows tolerated up to `cdc_lag_max_s`, PK-set diff, lag/ordering, and
-constraint/index/sequence parity on top of the set-based tiers. Deletes must be drained before
-the run unless the mapping declares `delete_evidence` (SQL Server CDC first) that lets the
-harness tell an in-flight delete from a stray target row; the factory verifies CDC is on and
-readable but never enables it.
+After installing, run the `install-dbx-factory` skill once per org (see `OVERVIEW.md`).
 
 ## Write-scope guard (`hooks/dbx_guard.py`)
 
@@ -129,7 +107,6 @@ for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row the
 `tool_name`; the guard reads `tool_input.file_path` and its new content. It blocks writes under `.migration/` except
 `recon/` and `waves/`, and permits `06_decisions.md` only when the edit adds a `D-<id>` row. This covers only file-edit
 tools the platform routes through PreToolUse under those names.
-
 **Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
 `DBX_DECISION=D-<id>` prefix matching a `legacy_write_authorized` row in `.migration/06_decisions.md` that names every
 object written. `guard_mode: warn` never downgrades an unauthorized legacy write. Decision rows that authorize legacy writes
