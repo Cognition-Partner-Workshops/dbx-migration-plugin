@@ -82,7 +82,9 @@ Analytical-track deltas (deploy/schedule, pipelines, governance): [references/an
   named follow-up wave, unless the STOP A target profile says otherwise.
 - One active update per Lakeflow pipeline per wave: each batch lists the pipelines it updates as
   `lakeflow_pipelines` in the wave manifest, and `python3 skills/target-routing/pipeline_updates.py
-  .migration/waves/wave-N.json` runs before launch. Two batches of a wave naming the same pipeline is
-  a halt unless the wave is serial (`width` 1) or `serialized_pipelines` maps that pipeline to a
-  decision row in `06_decisions.md`; a batch that lists nothing makes the result `unsupported`, not
-  clean.
+  .migration/waves/wave-N.json` runs before launch (the fan-out workflow runs it itself from the
+  pointer's `plugin` root and halts on any non-zero exit). Two batches of a wave naming the same
+  pipeline is a halt unless the wave is serial (`width` 1) or `serialized_pipelines` maps that pipeline
+  to a `D-<n>` row of `06_decisions.md` tagged `pipeline_serialized` that names it; then the workflow
+  launches those batches in manifest order, each after the previous one finished. A batch that lists
+  nothing makes the result `unsupported`, not clean.

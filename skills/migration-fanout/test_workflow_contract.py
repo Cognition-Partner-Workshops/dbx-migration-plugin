@@ -10,6 +10,7 @@ import pytest
 
 WORKFLOW = Path(__file__).with_name("workflow.py")
 DOCTOR = Path(__file__).parents[1] / "factory-doctor" / "doctor.py"
+PLUGIN = Path(__file__).parents[2]
 GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": ""}
 
 
@@ -29,7 +30,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
                other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
                deploy_objects=None, max_minutes=None, batch_max_minutes=None, manifest_name="wave-0.json", wave=0,
-               pipelines=None):
+               pipelines=None, lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -52,7 +53,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     source = {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}}
     manifest = {
         "wave": wave,
-        "width": 1,
+        "width": width,
         "repo": "github.com/acme/target",
         "child_macro": "child",
         "verify_macro": "verify",
@@ -67,8 +68,11 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "ready": True,
         },
         "batches": [{"id": "b-1", "units": list(units), "write_targets": list(write_targets), "brief": "brief",
-                     "gates": gates if gates is not None else [GATE]}],
+                     "gates": gates if gates is not None else [GATE], "lakeflow_pipelines": list(lakeflow_pipelines)},
+                    *extra_batches],
     }
+    if serialized_pipelines is not None:
+        manifest["serialized_pipelines"] = dict(serialized_pipelines)
     if deploy_objects is not None:
         manifest["batches"][0]["deploy_objects"] = list(deploy_objects)
     if max_minutes is not None:
@@ -139,6 +143,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     pointer_dir.mkdir(parents=True, exist_ok=True)
     pointer = {"manifest": manifest_name, "mode": mode, "run_id": run_id,
                "hook_probe": hook_probe}
+    if plugin is not None:
+        pointer["plugin"] = str(plugin)
     if pointer_at == "home":
         pointer["workspace"] = str(ws)
     (pointer_dir / "current.json").write_text(json.dumps(pointer))
@@ -596,6 +602,50 @@ def test_a_hand_run_wave_reserves_nothing_while_its_declared_targets_differ_from
     assert json.loads(proc.stdout)["reserved"] is True
 
 
+def _second_batch(pipelines, unit="v"):
+    return {"id": "b-2", "units": [unit], "write_targets": [f"mig.{unit}"], "brief": "brief", "gates": [GATE],
+            "lakeflow_pipelines": list(pipelines)}
+
+
+def test_a_pipeline_two_batches_share_halts_before_any_child_launches(tmp_path):
+    """The one-active-update check is the plugin's pipeline_updates.py run as a subprocess on the manifest
+    (the pointer's `plugin` names the plugin root); its non-zero exit is a halt before launch, and a wave
+    whose batches do not declare their pipelines is unchecked, so it halts too."""
+    ws, cwd = _workspace(tmp_path / "shared", units=("u",), recon={"u": True, "v": True}, manifest_name="wave-1.json",
+                         wave=1, width=2, lakeflow_pipelines=("p",), extra_batches=[_second_batch(["p"])])
+    proc, calls = _run(cwd, tmp_path / "shared", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "Traceback" not in proc.stderr
+    assert "pipeline_updates" in proc.stderr and "'p'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "undeclared", recon={"u": True, "v": True},
+                         extra_batches=[{k: v for k, v in _second_batch([]).items() if k != "lakeflow_pipelines"}])
+    proc, calls = _run(cwd, tmp_path / "undeclared", [])
+    assert proc.returncode != 0 and "unsupported" in proc.stderr and "b-2" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "noplugin", plugin=None)
+    proc, calls = _run(cwd, tmp_path / "noplugin", [])
+    assert proc.returncode != 0 and "plugin" in proc.stderr and "pipeline_updates.py" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_a_serialized_shared_pipeline_launches_its_batches_one_after_the_other(tmp_path):
+    """With a pipeline_serialized decision the wave launches, and b-2 starts only after b-1 finished even at
+    width 2: the pipeline_updates `order` is what run_batch waits on."""
+    ledger = "| D-7 | 2026-01-06 | user:U1 | pipeline_serialized p: b-1 then b-2 |\n"
+    ws, cwd = _workspace(tmp_path, recon={"u": True, "v": True}, decisions=ledger, manifest_name="wave-1.json", wave=1,
+                         lakeflow_pipelines=("p",), extra_batches=[_second_batch(["p"])], serialized_pipelines={"p": "D-7"},
+                         width=2)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(""), _pass_report("")])
+    assert proc.returncode == 0, proc.stderr
+    launched = [c["label"] for c in calls if c["kind"] == "agent"]
+    assert launched == ["b-1", "b-2"]
+    out = proc.stdout
+    assert out.index("done   b-1") < out.index("launch b-2")
+    assert json.loads((ws / ".migration/waves/wave-1.result.json").read_text())["pipeline_order"] == {"b-2": ["b-1"]}
+
+
 def test_malformed_sibling_wave_manifest_halts_before_launch(tmp_path):
     ws, cwd = _workspace(tmp_path, other_waves={"wave-1.json": "{"})
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
@@ -998,7 +1048,7 @@ def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tm
     proc = run(tmp_path / "ok", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
                deploy_objects=("mig.run",), namespace="mig")
     assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout) == {"wave": 0, "ready": True, "batches": ["b-1"]}
+    assert json.loads(proc.stdout) == {"wave": 0, "ready": True, "batches": ["b-1"], "pipeline_order": {}}
     proc = run(tmp_path / "drift", dependencies={"u": _analysis("mig.t", "mig.audit")})
     assert proc.returncode != 0 and "b-1" in proc.stderr and "mig.audit" in proc.stderr
     proc = run(tmp_path / "shared", other_waves={"wave-1.json": WAVE_1}, mappings={"u": MAPPING})
