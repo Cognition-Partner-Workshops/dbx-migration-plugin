@@ -1699,8 +1699,10 @@ def check_analytical_target_grants(full_name: str) -> Check:
 
 
 def _advisory(c: Check) -> Check:
-    """In a child, non-security `fail` rows are advisory `warn` (the orchestrator gated them at launch)."""
-    if c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and not (c.data or {}).get("units_problem"):
+    """In a child, non-security `fail` rows are advisory `warn` (the orchestrator gated them at launch);
+    a writable source principal is a legacy-safety finding and stays `fail`."""
+    if (c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and c.id != "source_principal_read_only"
+            and not (c.data or {}).get("units_problem")):
         return Check(c.id, "warn", "advisory in a child (the orchestrator gates it before launch): " + c.detail,
             c.data)
     return c
@@ -1715,7 +1717,8 @@ def _blocking(role: str, checks: list[Check]) -> list[str]:
         if s.id in sec and s.status != "ok":
             return True
         if role == "child":
-            return bool((s.data or {}).get("units_problem"))
+            return (bool((s.data or {}).get("units_problem")) or
+                (s.id == "source_principal_read_only" and s.status == "fail"))
         return s.status == "fail" or (s.id == "source_principal_read_only" and s.status == "unverified")
 
     blocking = [f"{row.id}={row.status}" for row in checks if any(blocks(s) for s in _flat([row]))]
