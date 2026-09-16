@@ -53,7 +53,7 @@
     "oracle": {
       "databricks": {
         "decimal_max_precision": 38,
-        "note": "Delta targets, lower case; first matching entry wins. NUMBER without a scale keeps fractions, so it is decimal(38,10) (any decimal(38,s) accepted; raise s when the census shows MAX(scale) > 10) and never decimal(38,0), double or float. NUMBER(p)/NUMBER(p,0) is whole: bigint for p<=18, decimal(p,0) above. TIMESTAMP is zone-less: timestamp_ntz, timestamp accepted, never a zoned type. Anything not listed is reported as unmapped, not passed. A `conditional` alternative needs the named token in the field's `evidence` list.",
+        "note": "Delta targets, lower case; first matching entry wins. NUMBER without a scale keeps fractions, so it is decimal(38,10) (any decimal(38,s) accepted; raise s when the census shows MAX(scale) > 10) and never decimal(38,0), double or float. NUMBER(p)/NUMBER(p,0) is whole: bigint for p<=18, decimal(p,0) above. TIMESTAMP is zone-less: timestamp_ntz only; timestamp is the session-zoned type and belongs to the WITH [LOCAL] TIME ZONE rules. Anything not listed is reported as unmapped, not passed. A `conditional` alternative needs the named token in the field's `evidence` list.",
         "types": [
           {
             "source": "NUMBER(p,0)",
@@ -200,17 +200,11 @@
           },
           {
             "source": "TIMESTAMP",
-            "target": "timestamp_ntz",
-            "accepts": [
-              "timestamp"
-            ]
+            "target": "timestamp_ntz"
           },
           {
             "source": "TIMESTAMP(n)",
-            "target": "timestamp_ntz",
-            "accepts": [
-              "timestamp"
-            ]
+            "target": "timestamp_ntz"
           },
           {
             "source": "TIMESTAMP WITH TIME ZONE",
