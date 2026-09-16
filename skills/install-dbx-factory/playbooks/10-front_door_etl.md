@@ -7,6 +7,7 @@ Playbook: Intake an ETL or batch pipeline and route it to the right migration pr
 | Scheduling | map D5 dependencies to Lakeflow Jobs or retain the scheduler with an explicit contract |
 | Dialect | invoke an optional dialect skill only when installed; never infer skill existence from an adapter flag |
 | Orchestration | invoke `!dbx_migrate_pipeline` in this session after intake and profile selection |
+| Pipelines | ask which pipelines share write targets or source objects; disjoint ones run as sibling orchestrator sessions after STOP A (rule in `9-orchestrator.md`) |
 | Allowlist | write `.migration/allowed_targets.json` (catalogs, legacy_sources) before any source probe; authorized legacy writes carry `DBX_DECISION=D-<id>` — see contract.md |
 
 ## Routing

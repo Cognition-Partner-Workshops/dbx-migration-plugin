@@ -180,6 +180,20 @@ def test_shared_table_across_waves_passes_when_every_reader_is_bounded():
     check([B1], _others({**B2, "write_targets": ["mig.other"]}), _specs())
 
 
+def test_pipeline_manifests_with_overlapping_targets_halt_and_disjoint_ones_pass(tmp_path):
+    fn = _functions()
+    (tmp_path / "wave-p1-1.json").write_text(json.dumps({"batches": []}))
+    (tmp_path / "wave-p2-1.json").write_text(json.dumps({"batches": [B2]}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p1-1.json")
+    assert "wave-p2-1.json" in others
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-p2-1\.json"):
+        fn["check_write_targets"]([B1], others, _specs(u1=UNBOUNDED))
+    (tmp_path / "wave-p2-1.json").write_text(json.dumps({"batches": [
+        {**B2, "write_targets": ["mig.other"]}]}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p1-1.json")
+    fn["check_write_targets"]([B1], others, _specs())
+
+
 @pytest.mark.parametrize("u2", [None, {"objects": []}, {"objects": [{"object": "mig.other", "target_where": "x = 1"}]}])
 def test_shared_table_other_wave_unit_without_a_mapping_for_it_halts_too(u2):
     check = _functions()["check_write_targets"]
@@ -1397,7 +1411,8 @@ def _prompt_ns(manifest):
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES"}
                     for t in node.targets))]
-    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "REPO": "repo", "MANIFEST": manifest,
+    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "TAG": "0",
+          "REPO": "repo", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled")}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     return ns
@@ -1848,7 +1863,7 @@ def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_repo
                                observed=[".migration/recon/wave-2/report.md", ".migration/recon/u/result.json"])
     assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/u/result.json"]
     src = WORKFLOW.read_text()
-    assert 'validate_verify(verify, passed, auto_merge, WAVE, verifier_changed_paths(WAVE, passed))' in src
+    assert 'validate_verify(verify, passed, auto_merge, TAG, verifier_changed_paths(TAG, passed))' in src
 
 
 # ---------------------------------------------------------------- capability contract vs the doctor's record (A3)

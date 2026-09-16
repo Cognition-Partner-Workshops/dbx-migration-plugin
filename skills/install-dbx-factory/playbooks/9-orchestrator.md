@@ -6,6 +6,7 @@ Read `references/contract.md` once per session for stops, `stop_mode`, D1–D10,
 ## Procedure
 0. **Resume.** Read `.migration/`, `06_decisions.md`, `05_progress.md`, and wave result files; re-ask a stop when its inputs changed, and resume a run with a `.run_id` rather than launching a duplicate.
 1. **Setup.** Run migration setup and present its committed artifacts at STOP A; never wait on a lead time when executable metadata work remains.
+   - **Parallel pipelines.** Intake asks which pipelines share write targets or source objects. After STOP A, pipelines that share none each run in a sibling orchestrator session on the same repo, in parallel; a shared object is a D2 (wave 0, owner pipeline) and the sharing pipelines run in sequence. Each sibling names its manifests `wave-<pipeline>-<N>.json`, commits them before STOP C, and pulls the integration branch before `preflight`, so the collision check reads every pipeline's declared targets and the verifier branch `recon/wave-<pipeline>-<N>` is its own.
 2. **Inventory.** Run inventory; present coverage, catalog, recommendation, and boundary at STOP B unless intake fixed both pipeline and boundary (condition in `references/contract.md`).
 3. **Plan.** Run analysis and planning, resolve dependencies, and present width, cost, gates, manifests, and capability contract at STOP C before launching children.
 4. **Wave 0.** Run shared objects and scaffolding serially through the workflow with `wave: 0`, `width: 1`; verify all D10 requests are progressing.

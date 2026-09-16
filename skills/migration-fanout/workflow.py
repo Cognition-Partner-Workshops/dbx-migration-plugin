@@ -109,6 +109,7 @@ from pathlib import Path
 POINTER_REL = Path(".migration/waves/current.json")
 MODES = ("start", "resume", "rerun", "smoke")
 HOOK_PROBE = re.compile(r"blocked:[0-9a-f]{8}|not-blocked|unknown")
+TAG_RE = re.compile(r"[A-Za-z0-9_-]+")
 DOCTOR_MAX_AGE = datetime.timedelta(minutes=15)
 
 
@@ -143,10 +144,15 @@ if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE
 ROOT = Path(POINTER["workspace"]).resolve() if isinstance(POINTER.get("workspace"), str) else POINTER_PATH.parents[2]
 WAVES_DIR = ROOT / ".migration" / "waves"
 MANIFEST_PATH = (WAVES_DIR / POINTER["manifest"]).resolve()
+if not (MANIFEST_PATH.name.startswith("wave-")
+        and TAG_RE.fullmatch(MANIFEST_PATH.stem[len("wave-"):] or "")):
+    raise SystemExit(f"{POINTER_PATH} manifest must be named wave-<N>.json or wave-<pipeline>-<N>.json "
+                     "so every sibling wave and pipeline sees it in the collision check")
 if MANIFEST_PATH.suffix != ".json" or MANIFEST_PATH.parent != WAVES_DIR.resolve() or MANIFEST_PATH.name.endswith((".result.json", ".doctor.json")):
     raise SystemExit(f"{POINTER_PATH} manifest must be the plain file name of a wave manifest inside {WAVES_DIR}")
 if not MANIFEST_PATH.exists():
     raise SystemExit(f"no wave manifest at {MANIFEST_PATH}; the plan playbook writes it, then re-run")
+TAG = MANIFEST_PATH.stem[len("wave-"):]
 MANIFEST_BYTES = MANIFEST_PATH.read_bytes()
 MANIFEST = json.loads(MANIFEST_BYTES)
 BASE_BRANCH = MANIFEST.get("base_branch", "")
@@ -1472,7 +1478,7 @@ def batch_verify_depth(batch) -> str:
     return batch.get("verify_depth", VERIFY_DEPTH)
 
 META = {
-    "name": f"smoke-wave-{WAVE}" if SMOKE else f"migration-wave-{WAVE}",
+    "name": f"smoke-wave-{TAG}" if SMOKE else f"migration-wave-{TAG}",
     "description": f"Wave {WAVE}: {len(BATCHES)} unit batches in parallel, then one independent verifier",
     "phases": [
         {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
@@ -1628,8 +1634,8 @@ def verify_prompt(passed, auto_merge):
         "its acceptance gates with the evidence the child gave; open the evidence of every passed gate and FAIL "
         "the unit if it does not show what the gate's kind requires. "
         "Sum result.json['cost'] over your runs into recon_cost.\n"
-        f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{WAVE}/report.md, "
-        f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
+        f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{TAG}/report.md, "
+        f"commit it on branch recon/wave-{TAG}, push, and give '<branch>:<path>' in "
         "report_path. Do not edit any other file under .migration/; report your branch's "
         "`git diff --name-only <base>...<head>` in changed_paths. Each finding is one plain "
         "sentence a lead can read without opening anything."
@@ -1902,14 +1908,14 @@ async def main():
         log(f"verify: {len(passed)} batches to an independent session")
         try:
             verify = await agent(verify_prompt(passed, auto_merge), phase="verify", schema=VERIFY_SCHEMA,
-                                 label=f"verify-wave-{WAVE}", repos=[REPO])
+                                 label=f"verify-wave-{TAG}", repos=[REPO])
         except WorkflowAgentError as e:
             verify = {"wave_verdict": "FAIL", "unit_verdicts": {},
                       "findings": [f"verifier session died: {e}"]}
     else:
         log("verify: skipped, no batch passed")
 
-    verify_problems = (validate_verify(verify, passed, auto_merge, WAVE, verifier_changed_paths(WAVE, passed))
+    verify_problems = (validate_verify(verify, passed, auto_merge, TAG, verifier_changed_paths(TAG, passed))
                        if verify is not None else [])
     if verify_problems:
         if not isinstance(verify, dict):
