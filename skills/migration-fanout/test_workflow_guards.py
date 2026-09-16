@@ -48,7 +48,7 @@ def _batch_runtime():
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
-                                                                         "gate_outcomes", "ledger_waiver"})
+                                                                         "gate_outcomes", "ledger_waiver", "batch_max_minutes"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
                                                          "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS"}
@@ -62,6 +62,7 @@ def _batch_runtime():
         "re": re,
         "decision_ledger": lambda: "",
         "MANIFEST": {"stop_c": "D-2"},
+        "MAX_MINUTES": 45,
         "REPLAYED": {},
         "CHILD_SCHEMA": {},
         "REPO": ".",
@@ -104,6 +105,50 @@ def test_validate_manifest_rejects_invalid_positive_integer(value):
                 "base_branch": "migration/loan-servicing"}
     with pytest.raises(SystemExit, match="width"):
         validate_manifest(manifest)
+
+
+@pytest.mark.parametrize("value", [0, True, "3"])
+def test_validate_manifest_rejects_invalid_max_minutes(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="max_minutes"):
+        validate_manifest(_manifest(max_minutes=value))
+    batch_bad = _manifest()
+    batch_bad["batches"][0]["max_minutes"] = value
+    with pytest.raises(SystemExit, match="max_minutes"):
+        validate_manifest(batch_bad)
+
+
+def test_validate_manifest_accepts_a_batch_max_minutes_override():
+    m = _manifest()
+    m["batches"][0]["max_minutes"] = 30
+    _functions()["validate_manifest"](m)
+
+
+def test_validate_manifest_rejects_max_minutes_over_sixty():
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="max_minutes.*at most 60"):
+        validate_manifest(_manifest(max_minutes=61))
+    m = _manifest()
+    m["batches"][0]["max_minutes"] = 61
+    with pytest.raises(SystemExit, match="max_minutes.*at most 60"):
+        validate_manifest(m)
+
+
+@pytest.mark.parametrize("bad", ["a/b", 7, {"scope": "key"}])
+def test_validate_manifest_rejects_non_list_secrets(bad):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="secrets"):
+        validate_manifest(_manifest(secrets=bad))
+    m = _manifest()
+    m["batches"][0]["secrets"] = bad
+    with pytest.raises(SystemExit, match="secrets"):
+        validate_manifest(m)
+
+
+def test_validate_manifest_accepts_list_of_string_secrets():
+    m = _manifest(secrets=["app/k"])
+    m["batches"][0]["secrets"] = ["app/k2"]
+    _functions()["validate_manifest"](m)
 
 
 CAPS = {"identity": "sp-1", "catalogs": ["mig"], "ready": True, "guard_mode": "block", "stop_mode": "soft"}
@@ -1423,7 +1468,7 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
 
 def _prompt_ns(manifest):
     tree = ast.parse(WORKFLOW.read_text())
-    names = {"verify_prompt", "batch_verify_depth", "child_prompt", "capability_block",
+    names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
              "sum_cost", "cost_line"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
@@ -1432,7 +1477,8 @@ def _prompt_ns(manifest):
                     for t in node.targets))]
     ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "TAG": "0",
           "REPO": "repo", "MANIFEST": manifest,
-          "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled")}
+          "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
+          "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     return ns
 
