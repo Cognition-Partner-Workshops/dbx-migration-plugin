@@ -193,10 +193,7 @@ def render_progress(mig: Path) -> str:
     waves = mig / "waves"
     results = []
     for path in sorted(waves.glob("*.result.json")):
-        try:
-            result = _result(path)
-        except ValueError:
-            raise
+        result = _result(path)
         results.append((result, path))
 
     rows = []
