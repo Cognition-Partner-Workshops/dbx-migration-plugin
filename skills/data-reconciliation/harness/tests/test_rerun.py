@@ -195,6 +195,10 @@ def test_declared_shape_refuses_ddl_without_a_create_table():
     ("TIMESTAMP(6)", "timestamp(6)"),
     ("TIMESTAMP (6) WITHOUT TIME ZONE", "timestamp(6)"),
     ("time  (3)  with   time   zone", "timetz(3)"),
+    ("character(3)", "char(3)"),
+    ("CHAR(3)", "char(3)"),
+    ("character", "char"),
+    ("character varying", "varchar"),
 ])
 def test_normalize_type_folds_case_whitespace_and_common_spellings(raw, norm):
     assert normalize_type(raw) == norm
@@ -558,6 +562,18 @@ def test_a_forced_one_to_one_assignment_resolves_tables_that_share_a_trailing_na
         ("archive.orders", "table_missing"), ("stage.orders", "table_missing")]
 
 
+def test_an_exact_match_is_reserved_before_any_trailing_name_match_whatever_the_order():
+    """`orders` declared after `sales.orders`: the one observed `orders` belongs to the exact
+    name, so sales.orders is missing, not the other way round, and not shared."""
+    cols = [{"name": "id", "type": "int", "nullable": True}]
+    for ddl in ("CREATE TABLE sales.orders (id INT); CREATE TABLE orders (id INT);",
+                "CREATE TABLE orders (id INT); CREATE TABLE sales.orders (id INT);"):
+        expected = declared_shape(ddl)["tables"]
+        assert _resolve_tables(expected, {"orders": cols}) == {"sales.orders": None, "orders": "orders"}
+        assert _resolve_tables(expected, {"orders": cols, "mig.sales.orders": cols}) == {
+            "sales.orders": "mig.sales.orders", "orders": "orders"}
+
+
 def test_drop_table_lets_a_later_create_land_its_own_shape():
     """A drop-and-recreate job is valid DDL: after DROP TABLE the next CREATE is the first one
     again and its columns are the declared shape."""
@@ -786,6 +802,8 @@ def test_databricks_target_reads_the_observed_shape_from_information_schema(monk
     sql, params = conn.executed[-1]
     assert "information_schema.columns" in sql and "ORDER BY ordinal_position" in sql
     assert params == {"catalog": "mig", "schema": "sales", "table": "orders"}
+    # a view or materialized view with the same columns is not the table the DDL creates
+    assert "information_schema.tables" in sql and "table_type IN ('MANAGED', 'EXTERNAL'" in sql
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
@@ -828,6 +846,7 @@ def test_lakebase_target_reads_the_observed_shape_from_pg_attribute(monkeypatch)
         {"name": "amount", "type": "decimal(18,2)", "nullable": True}]
     sql, params = conn.executed[-1]
     assert "pg_attribute" in sql and "format_type" in sql and params == ("sales", "orders")
+    assert "c.relkind IN ('r', 'p')" in sql
 
 
 def test_a_top_level_comparison_does_not_swallow_the_statements_after_it():
@@ -841,6 +860,20 @@ def test_a_top_level_comparison_does_not_swallow_the_statements_after_it():
     assert [c["name"] for c in shape["tables"]["u"]] == ["c", "d", "e"]
     assert shape["tables"]["u"][1]["type"] == "array<struct<x:int,y:int>>"
     assert shape["altered"] == ["t"] and shape["statements"]["other"] == 1
+
+
+def test_bracket_quoted_identifiers_keep_comment_markers_and_spacing():
+    """T-SQL `[...]` is a quoted identifier: `--` and `/*` inside it are name text, and its
+    whitespace is part of the name the digest must keep."""
+    shape = declared_shape(
+        "CREATE TABLE [orders--archive] ([a/*x*/b] INT, [c]]--d] INT); -- real\n"
+        "CREATE TABLE [orders/*archive*/] (id INT); /* real */")
+    assert sorted(shape["tables"]) == ["orders--archive", "orders/*archive*/"]
+    assert [c["name"] for c in shape["tables"]["orders--archive"]] == ["a/*x*/b", "c]--d"]
+    assert shape["statements"] == {"create_table": 2, "alter_table": 0, "other": 0}
+    digest = lambda ddl: expected_digest(declared_shape(ddl))  # noqa: E731
+    assert digest("CREATE TABLE [two  spaces] (a INT)") != digest("CREATE TABLE [two spaces] (a INT)")
+    assert digest("CREATE  TABLE [x] (a  INT)") == digest("CREATE TABLE [x] (a INT)")
 
 
 def test_comment_markers_inside_literals_and_quoted_identifiers_are_kept():
@@ -898,7 +931,8 @@ def test_shape_keeps_an_existing_zero_column_table_as_an_empty_list(monkeypatch,
     cli.main(["shape", "--target-kind", "databricks", "--target-secret", "D", "--target-catalog", "mig",
               "--target-schema", "sales", "--table", "markers", "--out", str(out)])
     assert json.loads(out.read_text())["tables"] == {"markers": []}
-    assert "information_schema.tables" in conn.executed[-1][0]
+    sql = conn.executed[-1][0]
+    assert "information_schema.tables" in sql and "table_type IN ('MANAGED', 'EXTERNAL'" in sql
 
 
 def test_lakebase_target_table_exists_asks_pg_class(monkeypatch):
@@ -911,6 +945,6 @@ def test_lakebase_target_table_exists_asks_pg_class(monkeypatch):
     conn.rows = [(1,)]
     assert target.table_exists("markers") is True
     sql, params = conn.executed[-1]
-    assert "pg_class" in sql and params == ("sales", "markers")
+    assert "pg_class" in sql and "c.relkind IN ('r', 'p')" in sql and params == ("sales", "markers")
     conn.rows = []
     assert target.table_exists("gone") is False
