@@ -18,7 +18,7 @@ Everything Databricks-side goes through `skills/target-routing/SKILL.md` to the 
 | Pre/Post SQL, Stored Procedure transformation, SQL-only Decision/Assignment | `CREATE PROCEDURE` + `CALL` from a `sql_task`; `DECLARE`/`SET`/`IF`; `EXECUTE IMMEDIATE` for `~param~` SQL | `databricks-dbsql` `references/sql-scripting.md` "CREATE PROCEDURE", "CALL", "Control Flow", "Exception Handling" |
 | Connections, `$DBConnection_*`, file dirs, reject files, credentials | UC catalog/schema, external locations, volumes; secrets by name only | `databricks-unity-catalog` `references/2-external-locations.md`, `references/6-volumes.md`, `references/1-access-control.md` |
 | OLTP front-door units only | Lakebase type column below | `databricks-lakebase` `references/synced-tables.md` "Data Type Mapping" |
-| Analyzer inventory of the export (no transpiler flag exists) | embedded SQL overrides transpile under `teradata` / `oracle` | `skills/lakebridge/SKILL.md` Informatica row |
+| Analyzer inventory of the export (no transpiler flag exists) | embedded SQL overrides transpile under `teradata` / `oracle` | `skills-extra/lakebridge/SKILL.md` Informatica row |
 
 ## 2. Enumeration and lineage
 

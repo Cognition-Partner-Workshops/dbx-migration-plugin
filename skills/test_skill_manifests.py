@@ -1,6 +1,7 @@
 """Every SKILL.md frontmatter must parse as YAML with a name matching its directory; an
 unquoted `: ` in a description is what the installer reports as "Skill malformed"."""
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -53,6 +54,18 @@ def test_extra_canonicalization_rules_load():
     paths += sorted((ROOT / "skills").glob("*/canonicalization.json"))
     for path in paths:
         load_canon_rules(path)
+
+
+def test_no_stale_core_paths_to_optional_skills():
+    pattern = re.compile(
+        r"skills/(lakebridge|informatica-xml|tsql-ssis|teradata-bteq|redshift-sql)\b"
+    )
+    paths = list((ROOT / "skills").rglob("*.md"))
+    paths += list((ROOT / "skills-extra").rglob("*.md"))
+    paths += [ROOT / name for name in ("README.md", "OVERVIEW.md") if (ROOT / name).exists()]
+    assert not [
+        path for path in paths if pattern.search(path.read_text())
+    ]
 
 
 def test_required_databricks_plugin_is_pinned():

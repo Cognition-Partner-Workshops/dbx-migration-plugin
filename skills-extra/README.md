@@ -2,7 +2,7 @@
 
 These optional source-dialect skills and the Lakebridge accelerator wrapper are not loaded by the core plugin; Devin loads only `skills/`.
 Their intended home is a separate `dbx-dialects-extra` plugin with the same layout once that repository exists.
-Until then, a fork that needs one copies `skills-extra/<name>` into `skills/`.
+Until then, a fork that needs one copies `skills-extra/<name>` into `skills/`, copies any companion it points at (the dialect skills point at `lakebridge`), and rewrites `skills-extra/` to `skills/` inside the copied Markdown (`sed -i 's#skills-extra/#skills/#g' skills/<name>/**/*.md`).
 Each `canonicalization.json` still loads with `recon.config.load_canon_rules` (`dbx-recon run --canonicalization <path>`).
 
 - `teradata-bteq` — Source-dialect skill for Teradata estates (Teradata SQL, BTEQ scripts, SPL stored procedures and macros, TPT/MLOAD/FASTLOAD control files).
