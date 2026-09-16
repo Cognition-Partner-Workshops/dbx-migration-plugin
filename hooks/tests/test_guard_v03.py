@@ -302,6 +302,10 @@ def test_python_default_database_comes_only_from_the_connection():
 def test_python_variable_sql_on_a_target_connection_resolves_or_fails_closed():
     block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); q='DROP TABLE prod.s.t'; c.execute(q)\"")
     approve("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); q='DROP TABLE staging'; c.execute(q)\"")
+    approve("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); q='DROP TABLE staging'; c.execute(q); "
+            "c.execute('DROP TABLE old')\"")
+    block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); q='DROP TABLE staging'; c.execute(q); "
+          "c.execute('DROP TABLE prod.s.t')\"")
     approve("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat'); c.execute(build())\"")
     block("python3 -c \"c=psycopg2.connect(host='lakebase-host', dbname='mig_cat', password=os.environ['PW']); c.execute(build())\"")
     block("python3 -c \"c=psycopg2.connect(host='lakebase-host'); c.execute(build())\"")

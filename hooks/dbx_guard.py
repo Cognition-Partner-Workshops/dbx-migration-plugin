@@ -1121,20 +1121,20 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
             prefix = text[:match.start()]
             assignments = list(re.finditer(
                 rf"(?<![\w.]){name}\s*(?:(?P<plain>=(?!=))|(?P<compound>[+\-*/%|&]=))", prefix))
-            literals = []
+            values = []
             for assignment in assignments:
                 if not assignment.group("plain"):
-                    literals = []
+                    values = []
                     break
                 literal = re.match(
                     rf"{re.escape(name)}\s*=\s*[rbuf]*(['\"]{{3}}|['\"])(.*?)\1",
                     prefix[assignment.start():], re.S)
                 if literal is None:
-                    literals = []
+                    values = []
                     break
-                literals.append(literal.group(2))
-            if assignments and literals and len(assignments) == len(literals):
-                statements.extend(literals)
+                values.append(literal.group(2))
+            if assignments and values and len(assignments) == len(values):
+                statements.extend(values)
             else:
                 opaque = True
     violations = []
