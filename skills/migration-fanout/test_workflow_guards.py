@@ -26,12 +26,14 @@ def _functions():
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
-                    and node.name in {"validate_manifest", "validate_verify", "ledger_violations"})
+                    and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
+                                      "validate_gates"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
-                                                         "ENV_NAME", "PARAM_VALUE"}
+                                                         "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
+                                                         "DECISION_ID"}
                     for t in node.targets))]
-    namespace = {"Counter": Counter, "re": re}
+    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -41,7 +43,8 @@ def _batch_runtime():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
-                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows"})
+                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
+                                                                         "gate_outcomes"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA"}
                     for t in node.targets))]
@@ -104,13 +107,193 @@ def _caps(**changes):
     return {**CAPS, **changes}
 
 
+GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": ""}
+
+
+def _gated(batches):
+    """Every manifest declares its gates at STOP C; tests about other fields get one pending gate each."""
+    return [{**b, "gates": b.get("gates", [dict(GATE)])} for b in batches]
+
+
 def _manifest(**extra):
     m = {"wave": 1, "repo": "repo", "child_macro": "child", "verify_macro": "verify",
          "capabilities": _caps(host=HOST),
          "base_branch": "migration/loan-servicing",
          "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
     m.update(extra)
+    m["batches"] = _gated(m["batches"])
+    m.setdefault("gates_sha", _functions()["declared_gates_sha"](m["batches"]))
     return m
+
+
+# ---------------------------------------------------------------- gates as manifest rows (WS3.3)
+
+@pytest.mark.parametrize("gates, message", [
+    (None, "gates"),
+    ([], "gates"),
+    ("g-rows", "gates"),
+    (["g-rows"], "gates"),
+    ([{**GATE, "id": ""}], "id"),
+    ([{**GATE, "id": "a b"}], "id"),
+    ([dict(GATE), dict(GATE)], "unique"),
+    ([{k: v for k, v in GATE.items() if k != "kind"}], "kind"),
+    ([{**GATE, "kind": "vibes"}], "kind"),
+    ([{k: v for k, v in GATE.items() if k != "status"}], "status"),
+    ([{**GATE, "status": "done"}], "status"),
+    ([{k: v for k, v in GATE.items() if k != "evidence"}], "evidence"),
+    ([{**GATE, "evidence": None}], "evidence"),
+    ([{**GATE, "status": "passed", "evidence": ""}], "evidence"),
+    ([{**GATE, "status": "waived"}], "decision_id"),
+    ([{**GATE, "status": "waived", "decision_id": "7"}], "decision_id"),
+    ([{**GATE, "decision_id": "seven"}], "decision_id"),
+])
+def test_validate_manifest_rejects_missing_or_malformed_gates(gates, message):
+    validate_manifest = _functions()["validate_manifest"]
+    batch = {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}
+    if gates is not None:
+        batch["gates"] = gates
+    m = _manifest()
+    m["batches"] = [batch]
+    with pytest.raises(SystemExit, match=message):
+        validate_manifest(m)
+
+
+def test_validate_manifest_accepts_every_gate_kind_and_status():
+    validate_manifest = _functions()["validate_manifest"]
+    kinds = ("byte_compare", "export_file", "publish_leg", "row_parity", "structural", "custom")
+    gates = [{"id": f"g-{k}", "kind": k, "status": "pending", "evidence": ""} for k in kinds]
+    gates += [{"id": "g-p", "kind": "custom", "status": "passed", "evidence": "recon/u/result.json"},
+              {"id": "g-f", "kind": "custom", "status": "failed", "evidence": ""},
+              {"id": "g-w", "kind": "custom", "status": "waived", "evidence": "", "decision_id": "D-12"}]
+    validate_manifest(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "x", "gates": gates}]))
+
+
+def test_declared_gate_list_is_hashed_into_the_manifest():
+    ns = _functions()
+    validate_manifest, sha = ns["validate_manifest"], ns["declared_gates_sha"]
+    m = _manifest()
+    good = m["gates_sha"]
+    assert re.fullmatch(r"[0-9a-f]{64}", good)
+    validate_manifest(m)
+    for missing in ({k: v for k, v in m.items() if k != "gates_sha"}, {**m, "gates_sha": ""}, {**m, "gates_sha": good[:-1] + "0"}):
+        with pytest.raises(SystemExit, match="gates_sha") as e:
+            validate_manifest(missing)
+        assert good in str(e.value) and "STOP C" in str(e.value)
+    # status and evidence move as gates pass; the id/kind list is what STOP C approved
+    passed = [{**b, "gates": [{**g, "status": "passed", "evidence": "x"} for g in b["gates"]]} for b in m["batches"]]
+    assert sha(passed) == good
+    validate_manifest({**m, "batches": passed})
+    # a gate swapped for another kind, renamed, dropped or added is a halt
+    for changed in ([{**b, "gates": [{**g, "kind": "custom"} for g in b["gates"]]} for b in m["batches"]],
+                    [{**b, "gates": [{**g, "id": "g-other"} for g in b["gates"]]} for b in m["batches"]],
+                    [{**b, "gates": b["gates"] + [{**GATE, "id": "g-extra"}]} for b in m["batches"]]):
+        assert sha(changed) != good
+        with pytest.raises(SystemExit, match="gates_sha"):
+            validate_manifest({**m, "batches": changed})
+    # the hash is over sorted batches and gate order, so re-ordering is not a change
+    assert sha(list(reversed(_manifest(batches=[
+        {"id": "a", "units": ["u"], "write_targets": ["t"], "brief": "x"},
+        {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"]))) == sha(_manifest(batches=[
+        {"id": "a", "units": ["u"], "write_targets": ["t"], "brief": "x"},
+        {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"])
+
+
+GATES_LEDGER = ("| D-12 | user: waive g-w for u, export leg retired with the legacy feed |\n"
+                "| D-13 | user: waive g-other for u |\n")
+
+
+def _gate_batch(*gates):
+    return {"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "b", "gates": list(gates)}
+
+
+def _gate_report(**extra):
+    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
+            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"], "one_line_summary": "ok", **extra}
+
+
+def _run_gates(batch, report, ledger=GATES_LEDGER):
+    ns = _batch_runtime()
+    ns["decision_ledger"] = lambda: ledger
+
+    async def agent(prompt, **kwargs):
+        return dict(report)
+
+    ns["agent"] = agent
+    return asyncio.run(ns["run_batch"](batch, asyncio.Semaphore(1), ns["Breaker"](3)))
+
+
+def test_pass_with_a_gate_still_pending_is_downgraded():
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report())
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert "g-rows" in out["one_line_summary"] and "pending" in out["one_line_summary"]
+    assert out["gates"] == [{**GATE, "decision_id": None}]
+
+
+def test_child_reported_gate_pass_with_evidence_closes_the_gate():
+    out = _run_gates(_gate_batch(dict(GATE)),
+                     _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": "recon/u/result.json"}]))
+    assert out["status"] == "PASS" and "failure_class" not in out
+    assert out["gates"] == [{**GATE, "status": "passed", "evidence": "recon/u/result.json", "decision_id": None}]
+
+
+@pytest.mark.parametrize("reported", [
+    [{"id": "g-rows", "status": "passed", "evidence": ""}],                       # no evidence
+    [{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}],
+    [{"id": "g-rows", "status": "waived", "evidence": "", "decision_id": "D-12"}],  # only the ledger waives
+    [{"id": "g-rows", "kind": "custom", "status": "passed", "evidence": "x"}],      # kind is not the child's to set
+    [{"id": "g-other", "status": "passed", "evidence": "x"}],                     # undeclared gate
+    [{"id": "g-rows", "status": "passed", "evidence": "x"}, {"id": "g-rows", "status": "passed", "evidence": "x"}],
+    ["g-rows"],
+    "g-rows passed",
+    [{"status": "passed", "evidence": "x"}],
+])
+def test_child_cannot_pass_a_gate_without_evidence_waive_it_or_rename_it(reported):
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(gates=reported))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+
+
+def test_manifest_passed_and_ledger_waived_gates_need_nothing_from_the_child():
+    batch = _gate_batch({**GATE, "status": "passed", "evidence": "stop-c/rows.md"},
+                        {**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
+    out = _run_gates(batch, _gate_report())
+    assert out["status"] == "PASS"
+    assert [g["status"] for g in out["gates"]] == ["passed", "waived"]
+    # a child cannot un-waive or flip a recorded gate
+    out = _run_gates(batch, _gate_report(gates=[{"id": "g-w", "status": "failed", "evidence": "x"}]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+
+
+@pytest.mark.parametrize("ledger", [
+    "",
+    "| D-12 | user: waive g-w for other_unit |\n",                 # names another unit
+    "| D-12 | user: waive g-other for u |\n",                      # names another gate
+    "| D-120 | user: waive g-w for u |\n",                         # D-12 is not a prefix match
+])
+def test_waived_gate_whose_decision_is_not_in_the_ledger_fails_closed(ledger):
+    batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
+    out = _run_gates(batch, _gate_report(), ledger)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "D-12" in out["one_line_summary"]
+
+
+def test_gate_check_runs_before_the_pr_gate_and_after_merge_authority():
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(merge_eligible=False))
+    assert out["failure_class"] == "merge_authority"
+    out = _run_gates(_gate_batch(dict(GATE)), {**_gate_report(), "pr_url": ""})
+    assert out["failure_class"] == "gates"
+
+
+def test_child_schema_and_prompts_carry_gates():
+    tree = ast.parse(WORKFLOW.read_text())
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
+    gate = schema["properties"]["gates"]["items"]
+    assert gate["properties"]["status"]["enum"] == ["passed", "failed"] and gate["required"] == ["id", "status", "evidence"]
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+    assert "g-rows" in child and "row_parity" in child and "waived" in child
+    verify = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1",
+                                  "gates": [{**GATE, "status": "passed", "evidence": "recon/u/result.json"}]}], False)
+    assert "g-rows" in verify and "recon/u/result.json" in verify
 
 
 @pytest.mark.parametrize("caps", [

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -8,11 +9,19 @@ import pytest
 
 WORKFLOW = Path(__file__).with_name("workflow.py")
 DOCTOR = Path(__file__).parents[1] / "factory-doctor" / "doctor.py"
+GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": ""}
+
+
+def _gates_sha(batches):
+    """The recipe the plan playbook documents: sha256 of the sorted {batch id: [[gate id, kind], ...]} map."""
+    declared = {b["id"]: [[g["id"], g["kind"]] for g in b["gates"]] for b in batches}
+    return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
-               doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None):
+               doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
+               gates=None, gates_sha=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -41,8 +50,10 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "stop_mode": "soft",
             "ready": True,
         },
-        "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief"}],
+        "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief",
+                     "gates": gates if gates is not None else [GATE]}],
     }
+    manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
     if smoke:
         manifest["smoke"] = True
     manifest_path = waves / "wave-0.json"
@@ -140,7 +151,51 @@ def log(message):
 def _pass_report(pr_url="", **extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": pr_url, "branch": "feature/x", "changed_paths": [],
+            "gates": [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}],
             "write_targets": ["mig.t"], "one_line_summary": "ok", **extra}
+
+
+def _result(ws):
+    return json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
+
+
+def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_ledger(tmp_path):
+    ws, cwd = _workspace(tmp_path / "pending")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "pending", [_pass_report(pr, gates=[])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["batches"][0]["status"] == "FAIL" and result["batches"][0]["failure_class"] == "gates"
+    assert result["batches"][0]["gates"][0]["status"] == "pending" and result["closed"] is False
+    assert "g-rows" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+
+    waived = {"id": "g-export", "kind": "export_file", "status": "waived", "evidence": "", "decision_id": "D-4"}
+    ws, cwd = _workspace(tmp_path / "waived", gates=[GATE, waived],
+                         decisions="| D-4 | user: waive g-export for u, the downstream feed is retired |\n")
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["closed"] is True
+    assert [g["status"] for g in result["batches"][0]["gates"]] == ["passed", "waived"]
+    assert result["waived_gates"] == [{"batch": "b-1", "units": ["u"], "gate": "g-export", "decision_id": "D-4"}]
+    assert "D-4" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert "g-rows" in [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+
+    ws, cwd = _workspace(tmp_path / "unwaived", gates=[GATE, waived])
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "unwaived", [_pass_report(pr)])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["batches"][0]["failure_class"] == "gates"
+
+
+def test_gate_list_changed_after_stop_c_halts_before_launch(tmp_path):
+    ws, cwd = _workspace(tmp_path, gates=[{**GATE, "kind": "custom"}], gates_sha=_gates_sha(
+        [{"id": "b-1", "gates": [GATE]}]))
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "gates_sha" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
 
 def _push_pr(ws, n=1):

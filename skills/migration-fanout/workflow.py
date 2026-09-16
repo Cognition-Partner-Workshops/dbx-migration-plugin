@@ -55,10 +55,23 @@ Manifest shape (written by the plan playbook, read here):
     {"id": "w2-b01", "units": ["orders_load", "orders_dim"],
      "write_targets": ["mig.orders", "mig.orders_dim"],
      "verify_depth": "full",                  # optional per-batch override
+     "gates": [                               # required; the acceptance gates STOP C approved for these units
+       {"id": "rows", "kind": "row_parity",  # kind: byte_compare | export_file | publish_leg | row_parity |
+        "status": "pending", "evidence": ""},  #   structural | custom. status: pending | passed | failed | waived
+       {"id": "feed", "kind": "export_file", "status": "waived", "evidence": "",
+        "decision_id": "D-14"}                  # waived needs the D-<n> row of 06_decisions.md naming gate and units
+     ],
      "brief": "...complete hand-off text for this batch..."}
-  ]
+  ],
+  "gates_sha": "<sha256>",                   # required; sha256 of the sorted {batch id: [[gate id, kind], ...]}
+                                              # map, compact JSON, recorded at STOP C. A gate renamed, added,
+                                              # dropped or swapped for another kind afterwards is a halt.
   "smoke": true                              # only valid for wave 0, width 1, mode smoke
 }
+
+A child closes a pending or failed gate by reporting gates: [{id, status: passed, evidence}] with non-empty
+evidence; it cannot waive, rename or re-kind one. A PASS with any gate not passed (or waived by a ledger row)
+is recorded FAIL with failure_class gates, so the wave cannot close over it.
 
 Wave 0 uses the same workflow with `"wave": 0` and `"width": 1` for serial shared objects.
 """
@@ -185,6 +198,8 @@ MERGE_EVIDENCE_MODES = ("live", "snapshot", "transactional")
 # Values the child doctor compares its own findings against (hooks/dbx_guard.py, 00_context.md).
 GUARD_MODES = ("block", "warn")
 STOP_MODES = ("hard", "soft")
+GATE_KINDS = ("byte_compare", "export_file", "publish_leg", "row_parity", "structural", "custom")
+GATE_STATUSES = ("pending", "passed", "failed", "waived")
 # A unit id is the one directory under .migration/recon/ its child may write, so it is a plain
 # name: no separators, no leading dot, and not the verifier's wave-N.
 UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
@@ -228,28 +243,59 @@ def ledger_rows(ledger):
             yield ids[0], cells
 
 
-def override_decision(decision_id, units, ledger):
-    """Whether the ledger holds the D-<n> row that lets a human merge past merge_eligible=false: the row
-    whose id cell is that id, with human provenance (`user:<id>`; a default-accepted row is the
-    orchestrator's, not a human's), the word merge_override and the id of every unit in the batch, in
-    whatever column order the ledger keeps. Units are looked for in the row's text cells only: a cell
-    that is an id, a date or the provenance alone is about the row and is skipped, and a provenance token
-    inside a text cell is blanked, so none of those stands in for a unit the row did not name, while a
-    unit that happens to be called like one counts when the text names it; nor does the marker stand in
-    for a unit that happens to be called merge_override (the row names it again)."""
+def override_decision(decision_id, units, ledger, word="merge_override"):
+    """Whether the ledger holds the D-<n> row a human wrote for these units: the row whose id cell is that
+    id, with human provenance (`user:<id>`; a default-accepted row is the orchestrator's, not a human's),
+    the deciding word (merge_override past merge_eligible=false; waive for a gate) and the id of every
+    unit in the batch, in whatever column order the ledger keeps. Units are looked for in the row's text
+    cells only: a cell that is an id, a date or the provenance alone is about the row and is skipped, and
+    a provenance token inside a text cell is blanked, so none of those stands in for a unit the row did
+    not name, while a unit that happens to be called like one counts when the text names it; nor does
+    the deciding word stand in for a unit of that name (the row names it again)."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
         return False
 
-    def word(w):
+    def token(w):
         return rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])"
 
     for row_id, cells in ledger_rows(ledger):
         if row_id == decision_id and any(HUMAN_PROVENANCE.search(c) for c in cells):
             text = " | ".join(HUMAN_PROVENANCE.sub(" ", c) for c in cells if not LEDGER_METADATA.fullmatch(c))
-            need = Counter(("merge_override", *units))
-            if all(len(re.findall(word(w), text)) >= n for w, n in need.items()):
+            need = Counter((word, *units))
+            if all(len(re.findall(token(w), text)) >= n for w, n in need.items()):
                 return True
     return False
+
+
+def declared_gates_sha(batches):
+    declared = {b["id"]: [[g["id"], g["kind"]] for g in b["gates"]] for b in batches}
+    return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def validate_gates(b):
+    """A unit's acceptance gates are manifest rows STOP C approved, not prose in a PR; every field is checked
+    so a missing one fails here rather than closing a wave over it."""
+    gates = b.get("gates")
+    if not isinstance(gates, list) or not gates or not all(isinstance(g, dict) for g in gates):
+        raise SystemExit(f"batch {b['id']} 'gates' must be a non-empty list of {{id, kind, status, evidence, decision_id?}} "
+                         "rows: the acceptance gates STOP C approved for its units")
+    ids = Counter(g.get("id") for g in gates)
+    if any(not isinstance(i, str) or not UNIT_ID.fullmatch(i) for i in ids):
+        raise SystemExit(f"batch {b['id']} gate 'id' must be a plain word (letters, digits, _ . -)")
+    if any(c > 1 for c in ids.values()):
+        raise SystemExit(f"batch {b['id']} gate ids must be unique: {[i for i, c in ids.items() if c > 1]}")
+    for g in gates:
+        if g.get("kind") not in GATE_KINDS:
+            raise SystemExit(f"batch {b['id']} gate {g['id']} 'kind' must be one of {GATE_KINDS}")
+        if g.get("status") not in GATE_STATUSES:
+            raise SystemExit(f"batch {b['id']} gate {g['id']} 'status' must be one of {GATE_STATUSES}")
+        if not isinstance(g.get("evidence"), str) or (g["status"] == "passed" and not g["evidence"]):
+            raise SystemExit(f"batch {b['id']} gate {g['id']} 'evidence' must be a string, non-empty once passed")
+        decision = g.get("decision_id")
+        if (g["status"] == "waived" and decision is None) or (
+                decision is not None and not (isinstance(decision, str) and DECISION_ID.fullmatch(decision))):
+            raise SystemExit(f"batch {b['id']} gate {g['id']} 'decision_id' must be the D-<n> row of 06_decisions.md "
+                             "(required for a waived gate)")
 
 
 def validate_manifest(m, doctor=None):
@@ -295,9 +341,15 @@ def validate_manifest(m, doctor=None):
                              "_ . -, not wave-*): the id names the only .migration/recon/<unit_id>/ its child may write")
         for u in b["units"]:
             owners.setdefault(u, []).append(b["id"])
+        validate_gates(b)
     shared = {u: bs for u, bs in owners.items() if len(bs) > 1}
     if shared:
         raise SystemExit(f"a unit id belongs to one batch (its child alone writes .migration/recon/<unit_id>/): {shared}")
+    want = declared_gates_sha(m["batches"])
+    if m.get("gates_sha") != want:
+        raise SystemExit(f"manifest 'gates_sha' is {m.get('gates_sha')!r} but the declared gate list hashes to {want}: "
+                         "record that value at STOP C with the approved gates; a gate renamed, added, dropped or "
+                         "swapped for another kind since is a plan change, not a child's call, so this run halts")
     src = m.get("source")
     if src is not None and (not isinstance(src, dict) or not isinstance(src.get("params", {}), dict)
                             or not all(isinstance(v, str) and WORD.fullmatch(v) for v in
@@ -646,6 +698,14 @@ CHILD_SCHEMA = {
         "changed_paths": {"type": "array", "items": {"type": "string"},
                           "description": "every path the PR changes: git diff --name-only <base>...<head>"},
         "skill_feedback": {"type": "array", "items": {"type": "string"}},
+        "gates": {
+            "type": "array",
+            "items": {"type": "object",
+                      "properties": {"id": {"type": "string"},
+                                     "status": {"type": "string", "enum": ["passed", "failed"]},
+                                     "evidence": {"type": "string"}},
+                      "required": ["id", "status", "evidence"]},
+            "description": "outcome of each gate declared in your brief, by id; passed needs the evidence path"},
         "recon_cost": {"type": "object",
                        "description": "result.json['cost'] of the final live/snapshot/transactional run"},
         "one_line_summary": {"type": "string"},
@@ -692,7 +752,10 @@ def child_prompt(batch):
         f"{batch['brief']}\n\n"
         f"Units: {json.dumps(batch['units'], sort_keys=True)}\n"
         f"Write targets you own (never write anywhere else): "
-        f"{json.dumps(batch.get('write_targets', []), sort_keys=True)}\n\n"
+        f"{json.dumps(batch.get('write_targets', []), sort_keys=True)}\n"
+        f"Acceptance gates STOP C declared for these units (report each by id in gates as passed with the "
+        f"evidence path, or failed; one still pending fails the unit; a waived one is the ledger's, not yours; "
+        f"never rename or re-kind a gate): {json.dumps(batch.get('gates', []), sort_keys=True)}\n\n"
         + capability_block(batch["units"])
         + "Rules that override anything else:\n"
         "- Do not edit files under .migration/ except your own recon evidence under "
@@ -768,7 +831,9 @@ def verify_prompt(passed, auto_merge):
         "merge_eligible is false, and cite the decision id in findings. "
         f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
         "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
-        "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. "
+        "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. Each batch lists "
+        "its acceptance gates with the evidence the child gave; open the evidence of every passed gate and FAIL "
+        "the unit if it does not show what the gate's kind requires. "
         "Sum result.json['cost'] over your runs into recon_cost.\n"
         f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{WAVE}/report.md, "
         f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
@@ -816,6 +881,12 @@ async def run_batch(batch, sem, breaker):
             out["one_line_summary"] = (
                 f"PASS downgraded: recon evidence was {out.get('recon_mode')}/"
                 f"{out.get('recon_verdict')}; " + out["one_line_summary"])
+        if out["status"] == "PASS":
+            out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger())
+            if unmet:
+                out["status"] = "FAIL"
+                out["failure_class"] = "gates"
+                out["one_line_summary"] = "PASS downgraded: " + "; ".join(unmet) + "; " + out["one_line_summary"]
         if (out["status"] == "PASS"
                 and (not out.get("pr_url") or not out.get("branch"))):
             out["status"] = "FAIL"
@@ -917,6 +988,46 @@ def cost_line(results, verify) -> str:
                if any("verify_depth" in b for b in BATCHES) else "") + ".")
 
 
+def gate_outcomes(batch, reported, ledger):
+    """The batch's gates after the child's report: a pending or failed gate takes the child's passed (with
+    evidence) or failed; a passed or waived gate is the plan's and stays. Returns the gates and what keeps
+    the unit from closing: any gate not passed, or waived without its ledger row naming gate and units."""
+    declared = {g["id"]: {**g, "decision_id": g.get("decision_id")} for g in batch.get("gates", [])}
+    unmet = []
+    if reported is None:
+        reported = []
+    if not isinstance(reported, list) or not all(isinstance(r, dict) for r in reported):
+        unmet.append("reported gates are not a list of {id, status, evidence} rows")
+        reported = []
+    seen = Counter(r.get("id") for r in reported)
+    for r in reported:
+        gid, g = r.get("id"), declared.get(r.get("id"))
+        if g is None:
+            unmet.append(f"gate {gid!r} reported but not declared for {batch['id']}")
+        elif (seen[gid] > 1 or set(r) - {"id", "status", "evidence"} or r.get("status") not in ("passed", "failed")
+              or not isinstance(r.get("evidence"), str) or (r["status"] == "passed" and not r["evidence"])):
+            unmet.append(f"gate {gid} report must be one {{id, status: passed|failed, evidence}} row, evidence "
+                         "non-empty when passed")
+        elif g["status"] in ("passed", "waived"):
+            unmet.append(f"gate {gid} is {g['status']} in the plan; a child cannot change it")
+        else:
+            g.update(status=r["status"], evidence=r["evidence"])
+    for g in declared.values():
+        if g["status"] == "waived":
+            if not override_decision(g["decision_id"], [g["id"], *batch["units"]], ledger, word="waive"):
+                unmet.append(f"gate {g['id']} waived by {g['decision_id']} but no such row naming the gate and "
+                             f"{', '.join(batch['units'])} is in .migration/06_decisions.md")
+        elif g["status"] != "passed":
+            unmet.append(f"gate {g['id']} ({g['kind']}) is {g['status']}")
+    return list(declared.values()), unmet
+
+
+def waived_gates(results):
+    return [{"batch": b["id"], "units": b["units"], "gate": g["id"], "decision_id": g["decision_id"]}
+            for b, r in zip(BATCHES, results) if r["status"] == "PASS"
+            for g in r.get("gates", []) if g["status"] == "waived"]
+
+
 def merge_overrides(results):
     return [{"batch": b["id"], "units": b["units"], "decision_id": r["merge_authority"]["decision_id"]}
             for b, r in zip(BATCHES, results)
@@ -951,6 +1062,10 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
     if unreported:
         lines.append(f"Merges held: {', '.join(unreported)} passed but reported no write targets; "
                      "a human confirms what they wrote before any PR lands.")
+    waived = waived_gates(results)
+    if waived:
+        lines.append("Gates waived by ledger decision: "
+                     + "; ".join(f"{w['batch']}/{w['gate']} by {w['decision_id']}" for w in waived) + ".")
     overrides = merge_overrides(results)
     if overrides:
         lines.append("Human override authority (merge_eligible=false; merged only if listed above): "
@@ -1012,7 +1127,8 @@ async def main():
             "Auto-merge is off for this wave; a human decides at wave close.")
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
-               "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority")}
+               "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
+               "gates": r.get("gates", [])}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
     verify = None
     if passed:
@@ -1049,6 +1165,7 @@ async def main():
         "undeclared_write_targets": undeclared,
         "unreported_write_targets": unreported,
         "merge_overrides": merge_overrides(results),
+        "waived_gates": waived_gates(results),
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
         "verify": verify,
     }, indent=2, sort_keys=True) + "\n")
