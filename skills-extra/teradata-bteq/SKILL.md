@@ -14,7 +14,7 @@ for collations, `references/best-practices.md` for DDL/MERGE/QUALIFY), `databric
 `sql_task`/`depends_on`/`run_if`), `databricks-pipelines` (load utilities -> streaming tables / `AUTO CDC`),
 `databricks-unity-catalog` (`DBC.*` grants -> UC grants, volumes), `databricks-lakebase` (OLTP column of the type map).
 Load `databricks-core` first. Hardened against the fixture estate `uc-dw-migration-teradata-to-bigquery` (`ddl/`,
-`dml/`, `verify/`; BigQuery half ignored). Lakebridge (`--source-dialect teradata`) coverage row: `skills-extra/lakebridge/SKILL.md`.
+`dml/`, `verify/`; BigQuery half ignored). Lakebridge (`--source-dialect teradata`) coverage row: `../lakebridge/SKILL.md`.
 
 ## Type map
 
