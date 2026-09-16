@@ -226,6 +226,94 @@ def test_a_table_the_source_lacks_is_unsupported_and_not_aggregated():
     assert src.calls["column_profile"] == 0
 
 
+class FailingCatalog(ShapedSource):
+    """A source whose catalog read fails the way a live driver does (denied, dropped, dialect)."""
+
+    def column_shape(self, table):
+        self._count("column_shape")
+        raise RuntimeError("permission denied for schema information_schema")
+
+
+def test_a_failed_catalog_read_is_unsupported_evidence_not_a_crash(tmp_path, monkeypatch):
+    src, fx = FailingCatalog({"app.orders": SOURCE_ROWS}, None), _source()
+    out = compare_fixture(SPEC, src, fx)
+    assert out["status"] == "unsupported" and out["findings"] == []
+    assert out["tables"]["app.orders"]["shape"] == "unsupported"
+    assert out["tables"]["app.orders"]["cardinality"] == "unsupported"
+    assert "RuntimeError" in out["tables"]["app.orders"]["reason"]
+    assert "permission denied" in out["tables"]["app.orders"]["reason"]
+    assert src.calls["column_profile"] == 0
+    # the CLI still writes the evidence for the wave gate to read
+    from recon import adapters
+    monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "postgres",
+                        lambda secret: src if secret == "SRC_DSN" else fx)
+    mapping = tmp_path / "mapping.json"
+    mapping.write_text(json.dumps({"version": "m1", "objects": [
+        {"object": "orders", "root_table": "app.orders",
+         "key": {"source": ["order_id"], "target": "order_id"},
+         "fields": [{"source": "order_id", "target": "order_id", "source_type": "bigint",
+                     "target_type": "long"}]}]}))
+    rc = cli.main(["fixture-shape", "--family", "postgres", "--mapping", str(mapping),
+                   "--source-dsn-secret", "SRC_DSN", "--fixture-dsn-secret", "FIX_DSN",
+                   "--source-statement-cap", "10", "--out", str(tmp_path / "w0")])
+    written = json.loads((tmp_path / "w0" / "fixture_shape.json").read_text())
+    assert rc != 0 and written["status"] == "unsupported"
+
+
+def test_a_failed_catalog_read_does_not_swallow_interrupts():
+    class Interrupted(ShapedSource):
+        def column_shape(self, table):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        compare_fixture(SPEC, Interrupted({}, None), _source())
+
+
+def test_comparison_keys_are_checked_even_when_not_mapped_as_fields():
+    spec = MappingSpec(version="map-v1", objects=[ObjectMapping(
+        object="orders", root_table="app.orders", key_source=["order_id"], key_target="order_id",
+        fields=[FieldMapping("status", "status", "varchar(12)", "string")])])
+    fixture = ShapedSource({"app.orders": [{"status": s} for s in ["new", "paid", None]]},
+                           {"app.orders": SOURCE_SHAPE[1:2]})
+    out = compare_fixture(spec, _source(), fixture)
+    assert [(f["check"], f["column"]) for f in out["findings"]] == [("column_missing", "order_id")]
+    assert out["status"] == "fail"
+    src = _source()
+    out = compare_fixture(spec, src, _source())
+    assert out["status"] == "pass"
+    assert src.calls["column_profile"] == 2  # the key column is profiled too
+
+
+def test_two_objects_on_one_root_table_each_keep_their_own_coverage():
+    """A second object on the same root table (a different slice or projection) must not
+    overwrite the first one's plan; each object's mapped columns and scope are checked."""
+    spec = MappingSpec(version="map-v1", objects=[
+        ObjectMapping(object="orders", root_table="app.orders", key_source=["order_id"],
+                      key_target="order_id",
+                      fields=[FieldMapping("status", "status", "varchar(12)", "string")]),
+        ObjectMapping(object="order_times", root_table="app.orders", key_source=["order_id"],
+                      key_target="order_id", root_where="status = 'paid'",
+                      fields=[FieldMapping("occurred_at", "occurred_at", "timestamp",
+                                           "timestamp")])])
+    src = _source()
+    # the fixture flattens status (fails `orders`) but keeps occurred_at faithful (`order_times`)
+    flat = [dict(r, status="paid" if r["status"] else None) for r in SOURCE_ROWS]
+    fx = ShapedSource({"app.orders": flat}, {"app.orders": SOURCE_SHAPE})
+    out = compare_fixture(spec, src, fx)
+    assert [(f["check"], f["column"]) for f in out["findings"]] == [
+        ("cardinality_collapsed", "status")]
+    assert out["tables"]["app.orders"]["status"] == "fail"
+    assert out["source_statements"] == 1 + 2 + 2  # one catalog read, both objects profiled
+    assert src.calls["column_shape"] == 1
+    # and the fixture that drops the second object's column is caught by the shape check
+    fx = ShapedSource({"app.orders": [{"order_id": r["order_id"], "status": r["status"]}
+                                      for r in SOURCE_ROWS]},
+                      {"app.orders": SOURCE_SHAPE[:2]})
+    out = compare_fixture(spec, src, fx)
+    assert ("column_missing", "occurred_at") in [(f["check"], f["column"])
+                                                 for f in out["findings"]]
+
+
 def test_findings_are_ordered_and_reference_the_unit_table():
     fixture = ShapedSource({"app.orders": []}, {"app.orders": SOURCE_SHAPE[:1]})
     out = compare_fixture(SPEC, _source(), fixture)

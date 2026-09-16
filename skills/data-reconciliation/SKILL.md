@@ -117,6 +117,8 @@ provenance warning and the run is not merge-eligible.
   compares the fixture copy with the real source per mapped table: column names, types (after
   the rerun proof's normalisation), nullability, and a sample cardinality (distinct count and
   null rate per mapped column, within the object's `root_where`), not just that the table exists.
+  Mapped columns are the object's comparison keys plus its fields; two objects on one root table
+  are each checked.
   `fixture_shape.json` carries
   `{status: pass|fail|unsupported, findings: [{table, check, column?, detail}], tables,
   source_statements}`; checks are `table_missing`, `column_missing`, `column_extra`,

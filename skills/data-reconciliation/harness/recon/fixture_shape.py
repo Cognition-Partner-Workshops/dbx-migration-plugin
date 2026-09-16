@@ -31,6 +31,8 @@ def _shape(adapter, table: str) -> dict[str, dict] | str:
         return f"column_shape unsupported: {type(adapter).__name__} has no catalog reader"
     except KeyError:
         return f"no {table}"
+    except Exception as exc:  # a live catalog read that failed (denied, dropped, dialect)
+        return f"column_shape failed: {type(exc).__name__}: {exc}"
     if not cols:
         return f"no {table}"
     return {str(c["name"]).lower(): {"type": normalize_type(c["type"]),
@@ -112,6 +114,23 @@ def _compare_cardinality(table: str, columns: list[str], where: str | None, sour
     return out, None
 
 
+def _table_shapes(table: str, source, fixture, row: dict, findings: list[dict]) -> tuple:
+    """Both sides' shapes for one table (one catalog read each); a side that could not be read
+    marks the row and leaves a reason in its place."""
+    fix = _shape(fixture, table)
+    if isinstance(fix, str) and fix.startswith("no "):
+        findings.append(_find(table, "table_missing", f"fixture has no {table}"))
+        row.update(status="fail", shape="unsupported", cardinality="unsupported",
+                   reason=f"fixture has no {table}")
+        return None, fix
+    src = _shape(source, table)
+    if isinstance(src, str) or isinstance(fix, str):
+        reason = src if isinstance(src, str) else fix
+        row.update(status="unsupported", shape="unsupported", cardinality="unsupported",
+                   reason=("source " if isinstance(src, str) else "fixture ") + reason)
+    return src, fix
+
+
 def compare_fixture(spec: MappingSpec, source, fixture,
                     source_statement_cap: int | None = None) -> dict:
     """Shapes first for every table (one source read each), then cardinality table by table,
@@ -123,34 +142,29 @@ def compare_fixture(spec: MappingSpec, source, fixture,
     budget = _Budget(source, source_statement_cap)
     findings: list[dict] = []
     tables: dict[str, dict] = {}
-    plans: dict[str, list[str] | None] = {}
+    shapes: dict[str, tuple] = {}  # one catalog read per side per table, shared by its objects
+    plans: list[list[str] | None] = []  # per object: the columns to profile, or nothing
     for obj in spec.objects:
         table = obj.root_table
-        mapped = list(dict.fromkeys(f.source.lower() for f in obj.fields))
-        row = {"status": "pass", "shape": "checked", "cardinality": "checked"}
-        tables[table] = row
-        plans[table] = None
-        fix = _shape(fixture, table)
-        if isinstance(fix, str) and fix.startswith("no "):
-            findings.append(_find(table, "table_missing", f"fixture has no {table}"))
-            row.update(status="fail", shape="unsupported", cardinality="unsupported",
-                       reason=f"fixture has no {table}")
-            continue
-        src = _shape(source, table)
-        if isinstance(src, str) or isinstance(fix, str):
-            reason = src if isinstance(src, str) else fix
-            row.update(status="unsupported", shape="unsupported", cardinality="unsupported",
-                       reason=("source " if isinstance(src, str) else "fixture ") + reason)
+        mapped = list(dict.fromkeys([*(c.lower() for c in obj.key_source),
+                                     *(f.source.lower() for f in obj.fields)]))
+        row = tables.setdefault(table, {"status": "pass", "shape": "checked",
+                                        "cardinality": "checked"})
+        plans.append(None)
+        if table not in shapes:
+            shapes[table] = _table_shapes(table, source, fixture, row, findings)
+        src, fix = shapes[table]
+        if not isinstance(src, dict) or not isinstance(fix, dict):
             continue
         found = _compare_shape(table, mapped, src, fix)
         findings.extend(found)
         if found:
             row["status"] = "fail"
         # a column the fixture lacks is already a finding; aggregating it would only error
-        plans[table] = [c for c in mapped if c in fix]
-    for obj in spec.objects:
+        plans[-1] = [c for c in mapped if c in fix]
+    for obj, mapped in zip(spec.objects, plans):
         table = obj.root_table
-        mapped, row = plans[table], tables[table]
+        row = tables[table]
         if mapped is None:
             continue
         if not budget.fits(len(mapped)):
