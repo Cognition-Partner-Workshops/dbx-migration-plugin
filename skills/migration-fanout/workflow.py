@@ -104,6 +104,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -1635,31 +1636,43 @@ def validate_close(close, to_merge) -> list[str]:
     return problems
 
 
-def _patch_id(a, b):
+def _applies_to(start, delta, commit):
+    """Whether applying delta (a `diff-tree -p --binary --full-index` patch) onto start's tree in a
+    scratch index yields exactly commit's tree."""
     git = ["git", "-C", str(ROOT)]
-    diff = subprocess.run(git + ["diff-tree", "-p", "-U0", "--no-color", a, b],
-                          check=True, capture_output=True, text=True, timeout=300).stdout
-    return subprocess.run(git + ["patch-id", "--stable"], input=diff, check=True,
-                          capture_output=True, text=True, timeout=300).stdout.split()[:1]
+    with tempfile.TemporaryDirectory() as d:
+        env = {"GIT_INDEX_FILE": str(Path(d) / "index")}
+        subprocess.run(git + ["read-tree", start], check=True, env=env, capture_output=True,
+                       text=True, timeout=300)
+        ok = subprocess.run(git + ["apply", "--cached", "--whitespace=nowarn"], input=delta, env=env,
+                            capture_output=True, text=True, timeout=300)
+        if ok.returncode:
+            return False
+        tree = subprocess.run(git + ["write-tree"], check=True, env=env, capture_output=True,
+                              text=True, timeout=300).stdout.strip()
+    landed = subprocess.run(git + ["rev-parse", f"{commit}^{{tree}}"], check=True, capture_output=True,
+                            text=True, timeout=300).stdout.strip()
+    return tree == landed
 
 
 def _same_change(parent, commit, head):
-    """Whether commit is a squash or rebase of head: the change of the squash commit, or of the N
-    first-parent rebased commits ending at it, against what precedes them must be the gated head's
-    change against its merge base (git's patch-id of each range; an unrelated commit cannot match)."""
+    """Whether commit is a squash or rebase of head: the gated head's exact change against its merge
+    base (bytes, whitespace and binaries included), applied onto what precedes the squash commit or
+    the N first-parent rebased commits ending at it, must produce the landed tree."""
     git = ["git", "-C", str(ROOT)]
     base = subprocess.run(git + ["merge-base", head, commit],
                           check=True, capture_output=True, text=True, timeout=300).stdout.strip()
     n = int(subprocess.run(git + ["rev-list", "--count", f"{base}..{head}"],
                            check=True, capture_output=True, text=True, timeout=300).stdout)
-    want = _patch_id(base, head)
-    if not want:
+    delta = subprocess.run(git + ["diff-tree", "-p", "--binary", "--full-index", "--no-color", base, head],
+                           check=True, capture_output=True, text=True, timeout=300).stdout
+    if not delta.strip():
         return False
-    if want == _patch_id(parent, commit):
+    if _applies_to(parent, delta, commit):
         return True
     start = subprocess.run(git + ["rev-parse", "--verify", "--quiet", f"{commit}~{n}"],
                            check=False, capture_output=True, text=True, timeout=300)
-    return n > 1 and start.returncode == 0 and want == _patch_id(start.stdout.strip(), commit)
+    return n > 1 and start.returncode == 0 and _applies_to(start.stdout.strip(), delta, commit)
 
 
 def proven_merged(to_merge, reported):
@@ -1667,9 +1680,10 @@ def proven_merged(to_merge, reported):
     gated head (a commit appended after verification is not the verified tree) and origin's base tip carries
     the merge: a merge_commit_sha the wave-close step recorded (`gh pr view` state MERGED, merged_head the
     gated head) must be on the tip and, when it has two parents, name the gated head as its PR-side parent
-    (a single-parent squash/rebase commit has no PR-side parent, so the change of the squash commit, or
-    of the N rebased commits ending at it, against what precedes them must be the gated head's change
-    against its merge base — git's patch-id of both, the record alone binds nothing).
+    (a single-parent squash/rebase commit has no PR-side parent, so the gated head's exact change
+    against its merge base, applied to what precedes the squash commit or the N rebased commits ending
+    at it, must reproduce the landed tree — git apply into a scratch index; whitespace, bytes and
+    binaries count, the record alone binds nothing).
     With no record — the step died, timed out, or dropped the PR — git alone still proves a
     merge commit on the base's first-parent line whose PR-side parent is the gated head. Whatever the close
     step reported or failed to report is reconciled against git."""

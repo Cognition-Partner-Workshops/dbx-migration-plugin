@@ -1600,6 +1600,85 @@ def test_a_multi_commit_squash_is_still_proven(tmp_path):
     assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
 
 
+def _commit_file(ws, name, data, msg=None):
+    git = ["git", "-C", str(ws)]
+    (ws / name).write_bytes(data if isinstance(data, bytes) else data.encode())
+    subprocess.run(git + ["add", name], check=True)
+    subprocess.run(git + ["commit", "-qm", msg or name], check=True)
+
+
+def _tip(ws):
+    return subprocess.run(["git", "-C", str(ws), "rev-parse", "origin/migration/x"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_a_squash_that_differs_only_by_whitespace_is_not_proof(tmp_path):
+    """patch-id ignores whitespace; the landed commit's tree must be the gated head's exact change
+    applied to what precedes it, so a squash adding one space is no merge of this PR."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    git = ["git", "-C", str(ws)]
+    _commit_file(ws, "q.sql", "SELECT a\n")
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    _commit_file(ws, "q.sql", "SELECT a, b\n")
+    pr = _push_pr(ws)
+    subprocess.run(git + ["reset", "-q", "--hard", "origin/migration/x"], check=True)
+    _commit_file(ws, "q.sql", "SELECT  a, b\n")
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, _tip(ws))])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_rebase_range_that_differs_only_by_whitespace_is_not_proof(tmp_path):
+    """The rebased range must carry the gated head's change exactly; a last commit landing 'select  3'
+    where the head has 'select 3' is not the PR's merge."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    git = ["git", "-C", str(ws)]
+    fork = subprocess.run(git + ["rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    pr, sha_a, head = _three_commit_pr(ws)
+    _advance_base(ws, [("u.sql", "select 0")])
+    subprocess.run(git + ["cherry-pick", f"{fork}..{head}~1"], check=True, capture_output=True)
+    _commit_file(ws, "c.sql", "select  3\n")
+    mc = subprocess.run(git + ["rev-parse", "HEAD"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+    close = _close_report(merged_prs=[_merge_row(pr, mc)])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is False
+    assert "does not carry the gated head's change" in result["close"]["unmerged"][0]["reason"]
+
+
+def test_a_binary_change_is_proven_exactly(tmp_path):
+    """A squash landing the gated head's binary bytes proves; the same commit shape landing different
+    bytes does not."""
+    for i, landed in enumerate((b"\x00\x02", b"\x00\x03")):
+        ws, cwd = _workspace(tmp_path / f"bin{i}", auto_merge=True)
+        git = ["git", "-C", str(ws)]
+        _commit_file(ws, "m.bin", b"\x00\x01")
+        subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+        _commit_file(ws, "m.bin", b"\x00\x02")
+        pr = _push_pr(ws)
+        subprocess.run(git + ["reset", "-q", "--hard", "origin/migration/x"], check=True)
+        # a same-bytes/same-message commit would dedupe to the PR head's sha; the landed commit must differ
+        _commit_file(ws, "m.bin", landed, msg="squash merge")
+        subprocess.run(git + ["push", "-q", "origin", "HEAD:migration/x"], check=True)
+        close = _close_report(merged_prs=[_merge_row(pr, _tip(ws))])
+        proc, _ = _run(cwd, tmp_path / f"bin{i}", [_pass_report(pr), _verify_report(), close])
+        assert proc.returncode == 0, proc.stderr
+        result = _result(ws)
+        if landed == b"\x00\x02":
+            assert result["close"]["merged_prs"] == [pr] and result["closed"] is True
+        else:
+            assert result["close"]["merged_prs"] == [] and result["closed"] is False
+            assert "does not carry" in result["close"]["unmerged"][0]["reason"]
+
+
 def test_a_record_whose_merged_head_is_not_the_gated_head_is_not_proven(tmp_path):
     ws, cwd = _workspace(tmp_path, auto_merge=True)
     pr = _unproven_pr(ws)
