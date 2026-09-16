@@ -1310,7 +1310,7 @@ def test_a_failed_sibling_does_not_hold_back_a_verified_pr_merge(tmp_path):
     """The verifier sees only PASS children; a wave FAIL on one still leaves the other's PR to merge."""
     ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
                          other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
-                                      "brief": "b", "gates": [GATE]})
+                                      "brief": "b", "gates": [GATE], "lakeflow_pipelines": []})
     pr, pr2 = _unproven_pr(ws), _push_pr(ws, 2)
     pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
                                                              "evidence": ".migration/recon/v/result.json"}])
@@ -1421,7 +1421,7 @@ def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
 
     pointer = ws / ".migration/waves/current.json"
     pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
-                                   "hook_probe": "blocked:0123abcd"}))
+                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
     (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
     subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "b"], check=True)
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
@@ -1440,7 +1440,7 @@ def test_a_close_reply_is_reconciled_against_git_per_pr(tmp_path):
     """The close step died after merging b-1's PR: git proves that one merged, b-2's stays unmerged."""
     ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
                          other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
-                                      "brief": "b", "gates": [GATE]})
+                                      "brief": "b", "gates": [GATE], "lakeflow_pipelines": []})
     pr = _unproven_pr(ws)
     pr2 = _unproven_pr(ws, 2)
     pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
@@ -1770,7 +1770,7 @@ def test_a_moved_pr_head_is_not_proven_even_with_a_record(tmp_path):
     mc = _merge_commit(ws, _PR_HEADS[pr])
     pointer = ws / ".migration/waves/current.json"
     pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
-                                   "hook_probe": "blocked:0123abcd"}))
+                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
     (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
     close = _close_report(merged_prs=[_merge_row(pr, mc)])
     close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
@@ -1787,7 +1787,7 @@ def test_proven_merges_are_recorded_before_the_result_and_reused_on_resume(tmp_p
     resume whose close step dies with no record still proves the PR from that file."""
     ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
                          other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
-                                      "brief": "b", "gates": [GATE]})
+                                      "brief": "b", "gates": [GATE], "lakeflow_pipelines": []})
     pr = _unproven_pr(ws)
     pr2 = _unproven_pr(ws, 2)
     pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
@@ -1808,7 +1808,7 @@ def test_proven_merges_are_recorded_before_the_result_and_reused_on_resume(tmp_p
 
     pointer = ws / ".migration/waves/current.json"
     pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
-                                   "hook_probe": "blocked:0123abcd"}))
+                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
     (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
     proc, _ = _run(cwd, tmp_path, [_pass_report(pr), pass2, verify, {"error": "boom"}])
     assert proc.returncode == 0, proc.stderr
