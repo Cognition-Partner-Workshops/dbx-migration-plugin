@@ -17,6 +17,7 @@ Every DEGRADED report names the mode in its header and never borrows LIVE wordin
 
 ## Specifications
 - Deliverable: independent wave report plus `dbx-recon` JSON and evidence ledger.
+- Identity or sequence drift found at recon is a parent-owned resync (manifest `resync`, run after the children and before the verifier), not something a child fixes; the child reports a `failure_class` containing "identity" or "sequence" so the workflow replays it after the resync.
 - Validation: source and target are read-only to the verifier, checks are rerunnable, and a fresh session can reproduce the verdict.
 
 ## Pointers

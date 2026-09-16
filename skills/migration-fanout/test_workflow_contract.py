@@ -31,7 +31,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
                deploy_objects=None, max_minutes=None, batch_max_minutes=None, manifest_name="wave-0.json", wave=0,
                pipelines=None, auto_merge=None, close_minutes=None, other_batch=None,
-               lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1):
+               lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1,
+               manifest_extra=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -86,6 +87,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         manifest["close_minutes"] = close_minutes
     if other_batch is not None:
         manifest["batches"].append(other_batch)
+    manifest.update(manifest_extra or {})
     if namespace is not None:
         manifest["target_namespace"] = namespace
     if pipelines is not None:
@@ -203,7 +205,7 @@ def _pass_report(pr_url="", **extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": pr_url, "branch": "feature/x", "changed_paths": [],
             "gates": [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}],
-            "write_targets": ["mig.t"], "review_clean": True, "review_head": _PR_HEADS.get(pr_url, ""),
+            "write_targets": ["mig.t"],
             "one_line_summary": "ok", **extra}
 
 
@@ -225,7 +227,7 @@ def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_le
     ws, cwd = _workspace(tmp_path / "waived", gates=[GATE, waived],
                          decisions="| D-4 | user:U1 | waive g-export for u, the downstream feed is retired |\n")
     pr = _push_pr(ws)
-    proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr), _verify_report()])
+    proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr), _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     result = _result(ws)
     assert result["closed"] is True
@@ -257,7 +259,8 @@ def test_a_waiver_a_human_wrote_for_an_earlier_run_does_not_waive_the_gate_after
 
     ws, cwd = _workspace(tmp_path / "after", decisions=waiver)
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "after", [_pass_report(pr, gates=[]), _verify_report()])
+    proc, _ = _run(cwd, tmp_path / "after", [_pass_report(pr, gates=[]), _verify_report(),
+                                       {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["waived_gates"] == [{"batch": "b-1", "units": ["u"], "gate": "g-rows", "decision_id": "D-4"}]
 
@@ -291,7 +294,7 @@ def test_a_default_accepted_stop_c_row_launches_only_a_soft_stop_mode_wave(tmp_p
     sha = json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
     (ws / ".migration" / "06_decisions.md").write_text(
         f"| D-2 | 2026-01-05 | default-accepted (soft, 60s) | STOP C wave-0 gates_sha {sha} |\n")
-    proc, calls = _run(cwd, tmp_path, [_pass_report(_push_pr(ws)), _verify_report()])
+    proc, calls = _run(cwd, tmp_path, [_pass_report(_push_pr(ws)), _verify_report(), {"error": "close step stubbed"}])
     if launches:
         assert proc.returncode == 0, proc.stderr
         assert _result(ws)["batches"][0]["status"] == "PASS"
@@ -333,52 +336,14 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
     assert proc.returncode != 0 and "{batch, pr_url, gates}" in proc.stderr
     runs = ws / ".migration/waves/wave-0.runs.jsonl"
     assert [json.loads(l)["mode"] for l in runs.read_text().splitlines()] == ["reserve"]  # unmet gates: the run stays open
-    clean = {"review_clean": True, "review_head": _PR_HEADS[pr]}
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed], **clean}])
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
-    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == [] and out["batches"]["b-1"]["review_waiver"] is None
+    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == [] and "review_waiver" not in out["batches"]["b-1"]
     assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
     assert [(json.loads(l)["stop_c"], json.loads(l)["mode"]) for l in runs.read_text().splitlines()] == [("D-2", "reserve"), ("D-2", "gates")]
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed], **clean}])
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
     assert proc.returncode != 0 and "closed" in proc.stderr and "D-2" in proc.stderr and "STOP C" in proc.stderr
-    assert not (ws / ".migration/waves/wave-0.result.json").exists()
-
-
-def test_gates_subcommand_applies_the_review_clean_rule_at_the_pr_head(tmp_path):
-    """A hand-gathered small wave is held to the same review-clean rule as a workflow child: review_clean=true
-    for review_head equal to the PR head git fetches, or a human's review_waived row, below this run's STOP C row,
-    naming that head and the units."""
-    ws, cwd = _workspace(tmp_path, doctor=False)
-    results = tmp_path / "results.json"
-    assert _workflow(cwd, "reserve").returncode == 0
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", "d" * 40)
-    passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
-
-    def run(**report):
-        results.write_text(json.dumps([{"batch": "b-1", "pr_url": pr, "gates": [passed], **report}]))
-        proc = _workflow(cwd, "gates", str(results))
-        assert "Traceback" not in proc.stderr, proc.stderr
-        return proc.returncode, json.loads(proc.stdout)["batches"]["b-1"]
-
-    for dirty in ({}, {"review_clean": False, "review_head": _PR_HEADS[pr]}, {"review_clean": "yes", "review_head": _PR_HEADS[pr]},
-                  {"review_clean": True}, {"review_clean": True, "review_head": "d" * 40},
-                  {"review_clean": False, "review_waiver": {"decision_id": "D-4"}},
-                  {"review_clean": False, "review_waiver": {"decision_id": "D-5"}}):
-        rc, b = run(**dirty)
-        assert rc != 0 and len(b["unmet"]) == 1 and "review_waived" in b["unmet"][0] and b["review_waiver"] is None, dirty
-        assert ("is not the gated PR head" in b["unmet"][0]) == (dirty.get("review_clean") is True), dirty
-        assert _PR_HEADS[pr] in b["unmet"][0] and "D-2" in b["unmet"][0], dirty
-    rc, b = run(review_clean=True, review_head=_PR_HEADS[pr])
-    assert rc == 0 and b["unmet"] == [] and b["review_waiver"] is None
-
-    ws, cwd = _workspace(tmp_path / "waived", doctor=False)
-    assert _workflow(cwd, "reserve").returncode == 0
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", _PR_HEADS[pr])
-    rc, b = run(review_clean=False, review_waiver={"decision_id": "D-5"})
-    assert rc == 0 and b["unmet"] == [] and b["review_waiver"] == {"decision_id": "D-5"}
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
 
@@ -590,7 +555,7 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
     ws, cwd = _workspace(tmp_path / "other_ns", other_waves={"wave-1.json": WAVE_1.replace('"mig.t"', '"t"')},
                          mappings={"u": bounded}, namespace="MIG")
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "other_ns", [_pass_report(pr), _verify_report()])
+    proc, _ = _run(cwd, tmp_path / "other_ns", [_pass_report(pr), _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
 
@@ -609,7 +574,8 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
     ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1},
                          mappings={"u": bounded, "v": PRIOR_MAPPING})
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "bounded", [_pass_report(pr), _verify_report()])
+    proc, _ = _run(cwd, tmp_path / "bounded", [_pass_report(pr), _verify_report(),
+                                       {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
 
@@ -721,7 +687,7 @@ def test_declared_write_targets_must_equal_the_call_graphs_transitive_writes(tmp
     ws, cwd = _workspace(tmp_path / "same", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
                          deploy_objects=("mig.run",), namespace="mig")
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "same", [_pass_report(pr), _verify_report()])
+    proc, _ = _run(cwd, tmp_path / "same", [_pass_report(pr), _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
 
@@ -739,7 +705,9 @@ def test_call_graph_writes_are_compared_as_the_mapping_specs_target_names(tmp_pa
     ws, cwd = _workspace(tmp_path / "ok", dependencies={"u": _analysis("src.ledger")}, mappings={"u": spec},
                          namespace="mig", write_targets=("mig.t", "mig.run"), deploy_objects=("MIG.run",))
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["mig.t", "mig.run"]), _verify_report()])
+    proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["mig.t", "mig.run"]),
+                                           _verify_report(),
+                                       {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
 
@@ -771,7 +739,7 @@ def test_child_reported_targets_compare_under_the_manifests_namespace_after_the_
     ws, cwd = _workspace(tmp_path / "ok", namespace="cat.mig", write_targets=("orders",))
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["CAT.MIG.orders", "orders"]),
-                                           _verify_report()])
+                                           _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert "outside their declared targets" not in proc.stdout and "overlapping" not in proc.stdout
     assert _result(ws)["closed"] is True
@@ -779,7 +747,8 @@ def test_child_reported_targets_compare_under_the_manifests_namespace_after_the_
     ws, cwd = _workspace(tmp_path / "other", namespace="cat.mig", write_targets=("orders",))
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "other", [_pass_report(pr, write_targets=["cat.mig.orders", "cat.mig.other"]),
-                                              _verify_report()])
+                                              _verify_report(),
+                                       {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert "outside their declared targets" in proc.stdout and "cat.mig.other" in proc.stdout
     assert "cat.mig.orders" not in proc.stdout.split("outside their declared targets")[1].splitlines()[0]
@@ -794,7 +763,8 @@ def test_read_only_batch_declares_no_targets_only_with_an_analysis_that_writes_n
 
     ws, cwd = _workspace(tmp_path / "ro", write_targets=(), dependencies={"u": json.dumps({"routines": []})})
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "ro", [_pass_report(pr, write_targets=[]), _verify_report()])
+    proc, _ = _run(cwd, tmp_path / "ro", [_pass_report(pr, write_targets=[]), _verify_report(),
+                                       {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
 
@@ -885,7 +855,7 @@ def test_merge_eligible_false_is_recorded_as_merged_only_by_a_ledger_override(tm
     ws, cwd = _workspace(tmp_path, decisions=ledger)
     pr = _push_pr(ws)
     proc, calls = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=override),
-                                       _verify_report()])
+                                       _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
     assert result["batches"][0]["status"] == "PASS"
@@ -924,7 +894,9 @@ def test_every_unit_of_the_batch_must_be_merge_eligible_in_its_own_result_json(t
     override = {"kind": "human_override", "decision_id": "D-3"}
     ws, cwd = _workspace(tmp_path / "override", units=("u", "u2"), recon={"u": True, "u2": False}, decisions=ledger)
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "override", [_pass_report(pr, merge_authority=override), _verify_report()])
+    proc, _ = _run(cwd, tmp_path / "override", [_pass_report(pr, merge_authority=override),
+                                           _verify_report(),
+                                       {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
     assert result["batches"][0]["status"] == "PASS" and result["batches"][0]["merge_authority"] == override
@@ -945,7 +917,7 @@ def test_a_unit_without_readable_recon_evidence_in_the_pr_is_not_merge_eligible(
 def test_harness_pass_records_harness_authority_and_no_overrides(tmp_path):
     ws, cwd = _workspace(tmp_path)
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report()])
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
     assert result["batches"][0]["merge_authority"] == {"kind": "harness", "decision_id": None}
@@ -1025,7 +997,7 @@ def test_pipeline_manifest_tags_the_verifier_branch_and_workflow(tmp_path):
     _PR_HEADS["https://github.com/acme/target/pull/1"] = subprocess.run(
         ["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1"),
-                                     _verify_report()])
+                                     _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     register = [c for c in calls if c["kind"] == "register"][0]
     assert register["meta"]["name"] == "migration-wave-p2-1"
@@ -1174,92 +1146,117 @@ def _close_report(**extra):
     return {"merged_prs": [], "unmerged": [], "changed_paths": [], **extra}
 
 
-def test_a_pass_needs_review_clean_or_a_review_waived_ledger_row(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False)])
+RESYNC = {"command": "python3 load/resync_identity.py --unit u --unit v", "units": ["u", "v"]}
+SEQ = {"object": "mig.u.orders_id_seq", "before": 10, "after": 42}
+
+
+def _resync_report(**extra):
+    return {"status": "ok", "sequences": [SEQ], "changed_paths": [], "one_line_summary": "reseeded 1 sequence", **extra}
+
+
+def _two_batch_workspace(tmp_path, resync=RESYNC, **kw):
+    return _workspace(tmp_path, recon={"u": True, "v": True}, manifest_extra={"resync": resync},
+                      other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
+                                   "brief": "b", "gates": [GATE], "lakeflow_pipelines": []}, **kw)
+
+
+def _pass2(pr2):
+    return _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
+                                                             "evidence": ".migration/recon/v/result.json"}])
+
+
+def test_a_manifest_resync_runs_once_after_the_children_and_before_the_verifier(tmp_path):
+    ws, cwd = _two_batch_workspace(tmp_path)
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    fail = {**_pass_report(pr), "status": "FAIL", "failure_class": "sequence_behind_source"}
+    proc, calls = _run(cwd, tmp_path, [fail, _pass2(pr2), _resync_report(),
+                                       {"wave_verdict": "PASS", "unit_verdicts": {"v": "PASS"}, "findings": [], "changed_paths": []},
+                                       {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
-    assert "review_waived" in batch["one_line_summary"] and "review_waiver" not in batch
+    labels = [c.get("label") for c in calls if c["kind"] == "agent"]
+    assert labels == ["b-1", "b-2", "resync-wave-0", "verify-wave-0", "close-wave-0"]
+    resync = [c for c in calls if c.get("label") == "resync-wave-0"][0]
+    assert resync["kwargs"]["phase"] == "resync" and RESYNC["command"] in resync["prompt"]
+    assert _result(ws)["resync"]["held_batches"] == []
+    assert "migration/x" in resync["prompt"] and "setval" in resync["prompt"] and "before" in resync["prompt"]
+    register = [c for c in calls if c["kind"] == "register"][0]
+    assert [p["title"] for p in register["meta"]["phases"]] == ["migrate", "resync", "verify", "close"]
+    result = _result(ws)
+    assert result["resync"]["command"] == RESYNC["command"] and result["resync"]["units"] == ["u", "v"]
+    assert result["resync"]["report"]["sequences"] == [SEQ] and result["resync"]["problems"] == []
+    assert result["verify"]["unit_verdicts"] == {"b-2": "PASS"}
+    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert "Identity resync" in brief and "mig.u.orders_id_seq" in brief and "10" in brief and "42" in brief
+    assert f"Awaiting manual merge: {pr2}" in brief
 
-    ws, cwd = _workspace(tmp_path / "missing")
-    pr = _push_pr(ws)
-    report = _pass_report(pr)
-    del report["review_clean"]
-    proc, _ = _run(cwd, tmp_path / "missing", [report])
+
+def test_a_resync_that_wrote_files_or_died_is_a_recorded_problem_that_holds_the_resynced_batches(tmp_path):
+    """resync.units covers only b-1's unit, so a problem holds b-1 from merge while b-2 merges."""
+    resync = {"command": RESYNC["command"], "units": ["u"]}
+    verify = {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+              "findings": [], "changed_paths": []}
+    for sub, out, what in [("wrote", _resync_report(changed_paths=["load/x.sql"]), "load/x.sql"),
+                           ("dead", {"error": "boom"}, "boom"),
+                           ("failed", _resync_report(status="failed"), "resync command failed"),
+                           ("malformed", _resync_report(sequences=[{"object": "mig.u.seq"}]),
+                            "sequences must be")]:
+        ws, cwd = _two_batch_workspace(tmp_path / sub, resync=resync, auto_merge=True)
+        pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+        proc, calls = _run(cwd, tmp_path / sub,
+                           [_pass_report(pr), _pass2(pr2), out, dict(verify), _merged(ws, pr2)])
+        assert proc.returncode == 0, proc.stderr
+        result = _result(ws)
+        assert any(what in p for p in result["resync"]["problems"])
+        assert result["verify"]["wave_verdict"] == "PASS"
+        assert result["resync"]["held_batches"] == ["b-1"]
+        assert result["auto_merge"] is True and result["closed"] is False
+        close = [c for c in calls if c.get("label") == "close-wave-0"]
+        assert len(close) == 1 and pr2 in close[0]["prompt"] and pr not in close[0]["prompt"]
+        brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+        assert "held from merge this run: b-1" in brief and what in brief
+
+    ws, cwd = _two_batch_workspace(tmp_path / "clean", resync=resync, auto_merge=True)
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    proc, calls = _run(cwd, tmp_path / "clean",
+                       [_pass_report(pr), _pass2(pr2), _resync_report(), dict(verify),
+                        _close_report(unmerged=[{"pr_url": pr, "reason": "no proof"},
+                                                {"pr_url": pr2, "reason": "no proof"}])])
     assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["batches"][0]["failure_class"] == "review_open"
+    assert _result(ws)["resync"]["held_batches"] == []
+    close = [c for c in calls if c.get("label") == "close-wave-0"][0]
+    assert pr in close["prompt"] and pr2 in close["prompt"]
 
 
-def _waive_review(ws, decision_id, head, above_stop_c=False):
-    ledger = ws / ".migration" / "06_decisions.md"
-    row = f"| {decision_id} | user:U1 | review_waived for u at {head}, the finding is a false positive |\n"
-    ledger.write_text(row + ledger.read_text() if above_stop_c else ledger.read_text() + row)
-
-
-def test_a_review_waived_ledger_row_carries_a_dirty_review(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", _PR_HEADS[pr])
-    proc, calls = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False,
-                                                   review_waiver={"decision_id": "D-5"}), _verify_report()])
+def test_a_resume_after_a_resync_reruns_only_identity_failures_and_unreported_children(tmp_path):
+    """Run 1: b-1 fails on sequence_behind_source, b-2 passes, resync reseeds. Run 2 (resume): b-1 is
+    re-launched with the resync report in its prompt, b-2 replays its recorded PASS, the resync step and
+    the verifier see the new state."""
+    ws, cwd = _two_batch_workspace(tmp_path)
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    fail = {**_pass_report(pr), "status": "FAIL", "failure_class": "sequence_behind_source"}
+    proc, calls = _run(cwd, tmp_path, [fail, _pass2(pr2), _resync_report(),
+                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-2": "PASS"}, "findings": [], "changed_paths": []},
+                                       {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "PASS" and batch["review_waiver"] == {"decision_id": "D-5"}
-    verify_prompt = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
-    assert "review_waiver" in verify_prompt
+    first = {c["label"]: c["prompt"] for c in calls if c["kind"] == "agent"}
+    result = _result(ws)
+    assert result["batches"][0]["status"] == "FAIL" and result["batches"][1]["status"] == "PASS"
 
-
-@pytest.mark.parametrize("stale", ["other_head", "earlier_run"])
-def test_a_review_waiver_binds_the_reviewed_head_and_this_runs_stop_c(tmp_path, stale):
-    """A review_waived row dismisses one wrong finding: it names the PR head it was written for and sits below
-    this run's STOP C row, so a waiver for an earlier PR or an earlier run does not carry a new dirty review."""
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", "d" * 40 if stale == "other_head" else _PR_HEADS[pr], above_stop_c=stale == "earlier_run")
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False, review_waiver={"decision_id": "D-5"})])
+    pointer = ws / ".migration/waves/current.json"
+    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
+                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _pass2(pr2), _resync_report(),
+                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+                                        "findings": [], "changed_paths": []}, {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open" and "review_waiver" not in batch
-    assert _PR_HEADS[pr] in batch["one_line_summary"] and "D-2" in batch["one_line_summary"]
-
-
-def test_a_merge_override_row_does_not_waive_the_review(tmp_path):
-    ws, cwd = _workspace(tmp_path, decisions="| D-5 | user:U1 | merge_override for u |\n")
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False, review_waiver={"decision_id": "D-5"})])
-    assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["batches"][0]["failure_class"] == "review_open"
-
-
-def test_a_clean_review_must_name_the_pr_head_it_cleared(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_head="0" * 40)])
-    assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
-    assert "0" * 40 in batch["one_line_summary"] and _PR_HEADS[pr] in batch["one_line_summary"]
-
-    ws, cwd = _workspace(tmp_path / "missing")
-    pr = _push_pr(ws)
-    report = _pass_report(pr)
-    del report["review_head"]
-    proc, _ = _run(cwd, tmp_path / "missing", [report])
-    assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
-
-    ws, cwd = _workspace(tmp_path / "waived")
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", _PR_HEADS[pr])
-    proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr, review_head="0" * 40,
-                                                               review_waiver={"decision_id": "D-5"}),
-                                                _verify_report()])
-    assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "PASS" and batch["review_waiver"] == {"decision_id": "D-5"}
+    second = {c["label"]: c["prompt"] for c in calls if c["kind"] == "agent"}
+    assert second["b-2"] == first["b-2"], "an unaffected PASS keeps its prompt so the runtime replays it"
+    assert second["b-1"] != first["b-1"] and "resync" in second["b-1"] and "mig.u.orders_id_seq" in second["b-1"]
+    assert second["resync-wave-0"] == first["resync-wave-0"]
+    result = _result(ws)
+    assert [b["status"] for b in result["batches"]] == ["PASS", "PASS"] and result["resync"]["report"]["sequences"] == [SEQ]
+    assert result["batches"][0]["prompt_sha"] != result["batches"][1]["prompt_sha"]
 
 
 def test_the_wave_close_step_merges_the_verifier_pass_prs(tmp_path):
@@ -1295,15 +1292,39 @@ def test_close_minutes_from_the_manifest_propagates_and_a_bad_one_halts(tmp_path
         assert not [c for c in calls if c["kind"] == "agent"]
 
 
-def test_hard_mode_runs_no_close_step_and_the_brief_lists_the_prs(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report()])
+def test_a_manual_wave_runs_a_review_only_close_and_the_brief_lists_the_prs(tmp_path):
+    """auto_merge off: the close step still runs one review round and merges nothing."""
+    ws, cwd = _two_batch_workspace(tmp_path)
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    unmerged = [{"pr_url": p, "reason": "auto_merge off; human merges at wave close"} for p in (pr, pr2)]
+    close_out = {"merged_prs": [], "unmerged": unmerged, "changed_paths": [],
+                 "review_findings": ["PR 1: unused import"]}
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _pass2(pr2), _resync_report(),
+                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+                                        "findings": [], "changed_paths": []}, close_out])
     assert proc.returncode == 0, proc.stderr
-    assert not [c for c in calls if c.get("label") == "close-wave-0"]
+    close = [c for c in calls if c.get("label") == "close-wave-0"]
+    assert len(close) == 1
+    assert "Do not merge anything" in close[0]["prompt"] and "one Devin Review round" in close[0]["prompt"]
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["closed"] is True
     brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
-    assert f"Awaiting manual merge: {pr}" in brief
-    assert _result(ws)["close"] is None
+    assert "Wave-close review over 2 verified PRs" in brief and "- review: PR 1: unused import" in brief
+    assert f"Awaiting manual merge: {pr}, {pr2}" in brief
+
+    ws, cwd = _two_batch_workspace(tmp_path / "bad")
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    bad = {"merged_prs": [{"pr_url": pr, "merge_commit_sha": "a" * 40, "merged_head": "b" * 40}],
+           "unmerged": [{"pr_url": pr2, "reason": "auto_merge off; human merges at wave close"}],
+           "changed_paths": []}
+    proc, calls = _run(cwd, tmp_path / "bad", [_pass_report(pr), _pass2(pr2), _resync_report(),
+                                               {"wave_verdict": "PASS",
+                                                "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+                                                "findings": [], "changed_paths": []}, bad])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert any("wave close invalid: merged with auto_merge off" in f for f in result["verify"]["findings"])
+    assert result["closed"] is False
 
 
 def test_a_failed_sibling_does_not_hold_back_a_verified_pr_merge(tmp_path):
