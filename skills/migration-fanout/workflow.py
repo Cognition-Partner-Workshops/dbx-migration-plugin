@@ -541,6 +541,16 @@ def validate_manifest(m, doctor=None):
         raise SystemExit(f"manifest 'verify_depth' must be one of {VERIFY_DEPTHS}")
     if "cost_estimate" in m and not isinstance(m["cost_estimate"], dict):
         raise SystemExit("manifest 'cost_estimate' must be an object (output of `dbx-recon estimate`, summed over the wave)")
+    rs = m.get("resync")
+    if rs is not None:
+        if (not isinstance(rs, dict) or set(rs) != {"command", "units"} or not isinstance(rs["command"], str)
+                or not rs["command"].strip() or not isinstance(rs["units"], list) or not rs["units"]):
+            raise SystemExit("manifest 'resync' must be {command: non-empty shell command, units: [unit ids declared "
+                             "in this wave]} and nothing else (no SQL in the manifest); the parent-owned step runs "
+                             "the command once after the children report and before the verifier")
+        ghosts = [u for u in rs["units"] if not isinstance(u, str) or u not in owners]
+        if ghosts:
+            raise SystemExit(f"manifest 'resync.units' {ghosts!r} are not units of this wave's batches")
     caps = m.get("capabilities")
     if not isinstance(caps, dict) or not isinstance(caps.get("identity"), str) or not caps["identity"]:
         raise SystemExit("manifest 'capabilities' must be an object with a non-empty 'identity' "
@@ -756,31 +766,11 @@ def gate_outcomes(batch, reported, ledger, head):
     return list(declared.values()), unmet
 
 
-def review_outcome(report, units, ledger, head, stop_c):
-    """The review-clean rule at a PR head, for a workflow child and a hand-gathered report alike: the report
-    says review_clean=true for review_head equal to the gated head, or a human's review_waived D-<n> row,
-    below this run's STOP C row, names that head and every unit. A waiver dismisses one wrong finding on one
-    PR head, so a row for an earlier head or an earlier run does not carry a new dirty review. Returns
-    (waiver, reason): the waiver row that carries a dirty review, or why the PASS falls."""
-    if report.get("review_clean") is True and report.get("review_head") == head:
-        return None, None
-    waiver = report.get("review_waiver")
-    decision = waiver.get("decision_id") if isinstance(waiver, dict) else None
-    if isinstance(head, str) and any(override_decision(decision, [head, *units], line, word="review_waived")
-                                     for line in rows_after(ledger, stop_c)):
-        return {"decision_id": decision}, None
-    why = ("Devin Review is not clean at the PR head" if report.get("review_clean") is not True else
-           f"review_head {report.get('review_head')!r} is not the gated PR head {head!r}")
-    return None, (f"{why} and no review_waived row {decision or 'D-<n>'} below STOP C row {stop_c} naming "
-                  f"{head} and {', '.join(units)} is in .migration/06_decisions.md")
-
-
 def gates_command(path):
     """`workflow.py gates <results.json>`: the wave-close gate rule for a wave the orchestrator gathered by
     hand. The file holds the children's [{batch, pr_url, gates}] reports; every manifest batch must be in it
-    once, and passed evidence and the review-clean rule are checked at each PR's head as the workflow path does.
-    Prints {closed, batches: {id: {gates, review_waiver, unmet}}} and exits 1 unless every gate is passed or
-    waived and every review is clean or waived."""
+    once, and passed evidence is checked at each PR's head as the workflow path does. Prints
+    {closed, batches: {id: {gates, unmet}}} and exits 1 unless every gate is passed or waived."""
     try:
         reports = json.loads(Path(path).read_text())
     except (OSError, ValueError) as e:
@@ -797,7 +787,7 @@ def gates_command(path):
     ledger = decision_ledger()
     out = {}
     for b in sorted(MANIFEST["batches"], key=lambda b: b["id"]):
-        report, waiver = next((r for r in reports if r["batch"] == b["id"]), None), None
+        report = next((r for r in reports if r["batch"] == b["id"]), None)
         if report is None:
             gates, unmet = [dict(g, decision_id=g.get("decision_id")) for g in b["gates"]], [f"batch {b['id']} was not gathered"]
         else:
@@ -805,10 +795,7 @@ def gates_command(path):
             gates, unmet = gate_outcomes(b, report.get("gates"), ledger, head)
             if head is None:
                 unmet.append(f"{report['pr_url']} is not a PR of {MANIFEST['repo']} whose head git can fetch; no evidence stands")
-            waiver, reason = review_outcome(report, b["units"], ledger, head, MANIFEST["stop_c"])
-            if reason:
-                unmet.append(reason)
-        out[b["id"]] = {"gates": gates, "review_waiver": waiver, "unmet": unmet}
+        out[b["id"]] = {"gates": gates, "unmet": unmet}
     closed = not any(v["unmet"] for v in out.values())
     print(json.dumps({"wave": MANIFEST["wave"], "tag": TAG, "closed": closed, "batches": out}, indent=2, sort_keys=True))
     return 0 if closed else 1
@@ -1595,9 +1582,23 @@ def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
             if p.startswith(".migration/") and not p.startswith(allowed)]
 
 
+def batch_verdicts(verdicts, passed):
+    """unit_verdicts keyed by batch id or unit id, normalised to one verdict per batch (a unit id that is also a
+    batch id is the batch). Keys that resolve to one batch with different values collide: that batch is None."""
+    if not isinstance(verdicts, dict):
+        return {}
+    owner = {u: p.get("batch") for p in passed for u in p.get("units") or []}
+    owner.update({p.get("batch"): p.get("batch") for p in passed})
+    out = {}
+    for key, verdict in verdicts.items():
+        batch = owner.get(key, key)
+        out[batch] = None if batch in out and out[batch] != verdict else verdict
+    return out
+
+
 def validate_verify(verify, passed, wave=None, observed=None) -> list[str]:
-    """Return verifier-output problems without reading files or mutating input. `observed` is what git
-    says the verifier itself changed on recon/wave-N (None: it could not be fetched or diffed)."""
+    """The verifier's verdicts and its report branch. Keys are normalised by batch_verdicts first; a collision,
+    a missing or an unexpected batch, a non-PASS/FAIL value, or a report that touched ledger paths all fail."""
     problems = []
     if not isinstance(verify, dict):
         return ["verifier output invalid: expected an object"]
@@ -1609,6 +1610,11 @@ def validate_verify(verify, passed, wave=None, observed=None) -> list[str]:
     if not isinstance(verdicts, dict):
         problems.append("verifier output invalid: unit_verdicts must be a dict")
         verdicts = {}
+    raw, verdicts = verdicts, batch_verdicts(verdicts, passed)
+    for batch in sorted(b for b, v in verdicts.items() if v is None):
+        keys = [k for k in raw if batch_verdicts({k: raw[k]}, passed) == {batch: raw[k]}]
+        problems.append(f"verifier output invalid: conflicting verdicts for {batch}: "
+                        + ", ".join(f"{k}={raw[k]}" for k in keys))
     missing = sorted(expected - set(verdicts))
     extra = sorted(set(verdicts) - expected)
     if missing:
@@ -1618,9 +1624,9 @@ def validate_verify(verify, passed, wave=None, observed=None) -> list[str]:
     wave_verdict = verify.get("wave_verdict")
     if wave_verdict not in ("PASS", "FAIL"):
         problems.append("verifier output invalid: wave_verdict must be PASS or FAIL")
-    for batch in sorted(expected):
+    for batch in sorted(expected - set(missing)):
         verdict = verdicts.get(batch)
-        if verdict not in ("PASS", "FAIL"):
+        if verdict is not None and verdict not in ("PASS", "FAIL"):
             problems.append(f"verifier output invalid: verdict for {batch} is {verdict!r}")
         elif wave_verdict == "PASS" and verdict != "PASS":
             problems.append(f"verifier output invalid: wave PASS contradicts {batch}={verdict}")
@@ -1801,6 +1807,9 @@ AUTO_MERGE = bool(MANIFEST.get("auto_merge", False))
 MAX_MINUTES = int(MANIFEST.get("max_minutes", 45))
 CLOSE_MINUTES = int(MANIFEST.get("close_minutes", 10))
 VERIFY_DEPTH = MANIFEST.get("verify_depth", "sampled")
+RESYNC = MANIFEST.get("resync")
+# the resync recorded by the run being resumed: its children that failed on identity/sequence are re-launched
+PRIOR_RESYNC = ((prior or {}).get("resync") or {}).get("report") if resume and isinstance(prior, dict) else None
 
 
 def batch_verify_depth(batch) -> str:
@@ -1817,9 +1826,11 @@ META = {
         {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
          "labels": [b["id"] for b in BATCHES],
          "soft_time_limit_minutes": max(batch_max_minutes(b) for b in BATCHES)},
+        *([{"title": "resync", "detail": "parent-owned identity/sequence resync on the listed units' targets",
+            "count": 1, "soft_time_limit_minutes": 30}] if RESYNC else []),
         {"title": "verify", "detail": "independent recon over the wave",
          "count": 1, "soft_time_limit_minutes": 60},
-        {"title": "close", "detail": "merge verifier-PASS PRs within the deadline",
+        {"title": "close", "detail": "one review round, then merge verifier-PASS PRs within the deadline",
          "count": 1, "soft_time_limit_minutes": CLOSE_MINUTES},
     ],
 }
@@ -1839,22 +1850,12 @@ CHILD_SCHEMA = {
                            "decision_id": {"type": "string"}},
             "description": "human_override with the D-<n> row of .migration/06_decisions.md that says merge_override "
                            "for your units; the workflow verifies the row. harness otherwise."},
-        "review_clean": {"type": "boolean",
-                         "description": "Devin Review on your PR has zero open actionable findings at pr_head"},
-        "review_head": {"type": "string",
-                        "description": "the 40-hex PR head sha Devin Review cleared; the workflow fails a "
-                                       "review_clean whose review_head is not the gated PR head"},
-        "review_waiver": {
-            "type": "object",
-            "properties": {"decision_id": {"type": "string"}},
-            "description": "the D-<n> row of .migration/06_decisions.md, below this wave's STOP C row, that says "
-                           "review_waived for your units at your PR head sha when a finding is wrong; the workflow "
-                           "verifies the row"},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
         "changed_paths": {"type": "array", "items": {"type": "string"},
                           "description": "every path the PR changes: git diff --name-only <base>...<head>"},
-        "skill_feedback": {"type": "array", "items": {"type": "string"}},
+        "skill_feedback": {"type": "array", "items": {"type": "string"},
+                           "description": "one line per rule you had to derive yourself"},
         "gates": {
             "type": "array",
             "items": {"type": "object",
@@ -1864,18 +1865,21 @@ CHILD_SCHEMA = {
                       "required": ["id", "status", "evidence"]},
             "description": "outcome of each gate declared in your brief, by id; passed needs the evidence path"},
         "recon_cost": {"type": "object",
-                       "description": "result.json['cost'] of the final live/snapshot/transactional run"},
+                       "description": "result.json['cost'] of the final live/snapshot/transactional run, one line"},
         "one_line_summary": {"type": "string"},
     },
     "required": ["status", "recon_verdict", "recon_mode", "merge_eligible", "write_targets", "changed_paths",
-                 "review_clean", "one_line_summary"],
+                 "one_line_summary"],
 }
 
 VERIFY_SCHEMA = {
     "type": "object",
     "properties": {
         "wave_verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
-        "unit_verdicts": {"type": "object"},
+        "unit_verdicts": {"type": "object",
+                          "description": "PASS or FAIL per batch, keyed by batch id or by unit id (a unit key is "
+                                         "normalised to its batch id; one verdict per batch, a batch whose keys "
+                                         "disagree is rejected)"},
         "findings": {"type": "array", "items": {"type": "string"}},
         "report_path": {"type": "string"},
         "changed_paths": {"type": "array", "items": {"type": "string"},
@@ -1902,90 +1906,126 @@ CLOSE_SCHEMA = {
                                "properties": {"pr_url": {"type": "string"}, "reason": {"type": "string"}},
                                "required": ["pr_url", "reason"]}},
         "changed_paths": {"type": "array", "items": {"type": "string"}},
+        "review_findings": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["merged_prs", "unmerged", "changed_paths"],
 }
 
+RESYNC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["ok", "failed"]},
+        "sequences": {"type": "array",
+                      "items": {"type": "object",
+                                "properties": {"object": {"type": "string"}, "before": {}, "after": {}},
+                                "required": ["object", "before", "after"]}},
+        "changed_paths": {"type": "array", "items": {"type": "string"}},
+        "one_line_summary": {"type": "string"},
+    },
+    "required": ["status", "sequences", "changed_paths", "one_line_summary"],
+}
+# a child failure class the parent-owned resync addresses; a resumed launch re-runs those children
+RESYNC_CLASS = re.compile(r"identity|sequence", re.IGNORECASE)
+
+
+def rerun_after_resync(record, resynced):
+    """After a resync, a resumed run re-launches a child that never reported or failed on an identity/sequence
+    class; a PASS, BLOCKED, or other FAIL replays."""
+    if not resynced:
+        return False
+    if not isinstance(record, dict) or record.get("status") not in ("PASS", "FAIL", "BLOCKED"):
+        return True
+    return record.get("status") == "FAIL" and bool(RESYNC_CLASS.search(record.get("failure_class") or ""))
+
+
+def resync_prompt(cfg):
+    return (
+        f"You are the parent-owned identity resync step of wave {WAVE}. Repo: {REPO}. From the repo root, on the "
+        f"base branch {BASE_BRANCH}, run exactly this command and nothing else: `{cfg['command']}`. It uses the "
+        "target credentials by name (never print a value) and may execute only setval / identity-reseed statements "
+        f"on the target objects of these units: {json.dumps(cfg['units'])}. The guard allowlist still applies; a "
+        "block is a finding, not something to route around. Commit nothing and write no files; report `git status "
+        "--porcelain` paths in changed_paths (it must be empty). For every sequence or identity column the command "
+        "touched, report {object, before, after} in sequences; status failed if the command exited non-zero."
+    )
+
+
+def validate_resync(out) -> list[str]:
+    if not isinstance(out, dict):
+        return ["resync output invalid: expected an object"]
+    problems = []
+    if out.get("status") not in ("ok", "failed"):
+        problems.append(f"resync output invalid: status {out.get('status')!r}")
+    rows = out.get("sequences")
+    if not isinstance(rows, list) or not all(isinstance(r, dict) and {"object", "before", "after"} <= set(r) for r in rows):
+        problems.append("resync output invalid: sequences must be [{object, before, after}, ...]")
+    changed = out.get("changed_paths")
+    if not isinstance(changed, list):
+        problems.append("resync output invalid: changed_paths must be a list")
+    elif changed:
+        problems.append("resync changed " + ", ".join(map(str, changed)) + " but must commit and write nothing")
+    return problems
+
 
 def child_prompt(batch):
+    gates = [g for g in batch.get("gates", []) if g["status"] != "waived"]
+    replay = ""
+    if rerun_after_resync(REPLAYED.get(batch["id"]), PRIOR_RESYNC):
+        replay = (f"\nA parent-owned identity resync ran after your earlier attempt: "
+                  f"{json.dumps(PRIOR_RESYNC.get('sequences'), sort_keys=True)}. Start again from the merge-evidence recon.\n")
     return (
-        f"You are one fan-out child in wave {WAVE} of a migration. Repo: {REPO}.\n"
-        f"Run the playbook {MANIFEST['child_macro']} for batch {batch['id']} exactly as written.\n\n"
-        f"BATCH BRIEF (your complete hand-off; if anything is missing, report status=BLOCKED "
-        f"with the missing item in one_line_summary, do not improvise):\n"
-        f"{batch['brief']}\n\n"
-        f"Units: {json.dumps(batch['units'], sort_keys=True)}\n"
-        f"Write targets you own (never write anywhere else): "
-        f"{json.dumps(batch.get('write_targets', []), sort_keys=True)}\n"
-        f"Time budget: {batch_max_minutes(batch)} minutes. At the budget stop where you are and report "
-        f"status=BLOCKED with findings in one_line_summary (what landed, what did not, what blocked it); "
-        f"never grind past it.\n"
-        f"Acceptance gates STOP C declared for these units (report each by id in gates as passed with the "
-        f"evidence path, or failed; one you do not report fails the unit, the plan's status is what is expected, "
-        f"not proof; a waived gate is the ledger's, not yours, and is not listed; never rename or re-kind a gate): "
-        f"{json.dumps([g for g in batch.get('gates', []) if g['status'] != 'waived'], sort_keys=True)}\n\n"
-        + capability_block(batch["units"])
-        + "Rules that override anything else:\n"
-        "- Do not edit files under .migration/ except your own recon evidence under "
-        ".migration/recon/<unit_id>/. The workflow writes the ledger from your report.\n"
-        "- Report every path your PR changes in changed_paths (`git diff --name-only <base>...<head>`); "
-        "any other .migration/ path in it turns your PASS into FAIL ledger_tampered.\n"
-        "- Do not merge your own PR.\n"
-        "- status=PASS also requires review_clean=true: finish the Devin Review round on your PR and fix "
-        "every actionable finding before reporting done, then report review_head as the exact 40-hex PR head "
-        "sha Devin Review cleared (a push after the review needs a new clean round); a wrong finding is "
-        "waived only by a human's review_waived row in .migration/06_decisions.md, written below this wave's "
-        "STOP C row, naming your units and the exact PR head sha it clears, reported as review_waiver.\n"
-        f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
-        "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
-        "evidence is never PASS. Report merge_eligible=true only when every unit's "
-        ".migration/recon/<unit>/result.json in your PR says so; the workflow reads each file. If any is "
-        "false and a human recorded a merge_override row for exactly your units in .migration/06_decisions.md, "
-        "report merge_authority {kind: human_override, decision_id: D-<n>}; the workflow checks the row and "
-        "fails the unit if it is missing. Never write that row yourself.\n"
-        "- If the recon harness fails 3 full runs, stop and report status=FAIL with a short "
-        "failure_class (for example 'timestamp_precision', 'decimal_rounding', 'missing_rule').\n"
-        "- Report every rule you had to derive yourself in skill_feedback.\n"
-        "- Copy result.json['cost'] of your final merge-evidence run into recon_cost; the wave brief "
-        "compares it with the STOP C estimate.\n"
-        "- one_line_summary is for a human skimming 20 of these: what landed, or why not."
+        f"You are one fan-out child in wave {WAVE}. Repo: {REPO}. Playbook: {MANIFEST['child_macro']}, batch "
+        f"{batch['id']}. Anything missing from the brief stops you: report it as blocked, never improvise.\n\n"
+        f"BRIEF:\n{batch['brief']}\n\n"
+        f"Units: {json.dumps(batch['units'])}. Write targets you own, write nowhere else: "
+        f"{json.dumps(batch.get('write_targets', []))}.\n"
+        "Converted files and mapping specs: .migration/units/<unit_id>/ per the brief, spec at "
+        ".migration/units/<unit_id>/mapping_spec.json.\n"
+        + replay + "\n" + capability_block(batch["units"])
+        + f"Time budget: {batch_max_minutes(batch)} minutes; at the budget report status=BLOCKED with what landed and what blocked.\n"
+        f"Gates STOP C declared (report each by id in gates as passed with its evidence path or failed; an unreported gate "
+        f"fails the unit; a waived gate is the ledger's and is not listed; never rename or re-kind one): {json.dumps(gates, sort_keys=True)}\n"
+        + "Recon: run the harness fixture-first, then the merge-evidence run; at most 3 full runs, never change a "
+        "tolerance or 03_recon_tolerances.json; after 3 failing runs report status=FAIL with a one-word failure_class "
+        "(timestamp_precision, decimal_rounding, sequence_behind_source, missing_rule).\n"
+        f"The harness is the merge authority: status=PASS needs a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} "
+        "(transactional for Lakebase/operational units) with every unit's .migration/recon/<unit>/result.json saying "
+        "merge_eligible=true; the workflow reads each file. Fixture evidence is never PASS. If a unit is not eligible and "
+        "a human recorded a merge_override row for exactly your units in .migration/06_decisions.md, report "
+        "merge_authority {kind: human_override, decision_id: D-<n>}; never write that row.\n"
+        "Open exactly one PR; the first line of its description is PASS or FAIL. Do not merge it; review happens at "
+        "wave close.\n"
+        "Edit nothing under .migration/ except your own evidence under .migration/recon/<unit_id>/; report every path "
+        "the PR changes in changed_paths (`git diff --name-only <base>...<head>`); any other .migration/ path turns "
+        "PASS into FAIL ledger_tampered.\n"
+        "Report: skill_feedback one line per rule you had to derive; recon_cost = result.json['cost'] of the final "
+        "merge-evidence run; one_line_summary for a human skimming 20 of these: what landed, or why not."
     )
 
 
 def capability_block(units):
     caps, src = MANIFEST["capabilities"], MANIFEST.get("source") or {}
-    unit_flags = " ".join(f"--unit {u}" for u in units)
-    source_flags = " ".join([f"--source-family {src['family']} --source-secret {src['secret']}"]
-                            + [f"--param {shlex.quote(f'{k}={v}')}" for k, v in src.get("params", {}).items()]) if src else ""
+    flags = " ".join(f"--unit {u}" for u in units)
+    if src:
+        flags += " " + " ".join([f"--source-family {src['family']} --source-secret {src['secret']}"]
+                                + [f"--param {shlex.quote(f'{k}={v}')}" for k, v in src.get("params", {}).items()])
     return (
-        "CAPABILITY CONTRACT (from the orchestrator's factory-doctor run): "
-        f"{json.dumps(caps, sort_keys=True)}\n"
-        f"Before converting anything run the factory-doctor skill with --role child "
-        f"--expect-identity {caps['identity']} {unit_flags} (exactly this batch; the doctor resolves "
-        "and verifies every unit's .migration/units/<unit_id>/mapping_spec.json itself), "
-        f"--expect-host {shlex.quote(caps['host'])} (the workspace the contract pins; the same principal "
-        "resolved against another workspace is a fail), "
-        f"--reuse-record .migration/waves/wave-{TAG}.doctor.json when that file is in the checkout "
-        "(the orchestrator's signed record; the doctor reuses its source-side rows only if the record "
-        f"is fresher than doctor_max_age minutes — {MANIFEST.get('doctor_max_age', 15)} here — bound to "
-        "this manifest and signed for this identity, otherwise it runs in full), "
-        + (f"{source_flags} (the source the doctor checks for write access; the same secret your recon "
-           "gate passes as --source-dsn-secret)" if source_flags else
-           "--source-secret naming the secret your recon gate passes as --source-dsn-secret, and the "
-           "same --param values the gate will get")
-        + "; then complete its hook probe. Any 'fail' row "
-        "(identity mismatch, harness missing, hooks not applied, allowlist differs from the "
-        "contract, a unit's mapping missing, declared delete evidence not readable on the source) "
-        "means status=BLOCKED with the check id in one_line_summary. Never continue as a different "
-        "identity, never run `databricks auth login`, never edit .migration/allowed_targets.json.\n\n"
+        f"Capability contract: {json.dumps(caps, sort_keys=True)}\nBefore converting anything run "
+        f"`factory-doctor --role child --reuse-record .migration/waves/wave-{TAG}.doctor.json "
+        f"--expect-identity {shlex.quote(caps['identity'])} --expect-host {shlex.quote(caps['host'])} {flags}` "
+        f"(the signed record's source rows are reused while fresher than doctor_max_age {MANIFEST.get('doctor_max_age', 15)} "
+        "minutes and bound to this manifest and identity; otherwise the doctor runs in full). Any fail row means "
+        "status=BLOCKED naming the check id; a warn row is reported in your summary and you continue. Never "
+        "switch identity, run `databricks auth login`, or edit .migration/allowed_targets.json.\n"
     )
 
 
 def verify_prompt(passed):
     by_id = {b["id"]: b for b in BATCHES}
     depths = {p["batch"]: batch_verify_depth(by_id[p["batch"]]) for p in passed}
-    merge_line = ("Do not merge anything; return per-unit verdicts. The workflow's wave-close step merges "
-                  "the PRs you mark PASS (or the brief lists them for the merge owner in hard mode).")
+    merge_line = ("Do not merge anything; return unit_verdicts as PASS or FAIL keyed by batch id (a unit id key is "
+                  "normalised to its batch id, so one verdict per batch, whatever the batch size). The workflow's "
+                  "wave-close step merges the PRs you mark PASS (or the brief lists them for the merge owner in hard mode).")
     return (
         f"You are the independent verifier for wave {WAVE}. Repo: {REPO}. You did not write "
         f"any of this code.\nRun the playbook {MANIFEST['verify_macro']} exactly as written over "
@@ -2035,7 +2075,9 @@ def close_prompt(to_merge, deadline_minutes):
         "is not exactly the verified pr_head, and never push to the PR branch. After each merge run "
         "`gh pr view <url> --json state,mergeCommit,headRefOid`: put {pr_url, merge_commit_sha: "
         "mergeCommit.oid, merged_head: headRefOid} in merged_prs only when state is MERGED — anything else "
-        "goes to unmerged. Do it within "
+        "goes to unmerged. First run one Devin Review round over these PRs and report each open finding as one line "
+        "in review_findings; a finding is not a merge blocker unless a human says so in .migration/06_decisions.md. "
+        "Do it within "
         f"{deadline_minutes} minutes; when time is up, stop and list the rest as unmerged. Write nothing: "
         "no commits, no files, no other PR; report `git diff --name-only` of anything you changed in "
         "changed_paths (it must be empty). The orchestrator commits the wave's ledger artifacts in one "
@@ -2150,15 +2192,6 @@ async def _run_batch(batch, sem, breaker):
                     f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
                     ".migration/06_decisions.md; " + out["one_line_summary"])
         if out["status"] == "PASS":
-            waiver, reason = review_outcome(out, batch["units"], decision_ledger(), out["pr_head"], MANIFEST["stop_c"])
-            if reason:
-                out["status"] = "FAIL"
-                out["failure_class"] = "review_open"
-                out.pop("review_waiver", None)
-                out["one_line_summary"] = f"PASS downgraded: {reason}; " + out["one_line_summary"]
-            elif waiver:
-                out["review_waiver"] = waiver
-        if out["status"] == "PASS":
             out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger(), out["pr_head"])
             if unmet:
                 out["status"] = "FAIL"
@@ -2226,67 +2259,55 @@ def merge_overrides(results):
             if r["status"] == "PASS" and (r.get("merge_authority") or {}).get("kind") == "human_override"]
 
 
-def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close=None, to_merge=None):
-    """Ten lines a lead reads in one minute. The orchestrator posts this at wave close."""
-    n = len(BATCHES)
-    passed = sum(1 for r in results if r["status"] == "PASS")
-    failed = [b["id"] for b, r in zip(BATCHES, results) if r["status"] == "FAIL"]
-    blocked = [b["id"] for b, r in zip(BATCHES, results) if r["status"] == "BLOCKED"]
-    held = [b["id"] for b, r in zip(BATCHES, results) if r["status"] == "NOT_LAUNCHED"]
-    feedback = sorted({s for r in results for s in r.get("skill_feedback", [])})
-    lines = [
-        f"# Wave {WAVE} close",
-        "",
-        f"Landed: {passed} of {n} batches passed their own recon.",
-        f"Independent verify: {verify['wave_verdict'] if verify else 'NOT RUN'}.",
-        f"Failed: {', '.join(failed) or 'none'}.",
-        f"Blocked on missing inputs: {', '.join(blocked) or 'none'}.",
-        f"Held back by circuit breaker: {', '.join(held) or 'none'}.",
-    ]
+def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close=None, to_merge=None, resync=None):
+    """Verdicts, the cost line, surprises, the resync report, and the PRs still to merge: what a lead reads in a
+    minute at wave close."""
+    by_status = {st: [b["id"] for b, r in zip(BATCHES, results) if r["status"] == st]
+                 for st in ("PASS", "FAIL", "BLOCKED", "NOT_LAUNCHED")}
+    lines = [f"# Wave {WAVE} close", "",
+             f"Landed: {len(by_status['PASS'])} of {len(BATCHES)} batches passed their own recon.",
+             f"Independent verify: {verify['wave_verdict'] if verify else 'NOT RUN'}.",
+             f"Failed: {', '.join(by_status['FAIL']) or 'none'}. Blocked: {', '.join(by_status['BLOCKED']) or 'none'}. "
+             f"Held by circuit breaker: {', '.join(by_status['NOT_LAUNCHED']) or 'none'}.",
+             cost_line(results, verify)]
     if surprises:
-        lines.append(f"Merges held: two children reported the same write target "
-                     f"({', '.join(surprises)}). A human decides which PR lands.")
+        lines.append(f"Merges held: two children reported the same write target ({', '.join(surprises)}).")
     if undeclared:
         lines.append("Merges held: children wrote outside their declared targets: "
-                     + "; ".join(f"{k}: {', '.join(v)}" for k, v in sorted(undeclared.items()))
-                     + ". A human decides which PR lands.")
+                     + "; ".join(f"{k}: {', '.join(v)}" for k, v in sorted(undeclared.items())) + ".")
     if unreported:
-        lines.append(f"Merges held: {', '.join(unreported)} passed but reported no write targets; "
-                     "a human confirms what they wrote before any PR lands.")
+        lines.append(f"Merges held: {', '.join(unreported)} passed but reported no write targets.")
     waived = waived_gates(results)
     if waived:
         lines.append("Gates waived by ledger decision: "
                      + "; ".join(f"{w['batch']}/{w['gate']} by {w['decision_id']}" for w in waived) + ".")
     overrides = merge_overrides(results)
     if overrides:
-        lines.append("Human override authority (merge_eligible=false; merged only if listed above): "
+        lines.append("Human override authority (merge_eligible=false): "
                      + "; ".join(f"{o['batch']} ({', '.join(o['units'])}) by {o['decision_id']}" for o in overrides) + ".")
+    if resync:
+        report = resync.get("report") or {}
+        lines += ["", f"Identity resync (`{resync['command']}` over {', '.join(resync['units'])}): "
+                  f"{report.get('status', 'no report')}. {report.get('one_line_summary', '')}".rstrip()]
+        lines += [f"- {r['object']}: {r['before']} -> {r['after']}" for r in report.get("sequences") or []]
+        lines += [f"- problem: {p}" for p in resync.get("problems", [])]
     if close is not None:
-        merged_n = len(close.get("merged_prs", [])) if isinstance(close, dict) else 0
-        lines.append(f"Wave close: {merged_n} of {len(to_merge or [])} verified PRs merged within "
-                     f"{CLOSE_MINUTES} min.")
-        unmerged = close.get("unmerged", []) if isinstance(close, dict) else []
-        if unmerged:
-            lines.append("Not merged: " + "; ".join(f"{u['pr_url']} ({u['reason']})" for u in unmerged) + ".")
+        lines += ["", f"Wave close: {len(close.get('merged_prs', []))} of {len(to_merge or [])} verified PRs merged "
+                  f"within {CLOSE_MINUTES} min."]
+        lines += [f"Not merged: {u['pr_url']} ({u['reason']})" for u in close.get("unmerged", [])]
+        lines += [f"- review: {f}" for f in (close.get("review_findings") or [])]
     if not auto_merge:
-        urls = [r["pr_url"] for r in results
-                if r["status"] == "PASS" and r.get("pr_url")]
+        urls = [r["pr_url"] for r in results if r["status"] == "PASS" and r.get("pr_url")]
         lines.append("Awaiting manual merge: " + (", ".join(urls) or "none reported"))
     elif isinstance(close, dict) and close.get("unmerged"):
         lines.append("Awaiting manual merge: " + ", ".join(u["pr_url"] for u in close["unmerged"]))
-    lines.append(cost_line(results, verify))
-    lines += [
-        "",
-        "Verifier findings:" if verify and verify["findings"] else "Verifier findings: none.",
-    ]
-    lines += [f"- {f}" for f in (verify or {}).get("findings", [])]
-    lines += ["", "Skill feedback to fold in before the next wave:" if feedback
-              else "Skill feedback: none."]
+    findings = (verify or {}).get("findings") or []
+    lines += ["", "Verifier findings:" if findings else "Verifier findings: none."] + [f"- {f}" for f in findings]
+    feedback = sorted({s for r in results for s in r.get("skill_feedback", []) if isinstance(s, str)})
+    lines += ["", "Skill feedback to fold in before the next wave:" if feedback else "Skill feedback: none."]
     lines += [f"- {s}" for s in feedback]
-    lines += ["", "Per batch:"]
-    lines += [f"- {b['id']}: {r['status']}. {r['one_line_summary']}"
-              + (f" {r['pr_url']}" if r.get("pr_url") else "")
-              for b, r in zip(BATCHES, results)]
+    lines += ["", "Per batch:"] + [f"- {b['id']}: {r['status']}. {r['one_line_summary']}"
+                                   + (f" {r['pr_url']}" if r.get("pr_url") else "") for b, r in zip(BATCHES, results)]
     brief_tmp = BRIEF_PATH.with_suffix(".brief.md.tmp")
     brief_tmp.write_text("\n".join(lines) + "\n")
     brief_tmp.replace(BRIEF_PATH)
@@ -2335,10 +2356,21 @@ async def main():
         log(f"HALT: PASS children did not report write targets: {unreported}. "
             "Auto-merge is off for this wave; a human decides at wave close.")
 
+    resync = None
+    if RESYNC:
+        log(f"resync: {RESYNC['command']} over {RESYNC['units']}")
+        try:
+            report = await agent(resync_prompt(RESYNC), phase="resync", schema=RESYNC_SCHEMA,
+                                 label=f"resync-wave-{TAG}", repos=[REPO], soft_time_limit_minutes=30)
+            problems = validate_resync(report)
+        except WorkflowAgentError as e:
+            report, problems = None, [f"resync session died: {e}"]
+        resync = {"command": RESYNC["command"], "units": RESYNC["units"], "report": report, "problems": problems}
+        for problem in problems:
+            log(f"WARNING: {problem}")
+
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
-               "review_clean": r.get("review_clean"), "review_head": r.get("review_head"),
-               "review_waiver": r.get("review_waiver"),
                "gates": r.get("gates", [])}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
     verify = None
@@ -2364,6 +2396,7 @@ async def main():
         verify["findings"].extend(verify_problems)
     to_merge = []
     if not verify_problems and isinstance(verify, dict) and isinstance(verify.get("unit_verdicts"), dict):
+        verify["unit_verdicts"] = batch_verdicts(verify["unit_verdicts"], passed)
         to_merge = [{"batch": p["batch"], "units": p["units"], "pr_url": p["pr_url"], "pr_head": p.get("pr_head")}
                     for p in passed if verify["unit_verdicts"].get(p["batch"]) == "PASS" and p.get("pr_url")]
     close = None
@@ -2408,7 +2441,9 @@ async def main():
                                "reason": (proof.get(p["pr_url"]) or reasons.get(p["pr_url"])
                                           or "wave-close output invalid")}
                               for p in to_merge if p["pr_url"] not in proven],
-                 "changed_paths": changed if isinstance(changed, list) else []}
+                 "changed_paths": changed if isinstance(changed, list) else [],
+                 "review_findings": [f for f in (raw.get("review_findings") if isinstance(raw, dict) else None) or []
+                                     if isinstance(f, str)]}
         merges_tmp = MERGES_PATH.with_suffix(".merges.json.tmp")
         merges_tmp.write_text(json.dumps(proven, indent=2, sort_keys=True) + "\n")
         merges_tmp.replace(MERGES_PATH)
@@ -2438,10 +2473,10 @@ async def main():
         "merge_overrides": merge_overrides(results),
         "waived_gates": waived_gates(results),
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
-        "verify": verify, "close": close, "close_minutes": CLOSE_MINUTES,
+        "verify": verify, "resync": resync, "close": close, "close_minutes": CLOSE_MINUTES,
     }, indent=2, sort_keys=True) + "\n")
     result_tmp.replace(RESULT_PATH)
-    write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close, to_merge)
+    write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close, to_merge, resync)
     log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 

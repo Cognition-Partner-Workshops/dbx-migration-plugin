@@ -31,7 +31,8 @@ def _functions():
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
                                       "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
                                       "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices", "check_wave_tag",
-                                      "check_pipelines_published", "_is_manifest", "validate_close", "check_pipeline_updates"})
+                                      "check_pipelines_published", "_is_manifest", "validate_close", "check_pipeline_updates",
+                                      "batch_verdicts"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
@@ -50,7 +51,7 @@ def _batch_runtime():
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name in {"run_batch", "_run_batch"})
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
-                                                                         "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes", "review_outcome"})
+                                                                         "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
                                                          "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS"}
@@ -1281,8 +1282,7 @@ def _gate_batch(*gates):
 
 def _gate_report(**extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
-            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"],
-            "review_clean": True, "review_head": "c" * 40, "one_line_summary": "ok", **extra}
+            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"], "one_line_summary": "ok", **extra}
 
 
 def _run_gates(batch, report, ledger=GATES_LEDGER):
@@ -1548,9 +1548,9 @@ def test_child_prompt_names_exactly_its_batch_units_for_the_doctor():
         {"id": "c", "units": ["fees"], "write_targets": ["t2"], "brief": "brief"},
     ]))
     text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
-    assert "--role child --expect-identity sp-1 --unit loans --unit payments (exactly this batch" in text
+    assert f"--expect-identity sp-1 --expect-host {HOST} --unit loans --unit payments" in text
     assert "--unit fees" not in text and "--mapping" not in text
-    assert "mapping_spec.json itself" in text
+    assert ".migration/units/<unit_id>/mapping_spec.json" in text
 
 
 def test_child_brief_pins_the_contracts_workspace_host_for_the_doctor():
@@ -1585,14 +1585,14 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
 def _prompt_ns(manifest):
     tree = ast.parse(WORKFLOW.read_text())
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
-             "sum_cost", "cost_line", "close_prompt"}
+             "sum_cost", "cost_line", "close_prompt", "rerun_after_resync"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES"}
+                    isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES", "RESYNC_CLASS"}
                     for t in node.targets))]
-    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "TAG": "0",
-          "REPO": "repo", "MANIFEST": manifest,
+    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "re": re, "WAVE": 1, "TAG": "0",
+          "REPO": "repo", "MANIFEST": manifest, "REPLAYED": {}, "PRIOR_RESYNC": None,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
           "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
@@ -1669,7 +1669,7 @@ def test_replayed_failures_do_not_refill_breaker():
                     "failure_class": "same", "one_line_summary": "replayed"}
         return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
                 "pr_url": "https://example/pr/held", "branch": "feature/held",
-                "changed_paths": ["src/held.sql"], "review_clean": True, "review_head": "c" * 40,
+                "changed_paths": ["src/held.sql"],
                 "one_line_summary": "held passed"}
 
     namespace["agent"] = agent
@@ -1824,7 +1824,6 @@ def _run_one(namespace, report):
 def test_pass_with_merge_evidence_mode_is_kept(mode):
     out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode, "merge_eligible": True,
                                       "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"],
-                                      "review_clean": True, "review_head": "c" * 40,
                                       "one_line_summary": "ok"})
     assert out["status"] == "PASS" and "failure_class" not in out
     assert out["merge_authority"] == {"kind": "harness", "decision_id": None}
@@ -1852,7 +1851,7 @@ def _ns_with_ledger(text=LEDGER):
 
 
 _pass_nomerge = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "pr_url": "https://example/pr/1",
-                 "branch": "f", "changed_paths": ["src/a.sql"], "review_clean": True, "review_head": "c" * 40,
+                 "branch": "f", "changed_paths": ["src/a.sql"],
                  "one_line_summary": "ok"}
 
 
@@ -1978,8 +1977,7 @@ def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child
         return asyncio.run(ns["run_batch"](batch, asyncio.Semaphore(1), ns["Breaker"](3)))
 
     base = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
-            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": [], "review_clean": True,
-            "review_head": "c" * 40, "one_line_summary": "ok"}
+            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": [], "one_line_summary": "ok"}
     out = run(base)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "merge_authority" not in out
     assert "recon/u2/result.json" in out["one_line_summary"] and "merge_eligible=False" in out["one_line_summary"]
@@ -2064,7 +2062,7 @@ LEDGER_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targe
 
 def _pass(**extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
-            "pr_url": "https://example/pr/1", "branch": "f", "review_clean": True, "review_head": "c" * 40,
+            "pr_url": "https://example/pr/1", "branch": "f",
             "one_line_summary": "ok", **extra}
 
 
@@ -2632,7 +2630,7 @@ def test_param_values_follow_the_recon_contract_so_a_timestamp_is_accepted():
     source = {"family": "sqlserver", "secret": "X", "params": {"as_of": "2026-09-08 18:43:52", "db": "loans"}}
     ns["validate_manifest"](_manifest(source=source))
     text = _prompt_ns(_manifest(source=source))["child_prompt"](_manifest()["batches"][0])
-    flags = text[text.index("--source-family"):].split(" (the source")[0]
+    flags = text[text.index("--source-family"):].split("`")[0]
     assert shlex.split(flags) == ["--source-family", "sqlserver", "--source-secret", "X",
                                   "--param", "as_of=2026-09-08 18:43:52", "--param", "db=loans"]
 
@@ -2644,63 +2642,193 @@ def test_child_prompt_passes_the_source_family_and_secret_to_the_doctor():
     assert "--source-family" not in _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])
 
 
-# ---------------------------------------------------------------- WS2.3 review gate + WS2.4 wave close
+# ---------------------------------------------------------------- G3: child contract without a per-child review, wave close
 
 
-def test_child_schema_requires_review_clean_and_the_prompt_names_the_waiver():
+def _child_schema():
+    tree = ast.parse(WORKFLOW.read_text())
+    return next(ast.literal_eval(n.value) for n in tree.body
+                if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
+
+
+def test_child_schema_has_no_review_fields_and_one_line_feedback_and_cost():
+    schema = _child_schema()
+    assert not {"review_clean", "review_head", "review_waiver"} & set(schema["properties"])
+    assert not {"review_clean", "review_head", "review_waiver"} & set(schema["required"])
+    assert schema["properties"]["skill_feedback"] == {"type": "array", "items": {"type": "string"},
+                                                       "description": "one line per rule you had to derive yourself"}
+    assert schema["properties"]["recon_cost"]["type"] == "object"
+    assert set(schema["required"]) == {"status", "recon_verdict", "recon_mode", "merge_eligible", "write_targets",
+                                       "changed_paths", "one_line_summary"}
+    child = _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])
+    assert "review_clean" not in child and "review_waived" not in child and "review_head" not in child
+
+
+def test_a_pass_no_longer_needs_a_review_round():
+    report = _pass(changed_paths=["src/a.sql"])
+    for k in ("review_clean", "review_head"):
+        report.pop(k, None)
+    out = _run_one(_batch_runtime(), report)
+    assert out["status"] == "PASS" and "failure_class" not in out and "review_waiver" not in out
+
+
+def test_child_prompt_is_s2_shaped_and_under_900_words():
+    brief = " ".join(f"word{i}" for i in range(300))
+    m = _manifest(batches=[{"id": "b", "units": ["loans", "payments"], "write_targets": ["mig.loans", "mig.pay"],
+                            "brief": brief, "gates": [GATE]}])
+    text = _prompt_ns(m)["child_prompt"](m["batches"][0])
+    assert len(text.split()) < 900, len(text.split())
+    order = [text.index(s) for s in (
+        '"loans"', "mig.loans",                                            # units and write targets
+        "mapping_spec.json",                                               # converted files and mapping specs
+        f"factory-doctor --role child --reuse-record .migration/waves/wave-0.doctor.json "
+        f"--expect-identity sp-1 --expect-host {HOST}",                    # exact doctor shape
+        "BLOCKED", "warn",                                                 # fail row blocks, warn continues
+        "3 full runs", "tolerance",                                        # harness cap, never loosen
+        "merge authority",                                                 # harness decides
+        "exactly one PR", "first line",                                    # one PR, PASS/FAIL line 1
+        "Do not merge",                                                    # no merge
+        ".migration/recon/<unit_id>/",                                     # ledger rule
+        "one_line_summary",                                                # structured output
+    )]
+    assert order == sorted(order), order
+    assert "hook probe" not in text.lower() and "Devin Review" not in text
+
+
+def test_close_prompt_and_schema_carry_the_wave_close_review_round():
+    ns = _prompt_ns(_manifest())
+    prompt = ns["close_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1", "pr_head": "c" * 40}], 10)
+    assert "one Devin Review round" in prompt and "review_findings" in prompt and "not a merge blocker" in prompt
     tree = ast.parse(WORKFLOW.read_text())
     schema = next(ast.literal_eval(n.value) for n in tree.body
-                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
-    assert "review_clean" in schema["required"] and schema["properties"]["review_clean"]["type"] == "boolean"
-    assert "review_waiver" in schema["properties"]
-    assert schema["properties"]["review_head"]["type"] == "string" and "review_head" not in schema["required"]
-    child = _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])
-    assert "review_clean" in child and "review_waived" in child and "review_head" in child
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CLOSE_SCHEMA" for t in n.targets))
+    assert schema["properties"]["review_findings"] == {"type": "array", "items": {"type": "string"}}
+    assert "review_findings" not in schema["required"]
 
 
-def test_a_pass_needs_review_clean_at_the_gated_pr_head_or_a_review_waived_ledger_row():
-    out = _run_one(_batch_runtime(), _pass(changed_paths=["src/a.sql"], review_clean=False))
-    assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
-    assert out["one_line_summary"].startswith("PASS downgraded: Devin Review") and "review_waived" in out["one_line_summary"]
-    assert "review_waiver" not in out
+# ---------------------------------------------------------------- G3: verifier verdicts keyed by batch or unit
 
-    for bad in ({"review_head": "d" * 40}, {"review_head": None}):
-        out = _run_one(_batch_runtime(), _pass(changed_paths=["src/a.sql"], **bad))
-        assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
-        assert "review_head" in out["one_line_summary"] and "is not the gated PR head" in out["one_line_summary"]
-    no_head = _pass(changed_paths=["src/a.sql"])
-    del no_head["review_head"]
-    out = _run_one(_batch_runtime(), no_head)
-    assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
 
-    stop_c = "| D-2 | 2024-05-03 | user:U0 | STOP C wave-0 gates_sha x | plan approved |\n"
-    waiver = f"| D-9 | 2024-05-04 | user:U1 | review_waived for u at {'c' * 40}, the finding is a false positive |\n"
-    ledger = LEDGER + stop_c + waiver
-    out = _run_one(_ns_with_ledger(ledger), _pass(changed_paths=["src/a.sql"], review_head="d" * 40,
-                                                 review_waiver={"decision_id": "D-9"}))
-    assert out["status"] == "PASS" and out["review_waiver"] == {"decision_id": "D-9"}
+def _verify(verdicts, passed):
+    return _functions()["validate_verify"]({"wave_verdict": "PASS", "unit_verdicts": verdicts, "findings": [],
+                                            "changed_paths": []}, passed)
 
-    for stale in (LEDGER + waiver + stop_c,                                 # written for an earlier run
-                  LEDGER + stop_c + waiver.replace("c" * 40, "d" * 40),     # written for another PR head
-                  LEDGER + stop_c + waiver.replace(" at " + "c" * 40, ""),  # names no head
-                  LEDGER + waiver):                                        # no STOP C row at all
-        out = _run_one(_ns_with_ledger(stale), _pass(changed_paths=["src/a.sql"], review_clean=False,
-                                                    review_waiver={"decision_id": "D-9"}))
-        assert out["status"] == "FAIL" and out["failure_class"] == "review_open" and "review_waiver" not in out, stale
-        assert "c" * 40 in out["one_line_summary"] and "D-2" in out["one_line_summary"], stale
 
-    missing = _pass(changed_paths=["src/a.sql"])
-    missing.pop("review_clean")
-    out = _run_one(_batch_runtime(), missing)
-    assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
+def test_validate_verify_normalises_unit_keys_to_batch_ids_for_any_batch_size():
+    passed = [{"batch": "w2-b03", "units": ["orders", "lines"], "pr_url": "https://example/pr/3"},
+              {"batch": "w2-b04", "units": ["fees"], "pr_url": "https://example/pr/4"}]
+    assert _verify({"orders": "PASS", "lines": "PASS", "fees": "PASS"}, passed) == []
+    assert _verify({"w2-b03": "PASS", "fees": "PASS"}, passed) == []
+    assert _verify({"orders": "PASS", "w2-b04": "PASS"}, passed) == []
+    assert _verify({"w2-b03": "PASS", "orders": "PASS", "lines": "PASS", "fees": "PASS"}, passed) == []
+    missing = _verify({"orders": "PASS"}, passed)
+    assert missing == ["verifier output invalid: missing verdicts for w2-b04"]
+    extra = _verify({"orders": "PASS", "fees": "PASS", "ledger": "PASS"}, passed)
+    assert extra == ["verifier output invalid: unexpected verdicts for ledger"]
 
-    out = _run_one(_ns_with_ledger(ledger), _pass(changed_paths=["src/a.sql"], review_clean=False,
-                                                 review_waiver={"decision_id": "D-9"}))
-    assert out["status"] == "PASS" and out["review_waiver"] == {"decision_id": "D-9"}
 
-    out = _run_one(_ns_with_ledger(), _pass(changed_paths=["src/a.sql"], review_clean=False,
-                                            review_waiver={"decision_id": "D-7"}))
-    assert out["failure_class"] == "review_open"   # a merge_override row is not a review waiver
+def test_validate_verify_fails_only_a_real_collision_after_normalisation():
+    passed = [{"batch": "w2-b03", "units": ["orders", "lines"], "pr_url": "https://example/pr/3"}]
+    problems = _verify({"orders": "PASS", "lines": "FAIL"}, passed)
+    assert any("conflicting verdicts for w2-b03" in p and "orders=PASS" in p and "lines=FAIL" in p for p in problems)
+    assert not any("unexpected verdicts" in p for p in problems)
+    problems = _verify({"w2-b03": "FAIL", "orders": "PASS"}, passed)
+    assert any("conflicting verdicts for w2-b03" in p for p in problems)
+    # a unit id that is also a batch id is read as the batch
+    passed = [{"batch": "orders", "units": ["orders"], "pr_url": "https://example/pr/3"}]
+    assert _verify({"orders": "PASS"}, passed) == []
+
+
+def test_batch_verdicts_is_what_main_reads_for_merges():
+    batch_verdicts = _functions()["batch_verdicts"]
+    passed = [{"batch": "w2-b03", "units": ["orders", "lines"]}, {"batch": "w2-b04", "units": ["fees"]}]
+    assert batch_verdicts({"orders": "PASS", "lines": "PASS", "w2-b04": "FAIL"}, passed) == {"w2-b03": "PASS", "w2-b04": "FAIL"}
+    assert batch_verdicts({"orders": "PASS", "lines": "FAIL"}, passed) == {"w2-b03": None}
+    assert batch_verdicts("nope", passed) == {}
+
+
+def test_verifier_prompt_and_schema_say_verdicts_are_normalised_to_batch_ids():
+    ns = _prompt_ns(_manifest())
+    text = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1"}])
+    assert "unit_verdicts" in text and "batch id" in text and "unit id" in text and "normalis" in text
+    tree = ast.parse(WORKFLOW.read_text())
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "VERIFY_SCHEMA" for t in n.targets))
+    desc = schema["properties"]["unit_verdicts"]["description"]
+    assert "batch id" in desc and "unit id" in desc and "PASS" in desc
+
+
+# ---------------------------------------------------------------- G3: identity resync step and selective replay
+
+
+def test_validate_manifest_accepts_and_checks_the_optional_resync_block():
+    validate_manifest = _functions()["validate_manifest"]
+    validate_manifest(_manifest(resync={"command": "python3 load/resync_identity.py --unit u", "units": ["u"]}))
+    for bad, why in (("run it", "resync"), ({"command": "x"}, "resync"), ({"units": ["u"]}, "resync"),
+                     ({"command": "", "units": ["u"]}, "command"), ({"command": "x", "units": []}, "units"),
+                     ({"command": "x", "units": ["ghost"]}, "ghost"), ({"command": "x", "units": "u"}, "units"),
+                     ({"command": "x", "units": ["u"], "sql": "setval"}, "resync")):
+        with pytest.raises(SystemExit, match=why):
+            validate_manifest(_manifest(resync=bad))
+
+
+def _resync_ns():
+    tree = ast.parse(WORKFLOW.read_text())
+    names = {"resync_prompt", "validate_resync", "rerun_after_resync"}
+    selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
+                or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"RESYNC_CLASS", "RESYNC_SCHEMA"}
+                                                       for t in n.targets))]
+    ns = {"json": json, "re": re, "WAVE": 1, "REPO": "repo", "BASE_BRANCH": "migration/x",
+          "MANIFEST": _manifest(resync={"command": "python3 load/resync_identity.py --unit u", "units": ["u"]})}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
+    return ns
+
+
+def test_resync_prompt_runs_exactly_the_command_and_commits_nothing():
+    ns = _resync_ns()
+    text = ns["resync_prompt"](ns["MANIFEST"]["resync"])
+    assert "python3 load/resync_identity.py --unit u" in text and "migration/x" in text and "repo root" in text
+    assert "setval" in text and "identity" in text and '"u"' in text
+    assert "by name" in text and "commit nothing" in text.lower() and "allowlist" in text
+    assert "before" in text and "after" in text and "sequences" in text
+    schema = ns["RESYNC_SCHEMA"]
+    assert schema["properties"]["sequences"]["items"]["required"] == ["object", "before", "after"]
+    assert set(schema["required"]) == {"status", "sequences", "changed_paths", "one_line_summary"}
+
+
+def test_validate_resync_rejects_writes_and_objects_outside_the_listed_units():
+    validate_resync = _resync_ns()["validate_resync"]
+    ok = {"status": "ok", "sequences": [{"object": "mig.u.orders_id_seq", "before": 10, "after": 42}],
+          "changed_paths": [], "one_line_summary": "reseeded"}
+    assert validate_resync(ok) == []
+    assert "expected an object" in validate_resync([])[0]
+    assert any("changed src/x.sql" in p for p in validate_resync({**ok, "changed_paths": ["src/x.sql"]}))
+    assert any("sequences" in p for p in validate_resync({**ok, "sequences": [{"object": "s"}]}))
+    assert any("status" in p for p in validate_resync({**ok, "status": "done"}))
+
+
+def test_child_prompt_carries_the_resync_report_only_to_the_children_it_reruns():
+    ns = _prompt_ns(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"},
+                                       {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "brief"}]))
+    plain = {b["id"]: ns["child_prompt"](b) for b in ns["MANIFEST"]["batches"]}
+    ns["REPLAYED"] = {"b": {"id": "b", "status": "FAIL", "failure_class": "sequence_behind_source"},
+                      "c": {"id": "c", "status": "PASS"}}
+    ns["PRIOR_RESYNC"] = {"status": "ok", "sequences": [{"object": "mig.u.s", "before": 1, "after": 9}]}
+    b, c = (ns["child_prompt"](x) for x in ns["MANIFEST"]["batches"])
+    assert b != plain["b"] and "resync" in b and "mig.u.s" in b
+    assert c == plain["c"]
+
+
+def test_rerun_after_resync_reruns_only_identity_failures_and_unreported_children():
+    rerun = _resync_ns()["rerun_after_resync"]
+    seq = {"status": "FAIL", "failure_class": "sequence_behind_source"}
+    ident = {"status": "FAIL", "failure_class": "identity_drift"}
+    other = {"status": "FAIL", "failure_class": "decimal_rounding"}
+    passed = {"status": "PASS"}
+    assert rerun(seq, True) and rerun(ident, True) and rerun(None, True)
+    assert rerun({"status": "NOT_LAUNCHED"}, True)
+    assert not rerun(other, True) and not rerun(passed, True) and not rerun({"status": "BLOCKED"}, True)
+    assert not rerun(seq, False) and not rerun(None, False)
 
 
 @pytest.mark.parametrize("value", [0, True, "10", 61])

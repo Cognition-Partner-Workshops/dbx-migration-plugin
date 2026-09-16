@@ -31,7 +31,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
                deploy_objects=None, max_minutes=None, batch_max_minutes=None, manifest_name="wave-0.json", wave=0,
                pipelines=None, auto_merge=None, close_minutes=None, other_batch=None,
-               lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1):
+               lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1,
+               manifest_extra=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -86,6 +87,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         manifest["close_minutes"] = close_minutes
     if other_batch is not None:
         manifest["batches"].append(other_batch)
+    manifest.update(manifest_extra or {})
     if namespace is not None:
         manifest["target_namespace"] = namespace
     if pipelines is not None:
@@ -203,7 +205,7 @@ def _pass_report(pr_url="", **extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": pr_url, "branch": "feature/x", "changed_paths": [],
             "gates": [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}],
-            "write_targets": ["mig.t"], "review_clean": True, "review_head": _PR_HEADS.get(pr_url, ""),
+            "write_targets": ["mig.t"],
             "one_line_summary": "ok", **extra}
 
 
@@ -333,52 +335,14 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
     assert proc.returncode != 0 and "{batch, pr_url, gates}" in proc.stderr
     runs = ws / ".migration/waves/wave-0.runs.jsonl"
     assert [json.loads(l)["mode"] for l in runs.read_text().splitlines()] == ["reserve"]  # unmet gates: the run stays open
-    clean = {"review_clean": True, "review_head": _PR_HEADS[pr]}
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed], **clean}])
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
-    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == [] and out["batches"]["b-1"]["review_waiver"] is None
+    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == [] and "review_waiver" not in out["batches"]["b-1"]
     assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
     assert [(json.loads(l)["stop_c"], json.loads(l)["mode"]) for l in runs.read_text().splitlines()] == [("D-2", "reserve"), ("D-2", "gates")]
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed], **clean}])
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
     assert proc.returncode != 0 and "closed" in proc.stderr and "D-2" in proc.stderr and "STOP C" in proc.stderr
-    assert not (ws / ".migration/waves/wave-0.result.json").exists()
-
-
-def test_gates_subcommand_applies_the_review_clean_rule_at_the_pr_head(tmp_path):
-    """A hand-gathered small wave is held to the same review-clean rule as a workflow child: review_clean=true
-    for review_head equal to the PR head git fetches, or a human's review_waived row, below this run's STOP C row,
-    naming that head and the units."""
-    ws, cwd = _workspace(tmp_path, doctor=False)
-    results = tmp_path / "results.json"
-    assert _workflow(cwd, "reserve").returncode == 0
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", "d" * 40)
-    passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
-
-    def run(**report):
-        results.write_text(json.dumps([{"batch": "b-1", "pr_url": pr, "gates": [passed], **report}]))
-        proc = _workflow(cwd, "gates", str(results))
-        assert "Traceback" not in proc.stderr, proc.stderr
-        return proc.returncode, json.loads(proc.stdout)["batches"]["b-1"]
-
-    for dirty in ({}, {"review_clean": False, "review_head": _PR_HEADS[pr]}, {"review_clean": "yes", "review_head": _PR_HEADS[pr]},
-                  {"review_clean": True}, {"review_clean": True, "review_head": "d" * 40},
-                  {"review_clean": False, "review_waiver": {"decision_id": "D-4"}},
-                  {"review_clean": False, "review_waiver": {"decision_id": "D-5"}}):
-        rc, b = run(**dirty)
-        assert rc != 0 and len(b["unmet"]) == 1 and "review_waived" in b["unmet"][0] and b["review_waiver"] is None, dirty
-        assert ("is not the gated PR head" in b["unmet"][0]) == (dirty.get("review_clean") is True), dirty
-        assert _PR_HEADS[pr] in b["unmet"][0] and "D-2" in b["unmet"][0], dirty
-    rc, b = run(review_clean=True, review_head=_PR_HEADS[pr])
-    assert rc == 0 and b["unmet"] == [] and b["review_waiver"] is None
-
-    ws, cwd = _workspace(tmp_path / "waived", doctor=False)
-    assert _workflow(cwd, "reserve").returncode == 0
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", _PR_HEADS[pr])
-    rc, b = run(review_clean=False, review_waiver={"decision_id": "D-5"})
-    assert rc == 0 and b["unmet"] == [] and b["review_waiver"] == {"decision_id": "D-5"}
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
 
@@ -1174,92 +1138,99 @@ def _close_report(**extra):
     return {"merged_prs": [], "unmerged": [], "changed_paths": [], **extra}
 
 
-def test_a_pass_needs_review_clean_or_a_review_waived_ledger_row(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False)])
+RESYNC = {"command": "python3 load/resync_identity.py --unit u --unit v", "units": ["u", "v"]}
+SEQ = {"object": "mig.u.orders_id_seq", "before": 10, "after": 42}
+
+
+def _resync_report(**extra):
+    return {"status": "ok", "sequences": [SEQ], "changed_paths": [], "one_line_summary": "reseeded 1 sequence", **extra}
+
+
+def _two_batch_workspace(tmp_path, **kw):
+    return _workspace(tmp_path, recon={"u": True, "v": True}, manifest_extra={"resync": RESYNC},
+                      other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
+                                   "brief": "b", "gates": [GATE], "lakeflow_pipelines": []}, **kw)
+
+
+def _pass2(pr2):
+    return _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
+                                                             "evidence": ".migration/recon/v/result.json"}])
+
+
+def test_a_manifest_resync_runs_once_after_the_children_and_before_the_verifier(tmp_path):
+    ws, cwd = _two_batch_workspace(tmp_path)
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    fail = {**_pass_report(pr), "status": "FAIL", "failure_class": "sequence_behind_source"}
+    proc, calls = _run(cwd, tmp_path, [fail, _pass2(pr2), _resync_report(),
+                                       {"wave_verdict": "PASS", "unit_verdicts": {"v": "PASS"}, "findings": [], "changed_paths": []}])
     assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
-    assert "review_waived" in batch["one_line_summary"] and "review_waiver" not in batch
+    labels = [c.get("label") for c in calls if c["kind"] == "agent"]
+    assert labels == ["b-1", "b-2", "resync-wave-0", "verify-wave-0"]
+    resync = [c for c in calls if c.get("label") == "resync-wave-0"][0]
+    assert resync["kwargs"]["phase"] == "resync" and RESYNC["command"] in resync["prompt"]
+    assert "migration/x" in resync["prompt"] and "setval" in resync["prompt"] and "before" in resync["prompt"]
+    register = [c for c in calls if c["kind"] == "register"][0]
+    assert [p["title"] for p in register["meta"]["phases"]] == ["migrate", "resync", "verify", "close"]
+    result = _result(ws)
+    assert result["resync"]["command"] == RESYNC["command"] and result["resync"]["units"] == ["u", "v"]
+    assert result["resync"]["report"]["sequences"] == [SEQ] and result["resync"]["problems"] == []
+    assert result["verify"]["unit_verdicts"] == {"b-2": "PASS"}
+    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert "Identity resync" in brief and "mig.u.orders_id_seq" in brief and "10" in brief and "42" in brief
+    assert f"Awaiting manual merge: {pr2}" in brief
 
-    ws, cwd = _workspace(tmp_path / "missing")
-    pr = _push_pr(ws)
-    report = _pass_report(pr)
-    del report["review_clean"]
-    proc, _ = _run(cwd, tmp_path / "missing", [report])
+
+def test_a_resync_that_wrote_files_or_died_is_a_recorded_problem_not_a_halt(tmp_path):
+    ws, cwd = _two_batch_workspace(tmp_path)
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _pass2(pr2), _resync_report(changed_paths=["load/x.sql"]),
+                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+                                        "findings": [], "changed_paths": []}])
     assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["batches"][0]["failure_class"] == "review_open"
+    result = _result(ws)
+    assert any("load/x.sql" in p for p in result["resync"]["problems"])
+    assert result["verify"]["wave_verdict"] == "PASS"
+    assert "load/x.sql" in (ws / ".migration/waves/wave-0.brief.md").read_text()
 
-
-def _waive_review(ws, decision_id, head, above_stop_c=False):
-    ledger = ws / ".migration" / "06_decisions.md"
-    row = f"| {decision_id} | user:U1 | review_waived for u at {head}, the finding is a false positive |\n"
-    ledger.write_text(row + ledger.read_text() if above_stop_c else ledger.read_text() + row)
-
-
-def test_a_review_waived_ledger_row_carries_a_dirty_review(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", _PR_HEADS[pr])
-    proc, calls = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False,
-                                                   review_waiver={"decision_id": "D-5"}), _verify_report()])
+    ws, cwd = _two_batch_workspace(tmp_path / "dead")
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    proc, calls = _run(cwd, tmp_path / "dead", [_pass_report(pr), _pass2(pr2), {"error": "boom"},
+                                                {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+                                                 "findings": [], "changed_paths": []}])
     assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "PASS" and batch["review_waiver"] == {"decision_id": "D-5"}
-    verify_prompt = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
-    assert "review_waiver" in verify_prompt
+    result = _result(ws)
+    assert result["resync"]["report"] is None and any("boom" in p for p in result["resync"]["problems"])
 
 
-@pytest.mark.parametrize("stale", ["other_head", "earlier_run"])
-def test_a_review_waiver_binds_the_reviewed_head_and_this_runs_stop_c(tmp_path, stale):
-    """A review_waived row dismisses one wrong finding: it names the PR head it was written for and sits below
-    this run's STOP C row, so a waiver for an earlier PR or an earlier run does not carry a new dirty review."""
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", "d" * 40 if stale == "other_head" else _PR_HEADS[pr], above_stop_c=stale == "earlier_run")
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False, review_waiver={"decision_id": "D-5"})])
+def test_a_resume_after_a_resync_reruns_only_identity_failures_and_unreported_children(tmp_path):
+    """Run 1: b-1 fails on sequence_behind_source, b-2 passes, resync reseeds. Run 2 (resume): b-1 is
+    re-launched with the resync report in its prompt, b-2 replays its recorded PASS, the resync step and
+    the verifier see the new state."""
+    ws, cwd = _two_batch_workspace(tmp_path)
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    fail = {**_pass_report(pr), "status": "FAIL", "failure_class": "sequence_behind_source"}
+    proc, calls = _run(cwd, tmp_path, [fail, _pass2(pr2), _resync_report(),
+                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-2": "PASS"}, "findings": [], "changed_paths": []}])
     assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open" and "review_waiver" not in batch
-    assert _PR_HEADS[pr] in batch["one_line_summary"] and "D-2" in batch["one_line_summary"]
+    first = {c["label"]: c["prompt"] for c in calls if c["kind"] == "agent"}
+    result = _result(ws)
+    assert result["batches"][0]["status"] == "FAIL" and result["batches"][1]["status"] == "PASS"
 
-
-def test_a_merge_override_row_does_not_waive_the_review(tmp_path):
-    ws, cwd = _workspace(tmp_path, decisions="| D-5 | user:U1 | merge_override for u |\n")
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False, review_waiver={"decision_id": "D-5"})])
+    pointer = ws / ".migration/waves/current.json"
+    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
+                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _pass2(pr2), _resync_report(),
+                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+                                        "findings": [], "changed_paths": []}])
     assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["batches"][0]["failure_class"] == "review_open"
-
-
-def test_a_clean_review_must_name_the_pr_head_it_cleared(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_head="0" * 40)])
-    assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
-    assert "0" * 40 in batch["one_line_summary"] and _PR_HEADS[pr] in batch["one_line_summary"]
-
-    ws, cwd = _workspace(tmp_path / "missing")
-    pr = _push_pr(ws)
-    report = _pass_report(pr)
-    del report["review_head"]
-    proc, _ = _run(cwd, tmp_path / "missing", [report])
-    assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
-
-    ws, cwd = _workspace(tmp_path / "waived")
-    pr = _push_pr(ws)
-    _waive_review(ws, "D-5", _PR_HEADS[pr])
-    proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr, review_head="0" * 40,
-                                                               review_waiver={"decision_id": "D-5"}),
-                                                _verify_report()])
-    assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "PASS" and batch["review_waiver"] == {"decision_id": "D-5"}
+    second = {c["label"]: c["prompt"] for c in calls if c["kind"] == "agent"}
+    assert second["b-2"] == first["b-2"], "an unaffected PASS keeps its prompt so the runtime replays it"
+    assert second["b-1"] != first["b-1"] and "resync" in second["b-1"] and "mig.u.orders_id_seq" in second["b-1"]
+    assert second["resync-wave-0"] == first["resync-wave-0"]
+    result = _result(ws)
+    assert [b["status"] for b in result["batches"]] == ["PASS", "PASS"] and result["resync"]["report"]["sequences"] == [SEQ]
+    assert result["batches"][0]["prompt_sha"] != result["batches"][1]["prompt_sha"]
 
 
 def test_the_wave_close_step_merges_the_verifier_pass_prs(tmp_path):
