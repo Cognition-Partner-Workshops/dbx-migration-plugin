@@ -1,15 +1,5 @@
 Playbook: Sequence setup, inventory, analysis, planning, waves, reconciliation, coexistence, and cutover without doing child work.
 
-## Overview
-Run setup, inventory, analysis, and planning in this session, pausing only at the stops; then sequence unit playbooks, launch children, gate on recon, integrate results, and maintain the ledger. The orchestrator owns width and sequencing, not unit conversion.
-
-## Stop mode
-Read `references/contract.md` once per session for stop decisions, merge authority, notifications, and fan-out guards; it is the sole process-rule home.
-
-## What's Needed From User
-- Intake supplies the first pipeline when known, the notification contract, and the cutover-principal holder.
-- Planning supplies confirmed width and batch packets; the orchestrator never widens the pipeline or changes tolerances mid-wave.
-
 ## Contract
 Read `references/contract.md` once per session for stops, `stop_mode`, D1–D10, notifications, branch/merge, and fan-out guards. The orchestrator owns sequencing, gathering, gates, integration, feedback, and the generated ledger; unit playbooks run unmodified.
 
@@ -37,6 +27,3 @@ Read `references/contract.md` once per session for stops, `stop_mode`, D1–D10,
 
 ## Pointers
 `workflow.py` owns execution and result schema. `factory-doctor` owns capability and wave signatures.
-
-## Advice
-Own width, not substance: use the plan's complete batch hand-off, harvest systematic SKILL FEEDBACK between waves, and keep exceptions in the evidence pack for the next session.
