@@ -300,11 +300,19 @@ def test_validate_manifest_rejects_a_pipelines_list_that_does_not_name_distinct_
 
 def test_check_wave_tag_pins_the_file_name_number_to_the_manifest_wave():
     check = _functions()["check_wave_tag"]
-    check("1", 1)
-    check("payments-1", 1)
+    check("1", {"wave": 1})
+    check("payments-1", {"wave": 1, "pipelines": ["payments"]})
     for tag, wave in [("2", 1), ("payments-1", 2), ("payments", 1)]:
         with pytest.raises(SystemExit, match="the wave number in the file name"):
-            check(tag, wave)
+            check(tag, {"wave": wave, "pipelines": ["payments"]})
+
+
+def test_check_wave_tag_requires_a_tagged_manifest_to_list_its_pipelines():
+    check = _functions()["check_wave_tag"]
+    with pytest.raises(SystemExit, match=r"wave-<pipeline>-<N>\.json.*pipelines"):
+        check("orders-1", {"wave": 1})
+    with pytest.raises(SystemExit, match="orders"):
+        check("orders-1", {"wave": 1, "pipelines": ["payments", "ledger"]})
 
 
 @pytest.mark.parametrize("u2", [None, {"objects": []}, {"objects": [{"object": "mig.other", "target_where": "x = 1"}]}])
@@ -2230,7 +2238,7 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
     with pytest.raises(SystemExit, match="mode: rerun"):
         ns["launch_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\[\"wave\"\]\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
+    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
     assert 'BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")' in src and '"base_sha": BASE_SHA' in src
 
 

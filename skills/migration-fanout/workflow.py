@@ -836,12 +836,18 @@ def hand_run_state():
     return state
 
 
-def check_wave_tag(tag, wave):
+def check_wave_tag(tag, manifest):
     """wave-<tag>.json's last '-' segment is the wave number it runs, so a file renamed or mis-numbered
-    cannot run under a wave the name does not declare."""
+    cannot run under a wave the name does not declare; a pipeline tag must be listed in 'pipelines' so
+    the planning barrier reads the manifest."""
+    wave = manifest["wave"]
     last = tag.rsplit("-", 1)[-1]
     if not last.isdigit() or int(last) != wave:
         raise SystemExit(f"wave-{tag}.json: the wave number in the file name must equal the manifest's 'wave' ({wave})")
+    pipeline = tag.rsplit("-", 1)[0]
+    if pipeline != tag and pipeline not in manifest.get("pipelines", []):
+        raise SystemExit(f"wave-{tag}.json: wave-<pipeline>-<N>.json manifests must list every sibling pipeline in "
+                         f"'pipelines' (including {pipeline}): the planning barrier reads it")
 
 
 def _is_manifest(name):
@@ -1353,7 +1359,7 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
 
 if sys.argv[1:2] == ["reserve"]:
     validate_manifest(MANIFEST)
-    check_wave_tag(TAG, MANIFEST["wave"])
+    check_wave_tag(TAG, MANIFEST)
     check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                         other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
@@ -1365,7 +1371,7 @@ if sys.argv[1:2] == ["reserve"]:
     sys.exit(0)
 if sys.argv[1:2] == ["gates"]:
     validate_manifest(MANIFEST)
-    check_wave_tag(TAG, MANIFEST["wave"])
+    check_wave_tag(TAG, MANIFEST)
     state = hand_run_state()
     if state == "closed":
         raise SystemExit(f"{RUNS_PATH} records that the hand run under STOP C row {MANIFEST['stop_c']} closed already; a new "
@@ -1387,7 +1393,7 @@ if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
     raise spent_halt()
 PREFLIGHT = sys.argv[1:] == ["preflight"]
 validate_manifest(MANIFEST)
-check_wave_tag(TAG, MANIFEST["wave"])
+check_wave_tag(TAG, MANIFEST)
 BASE_SHA = None if PREFLIGHT else launch_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
 if not SMOKE:

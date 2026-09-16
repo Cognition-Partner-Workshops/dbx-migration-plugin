@@ -28,7 +28,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
                other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
-               deploy_objects=None, max_minutes=None, batch_max_minutes=None, manifest_name="wave-0.json", wave=0):
+               deploy_objects=None, max_minutes=None, batch_max_minutes=None, manifest_name="wave-0.json", wave=0,
+               pipelines=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -76,6 +77,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         manifest["batches"][0]["max_minutes"] = batch_max_minutes
     if namespace is not None:
         manifest["target_namespace"] = namespace
+    if pipelines is not None:
+        manifest["pipelines"] = list(pipelines)
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"], wave)
     manifest["stop_c"] = "D-2"
     ledger = f"| D-2 | 2026-01-05 | user:U0 | STOP C wave-{wave} gates_sha {manifest['gates_sha']} | plan approved |\n" if stop_c else ""
@@ -857,7 +860,7 @@ def test_pointer_above_the_cwd_names_the_workspace(tmp_path):
 
 
 def test_pipeline_manifest_tags_the_verifier_branch_and_workflow(tmp_path):
-    ws, cwd = _workspace(tmp_path, manifest_name="wave-p2-1.json", wave=1)
+    ws, cwd = _workspace(tmp_path, manifest_name="wave-p2-1.json", wave=1, pipelines=["p2"])
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
                     "HEAD:recon/wave-p2-1"], check=True)
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1"),
@@ -885,6 +888,24 @@ def test_the_name_wave_number_must_equal_the_manifest_wave(tmp_path, name, wave)
     assert proc.returncode != 0
     assert "the wave number in the file name" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_a_pipeline_manifest_must_name_every_sibling_in_pipelines(tmp_path):
+    ws, cwd = _workspace(tmp_path, manifest_name="wave-orders-1.json", wave=1)
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "pipelines" in proc.stderr and "wave-<pipeline>-<N>" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "foreign", manifest_name="wave-orders-1.json", wave=1,
+                         pipelines=["payments", "ledger"])
+    proc, calls = _run(cwd, tmp_path / "foreign", [_pass_report()])
+    assert proc.returncode != 0 and "orders" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "plain", manifest_name="wave-1.json", wave=1)
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path / "plain", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
 
 
 @pytest.mark.parametrize("tamper", ["missing", "not_ready", "wrong_sha", "stale", "signature", "hook_probe", "source"])
