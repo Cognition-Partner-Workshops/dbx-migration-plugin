@@ -1452,3 +1452,30 @@ def test_a_close_reply_is_reconciled_against_git_per_pr(tmp_path):
     assert result["close"]["unmerged"] == [{"pr_url": pr2, "reason": result["close"]["unmerged"][0]["reason"]}]
     assert "did not finish" in result["close"]["unmerged"][0]["reason"]
     assert result["closed"] is False
+
+
+def test_a_hunk_rewritten_by_a_later_merged_pr_of_the_wave_is_not_a_revert(tmp_path):
+    """b-2's PR, merged after b-1's, replaces b-1's lines in the same file: b-1's hunk is gone from the tip but
+    a later merged PR of this wave superseded it, so both count as merged and the wave closes. A hunk that
+    is gone with no later merged PR touching its file is still a revert."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
+                         other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
+                                      "brief": "b", "gates": [GATE]})
+    git = ["git", "-C", str(ws)]
+    (ws / "x.sql").write_text("select 1\n")
+    subprocess.run(git + ["add", "x.sql"], check=True)
+    subprocess.run(git + ["commit", "-qm", "b-1"], check=True)
+    pr = _push_pr(ws)
+    (ws / "x.sql").write_text("select 2\n")
+    subprocess.run(git + ["commit", "-qam", "b-2 rewrites b-1's query"], check=True)
+    pr2 = _push_pr(ws, 2)
+    pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
+                                                             "evidence": ".migration/recon/v/result.json"}])
+    close = _close_report(merged_prs=[pr, pr2])
+    close["__run__"] = [git + ["push", "-q", "origin", "HEAD:refs/heads/migration/x"]]
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), pass2,
+                                   {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
+                                    "findings": [], "changed_paths": []}, close])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert sorted(result["close"]["merged_prs"]) == [pr, pr2] and result["closed"] is True

@@ -1637,43 +1637,48 @@ def _tip_file(tip, path):
     return r.stdout.splitlines() if r.returncode == 0 else []
 
 
-def _patch_on_tip(patch, tip) -> bool:
-    """Whether the base tip still carries every hunk of this patch (a `git diff -U1` text): each hunk's result
-    (its added lines with one line of context) is still contiguous in the tip's file, and no hunk that removed
-    lines has its old text back. A later PR editing elsewhere in the same file passes; a revert, or an
-    overwrite of the patched lines, does not. Files the diff calls binary must be byte-equal at the tip."""
-    path, lines, hunks = None, [], []
+def _patch_on_tip(patch, tip):
+    """({path touched}, {path whose hunks the tip lost}) for this patch (a `git diff -U1` text): a hunk holds
+    when its result (its added lines with one line of context) is still contiguous in the tip's file and, if
+    it removed lines, its old text is not back. A later PR editing elsewhere in the same file loses nothing;
+    a revert, or an overwrite of the patched lines, loses the path. A file the diff calls binary holds only
+    byte-equal at the tip."""
+    path, lines, hunks, touched, lost = None, [], [], set(), set()
     for line in patch.splitlines():
         if line.startswith("diff --git "):
             path = line.split(" b/", 1)[1]
+            touched.add(path)
             lines = _tip_file(tip, path)
         elif line.startswith("Binary files "):
             same = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", tip, "--", path],
                                   check=False, capture_output=True, timeout=300).returncode
             if same != 0:
-                return False
+                lost.add(path)
         elif line.startswith("@@"):
-            hunks.append((lines, [], [], False))
+            hunks.append((path, lines, [], [], False))
         elif hunks and line[:1] in (" ", "+", "-") and not line.startswith(("+++", "---")):
-            file_lines, new, old, removed = hunks[-1]
+            hunk_path, file_lines, new, old, removed = hunks[-1]
             if line[0] != "-":
                 new.append(line[1:])
             if line[0] != "+":
                 old.append(line[1:])
             if line[0] == "-":
-                hunks[-1] = (file_lines, new, old, True)
-    return all(_contains(file_lines, new) and not (removed and _contains(file_lines, old))
-               for file_lines, new, old, removed in hunks)
+                hunks[-1] = (hunk_path, file_lines, new, old, True)
+    lost |= {hunk_path for hunk_path, file_lines, new, old, removed in hunks
+             if not _contains(file_lines, new) or (removed and _contains(file_lines, old))}
+    return touched, lost
 
 
 def proven_merged(to_merge):
     """({proven pr_url}, {pr_url: reason}) — a merge counts only when the PR head still equals the gated
     head (a commit appended after verification is not the verified tree) and origin's base tip still carries
     the PR's patch: a merged head stays an ancestor after a revert, and a squash/rebase merge leaves only the
-    tree, so the patch reverse-applying to the tip is the proof either way (a later PR editing the same file
-    beside it is fine; a historical match the base later reverted is not the verified code). Whatever the
+    tree, so the tip holding the patch's hunks is the proof either way (a later PR editing the same file
+    beside it is fine; a historical match the base later reverted is not the verified code). A merged head
+    whose hunks the tip lost on some path is still merged when another PR of this wave, itself proven on the
+    tip, touched that path: the wave's later PR superseded it. Lost with no such PR is a revert. Whatever the
     close step reported or failed to report is reconciled against git."""
-    proven, reasons = set(), {}
+    proven, reasons, touches, superseded = set(), {}, {}, {}
     try:
         tip = _base_tip()
     except (OSError, subprocess.SubprocessError) as e:
@@ -1702,13 +1707,21 @@ def proven_merged(to_merge):
                 else:
                     reasons[url] = "PR diff is empty"
                 continue
-            if _patch_on_tip(patch, tip):
+            touched, lost = _patch_on_tip(patch, tip)
+            if not lost:
                 proven.add(url)
+            elif merged == 0:
+                superseded[url] = lost
             else:
-                reasons[url] = (f"reverted on origin/{BASE_BRANCH} after the merge" if merged == 0
-                                else f"head not on origin/{BASE_BRANCH}")
+                reasons[url] = f"head not on origin/{BASE_BRANCH}"
+            touches[url] = touched
         except (OSError, subprocess.SubprocessError) as e:
             reasons[url] = f"merge proof failed ({e})"
+    for url, lost in superseded.items():
+        if all(any(path in touches[other] for other in proven if other != url) for path in lost):
+            proven.add(url)
+        else:
+            reasons[url] = f"reverted on origin/{BASE_BRANCH} after the merge"
     return proven, reasons
 
 WAVE = MANIFEST["wave"]
