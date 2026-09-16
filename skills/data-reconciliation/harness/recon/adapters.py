@@ -90,6 +90,10 @@ class SchemaFacts:
     # (e.g. "lower(email)"); a unique one is a constraint the column-wise facts cannot see
     expression_unique: set[str] = field(default_factory=set)
     expression_indexes: set[str] = field(default_factory=set)
+    # relations that cannot carry NOT NULL (Postgres views and materialized views:
+    # pg_attribute.attnotnull is always false for them) set this False so tier 7 reports
+    # nullability as unverified instead of missing
+    declares_not_null: bool = True
 
 
 @dataclass(frozen=True)
@@ -1264,13 +1268,16 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.indexes.add(tuple(entry["cols"]))
         rows = self._rows(
             "SELECT a.attname, a.attnotnull, a.attidentity <> '' OR "
-            "       pg_get_serial_sequence(%s, a.attname) IS NOT NULL "
+            "       pg_get_serial_sequence(%s, a.attname) IS NOT NULL, c.relkind "
             "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped",
             (f'"{schema}"."{name}"', schema, name))
-        for col, notnull, has_seq in rows:
-            if notnull:
+        for col, notnull, has_seq, relkind in rows:
+            if relkind in ("v", "m"):
+                # views cannot declare NOT NULL (attnotnull is always false for them)
+                facts.declares_not_null = False
+            elif notnull:
                 facts.not_null.add(col)
             if has_seq:
                 facts.identity_columns.add(col)

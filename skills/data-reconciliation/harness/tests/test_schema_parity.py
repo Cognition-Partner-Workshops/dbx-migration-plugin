@@ -570,3 +570,18 @@ def test_nullable_unique_keys_must_agree_on_how_nulls_compare(src, tgt, codes, a
     assert result["verdict"] == "PASS" or codes != accepted
 
 
+
+
+def test_view_target_reports_not_null_unverified_not_missing():
+    # Postgres views cannot declare NOT NULL: pg_attribute.attnotnull is always false, so the
+    # adapter sets declares_not_null=False and tier 7 notes the source NOT NULLs as unverified
+    # rather than failing them missing.
+    loans, borrowers = _rows(6)
+    tgt_facts = _facts(TARGET_LOANS_FACTS, not_null=set(), declares_not_null=False)
+    source, target = _sides(loans, [dict(r) for r in loans], borrowers, tgt_facts=tgt_facts)
+    result = _run(source, target)
+    parity = _tier(result, "schema_parity")
+    assert "not_null_missing" not in _codes(result, "schema_parity")
+    (note,) = parity["stats"]["not_null_unverified"]
+    assert note == ("loans: target relation cannot declare NOT NULL; "
+                    "5 source NOT NULL columns unverified")
