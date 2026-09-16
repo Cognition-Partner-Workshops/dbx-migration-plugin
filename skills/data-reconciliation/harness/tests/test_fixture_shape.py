@@ -461,6 +461,26 @@ def test_cli_fixture_shape_refuses_an_untested_family(tmp_path):
     assert not (tmp_path / "fixture_shape.json").exists()
 
 
+@pytest.mark.parametrize("fixture_secret", ["SRC_DSN", "FIX_DSN"])
+def test_cli_fixture_shape_refuses_source_and_fixture_on_the_same_connection(
+        tmp_path, monkeypatch, capsys, fixture_secret):
+    """Same secret name, or two names holding the same DSN: comparing a copy against itself proves
+    nothing. The refusal names only the secret names, never their values."""
+    from recon import adapters
+    monkeypatch.setenv("SRC_DSN", "postgresql://h/legacy")
+    monkeypatch.setenv("FIX_DSN", "postgresql://h/legacy")
+    made = []
+    monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "postgres", lambda s: made.append(s))
+    mapping = tmp_path / "mapping.json"
+    mapping.write_text(json.dumps({"version": "m1", "objects": []}))
+    with pytest.raises(SystemExit, match="same connection") as exc:
+        cli.main(["fixture-shape", "--family", "postgres", "--mapping", str(mapping),
+                  "--source-dsn-secret", "SRC_DSN", "--fixture-dsn-secret", fixture_secret,
+                  "--source-statement-cap", "10", "--out", str(tmp_path / "w0")])
+    assert "legacy" not in str(exc.value) and made == []
+    assert not (tmp_path / "w0").exists()
+
+
 def test_cli_fixture_shape_requires_a_cap(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["fixture-shape", "--family", "postgres", "--mapping", str(tmp_path / "m.json"),

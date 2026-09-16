@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import decimal
 import json
+import os
 import re
 import sys
 import uuid as uuid_mod
@@ -333,9 +334,15 @@ def main(argv: list[str] | None = None) -> int:
                              "see SKILL.md")
         if args.source_statement_cap < 1:
             raise SystemExit("--source-statement-cap must be at least 1")
+        src_secret, fix_secret = args.source_dsn_secret, args.fixture_dsn_secret
+        if src_secret == fix_secret or (os.environ.get(src_secret) is not None
+                                        and os.environ.get(src_secret) == os.environ.get(fix_secret)):
+            raise SystemExit(f"fixture-shape: --source-dsn-secret {src_secret} and --fixture-dsn-secret "
+                             f"{fix_secret} resolve to the same connection; the fixture copy must live "
+                             "apart from the legacy source")
         spec = load_mapping_spec(args.mapping, parse_params(args.param))
-        source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
-        fixture = SOURCE_ADAPTERS[args.family](args.fixture_dsn_secret)
+        source = SOURCE_ADAPTERS[args.family](src_secret)
+        fixture = SOURCE_ADAPTERS[args.family](fix_secret)
         try:
             check = compare_fixture(spec, source, fixture, args.source_statement_cap)
         except ConfigError as exc:
