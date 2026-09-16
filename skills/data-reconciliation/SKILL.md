@@ -63,8 +63,9 @@ connection string or token.
 Unresolved placeholders are refused, and mapping identifiers are validated before execution.
 When `root_where` or an embed's `child_where` is set, the corresponding `target_where` is
 required so both sides have the same scope. A target table written by units in more than one
-wave must be read with a `target_where` bounded to the unit's own partition or run date; the
-fan-out workflow refuses to launch otherwise (rule in `skills/migration-fanout/SKILL.md`).
+wave declares `scope_columns` on the object (and on an embed that reads it) and is read with a
+`target_where` pinning one of them to the unit's own partition or run date; the fan-out workflow
+refuses to launch otherwise (rule in `skills/migration-fanout/SKILL.md`).
 
 The allowlist file is trusted setup state, not a caller-controlled CLI list. Use
 `--snapshot-manifest` for snapshot mode; it must live under `.migration/snapshots/` and record

@@ -470,11 +470,14 @@ def test_a_rerun_over_a_result_that_cannot_say_which_stop_c_it_spent_halts(tmp_p
 
 
 WAVE_1 = json.dumps({"wave": 1, "batches": [{"id": "b-2", "units": ["v"], "write_targets": ["mig.t"], "brief": "b"}]})
-MAPPING = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"]}]}
+MAPPING = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"]}]}
+BOUNDED_MAPPING = {"objects": [{**MAPPING["objects"][0], "root_where": "run_date = '${as_of}'",
+                                "target_where": "run_date = '${as_of}'"}]}
 
 
 def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_bounded(tmp_path):
-    ws, cwd = _workspace(tmp_path / "open", other_waves={"wave-1.json": WAVE_1}, mappings={"u": MAPPING})
+    ws, cwd = _workspace(tmp_path / "open", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": MAPPING, "v": BOUNDED_MAPPING})
     proc, calls = _run(cwd, tmp_path / "open", [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0
     assert "'mig.t'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr and "target_where" in proc.stderr
@@ -483,14 +486,19 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
 
     tautology = {"objects": [{**MAPPING["objects"][0], "root_where": "1 = 1", "target_where": "1 = 1"}]}
     ws, cwd = _workspace(tmp_path / "taut", other_waves={"wave-1.json": WAVE_1.replace("mig.t", "MIG.T")},
-                         mappings={"u": tautology})
+                         mappings={"u": tautology, "v": BOUNDED_MAPPING})
     proc, calls = _run(cwd, tmp_path / "taut", [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "target_where" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
-    bounded = {"objects": [{**MAPPING["objects"][0], "object": "T", "root_where": "run_date = '${as_of}'",
-                            "target_where": "run_date = '${as_of}'"}]}
-    ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1}, mappings={"u": bounded})
+    bounded = {"objects": [{**BOUNDED_MAPPING["objects"][0], "object": "T"}]}
+    ws, cwd = _workspace(tmp_path / "prior", other_waves={"wave-1.json": WAVE_1}, mappings={"u": bounded})
+    proc, calls = _run(cwd, tmp_path / "prior", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "units/v/mapping_spec.json is missing" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": bounded, "v": BOUNDED_MAPPING})
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "bounded", [_pass_report(pr), _verify_report()])
     assert proc.returncode == 0, proc.stderr

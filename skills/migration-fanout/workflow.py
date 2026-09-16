@@ -1071,14 +1071,22 @@ PREDICATE_TOKEN = re.compile(
 PREDICATE_WORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "true", "false"}
 
 
-def bounded_predicate(where):
-    """Whether a target_where can bound the rows recon reads: it tokenizes under the harness's predicate
-    grammar and parses the AND/OR/NOT/parenthesis structure. A comparison bounds when it names a target
-    column; an OR bounds only when every branch does, an AND when any operand does, at every depth, so
-    `1 = 1`, TRUE, a literal-only or parameter-only comparison, `col = x OR 1 = 1` and
-    `(col = x OR 1 = 1)` select the whole table and are no bound. Anything unparsable is no bound."""
+def column_key(name):
+    """A column however a predicate or scope list spells it: the last segment, unquoted, case-folded."""
+    return re.sub(r'^[`"\[]|[`"\]]$', "", str(name).strip().split(".")[-1].strip()).casefold()
+
+
+def bounded_predicate(where, scope):
+    """Whether a target_where bounds the rows recon reads to the unit's own slice: it tokenizes under the
+    harness's predicate grammar and parses the AND/OR/NOT/parenthesis structure. A comparison bounds when
+    it pins one of the mapping's declared scope columns to a literal or parameter with =, <, <=, >, >=, IN,
+    LIKE or BETWEEN; an OR bounds only when every branch does, an AND when any operand does, at every
+    depth. `1 = 1`, TRUE, `col = col`, `col IS NOT NULL`, `col <> x`, NOT (...), a column outside the
+    scope list, `col = x OR 1 = 1` and `(col = x OR 1 = 1)` select more than the slice and are no bound.
+    Anything unparsable is no bound."""
     if not isinstance(where, str):
         return False
+    scope = {column_key(c) for c in scope}
     tokens, pos = [], 0
     while pos < len(where):
         m = PREDICATE_TOKEN.match(where, pos)
@@ -1091,14 +1099,17 @@ def bounded_predicate(where):
     def keyword(i, *words):
         return i < len(tokens) and tokens[i][0] == "word" and tokens[i][1].lower() in words
 
-    def column(toks):
-        return any(k == "word" and t.lower() not in PREDICATE_WORDS
-                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")
-                   for i, (k, t) in enumerate(toks))
-
-    def compares(toks):
-        return any((k == "punct" and t not in "(),") or (k == "word" and t.lower() in ("is", "like", "in", "between"))
-                   for k, t in toks)
+    def pins(toks):
+        words = [t.lower() for k, t in toks if k == "word"]
+        columns = [t for i, (k, t) in enumerate(toks) if k == "word" and t.lower() not in PREDICATE_WORDS
+                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")]
+        values = any(k in ("string", "number", "param") for k, _ in toks)
+        operator = (any(k == "punct" and t in ("=", "<", "<=", ">", ">=") for k, t in toks)
+                    or any(w in ("in", "like", "between") for w in words))
+        wildcard = "like" in words and all(re.fullmatch(r"'[%_]*'", t) for k, t in toks if k == "string")
+        return (len(columns) == 1 and column_key(columns[0]) in scope and values and operator and not wildcard
+                and not any(w in ("is", "not") for w in words)
+                and not any(k == "punct" and t in ("<>", "!=") for k, t in toks))
 
     def expr(i):  # -> (bounded, next index); raises ValueError on a malformed predicate
         bounded, i = term(i)
@@ -1116,7 +1127,7 @@ def bounded_predicate(where):
 
     def factor(i):
         if keyword(i, "not"):
-            return factor(i + 1)
+            return False, factor(i + 1)[1]
         if i < len(tokens) and tokens[i] == ("punct", "("):
             bounded, i = expr(i + 1)
             if i >= len(tokens) or tokens[i] != ("punct", ")"):
@@ -1131,7 +1142,7 @@ def bounded_predicate(where):
         atom = tokens[start:i]
         if not atom or depth:
             raise ValueError
-        return column(atom) and compares(atom), i
+        return pins(atom), i
 
     try:
         bounded, end = expr(0)
@@ -1141,15 +1152,39 @@ def bounded_predicate(where):
 
 
 def bounded_readers(spec, table):
-    """Whether every object in a mapping spec that reads `table` carries a bounding target_where;
-    None when the spec has no object for the table (or no object list at all)."""
+    """Why the mapping spec's readers of `table` are not bounded to the unit's slice, '' when every one is,
+    None when the spec has no object for the table. Each reading object declares scope_columns (its
+    partition or run-date columns) and pins one of them in target_where; each of its embeds pins one of
+    its own scope_columns, or the object's, in its own target_where (the harness scopes an embed's nested
+    reads by the embed's predicate, not the object's)."""
     objects = spec.get("objects", spec.get("tables")) if isinstance(spec, dict) else None
     if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
         raise SystemExit("mapping spec 'objects' must be a list of object rows")
     mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table)]
     if not mine:
         return None
-    return all(bounded_predicate(o.get("target_where")) for o in mine)
+
+    def columns(row, inherited=None):
+        scope = row.get("scope_columns", inherited)
+        if not (isinstance(scope, list) and scope and all(isinstance(c, str) and c.strip() for c in scope)):
+            return None
+        return scope
+
+    for o in mine:
+        scope = columns(o)
+        if scope is None:
+            return "declares no scope_columns (non-empty list of the table's partition or run-date columns)"
+        if not bounded_predicate(o.get("target_where"), scope):
+            return "reads it without a target_where pinning one of its scope_columns"
+        embeds = o.get("embeds", [])
+        if not isinstance(embeds, list) or not all(isinstance(e, dict) for e in embeds):
+            return "has 'embeds' that is not a list of embed rows"
+        for e in embeds:
+            escope = columns(e, scope)
+            if escope is None or not bounded_predicate(e.get("target_where"), escope):
+                return (f"embed '{e.get('array_path')}' reads it without its own target_where pinning one of its "
+                        "scope_columns (or the object's)")
+    return ""
 
 
 def check_write_targets(batches, other_waves, mapping=None):
@@ -1178,24 +1213,24 @@ def check_write_targets(batches, other_waves, mapping=None):
         batch = next(b for b in batches if b["id"] == mine)
         shared = ", ".join(f"{name} {b['id']} (units {', '.join(b['units'])})" for name, b in elsewhere[k])
         why = (f"shared write target '{t}' is written by {mine} in this wave and by {shared}; every mapping "
-               f"that reads it needs a target_where that compares a column of the table (the unit's own "
-               f"partition or run date; `1 = 1` and other predicates naming no column are no bound)")
+               f"that reads it, in every wave, declares the object's scope_columns and a target_where pinning "
+               f"one of them to the unit's own partition or run date (`1 = 1`, `col = col`, IS NOT NULL, <> and "
+               f"columns outside scope_columns are no bound)")
         for wave, b in ((None, batch), *elsewhere[k]):
             for u in b["units"]:
                 spec = mapping(u)
                 path = f".migration/units/{u}/mapping_spec.json"
+                where = "" if wave is None else f" ({wave} {b['id']})"
                 if spec is None:
-                    if wave is None:
-                        raise SystemExit(f"{why}: {path} is missing, so unit {u} cannot be scoped")
-                    continue
+                    raise SystemExit(f"{why}: {path} is missing, so unit {u}{where} cannot be scoped")
                 try:
-                    bounded = bounded_readers(spec, t)
+                    problem = bounded_readers(spec, t)
                 except SystemExit as e:
                     raise SystemExit(f"{why}: {path}: {e}") from None
-                if bounded is None and wave is None:
-                    raise SystemExit(f"{why}: {path} has no object reading '{t}'")
-                if bounded is False:
-                    raise SystemExit(f"{why}: {path} (unit {u}) reads '{t}' without target_where")
+                if problem is None:
+                    raise SystemExit(f"{why}: {path}{where} has no object reading '{t}'")
+                if problem:
+                    raise SystemExit(f"{why}: {path} (unit {u}{where}) {problem}")
 
 
 def child_prompt(batch):

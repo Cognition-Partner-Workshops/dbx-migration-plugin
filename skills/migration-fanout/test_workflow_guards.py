@@ -28,7 +28,8 @@ def _functions():
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
-                                      "unit_mapping", "bounded_readers", "target_key", "reads_target", "bounded_predicate"})
+                                      "unit_mapping", "bounded_readers", "target_key", "reads_target", "bounded_predicate",
+                                      "column_key"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
@@ -136,9 +137,11 @@ def _manifest(**extra):
 
 B1 = {"id": "b-1", "units": ["u1"], "write_targets": ["mig.t"], "brief": "b"}
 B2 = {"id": "b-2", "units": ["u2"], "write_targets": ["mig.t", "mig.other"], "brief": "b"}
-BOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"],
+SCOPE = ["run_date", "unit_id", "region", "run_id", "batch_id", "run date", "Date"]
+BOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": SCOPE,
                         "root_where": "run_date = '${as_of}'", "target_where": "run_date = '${as_of}'"}]}
-UNBOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"]}]}
+UNBOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": SCOPE}]}
+OTHERS = {"wave-1.json": [B2]}
 
 
 def _specs(**by_unit):
@@ -164,8 +167,14 @@ def test_shared_table_across_waves_needs_a_bounded_target_where(spec):
 def test_shared_table_across_waves_passes_when_every_reader_is_bounded():
     check = _functions()["check_write_targets"]
     check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED, u2=BOUNDED))
-    check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED))
     check([B1], {"wave-1.json": [{**B2, "write_targets": ["mig.other"]}]}, _specs())
+
+
+@pytest.mark.parametrize("u2", [None, {"objects": []}, {"objects": [{"object": "mig.other", "target_where": "x = 1"}]}])
+def test_shared_table_other_wave_unit_without_a_mapping_for_it_halts_too(u2):
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-1\.json.*b-2.*units/u2/mapping_spec\.json"):
+        check([B1], {"wave-1.json": [B2]}, _specs(u1=BOUNDED, u2=u2))
 
 
 def test_shared_table_other_wave_unbounded_mapping_also_halts():
@@ -189,10 +198,12 @@ def test_shared_table_current_unit_without_a_mapping_for_it_halts(spec, message)
 
 def test_shared_table_matches_tables_key_and_target_table_spelling():
     check = _functions()["check_write_targets"]
-    legacy = {"tables": [{"target_table": "MIG.T", "source_table": "dbo.t", "target_where": "run_date = '${as_of}'"}]}
-    check([B1], {"wave-1.json": [B2]}, _specs(u1=legacy))
+    legacy = {"tables": [{"target_table": "MIG.T", "source_table": "dbo.t", "scope_columns": ["run_date"],
+                          "target_where": "run_date = '${as_of}'"}]}
+    check([B1], OTHERS, _specs(u1=legacy, u2=BOUNDED))
     with pytest.raises(SystemExit, match="target_where"):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1={"tables": [{"target_table": "MIG.T", "source_table": "dbo.t"}]}))
+        check([B1], OTHERS, _specs(u1={"tables": [{"target_table": "MIG.T", "source_table": "dbo.t",
+                                                  "scope_columns": ["run_date"]}]}, u2=BOUNDED))
 
 
 def test_shared_table_is_the_same_table_whatever_its_case_or_quoting():
@@ -201,20 +212,21 @@ def test_shared_table_is_the_same_table_whatever_its_case_or_quoting():
         check([B1, {**B2, "write_targets": ["MIG.T"]}], {}, _specs(u1=BOUNDED, u2=BOUNDED))
     for other in ("MIG.T", "`mig`.`t`", " Mig.T "):
         with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
-            check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=UNBOUNDED))
-        check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=BOUNDED))
+            check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=UNBOUNDED, u2=BOUNDED))
+        check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=BOUNDED, u2=BOUNDED))
 
 
 def test_bare_mapping_object_reads_the_qualified_target_but_schemas_stay_distinct():
     check = _functions()["check_write_targets"]
-    bare = lambda where: {"objects": [{"object": "T", "root_table": "dbo.t", "key": ["id"], "target_where": where}]}
-    check([B1], {"wave-1.json": [B2]}, _specs(u1=bare("run_date = '${as_of}'")))
+    bare = lambda where: {"objects": [{"object": "T", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"],
+                                       "target_where": where}]}
+    check([B1], OTHERS, _specs(u1=bare("run_date = '${as_of}'"), u2=BOUNDED))
     with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*target_where"):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1=bare("")))
+        check([B1], OTHERS, _specs(u1=bare(""), u2=BOUNDED))
     with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1={"objects": [{"object": "other.t", "target_where": "id = 1"}]}))
+        check([B1], OTHERS, _specs(u1={"objects": [{"object": "other.t", "target_where": "id = 1"}]}, u2=BOUNDED))
     with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1={"objects": [{"object": "ig.t", "target_where": "id = 1"}]}))
+        check([B1], OTHERS, _specs(u1={"objects": [{"object": "ig.t", "target_where": "id = 1"}]}, u2=BOUNDED))
     check([B1], {"wave-1.json": [{**B2, "write_targets": ["other.t"]}]}, _specs())
 
 
@@ -224,24 +236,65 @@ def test_bare_mapping_object_reads_the_qualified_target_but_schemas_stay_distinc
                                    "(run_date = '${as_of}' OR 1 = 1)", "((run_date = '${as_of}') OR (1 = 1))",
                                    "(unit_id = 'u1' OR 1 = 1) AND (1 = 1)", "NOT (run_date = '${as_of}' OR 1 = 1)",
                                    "(unit_id = 'u1' AND 1 = 1) OR 1 = 1", "(run_date = '${as_of}'", "run_date = '${as_of}')",
-                                   "run_date = '${as_of}' OR", "AND run_date = '${as_of}'", "() OR run_date = '${as_of}'"])
-def test_target_where_that_names_no_target_column_is_not_a_bound(where):
+                                   "run_date = '${as_of}' OR", "AND run_date = '${as_of}'", "() OR run_date = '${as_of}'",
+                                   "unit_id = unit_id", "run_date = t.run_date", "run_date IS NOT NULL", "run_date IS NULL",
+                                   "run_date <> '${as_of}'", "run_date != '${as_of}'", "NOT run_date = '${as_of}'",
+                                   "NOT (run_date = '${as_of}')", "NOT deleted_at IS NULL", "run_date LIKE '%'",
+                                   "run_date = '${as_of}' OR run_date IS NULL", "run_date", "run_date = ",
+                                   "deleted_at = '${as_of}'", "t.other = 1 AND 1 = 1", "run_date = '${as_of}' OR other = 1"])
+def test_target_where_that_does_not_pin_a_scope_column_is_not_a_bound(where):
     check = _functions()["check_write_targets"]
     spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
     with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
-        check([B1], {"wave-1.json": [B2]}, _specs(u1=spec))
+        check([B1], OTHERS, _specs(u1=spec, u2=BOUNDED))
 
 
 @pytest.mark.parametrize("where", ["run_date = '${as_of}'", "t.run_date = DATE '2024-01-01'", "batch_id IN (1, 2)",
                                    "unit_id = 'u1' AND 1 = 1", "(region = 'eu' OR region = 'us') AND run_id = ${run}",
-                                   "[run date] = 1", '"Run"."Date" IS NOT NULL', "NOT deleted_at IS NULL",
-                                   "run_date BETWEEN '2024-01-01' AND '2024-01-31'", "(run_date = '${as_of}' OR run_date IS NULL)",
+                                   "[run date] = 1", '"Run"."Date" = 1', "RUN_DATE = '${as_of}'", "run_date > '${as_of}'",
+                                   "run_date BETWEEN '2024-01-01' AND '2024-01-31'", "run_date = '${as_of}' AND deleted_at IS NULL",
                                    "1 = 1 AND (region = 'eu' OR (region = 'us' AND 1 = 1))", "((run_date = '${as_of}'))",
-                                   "unit_id = 'u1' AND (region = 'eu' OR 1 = 1)"])
-def test_target_where_over_a_target_column_is_a_bound(where):
+                                   "unit_id = 'u1' AND (region = 'eu' OR 1 = 1)", "unit_id LIKE 'u1%'", "run_date IN ('${as_of}')"])
+def test_target_where_pinning_a_declared_scope_column_is_a_bound(where):
     check = _functions()["check_write_targets"]
     spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
-    check([B1], {"wave-1.json": [B2]}, _specs(u1=spec))
+    check([B1], OTHERS, _specs(u1=spec, u2=BOUNDED))
+
+
+@pytest.mark.parametrize("scope", [None, [], "run_date", [1], [""]])
+def test_shared_table_reader_must_declare_scope_columns(scope):
+    check = _functions()["check_write_targets"]
+    row = {k: v for k, v in BOUNDED["objects"][0].items() if k != "scope_columns"}
+    spec = {"objects": [row if scope is None else {**row, "scope_columns": scope}]}
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*scope_columns"):
+        check([B1], OTHERS, _specs(u1=spec, u2=BOUNDED))
+
+
+def _embedded(embed):
+    return {"objects": [{**BOUNDED["objects"][0], "embeds": [{"array_path": "items", "child_table": "dbo.i", **embed}]}]}
+
+
+@pytest.mark.parametrize("embed", [{}, {"target_where": ""}, {"target_where": "1 = 1"}, {"target_where": "other = 1"},
+                                   {"target_where": "run_date IS NOT NULL"},
+                                   {"scope_columns": ["item_run"], "target_where": "run_date = '${as_of}'"},
+                                   {"scope_columns": [], "target_where": "run_date = '${as_of}'"}])
+def test_embed_of_a_shared_table_reader_needs_its_own_bound(embed):
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*embed 'items'.*target_where"):
+        check([B1], OTHERS, _specs(u1=_embedded(embed), u2=BOUNDED))
+
+
+@pytest.mark.parametrize("embed", [{"target_where": "run_date = '${as_of}'"},
+                                   {"scope_columns": ["item_run"], "target_where": "item_run = '${as_of}'"}])
+def test_embed_bounded_on_its_own_or_the_objects_scope_columns_passes(embed):
+    check = _functions()["check_write_targets"]
+    check([B1], OTHERS, _specs(u1=_embedded(embed), u2=BOUNDED))
+
+
+def test_embed_rows_must_be_a_list_of_objects():
+    check = _functions()["check_write_targets"]
+    with pytest.raises(SystemExit, match=r"u1.*embeds"):
+        check([B1], OTHERS, _specs(u1={"objects": [{**BOUNDED["objects"][0], "embeds": "items"}]}, u2=BOUNDED))
 
 
 def test_other_wave_manifests_reads_every_wave_but_the_current_and_fails_closed(tmp_path):
