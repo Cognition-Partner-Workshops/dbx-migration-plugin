@@ -45,11 +45,9 @@ from pathlib import Path
 REQUIRED_FILES = (
     "00_context.md",
     "01_conventions.md",
-    "02_glossary.md",
     "03_recon_tolerances.md",
     "03_recon_tolerances.json",
     "04_dependency_register.md",
-    "05_progress.md",
     "06_decisions.md",
     "07_access_checklist.md",
     "allowed_targets.json",
