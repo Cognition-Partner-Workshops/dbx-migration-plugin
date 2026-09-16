@@ -1184,8 +1184,9 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
     and the graph writes nothing; every unit analysed and none converting a routine is that empty graph,
     so anything declared is extra. The routines nothing else in the batch calls are its entry points and
     ship as deployed objects: each takes a deploy_objects row of its own, the one spelled with its own
-    trailing segments (`mig.app.close` for `app.close`), or a bare one under target_namespace (`mig.close`) when
-    no other root ends in that name (`mig.other.close` is somebody else's); a callee may be inlined into its
+    trailing segments under target_namespace (`mig.app.close` for `app.close`), or a bare one there (`mig.close`)
+    when no other root ends in that name (`mig.other.close` and `prod.app.close` are somebody else's); a callee may
+    be inlined into its
     caller and keep its row. A root left without a row is the same mismatch as an undeclared table. A row no
     root takes is a view or job the analysis has no routine for; it stays a declared target and the collision
     check's business."""
@@ -1241,18 +1242,16 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
 
         def take(root, fits):
             segs = target_key(root).split(".")
-            found = sorted(d for d in free if fits(d.split("."), segs))
+            found = sorted(d for d in free if d.split(".")[:len(prefix)] == prefix
+                           and fits(d.split(".")[len(prefix):], segs))
             if found:
                 free.discard(found[0])
             return bool(found)
 
-        def own(d):
-            return d[len(prefix):] if d[:len(prefix)] == prefix else d
-
         trailing = Counter(target_key(root).rsplit(".", 1)[-1] for root in roots)
-        exact = {root for root in roots if take(root, lambda d, s: d[-len(s):] == s)}
+        exact = {root for root in roots if take(root, lambda d, s: d == s if prefix else d[-len(s):] == s)}
         undeclared = [root for root in roots if root not in exact
-                      and not take(root, lambda d, s: d[-1] == s[-1] and len(own(d)) < len(s) and trailing[s[-1]] == 1)]
+                      and not take(root, lambda d, s: d[-1] == s[-1] and len(d) < len(s) and trailing[s[-1]] == 1)]
         if undeclared:
             raise SystemExit(f"batch {b['id']}: analysed routine(s) {undeclared} are entry points nothing in the batch "
                              "calls, so the unit deploys them, but deploy_objects has no object of that name left for "

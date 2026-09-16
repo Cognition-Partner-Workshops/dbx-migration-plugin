@@ -647,6 +647,21 @@ def test_same_named_roots_in_different_schemas_each_need_a_deploy_object_of_thei
               _deps(u=[roots[0]]), namespace="mig")
 
 
+@pytest.mark.parametrize("row", ["prod.app.close", "cat.other.app.close", "prod.close", "other.mig.app.close"])
+def test_a_deploy_object_outside_target_namespace_never_stands_for_a_root(row):
+    """A deploy_objects row is the root's only under target_namespace: `cat.mig.app.close` or the bare
+    `cat.mig.close` for `app.close`, never an object of some other catalog or schema that happens to end in
+    the same name (that is a production object the plan must not launch against)."""
+    check = _functions()["check_dependencies"]
+    root = _routine("app.close", writes=["cat.mig.a"])
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["cat.mig.a", row], "deploy_objects": [row], "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([b], _deps(u=[root]), namespace="cat.mig")
+    for good in ("cat.mig.app.close", "cat.mig.close", "close"):
+        check([{**b, "write_targets": ["cat.mig.a", good], "deploy_objects": [good]}], _deps(u=[root]),
+              namespace="cat.mig")
+
+
 def test_a_complete_analysis_with_no_routines_is_a_graph_that_writes_and_deploys_nothing():
     """Every unit analysed and none converting a routine is a real (empty) graph: a declared table is then
     an extra nothing writes, the same mismatch as with routines. A deploy object is not: the analysis has
