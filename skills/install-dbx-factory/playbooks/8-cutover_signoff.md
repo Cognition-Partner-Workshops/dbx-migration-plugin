@@ -1,6 +1,7 @@
 Playbook: Verify production readiness, obtain independent sign-off, and execute the customer-authorized cutover.
 
 ## Entry criteria
+- The parallel-run ledger shows the plan's agreed N consecutive green cycles; no dependency entry is UNDECIDED or IMPLEMENTED without evidence; no D10 is open. Any gap routes back before STOP E is presented.
 - All waves are merged and green; recon reports, target/governance parity, costs, and the unverified-path register are complete.
 - In DEGRADED mode, attach source/export manifests, coverage limits, and a customer-run in-perimeter recon as a STOP E entry criterion.
 - The deployable exists in the target catalog, scheduled jobs are paused or controlled, and the DEGRADED criterion is explicitly accepted or closed.

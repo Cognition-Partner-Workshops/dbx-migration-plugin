@@ -567,6 +567,48 @@ def test_refresh_merged_records_ancestral_heads(tmp_path):
     assert f"| 1 | b2 | u2 | PASS (unmerged) |  | PASS | {url_2} | pending |  |" in lines
 
 
+def test_refresh_merged_rebuilds_stale_record(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    base_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "feature")
+    (repo / "feature.txt").write_text("feature\n")
+    git("add", "feature.txt")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    git("merge", "--no-ff", "-q", "feature", "-m", "merge feature")
+    git("push", "-q", "origin", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/stale")
+
+    refresh_merged(mig)
+    assert json.loads((waves / "wave-1.merged.json").read_text())["merged"] == {
+        "https://example.invalid/stale": pr_head,
+    }
+
+    git("branch", "other", base_head)
+    git("push", "-q", "origin", "other")
+    _write_manifest(mig, 1, [{"id": "b1", "units": ["u1"]}], base_branch="other")
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "auto_merge": False,
+        "batches": [{
+            "id": "b1",
+            "units": ["u1"],
+            "status": "PASS",
+            "recon_verdict": "PASS",
+            "pr_url": "https://example.invalid/stale",
+            "pr_head": pr_head,
+            "recon_cost": {},
+        }],
+        "verify": {"unit_verdicts": {"b1": "PASS"}, "merged_prs": []},
+    })
+
+    refresh_merged(mig)
+
+    assert json.loads((waves / "wave-1.merged.json").read_text())["merged"] == {}
+    assert "| 1 | b1 | u1 | PASS (unmerged) | PASS | PASS | https://example.invalid/stale | pending | {} |" in render_progress(mig)
+
+
 def _refresh_repo(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
