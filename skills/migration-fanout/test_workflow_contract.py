@@ -12,16 +12,20 @@ DOCTOR = Path(__file__).parents[1] / "factory-doctor" / "doctor.py"
 GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": ""}
 
 
-def _gates_sha(batches):
-    """The recipe the fanout skill documents: sha256 of the sorted {batch id: [[units], [[gate id, kind], ...]]} map."""
-    declared = {b["id"]: [sorted(b["units"]), [[g["id"], g["kind"]] for g in b["gates"]]] for b in batches}
+def _gates_sha(batches, wave=0):
+    """The recipe the fanout skill documents: sha256 of the compact JSON {wave, batches: {id: {units (sorted),
+    gates: [[id, kind, status, evidence, decision_id or null], ...]}}} with sorted keys."""
+    declared = {"wave": wave, "batches": {
+        b["id"]: {"units": sorted(b["units"]),
+                  "gates": [[g["id"], g["kind"], g["status"], g["evidence"], g.get("decision_id")] for g in b["gates"]]}
+        for b in batches}}
     return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
-               gates=None, gates_sha=None, stop_c=True):
+               gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft"):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -45,14 +49,17 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "host": "https://adb-1.azuredatabricks.net",
             "catalogs": ["mig"],
             "guard_mode": "block",
-            "stop_mode": "soft",
+            "stop_mode": stop_mode,
             "ready": True,
         },
         "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief",
                      "gates": gates if gates is not None else [GATE]}],
     }
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
-    ledger = f"| D-2 | user:U0 STOP C approved wave-0 gates_sha {manifest['gates_sha']} |\n" if stop_c else ""
+    manifest["stop_c"] = "D-2"
+    ledger = f"| D-2 | 2026-01-05 | user:U0 | STOP C wave-0 gates_sha {manifest['gates_sha']} | plan approved |\n" if stop_c else ""
+    if prior_result is not None:
+        waves.joinpath("wave-0.result.json").write_text(json.dumps(prior_result))
     if decisions is not None or stop_c:
         (ws / ".migration" / "06_decisions.md").write_text(ledger + (decisions or ""))
     if smoke:
@@ -75,7 +82,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "checks": [
                 {"id": "allowed_targets", "status": "ok",
                  "data": {"catalogs": ["mig"], "guard_mode": "block"}},
-                {"id": "workspace", "status": "ok", "data": {"stop_mode": "soft"}},
+                {"id": "workspace", "status": "ok", "data": {"stop_mode": stop_mode}},
             ],
             "hook_probe": doctor_hook_probe,
             "source": doctor_source,
@@ -193,20 +200,39 @@ def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_le
 @pytest.mark.parametrize("ledger", [
     None,                                                                   # no ledger at all
     "",
-    "| D-2 | default-accepted (soft, 60s) STOP C gates_sha {sha} |\n",       # not a human's row
-    "| D-2 | user:U0 STOP C gates_sha {other} |\n",                          # a different approved list
-    "| D-2 | user:U0 STOP C {sha} |\n",                                      # the hash without its name
-    "| D-2 | user:U0 tolerance note, gates_sha {sha} |\n",                   # a human row that is not STOP C
+    "| D-2 | user:U0 | STOP C wave-0 gates_sha {other} |\n",                     # a different approved list
+    "| D-2 | user:U0 | STOP C wave-0 {sha} |\n",                                 # the hash without its name
+    "| D-2 | user:U0 | tolerance note, gates_sha {sha} |\n",                     # a human row that is not STOP C
+    "| D-2 | user:U0 | STOP C wave-1 gates_sha {sha} |\n",                       # another wave's approval
+    "| D-3 | user:U0 | STOP C wave-0 gates_sha {sha} |\n",                       # not the row the manifest names
+    "| D-2 | user:U0 STOP C wave-0 gates_sha {sha} approved |\n",                # prose, not a parsed row
 ])
 def test_gates_sha_must_be_the_one_a_human_approved_in_the_ledger(tmp_path, ledger):
     ws, cwd = _workspace(tmp_path, stop_c=False)
-    sha = _gates_sha([{"id": "b-1", "units": ["u-1"], "gates": [GATE]}])
+    sha = json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
     if ledger is not None:
         (ws / ".migration" / "06_decisions.md").write_text(ledger.format(sha=sha, other="0" * 64))
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0 and "gates_sha" in proc.stderr and "06_decisions.md" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+@pytest.mark.parametrize("stop_mode,launches", [("soft", True), ("hard", False)])
+def test_a_default_accepted_stop_c_row_launches_only_a_soft_stop_mode_wave(tmp_path, stop_mode, launches):
+    """STOP C resolves per stop_mode, like the other stops: the orchestrator's default-accepted row approves
+    the gate plan in soft mode; hard mode needs a human's row."""
+    ws, cwd = _workspace(tmp_path, stop_c=False, stop_mode=stop_mode)
+    sha = json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
+    (ws / ".migration" / "06_decisions.md").write_text(
+        f"| D-2 | 2026-01-05 | default-accepted (soft, 60s) | STOP C wave-0 gates_sha {sha} |\n")
+    proc, calls = _run(cwd, tmp_path, [_pass_report(_push_pr(ws)), _verify_report()])
+    if launches:
+        assert proc.returncode == 0, proc.stderr
+        assert _result(ws)["batches"][0]["status"] == "PASS"
+    else:
+        assert proc.returncode != 0 and "gates_sha" in proc.stderr and "user:<id>" in proc.stderr
+        assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(tmp_path):
@@ -220,20 +246,28 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
         return subprocess.run([sys.executable, str(WORKFLOW), "gates", str(results)], cwd=cwd, env={},
                               capture_output=True, text=True)
 
-    proc = run([{"batch": "b-1", "gates": [{"id": "g-rows", "status": "passed", "evidence": "recon/u/result.json"}]}])
+    pr = _push_pr(ws)
+    passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
     assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == []
     assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
-    for reports in ([{"batch": "b-1", "gates": []}],                                   # g-rows still pending
-                    [],                                                                  # batch not gathered
-                    [{"batch": "b-1", "gates": [{"id": "g-rows", "status": "passed", "evidence": ""}]}],
-                    [{"batch": "b-9", "gates": []}]):                                  # not in the manifest
+    for reports in ([{"batch": "b-1", "pr_url": pr, "gates": []}],                                   # g-rows still pending
+                    [],                                                                               # batch not gathered
+                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": ""}]}],
+                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": ".migration/recon/u/absent.md"}]}],
+                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": "recon/u/result.json"}]}],
+                    [{"batch": "b-1", "pr_url": "https://github.com/acme/target/pull/7", "gates": [passed]}],  # no such PR
+                    [{"batch": "b-1", "gates": [passed]}],                                            # no PR named
+                    [{"batch": "b-9", "pr_url": pr, "gates": []}]):                                  # not in the manifest
         proc = run(reports)
-        assert proc.returncode != 0, reports
-        assert "g-rows" in proc.stdout or "b-1" in proc.stdout or "b-9" in proc.stderr, reports
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr, reports
+        assert "g-rows" in proc.stdout or "b-1" in proc.stdout or "b-9" in proc.stderr or "pr_url" in proc.stderr, reports
+    proc = run([{"batch": "b-1", "pr_url": "https://github.com/acme/target/pull/7", "gates": [passed]}])
+    assert "pull/7 is not a PR of github.com/acme/target whose head git can fetch" in json.dumps(json.loads(proc.stdout)["batches"]["b-1"]["unmet"])
     proc = run("not a list")
-    assert proc.returncode != 0 and "{batch, gates}" in proc.stderr
+    assert proc.returncode != 0 and "{batch, pr_url, gates}" in proc.stderr
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
 
@@ -245,6 +279,40 @@ def test_gate_list_changed_after_stop_c_halts_before_launch(tmp_path, changed):
     assert proc.returncode != 0 and "gates_sha" in proc.stderr and "STOP C" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_a_gate_marked_passed_in_the_manifest_after_stop_c_halts_before_launch(tmp_path):
+    approved = [{"id": "b-1", "units": ["u"], "gates": [GATE]}]
+    ws, cwd = _workspace(tmp_path, gates_sha=_gates_sha(approved),
+                         gates=[{**GATE, "status": "passed", "evidence": "note.txt"}])
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "gates_sha" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_a_stop_c_approval_launches_one_run_of_its_wave(tmp_path):
+    """The manifest's stop_c row is the one STOP C occurrence that approved this wave; a rerun after a run
+    that recorded it needs STOP C to fire again (a new row, named in the manifest), not the old approval."""
+    spent = {"closed": False, "run_id": "wfr-old", "base_sha": "a" * 40, "stop_c": "D-2"}
+    ws, cwd = _workspace(tmp_path / "spent", mode="rerun", prior_result=spent)
+    proc, calls = _run(cwd, tmp_path / "spent", [_pass_report()])
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert json.loads((ws / ".migration/waves/wave-0.result.json").read_text()) == spent
+
+    ws, cwd = _workspace(tmp_path / "fresh", mode="rerun", prior_result={**spent, "stop_c": "D-1"})
+    proc, calls = _run(cwd, tmp_path / "fresh", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
+    assert _result(ws)["stop_c"] == "D-2"
+
+    ws, cwd = _workspace(tmp_path / "resume", mode="resume", run_id="wfr-old", prior_result=spent)
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-old\n")
+    base = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
+    (ws / ".migration/waves/wave-0.base_sha").write_text(base)
+    proc, calls = _run(cwd, tmp_path / "resume", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr  # the same run continuing is not a second run
 
 
 def _push_pr(ws, n=1):
