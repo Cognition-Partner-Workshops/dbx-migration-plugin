@@ -136,6 +136,20 @@ def selftest() -> int:
     return 0
 
 
+def _load_spec(mapping, canonicalization, family, target_kind, params):
+    """Mapping spec with the family's type map applied for the given target kind — the same
+    shape `run` reconciles, so `estimate` counts the statements the run will issue."""
+    spec = load_mapping_spec(mapping, params)
+    type_map = None
+    tm = load_type_map(canonicalization, family, target_kind) if canonicalization and family else None
+    if tm:
+        try:
+            spec, type_map = apply_type_map(tm, spec)
+        except ConfigError as exc:
+            raise SystemExit(f"type map: {exc}") from None
+    return spec, type_map
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="dbx-recon")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -152,6 +166,13 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--ops-count", type=int, default=0, help="number of Tier 4 recorded ops")
     e.add_argument("--mode", choices=MODES, default="live",
                    help="transactional adds the window, PK-set and schema-parity statements")
+    e.add_argument("--family", choices=SOURCE_FAMILIES,
+                   help="source engine; with --canonicalization its type_map is applied so the "
+                        "estimate counts the statements the run will actually issue")
+    e.add_argument("--canonicalization", type=Path,
+                   help="the source-dialect skill's canonicalization.json (optional; fills "
+                        "undeclared target types like `run` does)")
+    e.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
     e.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
     r = sub.add_parser("run", help="run the recon gate for one unit")
     r.add_argument("--unit", required=True)
@@ -211,7 +232,10 @@ def main(argv: list[str] | None = None) -> int:
 
     params = parse_params(args.param)
     if args.cmd == "estimate":
-        spec = load_mapping_spec(args.mapping, params)
+        if args.canonicalization and not args.family:
+            raise SystemExit("--canonicalization needs --family so its type_map is selected")
+        spec, _ = _load_spec(args.mapping, args.canonicalization, args.family,
+                             args.target_kind, params)
         tol = load_tolerances(args.tolerances)
         row_counts = None
         if args.row_counts is not None:
@@ -242,17 +266,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--family {args.family}: {args.family} source adapter is untested; "
                          "see SKILL.md")
 
-    spec = load_mapping_spec(args.mapping, params)
+    spec, type_map = _load_spec(args.mapping, args.canonicalization, args.family,
+                                args.target_kind, params)
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
-
-    type_map = None
-    tm = load_type_map(args.canonicalization, args.family)
-    if tm:
-        try:
-            spec, type_map = apply_type_map(tm, spec)
-        except ConfigError as exc:
-            raise SystemExit(f"type map: {exc}") from None
 
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
     try:

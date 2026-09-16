@@ -25,27 +25,28 @@ ORACLE_CANON = Path(__file__).resolve().parents[3] / "oracle-plsql" / "canonical
 
 @pytest.fixture
 def oracle_map():
-    return load_type_map(ORACLE_CANON, "oracle")
+    return load_type_map(ORACLE_CANON, "oracle", "databricks")
 
 
 def test_load_type_map_reads_the_real_oracle_file(oracle_map):
     assert oracle_map.family == "oracle" and oracle_map.rules
-    assert load_type_map(ORACLE_CANON, "sqlserver") is None
+    assert load_type_map(ORACLE_CANON, "sqlserver", "databricks") is None
+    assert load_type_map(ORACLE_CANON, "oracle", "lakebase") is not None
     assert type_map_families(ORACLE_CANON) == ["oracle"]
 
 
 def test_load_type_map_none_for_a_list_shaped_file(tmp_path):
     p = tmp_path / "c.json"
     p.write_text(json.dumps([{"rule": "identity"}]))
-    assert load_type_map(p, "oracle") is None
+    assert load_type_map(p, "oracle", "databricks") is None
     assert type_map_families(p) == []
 
 
 def test_load_type_map_refuses_a_malformed_entry(tmp_path):
     p = tmp_path / "c.json"
-    p.write_text(json.dumps({"type_map": {"oracle": {"types": [{"source": "NUMBER"}]}}}))
+    p.write_text(json.dumps({"type_map": {"oracle": {"databricks": {"types": [{"source": "NUMBER"}]}}}}))
     with pytest.raises(ConfigError):
-        load_type_map(p, "oracle")
+        load_type_map(p, "oracle", "databricks")
 
 
 @pytest.mark.parametrize("source_type, expected", [
@@ -114,8 +115,8 @@ def test_apply_type_map_fills_undeclared_and_records_unmapped(oracle_map):
         embed_fields=[FieldMapping("QTY", "qty", "NUMBER(3)", "bigint")],
     )
     new_spec, summary = apply_type_map(oracle_map, spec)
-    assert summary == {"family": "oracle", "filled": ["orders.ORDER_ID"],
-                       "unmapped": ["orders.SHAPE"]}
+    assert summary == {"family": "oracle", "target_kind": "databricks",
+                       "filled": ["orders.ORDER_ID"], "unmapped": ["orders.SHAPE"]}
     fields = new_spec.objects[0].fields
     assert fields[0].target_type == "bigint"
     assert fields[1].target_type == "decimal(10,2)"  # declared and accepted: untouched
@@ -184,7 +185,7 @@ def test_cli_refuses_a_spec_the_type_map_contradicts(tmp_path, monkeypatch):
     cli, argv, _ = _cli_run(tmp_path, monkeypatch,
                             [{"source": "ORDER_ID", "target": "order_id",
                               "source_type": "BIGINT", "target_type": "string"}],
-                            {"rules": [], "type_map": {"sqlserver": SQLSERVER_MAP}})
+                            {"rules": [], "type_map": {"sqlserver": {"databricks": SQLSERVER_MAP}}})
     with pytest.raises(SystemExit, match="^type map:"):
         cli.main(argv)
 
@@ -195,9 +196,9 @@ def test_cli_fills_undeclared_targets_and_records_the_summary(tmp_path, monkeypa
                                      "source_type": "BIGINT", "target_type": ""},
                                     {"source": "QTY", "target": "qty",
                                      "source_type": "INT", "target_type": "int"}],
-                                   {"rules": [], "type_map": {"sqlserver": SQLSERVER_MAP}})
+                                   {"rules": [], "type_map": {"sqlserver": {"databricks": SQLSERVER_MAP}}})
     assert cli.main(argv) == 0
-    assert captured["type_map"] == {"family": "sqlserver",
+    assert captured["type_map"] == {"family": "sqlserver", "target_kind": "databricks",
                                     "filled": ["orders.ORDER_ID"], "unmapped": []}
     assert captured["spec"].objects[0].fields[0].target_type == "bigint"
     assert captured["spec"].objects[0].fields[1].target_type == "int"
@@ -217,3 +218,89 @@ def test_build_result_records_type_map():
     marker = {"family": "sqlserver", "filled": [], "unmapped": []}
     assert build_result("u", "fixture", "m1", "t1", [])["type_map"] is None
     assert build_result("u", "fixture", "m1", "t1", [], type_map=marker)["type_map"] is marker
+
+
+@pytest.fixture
+def oracle_lakebase_map():
+    return load_type_map(ORACLE_CANON, "oracle", "lakebase")
+
+
+@pytest.mark.parametrize("source_type, expected", [
+    ("NUMBER(10,2)", "numeric(10,2)"),
+    ("NUMBER(18,0)", "bigint"),
+    ("NUMBER(20)", "numeric(20,0)"),
+    ("NUMBER", "numeric"),
+    ("TIMESTAMP WITH TIME ZONE", "timestamp with time zone"),
+    ("TIMESTAMP(6)", "timestamp(6)"),
+    ("VARCHAR2(30)", "varchar(30)"),
+    ("CLOB", "text"),
+    ("DATE", "timestamp(0)"),
+])
+def test_expected_target_lakebase(oracle_lakebase_map, source_type, expected):
+    assert expected_target(oracle_lakebase_map, source_type)[0] == expected
+
+
+@pytest.mark.parametrize("source_type, target_type, status", [
+    ("TIMESTAMP WITH TIME ZONE", "timestamp with time zone", "ok"),
+    ("TIMESTAMP WITH TIME ZONE", "timestamptz", "ok"),
+    ("TIMESTAMP WITH TIME ZONE", "timestamp", "contradiction"),
+    ("VARCHAR2(30)", "text", "ok"),
+    ("VARCHAR2(30)", "string", "contradiction"),
+    ("NUMBER(10,2)", "numeric(10,2)", "ok"),
+    ("NUMBER(10,2)", "double precision", "contradiction"),
+])
+def test_audit_field_lakebase(oracle_lakebase_map, source_type, target_type, status):
+    assert audit_field(oracle_lakebase_map, source_type, target_type)[0] == status
+
+
+def test_the_same_spec_disagrees_across_target_kinds(oracle_map, oracle_lakebase_map):
+    assert audit_field(oracle_map, "TIMESTAMP WITH TIME ZONE", "timestamp with time zone")[0] == "contradiction"
+    assert audit_field(oracle_lakebase_map, "TIMESTAMP WITH TIME ZONE", "timestamp with time zone")[0] == "ok"
+
+
+@pytest.mark.parametrize("source_type, expected", [
+    ("NUMBER(5,-2)", "bigint"),       # holds up to 7 integer digits: whole-number rule
+    ("NUMBER(20,-3)", "decimal(23,0)"),
+    ("NUMBER(4,5)", "decimal(5,5)"),  # |x| < 0.1 with 5 fractional digits
+])
+def test_expected_target_normalises_extreme_scales(oracle_map, source_type, expected):
+    assert expected_target(oracle_map, source_type)[0] == expected
+
+
+@pytest.mark.parametrize("source_type, target_type, status, expected", [
+    ("NUMBER(5,-2)", "double", "contradiction", "bigint"),
+    ("NUMBER(4,5)", "decimal(4,5)", "contradiction", "decimal(5,5)"),
+    ("NUMBER(4,5)", "decimal(5,5)", "ok", "decimal(5,5)"),
+])
+def test_audit_field_normalises_extreme_scales(oracle_map, source_type, target_type, status, expected):
+    assert audit_field(oracle_map, source_type, target_type) == (status, expected)
+
+
+def test_apply_reports_the_normalisation(oracle_map):
+    from recon.typemap import read_as
+    assert read_as("NUMBER(5,-2)") == "NUMBER(7,0)" and read_as("NUMBER(10,2)") is None
+    spec = _spec([FieldMapping("AMOUNT", "amount", "NUMBER(5,-2)", "double")])
+    with pytest.raises(ConfigError, match="NUMBER\\(5,-2\\) -> read as NUMBER\\(7,0\\)"):
+        apply_type_map(oracle_map, spec)
+
+
+def test_estimate_applies_the_same_type_map_as_run(tmp_path, monkeypatch, capsys):
+    from recon import cli
+    (tmp_path / "t.json").write_text(json.dumps({"version": "t1"}))
+    canon = {"rules": [], "type_map": {"oracle": {"databricks": {"types": [
+        {"source": "NUMBER(p,s)", "target": "decimal(p,s)"}]}}}}
+    (tmp_path / "c.json").write_text(json.dumps(canon))
+
+    def estimate(target_type):
+        m = {"version": "m1", "objects": [{
+            "object": "orders", "root_table": "ORDERS",
+            "key": {"source": ["ORDER_ID"], "target": ["order_id"]},
+            "fields": [{"source": "AMOUNT", "target": "amount",
+                        "source_type": "NUMBER(10,2)", "target_type": target_type}]}]}
+        (tmp_path / "m.json").write_text(json.dumps(m))
+        assert cli.main(["estimate", "--mapping", str(tmp_path / "m.json"),
+                         "--tolerances", str(tmp_path / "t.json"), "--depth", "full",
+                         "--family", "oracle", "--canonicalization", str(tmp_path / "c.json")]) == 0
+        return json.loads(capsys.readouterr().out)
+
+    assert estimate("") == estimate("decimal(10,2)")

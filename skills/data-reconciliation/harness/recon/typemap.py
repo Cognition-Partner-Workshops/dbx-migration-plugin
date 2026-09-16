@@ -21,11 +21,16 @@ _WS = re.compile(r"\s+")
 # Delta's TIMESTAMP is the session-zoned type, so a zoned spelling never aliases to it.
 _ALIASES = {
     "numeric": "decimal", "dec": "decimal", "integer": "int", "long": "bigint",
-    "real": "float", "double precision": "double",
+    "int8": "bigint", "int4": "int", "real": "float", "float4": "float",
+    "double precision": "double", "float8": "double",
+    "bool": "boolean", "character": "char", "character varying": "varchar",
     "timestamp without time zone": "timestamp_ntz",
     "timestamp with time zone": "timestamp_tz", "timestamptz": "timestamp_tz",
     "timestamp_ltz": "timestamp",
 }
+
+# decimal-like source types whose (p,s) edge shapes normalise before matching
+_DECIMAL_SOURCES = {"number", "decimal"}
 
 
 @dataclass(frozen=True)
@@ -39,20 +44,43 @@ class TypeRule:
 @dataclass(frozen=True)
 class TypeMap:
     family: str
+    target_kind: str
     note: str
     rules: tuple[TypeRule, ...]
 
 
-def _parse(text: str) -> tuple[str, tuple]:
+def _parse(text: str, aliases: bool = True) -> tuple[str, tuple]:
     t = _WS.sub(" ", str(text).strip().lower())
     args = tuple(_arg(a) for group in _PAREN.findall(t) for a in group.split(","))
     name = _WS.sub(" ", _PAREN.sub(" ", t)).strip()
-    return _ALIASES.get(name, name), args
+    return (_ALIASES.get(name, name) if aliases else name), args
 
 
 def _arg(token: str):
     first = token.strip().split(" ")[0] if token.strip() else ""
-    return int(first) if first.isdigit() else first
+    return int(first) if first.lstrip("-").isdigit() else first
+
+
+def _norm_decimal(name: str, args: tuple) -> tuple:
+    """Oracle NUMBER(p,s) edge shapes, as decimal arithmetic, not Oracle specifics:
+    s < 0 rounds to whole 10^-s so (p+|s|, 0) is exact; s > p means |x| < 0.1 with
+    s fractional digits, so (s, s)."""
+    if name in _DECIMAL_SOURCES and len(args) == 2 and all(isinstance(a, int) for a in args):
+        p, s = args
+        if s < 0:
+            return (p + abs(s), 0)
+        if s > p:
+            return (s, s)
+    return args
+
+
+def read_as(source_type: str) -> str | None:
+    """The normalised spelling when _norm_decimal rewrote the args (e.g. NUMBER(7,0))."""
+    name, args = _parse(source_type)
+    norm = _norm_decimal(name, args)
+    if norm == args:
+        return None
+    return f"{name}({','.join(str(a) for a in norm)})".upper()
 
 
 def _match(rule: TypeRule, name: str, args: tuple) -> dict | None:
@@ -77,7 +105,7 @@ def _match(rule: TypeRule, name: str, args: tuple) -> dict | None:
 
 
 def _render(pattern: str, bound: dict) -> str:
-    name, args = _parse(pattern)
+    name, args = _parse(pattern, aliases=False)  # render the kind's own name (numeric stays numeric)
     if not args:
         return name
     return f"{name}({','.join(str(bound.get(a, a)) for a in args)})"
@@ -96,7 +124,7 @@ def _target_matches(dname: str, dargs: tuple, pattern: str) -> bool:
     return True
 
 
-def load_type_map(path: Path, family: str) -> TypeMap | None:
+def load_type_map(path: Path, family: str, target_kind: str) -> TypeMap | None:
     try:
         data = json.loads(Path(path).read_text())
     except OSError:
@@ -104,15 +132,18 @@ def load_type_map(path: Path, family: str) -> TypeMap | None:
     if not isinstance(data, dict):
         return None
     entry = (data.get("type_map") or {}).get(family)
+    if not isinstance(entry, dict):
+        return None
+    entry = entry.get(target_kind)
     if entry is None:
         return None
     rules = []
     for r in entry.get("types", []):
         if not isinstance(r, dict) or not r.get("source") or not r.get("target"):
-            raise ConfigError(f"{path}: type_map.{family} entry missing source/target: {r}")
+            raise ConfigError(f"{path}: type_map.{family}.{target_kind} entry missing source/target: {r}")
         rules.append(TypeRule(source=r["source"], target=r["target"],
                               accepts=tuple(r.get("accepts", ())), p_max=r.get("p_max")))
-    return TypeMap(family=family, note=entry.get("note", ""), rules=tuple(rules))
+    return TypeMap(family=family, target_kind=target_kind, note=entry.get("note", ""), rules=tuple(rules))
 
 
 def type_map_families(path: Path) -> list[str]:
@@ -122,10 +153,19 @@ def type_map_families(path: Path) -> list[str]:
     return sorted((data.get("type_map") or {}).keys())
 
 
+def type_map_targets(path: Path, family: str) -> list[str]:
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        return []
+    entry = (data.get("type_map") or {}).get(family)
+    return sorted(entry.keys()) if isinstance(entry, dict) else []
+
+
 def expected_target(tm: TypeMap, source_type: str) -> tuple[str, tuple[str, ...]] | None:
     name, args = _parse(source_type)
     if not name:
         return None
+    args = _norm_decimal(name, args)
     for rule in tm.rules:
         bound = _match(rule, name, args)
         if bound is not None:
@@ -160,6 +200,7 @@ def audit_spec(tm: TypeMap, spec: MappingSpec) -> list[dict]:
         for f in fields:
             status, expected = audit_field(tm, f.source_type, f.target_type)
             rows.append({"object": label, "source": f.source, "source_type": f.source_type,
+                         "read_as": read_as(f.source_type),
                          "target_type": f.target_type, "expected": expected, "status": status})
     return rows
 
@@ -180,7 +221,9 @@ def apply_type_map(tm: TypeMap, spec: MappingSpec) -> tuple[MappingSpec, dict]:
             return replace(f, target_type=expected)
         if status == "contradiction":
             acc = f" (accepted: {', '.join(accepts)})" if accepts else ""
-            errors.append(f"{name}: {f.source_type} -> declared {f.target_type}, "
+            ra = read_as(f.source_type)
+            src = f"{f.source_type} -> read as {ra}" if ra else f.source_type
+            errors.append(f"{name}: {src} -> declared {f.target_type}, "
                           f"map says {expected}{acc}")
         return f
 
@@ -194,4 +237,5 @@ def apply_type_map(tm: TypeMap, spec: MappingSpec) -> tuple[MappingSpec, dict]:
     if errors:
         raise ConfigError(f"{len(errors)} field(s) contradict the {tm.family} type map: "
                           + "; ".join(errors))
-    return replace(spec, objects=objects), {"family": tm.family, "filled": filled, "unmapped": unmapped}
+    return replace(spec, objects=objects), {"family": tm.family, "target_kind": tm.target_kind,
+                                            "filled": filled, "unmapped": unmapped}
