@@ -41,13 +41,17 @@ def _batch_runtime():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
-                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha"})
+                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "MERGE_EVIDENCE_MODES" for t in node.targets))]
+                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA"}
+                    for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
+        "unit_eligibility": lambda head, units: {u: True for u in units},
         "Counter": Counter,
         "hashlib": hashlib,
+        "re": re,
+        "decision_ledger": lambda: "",
         "REPLAYED": {},
         "CHILD_SCHEMA": {},
         "REPO": ".",
@@ -284,7 +288,7 @@ def test_replayed_failures_do_not_refill_breaker():
         if kwargs["label"] in namespace["REPLAYED"]:
             return {"status": "FAIL", "recon_verdict": "NOT_RUN",
                     "failure_class": "same", "one_line_summary": "replayed"}
-        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live",
+        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
                 "pr_url": "https://example/pr/held", "branch": "feature/held",
                 "changed_paths": ["src/held.sql"], "one_line_summary": "held passed"}
 
@@ -309,7 +313,7 @@ def test_pass_without_pr_is_downgraded():
     namespace = _batch_runtime()
 
     async def agent(prompt, **kwargs):
-        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live",
+        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
                 "branch": "feature/no-url", "one_line_summary": "passed"}
 
     namespace["agent"] = agent
@@ -344,17 +348,187 @@ def _run_one(namespace, report):
 
 @pytest.mark.parametrize("mode", ["live", "snapshot", "transactional"])
 def test_pass_with_merge_evidence_mode_is_kept(mode):
-    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode,
+    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode, "merge_eligible": True,
                                       "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"],
                                       "one_line_summary": "ok"})
     assert out["status"] == "PASS" and "failure_class" not in out
+    assert out["merge_authority"] == {"kind": "harness", "decision_id": None}
 
 
 @pytest.mark.parametrize("mode", ["fixture", "continuous", None])
 def test_pass_without_merge_evidence_is_downgraded(mode):
-    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode,
+    out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode, "merge_eligible": True,
                                       "pr_url": "https://example/pr/1", "branch": "f", "one_line_summary": "ok"})
     assert out["status"] == "FAIL" and out["failure_class"] == "non_merge_evidence"
+
+
+# ---------------------------------------------------------------- merge authority (WS3.2)
+
+LEDGER = ("| D-6 | 2024-05-01 | user:U1 widen tolerance for orders_dim | \n"
+          "| D-7 | 2024-05-02 | user:U1 merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
+          "| D-8 | 2024-05-02 | default-accepted: merge_override for other_unit |\n"
+          "| D-70 | 2024-05-03 | user:U1 merge_override for u2 |\n")
+
+
+def _ns_with_ledger(text=LEDGER):
+    ns = _batch_runtime()
+    ns["decision_ledger"] = lambda: text
+    return ns
+
+
+_pass_nomerge = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "pr_url": "https://example/pr/1",
+                 "branch": "f", "changed_paths": ["src/a.sql"], "one_line_summary": "ok"}
+
+
+@pytest.mark.parametrize("report", [
+    _pass_nomerge,
+    {**_pass_nomerge, "merge_eligible": False},
+    {**_pass_nomerge, "merge_eligible": "true"},
+    {**_pass_nomerge, "merge_eligible": 1},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "harness", "decision_id": "D-7"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-6"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-8"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "7"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": "D-7"},
+])
+def test_pass_without_merge_eligible_true_needs_a_ledger_override(report):
+    out = _run_one(_ns_with_ledger(), report)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    assert "merge_override" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
+    assert "merge_authority" not in out or out["merge_authority"]["kind"] != "human_override"
+
+
+def test_human_override_recorded_in_the_ledger_for_the_unit_keeps_the_pass():
+    out = _run_one(_ns_with_ledger(), {**_pass_nomerge, "merge_eligible": False,
+                                       "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+    assert out["status"] == "PASS" and "failure_class" not in out
+    assert out["merge_authority"] == {"kind": "human_override", "decision_id": "D-7"}
+
+
+def test_override_does_not_bypass_the_merge_evidence_mode_gate():
+    out = _run_one(_ns_with_ledger(), {**_pass_nomerge, "recon_mode": "fixture", "merge_eligible": False,
+                                       "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+    assert out["status"] == "FAIL" and out["failure_class"] == "non_merge_evidence"
+
+
+def test_override_with_no_ledger_file_fails_closed():
+    out = _run_one(_ns_with_ledger(""), {**_pass_nomerge, "merge_eligible": False,
+                                         "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+
+
+def test_override_decision_row_must_name_every_unit_and_say_merge_override():
+    override_decision = _batch_runtime()["override_decision"]
+    assert override_decision("D-7", ["u"], LEDGER)
+    assert not override_decision("D-7", ["u", "u2"], LEDGER)
+    assert not override_decision("D-7", ["u"], LEDGER.replace("merge_override", "merge override"))
+    assert not override_decision("D-70", ["u"], LEDGER)      # D-70 names u2, not u
+    assert not override_decision("D-7", ["u2"], LEDGER)      # D-7 is not a prefix match for D-70
+    assert override_decision("D-70", ["u2"], LEDGER)
+    assert not override_decision("D-7", ["orders"], "D-7 merge_override for orders_dim")
+    assert not override_decision(None, ["u"], LEDGER) and not override_decision("D-", ["u"], LEDGER)
+
+
+def test_override_decision_row_names_units_in_its_text_not_in_its_metadata():
+    override_decision = _batch_runtime()["override_decision"]
+    row = "| D-7 | 2024-05-02 | user:U1 merge_override for u |\n"
+    assert override_decision("D-7", ["u"], row)
+    assert not override_decision("D-7", ["U1"], row)                 # the provenance id is not a unit
+    assert not override_decision("D-7", ["2024-05-02"], row)         # nor the date
+    assert not override_decision("D-7", ["u", "U1"], row)
+    assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 merge_override for u and v (feed gap) |")
+    # column order is the ledger author's: units before the marker count too
+    assert override_decision("D-7", ["orders"], "| D-7 | units: orders | user:U1 | merge_override for an accepted feed gap |")
+    assert override_decision("D-7", ["u", "v"], "| 2024-05-02T10:00:00Z | D-7 | u, v | user:U1 | merge_override |")
+    # but never a unit that is only the row's id, date or author
+    assert not override_decision("D-7", ["D-7"], "| D-7 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["2024-05-02"], "| D-7 | 2024-05-02 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["U1"], "| D-7 | user:U1 | merge_override for u |")
+    assert not override_decision("D-7", ["u"], "| D-7 | user:u | merge_override for v |")
+
+
+def test_override_decision_is_the_row_whose_id_cell_is_the_decision_not_a_row_that_mentions_it():
+    """A decision id authorizes only through its own row: one that cites it in prose (supersedes D-7,
+    see D-7) is another decision, and D-7 must be looked up as a row of its own."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u, supersedes D-7 |")
+    assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u | D-7 |")
+    assert not override_decision("D-7", ["u"], "D-7 user:U1 merge_override for u")   # prose, not a table row
+    assert override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u")   # edge pipes are optional
+    assert override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u |")
+    assert override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for v |\n| D-7 | user:U1 | merge_override for u |")
+
+
+def test_override_decision_counts_a_unit_named_like_metadata_when_the_row_names_it_in_its_text():
+    """Ids, dates and provenance are excluded by cell, not by shape: a unit called D-7, 2024-05-02 or
+    default-accepted is named like any other when it appears in the row's text."""
+    override_decision = _batch_runtime()["override_decision"]
+    assert override_decision("D-9", ["D-7"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for D-7 |")
+    assert override_decision("D-9", ["2024-05-02"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for 2024-05-02 |")
+    assert override_decision("D-9", ["default-accepted"], "| D-9 | user:evt-1 | merge_override for default-accepted |")
+    assert not override_decision("D-9", ["D-7"], "| D-9 | D-7 | user:evt-1 | merge_override for u |")   # a cell that is only an id
+    assert not override_decision("D-9", ["2026-09-16"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for u |")
+    assert not override_decision("D-9", ["evt-1"], "| D-9 | user:evt-1 merge_override for u |")
+
+
+def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
+    ns = _batch_runtime()
+    ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
+    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 merge_override for u, u2, u3 |\n"
+
+    def run(report):
+        async def agent(prompt, **kwargs):
+            return dict(report)
+        ns["agent"] = agent
+        batch = {"id": "b", "units": ["u", "u2", "u3"], "write_targets": ["t"], "brief": "b"}
+        return asyncio.run(ns["run_batch"](batch, asyncio.Semaphore(1), ns["Breaker"](3)))
+
+    base = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
+            "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": [], "one_line_summary": "ok"}
+    out = run(base)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "merge_authority" not in out
+    assert "recon/u2/result.json" in out["one_line_summary"] and "merge_eligible=False" in out["one_line_summary"]
+    assert "recon/u3/result.json" in out["one_line_summary"] and "missing or malformed" in out["one_line_summary"]
+    out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
+
+
+def test_override_decision_row_needs_human_provenance():
+    override_decision = _batch_runtime()["override_decision"]
+    assert not override_decision("D-8", ["other_unit"], LEDGER)          # default-accepted is not a human
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "bot:"))
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "user"))
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:U1", "user:"))      # user: with no event id
+    assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 merge", "user:a.b@x.io merge"))
+
+
+def test_override_decision_marker_does_not_stand_in_for_a_unit_of_that_name():
+    """A unit may be called merge_override (UNIT_ID allows it); the row's one authority marker is not then
+    also the mention of that unit. The row has to name it a second time."""
+    override_decision = _batch_runtime()["override_decision"]
+    row = "| D-9 | 2024-05-03 | user:U2 | merge_override for an accepted feed gap |\n"
+    assert not override_decision("D-9", ["merge_override"], row)
+    assert not override_decision("D-9", ["merge_override", "u"], row.replace("gap", "gap in u"))
+    assert override_decision("D-9", ["merge_override"], row.replace("gap", "gap in merge_override"))
+    assert override_decision("D-9", ["merge_override", "u"], row.replace("gap", "gap in merge_override and u"))
+
+
+def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():
+    src = WORKFLOW.read_text()
+    tree = ast.parse(src)
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
+    assert "merge_eligible" in schema["required"] and schema["properties"]["merge_eligible"]["type"] == "boolean"
+    assert schema["properties"]["merge_authority"]["properties"]["kind"]["enum"] == ["harness", "human_override"]
+    ns = _prompt_ns(_manifest())
+    child = ns["child_prompt"](_manifest()["batches"][0])
+    assert "merge_eligible" in child and "merge_override" in child and "06_decisions.md" in child
+    passed = [{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1",
+               "merge_authority": {"kind": "human_override", "decision_id": "D-7"}}]
+    verify = ns["verify_prompt"](passed, False)
+    assert "human_override" in verify and "D-7" in verify
 
 
 def test_prompts_name_every_merge_evidence_mode():
@@ -396,8 +570,8 @@ LEDGER_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targe
 
 
 def _pass(**extra):
-    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "pr_url": "https://example/pr/1",
-            "branch": "f", "one_line_summary": "ok", **extra}
+    return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
+            "pr_url": "https://example/pr/1", "branch": "f", "one_line_summary": "ok", **extra}
 
 
 def test_clean_diff_stays_pass_and_recon_evidence_for_its_own_units_is_allowed():
