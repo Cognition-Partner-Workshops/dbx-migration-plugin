@@ -288,6 +288,17 @@ def test_preflight_halts_until_every_declared_sibling_pipeline_has_published_a_m
         check(tmp_path, {"pipelines": {"orders": 1, "billing": 1}}, published)
 
 
+def test_only_wave_dash_files_are_manifests_on_origin(tmp_path):
+    """The pointer file or any other JSON committed under waves/ is not a manifest origin holds and disk lacks."""
+    is_manifest = _functions()["_is_manifest"]
+    assert is_manifest("wave-orders-1.json") and is_manifest("wave-1.json")
+    assert not is_manifest("current.json") and not is_manifest("wave-1.result.json")
+    check = _functions()["check_pipelines_published"]
+    orders = json.dumps({"batches": [B1], "pipelines": {"orders": 1}})
+    (tmp_path / "wave-orders-1.json").write_text(orders)
+    check(tmp_path, {"pipelines": {"orders": 1}}, {"wave-orders-1.json": orders, "current.json": "{}"})
+
+
 def test_preflight_halts_on_a_manifest_origin_does_not_hold_or_holds_differently(tmp_path):
     """A manifest that is only local, or edited since it was pushed, is one no sibling can see."""
     check = _functions()["check_pipelines_published"]

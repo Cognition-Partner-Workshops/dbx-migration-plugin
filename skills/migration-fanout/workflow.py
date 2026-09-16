@@ -854,7 +854,8 @@ def check_wave_tag(tag, manifest):
 
 
 def _is_manifest(name):
-    return name.endswith(".json") and TAG_RE.fullmatch(name[len("wave-"):-len(".json")]) is not None
+    return (name.startswith("wave-") and name.endswith(".json")
+            and TAG_RE.fullmatch(name[len("wave-"):-len(".json")]) is not None)
 
 
 def published_manifests():
