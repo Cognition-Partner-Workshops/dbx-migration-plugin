@@ -45,11 +45,9 @@ from pathlib import Path
 REQUIRED_FILES = (
     "00_context.md",
     "01_conventions.md",
-    "02_glossary.md",
     "03_recon_tolerances.md",
     "03_recon_tolerances.json",
     "04_dependency_register.md",
-    "05_progress.md",
     "06_decisions.md",
     "07_access_checklist.md",
     "allowed_targets.json",
@@ -166,9 +164,17 @@ def check_workspace(ws: Path) -> Check:
     mig = ws / ".migration"
     if not mig.is_dir():
         return Check("workspace", "fail", f"{mig} missing; run 1-migration_setup first")
-    missing = [f for f in REQUIRED_FILES if not (mig / f).exists()]
+    missing = [f for f in REQUIRED_FILES if not (mig / f).is_file()]
     if missing:
         return Check("workspace", "fail", f".migration/ incomplete: missing {missing}", {"missing": missing})
+    context = (mig / "00_context.md").read_text(errors="replace")
+    if not re.search(r"(?m)^##\s+Glossary\b", context) and not (mig / "02_glossary.md").is_file():
+        return Check(
+            "workspace",
+            "fail",
+            "00_context.md has no '## Glossary' section (02_glossary.md was folded into it)",
+            {"missing": ["00_context.md#Glossary"]},
+        )
     return Check("workspace", "ok", f".migration/ has all {len(REQUIRED_FILES)} required files")
 
 
@@ -176,7 +182,7 @@ def check_stop_mode(ws: Path) -> Check:
     text = ""
     for name in ("00_context.md", "01_conventions.md"):
         p = ws / ".migration" / name
-        if p.exists():
+        if p.is_file():
             text += p.read_text(errors="replace")
     for line in text.splitlines():
         low = line.lower()

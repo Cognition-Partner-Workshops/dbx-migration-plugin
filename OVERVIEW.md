@@ -15,7 +15,7 @@ The target is constant, so target knowledge is built once (the official `databri
 | Step | Macro | Does | Human |
 |---|---|---|---|
 | 1 | `!dbx_migration_setup` | target profiles, `.migration/` workspace, tolerances, access checklist, allowlist | STOP A |
-| 2 | `!dbx_estate_inventory` | asset census, lineage DAG, coverage proof, shared-object map | STOP B (only if intake did not fix pipeline order) |
+| 2 | `!dbx_estate_inventory` | asset census, lineage DAG, coverage proof, shared-object map | STOP B (skipped only when intake fixed pipeline and boundary; see `references/contract.md`) |
 | 3 | `!dbx_pipeline_analysis` | unit inventory, lineage waves, type dictionary, dependency sweep, batches | |
 | 4 | `!dbx_migration_plan` | plan, every dependency decided, access requests fired, wave manifests | STOP C |
 | 5 | `!dbx_unit_migration` | one fan-out child per unit batch | |

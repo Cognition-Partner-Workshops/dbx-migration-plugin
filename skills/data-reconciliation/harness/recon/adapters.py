@@ -905,7 +905,7 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         except Exception as exc:
             raise DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})") from exc
 
-    rows = q("information_schema.table_constraints", 
+    rows = q("information_schema.table_constraints",
         f"SELECT tc.constraint_type, tc.constraint_name, kcu.column_name, "
         "uk.table_schema, uk.table_name, uk.column_name "
         f"FROM {catalog}.information_schema.table_constraints tc "

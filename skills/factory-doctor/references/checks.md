@@ -5,7 +5,7 @@ and stop mode, which `workflow.py` compares before launch. Children and the veri
 identity and host and stop on any fail or unverified hook/security result.
 
 ### `workspace`
-Sub-checks: `workspace` verifies every required `.migration` setup file from `1-migration_setup`;
+Sub-checks: `workspace` verifies every required `.migration` setup file from `1-migration_setup` and requires a `## Glossary` section in `00_context.md` or legacy `02_glossary.md`;
 `stop_mode` verifies `hard|soft` in `00_context.md` or `01_conventions.md`.
 ### `allowed_targets`
 Sub-checks: `allowed_targets` parses and passes `hooks/dbx_guard.py` (warn for `guard_mode: warn`
