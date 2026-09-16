@@ -19,7 +19,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 - [ ] Fixture-first: develop against the fixture copy; read the real source once inside the legacy-query cap.
 - [ ] Check counts, aggregates, keyed diffs, report output, declared source volumes, populations, and idempotency evidence.
 - [ ] Launch heavy backfills/recon as jobs, record run IDs, and never babysit polling in-session.
-- [ ] On FAIL, capture evidence, fix converted code only, rerun only the failed check, and stop after three full runs.
+- [ ] On FAIL, capture evidence, fix converted code only, rerun `dbx-recon`, and stop after three full runs.
 
 ### Review and deliver
 - [ ] Self-review every gate, tolerance, unverified path, owner, severity, and closure gate; stop after three review rounds and escalate.

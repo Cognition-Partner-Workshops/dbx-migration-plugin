@@ -3,7 +3,7 @@ Playbook: Independently verify one completed wave and publish its evidence for w
 ## Procedure
 1. Use a fresh verifier session with the plan, manifest, child results, tolerances, source-volume declaration, and target allowlist; never grade your own conversion.
 2. Choose LIVE when federation or an approved live path exists; use `--mode snapshot` for a customer export or in-perimeter dual-run when it does not. Record DEGRADED and the D10 reason.
-3. Run Tier 1 counts/aggregates, Tier 2 keyed samples and range fingerprints, then Tier 3 row diffs only for narrowed failures; check schema, nullability, precision, timezone, collation, and deletes.
+3. Run Tier 1 row counts, Tier 2 per-column aggregates, and Tier 3 keyed row diffs at the manifest's required depth; check schema, nullability, precision, timezone, collation, and deletes.
 4. Keep all federated queries, partition copies, and legacy extracts under the recorded legacy-query concurrency cap; wide pulls use size tiers, not ad hoc scans.
 5. Probe adversarial boundaries: empty/all-null, duplicate keys, late arrivals, deletes, timezone/DST, decimal extremes, Unicode/collation, skew, retries, and reruns.
 6. Compare cross-unit totals and consumer outputs; for ML score parity compare features, seed/model version, distributions, and agreed numeric tolerance.
