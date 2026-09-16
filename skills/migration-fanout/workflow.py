@@ -34,6 +34,10 @@ Manifest shape (written by the plan playbook, read here):
   "breaker_threshold": 3,
   "auto_merge": false,
   "max_minutes": 45,                          # per-child session budget; a batch may override it
+  "doctor_max_age": 15,                        # optional; minutes a child may reuse the wave's signed
+                                              # .doctor.json source-side rows for (at most 1440)
+  "degraded": false,                           # optional; a true wave is verified at the structural tier
+                                              # only (no live source read)
   "verify_depth": "sampled",                  # optional; verifier Tier 3 depth for the wave:
                                               # sampled (default) | full. Per-batch "verify_depth"
                                               # overrides it (plan sets full on D4/finance-critical).
@@ -324,14 +328,17 @@ def ledger_waiver(gate_id, units, ledger, stop_c):
     return None
 
 
-def declared_gates_sha(wave, batches):
+def declared_gates_sha(wave, batches, degraded=False):
     """What STOP C approved, whole: the wave, each batch's units and every gate row as declared (id, kind,
-    status, evidence, decision_id). Outcomes reach the result through the children's reports, never by
-    editing the manifest, so any edit to it after STOP C changes the hash and halts."""
+    status, evidence, decision_id), and `degraded: true` when the wave verifies at the structural tier only.
+    Outcomes reach the result through the children's reports, never by editing the manifest, so any edit to
+    it after STOP C changes the hash and halts."""
     declared = {"wave": wave, "batches": {
         b["id"]: {"units": sorted(b["units"]),
                   "gates": [[g["id"], g["kind"], g["status"], g["evidence"], g.get("decision_id")] for g in b["gates"]]}
         for b in batches}}
+    if degraded:
+        declared["degraded"] = True
     return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -439,6 +446,12 @@ def validate_manifest(m, doctor=None):
     if "close_minutes" in m and (isinstance(m["close_minutes"], bool) or not isinstance(m["close_minutes"], int)
                                or not 0 < m["close_minutes"] <= 60):
         raise SystemExit("manifest key 'close_minutes' must be a positive integer of at most 60 minutes")
+    if "doctor_max_age" in m and (isinstance(m["doctor_max_age"], bool)
+                                 or not isinstance(m["doctor_max_age"], int)
+                                 or not 0 < m["doctor_max_age"] <= 1440):
+        raise SystemExit("manifest key 'doctor_max_age' must be a positive integer of at most 1440 minutes")
+    if "degraded" in m and not isinstance(m["degraded"], bool):
+        raise SystemExit("manifest key 'degraded' must be a boolean")
     if "secrets" in m and (not isinstance(m["secrets"], list)
                            or not all(isinstance(s, str) for s in m["secrets"])):
         raise SystemExit("wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
@@ -508,12 +521,12 @@ def validate_manifest(m, doctor=None):
     if not (isinstance(m.get("stop_c"), str) and DECISION_ID.fullmatch(m["stop_c"])):
         raise SystemExit("manifest 'stop_c' must be the D-<n> row of 06_decisions.md that resolved STOP C for this wave "
                          "(the row that records its gates_sha)")
-    want = declared_gates_sha(m["wave"], m["batches"])
+    want = declared_gates_sha(m["wave"], m["batches"], m.get("degraded") is True)
     if m.get("gates_sha") != want:
         raise SystemExit(f"manifest 'gates_sha' is {m.get('gates_sha')!r} but the declared gate list hashes to {want}: "
                          "record that value at STOP C with the approved gates; a gate renamed, added, dropped, swapped "
-                         "for another kind or given another status or evidence since is a plan change, not a child's "
-                         "call, so this run halts")
+                         "for another kind or given another status or evidence since, or the wave declared DEGRADED "
+                         "since, is a plan change, not a child's call, so this run halts")
     src = m.get("source")
     if src is not None and (not isinstance(src, dict) or not isinstance(src.get("params", {}), dict)
                             or not all(isinstance(v, str) and WORD.fullmatch(v) for v in
@@ -1952,6 +1965,10 @@ def capability_block(units):
         "and verifies every unit's .migration/units/<unit_id>/mapping_spec.json itself), "
         f"--expect-host {shlex.quote(caps['host'])} (the workspace the contract pins; the same principal "
         "resolved against another workspace is a fail), "
+        f"--reuse-record .migration/waves/wave-{TAG}.doctor.json when that file is in the checkout "
+        "(the orchestrator's signed record; the doctor reuses its source-side rows only if the record "
+        f"is fresher than doctor_max_age minutes — {MANIFEST.get('doctor_max_age', 15)} here — bound to "
+        "this manifest and signed for this identity, otherwise it runs in full), "
         + (f"{source_flags} (the source the doctor checks for write access; the same secret your recon "
            "gate passes as --source-dsn-secret)" if source_flags else
            "--source-secret naming the secret your recon gate passes as --source-dsn-secret, and the "
@@ -1978,14 +1995,26 @@ def verify_prompt(passed):
         "loosened a tolerance must fail here). For each PR run `git diff --name-only <base>...<head>`: any "
         ".migration/ path outside .migration/recon/<unit_id>/ is a FAIL for that unit with finding "
         "ledger_tampered. "
-        f"Mark a unit PASS only if you re-ran the harness in one of {list(MERGE_EVIDENCE_MODES)} "
-        "(the same mode the child used: transactional for Lakebase/operational units) and result.json "
-        "says merge_eligible=true. A batch listed with merge_authority kind human_override was cleared by the "
+        + ("This wave is declared DEGRADED (no live source read): run the harness with `--mode structural` "
+           "for every unit (Tier 0 `structural_parity` only: keys, constraints, indexes, triggers, identity "
+           "columns, grants, read from both catalogs, no row tier) and mark the unit PASS only when that run's "
+           "result.json says verdict=PASS and its merge_block_reasons is exactly [\"mode\"]: a structural_gap "
+           "or warnings entry means a catalog the harness could not read or a category it does not cover, "
+           "which is unverified structure, so FAIL with finding structure_unverifiable; verdict=FAIL is FAIL "
+           "with finding structural_drift. Its result.json is never merge_eligible and the mode reason alone is "
+           "expected here. Do not re-run Tier 1-3 and do not lower or raise a "
+           "depth: the child's snapshot row parity stands. "
+           if MANIFEST.get("degraded") is True else
+           f"Mark a unit PASS only if you re-ran the harness in one of {list(MERGE_EVIDENCE_MODES)} "
+           "(the same mode the child used: transactional for Lakebase/operational units) and result.json "
+           "says merge_eligible=true. "
+           f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
+           "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
+           "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. ")
+        + "A batch listed with merge_authority kind human_override was cleared by the "
         "named D-<n> merge_override row of .migration/06_decisions.md: mark it PASS on a PASS verdict even if "
         "merge_eligible is false, and cite the decision id in findings. "
-        f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
-        "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
-        "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. Each batch lists "
+        "Each batch lists "
         "its acceptance gates with the evidence the child gave; open the evidence of every passed gate and FAIL "
         "the unit if it does not show what the gate's kind requires. "
         "Sum result.json['cost'] over your runs into recon_cost.\n"

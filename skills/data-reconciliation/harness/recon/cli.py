@@ -440,8 +440,12 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(row_counts, dict) or any(
                     isinstance(v, bool) or not isinstance(v, int) for v in row_counts.values()):
                 raise SystemExit(f"{args.row_counts} must be a JSON object of integer row counts")
-        print(json.dumps(estimate_cost(spec, tol, args.depth, row_counts, args.ops_count,
-                                       mode=args.mode), indent=2))
+        try:
+            est = estimate_cost(spec, tol, args.depth, row_counts, args.ops_count,
+                                mode=args.mode, family=args.family, target_kind=args.target_kind)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        print(json.dumps(est, indent=2))
         return 0
 
     allowed_catalogs = _load_allowed_targets(args.allowed_targets_file)

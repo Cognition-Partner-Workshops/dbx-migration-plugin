@@ -67,6 +67,16 @@ Analytical-track deltas (deploy/schedule, pipelines, governance): [references/an
   migration catalog, USE elsewhere, no admin roles), cutover (customer-held, STOP E only, never in
   a child). Never request or use account-admin or workspace-admin permissions; escalate instead.
 
+### Platform 5xx on bundle deploy and run
+
+A `databricks bundle deploy` or `databricks bundle run` that fails with an HTTP 5xx or
+platform-unavailable response is retried at most twice — three attempts total — with a backoff of
+30 s then 120 s. Nothing else is retried: a 4xx, a validation error, a failing job run, or a guard
+block is a finding, not a retry. After the third 5xx the session stops and reports `status=BLOCKED`
+with failure class `platform_5xx` and the last request id in `one_line_summary`. The retries never
+widen the write scope and never switch identity, and the three attempts count as one for the
+circuit breaker (rule in `skills/install-dbx-factory/references/contract.md`).
+
 ### Write scope
 - Migration work writes only to the migration catalog recorded in `.migration/00_context.md`, and a
   child writes only to the targets in its brief (`.migration/allowed_targets.json` is the allowlist

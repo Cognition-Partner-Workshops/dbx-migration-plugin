@@ -5,7 +5,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 ### Before conversion
 - [ ] Read the complete hand-off: units, profiles, dictionary, dependencies, targets, branch, gate, tolerances, and `.migration/` path.
 - [ ] Read the dialect skill's `SKILL.md` and `references/contract.md` fan-out guards before the first unit.
-- [ ] Run `factory-doctor --role child` with the capability contract, every unit, source secret/parameters, and hook probe; report BLOCKED on any failed check.
+- [ ] Run `factory-doctor --role child` with the capability contract, every unit, source secret/parameters, and hook probe — or `--reuse-record` the orchestrator's signed record per `factory-doctor/SKILL.md`; report BLOCKED on any failed check.
 - [ ] At the brief's `max_minutes` budget, stop and report BLOCKED with findings (what landed, what did not, what blocked it); never grind past it.
 - [ ] Confirm every write target is declared; never edit `.migration/` outside `.migration/recon/<unit_id>/`, never edit `allowed_targets.json`, never write the ledger.
 - [ ] Never edit `05_progress.md`; it is generated from wave results, and report every changed path in `result.json`.
@@ -14,6 +14,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 - [ ] Convert each unit with CORE + workload profile + dialect skill; record systematic gaps as SKILL FEEDBACK.
 - [ ] Implement only the decided dependency mechanisms for this batch; never touch legacy sources.
 - [ ] Deploy only to the isolated namespace, idempotently, with Lakeflow Jobs owned by bundle/IaC and schedule PAUSED.
+- [ ] A platform 5xx on `databricks bundle deploy`/`bundle run` follows the bounded retry rule in `skills/target-routing/SKILL.md`.
 
 ### Reconcile
 - [ ] Run `dbx-recon` fixture-first with declared endpoints and fail closed when endpoints are missing; use one batched check window.

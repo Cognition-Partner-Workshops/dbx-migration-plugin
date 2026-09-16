@@ -11,4 +11,4 @@ Playbook: Intake code, models, and prediction consumers before selecting migrati
 | Allowlist | write `.migration/allowed_targets.json` (catalogs, legacy_sources) before any source probe; authorized legacy writes carry `DBX_DECISION=D-<id>` — see contract.md |
 
 ## Routing
-Use `CORE` + the matching `PIPELINE`, `ML-SCORING`, or `CONSUMER` profile + `DATA / DEPENDENCY`. Preserve data/model split and prediction parity through setup, inventory, analysis, and plan.
+Use `CORE` + the matching `PIPELINE`, `ML-SCORING`, or `CONSUMER` profile + `DATA / DEPENDENCY`. Preserve data/model split and prediction parity through setup, inventory, analysis, and plan. Bundle deploys and runs that hit a platform 5xx follow the bounded retry rule in `skills/target-routing/SKILL.md`.
