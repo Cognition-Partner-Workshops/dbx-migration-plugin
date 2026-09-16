@@ -337,12 +337,13 @@ def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(t
 
 def test_gates_subcommand_applies_the_review_clean_rule_at_the_pr_head(tmp_path):
     """A hand-gathered small wave is held to the same review-clean rule as a workflow child: review_clean=true
-    for review_head equal to the PR head git fetches, or a human's review_waived row naming the units."""
-    ws, cwd = _workspace(tmp_path, doctor=False,
-                         decisions="| D-5 | user:U1 | review_waived for u, the finding is a false positive |\n")
+    for review_head equal to the PR head git fetches, or a human's review_waived row, below this run's STOP C row,
+    naming that head and the units."""
+    ws, cwd = _workspace(tmp_path, doctor=False)
     results = tmp_path / "results.json"
     assert _workflow(cwd, "reserve").returncode == 0
     pr = _push_pr(ws)
+    _waive_review(ws, "D-5", "d" * 40)
     passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
 
     def run(**report):
@@ -353,17 +354,19 @@ def test_gates_subcommand_applies_the_review_clean_rule_at_the_pr_head(tmp_path)
 
     for dirty in ({}, {"review_clean": False, "review_head": _PR_HEADS[pr]}, {"review_clean": "yes", "review_head": _PR_HEADS[pr]},
                   {"review_clean": True}, {"review_clean": True, "review_head": "d" * 40},
-                  {"review_clean": False, "review_waiver": {"decision_id": "D-4"}}):
+                  {"review_clean": False, "review_waiver": {"decision_id": "D-4"}},
+                  {"review_clean": False, "review_waiver": {"decision_id": "D-5"}}):
         rc, b = run(**dirty)
         assert rc != 0 and len(b["unmet"]) == 1 and "review_waived" in b["unmet"][0] and b["review_waiver"] is None, dirty
         assert ("is not the gated PR head" in b["unmet"][0]) == (dirty.get("review_clean") is True), dirty
+        assert _PR_HEADS[pr] in b["unmet"][0] and "D-2" in b["unmet"][0], dirty
     rc, b = run(review_clean=True, review_head=_PR_HEADS[pr])
     assert rc == 0 and b["unmet"] == [] and b["review_waiver"] is None
 
-    ws, cwd = _workspace(tmp_path / "waived", doctor=False,
-                         decisions="| D-5 | user:U1 | review_waived for u, the finding is a false positive |\n")
+    ws, cwd = _workspace(tmp_path / "waived", doctor=False)
     assert _workflow(cwd, "reserve").returncode == 0
     pr = _push_pr(ws)
+    _waive_review(ws, "D-5", _PR_HEADS[pr])
     rc, b = run(review_clean=False, review_waiver={"decision_id": "D-5"})
     assert rc == 0 and b["unmet"] == [] and b["review_waiver"] == {"decision_id": "D-5"}
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
@@ -1110,9 +1113,16 @@ def test_a_pass_needs_review_clean_or_a_review_waived_ledger_row(tmp_path):
     assert _result(ws)["batches"][0]["failure_class"] == "review_open"
 
 
+def _waive_review(ws, decision_id, head, above_stop_c=False):
+    ledger = ws / ".migration" / "06_decisions.md"
+    row = f"| {decision_id} | user:U1 | review_waived for u at {head}, the finding is a false positive |\n"
+    ledger.write_text(row + ledger.read_text() if above_stop_c else ledger.read_text() + row)
+
+
 def test_a_review_waived_ledger_row_carries_a_dirty_review(tmp_path):
-    ws, cwd = _workspace(tmp_path, decisions="| D-5 | user:U1 | review_waived for u, the finding is a false positive |\n")
+    ws, cwd = _workspace(tmp_path)
     pr = _push_pr(ws)
+    _waive_review(ws, "D-5", _PR_HEADS[pr])
     proc, calls = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False,
                                                    review_waiver={"decision_id": "D-5"}), _verify_report()])
     assert proc.returncode == 0, proc.stderr
@@ -1120,6 +1130,20 @@ def test_a_review_waived_ledger_row_carries_a_dirty_review(tmp_path):
     assert batch["status"] == "PASS" and batch["review_waiver"] == {"decision_id": "D-5"}
     verify_prompt = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
     assert "review_waiver" in verify_prompt
+
+
+@pytest.mark.parametrize("stale", ["other_head", "earlier_run"])
+def test_a_review_waiver_binds_the_reviewed_head_and_this_runs_stop_c(tmp_path, stale):
+    """A review_waived row dismisses one wrong finding: it names the PR head it was written for and sits below
+    this run's STOP C row, so a waiver for an earlier PR or an earlier run does not carry a new dirty review."""
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    _waive_review(ws, "D-5", "d" * 40 if stale == "other_head" else _PR_HEADS[pr], above_stop_c=stale == "earlier_run")
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False, review_waiver={"decision_id": "D-5"})])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open" and "review_waiver" not in batch
+    assert _PR_HEADS[pr] in batch["one_line_summary"] and "D-2" in batch["one_line_summary"]
 
 
 def test_a_merge_override_row_does_not_waive_the_review(tmp_path):
@@ -1148,8 +1172,9 @@ def test_a_clean_review_must_name_the_pr_head_it_cleared(tmp_path):
     batch = _result(ws)["batches"][0]
     assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
 
-    ws, cwd = _workspace(tmp_path / "waived", decisions="| D-5 | user:U1 | review_waived for u |\n")
+    ws, cwd = _workspace(tmp_path / "waived")
     pr = _push_pr(ws)
+    _waive_review(ws, "D-5", _PR_HEADS[pr])
     proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr, review_head="0" * 40,
                                                                review_waiver={"decision_id": "D-5"}),
                                                 _verify_report()])

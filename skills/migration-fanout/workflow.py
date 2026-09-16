@@ -299,19 +299,24 @@ def override_decision(decision_id, units, ledger, word="merge_override"):
     return False
 
 
+def rows_after(ledger, stop_c):
+    """The ledger lines below this run's STOP C row. A run's STOP C row is its own, so a human row above it was
+    an earlier run's and does not carry into this one; no stop_c row in the ledger, no lines."""
+    lines = ledger.splitlines()
+    for n, line in enumerate(lines):
+        if any(row_id == stop_c for row_id, _ in ledger_rows(line)):
+            return lines[n + 1:]
+    return []
+
+
 def ledger_waiver(gate_id, units, ledger, stop_c):
     """The D-<n> of the human row, written after this run's STOP C row, that waives this gate for every unit
     of the batch, or None. The declaration is frozen by gates_sha, so a waiver decided after STOP C is found
-    here, not in the manifest; and a run's STOP C row is its own, so a waiver above it was an earlier run's
-    and does not carry. No stop_c row in the ledger, no waiver."""
-    after = False
-    for line in ledger.splitlines():
-        if after:
-            for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
-                if override_decision(decision_id, [gate_id, *units], line, word="waive"):
-                    return decision_id
-        elif any(row_id == stop_c for row_id, _ in ledger_rows(line)):
-            after = True
+    here, not in the manifest."""
+    for line in rows_after(ledger, stop_c):
+        for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
+            if override_decision(decision_id, [gate_id, *units], line, word="waive"):
+                return decision_id
     return None
 
 
@@ -734,20 +739,23 @@ def gate_outcomes(batch, reported, ledger, head):
     return list(declared.values()), unmet
 
 
-def review_outcome(report, units, ledger, head):
+def review_outcome(report, units, ledger, head, stop_c):
     """The review-clean rule at a PR head, for a workflow child and a hand-gathered report alike: the report
-    says review_clean=true for review_head equal to the gated head, or a human's review_waived D-<n> row names
-    every unit. Returns (waiver, reason): the waiver row that carries a dirty review, or why the PASS falls."""
+    says review_clean=true for review_head equal to the gated head, or a human's review_waived D-<n> row,
+    below this run's STOP C row, names that head and every unit. A waiver dismisses one wrong finding on one
+    PR head, so a row for an earlier head or an earlier run does not carry a new dirty review. Returns
+    (waiver, reason): the waiver row that carries a dirty review, or why the PASS falls."""
     if report.get("review_clean") is True and report.get("review_head") == head:
         return None, None
     waiver = report.get("review_waiver")
     decision = waiver.get("decision_id") if isinstance(waiver, dict) else None
-    if override_decision(decision, units, ledger, word="review_waived"):
+    if isinstance(head, str) and any(override_decision(decision, [head, *units], line, word="review_waived")
+                                     for line in rows_after(ledger, stop_c)):
         return {"decision_id": decision}, None
     why = ("Devin Review is not clean at the PR head" if report.get("review_clean") is not True else
            f"review_head {report.get('review_head')!r} is not the gated PR head {head!r}")
-    return None, (f"{why} and no review_waived row {decision or 'D-<n>'} naming {', '.join(units)} is in "
-                  ".migration/06_decisions.md")
+    return None, (f"{why} and no review_waived row {decision or 'D-<n>'} below STOP C row {stop_c} naming "
+                  f"{head} and {', '.join(units)} is in .migration/06_decisions.md")
 
 
 def gates_command(path):
@@ -780,7 +788,7 @@ def gates_command(path):
             gates, unmet = gate_outcomes(b, report.get("gates"), ledger, head)
             if head is None:
                 unmet.append(f"{report['pr_url']} is not a PR of {MANIFEST['repo']} whose head git can fetch; no evidence stands")
-            waiver, reason = review_outcome(report, b["units"], ledger, head)
+            waiver, reason = review_outcome(report, b["units"], ledger, head, MANIFEST["stop_c"])
             if reason:
                 unmet.append(reason)
         out[b["id"]] = {"gates": gates, "review_waiver": waiver, "unmet": unmet}
@@ -1724,8 +1732,9 @@ CHILD_SCHEMA = {
         "review_waiver": {
             "type": "object",
             "properties": {"decision_id": {"type": "string"}},
-            "description": "the D-<n> row of .migration/06_decisions.md that says review_waived for your units "
-                           "when a finding is wrong; the workflow verifies the row"},
+            "description": "the D-<n> row of .migration/06_decisions.md, below this wave's STOP C row, that says "
+                           "review_waived for your units at your PR head sha when a finding is wrong; the workflow "
+                           "verifies the row"},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
         "changed_paths": {"type": "array", "items": {"type": "string"},
@@ -1803,8 +1812,8 @@ def child_prompt(batch):
         "- status=PASS also requires review_clean=true: finish the Devin Review round on your PR and fix "
         "every actionable finding before reporting done, then report review_head as the exact 40-hex PR head "
         "sha Devin Review cleared (a push after the review needs a new clean round); a wrong finding is "
-        "waived only by a human's review_waived row in .migration/06_decisions.md naming your units, "
-        "reported as review_waiver.\n"
+        "waived only by a human's review_waived row in .migration/06_decisions.md, written below this wave's "
+        "STOP C row, naming your units and the exact PR head sha it clears, reported as review_waiver.\n"
         f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
         "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
         "evidence is never PASS. Report merge_eligible=true only when every unit's "
@@ -1988,7 +1997,7 @@ async def run_batch(batch, sem, breaker):
                     f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
                     ".migration/06_decisions.md; " + out["one_line_summary"])
         if out["status"] == "PASS":
-            waiver, reason = review_outcome(out, batch["units"], decision_ledger(), out["pr_head"])
+            waiver, reason = review_outcome(out, batch["units"], decision_ledger(), out["pr_head"], MANIFEST["stop_c"])
             if reason:
                 out["status"] = "FAIL"
                 out["failure_class"] = "review_open"

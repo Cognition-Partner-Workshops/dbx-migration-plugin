@@ -49,7 +49,7 @@ def _batch_runtime():
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
-                                                                         "gate_outcomes", "ledger_waiver", "batch_max_minutes", "review_outcome"})
+                                                                         "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes", "review_outcome"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
                                                          "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS"}
@@ -2523,10 +2523,21 @@ def test_a_pass_needs_review_clean_at_the_gated_pr_head_or_a_review_waived_ledge
     out = _run_one(_batch_runtime(), no_head)
     assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
 
-    ledger = LEDGER + "| D-9 | 2024-05-04 | user:U1 | review_waived for u, the finding is a false positive |\n"
+    stop_c = "| D-2 | 2024-05-03 | user:U0 | STOP C wave-0 gates_sha x | plan approved |\n"
+    waiver = f"| D-9 | 2024-05-04 | user:U1 | review_waived for u at {'c' * 40}, the finding is a false positive |\n"
+    ledger = LEDGER + stop_c + waiver
     out = _run_one(_ns_with_ledger(ledger), _pass(changed_paths=["src/a.sql"], review_head="d" * 40,
                                                  review_waiver={"decision_id": "D-9"}))
     assert out["status"] == "PASS" and out["review_waiver"] == {"decision_id": "D-9"}
+
+    for stale in (LEDGER + waiver + stop_c,                                 # written for an earlier run
+                  LEDGER + stop_c + waiver.replace("c" * 40, "d" * 40),     # written for another PR head
+                  LEDGER + stop_c + waiver.replace(" at " + "c" * 40, ""),  # names no head
+                  LEDGER + waiver):                                        # no STOP C row at all
+        out = _run_one(_ns_with_ledger(stale), _pass(changed_paths=["src/a.sql"], review_clean=False,
+                                                    review_waiver={"decision_id": "D-9"}))
+        assert out["status"] == "FAIL" and out["failure_class"] == "review_open" and "review_waiver" not in out, stale
+        assert "c" * 40 in out["one_line_summary"] and "D-2" in out["one_line_summary"], stale
 
     missing = _pass(changed_paths=["src/a.sql"])
     missing.pop("review_clean")
