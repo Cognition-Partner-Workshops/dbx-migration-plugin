@@ -101,6 +101,26 @@ provenance warning and the run is not merge-eligible.
   tier has findings or unverifiable objects. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
+- Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --source <job file>... --prior-proof
+  <last committed rerun_proof.json> --fresh <record> --evolved <record> --out <dir>` grades the idempotency job twice
+  from two run records (`dbx-recon shape` reads a target's observed columns, read-only; it refuses a
+  table the target does not have rather than recording it empty). The catalog is the source of truth,
+  never the DDL: the shape the fresh run landed is the expected shape and the evolved run, against the
+  table pre-created in its previous committed shape, must land the identical one (`harness/fixtures/example_rerun/`
+  is the canonical failing case, a `CREATE TABLE IF NOT EXISTS` that never lands the new column).
+  The previous shape is the last committed proof's observed `shape` (`--prior-proof`), or on a unit's
+  first run the manifest-declared old shape (`--prior-shape`). `rerun_proof.json` carries
+  `{fresh: pass|fail, evolved: pass|fail|unsupported, findings, shape, shape_digest, source_digest}`;
+  without an evolved record, without a prior, when the pre-created shape equals the fresh one or
+  differs from the prior one, or when the fresh leg failed, `evolved` is `unsupported` with the reason,
+  never clean; a reordered column is a `column_order` finding; a fresh run that recorded no table fails
+  (`no_tables`). `--ddl` is a hint only: tables its `CREATE TABLE` statements name that the fresh run did
+  not record become notes, never findings. `run --rerun-proof <file> --rerun-source <job file>...` copies
+  it into `result.json` after checking its `source_digest` against the job's files as committed now (any
+  edit to the DDL, notebook or SQL makes the proof stale and refused); a
+  failed leg adds `rerun_gap` to `merge_block_reasons`, an unsupported evolved leg adds
+  `rerun_unsupported`, a `run` without `--rerun-proof` adds `rerun_missing` (every migrated unit
+  writes its tables, so no proof is a missing control), and any of them sets `merge_eligible=false`.
 - Tiers 5-7 run even when tier 1 fails, so a FAIL names the keys, lag, and schema gaps rather than just a count.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.
