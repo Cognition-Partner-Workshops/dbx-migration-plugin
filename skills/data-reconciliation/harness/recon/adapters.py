@@ -1816,14 +1816,15 @@ class LakebaseTargetAdapter(_PostgresBase):
         return super().identity_state(self._q(object), column)
 
     def column_shape(self, object: str) -> list[dict[str, Any]]:
-        """Observed columns in declared order for the rerun proof (recon.rerun)."""
+        """Observed columns in declared order for the rerun proof (recon.rerun). attname is the
+        effective name: quoted identifiers keep their case, so it is kept as reported."""
         rows = self._rows(
             "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attnum "
             "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             f"WHERE n.nspname = %s AND c.relname = %s AND {_PG_PHYSICAL} "
             "AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum", (self._schema, object))
-        return [{"name": str(name).lower(), "type": normalize_type(dtype), "nullable": not notnull}
+        return [{"name": str(name), "type": normalize_type(dtype), "nullable": not notnull}
                 for name, dtype, notnull, _ in rows]
 
     def table_exists(self, object: str) -> bool:

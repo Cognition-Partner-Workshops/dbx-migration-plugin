@@ -581,10 +581,12 @@ def test_lakebase_target_reads_the_observed_shape_from_pg_attribute(monkeypatch)
     conn = _StubConn([("db",)])
     monkeypatch.setattr(psycopg, "connect", lambda dsn: conn)
     target = adapters.LakebaseTargetAdapter("T", "db", "sales")
-    conn.rows = [("order_id", "bigint", True, 1), ("amount", "numeric(18,2)", False, 2)]
+    conn.rows = [("order_id", "bigint", True, 1), ("amount", "numeric(18,2)", False, 2),
+                 ("CustomerID", "integer", False, 3)]
     assert target.column_shape("orders") == [
         {"name": "order_id", "type": "bigint", "nullable": False},
-        {"name": "amount", "type": "decimal(18,2)", "nullable": True}]
+        {"name": "amount", "type": "decimal(18,2)", "nullable": True},
+        {"name": "CustomerID", "type": "int", "nullable": True}]
     sql, params = conn.executed[-1]
     assert "pg_attribute" in sql and "format_type" in sql and params == ("sales", "orders")
     assert "c.relkind IN ('r', 'p')" in sql
