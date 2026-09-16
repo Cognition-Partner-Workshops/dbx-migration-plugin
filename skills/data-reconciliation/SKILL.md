@@ -144,6 +144,14 @@ The output is a machine-readable table of object, class, method, partition key, 
    `--mode live` exactly once inside the granted window. If live fails, go back to fixture.
 2. Pass the source-dialect skill's canonicalization JSON verbatim. If a rule is missing, that
    goes in the PR under "Skill feedback" for the parent to fold into the dialect skill, not an ad-hoc patch.
+   The same file's `type_map.<family>.<target_kind>` is applied when the spec loads (`--target-kind`
+   selects the table; `estimate --family/--canonicalization` applies it too, so the plan counts
+   the statements the run will issue): empty `target_type`s are
+   filled from it, a declared type it forbids — including a `conditional` alternative the
+   field's `evidence` list does not carry (the map names the token, e.g. `census_fits_int64`,
+   `census_midnight_only`) — stops the run before any query (`type map:` on
+   stderr), and `result.json` records the outcome under `type_map` (`null` when the family has
+   no map, so unaudited is never mistaken for clean).
 3. On FAIL: read `report.md`, fix converted code or the load only. Never touch the source.
    Never change `03_tolerances.json` (that needs a new STOP A approval).
 4. Paste `recon.summary.md` into the PR body, link `result.json` and `report.md`. Never paste
