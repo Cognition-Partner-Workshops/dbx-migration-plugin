@@ -93,11 +93,15 @@ def by_id(report):
     return {c["id"]: c for c in report["checks"]}
 
 
+def sub_by_id(report, row_id):
+    return {c["id"]: c for c in by_id(report)[row_id]["data"]["sub_results"]}
+
+
 def probed(ws):
     """What a session does before the live probe: one doctor run (report written) issues the nonce the probe echoes."""
     first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
-    return "blocked:" + by_id(first)["hook_platform_loaded"]["data"]["probe_nonce"]
+    return "blocked:" + sub_by_id(first, "hook_guard")["hook_platform_loaded"]["data"]["probe_nonce"]
 
 
 def test_probe_command_is_blocked_by_guard_and_harmless_otherwise():
@@ -118,11 +122,11 @@ def test_offline_run_passes_every_local_check_but_is_never_ready(tmp_path):
     # an unverified identity can never certify a wave, however the check was skipped
     assert not report["ready"] and report["blocking"] == ["databricks_identity=skipped"]
     assert c["workspace"]["status"] == "ok"
-    assert c["stop_mode"]["data"]["stop_mode"] == "hard"
-    assert c["allowed_targets"]["status"] == "ok" and c["allowed_targets"]["data"]["catalogs"] == ["mig_cat"]
-    assert c["hooks_files"]["status"] == "ok"
-    assert c["hook_guard_functional"]["status"] == "ok"
-    assert c["hook_platform_loaded"]["status"] == "ok"
+    assert c["workspace"]["data"]["stop_mode"] == "hard"
+    assert sub_by_id(report, "allowed_targets")["allowed_targets"]["status"] == "ok"
+    assert c["allowed_targets"]["data"]["catalogs"] == ["mig_cat"]
+    assert c["hook_guard"]["status"] == "ok"
+    assert sub_by_id(report, "hook_guard")["hook_platform_loaded"]["status"] == "ok"
     assert c["recon_harness"]["status"] == "ok"
     assert c["databricks_identity"]["status"] == "skipped"
 
@@ -131,41 +135,43 @@ def test_unknown_probe_is_unverified_and_carries_command(tmp_path):
     ws = make_workspace(tmp_path)
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
     c = by_id(report)
-    assert c["hook_platform_loaded"]["status"] == "unverified"
-    nonce = c["hook_platform_loaded"]["data"]["probe_nonce"]
+    sub = sub_by_id(report, "hook_guard")
+    assert c["hook_guard"]["status"] == "unverified"
+    assert sub["hook_platform_loaded"]["status"] == "unverified"
+    nonce = c["hook_guard"]["data"]["probe_nonce"]
     assert re.fullmatch(r"[0-9a-f]{8}", nonce)
-    assert c["hook_platform_loaded"]["data"]["probe_command"] == doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)
-    assert "blocked:<nonce>" in c["hook_platform_loaded"]["detail"]
+    assert sub["hook_platform_loaded"]["data"]["probe_command"] == doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)
+    assert "blocked:<nonce>" in sub["hook_platform_loaded"]["detail"]
     assert not report["ready"]
-    assert report["blocking"] == ["hook_platform_loaded=unverified", "databricks_identity=skipped"]
+    assert report["blocking"] == ["hook_guard=unverified", "databricks_identity=skipped"]
 
 
 def test_platform_probe_reuses_a_pending_nonce_until_accepted(tmp_path):
     ws = make_workspace(tmp_path)
     first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
-    nonce = by_id(first)["hook_platform_loaded"]["data"]["probe_nonce"]
+    nonce = by_id(first)["hook_guard"]["data"]["probe_nonce"]
     saved_nonce, issued_at = (ws / doctor.HOOK_PROBE_NONCE).read_text().strip().split()
     assert saved_nonce == nonce and issued_at.isdigit()
     second = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
-    assert by_id(second)["hook_platform_loaded"]["data"]["probe_nonce"] == nonce
+    assert by_id(second)["hook_guard"]["data"]["probe_nonce"] == nonce
     ok = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
-    assert by_id(ok)["hook_platform_loaded"]["status"] == "ok"
-    assert by_id(ok)["hook_platform_loaded"]["data"] == {"probe_nonce": nonce}
+    assert by_id(ok)["hook_guard"]["status"] == "ok"
+    assert by_id(ok)["hook_guard"]["data"]["probe_nonce"] == nonce
     again = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
-    assert by_id(again)["hook_platform_loaded"]["status"] == "ok"
+    assert by_id(again)["hook_guard"]["status"] == "ok"
     # a workspace with no prior report has no nonce to match, so nothing verifies it yet
     fresh = doctor.run(make_workspace(tmp_path / "fresh"), PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
-    assert by_id(fresh)["hook_platform_loaded"]["status"] == "unverified"
+    assert sub_by_id(fresh, "hook_guard")["hook_platform_loaded"]["status"] == "unverified"
 
 
 def test_failed_hook_report_without_probe_nonce_does_not_crash(tmp_path):
     ws = make_workspace(tmp_path)
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps({
-        "checks": [{"id": "hook_platform_loaded", "status": "fail", "data": {}}],
+        "checks": [{"id": "hook_guard", "status": "fail", "data": {}}],
     }))
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
-    row = by_id(report)["hook_platform_loaded"]
+    row = sub_by_id(report, "hook_guard")["hook_platform_loaded"]
     assert row["status"] == "unverified"
     assert re.fullmatch(r"[0-9a-f]{8}", row["data"]["probe_nonce"])
 
@@ -176,7 +182,7 @@ def test_expired_pending_nonce_is_not_accepted(tmp_path):
     (ws / doctor.HOOK_PROBE_NONCE).write_text(
         f"{old_nonce} {int(doctor.time.time()) - doctor.HOOK_PROBE_NONCE_TTL - 1}\n")
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{old_nonce}", None, True)
-    row = by_id(report)["hook_platform_loaded"]
+    row = sub_by_id(report, "hook_guard")["hook_platform_loaded"]
     assert row["status"] == "unverified"
     assert row["data"]["probe_nonce"] != old_nonce
     saved_nonce, issued_at = (ws / doctor.HOOK_PROBE_NONCE).read_text().strip().split()
@@ -188,14 +194,54 @@ def test_expired_report_nonce_is_not_accepted(tmp_path):
     old_nonce = "deadbeef"
     old_report = {
         "generated_at": "2000-01-01T00:00:00Z",
-        "checks": [{"id": "hook_platform_loaded", "status": "unverified",
+        "checks": [{"id": "hook_guard", "status": "unverified",
                     "data": {"probe_nonce": old_nonce}}],
     }
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(old_report))
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{old_nonce}", None, True)
-    row = by_id(report)["hook_platform_loaded"]
+    row = sub_by_id(report, "hook_guard")["hook_platform_loaded"]
     assert row["status"] == "unverified"
     assert row["data"]["probe_nonce"] != old_nonce
+
+
+def test_issued_nonce_reads_hook_guard_row(tmp_path):
+    ws = make_workspace(tmp_path)
+    nonce = "deadbeef"
+    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps({
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "checks": [{"id": "hook_guard", "status": "unverified",
+                    "data": {"probe_nonce": nonce}}],
+    }))
+    assert doctor._issued_nonce(ws) == nonce
+
+
+def test_run_core_rows_are_ten(tmp_path):
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    optional = {"lakebase_branch_create", "lakebase_target_grants", "analytical_target_grants"}
+    assert [c["id"] for c in report["checks"] if c["id"] not in optional] == [
+        "workspace", "allowed_targets", "allowlist_committed", "playbooks_in_sync", "hook_guard",
+        "official_databricks_plugin", "recon_harness", "delete_evidence",
+        "source_principal_read_only", "databricks_identity",
+    ]
+
+
+def test_merged_row_status_rules():
+    ok = doctor.Check("ok", "ok", "ok", {"ok": 1})
+    fail = doctor.Check("fail", "fail", "fail", {"fail": 2})
+    warn = doctor.Check("warn", "warn", "warn", {"warn": 3})
+    security = doctor.Check("hook_platform_loaded", "unverified", "security", {"security": 4})
+    assert doctor._merge("row", [ok, fail]).status == "fail"
+    assert doctor._merge("row", [ok, warn]).status == "warn"
+    assert doctor._merge("row", [doctor.Check("hook_platform_loaded", "ok", "ok"), warn]).status == "warn"
+    assert doctor._merge("row", [security, warn]).status == "unverified"
+    merged = doctor._merge("row", [ok, warn])
+    assert [s["id"] for s in merged.data["sub_results"]] == ["ok", "warn"]
+    assert merged.data["ok"] == 1 and merged.data["warn"] == 3
+
+
+def test_stop_mode_datum_on_workspace_row(tmp_path):
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    assert by_id(report)["workspace"]["data"]["stop_mode"] in ("soft", "hard")
 
 
 def test_cli_rejects_a_bare_blocked_claim(tmp_path):
@@ -530,7 +576,7 @@ def test_not_blocked_probe_fails(tmp_path):
     ws = make_workspace(tmp_path)
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "not-blocked", None, True)
     assert not report["ready"]
-    assert by_id(report)["hook_platform_loaded"]["status"] == "fail"
+    assert by_id(report)["hook_guard"]["status"] == "fail"
 
 
 def test_generated_and_folded_files_are_not_required(tmp_path):
@@ -582,7 +628,7 @@ def test_cli_writes_capabilities_json_and_exit_codes(tmp_path):
     r = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert r.returncode == 1, r.stdout + r.stderr
     cap = json.loads((ws / ".migration" / "09_capabilities.json").read_text())
-    nonce = by_id(cap)["hook_platform_loaded"]["data"]["probe_nonce"]
+    nonce = by_id(cap)["hook_guard"]["data"]["probe_nonce"]
     r = subprocess.run([*argv, "--hook-probe-result", f"blocked:{nonce}"], capture_output=True, text=True, check=False)
     assert r.returncode == 1, r.stdout + r.stderr  # offline: identity unverified, so not ready
     cap = json.loads((ws / ".migration" / "09_capabilities.json").read_text())
@@ -1503,7 +1549,7 @@ def test_source_attested_reports_attested_and_does_not_block(tmp_path):
     assert row["status"] == "attested" and row["data"]["decision"] == "D-7"
     assert row["data"]["provenance"] == "user:msg-41"
     assert not [b for b in report["blocking"] if b.startswith("source_principal_read_only")]
-    assert report["blocking"] == ["hook_platform_loaded=unverified", "databricks_identity=skipped"]
+    assert report["blocking"] == ["hook_guard=unverified", "databricks_identity=skipped"]
 
 
 def test_source_attested_fails_without_a_matching_ledger_line(tmp_path):
@@ -1612,7 +1658,7 @@ def test_allowlist_matches_contract(tmp_path):
     c = doctor.check_allowlist_matches_contract(ws, ["mig_cat", "prod"])
     assert c.status == "fail" and "prod" in c.detail and c.data["expected"] == ["mig_cat", "prod"]
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, expect_catalogs=["other"])
-    assert "allowlist_matches_contract=fail" in report["blocking"]
+    assert "allowed_targets=fail" in report["blocking"]
     # the guard accepts backticked / mixed-case spellings and normalizes them; the contract carries the
     # normalized names, so the comparison must use the guard's rule on both sides
     (ws / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["`Mig_Cat`"], "legacy_sources": []}')
@@ -1631,7 +1677,7 @@ def test_run_blocks_on_an_uncommitted_contract_and_the_cli_parses_expect_catalog
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--plugin-root",
                         str(PLUGIN_ROOT), "--no-databricks", "--expect-catalogs", "mig_cat, other", "--out", "-"],
                        capture_output=True, text=True, check=False)
-    assert "allowlist_matches_contract=fail" in r.stdout and "['mig_cat', 'other']" in r.stdout
+    assert "allowed_targets=fail" in r.stdout and "['mig_cat', 'other']" in r.stdout
 
 
 # ------------------------------------------------------------------ identity + host (A3)
@@ -1726,7 +1772,7 @@ def test_wave_flag_writes_a_signed_record_beside_the_manifest(tmp_path):
     assert doctor.wave_signature(record, manifest_bytes) == record["signature"]
     changed = {**record, "hook_probe": "unknown" if hook_probe != "unknown" else "not-blocked"}
     assert doctor.wave_signature(changed, manifest_bytes) != record["signature"]
-    assert next(c for c in record["checks"] if c["id"] == "allowlist_matches_contract")
+    assert next(c for c in record["checks"] if c["id"] == "allowed_targets")
 
     default_ws = make_workspace(tmp_path / "default")
     default_manifest = default_ws / ".migration" / "waves" / "wave-1.json"
