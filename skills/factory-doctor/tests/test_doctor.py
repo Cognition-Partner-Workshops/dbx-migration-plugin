@@ -167,6 +167,21 @@ def test_platform_probe_reuses_a_pending_nonce_until_accepted(tmp_path):
     assert sub_by_id(fresh, "hook_guard")["hook_platform_loaded"]["status"] == "unverified"
 
 
+def test_one_nonce_serves_functional_and_platform_probe(tmp_path):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    nonce = by_id(report)["hook_guard"]["data"]["probe_nonce"]
+    sub = sub_by_id(report, "hook_guard")
+    assert f"__dbx_guard_probe__{nonce}" in sub["hook_guard_functional"]["detail"]
+    assert sub["hook_platform_loaded"]["data"]["probe_command"] == \
+        doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)
+    second = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    sub2 = sub_by_id(second, "hook_guard")
+    assert f"__dbx_guard_probe__{nonce}" in sub2["hook_guard_functional"]["detail"]
+    assert sub2["hook_platform_loaded"]["data"]["probe_command"] == \
+        doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)
+
+
 def test_failed_hook_report_without_probe_nonce_does_not_crash(tmp_path):
     ws = make_workspace(tmp_path)
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps({
@@ -226,6 +241,13 @@ def test_run_core_rows_are_ten(tmp_path):
         "delete_evidence", "source_principal_read_only", "dictionary_readable",
         "named_secrets_exist", "databricks_identity",
     ]
+
+
+def test_security_controls_are_role_specific():
+    assert doctor.security_controls("child") == ("hook_guard_functional", "databricks_identity")
+    assert doctor.security_controls("orchestrator") == doctor.security_controls("setup") \
+        == doctor.SECURITY_CONTROLS
+    assert len(doctor.SECURITY_CONTROLS) == 3
 
 
 def test_merged_row_status_rules():
@@ -684,6 +706,22 @@ def test_cli_writes_capabilities_json_and_exit_codes(tmp_path):
     assert r.returncode == 1
 
 
+def test_unverified_probe_prints_the_command_as_the_last_line(tmp_path, capsys):
+    ws = make_workspace(tmp_path)
+    doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT),
+                 "--no-databricks", "--out", "-"])
+    out = capsys.readouterr().out
+    nonce = (ws / doctor.HOOK_PROBE_NONCE).read_text().split()[0]
+    assert out.splitlines()[-1] == (
+        "PROBE_COMMAND (run in the lead session's exec tool, not a sidekick shell): "
+        f"{doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)}")
+    child = make_workspace(tmp_path / "child")
+    _unit_mapping(child, "loans", evidence=False)
+    doctor.main(["--workspace", str(child), "--plugin-root", str(PLUGIN_ROOT), "--no-databricks",
+                 "--role", "child", "--unit", "loans", "--out", "-"])
+    assert "PROBE_COMMAND" not in capsys.readouterr().out
+
+
 def test_no_workspace_does_not_write(tmp_path):
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(tmp_path),
                         "--plugin-root", str(PLUGIN_ROOT), "--no-databricks"], capture_output=True, text=True)
@@ -872,6 +910,35 @@ def test_child_names_its_batch_and_every_unit_of_it_is_checked(tmp_path, monkeyp
     assert set(c.data["mappings"]) == {"loans", "payments"}
 
 
+def test_child_non_security_failures_are_warnings_and_do_not_block(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path, with_lock=False)
+    _unit_mapping(ws, "loans", evidence=False)
+    monkeypatch.setattr(doctor, "check_harness",
+                        lambda *a, **k: doctor.Check("recon_harness", "fail", "selftest rc=1"))
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "ok", "oauth-m2m (env)"),
+        doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
+        doctor.Check("databricks_warehouse", "warn", "none"),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"])
+    row = by_id(report)["recon_harness"]
+    assert row["status"] == "warn" and "selftest rc=1" in row["detail"]
+    assert by_id(report)["playbooks_in_sync"]["status"] == "warn"
+    assert report["ready"] is True and report["blocking"] == []
+
+
+def test_child_missing_unit_mapping_still_blocks(tmp_path):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True, units=["nope"])
+    rows = by_id(report)
+    for rid in ("type_map_audit", "delete_evidence", "source_principal_read_only",
+                "dictionary_readable"):
+        assert rows[rid]["status"] == "fail" and rows[rid]["data"]["units_problem"] is True, rid
+        assert f"{rid}=fail" in report["blocking"], rid
+    assert report["ready"] is False
+
+
 def test_delete_evidence_declared_needs_a_named_source_secret(tmp_path, monkeypatch):
     monkeypatch.delenv("LEGACY_ODBC", raising=False)
     c = doctor.check_delete_evidence(_mapping(tmp_path), None, PLUGIN_ROOT)
@@ -1034,7 +1101,9 @@ def test_run_includes_delete_evidence_and_a_failed_check_blocks(tmp_path, monkey
     _unit_mapping(ws, "loans")
     report = doctor.run(ws, PLUGIN_ROOT, "child", probed(ws), None, True, units=["loans"],
                         source_secret="LEGACY_ODBC")
-    assert "delete_evidence=fail" in report["blocking"]
+    row = by_id(report)["delete_evidence"]
+    assert row["status"] == "warn" and "CDC is not enabled" in row["detail"]
+    assert "delete_evidence=fail" not in report["blocking"]
     # a child preflight without its batch is a blocking row, never a silent skip
     report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", None, True)
     assert by_id(report)["delete_evidence"]["status"] == "fail"
@@ -1374,8 +1443,9 @@ def test_run_resolves_the_in_scope_tables_from_the_same_mappings_as_delete_evide
     report = doctor.run(ws, PLUGIN_ROOT, "child", probed(ws), None, True, units=["loans", "payments"],
                         source_secret="LEGACY_ODBC")
     assert seen == {"tables": ["raw.loans"], "family": "sqlserver", "secret": "LEGACY_ODBC"}
-    # unverified for a declared source blocks readiness; a fail does too
-    assert "source_principal_read_only=unverified" in report["blocking"]
+    # only `fail` softens in a child: the row stays unverified but does not block child readiness
+    assert by_id(report)["source_principal_read_only"]["status"] == "unverified"
+    assert "source_principal_read_only=unverified" not in report["blocking"]
     # --source-family is authoritative; without it the family comes from the mapping's delete_evidence kind
     seen.clear()
     doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_secret="LEGACY_ODBC",
@@ -1796,8 +1866,8 @@ def test_source_attested_reports_attested_and_does_not_block(tmp_path):
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                         source_family="teradata", source_attested="D-7")
     row = by_id(report)["source_principal_read_only"]
-    assert row["status"] == "attested" and row["data"]["decision"] == "D-7"
-    assert row["data"]["provenance"] == "user:msg-41"
+    assert row["status"] == "ok" and row["data"]["attested"] == "D-7"
+    assert row["data"]["decision"] == "D-7" and row["data"]["provenance"] == "user:msg-41"
     assert not [b for b in report["blocking"] if b.startswith("source_principal_read_only")]
     assert report["blocking"] == ["hook_guard=unverified", "recon_family_supported=fail",
                                   "databricks_identity=skipped"]
@@ -1926,7 +1996,7 @@ def test_recon_family_supported_is_its_own_row_beside_an_attested_principal(tmp_
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                         source_family="teradata", source_attested="D-7")
     rows = by_id(report)
-    assert rows["source_principal_read_only"]["status"] == "attested"
+    assert rows["source_principal_read_only"]["status"] == "ok"
     assert rows["recon_family_supported"]["status"] == "fail"
     assert "recon_family_supported=fail" in report["blocking"] and report["ready"] is False
 
@@ -2323,6 +2393,38 @@ def test_hook_guard_functional_requires_the_probe_token_in_the_block_reason(tmp_
         assert c.status == "fail" and "__dbx_guard_probe__" in c.detail, reason
 
 
+def test_child_never_live_probes_the_platform_hook(tmp_path):
+    ws = make_workspace(tmp_path)
+    first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    nonce = by_id(first)["hook_guard"]["data"]["probe_nonce"]
+    _unit_mapping(ws, "loans", evidence=False)
+    report = doctor.run(ws, PLUGIN_ROOT, "child", f"blocked:{nonce}", None, True, units=["loans"])
+    sub = sub_by_id(report, "hook_guard")
+    assert sub["hook_platform_loaded"]["status"] == "warn"
+    assert "orchestrator-only" in sub["hook_platform_loaded"]["detail"]
+    assert not [b for b in report["blocking"] if b.startswith("hook_guard")]
+    # a workspace with no pending nonce stays without one: a child never mints or writes it
+    fresh = make_workspace(tmp_path / "fresh")
+    _unit_mapping(fresh, "loans", evidence=False)
+    doctor.run(fresh, PLUGIN_ROOT, "child", f"blocked:{nonce}", None, True, units=["loans"])
+    assert not (fresh / doctor.HOOK_PROBE_NONCE).exists()
+
+
+def test_child_inherits_platform_row_from_the_signed_record(tmp_path):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    reused = {"signed_at": "2026-01-01T00:00:00Z",
+              "checks": [{"id": "hook_guard", "status": "ok", "detail": "…",
+                          "data": {"sub_results": [{"id": "hook_platform_loaded", "status": "ok",
+                                                    "detail": "live probe was BLOCKED…",
+                                                    "data": {"probe_nonce": "deadbeef"}}]}}]}
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, True, units=["loans"], reused=reused)
+    sub = sub_by_id(report, "hook_guard")["hook_platform_loaded"]
+    assert sub["status"] == "ok"
+    assert sub["detail"].startswith("reused from the orchestrator's record signed 2026-01-01T00:00:00Z")
+    assert sub["data"]["reused_from"] == "2026-01-01T00:00:00Z"
+
+
 # ------------------------------------------------------------------ playbooks in sync
 
 PLAYBOOKS_DIR = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
@@ -2375,21 +2477,23 @@ def test_playbooks_in_sync_ok(tmp_path):
     assert "and the live export (0 min old)" in c.detail
 
 
-def test_playbooks_in_sync_fails_on_stale_missing_and_unknown(tmp_path):
+def test_orchestrator_playbook_drift_is_a_warning_not_a_blocker(tmp_path):
     ws = make_workspace(tmp_path, with_lock=False)
     _lock(ws, overrides={"!dbx_migrate_pipeline": "0" * 64})
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail"
+    assert c.status == "warn"
     assert "!dbx_migrate_pipeline" in c.detail and "install-dbx-factory" in c.detail
     assert c.data["stale"] == ["!dbx_migrate_pipeline"]
     ws = make_workspace(tmp_path / "missing", with_lock=False)
     _lock(ws, drop=("!dbx_migrate_oltp",))
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child")
-    assert c.status == "fail" and c.data["missing"] == ["!dbx_migrate_oltp"]
+    assert c.status == "warn" and c.data["missing"] == ["!dbx_migrate_oltp"]
     ws = make_workspace(tmp_path / "unknown", with_lock=False)
     _lock(ws, overrides={"!dbx_gone": "f" * 64})
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and c.data["unknown"] == ["!dbx_gone"]
+    assert c.status == "warn" and c.data["unknown"] == ["!dbx_gone"]
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
+    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
 
 
 def test_playbooks_in_sync_lock_missing_and_role(tmp_path):
@@ -2404,10 +2508,10 @@ def test_playbooks_in_sync_lock_missing_and_role(tmp_path):
     row = next(l for l in r.stdout.splitlines() if "playbooks_in_sync" in l)
     assert row.startswith("skipped"), r.stdout
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "install-dbx-factory" in c.detail
-    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child").status == "fail"
+    assert c.status == "warn" and "install-dbx-factory" in c.detail
+    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child").status == "warn"
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert "playbooks_in_sync=fail" in report["blocking"]
+    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
 
 
 def test_playbooks_in_sync_malformed_entry_fails_not_crashes(tmp_path):
@@ -2416,7 +2520,7 @@ def test_playbooks_in_sync_malformed_entry_fails_not_crashes(tmp_path):
     entries["!dbx_migration_plan"]["installed_at"] = 1
     (ws / doctor.PLAYBOOKS_LOCK).write_text(json.dumps(entries))
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and c.data["malformed"] == ["!dbx_migration_plan"]
+    assert c.status == "warn" and c.data["malformed"] == ["!dbx_migration_plan"]
     assert "malformed: !dbx_migration_plan" in c.detail and "install-dbx-factory" in c.detail
 
 
@@ -2428,7 +2532,7 @@ def test_playbooks_in_sync_unlisted_repo_file_is_a_finding(tmp_path, monkeypatch
         c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
     finally:
         stray.unlink()
-    assert c.status == "fail" and "15-unlisted.md" in c.detail and "index.json" in c.detail
+    assert c.status == "warn" and "15-unlisted.md" in c.detail and "index.json" in c.detail
 
 
 def test_playbooks_in_sync_ok_checks_the_live_export(tmp_path):
@@ -2442,9 +2546,9 @@ def test_playbooks_in_sync_orchestrator_needs_the_live_export(tmp_path):
     ws = make_workspace(tmp_path)
     (ws / doctor.LIVE_PLAYBOOKS).unlink()
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "live_playbooks.json" in c.detail
+    assert c.status == "warn" and "live_playbooks.json" in c.detail
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert "playbooks_in_sync=fail" in report["blocking"]
+    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child")
     assert c.status == "ok" and c.data["live"] is None
     assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "setup").status == "ok"
@@ -2454,17 +2558,17 @@ def test_playbooks_in_sync_stale_live_export_fails(tmp_path):
     ws = make_workspace(tmp_path)
     _live(ws, age_minutes=20)
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "stale export" in c.detail
+    assert c.status == "warn" and "stale export" in c.detail
     ws2 = make_workspace(tmp_path / "child")
     _live(ws2, age_minutes=20)
-    assert doctor.check_playbooks_in_sync(ws2, PLUGIN_ROOT, "child").status == "fail"
+    assert doctor.check_playbooks_in_sync(ws2, PLUGIN_ROOT, "child").status == "warn"
 
 
 def test_playbooks_in_sync_live_drift_fails(tmp_path):
     ws = make_workspace(tmp_path)
     _live(ws, overrides={"!dbx_migrate_pipeline": "# edited live\n"})
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "!dbx_migrate_pipeline" in c.detail
+    assert c.status == "warn" and "!dbx_migrate_pipeline" in c.detail
     assert c.data["live_stale"] == ["!dbx_migrate_pipeline"]
 
 
@@ -2472,7 +2576,7 @@ def test_playbooks_in_sync_duplicate_macro_fails(tmp_path):
     ws = make_workspace(tmp_path)
     _live(ws, duplicate="!dbx_migrate_etl")
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "!dbx_migrate_etl" in c.detail
+    assert c.status == "warn" and "!dbx_migrate_etl" in c.detail
     assert "playbook-dbx_migrate_etl" in c.detail and "playbook-extra-copy" in c.detail
     assert sorted(c.data["duplicate"]["!dbx_migrate_etl"]) == [
         "playbook-dbx_migrate_etl", "playbook-extra-copy"]
@@ -2482,17 +2586,17 @@ def test_playbooks_in_sync_live_missing_macro_fails(tmp_path):
     ws = make_workspace(tmp_path)
     _live(ws, drop=("!dbx_migrate_oltp",))
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and c.data["live_missing"] == ["!dbx_migrate_oltp"]
+    assert c.status == "warn" and c.data["live_missing"] == ["!dbx_migrate_oltp"]
 
 
 def test_playbooks_in_sync_malformed_live_export_fails_not_crashes(tmp_path):
     ws = make_workspace(tmp_path)
     (ws / doctor.LIVE_PLAYBOOKS).write_text('{"a": 1}')
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "malformed" in c.detail
+    assert c.status == "warn" and "malformed" in c.detail
     (ws / doctor.LIVE_PLAYBOOKS).write_text('[{"macro": "!dbx_migrate_etl", "content": 7}]')
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "fail" and "malformed" in c.detail
+    assert c.status == "warn" and "malformed" in c.detail
 
 
 def test_playbooks_in_sync_trailing_newline_is_normalized(tmp_path):
@@ -2520,7 +2624,7 @@ def test_playbooks_in_sync_cli_live_playbooks_flag(tmp_path):
 def test_playbooks_in_sync_explicit_live_path_must_exist(tmp_path):
     ws = make_workspace(tmp_path)
     c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child", tmp_path / "nowhere.json")
-    assert c.status == "fail" and "nowhere.json" in c.detail
+    assert c.status == "warn" and "nowhere.json" in c.detail
 
 
 # ------------------------------------------------------------------ named_secrets_exist (WS2.6)
