@@ -339,6 +339,9 @@ class _SqlAdapterBase:
     datetime_bound_sql = "{lit}"
     # Literal of a binary counter watermark (SQL Server rowversion) against this engine's column.
     binary_literal_sql = "0x{hex}"
+    # Catalog statements the structural tier issues: schema_facts and identity_state per object,
+    # session once per adapter (version reads are cached). Zero where nothing is implemented.
+    CATALOG_STATEMENTS = {"schema_facts": 0, "identity_state": 0, "session": 0}
 
     def __init__(self, conn):
         self._conn = conn
@@ -1113,6 +1116,7 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
     snapshot_sql = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT"
     snapshot_reset_sql = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
     mod_sql = "({x} % {m})"  # T-SQL has no MOD(); pyodbc binds with `?`, so `%` is literal
+    CATALOG_STATEMENTS = {"schema_facts": 6, "identity_state": 1, "session": 0}
     # Every INSERT/UPDATE/DELETE statement against the table bumps user_updates, committed or
     # not, so a window whose token held saw no write at all. Needs VIEW SERVER STATE (2019) /
     # VIEW DATABASE PERFORMANCE STATE (2022+) on the read-only login; without it the token is
@@ -1315,6 +1319,7 @@ class DatabricksSourceAdapter(_SqlAdapterBase):
     """Databricks as the SOURCE (workspace-to-workspace or Hive-to-UC moves)."""
 
     paramstyle = "pyformat"
+    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 0}
 
     def __init__(self, dsn_secret: str):
         super().__init__(_databricks_connect(dsn_secret))
@@ -1366,6 +1371,9 @@ class DatabricksTargetAdapter:
     columns are supported for cardinality via size(); dotted field paths address STRUCT
     fields. Object names in the mapping spec are bare table names; the adapter qualifies
     them with the migration catalog and schema so a spec never points at production."""
+
+    # Unity Catalog reads share _uc_schema_facts/_uc_identity_state with the source adapter.
+    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 0}
 
     def __init__(self, secret_name: str, catalog: str, schema: str):
         # names are validated before a session is opened so a bad name never leaks one
@@ -1490,6 +1498,8 @@ class _PostgresBase(_SqlAdapterBase):
     # column ignores the offset, so the explicit +00:00 is right for both under the UTC contract.
     watermark_literal_utc_offset = True
     binary_literal_sql = "'\\x{hex}'::bytea"
+    # schema_facts' server_version_num read is cached after the first object (session).
+    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 1}
 
     def open_window(self) -> str:
         """Every statement until close_window reads one REPEATABLE READ snapshot."""
@@ -1853,3 +1863,6 @@ class LakebaseTargetAdapter(_PostgresBase):
         from .config import ConfigError
         raise ConfigError(f"{table}.{column}: applied position must be bytea or an integer, "
                           f"got {type(value).__name__}")
+
+
+TARGET_ADAPTERS = {"databricks": DatabricksTargetAdapter, "lakebase": LakebaseTargetAdapter}

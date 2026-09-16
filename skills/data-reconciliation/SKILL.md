@@ -86,7 +86,8 @@ provenance warning and the run is not merge-eligible.
 - `structural`: Tier 0 `structural_parity` only, both catalogs read and no row read on either
   side. The independent verifier's run on a wave the manifest declares `degraded`; never merge
   evidence: a clean run's `merge_block_reasons` is exactly `["mode"]` (no rerun proof applies, no
-  row tier ran), and `estimate` counts only Tier 0's catalog statements.
+  row tier ran), and `estimate` counts only Tier 0's catalog statements per adapter
+  (`CATALOG_STATEMENTS`), so `--family` is required in structural mode.
 
 
 

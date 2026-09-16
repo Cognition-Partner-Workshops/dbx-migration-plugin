@@ -25,17 +25,32 @@ def _tier3_mode(depth: str, n: int | None, tol: Tolerances) -> str:
     return "stratified_sample" if n > tol.full_diff_row_threshold else "full_diff"
 
 
-# Catalog statements per side for tier 7 (constraints, indexes, columns, checks).
+# Catalog statements per side for tier 7 (constraints, indexes, columns, checks). Tier 0's are
+# per adapter instead: CATALOG_STATEMENTS on each adapter class.
 SCHEMA_FACT_STATEMENTS = 4
 
 
 def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
                   row_counts: dict[str, int] | None = None, ops: int = 0,
-                  mode: str = "live") -> dict:
+                  mode: str = "live", family: str | None = None,
+                  target_kind: str = "databricks") -> dict:
     if mode == "structural":
-        # Tier 0 only: the catalog reads schema_parity makes per object and side, no row read.
-        src = {"tier0": sum(SCHEMA_FACT_STATEMENTS + (2 if c.identity_source else 0) for c in spec.objects)}
-        tgt = {"tier0": sum(SCHEMA_FACT_STATEMENTS + (2 if c.identity_target else 0) for c in spec.objects)}
+        if family is None:
+            raise ValueError("estimate --mode structural needs --family: Tier 0's catalog "
+                             "statements are per adapter")
+        from .adapters import SOURCE_ADAPTERS, TARGET_ADAPTERS
+        sides = (SOURCE_ADAPTERS[family].CATALOG_STATEMENTS,
+                 TARGET_ADAPTERS[target_kind].CATALOG_STATEMENTS)
+
+        def tier0(st):
+            # schema_facts once per object, identity_state only where both sides declare an
+            # identity column, and the adapter's session-scoped reads once (cached per adapter).
+            return (sum(st["schema_facts"] + (st["identity_state"]
+                                              if c.identity_source and c.identity_target else 0)
+                        for c in spec.objects)
+                    + (st["session"] if spec.objects else 0))
+
+        src, tgt = {"tier0": tier0(sides[0])}, {"tier0": tier0(sides[1])}
         src["total"], tgt["total"] = src["tier0"], tgt["tier0"]
         return {"mode": mode, "depth": depth, "tier3_mode": {}, "source_statements": src,
                 "target_statements": tgt, "source_rows_fetched": 0, "target_rows_fetched": 0,
