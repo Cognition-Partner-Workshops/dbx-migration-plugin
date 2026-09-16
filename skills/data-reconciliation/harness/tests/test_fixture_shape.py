@@ -513,3 +513,43 @@ def test_postgres_source_column_shape_reads_pg_attribute():
         {"name": "note", "type": "varchar(40)", "nullable": True}]
     cur = conn.cursors[0]
     assert "pg_attribute" in cur.sql and cur.params == ("app", "t")
+
+
+def test_sqlserver_float_keeps_its_declared_precision():
+    """float(24) and float(53) are different storage; folding both to `float` would let a
+    lower-precision fixture pass the shape gate."""
+    from recon.adapters import SqlServerSourceAdapter
+    conn = _Conn([("Rate", "float", 4, 24, None, True, 1),
+                  ("Amt", "float", 8, 53, None, True, 2),
+                  ("Real", "real", 4, 24, None, True, 3)])
+    ad = SqlServerSourceAdapter.__new__(SqlServerSourceAdapter)
+    ad._conn, ad.statements, ad.rows_fetched = conn, 0, 0
+    assert [c["type"] for c in ad.column_shape("dbo.Orders")] == ["float(24)", "float(53)", "real"]
+
+
+class UnprofilableSource(ShapedSource):
+    """A side whose profile query fails on one column (a type with no equality operator)."""
+
+    def column_profile(self, table, column, where=None):
+        if column == "status":
+            self._count("column_profile")
+            raise RuntimeError("could not identify an equality operator for type json")
+        return super().column_profile(table, column, where)
+
+
+def test_a_profile_read_that_fails_leaves_the_table_unsupported_with_evidence():
+    """A COUNT(DISTINCT) the source cannot run must end that table's cardinality check as
+    `unsupported` (reason recorded), never escape and leave wave 0 without fixture_shape.json."""
+    src = UnprofilableSource({"app.orders": SOURCE_ROWS}, {"app.orders": SOURCE_SHAPE})
+    out = compare_fixture(SPEC, src, _source())
+    row = out["tables"]["app.orders"]
+    assert out["status"] == "unsupported" and out["findings"] == []
+    assert row["status"] == "unsupported" and row["cardinality"] == "unsupported"
+    assert "status" in row["reason"] and "RuntimeError" in row["reason"]
+    assert src.calls["column_profile"] < 3  # profiling that table stops at the failure
+    with pytest.raises(KeyboardInterrupt):
+        class Interrupting(ShapedSource):
+            def column_profile(self, table, column, where=None):
+                raise KeyboardInterrupt
+        compare_fixture(SPEC, Interrupting({"app.orders": SOURCE_ROWS}, {"app.orders": SOURCE_SHAPE}),
+                        _source())

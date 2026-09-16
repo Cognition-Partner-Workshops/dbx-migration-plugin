@@ -1052,6 +1052,7 @@ def _uc_identity_state(run_query, catalog: str, schema: str, table: str,
 _TSQL_LENGTH_TYPES = ("char", "varchar", "binary", "varbinary", "nchar", "nvarchar")
 _TSQL_PRECISION_TYPES = ("decimal", "numeric")
 _TSQL_SCALE_TYPES = ("datetime2", "datetimeoffset", "time")
+_TSQL_BITS_TYPES = ("float",)  # float(24) and float(53) are different storage
 
 
 def _tsql_type(kind, max_length, precision, scale) -> str:
@@ -1066,6 +1067,8 @@ def _tsql_type(kind, max_length, precision, scale) -> str:
         return f"{kind}({int(precision)},{int(scale or 0)})"
     if kind in _TSQL_SCALE_TYPES and scale is not None:
         return f"{kind}({int(scale)})"
+    if kind in _TSQL_BITS_TYPES and precision is not None:
+        return f"{kind}({int(precision)})"
     return normalize_type(kind)
 
 

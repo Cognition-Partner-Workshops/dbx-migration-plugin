@@ -95,10 +95,13 @@ def _compare_cardinality(table: str, columns: list[str], where: str | None, sour
     for col in columns:
         if not budget.fits():
             return out, budget.reason()
-        s = source.column_profile(table, col, where)
-        if not budget.fits(0):
-            return out, budget.reason() + f" (profiling {col} overspent it)"
-        f = fixture.column_profile(table, col, where)
+        try:
+            s = source.column_profile(table, col, where)
+            if not budget.fits(0):
+                return out, budget.reason() + f" (profiling {col} overspent it)"
+            f = fixture.column_profile(table, col, where)
+        except Exception as exc:  # a profile the side cannot run (no equality operator, denied)
+            return out, f"profiling {col} failed: {type(exc).__name__}: {exc}"
         s_rows, f_rows = int(s["count"]), int(f["count"])
         if f_rows == 0:
             out.append(_find(table, "empty_fixture", f"source {s_rows} rows, fixture 0 rows"))
