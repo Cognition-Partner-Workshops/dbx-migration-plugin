@@ -30,7 +30,7 @@ from .config import (
 )
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
-from .rerun import check_proof, declared_shape, expected_digest, grade_rerun, load_record, load_shape
+from .rerun import check_proof, grade_rerun, load_prior, load_record, source_digest
 from .typemap import apply_type_map, load_type_map
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres")
@@ -189,14 +189,16 @@ def main(argv: list[str] | None = None) -> int:
     rp = sub.add_parser("rerun-proof", help="grade the schema-evolution rerun proof from the "
                         "child's two run records (no connections); writes <out>/rerun_proof.json")
     rp.add_argument("--unit", required=True)
+    rp.add_argument("--source", action="append", default=[], type=Path,
+                    help="a source file of the job under proof (DDL, notebook, SQL); repeatable; the "
+                         "proof digests them so any later edit makes it stale")
     rp.add_argument("--ddl", type=Path,
-                    help="the unit's committed DDL; the shape it declares is what both runs must land")
-    rp.add_argument("--expected-shape", type=Path,
-                    help="shape JSON instead of --ddl when the DDL is generated at run time")
-    rp.add_argument("--prior-ddl", type=Path,
-                    help="the previous committed DDL (git history or the prior wave); the evolved "
-                         "run's pre_shape must equal the shape it declares")
-    rp.add_argument("--prior-shape", type=Path, help="shape JSON instead of --prior-ddl")
+                    help="optional DDL hint: tables it creates that the fresh run did not record are notes")
+    rp.add_argument("--prior-proof", type=Path,
+                    help="the previously committed rerun_proof.json; its observed shape is what the "
+                         "evolved run's pre_shape must equal")
+    rp.add_argument("--prior-shape", type=Path,
+                    help="shape JSON instead of --prior-proof (first run: the manifest-declared old shape)")
     rp.add_argument("--fresh", required=True, type=Path,
                     help="run record from the fresh-target run (dbx-recon shape after the job)")
     rp.add_argument("--evolved", type=Path,
@@ -253,11 +255,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--rerun-proof", type=Path,
                    help="rerun_proof.json from `dbx-recon rerun-proof`; a failed leg blocks merge "
                         "with reason rerun_gap; an unsupported evolved leg with rerun_unsupported")
-    r.add_argument("--rerun-ddl", type=Path,
-                   help="with --rerun-proof: the unit's committed DDL now; a proof that graded another "
-                        "shape is stale and refused")
-    r.add_argument("--rerun-expected-shape", type=Path,
-                   help="with --rerun-proof: shape JSON instead of --rerun-ddl")
+    r.add_argument("--rerun-source", action="append", default=[], type=Path,
+                   help="with --rerun-proof: the job's source files as committed now (the same set "
+                        "rerun-proof was given); a proof of other files is stale and refused")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -312,23 +312,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "rerun-proof":
-        if (args.ddl is None) == (args.expected_shape is None):
-            raise SystemExit("rerun-proof needs exactly one of --ddl or --expected-shape")
-        if args.prior_ddl is not None and args.prior_shape is not None:
-            raise SystemExit("rerun-proof takes --prior-ddl or --prior-shape, not both")
+        if not args.source:
+            raise SystemExit("rerun-proof needs --source <file> (the job's DDL, notebook or SQL; repeatable)")
+        if args.prior_proof is not None and args.prior_shape is not None:
+            raise SystemExit("rerun-proof takes --prior-proof or --prior-shape, not both")
+        prior_path = args.prior_proof or args.prior_shape
         try:
-            if args.ddl is not None:
-                expected = declared_shape(args.ddl.read_text())
-            else:
-                expected = load_shape(args.expected_shape)
-            prior = (declared_shape(args.prior_ddl.read_text()) if args.prior_ddl is not None
-                     else load_shape(args.prior_shape) if args.prior_shape is not None else None)
-            proof = grade_rerun(expected, load_record(args.fresh, "fresh"),
-                                load_record(args.evolved, "evolved") if args.evolved else None, prior)
+            prior = load_prior(prior_path) if prior_path is not None else None
+            proof = grade_rerun(load_record(args.fresh, "fresh"),
+                                load_record(args.evolved, "evolved") if args.evolved else None, prior,
+                                digest=source_digest(args.source),
+                                ddl=args.ddl.read_text() if args.ddl is not None else None)
         except (OSError, ConfigError) as exc:
             raise SystemExit(f"rerun-proof: {exc}") from None
-        proof = {"unit": args.unit, "expected_from": str(args.ddl or args.expected_shape),
-                 **({"prior_from": str(args.prior_ddl or args.prior_shape)} if prior is not None else {}),
+        proof = {"unit": args.unit, "sources": [str(s) for s in args.source],
+                 **({"prior_from": str(prior_path)} if prior is not None else {}),
                  **proof}
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / "rerun_proof.json").write_text(json.dumps(proof, indent=2) + "\n")
@@ -409,14 +407,12 @@ def main(argv: list[str] | None = None) -> int:
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
     rerun_proof = None
     if args.rerun_proof is not None:
-        if (args.rerun_ddl is None) == (args.rerun_expected_shape is None):
-            raise SystemExit("--rerun-proof needs exactly one of --rerun-ddl or --rerun-expected-shape "
-                             "(the shape the unit declares now)")
+        if not args.rerun_source:
+            raise SystemExit("--rerun-proof needs --rerun-source <file> (the job's source files as they "
+                             "are now; the proof must bind to them)")
         try:
-            expected = (declared_shape(args.rerun_ddl.read_text()) if args.rerun_ddl is not None
-                        else load_shape(args.rerun_expected_shape))
             rerun_proof = check_proof(json.loads(args.rerun_proof.read_text()), args.unit,
-                                      str(args.rerun_proof), expected_digest(expected))
+                                      str(args.rerun_proof), source_digest(args.rerun_source))
         except (OSError, json.JSONDecodeError, ConfigError) as exc:
             raise SystemExit(f"--rerun-proof: {exc}") from None
     try:

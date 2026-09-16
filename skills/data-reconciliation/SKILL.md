@@ -101,21 +101,23 @@ provenance warning and the run is not merge-eligible.
   tier has findings or unverifiable objects. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
-- Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --ddl <unit ddl> --prior-ddl
-  <previous committed ddl> --fresh <record> --evolved <record> --out <dir>` grades the idempotency job twice from two run
-  records (`dbx-recon shape` reads a target's observed columns, read-only): once on a fresh
-  target, once against the table pre-created in its previous committed shape (git history or
-  the prior wave's DDL; `harness/fixtures/example_rerun/` is the canonical failing case, a
-  `CREATE TABLE IF NOT EXISTS` that never lands the new column). `rerun_proof.json` carries
-  `{fresh: pass|fail, evolved: pass|fail|unsupported, findings}`; without an evolved record,
-  without `--prior-ddl`/`--prior-shape`, or when the pre-created shape equals the declared one
-  or differs from the prior one, `evolved` is `unsupported` with the reason, never clean; a reordered column is a `column_order` finding. The DDL parser applies
-  `CREATE TABLE (columns)` and `ALTER TABLE ... ADD COLUMN(S)` (with `FIRST` / `AFTER`) only and refuses any other
-  `ALTER TABLE`, `CREATE TABLE ... AS SELECT` or `LIKE` (use `--expected-shape`); `shape` refuses a
-  table the target does not have rather than recording it empty. `run --rerun-proof <file> --rerun-ddl <unit ddl>` (or
-  `--rerun-expected-shape`) copies it into `result.json` after checking its `expected_digest`
-  against the DDL the unit declares now (shape and statements: a proof from an older DDL, or one
-  graded from a shape file, is stale and refused); a
+- Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --source <job file>... --prior-proof
+  <last committed rerun_proof.json> --fresh <record> --evolved <record> --out <dir>` grades the idempotency job twice
+  from two run records (`dbx-recon shape` reads a target's observed columns, read-only; it refuses a
+  table the target does not have rather than recording it empty). The catalog is the source of truth,
+  never the DDL: the shape the fresh run landed is the expected shape and the evolved run, against the
+  table pre-created in its previous committed shape, must land the identical one (`harness/fixtures/example_rerun/`
+  is the canonical failing case, a `CREATE TABLE IF NOT EXISTS` that never lands the new column).
+  The previous shape is the last committed proof's observed `shape` (`--prior-proof`), or on a unit's
+  first run the manifest-declared old shape (`--prior-shape`). `rerun_proof.json` carries
+  `{fresh: pass|fail, evolved: pass|fail|unsupported, findings, shape, shape_digest, source_digest}`;
+  without an evolved record, without a prior, when the pre-created shape equals the fresh one or
+  differs from the prior one, or when the fresh leg failed, `evolved` is `unsupported` with the reason,
+  never clean; a reordered column is a `column_order` finding; a fresh run that recorded no table fails
+  (`no_tables`). `--ddl` is a hint only: tables its `CREATE TABLE` statements name that the fresh run did
+  not record become notes, never findings. `run --rerun-proof <file> --rerun-source <job file>...` copies
+  it into `result.json` after checking its `source_digest` against the job's files as committed now (any
+  edit to the DDL, notebook or SQL makes the proof stale and refused); a
   failed leg adds `rerun_gap` to `merge_block_reasons`, an unsupported evolved leg adds
   `rerun_unsupported`, a `run` without `--rerun-proof` adds `rerun_missing` (every migrated unit
   writes its tables, so no proof is a missing control), and any of them sets `merge_eligible=false`.
