@@ -46,7 +46,7 @@ Every child uses CORE + its workload profile + DATA / DEPENDENCY. No downstream 
 1. Consume `00_intake_template.md`, probe what it leaves blank, and propose only what neither source nor probe can answer.
 2. Write `00_context.md` with `## Glossary`, `01_conventions.md`, and the target-state cites. Read the process contract from `references/contract.md`; do not restate it.
 3. Pin exact-match or per-type/per-surface tolerances, row and aggregate thresholds, populations, nondeterminism, ML parity, legacy-query cap, LIVE/DEGRADED mode, amendment procedure, and matching JSON fields; every rate names its population and every amendment preserves the old row and re-verification scope (DEGRADED evidence standard: playbook 6).
-4. Initialize `04_dependency_register.md`, `06_decisions.md`, and the generated-ledger workflow; never hand-edit `05_progress.md`.
+4. Initialize `04_dependency_register.md`, `06_decisions.md`, and the generated-ledger workflow; never hand-edit `05_progress.md`; regenerate it with `python3 <plugin>/skills/migration-fanout/progress.py .migration` at every wave close and use `--refresh-merged` after merges.
 5. Probe legacy read, Databricks query, and target write; the write probe covers the promotion schema named by the target profile. Record WORKS/BLOCKED evidence and fire every blocked item as a D10.
 6. Record the three principal tiers in `07_access_checklist.md`:
 
