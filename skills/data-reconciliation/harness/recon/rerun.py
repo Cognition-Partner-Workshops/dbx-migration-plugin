@@ -205,6 +205,7 @@ def _strip_comments(sql: str) -> str:
 
 
 _PLACEMENT = re.compile(r"\b(?:(?P<first>FIRST)|AFTER\s+(?P<after>\S+))\s*$", re.IGNORECASE)
+_ADD_ACTION = re.compile(r"^ADD\s+(?:COLUMNS?\s+)?(?:IF\s+NOT\s+EXISTS\s+)?", re.IGNORECASE)
 
 
 def _add_column(cols: list[dict], defn: str) -> None:
@@ -233,15 +234,15 @@ def declared_shape(sql: str) -> dict:
     if_not_exists: list[str] = []
     altered: list[str] = []
     counts = {"create_table": 0, "alter_table": 0, "other": 0}
-    for stmt in _split_top(_strip_comments(sql), ";", angle=False):
-        stmt = stmt.strip()
+    statements = [re.sub(r"\s+", " ", st).strip() for st in _split_top(_strip_comments(sql), ";", angle=False)]
+    for stmt in statements:
         m = _CREATE.match(stmt)
         if m:
             name = _ident(m.group("name"))
             end = _balanced(stmt, m.end() - 1)
             body = stmt[m.end():end - 1]
-            if re.match(r"\s*LIKE\b", body, re.IGNORECASE):
-                raise ConfigError(f"CREATE TABLE {name} LIKE: the columns are not in the DDL; "
+            if any(re.match(r"LIKE\b", d, re.IGNORECASE) for d in _split_top(body)):
+                raise ConfigError(f"CREATE TABLE {name} LIKE: the inherited columns are not in the DDL; "
                                   "pass --expected-shape instead")
             tables[name] = _table_columns(body)
             counts["create_table"] += 1
@@ -255,7 +256,13 @@ def declared_shape(sql: str) -> dict:
             if body.startswith("("):
                 body = body[1:_balanced(body, 0) - 1]
             cols = tables.setdefault(name, [])
-            for d in _split_top(body):
+            for i, d in enumerate(_split_top(body)):
+                if i and _ADD_ACTION.match(d):
+                    d = d[_ADD_ACTION.match(d).end():]
+                elif i and re.match(r"^(?:ADD|DROP|ALTER|RENAME|MODIFY|CHANGE|SET|UNSET)\b", d, re.IGNORECASE):
+                    raise ConfigError(f"cannot apply ALTER TABLE {name} action {d[:40].strip()!r} to the "
+                                      "declared shape (only ADD COLUMN(S) is applied); pass "
+                                      "--expected-shape instead")
                 _add_column(cols, d)
             counts["alter_table"] += 1
             if name not in altered:
@@ -271,7 +278,8 @@ def declared_shape(sql: str) -> dict:
         counts["other"] += 1
     if not counts["create_table"]:
         raise ConfigError("no CREATE TABLE statement in the DDL; pass --expected-shape instead")
-    return {"tables": tables, "if_not_exists": if_not_exists, "altered": altered, "statements": counts}
+    return {"tables": tables, "if_not_exists": if_not_exists, "altered": altered, "statements": counts,
+            "ddl_digest": hashlib.sha256(";".join(statements).encode()).hexdigest()}
 
 
 def _check_shape(shape, where: str) -> dict:
@@ -294,9 +302,10 @@ def _check_shape(shape, where: str) -> dict:
 
 
 def expected_digest(expected: dict) -> str:
-    """sha256 of the declared tables, so a proof names the shape it graded and `run` can refuse
-    one that a later DDL change made stale."""
-    return hashlib.sha256(json.dumps(expected["tables"], sort_keys=True,
+    """sha256 of the declared tables and, from DDL, of the statements that land them (comments and
+    whitespace aside), so a proof names what it graded and `run` refuses one made stale by a
+    later change: a shape edit, or a rewrite of the statements that leaves the shape alone."""
+    return hashlib.sha256(json.dumps([expected["tables"], expected.get("ddl_digest")], sort_keys=True,
                                      separators=(",", ":")).encode()).hexdigest()
 
 
@@ -379,9 +388,10 @@ def _grade(run: str, expected: dict, record: dict) -> tuple[str, list[dict]]:
     return ("fail" if findings else "pass"), findings
 
 
-def grade_rerun(expected: dict, fresh: dict | None, evolved: dict | None) -> dict:
+def grade_rerun(expected: dict, fresh: dict | None, evolved: dict | None, prior: dict | None = None) -> dict:
     """`expected` is `declared_shape(...)` or a `load_shape(...)` result; records come from
-    `load_record` (or None when the child did not run that leg)."""
+    `load_record` (or None when the child did not run that leg); `prior` is the previous committed
+    shape, which the evolved leg's pre_shape must equal for that leg to count as evolution."""
     if fresh is None:
         raise ConfigError("a fresh run record is required; the proof starts on an empty target")
     for rec, run in ((fresh, "fresh"), (evolved, "evolved")):
@@ -410,6 +420,14 @@ def grade_rerun(expected: dict, fresh: dict | None, evolved: dict | None) -> dic
     elif not _compare("evolved", expected["tables"], evolved["pre_shape"]["tables"]):
         reason = ("evolved pre_shape equals the declared shape: nothing evolved, so the run proves "
                   "only what fresh proved")
+    elif prior is None:
+        reason = ("no prior shape: pass --prior-ddl or --prior-shape (the previous committed shape) "
+                  "so the evolved leg can be checked against it")
+    elif _compare("evolved", prior["tables"], evolved["pre_shape"]["tables"]):
+        drift = _compare("evolved", prior["tables"], evolved["pre_shape"]["tables"])
+        reason = ("evolved pre_shape is not the prior committed shape: " + "; ".join(
+            f"{f['table']}.{f['column']}: {f['check']}" if f["column"] else f"{f['table']}: {f['check']}"
+            for f in drift))
     else:
         evolved_status, more = _grade("evolved", expected, evolved)
         findings.extend(more)
@@ -428,6 +446,8 @@ def grade_rerun(expected: dict, fresh: dict | None, evolved: dict | None) -> dic
         "expected_digest": expected_digest(expected),
         "evidence": {"fresh": fresh["evidence"], **({"evolved": evolved["evidence"]} if evolved else {})},
     }
+    if prior is not None:
+        out["prior_digest"] = expected_digest(prior)
     if reason:
         out["unsupported_reason"] = reason
     return out
@@ -438,6 +458,12 @@ def rerun_gap(proof: dict | None) -> bool:
     failed, or that lists any finding at all. No proof is recorded as null, never as clean."""
     return proof is not None and (proof.get("fresh") == "fail" or proof.get("evolved") == "fail"
                                   or bool(proof.get("findings")))
+
+
+def rerun_missing(proof: dict | None) -> bool:
+    """True when no proof was supplied at all: the unit writes its tables, so an unrecorded rerun
+    is a missing control and result.json carries `rerun_missing`."""
+    return proof is None
 
 
 def rerun_unsupported(proof: dict | None) -> bool:
@@ -486,4 +512,7 @@ def check_proof(data: object, unit: str, where: str, digest: str) -> dict:
             raise ConfigError(f"{where}: the {leg} leg ran ({status}) but has no evidence")
     if evolved == "unsupported" and not str(data.get("unsupported_reason") or "").strip():
         raise ConfigError(f"{where}: evolved is unsupported without an unsupported_reason")
+    if evolved == "pass" and not str(data.get("prior_digest") or "").strip():
+        raise ConfigError(f"{where}: the evolved leg passed without a prior_digest naming the previous "
+                          "committed shape it started from")
     return data
