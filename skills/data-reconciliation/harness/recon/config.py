@@ -227,6 +227,8 @@ class ObjectMapping:
 class MappingSpec:
     version: str
     objects: list[ObjectMapping]
+    # source principal -> target principal for the grant comparison; identity when absent
+    principal_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -430,7 +432,12 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
         ))
     if not objects:
         raise ConfigError(f"{path}: mapping spec has no objects")
-    return MappingSpec(version=version, objects=objects)
+    principal_map = data.get("principal_map") or {}
+    if not isinstance(principal_map, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in principal_map.items()):
+        raise ConfigError(f"{path}: principal_map must be a string -> string object")
+    return MappingSpec(version=version, objects=objects,
+                       principal_map={k.lower(): v.lower() for k, v in principal_map.items()})
 
 
 def _flag(data: dict, key: str, path: Path) -> bool:

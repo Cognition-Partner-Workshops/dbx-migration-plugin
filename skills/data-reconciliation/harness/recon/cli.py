@@ -206,6 +206,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--target-schema", required=True)
     r.add_argument("--ops", type=Path, help="recorded representative queries for Tier 4")
     r.add_argument("--snapshot-manifest", type=Path)
+    r.add_argument("--source-dictionary", type=Path,
+                   help="fixture dictionary JSON (harness/fixtures/example_<family>/dictionary.json): "
+                        "structural facts read from the file, not the live catalog; never merge-eligible")
+    r.add_argument("--target-dictionary", type=Path,
+                   help="same, for the target side")
     r.add_argument("--seed", type=int, default=0,
                    help="sampling seed (recorded in result.json for re-runnability)")
     r.add_argument("--depth", choices=DEPTHS, default="threshold",
@@ -331,6 +336,15 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(str(exc)) from None
     else:
         target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
+    if args.source_dictionary or args.target_dictionary:
+        from .structure import DictionaryOverlay, load_dictionary
+        try:
+            if args.source_dictionary:
+                source = DictionaryOverlay(source, load_dictionary(args.source_dictionary))
+            if args.target_dictionary:
+                target = DictionaryOverlay(target, load_dictionary(args.target_dictionary))
+        except ConfigError as exc:
+            raise SystemExit(f"dictionary: {exc}") from None
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,

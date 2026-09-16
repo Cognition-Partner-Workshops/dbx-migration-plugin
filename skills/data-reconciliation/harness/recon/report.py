@@ -53,6 +53,18 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
     merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
                       and not warnings and (mode != "snapshot" or snapshot is not None))
+    structural = next((t for t in tiers if t.name in ("structural_parity", "schema_parity")), None)
+    reasons = []
+    if structural is not None and (structural.findings or structural.stats.get("unverified")):
+        reasons.append("structural_gap")
+    if verdict == "FAIL":
+        reasons.append("tier_failed")
+    if warnings:
+        reasons.append("warnings")
+    if mode not in ("live", "snapshot", "transactional"):
+        reasons.append("mode")
+    if mode == "snapshot" and snapshot is None:
+        reasons.append("snapshot_missing")
     return {
         "unit": unit,
         "mode": mode,
@@ -70,6 +82,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "merge_eligible": merge_eligible,
         "merge_authority": {"kind": "harness", "decision_id": None},
         "type_map": type_map,
+        "merge_block_reasons": reasons,
     }
 
 
@@ -145,6 +158,10 @@ def render_summary(result: dict) -> str:
         lines.append(f"- Cost: source {cost['source_statements']} statements / "
                      f"{cost['source_rows_fetched']} rows fetched; target {cost['target_statements']} "
                      f"statements / {cost['target_rows_fetched']} rows; {cost['elapsed_s']}s")
+    structural = next((t for t in result["tiers"] if t["name"] in ("structural_parity", "schema_parity")), None)
+    if structural is not None and structural["stats"].get("structural_checks"):
+        checks = ", ".join(f"{k}={v}" for k, v in structural["stats"]["structural_checks"].items())
+        lines.append(f"- Structural checks: {checks}")
     if result.get("snapshot") is not None:
         lines.append(f"- Snapshot provenance: `{json.dumps(result['snapshot'], default=str)}`")
     window = next((t for t in result["tiers"] if t["name"] == "consistency_window"), None)

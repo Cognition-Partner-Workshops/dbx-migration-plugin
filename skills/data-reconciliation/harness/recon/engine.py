@@ -13,6 +13,7 @@ from .adapters import StatementCounting
 from .canon import Canonicalizer
 from .config import CanonRule, ConfigError, MappingSpec, Tolerances
 from .report import build_result, write_outputs
+from .structure import tier0_structural_parity
 from .tiers import tier1_counts, tier2_aggregates, tier3_diffs, tier4_parity
 from .transactional import (
     abandon_window,
@@ -93,6 +94,9 @@ def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source,
         tiers.append(tier7_schema_parity(spec, tol, source, target))
         # the window closes last so every tier above read inside it; a moved side fails the run
         tiers.insert(0, close_window(spec, tol, ctx, source, target))
+    elif mode != "continuous":
+        # structural parity outside a window: runs regardless of tier 1's outcome, gates nothing
+        tiers.insert(0, tier0_structural_parity(spec, tol, source, target))
     return tiers
 
 

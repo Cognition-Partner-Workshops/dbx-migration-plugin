@@ -1,0 +1,21 @@
+{"family": "databricks",
+ "note": "Example Unity Catalog shape for --target-dictionary. Delta has no indexes or triggers, so both are declared unsupported — an honest hole, not clean.",
+ "unsupported": ["indexes", "triggers"],
+ "tables": {
+  "loans": {
+   "primary_key": ["loan_id"],
+   "unique": [["loan_number"]],
+   "foreign_keys": [{"columns": ["borrower_id"], "references": "borrowers",
+                     "referenced_columns": ["borrower_id"],
+                     "on_update": "no action", "on_delete": "no action"}],
+   "not_null": ["loan_id", "loan_number", "borrower_id"],
+   "checks": ["current_balance >= 0"],
+   "identity_columns": ["loan_id"],
+   "identity_state": {"loan_id": {"next": 1001, "increment": 1}},
+   "grants": {"migration_svc": ["select", "modify"]}},
+  "borrowers": {
+   "primary_key": ["borrower_id"],
+   "not_null": ["borrower_id"],
+   "identity_columns": ["borrower_id"],
+   "identity_state": {"borrower_id": {"next": 500, "increment": 1}}}}}
+

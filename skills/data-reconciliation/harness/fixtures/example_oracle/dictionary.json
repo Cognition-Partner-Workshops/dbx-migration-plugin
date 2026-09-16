@@ -1,0 +1,23 @@
+{"family": "oracle",
+ "note": "Format fixture only: the harness has no live Oracle adapter, so this dictionary exists to show the shape (Oracle names, sequence-fed identity via identity_columns); its live reader stays untested.",
+ "unsupported": [],
+ "tables": {
+  "APP.LOANS": {
+   "primary_key": ["LOAN_ID"],
+   "unique": [["LOAN_NUMBER"]],
+   "foreign_keys": [{"columns": ["BORROWER_ID"], "references": "APP.BORROWERS",
+                     "referenced_columns": ["BORROWER_ID"],
+                     "on_update": "no action", "on_delete": "cascade"}],
+   "not_null": ["LOAN_ID", "LOAN_NUMBER", "BORROWER_ID"],
+   "indexes": [["BORROWER_ID"]],
+   "checks": ["CURRENT_BALANCE >= 0"],
+   "identity_columns": ["LOAN_ID"],
+   "identity_state": {"LOAN_ID": {"next": 1001, "increment": 1}},
+   "triggers": {"TRG_LOANS_AUDIT": {"timing": "after", "events": ["insert", "update"]}},
+   "grants": {"APP_RW": ["select", "insert", "update", "delete"], "REPORTING_RO": ["select"]}},
+  "APP.BORROWERS": {
+   "primary_key": ["BORROWER_ID"],
+   "not_null": ["BORROWER_ID"],
+   "identity_columns": ["BORROWER_ID"],
+   "identity_state": {"BORROWER_ID": {"next": 500, "increment": 1}}}}}
+
