@@ -1039,6 +1039,26 @@ def _uc_identity_state(run_query, catalog: str, schema: str, table: str,
     return IdentityState(int(mx) + inc if mx is not None else start, inc)
 
 
+_TSQL_LENGTH_TYPES = ("char", "varchar", "binary", "varbinary", "nchar", "nvarchar")
+_TSQL_PRECISION_TYPES = ("decimal", "numeric")
+_TSQL_SCALE_TYPES = ("datetime2", "datetimeoffset", "time")
+
+
+def _tsql_type(kind, max_length, precision, scale) -> str:
+    """sys.types name plus the length/precision sys.columns carries, spelled as declared."""
+    kind = str(kind).lower()
+    if kind in _TSQL_LENGTH_TYPES and max_length is not None:
+        if int(max_length) == -1:
+            return f"{kind}(max)"
+        n = int(max_length) // 2 if kind.startswith("n") else int(max_length)
+        return f"{kind}({n})"
+    if kind in _TSQL_PRECISION_TYPES and precision is not None:
+        return f"{kind}({int(precision)},{int(scale or 0)})"
+    if kind in _TSQL_SCALE_TYPES and scale is not None:
+        return f"{kind}({int(scale)})"
+    return normalize_type(kind)
+
+
 def _split_table(table: str, default_schema: str | None) -> tuple[str | None, str]:
     parts = table.replace("[", "").replace("]", "").replace('"', "").split(".")
     return (parts[-2] if len(parts) > 1 else default_schema), parts[-1]
@@ -1227,6 +1247,19 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
         facts.grants = {g: frozenset(p) for g, p in grants.items()}
         return facts
 
+    def column_shape(self, table: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order (recon.fixture_shape); one catalog read."""
+        schema, name = _split_table(table, "dbo")
+        rows = self._rows(
+            "SELECT c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable, c.column_id "
+            "FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id "
+            "JOIN sys.objects o ON o.object_id = c.object_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = ? AND o.name = ? "
+            "ORDER BY c.column_id", (schema, name))
+        return [{"name": str(col).lower(), "type": _tsql_type(kind, max_length, precision, scale),
+                 "nullable": bool(nullable)}
+                for col, kind, max_length, precision, scale, nullable, _ in rows]
+
     def numeric_columns(self, table: str) -> set[str]:
         schema, name = _split_table(table, "dbo")
         rows = self._rows(
@@ -1320,6 +1353,21 @@ class DatabricksSourceAdapter(_SqlAdapterBase):
             raise NotImplementedError(
                 f"{type(self).__name__} needs a catalog.schema.table name, got {table!r}")
         return _uc_schema_facts(lambda sql, params: self._rows(sql, params), *parts)
+
+    def column_shape(self, table: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order (recon.fixture_shape); one catalog read."""
+        parts = table.replace("`", "").split(".")
+        if len(parts) != 3:
+            raise NotImplementedError(
+                f"{type(self).__name__} needs a catalog.schema.table name, got {table!r}")
+        catalog, schema, name = parts
+        rows = self._rows(
+            f"SELECT column_name, full_data_type, is_nullable, ordinal_position "
+            f"FROM {quote_ident(catalog, '`')}.information_schema.columns "
+            "WHERE table_catalog = %(catalog)s AND table_schema = %(schema)s AND table_name = %(table)s "
+            "ORDER BY ordinal_position", {"catalog": catalog, "schema": schema, "table": name})
+        return [{"name": str(col).lower(), "type": normalize_type(dtype),
+                 "nullable": str(nullable).upper() != "NO"} for col, dtype, nullable, _ in rows]
 
     def identity_state(self, table: str, column: str) -> IdentityState | None:
         parts = table.replace("`", "").split(".")
@@ -1471,6 +1519,16 @@ class _PostgresBase(_SqlAdapterBase):
     # column ignores the offset, so the explicit +00:00 is right for both under the UTC contract.
     watermark_literal_utc_offset = True
     binary_literal_sql = "'\\x{hex}'::bytea"
+
+    def _pg_column_shape(self, schema: str, name: str) -> list[dict[str, Any]]:
+        rows = self._rows(
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attnum "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped "
+            "ORDER BY a.attnum", (schema, name))
+        return [{"name": str(col).lower(), "type": normalize_type(dtype), "nullable": not notnull}
+                for col, dtype, notnull, _ in rows]
 
     def open_window(self) -> str:
         """Every statement until close_window reads one REPEATABLE READ snapshot."""
@@ -1707,6 +1765,10 @@ class PostgresSourceAdapter(_PostgresBase):
         import psycopg  # lazy: optional extra
         super().__init__(psycopg.connect(_secret(dsn_secret)))
 
+    def column_shape(self, table: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order (recon.fixture_shape); one catalog read."""
+        return self._pg_column_shape(*_split_table(table, "public"))
+
 
 SOURCE_ADAPTERS["postgres"] = PostgresSourceAdapter
 
@@ -1798,14 +1860,7 @@ class LakebaseTargetAdapter(_PostgresBase):
 
     def column_shape(self, object: str) -> list[dict[str, Any]]:
         """Observed columns in declared order for the rerun proof (recon.rerun)."""
-        rows = self._rows(
-            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attnum "
-            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped "
-            "ORDER BY a.attnum", (self._schema, object))
-        return [{"name": str(name).lower(), "type": normalize_type(dtype), "nullable": not notnull}
-                for name, dtype, notnull, _ in rows]
+        return self._pg_column_shape(self._schema, object)
 
     def null_key_count(self, object: str, key_fields: list[str], where: str | None = None) -> int:
         return super().null_key_count(self._q(object), key_fields, where)
