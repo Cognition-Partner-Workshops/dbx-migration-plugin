@@ -164,7 +164,7 @@ def check_workspace(ws: Path) -> Check:
     mig = ws / ".migration"
     if not mig.is_dir():
         return Check("workspace", "fail", f"{mig} missing; run 1-migration_setup first")
-    missing = [f for f in REQUIRED_FILES if not (mig / f).exists()]
+    missing = [f for f in REQUIRED_FILES if not (mig / f).is_file()]
     if missing:
         return Check("workspace", "fail", f".migration/ incomplete: missing {missing}", {"missing": missing})
     context = (mig / "00_context.md").read_text(errors="replace")
@@ -182,7 +182,7 @@ def check_stop_mode(ws: Path) -> Check:
     text = ""
     for name in ("00_context.md", "01_conventions.md"):
         p = ws / ".migration" / name
-        if p.exists():
+        if p.is_file():
             text += p.read_text(errors="replace")
     for line in text.splitlines():
         low = line.lower()

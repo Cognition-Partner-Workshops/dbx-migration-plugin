@@ -209,8 +209,6 @@ def refresh_merged(mig: Path) -> None:
     refreshes = []
     for path in sorted(waves.glob("*.result.json")):
         result = _result(path)
-        if result.get("auto_merge") is not False:
-            continue
         if not isinstance(result.get("batches"), list):
             raise ValueError(f"{path}: result batches is not a list")
         verify = result.get("verify")
@@ -219,7 +217,6 @@ def refresh_merged(mig: Path) -> None:
         merged_prs = verify.get("merged_prs") if isinstance(verify, dict) else None
         if merged_prs is not None and not isinstance(merged_prs, list):
             raise ValueError(f"{path}: verify merged_prs is not a list")
-        merged_prs = merged_prs or []
         candidates = [
             (batch.get("pr_url"), batch.get("pr_head"))
             for batch in result["batches"]
@@ -229,7 +226,6 @@ def refresh_merged(mig: Path) -> None:
             and batch.get("pr_url")
             and isinstance(batch.get("pr_head"), str)
             and batch.get("pr_head")
-            and batch.get("pr_url") not in merged_prs
         ]
         merged_record = _merged_record(path)
         manifest_path, manifest_bytes = _manifest_bytes(path, result.get("manifest_sha"))
@@ -376,13 +372,14 @@ def render_progress(mig: Path) -> str:
             )
             merged = (
                 "yes"
+                if isinstance(record_head, str) and record_head and record_head == batch.get("pr_head")
+                else "REPORTED, UNPROVEN"
                 if isinstance(pr_url, str) and pr_url and isinstance(merged_prs, list) and pr_url in merged_prs
-                or isinstance(record_head, str) and record_head and record_head == batch.get("pr_head")
                 else "pending"
                 if status == "PASS"
                 else ""
             )
-            if result.get("auto_merge") is False and status == "PASS" and merged != "yes":
+            if status == "PASS" and merged != "yes":
                 status = "PASS (unmerged)"
             normal_index = 0
             for unit in units:
