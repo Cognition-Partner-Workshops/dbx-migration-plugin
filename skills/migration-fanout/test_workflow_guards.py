@@ -30,14 +30,15 @@ def _functions():
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
                                       "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
-                                      "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices"})
+                                      "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices", "check_wave_tag",
+                                      "check_pipelines_published", "_is_manifest"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
                                                          "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED", "_SEGMENT",
-                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS"}
+                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE"}
                     for t in node.targets))]
-    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent")}
+    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate"}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -223,6 +224,123 @@ def test_shared_table_across_waves_passes_when_every_reader_is_bounded():
     check = _functions()["check_write_targets"]
     check([B1], _others(B2), _specs(u1=BOUNDED, u2=PRIOR))
     check([B1], _others({**B2, "write_targets": ["mig.other"]}), _specs())
+
+
+def test_pipeline_manifests_with_overlapping_targets_halt_and_disjoint_ones_pass(tmp_path):
+    fn = _functions()
+    (tmp_path / "wave-p1-1.json").write_text(json.dumps({"batches": []}))
+    (tmp_path / "wave-p2-1.json").write_text(json.dumps({"batches": [B2]}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p1-1.json")
+    assert "wave-p2-1.json" in others
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-p2-1\.json"):
+        fn["check_write_targets"]([B1], others, _specs(u1=UNBOUNDED))
+    (tmp_path / "wave-p2-1.json").write_text(json.dumps({"batches": [
+        {**B2, "write_targets": ["mig.other"]}]}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p1-1.json")
+    fn["check_write_targets"]([B1], others, _specs())
+
+
+def test_other_wave_manifests_skips_generated_wave_files(tmp_path):
+    fn = _functions()
+    (tmp_path / "wave-p1-1.json").write_text(json.dumps({"batches": [B1]}))
+    (tmp_path / "wave-p1-1.merged.json").write_text(json.dumps({"base": "a" * 40, "merged": {"b-1": True}}))
+    (tmp_path / "wave-p1-1.result.json").write_text(json.dumps({"wave": 1, "batches": [{"id": "b-1"}]}))
+    (tmp_path / "wave-p1-1.doctor.json").write_text(json.dumps({"checks": []}))
+    others = fn["other_wave_manifests"](tmp_path, "wave-p2-1.json")
+    assert list(others) == ["wave-p1-1.json"]
+
+
+def test_preflight_halts_until_every_declared_sibling_pipeline_has_published_a_manifest(tmp_path):
+    """The collision check reads what is on disk, so a sibling whose manifest has not landed on the integration
+    branch yet is invisible to it; the manifest names the pipelines the plan split, and launch waits until each
+    has a manifest on origin and the disk matches origin."""
+    check = _functions()["check_pipelines_published"]
+    pipelines = {"orders": 1, "payments": 1, "ledger": 1}
+    orders = json.dumps({"batches": [B1], "pipelines": pipelines})
+    (tmp_path / "wave-orders-1.json").write_text(orders)
+    manifest = {"pipelines": pipelines}
+    published = {"wave-orders-1.json": orders}
+    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json, wave-payments-1\.json.*integration branch"):
+        check(tmp_path, manifest, published)
+    payments = json.dumps({"batches": [B2], "pipelines": pipelines})
+    (tmp_path / "wave-payments-1.json").write_text(payments)
+    published["wave-payments-1.json"] = payments
+    published["wave-ledger-2.json"] = json.dumps({"batches": [], "pipelines": pipelines})   # past the count
+    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json"):
+        check(tmp_path, manifest, published)
+    published["wave-ledger-1.json"] = json.dumps({"batches": [], "pipelines": pipelines})
+    (tmp_path / "wave-ledger-1.json").write_text(published["wave-ledger-1.json"])
+    with pytest.raises(SystemExit, match=r"wave-ledger-2\.json.*plans disagree"):
+        check(tmp_path, manifest, published)
+    del published["wave-ledger-2.json"]
+    published["wave-payments-1.json"] = json.dumps(
+        {"batches": [B2], "pipelines": {"orders": 1, "payments": 1, "ledger": 2}})
+    with pytest.raises(SystemExit, match="plans disagree"):
+        check(tmp_path, manifest, published)
+    for junk in ("[]", "not json"):
+        published["wave-payments-1.json"] = junk
+        with pytest.raises(SystemExit, match="plans disagree"):
+            check(tmp_path, manifest, published)
+    published["wave-payments-1.json"] = payments
+    check(tmp_path, manifest, published)
+    check(tmp_path, {}, published)
+    with pytest.raises(SystemExit, match="billing"):
+        check(tmp_path, {"pipelines": {"orders": 1, "billing": 1}}, published)
+
+
+def test_only_wave_dash_files_are_manifests_on_origin(tmp_path):
+    """The pointer file or any other JSON committed under waves/ is not a manifest origin holds and disk lacks."""
+    is_manifest = _functions()["_is_manifest"]
+    assert is_manifest("wave-orders-1.json") and is_manifest("wave-1.json")
+    assert not is_manifest("current.json") and not is_manifest("wave-1.result.json")
+    check = _functions()["check_pipelines_published"]
+    orders = json.dumps({"batches": [B1], "pipelines": {"orders": 1}})
+    (tmp_path / "wave-orders-1.json").write_text(orders)
+    check(tmp_path, {"pipelines": {"orders": 1}}, {"wave-orders-1.json": orders, "current.json": "{}"})
+
+
+def test_preflight_halts_on_a_manifest_origin_does_not_hold_or_holds_differently(tmp_path):
+    """A manifest that is only local, or edited since it was pushed, is one no sibling can see."""
+    check = _functions()["check_pipelines_published"]
+    (tmp_path / "wave-orders-1.json").write_text(json.dumps({"batches": [B1]}))
+    with pytest.raises(SystemExit, match=r"wave-orders-1\.json.*not on origin.*commit and push"):
+        check(tmp_path, {}, {})
+    with pytest.raises(SystemExit, match=r"wave-orders-1\.json.*differs from origin.*commit and push"):
+        check(tmp_path, {}, {"wave-orders-1.json": json.dumps({"batches": [B2]})})
+    (tmp_path / "wave-orders-1.result.json").write_text("{}")
+    (tmp_path / "wave-orders-1.merged.json").write_text("{}")
+    check(tmp_path, {}, {"wave-orders-1.json": json.dumps({"batches": [B1]})})
+
+
+@pytest.mark.parametrize("bad", ["orders", [], {}, {"orders": 0}, {"orders": -1}, {"orders": True},
+                                 {"orders": "2"}, {"orders": None}, {"orders/1": 2}, {7: 2},
+                                 [["orders"]], [{"a": 1}]])
+def test_validate_manifest_rejects_a_pipelines_map_that_does_not_name_each_pipeline_and_its_wave_count(bad):
+    validate = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="'pipelines'"):
+        validate({**_manifest(), "pipelines": bad})
+    validate({**_manifest(), "pipelines": {"orders": 1, "payments_2": 3}})
+
+
+def test_check_wave_tag_pins_the_file_name_number_to_the_manifest_wave():
+    check = _functions()["check_wave_tag"]
+    check("1", {"wave": 1})
+    check("payments-1", {"wave": 1, "pipelines": {"payments": 1}})
+    for tag, wave in [("2", 1), ("payments-1", 2), ("payments", 1)]:
+        with pytest.raises(SystemExit, match="the wave number in the file name"):
+            check(tag, {"wave": wave, "pipelines": {"payments": 2}})
+
+
+def test_check_wave_tag_requires_a_tagged_manifest_to_list_its_pipelines():
+    check = _functions()["check_wave_tag"]
+    check("orders-1", {"wave": 1, "pipelines": {"orders": 2}})
+    check("orders-2", {"wave": 2, "pipelines": {"orders": 2}})
+    with pytest.raises(SystemExit, match=r"wave-<pipeline>-<N>\.json.*pipelines"):
+        check("orders-1", {"wave": 1})
+    with pytest.raises(SystemExit, match="orders"):
+        check("orders-1", {"wave": 1, "pipelines": {"payments": 1, "ledger": 1}})
+    with pytest.raises(SystemExit, match="orders"):
+        check("orders-3", {"wave": 3, "pipelines": {"orders": 2}})
 
 
 @pytest.mark.parametrize("u2", [None, {"objects": []}, {"objects": [{"object": "mig.other", "target_where": "x = 1"}]}])
@@ -1442,7 +1560,8 @@ def _prompt_ns(manifest):
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES"}
                     for t in node.targets))]
-    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "REPO": "repo", "MANIFEST": manifest,
+    ns = {"json": __import__("json"), "shlex": __import__("shlex"), "WAVE": 1, "TAG": "0",
+          "REPO": "repo", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
           "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
@@ -1894,7 +2013,7 @@ def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_repo
                                observed=[".migration/recon/wave-2/report.md", ".migration/recon/u/result.json"])
     assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/u/result.json"]
     src = WORKFLOW.read_text()
-    assert 'validate_verify(verify, passed, auto_merge, WAVE, verifier_changed_paths(WAVE, passed))' in src
+    assert 'validate_verify(verify, passed, auto_merge, TAG, verifier_changed_paths(TAG, passed))' in src
 
 
 # ---------------------------------------------------------------- capability contract vs the doctor's record (A3)
@@ -1941,12 +2060,14 @@ def _launch_ns(tmp_path, fake_run=None):
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"signed_doctor_report", "wave_signature", "pr_changed_paths",
                                       "ref_changed_paths", "wave_base", "launch_base", "evidence_in_pr",
-                                      "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate"})
+                                      "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate",
+                                      "fetch_ref", "pr_head"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"PR_URL", "UNIT_ID"} for t in node.targets))]
     ns = {"datetime": datetime, "hashlib": hashlib, "hmac": hmac, "json": json, "os": os, "re": re,
           "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
           "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target", "resume": False,
+          "TAG": "orders-1", "MANIFEST": {"repo": "github.com/acme/dbx-target"},
           "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json",
           "BASE_SHA_PATH": tmp_path / ".migration" / "waves" / "wave-1.base_sha",
           "DOCTOR_MAX_AGE": datetime.timedelta(minutes=15),
@@ -1993,7 +2114,7 @@ def test_signed_doctor_report_gate(tmp_path):
 
 
 def _git_fake(calls, head, merged, paths):
-    """git as the gate sees it: the PR head fetched into FETCH_HEAD, origin/main at 't'*40 (fresh fetch),
+    """git as the gate sees it: the PR head fetched into this workflow's own ref, origin/main at 't'*40 (fresh fetch),
     `merge-base --is-ancestor` answering whether the head is already in it, one diff."""
     def fake_run(cmd, **kw):
         calls.append(cmd)
@@ -2013,9 +2134,13 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     # the gated head's sha comes back with the paths: the verifier's tree is later held to exactly it
     assert ns["pr_changed_paths"]("https://github.com/acme/dbx-target/pull/42") == (
         "c" * 40, ["src/a.sql", ".migration/allowed_targets.json"])
-    # the host writes refs/pull/N/head; the child's branch name never reaches git
-    assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", "refs/pull/42/head"]
-    assert calls[1][3:] == ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]
+    # the host writes refs/pull/N/head; the child's branch name never reaches git. The fetch lands in a ref
+    # only this workflow writes: FETCH_HEAD is shared by every process in the clone, so a sibling
+    # pipeline's fetch between the two commands would hand this wave another PR's head
+    local = "refs/migration/wave-orders-1/refs/pull/42/head"
+    assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", f"+refs/pull/42/head:{local}"]
+    assert calls[1][3:] == ["rev-parse", "--verify", local + "^{commit}"]
+    assert not any("FETCH_HEAD" in " ".join(c) for c in calls)
     # the base is fetched now, not read from the launch snapshot: a child launched on a resume forked from
     # a base the verifier had merged accepted units into, and those units are not its diff
     assert calls[2][3:] == ["fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]
@@ -2044,8 +2169,22 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     assert _launch_ns(tmp_path, failing)["ref_changed_paths"]("recon/wave-2") is None
 
 
+def test_every_fetch_the_gate_makes_lands_in_this_workflows_own_ref(tmp_path):
+    calls = []
+    ns = _launch_ns(tmp_path, _git_fake(calls, "c" * 40, False, ""))
+    assert ns["ref_changed_paths"]("recon/wave-orders-1") == ("c" * 40, [])
+    assert calls[0][3:] == ["fetch", "-q", "origin", "+recon/wave-orders-1:refs/migration/wave-orders-1/recon/wave-orders-1"]
+    assert calls[1][3:] == ["rev-parse", "--verify", "refs/migration/wave-orders-1/recon/wave-orders-1^{commit}"]
+    calls.clear()
+    assert ns["pr_head"]("https://github.com/acme/dbx-target/pull/7") == "c" * 40
+    assert calls[0][3:] == ["fetch", "-q", "origin", "+refs/pull/7/head:refs/migration/wave-orders-1/refs/pull/7/head"]
+    assert calls[1][3:] == ["rev-parse", "--verify", "refs/migration/wave-orders-1/refs/pull/7/head^{commit}"]
+    assert ns["pr_head"]("https://github.com/other/repo/pull/7") is None
+    assert "FETCH_HEAD" not in WORKFLOW.read_text()
+
+
 def _replay_git(calls, head, record_merged, paths):
-    """git as replay_gate sees it: the PR's current head in FETCH_HEAD, origin/main at 't'*40, `merge-base
+    """git as replay_gate sees it: the PR's current head fetched into this workflow's ref, origin/main at 't'*40, `merge-base
     --is-ancestor` true for the recorded head only when record_merged (the resumed run's verifier merged it),
     never for the current head; one diff."""
     def fake_run(cmd, **kw):
@@ -2071,7 +2210,8 @@ def test_replay_gate_reuses_the_recorded_head_only_while_the_pr_still_points_at_
     # possibly naming other units' evidence) is not what gates it; the recorded head stands as gated
     ns = _launch_ns(tmp_path, _replay_git(calls, "c" * 40, False, ".migration/recon/other/result.json\n"))
     assert ns["replay_gate"](record, url) == ("c" * 40, [])
-    assert calls[0][3:] == ["fetch", "-q", "origin", "refs/pull/42/head"]  # the PR's head, fetched now
+    assert calls[0][3:] == ["fetch", "-q", "origin",
+                            "+refs/pull/42/head:refs/migration/wave-orders-1/refs/pull/42/head"]  # the PR's head, fetched now
     calls.clear()
     # the PR gained a commit touching the allowlist since the record: the new head is gated, and fails
     ns = _launch_ns(tmp_path, _replay_git(calls, "e" * 40, False, ".migration/allowed_targets.json\nsrc/a.sql\n"))
@@ -2126,7 +2266,7 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
     with pytest.raises(SystemExit, match="mode: rerun"):
         ns["launch_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
+    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
     assert 'BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")' in src and '"base_sha": BASE_SHA' in src
 
 
@@ -2163,7 +2303,7 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
     assert ns["verifier_changed_paths"](2, passed) == [
         ".migration/03_recon_tolerances.json", ".migration/recon/u/result.json", ".migration/recon/wave-2/report.md",
         "src/loans.sql"]
-    assert calls[0][3:] == ["fetch", "-q", "origin", "recon/wave-2"]
+    assert calls[0][3:] == ["fetch", "-q", "origin", "+recon/wave-2:refs/migration/wave-orders-1/recon/wave-2"]
     assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "t" * 40 + "..." + "v" * 40]
     assert calls[6][3:] == ["diff", "--name-only", "--no-renames", "1" * 40, "v" * 40, "--", ".migration/recon/u/"]
     assert calls[7][3:] == ["diff", "--name-only", "--no-renames", "b" * 40, "v" * 40, "--", ".migration/recon/u/"]
