@@ -803,6 +803,25 @@ def test_refresh_merged_detects_squash_merge(tmp_path):
     }
 
 
+def test_refresh_merged_rejects_whitespace_equivalent_commit(tmp_path):
+    repo, git = _refresh_repo(tmp_path)
+    git("checkout", "-q", "-b", "feature")
+    (repo / "shared.txt").write_text("before\n    x = 1\n")
+    git("add", "shared.txt")
+    git("commit", "-q", "-m", "feature")
+    pr_head = git("rev-parse", "HEAD")
+    git("checkout", "-q", "base")
+    (repo / "shared.txt").write_text("before\nx = 1\n")
+    git("add", "shared.txt")
+    git("commit", "-q", "-m", "base equivalent")
+    git("push", "-q", "origin", "base")
+    mig, waves = _refresh_result(repo, pr_head, "https://example.invalid/whitespace")
+
+    refresh_merged(mig)
+
+    assert not (waves / "wave-1.merged.json").exists()
+
+
 def test_refresh_merged_leaves_unmerged_pr_unrecorded(tmp_path):
     repo, git = _refresh_repo(tmp_path)
     git("checkout", "-q", "-b", "feature")
