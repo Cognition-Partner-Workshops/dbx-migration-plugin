@@ -26,8 +26,8 @@ from pathlib import Path
 
 REQUIRED_FILES = ("00_context.md", "01_conventions.md", "03_recon_tolerances.md", "03_recon_tolerances.json",
     "04_dependency_register.md", "06_decisions.md", "07_access_checklist.md", "allowed_targets.json")
-OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines", "databricks-jobs", "databricks-dabs"
-    , "databricks-unity-catalog", "databricks-lakeflow-connect", "databricks-lakebase")
+OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines", "databricks-jobs",
+    "databricks-dabs", "databricks-unity-catalog", "databricks-lakeflow-connect", "databricks-lakebase")
 M2M_VARS = ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET")
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
 CHILD_SECURITY_CONTROLS = ("hook_guard_functional", "databricks_identity")
@@ -93,10 +93,10 @@ def manifest_sha(manifest_bytes: bytes) -> str:
 def wave_signature(body: dict, manifest_bytes: bytes) -> str:
     """HMAC over the canonical record, keyed by manifest bytes + the seen identity (tamper-evident)."""
     ident = body.get("identity") or {}
-    key = hashlib.sha256(manifest_bytes + str(ident.get("userName") or "").encode() + str(ident.get("host") or "").
-        encode()).digest()
-    message = json.dumps({k: v for k, v in body.items() if k != "signature"}, sort_keys=True, separators=(",", ":")
-        ).encode()
+    key = hashlib.sha256(manifest_bytes + str(ident.get("userName") or "").encode() + str(ident.get("host") or
+        "").encode()).digest()
+    message = json.dumps({k: v for k, v in body.items() if k != "signature"}, sort_keys=True, separators=(",",
+        ":")).encode()
     return hmac.new(key, message, "sha256").hexdigest()
 
 
@@ -126,8 +126,8 @@ def inputs_sha(ws: Path) -> str:
     return h.hexdigest()
 
 
-def reusable_record(record, manifest, manifest_bytes: bytes, expect_identity: str | None, expect_host: str | None, now
-    : datetime.datetime | None = None, inputs_sha: str | None = None) -> tuple:
+def reusable_record(record, manifest, manifest_bytes: bytes, expect_identity: str | None, expect_host: str | None,
+    now: datetime.datetime | None = None, inputs_sha: str | None = None) -> tuple:
     """(record, "") when a child may reuse the orchestrator's signed record, else (None, why)."""
     if not isinstance(record, dict):
         return None, "record is not an object"
@@ -147,8 +147,8 @@ def reusable_record(record, manifest, manifest_bytes: bytes, expect_identity: st
     now = now or datetime.datetime.now(datetime.timezone.utc)
     if signed > now:
         return None, "signed_at is in the future"
-    max_age = (manifest.get("doctor_max_age", DOCTOR_MAX_AGE_MINUTES) if isinstance(manifest, dict) else
-        DOCTOR_MAX_AGE_MINUTES)
+    max_age = (manifest.get("doctor_max_age", DOCTOR_MAX_AGE_MINUTES) if isinstance(manifest,
+        dict) else DOCTOR_MAX_AGE_MINUTES)
     if not isinstance(max_age, int) or isinstance(max_age, bool) or max_age <= 0:
         max_age = DOCTOR_MAX_AGE_MINUTES
     if now - signed > datetime.timedelta(minutes=max_age):
@@ -183,8 +183,8 @@ def _redact(text: str) -> str:
     text = _BEARER.sub(r"\1 <redacted>", text)
     text = _URL_USERINFO.sub(r"\1:<redacted>@", text)
     text = _TOKEN_SHAPED.sub("<redacted>", text)
-    return " ".join("<redacted>" if len(tok) > 24 and any(c.isdigit() for c in tok) and "/" not in tok and "." not in
-        tok else tok for tok in text.split())[:400]
+    return " ".join("<redacted>" if len(tok) > 24 and any(c.isdigit() for c in tok) and "/" not in tok and
+        "." not in tok else tok for tok in text.split())[:400]
 
 
 def check_workspace(ws: Path) -> Check:
@@ -245,8 +245,8 @@ def check_allowed_targets(ws: Path, plugin_root: Path) -> Check:
     cats = raw.get("catalogs") if isinstance(raw, dict) else None
     if not isinstance(cats, list) or not cats:
         return Check("allowed_targets", "fail", f"{p.name} has no non-empty 'catalogs' list")
-    return Check("allowed_targets", "ok", f"catalogs={cats} (guard module not found; shape check only)", {"catalogs":
-        cats})
+    return Check("allowed_targets", "ok", f"catalogs={cats} (guard module not found; shape check only)", {
+        "catalogs": cats})
 
 
 def _issued_nonce(ws: Path) -> str | None:
@@ -302,8 +302,8 @@ def _flat(checks):
         yield from (Check(**d) for d in sub_results) if sub_results else iter((row,))
 
 
-def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orchestrator", reused: dict | None = None
-    ) -> list[Check]:
+def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orchestrator",
+    reused: dict | None = None) -> list[Check]:
     out: list[Check] = []
     hooks_json, guard = plugin_root / "hooks.json", plugin_root / "hooks" / "dbx_guard.py"
     if not hooks_json.exists() or not guard.exists():
@@ -323,8 +323,8 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
     token = HOOK_PROBE_TOKEN.format(nonce=nonce)
     event = json.dumps({"tool_name": "exec", "tool_input": {"command": HOOK_PROBE_COMMAND.format(nonce=nonce)}})
     try:
-        r = subprocess.run([sys.executable, str(guard)], input=event, text=True, capture_output=True, timeout=30, cwd=
-            ws, env={**os.environ, "CLAUDE_PROJECT_DIR": str(ws)})
+        r = subprocess.run([sys.executable, str(guard)], input=event, text=True, capture_output=True, timeout=30,
+            cwd=ws, env={**os.environ, "CLAUDE_PROJECT_DIR": str(ws)})
         if r.returncode == 2 and '"block"' in r.stdout and token in r.stdout:
             out.append(Check("hook_guard_functional", "ok",
                 f"dbx_guard.py blocks the probe command when invoked directly and names {token}"))
@@ -337,14 +337,14 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
 
     if role == "child":
         # A child never live-probes the platform hook: it inherits the orchestrator's signed row.
-        row = next((c for c in (reused or {}).get("checks") or [] if isinstance(c, dict) and c.get("id") ==
-            "hook_guard"), None)
-        sub = next((s for s in ((row or {}).get("data") or {}).get("sub_results") or [] if isinstance(s, dict) and s.
-            get("id") == "hook_platform_loaded"), None)
+        row = next((c for c in (reused or {}).get("checks") or [] if isinstance(c, dict) and c.get(
+            "id") == "hook_guard"), None)
+        sub = next((s for s in ((row or {}).get("data") or {}).get("sub_results") or [] if isinstance(s, dict) and
+            s.get("id") == "hook_platform_loaded"), None)
         if sub and isinstance(sub.get("status"), str) and isinstance(sub.get("detail"), str):
             out.append(Check("hook_platform_loaded", sub["status"],
-                f"reused from the orchestrator's record signed {reused.get('signed_at')}: {sub['detail']}", {**(sub.
-                get("data") or {}), "reused_from": reused.get("signed_at")}))
+                f"reused from the orchestrator's record signed {reused.get('signed_at')}: {sub['detail']}", {**(
+                sub.get("data") or {}), "reused_from": reused.get("signed_at")}))
         else:
             out.append(Check("hook_platform_loaded", "warn",
                 "orchestrator-only: the platform hook is proven once per wave by the orchestrator's live probe "
@@ -368,8 +368,8 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
                 pass
         why = ("the nonce did not match the one this workspace's last report issued; " if probe_result.startswith(
             "blocked:") else "")
-        out.append(Check("hook_platform_loaded", "unverified", why +
-            "run the probe command in this session's shell; the guard's block message names "
+        out.append(Check("hook_platform_loaded", "unverified",
+            why + "run the probe command in this session's shell; the guard's block message names "
             "__dbx_guard_probe__<nonce>; re-run the doctor with --hook-probe-result blocked:<nonce> "
             "(or not-blocked if the echo printed)", {"probe_command": HOOK_PROBE_COMMAND.format(nonce=nonce),
             "probe_nonce": nonce}))
@@ -381,8 +381,8 @@ def check_allowlist_committed(ws: Path) -> Check:
     states: dict[str, str] = {}
     for rel in LEDGER_CONTRACT_FILES:
         try:
-            r = subprocess.run(["git", "-C", str(ws), "show", f"HEAD:{rel}"], capture_output=True, timeout=60, check=
-                False)
+            r = subprocess.run(["git", "-C", str(ws), "show", f"HEAD:{rel}"], capture_output=True, timeout=60,
+                check=False)
         except (OSError, subprocess.TimeoutExpired) as e:
             return Check("allowlist_committed", "fail", f"git show HEAD:{rel} failed under {ws}: {_redact(str(e))}")
         err = r.stderr.decode(errors="replace").strip()
@@ -398,8 +398,8 @@ def check_allowlist_committed(ws: Path) -> Check:
         states[rel] = "untracked" if not in_head else "clean" if disk == r.stdout else "modified since HEAD"
     bad = [f"{rel} {state}" for rel, state in states.items() if state != "clean"]
     if bad:
-        return Check("allowlist_committed", "fail", "the working copy is not the committed contract: " + "; ".join(bad
-            ) + ". Restore HEAD's copy, or commit the change through a recorded decision, then re-run", states)
+        return Check("allowlist_committed", "fail", "the working copy is not the committed contract: " + "; ".join(
+            bad) + ". Restore HEAD's copy, or commit the change through a recorded decision, then re-run", states)
     return Check("allowlist_committed", "ok",
         "allowed_targets.json and 03_recon_tolerances.json are byte-equal to HEAD", states)
 
@@ -475,7 +475,8 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str, live_playboo
         return Check(cid, "warn", f"{PLAYBOOKS_LOCK} is not a JSON object", {"lock": PLAYBOOKS_LOCK})
     repo = _repo_playbooks(plugin_root)
     playbooks_dir = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
-    data: dict = {"malformed": [], "stale": [], "missing": [], "unknown": [], "unlisted": [], "checked": len(repo)}
+    data: dict = {"malformed": [], "stale": [], "missing": [], "unknown": [], "unlisted": [], "checked": len(repo),
+        "live": None, "duplicate": {}, "live_missing": [], "live_stale": []}
     for macro, (_repo_file, sha) in repo.items():
         entry = lock_data.get(macro)
         if entry is None:
@@ -487,13 +488,12 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str, live_playboo
             data["stale"].append(macro)
     data["unknown"] = sorted(m for m in lock_data if m not in repo)
     repo_files = {f for f, _sha in repo.values()}
-    data["unlisted"] = sorted(p.name for p in playbooks_dir.glob("*.md") if p.name not in _NOT_PLAYBOOKS and p.name
-        not in repo_files)
+    data["unlisted"] = sorted(p.name for p in playbooks_dir.glob("*.md") if p.name not in _NOT_PLAYBOOKS and
+        p.name not in repo_files)
     findings = [f"{k}: {', '.join(data[k])}" for k in ("malformed", "stale", "missing", "unknown") if data[k]]
     if data["unlisted"]:
         findings.append(f"not in playbooks/{PLAYBOOKS_INDEX}: {', '.join(data['unlisted'])}")
     live = live_playbooks or ws / LIVE_PLAYBOOKS
-    data.update({"live": None, "duplicate": {}, "live_missing": [], "live_stale": []})
     age_min = None
     if not live.is_file():
         if role == "orchestrator" or live_playbooks is not None:
@@ -518,10 +518,10 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str, live_playboo
                 grouped: dict[str, list[dict]] = {}
                 for r in records:
                     grouped.setdefault(r["macro"], []).append(r)
-                data["duplicate"] = {m: [r.get("playbook_id") for r in rs] for m, rs in grouped.items() if len(rs) > 1
-                    }
-                findings += [f"duplicate: {m} ({', '.join(str(i) for i in ids)})" for m, ids in data["duplicate"].
-                    items()]
+                data["duplicate"] = {m: [r.get("playbook_id") for r in rs] for m, rs in grouped.items() if len(
+                    rs) > 1}
+                findings += [f"duplicate: {m} ({', '.join(str(i) for i in ids)})" for m, ids in data[
+                    "duplicate"].items()]
                 for macro, (f, _sha) in repo.items():
                     rs = grouped.get(macro)
                     if not rs:
@@ -541,8 +541,8 @@ def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str, live_playboo
     detail = f"{len(repo)} playbooks match the lock written at the last install-dbx-factory sync ({installed_at})"
     if data["live"]:
         detail += f" and the live export ({age_min} min old)"
-    return Check(cid, "ok", detail, {**data, "checked": len(repo), "installed_at": installed_at if installed else None
-        })
+    return Check(cid, "ok", detail, {**data, "checked": len(repo),
+        "installed_at": installed_at if installed else None})
 
 
 def check_official_plugin(plugin_root: Path) -> Check:
@@ -559,8 +559,8 @@ def check_official_plugin(plugin_root: Path) -> Check:
     if not found:
         return Check("official_databricks_plugin", "unverified",
             "official databricks-agent-skills not found on disk under known plugin roots; it is declared in "
-            "requiredPlugins and is loaded by the platform, so this is only a local visibility gap", {"searched": [str
-            (r) for r in roots]})
+            "requiredPlugins and is loaded by the platform, so this is only a local visibility gap", {"searched": [
+            str (r) for r in roots]})
     if missing:
         return Check("official_databricks_plugin", "warn", f"official plugin present but missing skills {missing}", {
             "found": found})
@@ -613,8 +613,9 @@ def _module_present(dotted: str) -> bool:
 def check_drivers() -> Check:
     present = {k: _module_present(v) for k, v in DRIVERS.items()}
     return Check("recon_drivers", "ok" if present["databricks"] else "warn",
-        f"installed adapters: {sorted(k for k, v in present.items() if v) or 'none'}" + ("" if present["databricks"]
-        else "; databricks-sql-connector missing, live/snapshot recon cannot run"), {"drivers": present})
+        f"installed adapters: {sorted(k for k, v in present.items() if v) or 'none'}" + ("" if present[
+        "databricks"] else "; databricks-sql-connector missing, live/snapshot recon cannot run"), {
+        "drivers": present})
 
 
 def check_recon_family_supported(plugin_root: Path, source_family: str | None) -> Check:
@@ -629,8 +630,8 @@ def check_recon_family_supported(plugin_root: Path, source_family: str | None) -
             "not on PATH and no checkout harness", {"family": source_family})
     argv, cwd, how = cmd
     reg, rc, shown = _harness_json(cmd, ["families"])
-    if (not isinstance(reg, dict) or not isinstance(reg.get("live_tested"), list) or not isinstance(reg.get("untested"
-        ), list) or not all(isinstance(f, str) for f in reg["live_tested"] + reg["untested"])):
+    if (not isinstance(reg, dict) or not isinstance(reg.get("live_tested"), list) or not isinstance(reg.get(
+        "untested"), list) or not all(isinstance(f, str) for f in reg["live_tested"] + reg["untested"])):
         return Check(cid, "fail", f"cannot ask the harness which families it supports "
             f"({how} families rc={rc}): {shown}", {"family": source_family})
     live = sorted(reg["live_tested"])
@@ -656,8 +657,8 @@ def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path]
     if role == "child":
         if not units:
             return ({}, {}, ("fail", "a child preflight covers every unit in its batch: pass --unit <id> for each "
-                "unit in the brief, --source-secret NAME and the --param values the recon gate will get", {"units": []
-                , "mappings": {}}))
+                "unit in the brief, --source-secret NAME and the --param values the recon gate will get", {"units": [
+                ], "mappings": {}}))
         expected = {u: unit_dir / u / "mapping_spec.json" for u in dict.fromkeys(units)}
     else:
         if units:
@@ -668,8 +669,8 @@ def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path]
     missing = [u for u, p in expected.items() if not p.is_file()]
     if missing:
         return (expected, {}, ("fail", f"unit mapping(s) missing for {', '.join(missing)}: expected "
-            f"{unit_dir.relative_to(ws)}/<id>/mapping_spec.json (hand-off incomplete; report BLOCKED)", {"units": list
-            (expected), "missing_units": missing, "mappings": {}}))
+            f"{unit_dir.relative_to(ws)}/<id>/mapping_spec.json (hand-off incomplete; report BLOCKED)", {
+            "units": list (expected), "missing_units": missing, "mappings": {}}))
     todo = dict(expected)
     seen = {p.resolve() for p in expected.values()}
     for m in mappings:
@@ -679,8 +680,8 @@ def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path]
     return expected, todo, None
 
 
-def per_unit(cid: str, ws: Path, role: str, units: list[str], mappings: list[Path], fn, setup: Check | None = None
-    ) -> Check:
+def per_unit(cid: str, ws: Path, role: str, units: list[str], mappings: list[Path], fn,
+    setup: Check | None = None) -> Check:
     """resolve_mappings for row `cid`: the problem/setup row when applicable, else fn(expected, todo)."""
     expected, todo, problem = resolve_mappings(ws, role, units, mappings)
     if problem:
@@ -718,8 +719,7 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
                 "--target-kind", target_kind, *cargs, *pargs])
             if (not isinstance(reg, dict) or not isinstance(reg.get("findings"), list) or not all(isinstance(f.get(
                 "verdict"), str) for f in reg["findings"])):
-                return Check(cid, "fail",
-                    f"cannot audit target types ({how} type-map-audit rc={rc}): {shown}", data)
+                return Check(cid, "fail", f"cannot audit target types ({how} type-map-audit rc={rc}): {shown}", data)
             if reg.get("error"):
                 return Check(cid, "fail", f"{p_}: {_redact(str(reg['error']))} ({how})", data)
             family_known |= bool(reg.get("family_known"))
@@ -742,16 +742,15 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
                     "family_known": True})
             return Check(cid, "warn", f"no type map for {source_family} in any skills/*/canonicalization.json; "
                 "the spec's target types are unaudited (adding a family is JSON)", {**data, "family_known": False})
-        data.update({"map": rel, "fields": fields, "unmapped": [r["field"] for r in unmapped], "undeclared":
-            undeclared})
+        data.update({"map": rel, "fields": fields, "unmapped": [r["field"] for r in unmapped],
+            "undeclared": undeclared})
         if contradictions:
-            shown = "; ".join(
-                f"{r['field']} {r['source_type']} -> declared {r['target_type']}, map says {r['detail']}" for r in
-                contradictions[:5])
+            shown = "; ".join(f"{r['field']} {r['source_type']} -> declared {r['target_type']}, "
+                f"map says {r['detail']}" for r in contradictions[:5])
             more = f" …and {len(contradictions) - 5} more" if len(contradictions) > 5 else ""
             return Check(cid, "fail", f"{len(contradictions)} field(s) declare a target type the "
-                f"{source_family} type map forbids: {shown}{more} ({how})", {**data, "contradictions": contradictions}
-                )
+                f"{source_family} type map forbids: {shown}{more} ({how})", {**data,
+                "contradictions": contradictions})
         return Check(cid, "ok", f"{fields} typed fields agree with {rel}; {len(unmapped)} unmapped "
             f"source types recorded, {undeclared} undeclared targets the harness fills at run time ({how})", data)
 
@@ -804,16 +803,15 @@ def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: l
             p in todo.items()}
         worst = "fail" if any(c.status == "fail" for c in rows.values()) else "ok"
         return Check("delete_evidence", worst, "; ".join(f"{label}: {c.detail}" for label, c in rows.items()), {
-            "units": list(expected), "mappings": {label: {"status": c.status, "detail": c.detail, **(c.data or {})}
-            for label, c in rows.items()}})
+            "units": list(expected), "mappings": {label: {"status": c.status, "detail": c.detail, **(c.data or {
+            })} for label, c in rows.items()}})
 
     return per_unit("delete_evidence", ws, role, units, mappings, evidence, setup=Check("delete_evidence", "skipped",
-        f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}", {"units": [], "mappings": {}}),
-        )
+        f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}", {"units": [], "mappings": {}}),)
 
 
-def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root: Path, connect=_pyodbc_connect, params
-    : dict[str, str] | None = None) -> Check:
+def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root: Path, connect=_pyodbc_connect,
+    params: dict[str, str] | None = None) -> Check:
     """Every declared `delete_evidence` block must be answerable on the source (references/checks.md)."""
     sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
     from recon.config import ConfigError, load_mapping_spec
@@ -824,8 +822,8 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
         return Check("delete_evidence", "fail", f"{mapping}: {_redact(str(e))}")
     declared = [(c.object, c.delete_evidence) for c in spec.objects if c.delete_evidence is not None]
     if not declared:
-        return Check("delete_evidence", "ok", "no object declares delete_evidence (drain-before-run contract applies)"
-            )
+        return Check("delete_evidence", "ok",
+            "no object declares delete_evidence (drain-before-run contract applies)")
     kinds = sorted({de.kind for _, de in declared})
     if kinds != ["sqlserver_cdc"]:
         return Check("delete_evidence", "fail", f"unsupported delete_evidence kind(s) {kinds}")
@@ -856,8 +854,8 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
             cur.execute(_CDC_QUERIES["captures"])
             names = [d[0].lower() for d in cur.description]
             cap_i, cols_i = names.index("capture_instance"), names.index("captured_column_list")
-            visible = {str(r[cap_i]).casefold(): [c.casefold() for c in _captured_columns(r[cols_i])] for r in cur.
-                fetchall()}
+            visible = {str(r[cap_i]).casefold(): [c.casefold() for c in _captured_columns(r[
+                cols_i])] for r in cur.fetchall()}
             data["missing"] = [c for c in wanted if c.casefold() not in visible]
             if data["missing"]:
                 return Check(*fail, "declared capture instance(s) not present or not readable by this identity "
@@ -876,8 +874,8 @@ def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root:
                     "horizon is empty and every target-only key would be graded strictly", data)
             for cap in wanted:
                 for key_cols, scope in reads[cap]:
-                    sql = _CDC_QUERIES["probe"].format(cols=", ".join(key_cols), capture=cap, scope=f" AND ({scope})"
-                        if scope else "")
+                    sql = _CDC_QUERIES["probe"].format(cols=", ".join(key_cols), capture=cap,
+                        scope=f" AND ({scope})" if scope else "")
                     try:
                         cur.execute(sql, (hi, hi)).fetchall()
                     except Exception as e:  # noqa: BLE001 - the engine's refusal is the finding
@@ -909,33 +907,47 @@ _PG_FUNCTIONS = ("SELECT n.nspname || '.' || p.proname || '(' || pg_get_function
     "AND (p.prosecdef OR p.proacl IS NOT NULL) AND has_function_privilege({who}p.oid, 'EXECUTE') ORDER BY 1")
 _TABLE_PRIVILEGES = {"sqlserver": ("INSERT", "UPDATE", "DELETE", "ALTER"), "postgres": ("INSERT", "UPDATE", "DELETE",
     "TRUNCATE", "CREATE on schema")}
-_PRIVILEGE_QUERIES = {"sqlserver": {"roles": "SELECT " + ", ".join([*(f"IS_SRVROLEMEMBER('{r}')" for r in _SRV_ROLES),
-    *(f"IS_MEMBER('{r}')" for r in _DB_ROLES), *(f"HAS_PERMS_BY_NAME(NULL, NULL, '{p}')" for p in _SRV_PERMS)]),
-    "exists": "SELECT OBJECT_ID(?)", "table": "SELECT " + ", ".join(f"HAS_PERMS_BY_NAME(?, 'OBJECT', '{p}')" for p in
-    _TABLE_PRIVILEGES["sqlserver"]), "columns": (
-    "SELECT QUOTENAME(subentity_name), permission_name FROM fn_my_permissions(?, 'OBJECT') "
-    "WHERE subentity_name <> '' AND permission_name = 'UPDATE' ORDER BY 1"), "indirect": (
-    "SELECT 'LOGIN ' + name, 'IMPERSONATE' FROM sys.server_principals WHERE type IN ('S', 'U', 'C', 'K') "
-    "AND name <> SUSER_SNAME() AND HAS_PERMS_BY_NAME(name, 'LOGIN', 'IMPERSONATE') = 1",
-    "SELECT 'USER ' + name, 'IMPERSONATE' FROM sys.database_principals WHERE type IN ('S', 'U', 'C', 'K', 'E', 'X') "
-    "AND name <> USER_NAME() AND HAS_PERMS_BY_NAME(name, 'USER', 'IMPERSONATE') = 1",
-    "SELECT QUOTENAME(s.name) + '.' + QUOTENAME(o.name), 'EXECUTE' FROM sys.objects o "
-    "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN ('P', 'PC', 'X') AND o.is_ms_shipped = 0 "
-    "AND HAS_PERMS_BY_NAME(QUOTENAME(s.name) + '.' + QUOTENAME(o.name), 'OBJECT', 'EXECUTE') = 1 ORDER BY 1"),
-    "read_only": None}, "postgres": {"roles": "SELECT " + ", ".join([*_PG_ATTRS, *(
-    f"pg_has_role(current_user, '{r}', 'MEMBER')" for r in _PG_ROLES)]) +
-    " FROM pg_roles WHERE rolname = current_user", "exists": "SELECT to_regclass(%s)", "table": "SELECT " + ", ".join(
-    f"has_table_privilege(%s, '{p}')" for p in ("INSERT", "UPDATE", "DELETE", "TRUNCATE")) +
-    ", has_schema_privilege(%s, 'CREATE')", "columns": (
-    "SELECT a.attname, p FROM pg_attribute a CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE']) AS p "
-    "WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped "
-    "AND has_column_privilege(a.attrelid, a.attnum, p) AND NOT has_table_privilege(a.attrelid, p) ORDER BY 1, 2"),
-    "functions": _PG_FUNCTIONS.format(who=""), "as_role_functions": _PG_FUNCTIONS.format(who="%s, "), "members":
-    "SELECT rolname FROM pg_roles WHERE rolname <> current_user AND pg_has_role(current_user, oid, "
-    "CASE WHEN current_setting('server_version_num')::int >= 160000 THEN 'USAGE, SET' ELSE 'MEMBER' END) ORDER BY 1",
-    "as_role":
-    "SELECT has_table_privilege(%s, %s, 'INSERT,UPDATE,DELETE,TRUNCATE'), has_schema_privilege(%s, %s, 'CREATE')",
-    "read_only": "SELECT current_setting('transaction_read_only')"}}
+_PG_ROLE_COLS = ", ".join([*_PG_ATTRS, *(f"pg_has_role(current_user, '{r}', 'MEMBER')" for r in _PG_ROLES)])
+_PG_TABLE_COLS = ", ".join(f"has_table_privilege(%s, '{p}')" for p in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"))
+_PRIVILEGE_QUERIES = {
+    "sqlserver": {
+        "roles": "SELECT " + ", ".join([*(f"IS_SRVROLEMEMBER('{r}')" for r in _SRV_ROLES),
+            *(f"IS_MEMBER('{r}')" for r in _DB_ROLES),
+            *(f"HAS_PERMS_BY_NAME(NULL, NULL, '{p}')" for p in _SRV_PERMS)]),
+        "exists": "SELECT OBJECT_ID(?)",
+        "table": "SELECT " + ", ".join(
+            f"HAS_PERMS_BY_NAME(?, 'OBJECT', '{p}')" for p in _TABLE_PRIVILEGES["sqlserver"]),
+        "columns": ("SELECT QUOTENAME(subentity_name), permission_name FROM fn_my_permissions(?, 'OBJECT') "
+            "WHERE subentity_name <> '' AND permission_name = 'UPDATE' ORDER BY 1"),
+        "indirect": (
+            "SELECT 'LOGIN ' + name, 'IMPERSONATE' FROM sys.server_principals WHERE type IN ('S', 'U', 'C', 'K') "
+            "AND name <> SUSER_SNAME() AND HAS_PERMS_BY_NAME(name, 'LOGIN', 'IMPERSONATE') = 1",
+            "SELECT 'USER ' + name, 'IMPERSONATE' FROM sys.database_principals "
+            "WHERE type IN ('S', 'U', 'C', 'K', 'E', 'X') "
+            "AND name <> USER_NAME() AND HAS_PERMS_BY_NAME(name, 'USER', 'IMPERSONATE') = 1",
+            "SELECT QUOTENAME(s.name) + '.' + QUOTENAME(o.name), 'EXECUTE' FROM sys.objects o "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN ('P', 'PC', 'X') "
+            "AND o.is_ms_shipped = 0 "
+            "AND HAS_PERMS_BY_NAME(QUOTENAME(s.name) + '.' + QUOTENAME(o.name), 'OBJECT', 'EXECUTE') = 1 "
+            "ORDER BY 1"),
+        "read_only": None},
+    "postgres": {
+        "roles": f"SELECT {_PG_ROLE_COLS} FROM pg_roles WHERE rolname = current_user",
+        "exists": "SELECT to_regclass(%s)",
+        "table": f"SELECT {_PG_TABLE_COLS}, has_schema_privilege(%s, 'CREATE')",
+        "columns": ("SELECT a.attname, p FROM pg_attribute a CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE']) AS p "
+            "WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped "
+            "AND has_column_privilege(a.attrelid, a.attnum, p) "
+            "AND NOT has_table_privilege(a.attrelid, p) ORDER BY 1, 2"),
+        "functions": _PG_FUNCTIONS.format(who=""),
+        "as_role_functions": _PG_FUNCTIONS.format(who="%s, "),
+        "members": "SELECT rolname FROM pg_roles WHERE rolname <> current_user "
+            "AND pg_has_role(current_user, oid, "
+            "CASE WHEN current_setting('server_version_num')::int >= 160000 THEN 'USAGE, SET' ELSE 'MEMBER' END) "
+            "ORDER BY 1",
+        "as_role": "SELECT has_table_privilege(%s, %s, 'INSERT,UPDATE,DELETE,TRUNCATE'), "
+            "has_schema_privilege(%s, %s, 'CREATE')",
+        "read_only": "SELECT current_setting('transaction_read_only')"}}
 
 
 def _databricks_sql_connect(secret_value: str):
@@ -949,8 +961,8 @@ def _databricks_sql_connect(secret_value: str):
         "access_token"])
 
 
-_READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect, "databricks":
-    _databricks_sql_connect}
+_READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect,
+    "databricks": _databricks_sql_connect}
 _ADVISORY = ("driver-level read-only (SQL Server readonly=True, Postgres default_transaction_read_only) is advisory, "
     "a hint the server may ignore; only the principal's grants stop writes")
 
@@ -970,8 +982,8 @@ def _indirect_writes(cur, q: dict, family: str, tables: list[str], resolved: lis
         for (role,) in cur.execute(q["members"]).fetchall():  # what SET ROLE <role> would unlock
             for t in resolved:
                 write, create = cur.execute(q["as_role"], (role, t, role, _schema(t))).fetchall()[0]
-                found += [f"SET ROLE {role}: {t} {w}" for w, held in (("write", write), ("CREATE on schema", create))
-                    if held]
+                found += [f"SET ROLE {role}: {t} {w}" for w, held in (("write", write), ("CREATE on schema",
+                    create)) if held]
             found += [f"SET ROLE {role}: {obj} {priv}" for obj, priv in cur.execute(q["as_role_functions"], (schemas,
                 role)).fetchall()]
     return found
@@ -986,8 +998,8 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
     if q is None:
         return Check(cid, "unverified", f"{family}: no privilege query implemented for this family, so the "
             "source principal's write privileges are unknown; confirm SELECT-only grants by hand and "
-            "record the decision in .migration/06_decisions.md, then pass --source-attested D-<id>", {"family": family
-            , "tables": tables})
+            "record the decision in .migration/06_decisions.md, then pass --source-attested D-<id>", {
+            "family": family, "tables": tables})
     if not source_secret:
         return Check(cid, "fail", f"{family} source with {len(tables)} in-scope table(s); pass --source-secret NAME "
             "(env var holding the source DSN) so the principal's write privileges can be checked")
@@ -1010,8 +1022,8 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
                     data["unresolved"].append(t)
                     continue
                 resolved.append(t)
-                row = cur.execute(q["table"], (t,) * 4 + ((_schema(t),) if family == "postgres" else ())).fetchall()[0
-                    ]
+                row = cur.execute(q["table"], (t,) * 4 + ((_schema(t),) if family == "postgres" else ())).fetchall()[
+                    0]
                 held = [p for p, v in zip(_TABLE_PRIVILEGES[family], row) if v]
                 held += [f"{p} on column {c}" for c, p in cur.execute(q["columns"], (t,)).fetchall() if p not in held]
                 if held:
@@ -1021,8 +1033,8 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
             conn.close()
     except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
         return Check(cid, "fail", f"source query failed: {_redact(str(e))}", data)
-    can_write = ([f"role {r}" for r in data["roles"]] + [f"{t}: {', '.join(p)}" for t, p in data["writable"].items()]
-        + data["indirect"])
+    can_write = ([f"role {r}" for r in data["roles"]] + [f"{t}: {', '.join(p)}" for t, p in data["writable"].items(
+        )] + data["indirect"])
     if can_write:
         shown = "; ".join(can_write[:6]) + (f"; +{len(can_write) - 6} more in data" if len(can_write) > 6 else "")
         return Check(cid, "fail", f"{family}: the source principal can write in scope ({shown}); the "
@@ -1080,8 +1092,8 @@ def _check_databricks_source_principal(tables: list[str], source_secret: str | N
     who, shown = _cli_json(cli, "current-user", "me", env=env)
     who = who if isinstance(who, dict) else {}
     principal = who.get("applicationId") or who.get("userName")
-    groups = {g["display"] for g in who.get("groups", []) if isinstance(g, dict) and isinstance(g.get("display"), str)
-        }
+    groups = {g["display"] for g in who.get("groups", []) if isinstance(g, dict) and isinstance(g.get("display"),
+        str)}
     if not isinstance(principal, str) or not principal:
         return Check(cid, "unverified", f"databricks: current-user me failed: {shown}", data)
     data["principal"] = principal
@@ -1126,8 +1138,8 @@ def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
     cid = "source_principal_read_only"
     if family == "databricks" or family in _PRIVILEGE_QUERIES:
         return Check(cid, "fail", f"{family}: --source-attested {decision} rejected, this family has a "
-            "privilege query: run the query instead (drop --source-attested)", {"family": family, "decision": decision
-            })
+            "privilege query: run the query instead (drop --source-attested)", {"family": family,
+            "decision": decision})
     ledger = ws / ".migration" / "06_decisions.md"
     if not ledger.is_file():
         return Check(cid, "fail", f"{family}: ledger .migration/06_decisions.md not found", {"decision": decision})
@@ -1140,15 +1152,16 @@ def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
                     "without user:<id> provenance; a default-accepted row cannot attest the source "
                     "is read-only, a human has to reply", {"decision": decision})
             return Check(cid, "ok", f"{family}: source principal read-only attested by decision "
-                f"{decision} ({who.group(0)}) in .migration/06_decisions.md (no principal to query)", {"decision":
-                decision, "attested": decision, "family": family, "tables": tables, "provenance": who.group(0)})
+                f"{decision} ({who.group(0)}) in .migration/06_decisions.md (no principal to query)", {
+                "decision": decision, "attested": decision, "family": family, "tables": tables,
+                "provenance": who.group(0)})
     return Check(cid, "fail", f"{family}: decision {decision} is not in .migration/06_decisions.md with "
         "'source_principal_read_only', 'attested' and user:<id> provenance in its line; record the "
         "attestation in the ledger first", {"decision": decision})
 
 
-def _mapped_tables(todo: dict[str, Path], params: dict[str, str] | None, plugin_root: Path, source_family: str | None
-    ):
+def _mapped_tables(todo: dict[str, Path], params: dict[str, str] | None, plugin_root: Path,
+    source_family: str | None):
     """(tables, family) over every mapping in `todo`, or a Check (id set by the caller) when a spec does not load."""
     sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
     from recon.config import ConfigError, load_mapping_spec
@@ -1240,11 +1253,11 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
                                 f"{t} is not catalog.schema.table; cannot scope the dictionary probe", data)
                         parts[t] = p_
                     if "{schema}" in sql or "{table}" in sql:
-                        probes = [(t, sql.format(catalog=_quote_ident(p_[0]), schema=_quote_ident(p_[1]), table=
-                            _quote_ident(p_[2]))) for t, p_ in parts.items()]
+                        probes = [(t, sql.format(catalog=_quote_ident(p_[0]), schema=_quote_ident(p_[1]),
+                            table= _quote_ident(p_[2]))) for t, p_ in parts.items()]
                     else:  # {catalog} only: information_schema is catalog-scoped, probe per catalog
-                        probes = [(None, sql.format(catalog=_quote_ident(c))) for c in sorted({p_[0] for p_ in parts.
-                            values()})]
+                        probes = [(None, sql.format(catalog=_quote_ident(c))) for c in sorted({p_[
+                            0] for p_ in parts.values()})]
                 for table, probe in probes:
                     try:
                         cur.execute(probe).fetchall()
@@ -1265,8 +1278,8 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
                     mismatched.append(t)
             if mismatched and family == "sqlserver":
                 return Check(cid, "fail", f"{mismatched[0]} has triggers the principal cannot "
-                    "list: sys.triggers is filtered by permission, so the trigger tier " "would pass on an empty view"
-                    , data)
+                    "list: sys.triggers is filtered by permission, so the trigger tier "
+                    "would pass on an empty view", data)
             if mismatched:
                 return Check(cid, "warn", f"declared vs listed trigger census differs on "
                     f"{', '.join(mismatched[:3])}: relhastriggers can stay true after a drop until vacuum", data)
@@ -1278,8 +1291,9 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
         f"{len(tables)} in-scope table(s)", data)
 
 
-def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str |
-    None, source_family: str | None, plugin_root: Path, params: dict[str, str] | None = None) -> Check:
+def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mappings: list[Path],
+    source_secret: str | None, source_family: str | None, plugin_root: Path, params: dict[str,
+    str] | None = None) -> Check:
     """Every source table the resolved mappings read, against --source-family or the mappings' implied family."""
     cid = "dictionary_readable"
 
@@ -1296,8 +1310,8 @@ def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mapping
                 views = [tuple(x) for x in d["objects"]] if d.get("family_known") else None
             except (ValueError, KeyError, TypeError):
                 return Check(cid, "fail", f"cannot ask the harness which catalog objects to probe "
-                    f"({how} dictionary-objects rc={rc}): {_redact(err or out)}", {"family": family, "tables": tables}
-                    )
+                    f"({how} dictionary-objects rc={rc}): {_redact(err or out)}", {"family": family,
+                    "tables": tables})
             c = check_dictionary_readable(tables, family, source_secret, views=views)
             c.data["harness"] = how
             return c
@@ -1386,8 +1400,9 @@ def check_named_secrets(names: list[str], list_secrets=None) -> Check:
     data["missing"] = [n for n in names if keys[n.split("/", 1)[0]] is None or n.split("/", 1)[1] not in keys[n.split(
         "/", 1)[0]]]
     if data["missing"]:
-        detail = ("missing named secrets (STOP C blocker: create them before launch; values are never read): " + ", ".
-            join(data["missing"]))
+        detail = (
+            "missing named secrets (STOP C blocker: create them before launch; values are never read): " + ", ".join(
+            data["missing"]))
         if data["unreadable_scopes"]:
             detail += "; " + "; ".join(f"scope {s} not readable via `databricks secrets list-secrets`" for s in data[
                 "unreadable_scopes"])
@@ -1421,14 +1436,9 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
             f"DATABRICKS_CLIENT_ID/SECRET from named secrets")
     out.append(Check("databricks_auth_kind", status, detail, {"auth_kind": auth_kind, "env_set": set_vars}))
 
-    rc, me, err = _run([cli, "current-user", "me", "--output", "json"], timeout=60)
-    if rc != 0:
-        out.append(Check("databricks_identity", "fail", f"current-user me failed: {_redact(err)}"))
-        return out
-    try:
-        who = json.loads(me)
-    except json.JSONDecodeError:
-        out.append(Check("databricks_identity", "fail", "current-user me returned non-JSON"))
+    who, shown = _cli_json(cli, "current-user", "me")
+    if not isinstance(who, dict):
+        out.append(Check("databricks_identity", "fail", f"current-user me failed: {shown}"))
         return out
     name, is_sp = classify_identity(who)
     desc, _shown = _cli_json(cli, "auth", "describe")
@@ -1470,23 +1480,23 @@ def check_lakebase_branch_create(project: str, parent_branch: str) -> Check:
     branch = f"dbx-doctor-probe-{secrets.token_hex(4)}"
     project_path = f"projects/{project}"
     rc, out, err = _run([cli, "postgres", "create-branch", project_path, branch, "--json", json.dumps({"spec": {
-        "source_branch": f"{project_path}/branches/{parent_branch}", "ttl": "3600s"}}), "--output", "json"], timeout=
-        300)
+        "source_branch": f"{project_path}/branches/{parent_branch}", "ttl": "3600s"}}), "--output", "json"],
+        timeout=300)
     if rc != 0:
         low = err.lower()
-        detail = next((d for needle, d in (
-            ("not authorized", f"migration principal is not authorized; grant the migration principal "
-                f"Can Manage on Lakebase project {project}"),
-            ("expiration date cannot have child branches", f"parent branch {parent_branch} has an expiry; clear it "
-                "(Lakebase project → branch → edit → remove expiration), TTLs belong on per-batch children"),
-        ) if needle in low), _redact(err or out))
+        detail = next((d for needle, d in (("not authorized",
+            f"migration principal is not authorized; grant the migration principal "
+            f"Can Manage on Lakebase project {project}"), ("expiration date cannot have child branches",
+            f"parent branch {parent_branch} has an expiry; clear it "
+            "(Lakebase project → branch → edit → remove expiration), TTLs belong on per-batch children"),
+            ) if needle in low), _redact(err or out))
         return Check(cid, "fail", detail, {"project": project, "parent_branch": parent_branch})
     delete_rc, delete_out, delete_err = _run([cli, "postgres", "delete-branch", f"{project_path}/branches/{branch}",
         "--purge"], timeout=300)
     if delete_rc != 0:
         return Check(cid, "warn",
-            f"branch {branch} was created but could not be deleted: {_redact(delete_err or delete_out)}", {"project":
-            project, "parent_branch": parent_branch, "branch": branch})
+            f"branch {branch} was created but could not be deleted: {_redact(delete_err or delete_out)}", {
+            "project": project, "parent_branch": parent_branch, "branch": branch})
     return Check(cid, "ok", "branch created and deleted", {"project": project, "parent_branch": parent_branch,
         "branch": branch})
 
@@ -1515,8 +1525,8 @@ def check_lakebase_target_grants(dsn_name: str, schema: str | None = None, conne
             if cur.fetchone() is not None:
                 cur.execute("select has_schema_privilege(current_user, %s, 'CREATE')", (schema,))
                 if not cur.fetchone()[0]:
-                    return Check(cid, "fail", f"missing required privilege: GRANT CREATE ON SCHEMA {schema} TO {role}"
-                        , data)
+                    return Check(cid, "fail",
+                        f"missing required privilege: GRANT CREATE ON SCHEMA {schema} TO {role}", data)
                 return Check(cid, "ok", f"role {role} can CREATE in schema {schema}", data)
         if bool(db_create):
             return Check(cid, "ok", f"role {role} can CREATE in database {database}", data)
@@ -1532,14 +1542,14 @@ def check_lakebase_target_grants(dsn_name: str, schema: str | None = None, conne
 def _effective_privileges(payload) -> set[str]:
     """Privilege names from effective-assignment or plain grant payloads ({privilege: name} dicts or bare strings)."""
     if isinstance(payload, dict):
-        items = [p for a in payload.get("privilege_assignments") or [] if isinstance(a, dict)
-            for p in a.get("privileges") or []] + list(payload.get("privileges") or [])
+        items = [p for a in payload.get("privilege_assignments") or [] if isinstance(a, dict) for p in a.get(
+            "privileges") or []] + list(payload.get("privileges") or [])
     elif isinstance(payload, list):
         items = list(payload)
     else:
         items = []
-    return {v.upper() if isinstance(v, str) else v["privilege"].upper() for v in items
-        if isinstance(v, str) or isinstance(v, dict) and isinstance(v.get("privilege"), str)}
+    return {v.upper() if isinstance(v, str) else v["privilege"].upper() for v in items if isinstance(v, str) or
+        isinstance(v, dict) and isinstance(v.get("privilege"), str)}
 
 
 def _effective_privileges_strict(payload) -> set[str] | None:
@@ -1640,8 +1650,8 @@ def check_analytical_target_grants(full_name: str) -> Check:
     assert catalog_privileges is not None
     has = lambda p: "ALL_PRIVILEGES" in catalog_privileges or p in catalog_privileges
     has_schema = lambda p: "ALL_PRIVILEGES" in schema_privileges or p in schema_privileges
-    data = {"principal": principal, "owner": principal if owned else owner, "catalog_owner": catalog_owner, "exists":
-        bool(exists)}
+    data = {"principal": principal, "owner": principal if owned else owner, "catalog_owner": catalog_owner,
+        "exists": bool(exists)}
 
     def granted():
         """(missing list, GRANT statement) for the exists-branches; the caller renders the row."""
@@ -1667,8 +1677,8 @@ def check_analytical_target_grants(full_name: str) -> Check:
         missing = [] if has("USE_CATALOG") else ["USE_CATALOG"]
         if missing:
             statement = _grant_statements(catalog, full_name, principal, missing, [])
-            return row("fail", f"missing required privileges: {statement}; schema owned by {principal}", missing=
-                missing, **data)
+            return row("fail", f"missing required privileges: {statement}; schema owned by {principal}",
+                missing=missing, **data)
         return row("ok", f"schema {full_name} is owned by {principal}", **data)
     missing, statement = granted()
     if missing:
@@ -1692,19 +1702,19 @@ def _blocking(role: str, checks: list[Check]) -> list[str]:
 
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None, no_databricks: bool,
-    units: list[str] | None = None, mappings: list[Path] | None = None, source_secret: str | None = None, params: dict
-    [str, str] | None = None, expect_catalogs: list[str] | None = None, source_family: str | None = None, expect_host:
-    str | None = None, lakebase_project: str | None = None, lakebase_parent_branch: str | None = None, lakebase_dsn:
-    str | None = None, lakebase_schema: str | None = None, analytical_schema: str | None = None, source_attested: str
-    | None = None, live_playbooks: Path | None = None, target_kind: str = "databricks", secret_names: list[str] | None
-    = None, list_secrets=None, reused: dict | None = None) -> dict:
+    units: list[str] | None = None, mappings: list[Path] | None = None, source_secret: str | None = None,
+    params: dict [str, str] | None = None, expect_catalogs: list[str] | None = None, source_family: str | None = None,
+    expect_host: str | None = None, lakebase_project: str | None = None, lakebase_parent_branch: str | None = None,
+    lakebase_dsn: str | None = None, lakebase_schema: str | None = None, analytical_schema: str | None = None,
+    source_attested: str | None = None, live_playbooks: Path | None = None, target_kind: str = "databricks",
+    secret_names: list[str] | None = None, list_secrets=None, reused: dict | None = None) -> dict:
     def _row(row_id, thunk, **binds):
         """`binds` are data keys the recorded row must carry with these exact values to stand in."""
         if isinstance(reused, dict) and row_id in REUSABLE_ROWS:
             row = next((c for c in reused.get("checks") or [] if isinstance(c, dict) and c.get("id") == row_id), None)
             data = row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {}
-            if (isinstance(row, dict) and isinstance(row.get("status"), str) and isinstance(row.get("detail"), str)
-                and all(data.get(k) == v for k, v in binds.items())):
+            if (isinstance(row, dict) and isinstance(row.get("status"), str) and isinstance(row.get("detail"),
+                str) and all(data.get(k) == v for k, v in binds.items())):
                 return Check(row["id"], row["status"],
                     f"reused from the orchestrator's record signed {reused.get('signed_at')}: {row['detail']}", {**(
                     row.get("data") or {}), "reused_from": reused.get("signed_at")})
@@ -1718,14 +1728,15 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         "hook_guard", check_hooks(plugin_root, ws, probe_result, role, reused), sec), check_official_plugin(
         plugin_root), _merge("recon_harness", [check_harness(plugin_root), check_drivers()]), _row(
         "recon_family_supported", lambda: check_recon_family_supported(plugin_root, source_family)), _row(
-        "type_map_audit", lambda: check_type_map_audit(ws, role, units, mappings, source_family, plugin_root, params=
-        params, target_kind=target_kind), target_kind=target_kind), _row("delete_evidence", lambda:
-        check_delete_evidence_all(ws, role, units, mappings, source_secret, plugin_root, params=params)), _row(
-        "source_principal_read_only", lambda: check_source_principal_all(ws, role, units, mappings, source_secret,
-        source_family, plugin_root, params=params, attested=source_attested)), _row("dictionary_readable", lambda:
-        check_dictionary_readable_all(ws, role, units, mappings, source_secret, source_family, plugin_root, params=
-        params)), _row("named_secrets_exist", lambda: (Check("named_secrets_exist", "skipped", "--no-databricks") if
-        no_databricks else check_named_secrets(secret_names or [], list_secrets)))]
+        "type_map_audit", lambda: check_type_map_audit(ws, role, units, mappings, source_family, plugin_root,
+        params=params, target_kind=target_kind), target_kind=target_kind), _row("delete_evidence",
+        lambda: check_delete_evidence_all(ws, role, units, mappings, source_secret, plugin_root, params=params)),
+        _row("source_principal_read_only", lambda: check_source_principal_all(ws, role, units, mappings,
+        source_secret, source_family, plugin_root, params=params, attested=source_attested)), _row(
+        "dictionary_readable", lambda: check_dictionary_readable_all(ws, role, units, mappings, source_secret,
+        source_family, plugin_root, params=params)), _row("named_secrets_exist", lambda: (Check(
+        "named_secrets_exist", "skipped", "--no-databricks") if no_databricks else check_named_secrets(secret_names or
+        [], list_secrets)))]
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))
     else:
@@ -1739,18 +1750,18 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     if lakebase_dsn:
         checks.append(check_lakebase_target_grants(lakebase_dsn, lakebase_schema))
     if analytical_schema:
-        checks.append(Check("analytical_target_grants", "skipped", "--no-databricks") if no_databricks else
-            check_analytical_target_grants(analytical_schema))
+        checks.append(Check("analytical_target_grants", "skipped",
+            "--no-databricks") if no_databricks else check_analytical_target_grants(analytical_schema))
     if role == "child":  # non-security failures are advisory; the orchestrator gated them at launch
 
         def _advisory(c: Check) -> Check:
             if c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and not (c.data or {}).get("units_problem"):
-                return Check(c.id, "warn", "advisory in a child (the orchestrator gates it before launch): " + c.
-                    detail, c.data)
+                return Check(c.id, "warn",
+                    "advisory in a child (the orchestrator gates it before launch): " + c.detail, c.data)
             return c
 
-        checks = [(_merge(row.id, [_advisory(Check(**d)) for d in row.data["sub_results"]], sec) if (row.data or {}).
-            get("sub_results") else _advisory(row)) for row in checks]
+        checks = [(_merge(row.id, [_advisory(Check(**d)) for d in row.data["sub_results"]], sec) if (row.data or {
+            }).get("sub_results") else _advisory(row)) for row in checks]
     counts: dict[str, int] = {}
     for c in checks:
         counts[c.status] = counts.get(c.status, 0) + 1
@@ -1758,9 +1769,9 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     identity = next((c.data for c in _flat(checks) if c.id == "databricks_identity" and c.data), None)
     return {"identity": identity, "schema": "dbx-migration-factory/capabilities/1", "generated_at": time.strftime(
         "%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "role": role, "workspace": str(ws), "plugin_root": str(plugin_root),
-        "summary": counts, "ready": not blocking, "blocking": blocking, "reused_doctor": reused["signed_at"] if
-        isinstance(reused, dict) else None, "checks": [{**asdict(c), "reusable": c.id in REUSABLE_ROWS} for c in
-        checks]}
+        "summary": counts, "ready": not blocking, "blocking": blocking, "reused_doctor": reused[
+        "signed_at"] if isinstance(reused, dict) else None, "checks": [{**asdict(c),
+        "reusable": c.id in REUSABLE_ROWS} for c in checks]}
 
 
 def _manifest_source(manifest) -> tuple:
@@ -1799,44 +1810,45 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workspace", type=Path, default=Path.cwd())
     p.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parents[2])
     p.add_argument("--role", choices=("orchestrator", "child", "setup"), default="orchestrator")
-    p.add_argument("--wave", type=Path, help=
-        "wave manifest; also writes <manifest>.doctor.json, the signed record the fan-out launches from")
+    p.add_argument("--wave", type=Path,
+        help="wave manifest; also writes <manifest>.doctor.json, the signed record the fan-out launches from")
     p.add_argument("--reuse-record", type=Path, metavar="PATH",
         help="(--role child) the orchestrator's <manifest>.doctor.json; reuse its signed source-side rows "
         "when it checks out")
-    p.add_argument("--hook-probe-result", default="unknown", metavar="blocked:<nonce>|not-blocked|unknown", help=
-        "outcome of running the last report's probe_command")
+    p.add_argument("--hook-probe-result", default="unknown", metavar="blocked:<nonce>|not-blocked|unknown",
+        help="outcome of running the last report's probe_command")
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
     p.add_argument("--expect-host", help="workspace host the session must be authenticated against (the contract's)")
     p.add_argument("--expect-catalogs", metavar="A,B", type=lambda s: [c.strip() for c in s.split(",") if c.strip()],
         help="catalogs the wave's capability contract names; must equal allowed_targets.json's")
-    p.add_argument("--no-databricks", action="store_true", help=
-        "skip CLI/identity checks (offline; the report is never ready)")
-    p.add_argument("--unit", action="append", default=[], metavar="UNIT_ID", help=
-        "(--role child) a unit of this batch, repeat per unit in the brief")
-    p.add_argument("--mapping", type=Path, action="append", default=[], metavar="MAPPING_SPEC", help=
-        "additional recon mapping_spec.json to verify (a candidate mapping at setup)")
+    p.add_argument("--no-databricks", action="store_true",
+        help="skip CLI/identity checks (offline; the report is never ready)")
+    p.add_argument("--unit", action="append", default=[], metavar="UNIT_ID",
+        help="(--role child) a unit of this batch, repeat per unit in the brief")
+    p.add_argument("--mapping", type=Path, action="append", default=[], metavar="MAPPING_SPEC",
+        help="additional recon mapping_spec.json to verify (a candidate mapping at setup)")
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
-    p.add_argument("--secret", action="append", default=[], metavar="SCOPE/KEY", help=
-        "Databricks secret name a brief references; checked by name, value never read")
-    p.add_argument("--source-family", choices=SOURCE_FAMILIES, help=
-        "source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
-    p.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks", help=
-        "recon target the type_map is audited against")
+    p.add_argument("--secret", action="append", default=[], metavar="SCOPE/KEY",
+        help="Databricks secret name a brief references; checked by name, value never read")
+    p.add_argument("--source-family", choices=SOURCE_FAMILIES,
+        help="source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
+    p.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks",
+        help="recon target the type_map is audited against")
     p.add_argument("--source-attested", metavar="D-<id>",
         help="ledger decision id attesting the source has no principal to query; rejected for families "
         "with a privilege query")
     p.add_argument("--lakebase-project", help="Lakebase project id for the branch-create preflight")
     p.add_argument("--lakebase-parent-branch", help="Lakebase parent branch for the branch-create preflight")
-    p.add_argument("--lakebase-dsn", metavar="ENV_VAR_NAME", help=
-        "env var NAME holding the Lakebase DSN (value never printed)")
+    p.add_argument("--lakebase-dsn", metavar="ENV_VAR_NAME",
+        help="env var NAME holding the Lakebase DSN (value never printed)")
     p.add_argument("--lakebase-schema", help="optional Lakebase schema to check for CREATE")
-    p.add_argument("--analytical-schema", metavar="CATALOG.SCHEMA", help=
-        "promotion schema the principal must be able to write")
-    p.add_argument("--live-playbooks", type=Path, metavar="PATH", help=
-        "JSON export of the live playbooks written right before this run (default .migration/live_playbooks.json)")
-    p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE", help=
-        "mapping ${NAME} placeholder value, same rules as dbx-recon run --param")
+    p.add_argument("--analytical-schema", metavar="CATALOG.SCHEMA",
+        help="promotion schema the principal must be able to write")
+    p.add_argument("--live-playbooks", type=Path, metavar="PATH",
+        help="JSON export of the live playbooks written right before this run "
+        "(default .migration/live_playbooks.json)")
+    p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+        help="mapping ${NAME} placeholder value, same rules as dbx-recon run --param")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
     if a.hook_probe_result == "blocked":
@@ -1856,14 +1868,13 @@ def main(argv: list[str] | None = None) -> int:
 
     reused, reuse_why = None, ""
     if a.reuse_record:
-        if a.wave:
-            p.error("--reuse-record reads the manifest beside the record; drop --wave")
-        if a.role != "child":
-            p.error("--reuse-record is for --role child runs")
-        if a.no_databricks:
-            p.error("--reuse-record still runs the databricks identity check; drop --no-databricks")
-        if a.expect_identity is None:
-            p.error("--reuse-record requires --expect-identity: the principal the record must be signed for")
+        for bad, why in ((a.wave, "--reuse-record reads the manifest beside the record; drop --wave"),
+            (a.role != "child", "--reuse-record is for --role child runs"),
+            (a.no_databricks, "--reuse-record still runs the databricks identity check; drop --no-databricks"),
+            (a.expect_identity is None, "--reuse-record requires --expect-identity: the principal the record must "
+                "be signed for")):
+            if bad:
+                p.error(why)
         try:
             manifest_path = a.reuse_record.with_name(a.reuse_record.name.replace(".doctor.json", ".json"))
             manifest_bytes, manifest = _load_manifest(p, manifest_path, "--reuse-record's manifest")
@@ -1871,14 +1882,14 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as e:
             p.error(f"cannot read --reuse-record or the manifest beside it: {e}")
         want_family, want_secret, want_params, _names, _caps = _manifest_source(manifest)
-        for flag, given, want in (("--source-family", a.source_family, want_family), ("--source-secret", a.
-            source_secret, want_secret), ("--param", sorted(a.param or []), sorted(want_params))):
+        for flag, given, want in (("--source-family", a.source_family, want_family), ("--source-secret",
+            a.source_secret, want_secret), ("--param", sorted(a.param or []), sorted(want_params))):
             if given not in (None, [], want):
                 p.error(f"{flag} differs from the manifest's source block; --reuse-record takes source settings "
                     "from the manifest, so pass the same values or none")
         _apply_manifest(a, manifest)
-        reused, reuse_why = reusable_record(record, manifest if isinstance(manifest, dict) else {}, manifest_bytes, a.
-            expect_identity, a.expect_host, inputs_sha=inputs_sha(a.workspace.resolve()))
+        reused, reuse_why = reusable_record(record, manifest if isinstance(manifest, dict) else {}, manifest_bytes,
+            a.expect_identity, a.expect_host, inputs_sha=inputs_sha(a.workspace.resolve()))
 
     params = None
     if a.param:
@@ -1887,15 +1898,15 @@ def main(argv: list[str] | None = None) -> int:
 
         params = parse_params(a.param)
 
-    report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result, a.expect_identity, a.
-        no_databricks, a.unit, a.mapping, a.source_secret, params, a.expect_catalogs, a.source_family, a.expect_host,
-        a.lakebase_project, a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema, a.analytical_schema,
-        source_attested=a.source_attested, live_playbooks=a.live_playbooks, target_kind=a.target_kind, secret_names=a.
-        secret, reused=reused)
+    report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result, a.expect_identity,
+        a.no_databricks, a.unit, a.mapping, a.source_secret, params, a.expect_catalogs, a.source_family,
+        a.expect_host, a.lakebase_project, a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema,
+        a.analytical_schema, source_attested=a.source_attested, live_playbooks=a.live_playbooks,
+        target_kind=a.target_kind, secret_names=a.secret, reused=reused)
     if a.reuse_record:
         report["checks"].append({**asdict(Check("doctor_record", "ok" if reused else "skipped",
-            f"reused the orchestrator's record signed {reused['signed_at']}" if reused else reuse_why)), "reusable":
-            False})
+            f"reused the orchestrator's record signed {reused['signed_at']}" if reused else reuse_why)),
+            "reusable": False})
         if not reused:
             print(f"doctor record not reused: {reuse_why}", file=sys.stderr)
     text = json.dumps(report, indent=2, sort_keys=True)
@@ -1906,12 +1917,12 @@ def main(argv: list[str] | None = None) -> int:
         out.write_text(text + "\n")
     for c in report["checks"]:
         print(f"{c['status']:<10} {c['id']:<28} {c['detail']}")
-    print(f"\nready={report['ready']} {report['summary']}" + (f" blocking={report['blocking']}" if report["blocking"]
-        else "") + (f"  -> {out}" if str(out) != "-" else ""))
+    print(f"\nready={report['ready']} {report['summary']}" + (f" blocking={report['blocking']}" if report[
+        "blocking"] else "") + (f"  -> {out}" if str(out) != "-" else ""))
     if a.wave:
-        a.wave.with_suffix(".doctor.json").write_text(json.dumps(sign_wave_report({**report, "hook_probe": a.
-            hook_probe_result, "source": manifest.get("source"), "inputs_sha": inputs_sha(a.workspace.resolve())},
-            manifest_bytes), indent=2, sort_keys=True) + "\n")
+        a.wave.with_suffix(".doctor.json").write_text(json.dumps(sign_wave_report({**report,
+            "hook_probe": a.hook_probe_result, "source": manifest.get("source"), "inputs_sha": inputs_sha(
+            a.workspace.resolve())}, manifest_bytes), indent=2, sort_keys=True) + "\n")
     if a.role != "child":
         probe = next((s for c in report["checks"] for s in (c.get("data") or {}).get("sub_results") or [] if s.get(
             "id") == "hook_platform_loaded"), None)
