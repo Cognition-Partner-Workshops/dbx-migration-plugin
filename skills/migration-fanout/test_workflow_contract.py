@@ -582,7 +582,7 @@ def test_a_hand_run_wave_reserves_nothing_while_its_declared_targets_differ_from
     assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
 
     ws, cwd = _workspace(tmp_path / "ok", doctor=False, dependencies={"u": _analysis("MIG.T")},
-                         write_targets=("mig.t", "mig.run"), deploy_objects=("mig.run",))
+                         write_targets=("mig.t", "mig.run"), deploy_objects=("mig.run",), namespace="mig")
     proc = _workflow(cwd, "reserve")
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["reserved"] is True
@@ -610,7 +610,7 @@ def test_declared_write_targets_must_equal_the_call_graphs_transitive_writes(tmp
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
     ws, cwd = _workspace(tmp_path / "same", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
-                         deploy_objects=("mig.run",))
+                         deploy_objects=("mig.run",), namespace="mig")
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "same", [_pass_report(pr), _verify_report()])
     assert proc.returncode == 0, proc.stderr
@@ -894,7 +894,7 @@ def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tm
         return proc
 
     proc = run(tmp_path / "ok", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
-               deploy_objects=("mig.run",))
+               deploy_objects=("mig.run",), namespace="mig")
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == {"wave": 0, "ready": True, "batches": ["b-1"]}
     proc = run(tmp_path / "drift", dependencies={"u": _analysis("mig.t", "mig.audit")})
