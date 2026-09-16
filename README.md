@@ -1,8 +1,8 @@
 # dbx-migration-factory (Devin plugin)
 
-Private, installable Devin plugin for Databricks migrations: source-dialect skills (Redshift,
-Teradata BTEQ, Informatica XML), a reconciliation harness, a Lakebridge
-wrapper, enforcement hooks, a preflight doctor, always-on guardrail rules, and a bootstrap skill
+Private, installable Devin plugin for Databricks migrations: source-dialect skills (Oracle PL/SQL
+and optional dialects), a reconciliation harness, a Lakebridge wrapper, enforcement hooks, a
+preflight doctor, always-on guardrail rules, and a bootstrap skill
 that imports the DBX playbook chain into the org.
 
 The factory owns the *migration* problem: source dialects, lineage, reconciliation, fan-out, human
@@ -20,7 +20,7 @@ AGENTS.md                   always-on guardrails
 hooks.json, hooks/          PreToolUse write-scope guard (fail closed, see below)
 skills/                     one directory per skill
 skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills (child-session brief)
-skills/lakebridge/          analyzer/transpiler invocation, dialect flags, seeded coverage table
+skills-extra/               optional dialect skills + Lakebridge wrapper, not loaded by the core plugin (see skills-extra/README.md)
 skills/target-routing/      step -> official databricks skill map, plus migration-only deltas
 skills/factory-doctor/      read-only preflight: CLI, identity + host, harness, .migration/ integrity,
                             committed allowlist/tolerances, source principal cannot write, hooks (nonce probe)

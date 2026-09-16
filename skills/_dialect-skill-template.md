@@ -7,7 +7,7 @@ Not a skill: the specification a child session follows to write or deepen one. A
 skills/<dialect>/SKILL.md                 the skill (>= 300 lines, sections 1-12 below, in order)
 skills/<dialect>/canonicalization.json    harness rules, validated by `dbx-recon selftest`-style load
 skills/<dialect>/examples/                >= 5 before/after pairs (source file + converted file + note)
-skills/lakebridge/SKILL.md                append the dialect's coverage-table delta (SEEDED rows)
+skills-extra/lakebridge/SKILL.md         append the dialect's coverage-table delta (SEEDED rows)
 ```
 Front matter: `name`, `description` (when to load it: enumerating, analyzing, converting, or reconciling this dialect), no `triggers` (playbooks load it by name).
 
@@ -21,7 +21,7 @@ Front matter: `name`, `description` (when to load it: enumerating, analyzing, co
 7. **Known traps with recon signature**. Each trap: what the legacy engine does, what Databricks does, which tier and metric shows it (e.g. "Tier 2 distinct-count drift on string keys"), the fix in converted code, and the canonicalization or `COLLATE` decision it forces before the first run.
 8. **Canonicalization rules**. The `canonicalization.json` content explained row by row; only rule names the harness implements (`decimal_round`, `datetime_utc_truncate_ms`, `datetime_grid_333`, `rstrip_spaces`, `empty_string_is_null`, `null_missing_equiv`, `collation_casefold`, `uuid_normalize`, `identity`); a rule the dialect needs and the harness lacks is filed as a harness change, never faked in the mapping.
 9. **Governance discovery**. Queries for grants, roles and memberships, ownership-implied rights, row/column security, masking, PUBLIC grants, and audit settings, feeding the governance inventory (playbook 2, step 7) and D8.
-10. **Lakebridge coverage delta**. Which `--source-dialect` flag (or none) applies; SEEDED converts / mangles / rejects rows for this dialect, mirrored into `skills/lakebridge/SKILL.md`.
+10. **Lakebridge coverage delta**. Which `--source-dialect` flag (or none) applies; SEEDED converts / mangles / rejects rows for this dialect, mirrored into `skills-extra/lakebridge/SKILL.md`.
 11. **Risk heuristics**. Per-object scoring inputs for the inventory's complexity rank (lines, procedural depth, dynamic SQL, vendor-function density, external calls, trigger fan-out); thresholds are suggestions, the census computes them.
 12. **Worked examples**. Index of `examples/` with, per pair, the constructs it exercises and the recon tier that would catch a wrong conversion.
 
