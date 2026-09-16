@@ -32,6 +32,23 @@ playbook is right.
 | Streaming legacy jobs (Kafka consumers, CDC streams) | `databricks-spark-structured-streaming` | Trigger modes, checkpoints, sinks. |
 | Verifying a migrated model/scoring job (prediction parity, playbook 6 ML-SCORING step) | `databricks-model-serving`, `databricks-ml-training` | Endpoints, MLflow, batch inference. |
 
+## Route by call graph
+
+Track assignment follows the dependency analysis a source-dialect skill emits
+(`.migration/units/<unit>/dependencies.json`, `{routine, reads, writes, calls}` rows; shape and fixture in
+`skills/oracle-plsql/SKILL.md`), not the table's home schema. Walk each routine's `calls` transitively and
+union its `reads` and `writes`:
+
+- A routine on the operational-database track (Lakebase, `14-front_door_oltp`) pulls every table it reads
+  onto that track as well: the converted PL/pgSQL runs inside a Postgres transaction and can only read
+  Postgres tables, so a lookup left analytical-only breaks the routine. Such a table lands on both tracks
+  (the Lakebase copy fed by the synced-table path in `databricks-lakebase`), with one side recorded as owner.
+- A routine on the analytical track routes its reads and writes to the DBSQL/Lakeflow skills above; a
+  table it writes that an OLTP routine also writes is a routing conflict to decide (`06_decisions.md`), not
+  something to split silently.
+- The transitive `writes` of a unit's routines are its write targets. The fan-out workflow refuses a wave
+  whose declared `write_targets` differ from them (rule in `skills/migration-fanout/SKILL.md`).
+
 ## Migration-only deltas (these override nothing in the official skills; they narrow them)
 
 Analytical-track deltas (deploy/schedule, pipelines, governance): [references/analytical-deltas.md](references/analytical-deltas.md); load for warehouse/ETL/code units, not for Lakebase-only units.

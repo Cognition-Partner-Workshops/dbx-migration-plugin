@@ -29,7 +29,7 @@ def _functions():
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
-                                      "column_key"})
+                                      "column_key", "unit_dependencies", "transitive_writes", "check_dependencies"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
@@ -412,6 +412,123 @@ def test_unit_mapping_is_none_when_absent_and_halts_when_malformed(tmp_path):
     spec.write_text("{")
     with pytest.raises(SystemExit, match=r"u9/mapping_spec\.json.*JSON"):
         ns["unit_mapping"]("u9")
+
+
+# ---------------------------------------------------------------- route by call graph (WS3.4)
+
+FIXTURE = Path(__file__).resolve().parents[1] / "oracle-plsql" / "fixtures" / "example_dependencies.json"
+
+
+def _routine(name, reads=(), writes=(), calls=()):
+    return {"routine": name, "reads": list(reads), "writes": list(writes), "calls": list(calls)}
+
+
+CLOSE = _routine("app.close_period", reads=["src.ledger"], writes=["mig.ledger"], calls=["app.log_run"])
+LOG = _routine("app.log_run", writes=["mig.run_log"])
+LOOP = _routine("app.retry", calls=["app.close_period"])
+
+
+def _deps(**by_unit):
+    return lambda unit: by_unit.get(unit)
+
+
+def test_transitive_writes_follows_calls_and_tolerates_cycles():
+    writes = _functions()["transitive_writes"]
+    assert writes([CLOSE, LOG, LOOP]) == {"mig.ledger", "mig.run_log"}
+    assert writes([LOG]) == {"mig.run_log"}
+    assert writes([_routine("app.read_only", reads=["src.x"])]) == set()
+
+
+def test_transitive_writes_is_case_insensitive_on_routine_and_table_names():
+    writes = _functions()["transitive_writes"]
+    assert writes([_routine("APP.A", writes=["MIG.T"], calls=["app.b"]), _routine("app.B", writes=["mig.t"])]) == {"mig.t"}
+
+
+def test_transitive_writes_halts_on_a_callee_the_analysis_does_not_cover():
+    writes = _functions()["transitive_writes"]
+    with pytest.raises(SystemExit, match=r"app\.close_period.*app\.log_run"):
+        writes([CLOSE])
+
+
+def test_check_dependencies_passes_when_declared_targets_equal_transitive_writes():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["MIG.ledger", "mig.run_log"], "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]))
+    check([{**b, "units": ["u", "v"]}], _deps(u=[CLOSE, LOG], v=[LOOP]))
+    check([{**b, "units": ["u", "v"]}], _deps(u=[CLOSE, LOG]))
+
+
+def test_check_dependencies_skips_a_batch_with_no_analysis_at_all():
+    check = _functions()["check_dependencies"]
+    check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"], "brief": "b"}], _deps())
+
+
+def test_check_dependencies_names_missing_and_extra_tables():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-7", "units": ["u"], "write_targets": ["mig.ledger", "mig.stale"], "brief": "b"}
+    with pytest.raises(SystemExit) as e:
+        check([b], _deps(u=[CLOSE, LOG]))
+    msg = str(e.value)
+    assert "b-7" in msg
+    assert re.search(r"missing.*mig\.run_log", msg)
+    assert re.search(r"extra.*mig\.stale", msg)
+    assert "mig.ledger" not in msg.split("missing", 1)[1].split("extra", 1)[0]
+
+
+def test_check_dependencies_halts_when_the_analysis_writes_nothing_the_batch_declared():
+    check = _functions()["check_dependencies"]
+    with pytest.raises(SystemExit, match=r"b.*extra.*mig\.t"):
+        check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"], "brief": "b"}],
+              _deps(u=[_routine("app.read_only", reads=["src.x"])]))
+
+
+def test_check_dependencies_halts_on_an_uncovered_callee_naming_the_unit():
+    check = _functions()["check_dependencies"]
+    with pytest.raises(SystemExit, match=r"u.*app\.close_period.*app\.log_run"):
+        check([{"id": "b", "units": ["u"], "write_targets": ["mig.ledger"], "brief": "b"}], _deps(u=[CLOSE]))
+
+
+@pytest.mark.parametrize("body", ["{", "[]", "{}", '{"routines": {}}', '{"routines": ["x"]}',
+                                  '{"routines": [{"reads": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": "t", "writes": [], "calls": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": [1], "calls": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": []}]}',
+                                  '{"routines": [{"routine": "a", "reads": [], "writes": [], "calls": []}, '
+                                  '{"routine": "A", "reads": [], "writes": [], "calls": []}]}'])
+def test_unit_dependencies_halts_on_a_malformed_analysis(tmp_path, body):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    p = tmp_path / ".migration" / "units" / "u9" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(body)
+    with pytest.raises(SystemExit, match=r"u9/dependencies\.json"):
+        ns["unit_dependencies"]("u9")
+
+
+def test_unit_dependencies_is_none_when_absent_and_returns_the_routine_rows(tmp_path):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    assert ns["unit_dependencies"]("u9") is None
+    p = tmp_path / ".migration" / "units" / "u9" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"routines": [CLOSE, LOG]}))
+    assert ns["unit_dependencies"]("u9") == [CLOSE, LOG]
+
+
+def test_example_fixture_is_a_valid_analysis_whose_writes_the_check_accepts(tmp_path):
+    ns = _functions()
+    ns["ROOT"] = tmp_path
+    p = tmp_path / ".migration" / "units" / "example" / "dependencies.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(FIXTURE.read_text())
+    routines = ns["unit_dependencies"]("example")
+    assert routines and all(set(r) == {"routine", "reads", "writes", "calls"} for r in routines)
+    assert any(r["calls"] for r in routines) and any(r["reads"] for r in routines)
+    writes = ns["transitive_writes"](routines)
+    assert len(writes) > 1 and writes > set().union(*(map(str.casefold, r["writes"]) for r in routines[:1]))
+    ns["check_dependencies"]([{"id": "b", "units": ["example"], "write_targets": sorted(writes), "brief": "b"}])
+    with pytest.raises(SystemExit, match="missing"):
+        ns["check_dependencies"]([{"id": "b", "units": ["example"], "write_targets": sorted(writes)[1:], "brief": "b"}])
 
 
 # ---------------------------------------------------------------- gates as manifest rows (WS3.3)

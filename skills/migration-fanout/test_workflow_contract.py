@@ -27,7 +27,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
-               other_waves=None, mappings=None, namespace=None):
+               other_waves=None, mappings=None, namespace=None, dependencies=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -43,6 +43,10 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         path = ws / ".migration" / "units" / unit / "mapping_spec.json"
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps(spec))
+    for unit, text in (dependencies or {}).items():
+        path = ws / ".migration" / "units" / unit / "dependencies.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
     source = {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}}
     manifest = {
         "wave": 0,
@@ -531,6 +535,34 @@ def test_malformed_sibling_wave_manifest_halts_before_launch(tmp_path):
     ws, cwd = _workspace(tmp_path, other_waves={"wave-1.json": "{"})
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0 and "wave-1.json" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def _analysis(*writes):
+    return json.dumps({"routines": [
+        {"routine": "app.run", "reads": ["src.t"], "writes": [], "calls": ["app.write"]},
+        {"routine": "app.write", "reads": [], "writes": list(writes), "calls": []}]})
+
+
+def test_declared_write_targets_must_equal_the_call_graphs_transitive_writes(tmp_path):
+    ws, cwd = _workspace(tmp_path / "drift", dependencies={"u": _analysis("mig.t", "mig.audit")})
+    proc, calls = _run(cwd, tmp_path / "drift", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0
+    assert "b-1" in proc.stderr and "missing" in proc.stderr and "mig.audit" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+    ws, cwd = _workspace(tmp_path / "same", dependencies={"u": _analysis("MIG.T")})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "same", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+
+def test_malformed_dependency_analysis_halts_before_launch(tmp_path):
+    ws, cwd = _workspace(tmp_path, dependencies={"u": '{"routines": [{"routine": "a"}]}'})
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "u/dependencies.json" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
 

@@ -53,7 +53,8 @@ Manifest shape (written by the plan playbook, read here):
   "base_branch": "migration/loan-servicing", # engagement feature branch; PR diffs are taken against it.
   "batches": [
     {"id": "w2-b01", "units": ["orders_load", "orders_dim"],
-     "write_targets": ["mig.orders", "mig.orders_dim"],
+     "write_targets": ["mig.orders", "mig.orders_dim"],  # must equal the transitive writes of every
+                                              #   .migration/units/<unit>/dependencies.json the batch's units ship
      "verify_depth": "full",                  # optional per-batch override
      "gates": [                               # required; the acceptance gates STOP C approved for these units
        {"id": "rows", "kind": "row_parity",  # kind: byte_compare | export_file | publish_leg | row_parity |
@@ -1262,6 +1263,76 @@ def check_write_targets(batches, other_waves, mapping=None, namespace=""):
                     raise SystemExit(f"{why}: {path} (unit {u}{where}) {problem}")
 
 
+def unit_dependencies(unit):
+    """The unit's dependency analysis ({routine, reads, writes, calls} rows, shape in the source-dialect
+    skill), None when the dialect emits none. Anything else is a halt."""
+    p = ROOT / ".migration" / "units" / unit / "dependencies.json"
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except ValueError as e:
+        raise SystemExit(f"{p} is not valid JSON ({e})") from None
+    rows = data.get("routines") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows or not all(
+            isinstance(r, dict) and isinstance(r.get("routine"), str) and r["routine"]
+            and all(isinstance(r.get(k), list) and all(isinstance(t, str) and t for t in r[k])
+                    for k in ("reads", "writes", "calls"))
+            for r in rows):
+        raise SystemExit(f"{p} needs a non-empty 'routines' list of {{routine, reads, writes, calls}} rows "
+                         "(string name, lists of names)")
+    names = Counter(r["routine"].casefold() for r in rows)
+    if any(n > 1 for n in names.values()):
+        raise SystemExit(f"{p} names a routine twice: {', '.join(sorted(k for k, n in names.items() if n > 1))}")
+    return rows
+
+
+def transitive_writes(routines):
+    """Every table written by the routines or anything they call, transitively. A callee the analysis
+    does not cover means unknown writes, so it halts."""
+    by_name = {r["routine"].casefold(): r for r in routines}
+    seen, writes = set(), set()
+    todo = list(by_name)
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        r = by_name[name]
+        writes.update(t.casefold() for t in r["writes"])
+        for callee in r["calls"]:
+            if callee.casefold() not in by_name:
+                raise SystemExit(f"routine {r['routine']} calls {callee}, which the dependency analysis does not cover, "
+                                 "so its writes are unknown")
+            todo.append(callee.casefold())
+    return writes
+
+
+def check_dependencies(batches, analysis=None):
+    """Where a unit ships a dependency analysis, the batch's declared write_targets must equal the
+    call graph's transitive writes. A table the code writes but the plan did not declare escapes the
+    collision check; a declared table nothing writes hides a dropped step. Either halts."""
+    analysis = unit_dependencies if analysis is None else analysis
+    for b in batches:
+        routines = [r for u in b["units"] for r in analysis(u) or []]
+        if not routines:
+            continue
+        where = f"batch {b['id']} (units {', '.join(b['units'])})"
+        names = Counter(r["routine"].casefold() for r in routines)
+        if any(n > 1 for n in names.values()):
+            raise SystemExit(f"{where}: two units analyse the same routine: "
+                             f"{', '.join(sorted(k for k, n in names.items() if n > 1))}")
+        try:
+            actual = transitive_writes(routines)
+        except SystemExit as e:
+            raise SystemExit(f"{where}: {e}") from None
+        declared = {t.casefold() for t in b["write_targets"]}
+        if actual != declared:
+            raise SystemExit(f"batch {b['id']}: declared write_targets differ from the call graph's transitive writes; "
+                             f"missing from the declaration: {sorted(actual - declared) or '-'}; "
+                             f"extra in the declaration: {sorted(declared - actual) or '-'}. Fix the wave plan, then re-run.")
+
+
 def child_prompt(batch):
     return (
         f"You are one fan-out child in wave {WAVE} of a migration. Repo: {REPO}.\n"
@@ -1588,6 +1659,7 @@ async def main():
     await register_workflow(META)
     check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
                         namespace=MANIFEST.get("target_namespace", ""))
+    check_dependencies(BATCHES)
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}")
 
     sem = asyncio.Semaphore(WIDTH)
