@@ -144,7 +144,9 @@ The output is a machine-readable table of object, class, method, partition key, 
    The same file's `type_map.<family>.<target_kind>` is applied when the spec loads (`--target-kind`
    selects the table; `estimate --family/--canonicalization` applies it too, so the plan counts
    the statements the run will issue): empty `target_type`s are
-   filled from it, a declared type it forbids stops the run before any query (`type map:` on
+   filled from it, a declared type it forbids — including a `conditional` alternative the
+   field's `rules` does not carry (the map names the rule, e.g. `census_fits_int64`,
+   `census_midnight_only`) — stops the run before any query (`type map:` on
    stderr), and `result.json` records the outcome under `type_map` (`null` when the family has
    no map, so unaudited is never mistaken for clean).
 3. On FAIL: read `report.md`, fix converted code or the load only. Never touch the source.

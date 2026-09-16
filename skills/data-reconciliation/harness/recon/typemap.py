@@ -29,8 +29,14 @@ _ALIASES = {
     "timestamp_ltz": "timestamp",
 }
 
+# spellings that mean something else on a specific target kind, applied before _ALIASES
+# when parsing types spelled for that kind (declared targets and map patterns)
+_KIND_ALIASES = {
+    "lakebase": {"timestamp without time zone": "timestamp"},
+}
+
 # decimal-like source types whose (p,s) edge shapes normalise before matching
-_DECIMAL_SOURCES = {"number", "decimal"}
+_DECIMAL_SOURCES = {"number", "decimal", "numeric"}
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,9 @@ class TypeRule:
     source: str
     target: str
     accepts: tuple[str, ...] = ()
+    # alternative spellings accepted only when the field carries the named canonicalization
+    # rule: (alternative, required rule name)
+    conditional: tuple[tuple[str, str], ...] = ()
     p_max: int | None = None
 
 
@@ -47,13 +56,16 @@ class TypeMap:
     target_kind: str
     note: str
     rules: tuple[TypeRule, ...]
+    decimal_max_precision: int | None = None
 
 
-def _parse(text: str, aliases: bool = True) -> tuple[str, tuple]:
+def _parse(text: str, aliases: bool = True, kind: str | None = None) -> tuple[str, tuple]:
     t = _WS.sub(" ", str(text).strip().lower())
     args = tuple(_arg(a) for group in _PAREN.findall(t) for a in group.split(","))
     name = _WS.sub(" ", _PAREN.sub(" ", t)).strip()
-    return (_ALIASES.get(name, name) if aliases else name), args
+    if not aliases:
+        return name, args
+    return _KIND_ALIASES.get(kind, {}).get(name, _ALIASES.get(name, name)), args
 
 
 def _arg(token: str):
@@ -111,8 +123,8 @@ def _render(pattern: str, bound: dict) -> str:
     return f"{name}({','.join(str(bound.get(a, a)) for a in args)})"
 
 
-def _target_matches(dname: str, dargs: tuple, pattern: str) -> bool:
-    pname, pargs = _parse(pattern)
+def _target_matches(dname: str, dargs: tuple, pattern: str, kind: str | None = None) -> bool:
+    pname, pargs = _parse(pattern, kind=kind)
     if pname != dname or len(pargs) != len(dargs):
         return False
     for pat, arg in zip(pargs, dargs):
@@ -142,8 +154,11 @@ def load_type_map(path: Path, family: str, target_kind: str) -> TypeMap | None:
         if not isinstance(r, dict) or not r.get("source") or not r.get("target"):
             raise ConfigError(f"{path}: type_map.{family}.{target_kind} entry missing source/target: {r}")
         rules.append(TypeRule(source=r["source"], target=r["target"],
-                              accepts=tuple(r.get("accepts", ())), p_max=r.get("p_max")))
-    return TypeMap(family=family, target_kind=target_kind, note=entry.get("note", ""), rules=tuple(rules))
+                              accepts=tuple(r.get("accepts", ())),
+                              conditional=tuple(sorted((r.get("conditional") or {}).items())),
+                              p_max=r.get("p_max")))
+    return TypeMap(family=family, target_kind=target_kind, note=entry.get("note", ""),
+                   rules=tuple(rules), decimal_max_precision=entry.get("decimal_max_precision"))
 
 
 def type_map_families(path: Path) -> list[str]:
@@ -161,7 +176,20 @@ def type_map_targets(path: Path, family: str) -> list[str]:
     return sorted(entry.keys()) if isinstance(entry, dict) else []
 
 
-def expected_target(tm: TypeMap, source_type: str) -> tuple[str, tuple[str, ...]] | None:
+def _precision_error(tm: TypeMap, source_type: str) -> str | None:
+    """A normalised decimal wider than the target kind can hold is a defect, not a fill."""
+    if tm.decimal_max_precision is None:
+        return None
+    name, args = _parse(source_type)
+    args = _norm_decimal(name, args)
+    if (name in _DECIMAL_SOURCES and len(args) == 2 and isinstance(args[0], int)
+            and args[0] > tm.decimal_max_precision):
+        return (f"{source_type} needs decimal({args[0]},{args[1]}); "
+                f"{tm.target_kind} decimals stop at {tm.decimal_max_precision}")
+    return None
+
+
+def expected_target(tm: TypeMap, source_type: str) -> tuple[str, tuple[str, ...], tuple] | None:
     name, args = _parse(source_type)
     if not name:
         return None
@@ -169,21 +197,30 @@ def expected_target(tm: TypeMap, source_type: str) -> tuple[str, tuple[str, ...]
     for rule in tm.rules:
         bound = _match(rule, name, args)
         if bound is not None:
-            return _render(rule.target, bound), tuple(_render(a, bound) for a in rule.accepts)
+            return (_render(rule.target, bound),
+                    tuple(_render(a, bound) for a in rule.accepts), rule.conditional)
     return None
 
 
-def audit_field(tm: TypeMap, source_type: str, target_type: str) -> tuple[str, str | None]:
+def audit_field(tm: TypeMap, source_type: str, target_type: str,
+                rules: tuple | list = ()) -> tuple[str, str | None]:
+    if (err := _precision_error(tm, source_type)) is not None:
+        return "unrepresentable", err
     found = expected_target(tm, source_type)
     if found is None:
         return "unmapped", None
-    expected, accepts = found
+    expected, accepts, conditional = found
     if not (target_type or "").strip():
         return "undeclared", expected
-    dname, dargs = _parse(target_type)
+    dname, dargs = _parse(target_type, kind=tm.target_kind)
     for pat in (expected, *accepts):
-        if _target_matches(dname, dargs, pat):
+        if _target_matches(dname, dargs, pat, tm.target_kind):
             return "ok", expected
+    for alt, token in conditional:
+        if _target_matches(dname, dargs, alt, tm.target_kind):
+            if token in rules:
+                return "ok", expected
+            return "contradiction", f"{expected} ({alt} needs rule {token} on the field)"
     return "contradiction", expected
 
 
@@ -198,7 +235,7 @@ def audit_spec(tm: TypeMap, spec: MappingSpec) -> list[dict]:
     rows = []
     for _container, label, fields in _each_field(spec):
         for f in fields:
-            status, expected = audit_field(tm, f.source_type, f.target_type)
+            status, expected = audit_field(tm, f.source_type, f.target_type, f.rules)
             rows.append({"object": label, "source": f.source, "source_type": f.source_type,
                          "read_as": read_as(f.source_type),
                          "target_type": f.target_type, "expected": expected, "status": status})
@@ -210,12 +247,15 @@ def apply_type_map(tm: TypeMap, spec: MappingSpec) -> tuple[MappingSpec, dict]:
 
     def fix(label: str, f):
         name = f"{label}.{f.source}"
+        if (err := _precision_error(tm, f.source_type)) is not None:
+            errors.append(f"{name}: {err}")
+            return f
         found = expected_target(tm, f.source_type)
         if found is None:
             unmapped.append(name)
             return f
-        expected, accepts = found
-        status, _ = audit_field(tm, f.source_type, f.target_type)
+        expected, accepts, _cond = found
+        status, detail = audit_field(tm, f.source_type, f.target_type, f.rules)
         if status == "undeclared":
             filled.append(name)
             return replace(f, target_type=expected)
@@ -224,7 +264,7 @@ def apply_type_map(tm: TypeMap, spec: MappingSpec) -> tuple[MappingSpec, dict]:
             ra = read_as(f.source_type)
             src = f"{f.source_type} -> read as {ra}" if ra else f.source_type
             errors.append(f"{name}: {src} -> declared {f.target_type}, "
-                          f"map says {expected}{acc}")
+                          f"map says {detail}{acc}")
         return f
 
     objects = []

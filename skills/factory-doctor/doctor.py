@@ -700,7 +700,7 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
             return Check(cid, "fail", f"{p}: {_redact(str(e))}")
         for row in audit_spec(tm, spec):
             fields += 1
-            if row["status"] == "contradiction":
+            if row["status"] in ("contradiction", "unrepresentable"):
                 contradictions.append(row)
             elif row["status"] == "unmapped":
                 unmapped.append(row)

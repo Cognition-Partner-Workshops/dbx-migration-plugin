@@ -304,3 +304,37 @@ def test_estimate_applies_the_same_type_map_as_run(tmp_path, monkeypatch, capsys
         return json.loads(capsys.readouterr().out)
 
     assert estimate("") == estimate("decimal(10,2)")
+
+
+def test_unrepresentable_precision_fails_instead_of_filling(oracle_map, oracle_lakebase_map):
+    # NUMBER(38,-84) normalises to decimal(122,0): beyond databricks' 38, within postgres' 1000
+    status, detail = audit_field(oracle_map, "NUMBER(38,-84)", "decimal(122,0)")
+    assert status == "unrepresentable" and "decimals stop at 38" in detail
+    assert expected_target(oracle_lakebase_map, "NUMBER(38,-84)")[0] == "numeric(122,0)"
+    assert audit_field(oracle_lakebase_map, "NUMBER(38,-84)", "numeric(122,0)")[0] == "ok"
+    spec = _spec([FieldMapping("BIG", "big", "NUMBER(38,-84)", "")])
+    with pytest.raises(ConfigError, match="decimals stop at 38"):
+        apply_type_map(oracle_map, spec)
+
+
+def test_conditional_targets_need_their_census_rule(oracle_map):
+    status, detail = audit_field(oracle_map, "INTEGER", "bigint")
+    assert status == "contradiction" and "census_fits_int64" in detail
+    assert audit_field(oracle_map, "INTEGER", "bigint", rules=["census_fits_int64"])[0] == "ok"
+    assert audit_field(oracle_map, "INT", "bigint", rules=["census_fits_int64"])[0] == "ok"
+    assert audit_field(oracle_map, "SMALLINT", "bigint", rules=["census_fits_int64"])[0] == "ok"
+    status, detail = audit_field(oracle_map, "DATE", "date")
+    assert status == "contradiction" and "census_midnight_only" in detail
+    assert audit_field(oracle_map, "DATE", "date", rules=["census_midnight_only"])[0] == "ok"
+    with pytest.raises(ConfigError, match="census_midnight_only"):
+        apply_type_map(oracle_map, _spec([FieldMapping("D", "d", "DATE", "date")]))
+    # declared with the rule audits ok through the whole-spec path too
+    spec = _spec([FieldMapping("N", "n", "INTEGER", "bigint", rules=["census_fits_int64"])])
+    apply_type_map(oracle_map, spec)
+    assert audit_spec(oracle_map, spec)[0]["status"] == "ok"
+
+
+def test_lakebase_parses_timestamp_without_time_zone_as_timestamp(oracle_map, oracle_lakebase_map):
+    assert audit_field(oracle_lakebase_map, "TIMESTAMP(6)", "TIMESTAMP(6) WITHOUT TIME ZONE")[0] == "ok"
+    # databricks unchanged: the spelling is timestamp_ntz there, and a bare timestamp_ntz stays ok
+    assert audit_field(oracle_map, "TIMESTAMP(6)", "timestamp_ntz")[0] == "ok"
