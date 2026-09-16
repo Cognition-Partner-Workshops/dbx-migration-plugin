@@ -1,0 +1,37 @@
+{
+  "table": "app.events",
+  "shape": [
+    {
+      "name": "event_id",
+      "type": "int",
+      "nullable": false
+    },
+    {
+      "name": "timestamp",
+      "type": "timestamp",
+      "nullable": true
+    },
+    {
+      "name": "status",
+      "type": "varchar(12)",
+      "nullable": true
+    }
+  ],
+  "rows": [
+    {
+      "event_id": 1,
+      "timestamp": "2024-03-01T00:00:00",
+      "status": "new"
+    },
+    {
+      "event_id": 2,
+      "timestamp": "2024-03-01T00:00:00",
+      "status": "new"
+    },
+    {
+      "event_id": 3,
+      "timestamp": "2024-03-01T00:00:00",
+      "status": "new"
+    }
+  ]
+}

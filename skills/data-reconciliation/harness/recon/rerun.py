@@ -109,13 +109,25 @@ def load_shape(path: Path) -> dict:
     return _check_shape(_read_json(path), str(path))
 
 
-def load_prior(path: Path) -> dict:
-    """The previous committed shape: a rerun_proof.json (its observed `shape`) or a shape file."""
+def load_prior(path: Path, unit: str, proof: bool) -> dict:
+    """The previous committed shape: with `proof`, this unit's earlier rerun_proof.json (its observed
+    `shape`, which must still match its `shape_digest`); otherwise a declared bare shape file."""
     data = _read_json(path)
-    if isinstance(data, dict) and "unit" in data and "shape" in data:
-        if not isinstance(data.get("shape"), dict):
-            raise ConfigError(f"{path}: prior proof carries no observed shape (no 'tables'); its fresh leg failed")
-        data = data["shape"]
+    is_proof = isinstance(data, dict) and "unit" in data and "shape" in data
+    if proof:
+        if not is_proof:
+            raise ConfigError(f"{path}: --prior-proof is not a rerun proof (no unit and shape); "
+                              "a declared shape goes through --prior-shape")
+        if data["unit"] != unit:
+            raise ConfigError(f"{path}: prior proof is for unit {data['unit']!r}, not {unit!r}")
+        if not isinstance(data["shape"], dict):
+            raise ConfigError(f"{path}: prior proof carries no observed shape; its fresh leg failed")
+        shape = _check_shape(data["shape"], str(path))
+        if data.get("shape_digest") != shape_digest(shape):
+            raise ConfigError(f"{path}: prior proof's shape does not match its shape_digest")
+        return shape
+    if is_proof:
+        raise ConfigError(f"{path}: --prior-shape names a rerun proof, not a declared shape; use --prior-proof")
     return _check_shape(data, str(path))
 
 
@@ -254,6 +266,8 @@ def grade_rerun(fresh: dict | None, evolved: dict | None, prior: dict | None = N
     }
     if fresh_status == "pass":
         out["shape"], out["shape_digest"] = fresh["shape"], shape_digest(fresh["shape"])
+    else:
+        out["shape"] = out["shape_digest"] = None
     if prior is not None:
         out["prior_digest"] = shape_digest(prior)
     if reason:
