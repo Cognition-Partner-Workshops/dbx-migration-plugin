@@ -19,6 +19,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 - [ ] Run `dbx-recon` fixture-first with declared endpoints and fail closed when endpoints are missing; use one batched check window.
 - [ ] Fixture-first: develop against the fixture copy; read the real source once inside the legacy-query cap.
 - [ ] Check counts, aggregates, keyed diffs, report output, declared source volumes, populations, and idempotency evidence.
+- [ ] Idempotency is the rerun proof of `data-reconciliation` (`dbx-recon rerun-proof`, fixture `harness/fixtures/example_rerun/`): fresh target and a target pre-created in the table's previous committed shape (`--prior-proof`, the last committed `rerun_proof.json`); pass `--rerun-proof` with `--rerun-source` to `run`.
 - [ ] Launch heavy backfills/recon as jobs, record run IDs, and never babysit polling in-session.
 - [ ] On FAIL, capture evidence, fix converted code only, rerun `dbx-recon`, and stop after three full runs.
 
