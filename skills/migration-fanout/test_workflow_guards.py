@@ -29,7 +29,7 @@ def _functions():
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
-                                      "column_key"})
+                                      "column_key", "predicate_slices", "reader_slices", "disjoint_slices"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
@@ -141,6 +141,8 @@ SCOPE = ["run_date", "unit_id", "region", "run_id", "batch_id", "run date", "Dat
 BOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": SCOPE,
                         "root_where": "run_date = '${as_of}'", "target_where": "run_date = '${as_of}'"}]}
 UNBOUNDED = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": SCOPE}]}
+PRIOR = {"objects": [{**BOUNDED["objects"][0], "root_where": "run_date = '${prior_as_of}'",
+                      "target_where": "run_date = '${prior_as_of}'"}]}
 
 
 def _others(*batches, namespace="", name="wave-1.json"):
@@ -158,7 +160,7 @@ def _specs(**by_unit):
 def test_same_wave_collision_still_halts_naming_both_batches():
     check = _functions()["check_write_targets"]
     with pytest.raises(SystemExit, match=r"collision.*'mig.t'.*b-1.*b-2"):
-        check([B1, B2], {}, _specs(u1=BOUNDED, u2=BOUNDED))
+        check([B1, B2], {}, _specs(u1=BOUNDED, u2=PRIOR))
 
 
 @pytest.mark.parametrize("spec", [UNBOUNDED,
@@ -173,7 +175,7 @@ def test_shared_table_across_waves_needs_a_bounded_target_where(spec):
 
 def test_shared_table_across_waves_passes_when_every_reader_is_bounded():
     check = _functions()["check_write_targets"]
-    check([B1], _others(B2), _specs(u1=BOUNDED, u2=BOUNDED))
+    check([B1], _others(B2), _specs(u1=BOUNDED, u2=PRIOR))
     check([B1], _others({**B2, "write_targets": ["mig.other"]}), _specs())
 
 
@@ -207,20 +209,20 @@ def test_shared_table_matches_tables_key_and_target_table_spelling():
     check = _functions()["check_write_targets"]
     legacy = {"tables": [{"target_table": "MIG.T", "source_table": "dbo.t", "scope_columns": ["run_date"],
                           "target_where": "run_date = '${as_of}'"}]}
-    check([B1], OTHERS, _specs(u1=legacy, u2=BOUNDED))
+    check([B1], OTHERS, _specs(u1=legacy, u2=PRIOR))
     with pytest.raises(SystemExit, match="target_where"):
         check([B1], OTHERS, _specs(u1={"tables": [{"target_table": "MIG.T", "source_table": "dbo.t",
-                                                  "scope_columns": ["run_date"]}]}, u2=BOUNDED))
+                                                  "scope_columns": ["run_date"]}]}, u2=PRIOR))
 
 
 def test_shared_table_is_the_same_table_whatever_its_case_or_quoting():
     check = _functions()["check_write_targets"]
     with pytest.raises(SystemExit, match=r"collision.*b-1.*b-2"):
-        check([B1, {**B2, "write_targets": ["MIG.T"]}], {}, _specs(u1=BOUNDED, u2=BOUNDED))
+        check([B1, {**B2, "write_targets": ["MIG.T"]}], {}, _specs(u1=BOUNDED, u2=PRIOR))
     for other in ("MIG.T", "`mig`.`t`", " Mig.T "):
         with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
-            check([B1], _others({**B2, "write_targets": [other]}), _specs(u1=UNBOUNDED, u2=BOUNDED))
-        check([B1], _others({**B2, "write_targets": [other]}), _specs(u1=BOUNDED, u2=BOUNDED))
+            check([B1], _others({**B2, "write_targets": [other]}), _specs(u1=UNBOUNDED, u2=PRIOR))
+        check([B1], _others({**B2, "write_targets": [other]}), _specs(u1=BOUNDED, u2=PRIOR))
 
 
 BARE = lambda where: {"objects": [{"object": "T", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"],
@@ -241,16 +243,16 @@ def test_one_normalizer_qualifies_bare_names_with_the_manifest_target_namespace(
     for current, previous in (("t", "mig.t"), ("mig.t", "t"), ("T", full), (full, "t")):
         with pytest.raises(SystemExit, match=rf"'{re.escape(current)}'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
             check([{**B1, "write_targets": [current]}], _others({**B2, "write_targets": [previous]}, namespace=namespace),
-                  _specs(u1=UNBOUNDED, u2=BOUNDED), namespace)
+                  _specs(u1=UNBOUNDED, u2=PRIOR), namespace)
         check([{**B1, "write_targets": [current]}], _others({**B2, "write_targets": [previous]}, namespace=namespace),
-              _specs(u1=BARE("run_date = '${as_of}'"), u2=BOUNDED), namespace)
+              _specs(u1=BARE("run_date = '${as_of}'"), u2=PRIOR), namespace)
     with pytest.raises(SystemExit, match=r"collision.*'(t|mig\.t)'.*b-1.*b-2"):
-        check([{**B1, "write_targets": ["t"]}, B2], {}, _specs(u1=BOUNDED, u2=BOUNDED), namespace)
+        check([{**B1, "write_targets": ["t"]}, B2], {}, _specs(u1=BOUNDED, u2=PRIOR), namespace)
     with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*target_where"):
-        check([B1], _others(B2, namespace=namespace), _specs(u1=BARE(""), u2=BOUNDED), namespace)
+        check([B1], _others(B2, namespace=namespace), _specs(u1=BARE(""), u2=PRIOR), namespace)
     for other in ("other.t", "ig.t"):
         with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
-            check([B1], _others(B2, namespace=namespace), _specs(u1={"objects": [{"object": other, "target_where": "id = 1"}]}, u2=BOUNDED), namespace)
+            check([B1], _others(B2, namespace=namespace), _specs(u1={"objects": [{"object": other, "target_where": "id = 1"}]}, u2=PRIOR), namespace)
         check([B1], _others({**B2, "write_targets": [other]}, namespace=namespace), _specs(), namespace)
 
 
@@ -263,9 +265,9 @@ def test_each_wave_resolves_its_own_targets_with_its_own_target_namespace():
     check = fn["check_write_targets"]
     sibling_bare = _others({**B2, "write_targets": ["t"]}, namespace="mig")
     with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
-        check([B1], sibling_bare, _specs(u1=UNBOUNDED, u2=BOUNDED))
-    check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BOUNDED))
-    check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BARE("run_date = '${as_of}'")))
+        check([B1], sibling_bare, _specs(u1=UNBOUNDED, u2=PRIOR))
+    check([B1], sibling_bare, _specs(u1=BOUNDED, u2=PRIOR))
+    check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BARE("run_date = '${prior_as_of}'")))
     with pytest.raises(SystemExit, match=r"'mig.t'.*wave-1\.json.*b-2.*u2.*target_where"):
         check([B1], sibling_bare, _specs(u1=BOUNDED, u2=BARE("")))
     with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
@@ -274,28 +276,51 @@ def test_each_wave_resolves_its_own_targets_with_its_own_target_namespace():
     check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}), _specs(), "mig_a")
     check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}, namespace="mig"), _specs())
     with pytest.raises(SystemExit, match=r"'t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
-        check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}), _specs(u1=BARE(""), u2=BOUNDED))
+        check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}), _specs(u1=BARE(""), u2=PRIOR))
     with pytest.raises(SystemExit, match=r"'t'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
         check([{**B1, "write_targets": ["t"]}], _others({**B2, "write_targets": ["t"]}, namespace="mig"),
-              _specs(u1=BARE(""), u2=BOUNDED), "MIG")
+              _specs(u1=BARE(""), u2=PRIOR), "MIG")
     for shape in ([B2], {"batches": [B2]}, {"target_namespace": 1, "batches": [B2]},
                   {"target_namespace": "a b", "batches": [B2]}, {"target_namespace": "", "batches": B2}):
         with pytest.raises(SystemExit, match=r"wave-1\.json"):
-            check([B1], {"wave-1.json": shape}, _specs(u1=BOUNDED, u2=BOUNDED))
+            check([B1], {"wave-1.json": shape}, _specs(u1=BOUNDED, u2=PRIOR))
 
 
-def test_without_a_target_namespace_a_bare_name_is_only_itself():
-    """No namespace, no guessing: `t` and `mig.t` are different targets everywhere, so a bare object does not
-    read a qualified shared table and the unit halts for having no reader of it rather than being scoped
-    by suffix."""
+def test_without_a_target_namespace_a_bare_mapping_object_reads_the_qualified_table_of_its_name():
+    """Manifests without a target_namespace still qualify their targets while the harness's mapping objects
+    are often bare (the run supplies catalog and schema). Two manifest names stay distinct (`t` is not
+    `mig.t`), but a bare object with no namespace to resolve in reads the shared table whose trailing name
+    it is, case-folded, so it is held to a bound rather than escaping as a non-reader."""
     fn = _functions()
     assert fn["target_key"]("T") == "t" != fn["target_key"]("mig.t") and fn["target_key"]("MIG.T") == "mig.t"
-    assert not fn["reads_target"]("T", "mig.t") and fn["reads_target"]("`MIG`.T", "mig.t")
+    assert fn["reads_target"]("T", "mig.t") and fn["reads_target"]("`MIG`.T", "mig.t")
+    assert fn["reads_target"]("mig.t", "T") and not fn["reads_target"]("other.t", "mig.t")
+    assert not fn["reads_target"]("T", "mig.t", "cat") and not fn["reads_target"]("", "t")
     check = fn["check_write_targets"]
     check([B1], _others({**B2, "write_targets": ["t"]}), _specs())
     check([{**B1, "write_targets": ["t"]}, B2], {}, _specs())
+    check([B1], OTHERS, _specs(u1=BARE("run_date = '${as_of}'"), u2=PRIOR))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*target_where"):
+        check([B1], OTHERS, _specs(u1=BARE(""), u2=PRIOR))
     with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
-        check([B1], OTHERS, _specs(u1=BARE("run_date = '${as_of}'"), u2=BOUNDED))
+        check([B1], OTHERS, _specs(u1={"objects": [{"object": "other.t", "target_where": "id = 1"}]}, u2=PRIOR))
+
+
+def test_only_the_units_whose_mappings_read_a_shared_table_must_bound_it():
+    """A batch of several units writes a shared table through one of them; the others' mappings never name
+    it and need no bound for it. A batch none of whose units read it has no scoped reader at all: halt."""
+    check = _functions()["check_write_targets"]
+    other = {"objects": [{"object": "mig.other", "root_table": "dbo.o", "key": ["id"]}]}
+    b1 = {**B1, "units": ["u1", "u3"]}
+    check([b1], _others({**B2, "units": ["u2", "u4"]}), _specs(u1=BOUNDED, u2=PRIOR, u3=other, u4=other))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
+        check([b1], OTHERS, _specs(u1=UNBOUNDED, u2=PRIOR, u3=other))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*no unit of b-1 .*reads"):
+        check([b1], OTHERS, _specs(u1=other, u2=PRIOR, u3=other))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*wave-1\.json.*no unit of b-2 .*reads"):
+        check([b1], _others({**B2, "units": ["u2", "u4"]}), _specs(u1=BOUNDED, u2=other, u3=other, u4=other))
+    with pytest.raises(SystemExit, match=r"units/u3/mapping_spec\.json is missing"):
+        check([b1], OTHERS, _specs(u1=BOUNDED, u2=PRIOR))
 
 
 @pytest.mark.parametrize("namespace", [1, "", " ", "a b", "cat.", ".mig", "cat..mig", ["mig"]])
@@ -319,10 +344,12 @@ def test_target_namespace_when_present_is_a_dotted_identifier(namespace):
                                    "run_date = '${as_of}' OR run_date IS NULL", "run_date", "run_date = ",
                                    "deleted_at = '${as_of}'", "t.other = 1 AND 1 = 1", "run_date = '${as_of}' OR other = 1"])
 def test_target_where_that_does_not_pin_a_scope_column_is_not_a_bound(where):
-    check = _functions()["check_write_targets"]
+    fn = _functions()
     spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
+    assert not fn["bounded_predicate"](where, SCOPE)
+    assert fn["bounded_readers"](spec, "mig.t") == "reads it without a target_where pinning one of its scope_columns"
     with pytest.raises(SystemExit, match=r"'mig.t'.*b-1.*b-2.*u1.*target_where"):
-        check([B1], OTHERS, _specs(u1=spec, u2=BOUNDED))
+        fn["check_write_targets"]([B1], OTHERS, _specs(u1=spec, u2=PRIOR))
 
 
 @pytest.mark.parametrize("where", ["run_date = '${as_of}'", "t.run_date = DATE '2024-01-01'", "batch_id IN (1, 2)",
@@ -332,9 +359,91 @@ def test_target_where_that_does_not_pin_a_scope_column_is_not_a_bound(where):
                                    "1 = 1 AND (region = 'eu' OR (region = 'us' AND 1 = 1))", "((run_date = '${as_of}'))",
                                    "unit_id = 'u1' AND (region = 'eu' OR 1 = 1)", "unit_id LIKE 'u1%'", "run_date IN ('${as_of}')"])
 def test_target_where_pinning_a_declared_scope_column_is_a_bound(where):
-    check = _functions()["check_write_targets"]
+    fn = _functions()
     spec = {"objects": [{**UNBOUNDED["objects"][0], "target_where": where}]}
-    check([B1], OTHERS, _specs(u1=spec, u2=BOUNDED))
+    assert fn["bounded_predicate"](where, SCOPE)
+    assert fn["bounded_readers"](spec, "mig.t") == ""
+
+
+def _slices(where):
+    return _functions()["predicate_slices"](where, SCOPE)
+
+
+@pytest.mark.parametrize("a, b", [
+    ("run_date = '${as_of}'", "run_date = '${prior_as_of}'"),
+    ("run_date = '${as_of}'", "RUN_DATE = ${prior}"),
+    ("unit_id = 'u1'", "unit_id = 'u2'"),
+    ("unit_id = 'u1'", "t.UNIT_ID = 'U1'"),
+    ("batch_id IN (1, 2)", "batch_id IN (3, 4)"),
+    ("batch_id = 1", "batch_id IN (2, 3)"),
+    ("run_date < '2024-02-01'", "run_date >= '2024-02-01'"),
+    ("run_date BETWEEN '2024-01-01' AND '2024-01-31'", "run_date BETWEEN '2024-02-01' AND '2024-02-29'"),
+    ("run_date BETWEEN DATE '2024-01-01' AND DATE '2024-01-31'", "run_date > DATE '2024-01-31'"),
+    ("batch_id <= 10", "11 <= batch_id"),
+    ("batch_id > 10", "batch_id = 10"),
+    ("unit_id = 'u1' AND run_date = '${as_of}'", "unit_id = 'u2' AND run_date = '${as_of}'"),
+    ("unit_id = 'u1' AND run_date = '${as_of}'", "unit_id = 'u1' AND run_date = '${prior}'"),
+    ("region = 'eu' OR region = 'us'", "region = 'apac' OR region = 'latam'"),
+    ("(region = 'eu' AND run_id = 1) OR region = 'us'", "region = 'apac'"),
+    ("1 = 1 AND unit_id = 'u1'", "unit_id = 'u2' AND deleted_at IS NULL"),
+])
+def test_slices_of_two_readers_are_disjoint_when_the_predicates_prove_it(a, b):
+    """Two readers of a shared table may each recon their own slice only when the predicates cannot select
+    the same row: equality or IN on a scope column with no value in common, non-overlapping literal ranges,
+    or a pin on differently named parameters (each run supplies its own; the same name is the same value).
+    An AND is separated by any one column, an OR only when every branch is."""
+    fn = _functions()
+    assert fn["disjoint_slices"](_slices(a), _slices(b)) and fn["disjoint_slices"](_slices(b), _slices(a))
+    check = fn["check_write_targets"]
+    check([B1], OTHERS, _specs(u1={"objects": [{**UNBOUNDED["objects"][0], "target_where": a}]},
+                               u2={"objects": [{**UNBOUNDED["objects"][0], "target_where": b}]}))
+
+
+@pytest.mark.parametrize("a, b", [
+    ("run_date = '${as_of}'", "run_date = '${as_of}'"),
+    ("run_date = '${as_of}'", "RUN_DATE = ${as_of}"),
+    ("run_date = '${as_of}'", "run_date = '2024-01-01'"),
+    ("run_date = '${as_of}'", "unit_id = 'u1'"),
+    ("unit_id = 'u1'", "unit_id = 'u1'"),
+    ("unit_id = 'u1'", "unit_id IN ('u1', 'u2')"),
+    ("unit_id LIKE 'u1%'", "unit_id LIKE 'u2%'"),
+    ("unit_id LIKE 'u1%'", "unit_id = 'u2'"),
+    ("run_date < '2024-02-01'", "run_date > '2024-01-15'"),
+    ("run_date <= '2024-02-01'", "run_date >= '2024-02-01'"),
+    ("run_date BETWEEN '2024-01-01' AND '2024-02-15'", "run_date BETWEEN '2024-02-01' AND '2024-02-29'"),
+    ("batch_id < 10", "batch_id < 20"),
+    ("batch_id > 10", "batch_id = 11"),
+    ("batch_id > ${lo}", "batch_id < ${hi}"),
+    ("batch_id > 10", "batch_id < '20'"),
+    ("unit_id = 'u1' AND run_date = '${as_of}'", "unit_id = 'u1' AND run_date = '${as_of}'"),
+    ("region = 'eu' OR region = 'us'", "region = 'us' OR region = 'apac'"),
+    ("(region = 'eu' AND run_id = 1) OR region = 'us'", "region = 'us' AND run_id = 2"),
+    ("region = 'eu' OR unit_id = 'u1'", "region = 'us'"),
+])
+def test_shared_table_readers_whose_slices_may_overlap_halt_naming_both_units(a, b):
+    """Overlap, or scopes the workflow cannot prove apart (a parameter against a literal, LIKE prefixes,
+    pins on different columns, ranges the same value satisfies), halts before launch naming the table and
+    both readers, whichever wave each is in."""
+    fn = _functions()
+    assert not fn["disjoint_slices"](_slices(a), _slices(b))
+    check = fn["check_write_targets"]
+    u1 = {"objects": [{**UNBOUNDED["objects"][0], "target_where": a}]}
+    u2 = {"objects": [{**UNBOUNDED["objects"][0], "target_where": b}]}
+    with pytest.raises(SystemExit, match=r"'mig.t'.*u1 .*u2 \(wave-1\.json b-2\).*overlap"):
+        check([B1], OTHERS, _specs(u1=u1, u2=u2))
+    with pytest.raises(SystemExit, match=r"'mig.t'.*overlap"):
+        check([{**B1, "units": ["u1", "u3"]}], _others({**B2, "units": ["u2"]}), _specs(u1=u1, u3=u2, u2=PRIOR))
+
+
+def test_reader_slices_are_the_union_of_every_object_reading_the_table():
+    fn = _functions()
+    two = {"objects": [{**UNBOUNDED["objects"][0], "target_where": "region = 'eu'"},
+                       {**UNBOUNDED["objects"][0], "object": "MIG.T", "target_where": "region = 'us'"},
+                       {"object": "mig.other", "target_where": "region = 'apac'"}]}
+    assert fn["reader_slices"](two, "mig.t") == _slices("region = 'eu' OR region = 'us'")
+    assert fn["disjoint_slices"](fn["reader_slices"](two, "mig.t"), _slices("region = 'apac'"))
+    assert not fn["disjoint_slices"](fn["reader_slices"](two, "mig.t"), _slices("region = 'us'"))
+    assert fn["reader_slices"](two, "mig.none") is None
 
 
 @pytest.mark.parametrize("scope", [None, [], "run_date", [1], [""]])
@@ -343,7 +452,7 @@ def test_shared_table_reader_must_declare_scope_columns(scope):
     row = {k: v for k, v in BOUNDED["objects"][0].items() if k != "scope_columns"}
     spec = {"objects": [row if scope is None else {**row, "scope_columns": scope}]}
     with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*scope_columns"):
-        check([B1], OTHERS, _specs(u1=spec, u2=BOUNDED))
+        check([B1], OTHERS, _specs(u1=spec, u2=PRIOR))
 
 
 def _embedded(embed):
@@ -357,20 +466,20 @@ def _embedded(embed):
 def test_embed_of_a_shared_table_reader_needs_its_own_bound(embed):
     check = _functions()["check_write_targets"]
     with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*embed 'items'.*target_where"):
-        check([B1], OTHERS, _specs(u1=_embedded(embed), u2=BOUNDED))
+        check([B1], OTHERS, _specs(u1=_embedded(embed), u2=PRIOR))
 
 
 @pytest.mark.parametrize("embed", [{"target_where": "run_date = '${as_of}'"},
                                    {"scope_columns": ["item_run"], "target_where": "item_run = '${as_of}'"}])
 def test_embed_bounded_on_its_own_or_the_objects_scope_columns_passes(embed):
     check = _functions()["check_write_targets"]
-    check([B1], OTHERS, _specs(u1=_embedded(embed), u2=BOUNDED))
+    check([B1], OTHERS, _specs(u1=_embedded(embed), u2=PRIOR))
 
 
 def test_embed_rows_must_be_a_list_of_objects():
     check = _functions()["check_write_targets"]
     with pytest.raises(SystemExit, match=r"u1.*embeds"):
-        check([B1], OTHERS, _specs(u1={"objects": [{**BOUNDED["objects"][0], "embeds": "items"}]}, u2=BOUNDED))
+        check([B1], OTHERS, _specs(u1={"objects": [{**BOUNDED["objects"][0], "embeds": "items"}]}, u2=PRIOR))
 
 
 def test_other_wave_manifests_reads_every_wave_but_the_current_and_fails_closed(tmp_path):

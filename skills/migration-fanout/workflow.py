@@ -385,9 +385,15 @@ def valid_namespace(value):
 
 
 def reads_target(obj, table, namespace=""):
-    """A mapping object reads the target when both resolve to the same identity."""
-    o = target_key(obj, namespace)
-    return bool(o) and o == target_key(table, namespace)
+    """A mapping object reads the target when both resolve to the same identity; with no namespace to
+    resolve a bare name in, a bare object is the table whose trailing name it is (the harness qualifies
+    it with the run's catalog and schema)."""
+    o, t = target_key(obj, namespace), target_key(table, namespace)
+    if not o:
+        return False
+    if not namespace and ("." not in o or "." not in t):
+        return o.rsplit(".", 1)[-1] == t.rsplit(".", 1)[-1]
+    return o == t
 
 
 def validate_manifest(m, doctor=None):
@@ -832,22 +838,25 @@ def column_key(name):
     return re.sub(r'^[`"\[]|[`"\]]$', "", str(name).strip().split(".")[-1].strip()).casefold()
 
 
-def bounded_predicate(where, scope):
-    """Whether a target_where bounds the rows recon reads to the unit's own slice: it tokenizes under the
-    harness's predicate grammar and parses the AND/OR/NOT/parenthesis structure. A comparison bounds when
-    it pins one of the mapping's declared scope columns to a literal or parameter with =, <, <=, >, >=, IN,
-    LIKE or BETWEEN; an OR bounds only when every branch does, an AND when any operand does, at every
-    depth. `1 = 1`, TRUE, `col = col`, `col IS NOT NULL`, `col <> x`, NOT (...), a column outside the
-    scope list, `col = x OR 1 = 1` and `(col = x OR 1 = 1)` select more than the slice and are no bound.
-    Anything unparsable is no bound."""
+def predicate_slices(where, scope):
+    """The rows a target_where bounds recon to, as slices: a list of boxes, each a scope column -> the
+    constraints an AND pins it with; None when the predicate is no bound. It tokenizes under the harness's
+    predicate grammar and parses the AND/OR/NOT/parenthesis structure. A comparison bounds when it pins
+    one of the mapping's declared scope columns to a literal or parameter with =, <, <=, >, >=, IN, LIKE or
+    BETWEEN; an OR bounds only when every branch does (its boxes are the branches'), an AND when any
+    operand does (one box per combination), at every depth. `1 = 1`, TRUE, `col = col`, `col IS NOT NULL`,
+    `col <> x`, NOT (...), a column outside the scope list, `col = x OR 1 = 1` and `(col = x OR 1 = 1)`
+    select more than the slice and are no bound. Anything unparsable is no bound. A constraint is
+    ("eq", values) for = and IN, ("range", low, high) with (value, inclusive) ends for the others, or
+    ("like",); a value is ("n", number), ("s", text) or ("p", parameter name)."""
     if not isinstance(where, str):
-        return False
+        return None
     scope = {column_key(c) for c in scope}
     tokens, pos = [], 0
     while pos < len(where):
         m = PREDICATE_TOKEN.match(where, pos)
         if not m:
-            return False
+            return None
         if m.lastgroup:
             tokens.append((m.lastgroup, m.group()))
         pos = m.end()
@@ -855,56 +864,115 @@ def bounded_predicate(where, scope):
     def keyword(i, *words):
         return i < len(tokens) and tokens[i][0] == "word" and tokens[i][1].lower() in words
 
-    def pins(toks):
-        words = [t.lower() for k, t in toks if k == "word"]
-        columns = [t for i, (k, t) in enumerate(toks) if k == "word" and t.lower() not in PREDICATE_WORDS
-                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")]
-        values = any(k in ("string", "number", "param") for k, _ in toks)
-        operator = (any(k == "punct" and t in ("=", "<", "<=", ">", ">=") for k, t in toks)
-                    or any(w in ("in", "like", "between") for w in words))
-        wildcard = "like" in words and all(re.fullmatch(r"'[%_]*'", t) for k, t in toks if k == "string")
-        return (len(columns) == 1 and column_key(columns[0]) in scope and values and operator and not wildcard
-                and not any(w in ("is", "not") for w in words)
-                and not any(k == "punct" and t in ("<>", "!=") for k, t in toks))
+    def value(kind, text):
+        if kind == "number":
+            return "n", float(text)
+        if kind == "param":
+            return "p", text[2:-1]
+        text = text[1:-1].replace("''", "'")
+        return ("p", text[2:-1]) if re.fullmatch(r"\$\{\w+\}", text) else ("s", text)
 
-    def expr(i):  # -> (bounded, next index); raises ValueError on a malformed predicate
-        bounded, i = term(i)
+    def pins(toks):  # -> (column, constraint) or None when the atom is no bound
+        words = [t.lower() for k, t in toks if k == "word"]
+        columns = [i for i, (k, t) in enumerate(toks) if k == "word" and t.lower() not in PREDICATE_WORDS
+                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")]
+        values = [(i, value(k, t)) for i, (k, t) in enumerate(toks) if k in ("string", "number", "param")]
+        ops = [t for k, t in toks if k == "punct" and t in ("=", "<", "<=", ">", ">=")]
+        wildcard = "like" in words and all(re.fullmatch(r"'[%_]*'", t) for k, t in toks if k == "string")
+        if not (len(columns) == 1 and column_key(toks[columns[0]][1]) in scope and values and (ops or any(
+                w in ("in", "like", "between") for w in words)) and not wildcard
+                and not any(w in ("is", "not") for w in words)
+                and not any(k == "punct" and t in ("<>", "!=") for k, t in toks)):
+            return None
+        col = column_key(toks[columns[0]][1])
+        if "like" in words:
+            return col, ("like",)
+        if "in" in words or ops == ["="]:
+            return col, ("eq", frozenset(v for _, v in values))
+        if "between" in words and len(values) == 2 and not ops:
+            return col, ("range", (values[0][1], True), (values[1][1], True))
+        if len(ops) == 1 and len(values) == 1:
+            op, (at, v) = ops[0], values[0]
+            if at < columns[0]:
+                op = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}[op]
+            return col, (("range", None, (v, op == "<=")) if op in ("<", "<=") else ("range", (v, op == ">="), None))
+        return col, ("like",)
+
+    def both(a, b):
+        return [{c: x.get(c, []) + y.get(c, []) for c in {*x, *y}} for x in a for y in b]
+
+    def expr(i):  # -> (boxes or None, next index); raises ValueError on a malformed predicate
+        boxes, i = term(i)
         while keyword(i, "or"):
             b, i = term(i + 1)
-            bounded = bounded and b
-        return bounded, i
+            boxes = None if boxes is None or b is None else boxes + b
+        return boxes, i
 
     def term(i):
-        bounded, i = factor(i)
+        boxes, i = factor(i)
         while keyword(i, "and"):
             b, i = factor(i + 1)
-            bounded = bounded or b
-        return bounded, i
+            boxes = b if boxes is None else boxes if b is None else both(boxes, b)
+        return boxes, i
 
     def factor(i):
         if keyword(i, "not"):
-            return False, factor(i + 1)[1]
+            return None, factor(i + 1)[1]
         if i < len(tokens) and tokens[i] == ("punct", "("):
-            bounded, i = expr(i + 1)
+            boxes, i = expr(i + 1)
             if i >= len(tokens) or tokens[i] != ("punct", ")"):
                 raise ValueError
-            return bounded, i + 1
-        start, depth = i, 0
-        while i < len(tokens) and not (depth == 0 and (keyword(i, "and", "or") or tokens[i] == ("punct", ")"))):
+            return boxes, i + 1
+        start, depth, between = i, 0, False
+        while i < len(tokens) and not (depth == 0 and not between and (keyword(i, "and", "or") or tokens[i] == ("punct", ")"))):
             depth += (tokens[i] == ("punct", "(")) - (tokens[i] == ("punct", ")"))
             if depth < 0:
                 raise ValueError
+            between = (between and not keyword(i, "and")) or keyword(i, "between")
             i += 1
         atom = tokens[start:i]
         if not atom or depth:
             raise ValueError
-        return pins(atom), i
+        pin = pins(atom)
+        return (None if pin is None else [{pin[0]: [pin[1]]}]), i
 
     try:
-        bounded, end = expr(0)
+        boxes, end = expr(0)
     except ValueError:
-        return False
-    return bounded and end == len(tokens)
+        return None
+    return boxes if end == len(tokens) else None
+
+
+def bounded_predicate(where, scope):
+    """Whether a target_where bounds the rows recon reads to the unit's own slice (predicate_slices)."""
+    return predicate_slices(where, scope) is not None
+
+
+def disjoint_slices(a, b):
+    """Whether two readers' slices can never select the same row: every box of one against every box of
+    the other has a scope column both pin with constraints that are provably apart. Apart is: = or IN with
+    no value in common (a parameter is its own value: differently named parameters are different slices,
+    the same name the same one, and a parameter against a literal cannot be told apart); a literal range
+    or value entirely below or above another literal range of the same kind. LIKE separates nothing."""
+    def literal(v, kind):
+        return v[0] == kind and kind != "p"
+
+    def below(hi, lo):  # the (value, inclusive) high end of one range is under the low end of the other
+        return (hi is not None and lo is not None and hi[0][0] == lo[0][0] and literal(hi[0], hi[0][0])
+                and (hi[0][1] < lo[0][1] or (hi[0][1] == lo[0][1] and not (hi[1] and lo[1]))))
+
+    def apart(x, y):
+        if x[0] == "like" or y[0] == "like":
+            return False
+        if x[0] == "eq" and y[0] == "eq":
+            params = {v for v in x[1] | y[1] if v[0] == "p"}
+            return not (x[1] & y[1]) and (not params or params == x[1] | y[1])
+        if x[0] == "range" and y[0] == "range":
+            return below(x[2], y[1]) or below(y[2], x[1])
+        eq, rng = (x, y) if x[0] == "eq" else (y, x)
+        return all(below((v, True), rng[1]) or below(rng[2], (v, True)) for v in eq[1])
+
+    return all(any(apart(x, y) for c in set(p) & set(q) for x in p[c] for y in q[c]) for p in a for q in b)
 
 
 def bounded_readers(spec, table, namespace=""):
@@ -943,13 +1011,26 @@ def bounded_readers(spec, table, namespace=""):
     return ""
 
 
+def reader_slices(spec, table, namespace=""):
+    """The slices of `table` the spec's readers recon, every reading object's boxes together (call after
+    bounded_readers found them bounded); None when no object reads it."""
+    objects = spec.get("objects", spec.get("tables"))
+    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
+    if not mine:
+        return None
+    return [box for o in mine for box in predicate_slices(o.get("target_where"), o.get("scope_columns", []))]
+
+
 def check_write_targets(batches, other_waves, mapping=None, namespace=""):
     """Two batches in one wave writing the same table means the lineage missed an edge: refuse to launch.
     A table written by units in different waves is shared: whole-table recon of the earlier unit is
     undone by the later one's rows, so every mapping that reads it must be bounded (target_where to the
-    unit's own partition or run date), or this wave does not launch. Every name here, written or read,
-    goes through target_key with the target_namespace of the wave that declares or reads it, so one table
-    has one identity and a bare name is never read in another wave's namespace."""
+    unit's own partition or run date), or this wave does not launch, and the readers' slices must be
+    provably disjoint pairwise (disjoint_slices), whichever waves they are in: two units whose predicates
+    may select the same row halt, named with their predicates. Every name here, written or read, goes
+    through target_key with the target_namespace of the wave that declares or reads it, so one table has
+    one identity and a bare name is never read in another wave's namespace. Only the units whose mapping
+    has an object for the table are its readers; a writing batch with no reader at all halts."""
     mapping = unit_mapping if mapping is None else mapping
     owners, spelled = {}, {}
     for b in batches:
@@ -979,11 +1060,13 @@ def check_write_targets(batches, other_waves, mapping=None, namespace=""):
                f"that reads it, in every wave, declares the object's scope_columns and a target_where pinning "
                f"one of them to the unit's own partition or run date (`1 = 1`, `col = col`, IS NOT NULL, <> and "
                f"columns outside scope_columns are no bound)")
+        readers = []
         for wave, b in ((None, batch), *elsewhere[k]):
+            where = "" if wave is None else f" ({wave} {b['id']})"
+            before = len(readers)
             for u in b["units"]:
                 spec = mapping(u)
                 path = f".migration/units/{u}/mapping_spec.json"
-                where = "" if wave is None else f" ({wave} {b['id']})"
                 if spec is None:
                     raise SystemExit(f"{why}: {path} is missing, so unit {u}{where} cannot be scoped")
                 try:
@@ -991,9 +1074,21 @@ def check_write_targets(batches, other_waves, mapping=None, namespace=""):
                 except SystemExit as e:
                     raise SystemExit(f"{why}: {path}: {e}") from None
                 if problem is None:
-                    raise SystemExit(f"{why}: {path}{where} has no object reading '{t}'")
+                    continue
                 if problem:
                     raise SystemExit(f"{why}: {path} (unit {u}{where}) {problem}")
+                readers.append((f"unit {u}{where}", reader_slices(spec, k, namespaces[wave])))
+            if len(readers) == before:
+                paths = ", ".join(f".migration/units/{u}/mapping_spec.json" for u in b["units"])
+                raise SystemExit(f"{why}: no unit of {b['id']}{where} reads '{t}': no object reading '{t}' in {paths}")
+        for i, (a, slices_a) in enumerate(readers):
+            for c, slices_c in readers[i + 1:]:
+                if not disjoint_slices(slices_a, slices_c):
+                    raise SystemExit(f"shared write target '{t}': the slices {a} and {c} recon may overlap; their "
+                                     f"target_where must pin a common scope column to values that cannot both hold "
+                                     f"(=/IN with no value in common, differently named parameters, or literal ranges "
+                                     f"that do not meet; LIKE, a parameter against a literal, or different columns "
+                                     f"prove nothing). Fix the mapping specs, then re-run.")
 
 
 if sys.argv[1:2] == ["reserve"]:

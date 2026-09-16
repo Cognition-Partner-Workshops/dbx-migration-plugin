@@ -475,6 +475,8 @@ WAVE_1 = json.dumps({"wave": 1, "batches": [{"id": "b-2", "units": ["v"], "write
 MAPPING = {"objects": [{"object": "mig.t", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"]}]}
 BOUNDED_MAPPING = {"objects": [{**MAPPING["objects"][0], "root_where": "run_date = '${as_of}'",
                                 "target_where": "run_date = '${as_of}'"}]}
+PRIOR_MAPPING = {"objects": [{**MAPPING["objects"][0], "root_where": "run_date = '${prior_as_of}'",
+                              "target_where": "run_date = '${prior_as_of}'"}]}
 
 
 def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_bounded(tmp_path):
@@ -494,9 +496,16 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
     assert not [c for c in calls if c["kind"] == "agent"]
 
     bounded = {"objects": [{**BOUNDED_MAPPING["objects"][0], "object": "T"}]}
-    ws, cwd = _workspace(tmp_path / "bare", other_waves={"wave-1.json": WAVE_1}, mappings={"u": bounded})
+    unbounded = {"objects": [{**MAPPING["objects"][0], "object": "T"}]}
+    ws, cwd = _workspace(tmp_path / "bare", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": unbounded, "v": BOUNDED_MAPPING})
     proc, calls = _run(cwd, tmp_path / "bare", [_pass_report("https://github.com/acme/target/pull/1")])
-    assert proc.returncode != 0 and "units/u/mapping_spec.json has no object reading 'mig.t'" in proc.stderr
+    assert proc.returncode != 0 and "(unit u) reads it without a target_where" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    ws, cwd = _workspace(tmp_path / "elsewhere", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": {"objects": [{**MAPPING["objects"][0], "object": "other.t"}]}, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "elsewhere", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "no unit of b-1 reads 'mig.t'" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
     sibling_bare = WAVE_1.replace('"mig.t"', '"t"').replace('"wave": 1', '"wave": 1, "target_namespace": "mig"')
@@ -519,8 +528,14 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
     assert proc.returncode != 0 and "wave-1.json" in proc.stderr and "target_namespace" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
+    ws, cwd = _workspace(tmp_path / "overlap", other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": bounded, "v": BOUNDED_MAPPING})
+    proc, calls = _run(cwd, tmp_path / "overlap", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "unit u and unit v (wave-1.json b-2)" in proc.stderr
+    assert "overlap" in proc.stderr and not [c for c in calls if c["kind"] == "agent"]
+
     ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1},
-                         mappings={"u": bounded, "v": BOUNDED_MAPPING}, namespace="cat.mig")
+                         mappings={"u": bounded, "v": PRIOR_MAPPING})
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "bounded", [_pass_report(pr), _verify_report()])
     assert proc.returncode == 0, proc.stderr
@@ -537,8 +552,14 @@ def test_a_hand_run_wave_reserves_nothing_while_a_shared_table_is_unbounded(tmp_
     assert "'mig.t'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr and "target_where" in proc.stderr
     assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
 
-    ws, cwd = _workspace(tmp_path / "bounded", doctor=False, other_waves={"wave-1.json": WAVE_1},
+    ws, cwd = _workspace(tmp_path / "overlap", doctor=False, other_waves={"wave-1.json": WAVE_1},
                          mappings={"u": BOUNDED_MAPPING, "v": BOUNDED_MAPPING})
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "overlap" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+
+    ws, cwd = _workspace(tmp_path / "bounded", doctor=False, other_waves={"wave-1.json": WAVE_1},
+                         mappings={"u": BOUNDED_MAPPING, "v": PRIOR_MAPPING})
     proc = _workflow(cwd, "reserve")
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["reserved"] is True
