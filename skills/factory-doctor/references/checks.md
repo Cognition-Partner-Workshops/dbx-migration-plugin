@@ -63,3 +63,12 @@ asked of the same harness `recon_harness` ran (`dbx-recon` on PATH, else the che
 `skipped` when no family is declared. Kept apart from `source_principal_read_only` on purpose:
 attestation says the principal is read-only; this row says whether we can reconcile the family.
 ### `databricks_identity`
+### `type_map_audit`
+
+`fail` when a resolved unit mapping declares a `target_type` the source family's
+`type_map.<family>.<target_kind>` forbids — including a `conditional` alternative whose
+token is not in the field's `evidence` list — or when two `canonicalization.json` files claim
+the family or the spec will not load; `unverified` when no family is declared;
+`warn` when no dialect skill carries a map for the family or the chosen `--target-kind`;
+`ok` counts typed fields and records unmapped source types plus undeclared targets the
+harness fills; `skipped` only at setup.

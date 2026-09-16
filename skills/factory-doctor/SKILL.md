@@ -5,8 +5,20 @@ description: Preflight for a DBX migration workspace. Verifies setup, hooks, con
 
 # factory-doctor
 
-Run before STOP A, before every wave, and before a child converts its first unit. A fail is a D10,
-not something to work around.
+| `workspace` | setup files or `stop_mode` are missing | rerun `1-migration_setup` |
+| `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
+| `allowlist_committed` | allowlist or tolerances differ from `HEAD` | commit through a recorded decision |
+| `playbooks_in_sync` | lock/live playbooks are missing, stale, malformed, duplicated, or differ from repo | rerun `install-dbx-factory` |
+| `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
+| `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
+| `recon_harness` | harness self-test/import or a required driver fails | install the harness extras |
+| `type_map_audit` | a unit mapping declares a `target_type` the source family's `type_map.<family>.<target_kind>` forbids | fix the declared type or add the required `evidence` token |
+| `delete_evidence` | mapped CDC evidence is absent, incomplete, or unreadable | provide source CDC evidence; never enable it here |
+| `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a user-attested decision |
+| `databricks_identity` | CLI/auth/host/identity is missing, human, or mismatched | use the expected OAuth M2M principal and host |
+| `lakebase_branch_create` | optional branch probe cannot create/delete a one-hour child | fix Lakebase project/parent permissions |
+| `lakebase_target_grants` | optional DSN role lacks database/schema `CREATE` | grant target create permission |
+| `analytical_target_grants` | optional promotion schema lacks required UC privileges | grant `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, `MODIFY`, `SELECT` |
 
 ## Run
 
@@ -36,6 +48,7 @@ guard mode, and stop mode are the workflow capability contract.
 
 | row | fails when | fix |
 |---|---|---|
+<<<<<<< HEAD
 | `workspace` | setup files or `stop_mode` are missing | rerun `1-migration_setup` |
 | `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
 | `allowlist_committed` | allowlist or tolerances differ from `HEAD` | commit through a recorded decision |
@@ -50,5 +63,51 @@ guard mode, and stop mode are the workflow capability contract.
 | `lakebase_branch_create` | optional branch probe cannot create/delete a one-hour child | fix Lakebase project/parent permissions |
 | `lakebase_target_grants` | optional DSN role lacks database/schema `CREATE` | grant target create permission |
 | `analytical_target_grants` | optional promotion schema lacks required UC privileges | grant `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, `MODIFY`, `SELECT` |
+||||||| parent of 319772c (docs: type_map_audit row and harness type_map application)
+| `workspace` | setup files missing | `1-migration_setup` |
+| `stop_mode` | stop mode absent | `00_context.md` |
+| `allowed_targets` | allowlist invalid or rejected | `hooks/dbx_guard.py` |
+| `allowlist_committed` | allowlist/tolerances differ from HEAD | `git` |
+| `allowlist_matches_contract` | catalogs differ from the wave contract | `allowed_targets.json` |
+| `playbooks_in_sync` | installed playbooks differ from repo files, the lock is missing, or (orchestrator) the live export is missing/stale/mismatched/duplicated | `.migration/playbooks.lock.json`, `.migration/live_playbooks.json` |
+| `hooks_files` | hook registration missing or malformed | plugin root |
+| `hook_guard_functional` | probe is not blocked by the guard | `hooks/dbx_guard.py` |
+| `hook_platform_loaded` | live probe unblocked or nonce unverified | this session |
+| `lakebase_branch_create` | optional branch probe failed | Lakebase project permissions and parent expiry |
+| `lakebase_target_grants` | optional DSN role lacks CREATE | Postgres privileges |
+| `analytical_target_grants` | optional analytical schema: principal neither owns it nor has USE SCHEMA/CREATE TABLE/MODIFY/SELECT | Unity Catalog grants on the promotion schema |
+| `official_databricks_plugin` | routed official skills are missing/unverified | `target-routing` |
+| `recon_harness` | harness self-test/import failed | `data-reconciliation` |
+| `recon_drivers` | required driver missing | harness extras |
+| `delete_evidence` | CDC evidence is missing or unusable | `data-reconciliation` |
+| `source_principal_read_only` | source principal can write, or grants unverified and not attested | source catalog views / `databricks grants get-effective` / `06_decisions.md` |
+| `databricks_cli` | CLI is not on PATH | `databricks-core` |
+| `databricks_auth_kind` | OAuth M2M env is absent | `target-routing` auth rules |
+| `databricks_identity` | identity/host is invalid or human | `07_access_checklist.md` |
+| `databricks_warehouse` | default warehouse is unavailable | `databricks-core` |
+=======
+| `workspace` | setup files missing | `1-migration_setup` |
+| `stop_mode` | stop mode absent | `00_context.md` |
+| `allowed_targets` | allowlist invalid or rejected | `hooks/dbx_guard.py` |
+| `allowlist_committed` | allowlist/tolerances differ from HEAD | `git` |
+| `allowlist_matches_contract` | catalogs differ from the wave contract | `allowed_targets.json` |
+| `playbooks_in_sync` | installed playbooks differ from repo files, the lock is missing, or (orchestrator) the live export is missing/stale/mismatched/duplicated | `.migration/playbooks.lock.json`, `.migration/live_playbooks.json` |
+| `hooks_files` | hook registration missing or malformed | plugin root |
+| `hook_guard_functional` | probe is not blocked by the guard | `hooks/dbx_guard.py` |
+| `hook_platform_loaded` | live probe unblocked or nonce unverified | this session |
+| `lakebase_branch_create` | optional branch probe failed | Lakebase project permissions and parent expiry |
+| `lakebase_target_grants` | optional DSN role lacks CREATE | Postgres privileges |
+| `analytical_target_grants` | optional analytical schema: principal neither owns it nor has USE SCHEMA/CREATE TABLE/MODIFY/SELECT | Unity Catalog grants on the promotion schema |
+| `official_databricks_plugin` | routed official skills are missing/unverified | `target-routing` |
+| `recon_harness` | harness self-test/import failed | `data-reconciliation` |
+| `recon_drivers` | required driver missing | harness extras |
+| `type_map_audit` | a unit mapping declares a target type the source family's type map forbids | the dialect skill's `canonicalization.json` `type_map` |
+| `delete_evidence` | CDC evidence is missing or unusable | `data-reconciliation` |
+| `source_principal_read_only` | source principal can write, or grants unverified and not attested | source catalog views / `databricks grants get-effective` / `06_decisions.md` |
+| `databricks_cli` | CLI is not on PATH | `databricks-core` |
+| `databricks_auth_kind` | OAuth M2M env is absent | `target-routing` auth rules |
+| `databricks_identity` | identity/host is invalid or human | `07_access_checklist.md` |
+| `databricks_warehouse` | default warehouse is unavailable | `databricks-core` |
+>>>>>>> 319772c (docs: type_map_audit row and harness type_map application)
 
 Long form: `references/checks.md`.
