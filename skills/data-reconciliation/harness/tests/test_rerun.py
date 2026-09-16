@@ -398,6 +398,37 @@ def test_the_digest_binds_the_ddl_text_not_only_the_shape_it_lands():
     assert expected_digest(declared_shape(respaced)) == expected_digest(declared_shape(DDL))
 
 
+def test_the_digest_keeps_whitespace_inside_literals_and_quoted_identifiers():
+    """Only whitespace between tokens is insignificant: a DEFAULT literal or a quoted name that
+    changes its spaces is a different statement, so the old proof is stale."""
+    one = "CREATE TABLE t (note STRING DEFAULT 'x  y', `two  words` INT);"
+    two = "CREATE TABLE t (note STRING DEFAULT 'x y', `two  words` INT);"
+    three = "CREATE TABLE t (note STRING DEFAULT 'x  y', `two words` INT);"
+    assert declared_shape(one)["tables"] == declared_shape(two)["tables"]
+    assert expected_digest(declared_shape(one)) != expected_digest(declared_shape(two))
+    assert expected_digest(declared_shape(one)) != expected_digest(declared_shape(three))
+    assert expected_digest(declared_shape(one)) == expected_digest(declared_shape(
+        "CREATE   TABLE t\n(note STRING   DEFAULT 'x  y',\n `two  words`  INT);"))
+
+
+def test_a_later_guarded_create_keeps_the_first_shape_and_an_unguarded_duplicate_is_refused():
+    """SQL creates the first definition and treats a later CREATE TABLE IF NOT EXISTS as a no-op;
+    only CREATE OR REPLACE replaces. A second unguarded CREATE of the same table would fail when
+    run, so the DDL is refused rather than graded against a shape it never lands."""
+    shape = declared_shape("CREATE TABLE t (a INT); CREATE TABLE IF NOT EXISTS t (b INT);")
+    assert shape["tables"]["t"] == [{"name": "a", "type": "int", "nullable": True}]
+    assert shape["if_not_exists"] == ["t"] and shape["statements"]["create_table"] == 2
+    shape = declared_shape("CREATE TABLE t (a INT); ALTER TABLE t ADD COLUMN c INT; "
+                           "CREATE TABLE IF NOT EXISTS t (b INT);")
+    assert [c["name"] for c in shape["tables"]["t"]] == ["a", "c"]
+    shape = declared_shape("CREATE TABLE t (a INT); CREATE OR REPLACE TABLE t (b INT);")
+    assert [c["name"] for c in shape["tables"]["t"]] == ["b"]
+    with pytest.raises(ConfigError, match="t is created twice"):
+        declared_shape("CREATE TABLE t (a INT); CREATE TABLE t (b INT);")
+    with pytest.raises(ConfigError, match="t is created twice"):
+        declared_shape("CREATE TABLE IF NOT EXISTS t (a INT); CREATE TABLE t (b INT);")
+
+
 def test_the_evolved_leg_needs_the_prior_committed_shape_and_the_pre_shape_must_equal_it():
     """`pre_shape != declared` only proves something differed; the leg is evolution only when the
     table started in the previous committed shape, so that shape is an input and pre_shape must
@@ -442,6 +473,23 @@ def test_tables_match_on_their_trailing_name_when_one_side_is_unqualified():
     out = grade_rerun(expected, _record("fresh", {"tables": {"mig.sales.orders": [
         {"name": "A", "type": "INT", "nullable": True}]}}), None)
     assert out["fresh"] == "pass" and out["findings"] == []
+
+
+def test_one_observed_table_cannot_stand_in_for_two_declared_tables_that_share_a_name():
+    """Two declared tables with the same trailing name and one unqualified observation: the match
+    is ambiguous, so both are missing rather than both passing on one table."""
+    expected = declared_shape("CREATE TABLE sales.orders (id INT); CREATE TABLE archive.orders (id INT);")
+    one = {"tables": {"orders": [{"name": "id", "type": "int", "nullable": True}]}}
+    out = grade_rerun(expected, _record("fresh", one), None)
+    assert out["fresh"] == "fail"
+    assert [(f["table"], f["check"]) for f in out["findings"]] == [
+        ("sales.orders", "table_missing"), ("archive.orders", "table_missing")]
+    assert all("ambiguous" in f["detail"] for f in out["findings"])
+    both = {"tables": {"sales.orders": one["tables"]["orders"], "archive.orders": one["tables"]["orders"]}}
+    assert grade_rerun(expected, _record("fresh", both), None)["findings"] == []
+    # a qualified observation of one and an exact match of the other still resolve one-to-one
+    mixed = {"tables": {"mig.sales.orders": one["tables"]["orders"], "archive.orders": one["tables"]["orders"]}}
+    assert grade_rerun(expected, _record("fresh", mixed), None)["findings"] == []
 
 
 # ---- result.json wiring -----------------------------------------------------------------------
