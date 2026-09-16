@@ -202,6 +202,39 @@ def test_render_progress_rejects_invalid_verifier_unit_verdicts(tmp_path):
         render_progress(mig)
 
 
+def test_render_progress_rejects_non_object_batch(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"id": "b1", "units": ["u1"]}, None],
+    })
+
+    with pytest.raises(ValueError, match=r"wave-1\.result\.json: result batch is not an object"):
+        render_progress(mig)
+
+
+def test_render_progress_rejects_batch_without_id(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"units": ["u1"]}],
+    })
+
+    with pytest.raises(ValueError, match=r"wave-1\.result\.json: result batch has no id"):
+        render_progress(mig)
+
+
+def test_render_progress_rejects_empty_batch_units(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"id": "b1", "units": []}],
+    })
+
+    with pytest.raises(ValueError, match=r"wave-1\.result\.json: batch 'b1' has no units"):
+        render_progress(mig)
+
+
 def test_render_progress_empty_waves_has_header_and_table(tmp_path):
     text = render_progress(tmp_path / ".migration")
 

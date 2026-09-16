@@ -95,7 +95,10 @@ def render_progress(mig: Path) -> str:
         manifest_units = None
         for batch in result.get("batches", []):
             if not isinstance(batch, dict):
-                continue
+                raise ValueError(f"{path}: result batch is not an object")
+            batch_id = batch.get("id")
+            if not isinstance(batch_id, str):
+                raise ValueError(f"{path}: result batch has no id")
             cost = batch.get("recon_cost")
             cost_text = json.dumps(cost, sort_keys=True, separators=(",", ":")) \
                 if isinstance(cost, dict) else ""
@@ -118,7 +121,8 @@ def render_progress(mig: Path) -> str:
                     raise ValueError(
                         f"{path}: batch {batch.get('id')!r} has no units and no readable manifest entry"
                     )
-            batch_id = batch.get("id")
+            if not units:
+                raise ValueError(f"{path}: batch {batch_id!r} has no units")
             verifier_verdict = (
                 _text(unit_verdicts[batch_id])
                 if isinstance(unit_verdicts, dict) and batch_id in unit_verdicts
