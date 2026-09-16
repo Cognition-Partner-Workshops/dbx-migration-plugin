@@ -11,6 +11,7 @@ Run record: {"run": "fresh"|"evolved", "status": "pass"|"fail", "evidence": "<ru
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -25,6 +26,7 @@ STATUSES = ("pass", "fail")
 _TYPE_ALIASES = {
     "integer": "int", "character varying": "varchar", "timestamp without time zone": "timestamp",
     "timestamp with time zone": "timestamptz", "double precision": "double", "boolean": "boolean",
+    "numeric": "decimal",
 }
 # tokens that end a column's type in a column definition
 _COLUMN_CLAUSE = re.compile(
@@ -38,6 +40,12 @@ _CREATE = re.compile(
 _ALTER_ADD = re.compile(
     r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<name>[^\s(]+)\s+ADD\s+COLUMNS?\s+(?P<ine>IF\s+NOT\s+EXISTS\s+)?"
     r"(?P<body>.*)$", re.IGNORECASE | re.DOTALL)
+# ALTER TABLE forms that leave the column shape alone; any other ALTER TABLE is a refusal
+_ALTER_NEUTRAL = re.compile(
+    r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?[^\s(]+\s+(?:SET|UNSET)\s+(?:TBLPROPERTIES|OWNER)\b",
+    re.IGNORECASE | re.DOTALL)
+_ALTER = re.compile(r"^ALTER\s+TABLE\b", re.IGNORECASE)
+_TABLE_PK = re.compile(r"^(?:CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\s*\(", re.IGNORECASE | re.DOTALL)
 
 
 def normalize_type(raw: str) -> str:
@@ -135,6 +143,23 @@ def _column(defn: str) -> dict | None:
     return {"name": name, "type": normalize_type(type_text), "nullable": not not_null}
 
 
+def _table_columns(body: str) -> list[dict]:
+    """Columns of a CREATE TABLE body with table-level PRIMARY KEY members made NOT NULL."""
+    defs = _split_top(body)
+    cols = [c for c in (_column(d) for d in defs) if c]
+    for d in defs:
+        m = _TABLE_PK.match(d)
+        if not m:
+            continue
+        keys = [_ident(k) for k in _split_top(d[m.end():_balanced(d, m.end() - 1) - 1])]
+        for k in keys:
+            hit = [c for c in cols if c["name"] == k]
+            if not hit:
+                raise ConfigError(f"PRIMARY KEY names {k}, missing from the column list")
+            hit[0]["nullable"] = False
+    return cols
+
+
 def _strip_comments(sql: str) -> str:
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     return re.sub(r"--[^\r\n]*", " ", sql)
@@ -154,8 +179,7 @@ def declared_shape(sql: str) -> dict:
         if m:
             name = _ident(m.group("name"))
             end = _balanced(stmt, m.end() - 1)
-            cols = [c for c in (_column(d) for d in _split_top(stmt[m.end():end - 1])) if c]
-            tables[name] = cols
+            tables[name] = _table_columns(stmt[m.end():end - 1])
             counts["create_table"] += 1
             if m.group("ine") and name not in if_not_exists:
                 if_not_exists.append(name)
@@ -174,6 +198,9 @@ def declared_shape(sql: str) -> dict:
             if name not in altered:
                 altered.append(name)
             continue
+        if _ALTER.match(stmt) and not _ALTER_NEUTRAL.match(stmt):
+            raise ConfigError(f"cannot apply ALTER TABLE {stmt[12:60].strip()!r} to the declared shape "
+                              "(only ADD COLUMN(S) is applied); pass --expected-shape instead")
         counts["other"] += 1
     if not counts["create_table"]:
         raise ConfigError("no CREATE TABLE statement in the DDL; pass --expected-shape instead")
@@ -197,6 +224,13 @@ def _check_shape(shape, where: str) -> dict:
                          "nullable": c["nullable"]})
         out[_ident(table)] = rows
     return {"tables": out}
+
+
+def expected_digest(expected: dict) -> str:
+    """sha256 of the declared tables, so a proof names the shape it graded and `run` can refuse
+    one that a later DDL change made stale."""
+    return hashlib.sha256(json.dumps(expected["tables"], sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
 
 
 def _read_json(path: Path) -> object:
@@ -301,6 +335,11 @@ def grade_rerun(expected: dict, fresh: dict | None, evolved: dict | None) -> dic
                   "history or the prior wave's DDL) and run again")
     elif "pre_shape" not in evolved:
         reason = "evolved record has no pre_shape: the shape before the run was not recorded"
+    elif any(_find_table(evolved["pre_shape"]["tables"], t) is None for t in expected["tables"]):
+        missing = next(t for t in expected["tables"]
+                       if _find_table(evolved["pre_shape"]["tables"], t) is None)
+        reason = (f"evolved pre_shape has no {missing}: the table did not exist before the run, "
+                  "so that leg was a fresh run")
     elif not _compare("evolved", expected["tables"], evolved["pre_shape"]["tables"]):
         reason = ("evolved pre_shape equals the declared shape: nothing evolved, so the run proves "
                   "only what fresh proved")
@@ -319,6 +358,7 @@ def grade_rerun(expected: dict, fresh: dict | None, evolved: dict | None) -> dic
         "findings": findings,
         "notes": notes,
         "tables": sorted(expected["tables"]),
+        "expected_digest": expected_digest(expected),
         "evidence": {"fresh": fresh["evidence"], **({"evolved": evolved["evidence"]} if evolved else {})},
     }
     if reason:
@@ -339,17 +379,22 @@ def rerun_unsupported(proof: dict | None) -> bool:
     return proof is not None and proof.get("evolved") == "unsupported"
 
 
-def check_proof(data: object, unit: str, where: str) -> dict:
+def check_proof(data: object, unit: str, where: str, digest: str) -> dict:
     """A rerun_proof.json written by `dbx-recon rerun-proof`, re-read by `run`. Every field is
     typed and the fields agree: `passed` follows the legs, a leg has findings exactly when it
-    failed, an unsupported evolved leg names its reason, every run leg has evidence."""
+    failed, an unsupported evolved leg names its reason, every run leg has evidence, and the
+    proof graded the shape the unit declares now (`digest`, from `expected_digest`)."""
     if not isinstance(data, dict):
         raise ConfigError(f"{where}: rerun proof must be a JSON object")
-    for key in ("unit", "fresh", "evolved", "passed", "findings", "notes", "evidence"):
+    for key in ("unit", "fresh", "evolved", "passed", "findings", "notes", "evidence", "expected_digest"):
         if key not in data:
             raise ConfigError(f"{where}: rerun proof lacks {key!r}; write it with dbx-recon rerun-proof")
     if data["unit"] != unit:
         raise ConfigError(f"{where}: rerun proof is for unit {data['unit']!r}, not {unit!r}")
+    if not isinstance(data["expected_digest"], str) or data["expected_digest"] != digest:
+        raise ConfigError(f"{where}: rerun proof is stale: it graded expected shape "
+                          f"{str(data['expected_digest'])[:12]!r}, the unit now declares {digest[:12]!r}; "
+                          "run dbx-recon rerun-proof again")
     fresh, evolved = data["fresh"], data["evolved"]
     if fresh not in STATUSES or evolved not in STATUSES + ("unsupported",):
         raise ConfigError(f"{where}: fresh must be pass|fail and evolved pass|fail|unsupported")

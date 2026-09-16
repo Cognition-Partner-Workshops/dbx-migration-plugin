@@ -31,7 +31,7 @@ from .config import (
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
 from .fixture_shape import compare_fixture
-from .rerun import check_proof, declared_shape, grade_rerun, load_record, load_shape
+from .rerun import check_proof, declared_shape, expected_digest, grade_rerun, load_record, load_shape
 from .typemap import apply_type_map, load_type_map
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres")
@@ -264,6 +264,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--rerun-proof", type=Path,
                    help="rerun_proof.json from `dbx-recon rerun-proof`; a failed leg blocks merge "
                         "with reason rerun_gap; an unsupported evolved leg with rerun_unsupported")
+    r.add_argument("--rerun-ddl", type=Path,
+                   help="with --rerun-proof: the unit's committed DDL now; a proof that graded another "
+                        "shape is stale and refused")
+    r.add_argument("--rerun-expected-shape", type=Path,
+                   help="with --rerun-proof: shape JSON instead of --rerun-ddl")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -427,9 +432,14 @@ def main(argv: list[str] | None = None) -> int:
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
     rerun_proof = None
     if args.rerun_proof is not None:
+        if (args.rerun_ddl is None) == (args.rerun_expected_shape is None):
+            raise SystemExit("--rerun-proof needs exactly one of --rerun-ddl or --rerun-expected-shape "
+                             "(the shape the unit declares now)")
         try:
+            expected = (declared_shape(args.rerun_ddl.read_text()) if args.rerun_ddl is not None
+                        else load_shape(args.rerun_expected_shape))
             rerun_proof = check_proof(json.loads(args.rerun_proof.read_text()), args.unit,
-                                      str(args.rerun_proof))
+                                      str(args.rerun_proof), expected_digest(expected))
         except (OSError, json.JSONDecodeError, ConfigError) as exc:
             raise SystemExit(f"--rerun-proof: {exc}") from None
     try:
