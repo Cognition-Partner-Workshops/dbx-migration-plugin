@@ -1,6 +1,6 @@
 # Migration Factory Process Contract
 
-This is the single source for process rules; `AGENTS.md` holds the always-on hard rules; skill `SKILL.md` files hold tool contracts.
+The only home for the process rules below (stops, `stop_mode`, D1-D10, notifications, branch and merge, fan-out guards). `AGENTS.md` holds the always-on hard rules; each skill's `SKILL.md` holds its tool contract; `OVERVIEW.md` is the map. Other files point here and do not restate.
 
 ## Stops A–E
 
@@ -25,7 +25,7 @@ Precedence: the user can set `stop_mode: hard` for the whole engagement at intak
 
 Every stop, in either mode, writes one row to `06_decisions.md` with its provenance: `user:<message/event id>` when a human replied, or `default-accepted (soft, 60s, no reply)` when the window elapsed. Writing `user:` without a human reply is forbidden; accepting a default in hard mode is forbidden. The row is what the resume rule reads; the chat is not.
 
-Why soft is the default: in the runs that shaped this kit, human turnaround between stops was the largest single wall-clock component (up to two hours per run), and the stops were almost always answered with the recommended default. Soft mode keeps every stop visible and overridable while letting an unattended run finish; the provenance column keeps the record honest about which decisions a human actually made. Engagements with real change control set `stop_mode: hard` at intake.
+Soft is the default because human turnaround between stops dominates wall-clock time and stops are almost always answered with the recommended default; engagements with real change control set `stop_mode: hard` at intake.
 
 ## Dependency taxonomy
 
@@ -50,7 +50,7 @@ Each entry records the full contract, then a decision (federate / re-point / dua
 
 If `00_context.md` names a notification contract, post to it at exactly these moments: each stop when its artifacts are ready for approval (one message, artifact links, what decision is needed), each STOP D wave close (exception count and the wave report), and any fan-out halt (collision or circuit breaker) with what is paused and what unblocks it. Slack posts go through the Slack integration (stops can be approved from the thread); Teams posts go to the webhook whose URL lives in the named secret. Never post per-child or per-green-PR updates. If the interaction contract opts in, add one **daily digest** at the agreed hour (a run that spans a sleep period earns it): the latest wave-close brief's headline, the status-table delta, and anything awaiting the user, in 2-4 sentences with links; it is a summary surface, never a substitute for an approval stop.
 
-The contract also fixes the message style: 2-4 short sentences, lead with the one decision, state the recommended answer and the exact reply that approves it, link artifacts instead of summarizing them; one message per event, and the only events are stops, wave closes, and emergency halts.
+Message style and the one-message-per-event rule are `AGENTS.md`.
 
 ## Branch, PR and merge
 
@@ -62,20 +62,18 @@ The contract also fixes the message style: 2-4 short sentences, lead with the on
 
 ## Fan-out guards
 
+Each row names the check that enforces it; the always-on rules (secrets, write scope, cutover, message volume, tolerances) are `AGENTS.md` and are not repeated here.
+
 | If this happens | What catches it |
 |---|---|
-| A stop is skipped or an old approval is reused | Every stop is a row in the decisions file with a date. The orchestrator re-reads it on resume and re-asks if the inputs changed. |
+| A stop is skipped or an old approval is reused | Every stop is a dated row in `06_decisions.md`; the orchestrator re-reads it on resume and re-asks if the inputs changed. |
 | A child gets an incomplete brief | It reports BLOCKED, does nothing, and the brief says which item was missing. It never guesses. |
-| Two children write the same table | The wave refuses to launch. If it only shows up afterwards, merges are held and the brief says so. |
-| The same wave is launched twice | The workflow refuses if the wave's result file already exists. Resume uses the run_id; redo needs an explicit flag. |
-| One mistake repeats across 20 children | Circuit breaker: 3 same-class failures and no new children launch. Fix once, resume, held-back batches run. |
-| A child keeps retrying a red recon | Hard cap of 3 full runs, then it reports FAIL with a one-word failure class. |
-| Children hammer the live source | Fixture first. Each child reads the real source once, inside the cap agreed at the first stop. |
-| A child grades its own homework | A separate session that wrote none of the code re-runs the harness. Only its PASS merges. |
-| Fixture PASS gets mistaken for done | The report says so in the verdict line. Only a live, snapshot or transactional PASS can merge. |
+| Two children write the same table | `workflow.py` collision check refuses to launch the wave; found afterwards, merges are held and the brief says so. |
+| The same wave is launched twice | `workflow.py` refuses if `wave-N.result.json` exists; resume uses the run_id, redo needs an explicit flag. |
+| A wave launches on a stale or unsigned preflight | `workflow.py` requires the doctor-signed `wave-N.doctor.json` for that wave. |
+| One mistake repeats across 20 children | `workflow.py` circuit breaker: 3 same-class failures and no new children launch; fix once, resume, held-back batches run. |
+| A child keeps retrying a red recon | Hard cap of 3 full `dbx-recon` runs, then it reports FAIL with a one-word failure class. |
+| Children hammer the live source | Fixture first; each child reads the real source once, inside the cap agreed at STOP A. |
+| A child grades its own homework | The verifier session (wrote none of the code) re-runs the harness; only its PASS merges. |
+| Fixture PASS gets mistaken for done | The `dbx-recon` verdict line names fixture vs live; only a live, snapshot or transactional PASS can merge. |
 | The source moved during the check | Live comparisons are timestamped and re-run on the source side to separate drift from a real defect. |
-| Someone loosens a tolerance to go green | Tolerance changes need a dated approval in the decisions file. Grading-only fixes are the one exception. |
-| A secret ends up in a PR or log | Everything takes secret names; values are read from the environment at run time and never printed. |
-| Work lands outside the migration area | Write targets come from the brief only. The migration catalog or cluster is the only place with write grants. |
-| Cutover runs by accident | It needs a customer-held principal Devin never has, plus a current approval. Children cannot do it. |
-| Too many messages | One message per stop, wave close, or halt. Never per child or per PR. The wave brief is ten lines. |

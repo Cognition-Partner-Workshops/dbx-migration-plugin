@@ -1856,12 +1856,37 @@ def test_hook_guard_functional_requires_the_probe_token_in_the_block_reason(tmp_
 PLAYBOOKS_DIR = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
 
 
+def test_repo_playbooks_malformed_index_returns_empty(tmp_path):
+    playbooks = tmp_path / "skills" / "install-dbx-factory" / "playbooks"
+    playbooks.mkdir(parents=True)
+    (playbooks / "1-x.md").write_text("# playbook\n")
+    for content in ("[]", '{"playbooks": 3}', '{"playbooks": [null]}', "{"):
+        (playbooks / "index.json").write_text(content)
+        assert doctor._repo_playbooks(tmp_path) == {}
+
+
+def test_repo_playbooks_valid_index_returns_macro(tmp_path):
+    playbooks = tmp_path / "skills" / "install-dbx-factory" / "playbooks"
+    playbooks.mkdir(parents=True)
+    body = "# playbook\n"
+    (playbooks / "1-x.md").write_text(body)
+    (playbooks / "index.json").write_text(json.dumps({
+        "playbooks": [{"file": "1-x.md", "macro": "!x", "title": "X"}],
+    }))
+
+    expected = hashlib.sha256(body.encode()).hexdigest()
+    assert doctor._repo_playbooks(tmp_path) == {"!x": ("1-x.md", expected)}
+
+
 def test_repo_playbooks_keys_are_macros_only():
     repo = doctor._repo_playbooks(PLUGIN_ROOT)
     assert all(m.startswith("!") for m in repo)
-    assert "0-README.md" not in repo and "00_intake_template.md" not in repo
+    assert "00_intake_template.md" not in repo and "index.json" not in repo
     assert "!dbx_migrate_pipeline" in repo
     assert len(repo) >= 14
+    index = json.loads((PLAYBOOKS_DIR / "index.json").read_text())["playbooks"]
+    assert [r["macro"] for r in index] == list(repo)
+    assert all(r["title"].startswith("[DBX v1] ") for r in index)
 
 
 def test_playbooks_in_sync_ok(tmp_path):
@@ -1931,7 +1956,7 @@ def test_playbooks_in_sync_unlisted_repo_file_is_a_finding(tmp_path, monkeypatch
         c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
     finally:
         stray.unlink()
-    assert c.status == "fail" and "15-unlisted.md" in c.detail and "0-README" in c.detail
+    assert c.status == "fail" and "15-unlisted.md" in c.detail and "index.json" in c.detail
 
 
 def test_playbooks_in_sync_ok_checks_the_live_export(tmp_path):

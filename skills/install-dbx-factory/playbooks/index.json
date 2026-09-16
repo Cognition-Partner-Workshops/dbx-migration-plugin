@@ -1,0 +1,19 @@
+{
+  "_comment": "Playbook file -> org library title and macro, in sync order. Read by install-dbx-factory and factory-doctor (playbooks_in_sync). 00_intake_template.md is a form, not a playbook, and is not listed.",
+  "playbooks": [
+    {"file": "1-migration_setup.md", "title": "[DBX v1] Migration Setup (target state + workspace + tolerances + access)", "macro": "!dbx_migration_setup"},
+    {"file": "2-estate_inventory.md", "title": "[DBX v1] Estate Inventory & Coverage", "macro": "!dbx_estate_inventory"},
+    {"file": "3-pipeline_analysis.md", "title": "[DBX v1] Pipeline Analysis", "macro": "!dbx_pipeline_analysis"},
+    {"file": "4-migration_plan.md", "title": "[DBX v1] Pipeline Migration Planning", "macro": "!dbx_migration_plan"},
+    {"file": "5-unit_migration.md", "title": "[DBX v1] Unit Migration (fan-out child)", "macro": "!dbx_unit_migration"},
+    {"file": "6-data_reconciliation.md", "title": "[DBX v1] Data Reconciliation", "macro": "!dbx_data_reconciliation"},
+    {"file": "7-parallel_run_monitoring.md", "title": "[DBX v1] Parallel Run & Event-Driven Remediation", "macro": "!dbx_parallel_run"},
+    {"file": "8-cutover_signoff.md", "title": "[DBX v1] Cutover Verification & Sign-off", "macro": "!dbx_cutover_signoff"},
+    {"file": "9-orchestrator.md", "title": "[DBX v1] Pipeline Migration Orchestrator", "macro": "!dbx_migrate_pipeline"},
+    {"file": "10-front_door_etl.md", "title": "[DBX v1] Front Door: ETL Tool Estate", "macro": "!dbx_migrate_etl"},
+    {"file": "11-front_door_warehouse.md", "title": "[DBX v1] Front Door: SQL Warehouse Estate", "macro": "!dbx_migrate_warehouse"},
+    {"file": "12-front_door_code.md", "title": "[DBX v1] Front Door: Code & ML Scoring Estate", "macro": "!dbx_migrate_code"},
+    {"file": "13-dependency_resolution.md", "title": "[DBX v1] Dependency Resolution (Register / Decide / Implement)", "macro": "!dbx_dependency_resolution"},
+    {"file": "14-front_door_oltp.md", "title": "[DBX v1] Front Door: Operational Database Estate (Lakebase)", "macro": "!dbx_migrate_oltp"}
+  ]
+}

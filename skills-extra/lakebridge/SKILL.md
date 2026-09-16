@@ -93,7 +93,7 @@ Additions to the `oracle` row above for `--source-dialect oracle`; the base row 
 | Rejects / hand-convert | `CREATE SYNONYM`, `@dblink` references, `CREATE DATABASE LINK`, VPD (`DBMS_RLS`) / `DBMS_REDACT` policies, `GRANT ... TO PUBLIC` | inventory only; resolve synonyms in lineage, external links stay `INFERRED` edges, policies map through `databricks-unity-catalog` or `GAP` (traps 18, 19) |
 
 ## Reconciler [docs]
-Lakebridge ships its own reconcile module. It may run as a second opinion on a unit; it never replaces the kit's `dbx-recon` gate and never self-certifies (rule 4 of the guardrails). If both disagree, the kit's harness result stands and the disagreement is a finding.
+Lakebridge ships its own reconcile module. It may run as a second opinion on a unit; it never replaces the kit's `dbx-recon` gate and never self-certifies (`AGENTS.md`). If both disagree, the kit's harness result stands and the disagreement is a finding.
 
 ## Rules
 - Transpiled output is a draft: review against the source-dialect skill's conversion rules, then prove it with the data-reconciliation harness like hand-converted code.
