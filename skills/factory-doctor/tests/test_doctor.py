@@ -1810,6 +1810,28 @@ def test_hook_guard_functional_requires_the_probe_token_in_the_block_reason(tmp_
 PLAYBOOKS_DIR = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
 
 
+def test_repo_playbooks_malformed_index_returns_empty(tmp_path):
+    playbooks = tmp_path / "skills" / "install-dbx-factory" / "playbooks"
+    playbooks.mkdir(parents=True)
+    (playbooks / "1-x.md").write_text("# playbook\n")
+    for content in ("[]", '{"playbooks": 3}', '{"playbooks": [null]}', "{"):
+        (playbooks / "index.json").write_text(content)
+        assert doctor._repo_playbooks(tmp_path) == {}
+
+
+def test_repo_playbooks_valid_index_returns_macro(tmp_path):
+    playbooks = tmp_path / "skills" / "install-dbx-factory" / "playbooks"
+    playbooks.mkdir(parents=True)
+    body = "# playbook\n"
+    (playbooks / "1-x.md").write_text(body)
+    (playbooks / "index.json").write_text(json.dumps({
+        "playbooks": [{"file": "1-x.md", "macro": "!x", "title": "X"}],
+    }))
+
+    expected = hashlib.sha256(body.encode()).hexdigest()
+    assert doctor._repo_playbooks(tmp_path) == {"!x": ("1-x.md", expected)}
+
+
 def test_repo_playbooks_keys_are_macros_only():
     repo = doctor._repo_playbooks(PLUGIN_ROOT)
     assert all(m.startswith("!") for m in repo)

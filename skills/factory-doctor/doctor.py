@@ -383,10 +383,17 @@ def _repo_playbooks(plugin_root: Path) -> dict[str, tuple[str, str]]:
     if not index.is_file():
         return macros
     try:
-        rows = json.loads(index.read_text()).get("playbooks", [])
+        doc = json.loads(index.read_text())
     except ValueError:
         return macros
+    if not isinstance(doc, dict):
+        return macros
+    rows = doc.get("playbooks", [])
+    if not isinstance(rows, list):
+        return macros
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         p = playbooks / str(row.get("file", ""))
         macro = str(row.get("macro", ""))
         if p.is_file() and p.name not in _NOT_PLAYBOOKS and macro.startswith("!"):
