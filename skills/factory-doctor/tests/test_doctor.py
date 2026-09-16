@@ -2800,21 +2800,23 @@ def test_reusable_record_rejects_non_orchestrator_not_ready_and_malformed():
 
 
 SAFETY_ROWS = ("source_principal_read_only", "named_secrets_exist", "recon_family_supported")
+LOCAL_ROWS = ("recon_harness",)
 
 
-def test_reusable_rows_are_the_non_safety_ones():
+def test_reusable_rows_are_the_non_safety_checkout_bound_ones():
     """Reuse is policy, not the signature: a record any manifest reader could forge may only stand in
-    for rows whose failure the child's own run would catch anyway (package, type map, dictionary,
-    delete evidence); the rows that guard the source and the secrets always run in the child."""
-    assert set(doctor.REUSABLE_ROWS) == {"recon_harness", "type_map_audit", "delete_evidence",
-                                         "dictionary_readable"}
-    assert not set(doctor.REUSABLE_ROWS) & set(SAFETY_ROWS)
+    for rows that read the checkout and the source (type map, dictionary, delete evidence); the rows
+    that guard the source and the secrets always run in the child, and so does recon_harness, whose
+    driver imports describe the orchestrator's machine, not the child's."""
+    assert set(doctor.REUSABLE_ROWS) == {"type_map_audit", "delete_evidence", "dictionary_readable"}
+    assert not set(doctor.REUSABLE_ROWS) & set(SAFETY_ROWS + LOCAL_ROWS)
 
 
 def test_run_reuses_the_signed_source_side_rows_and_keeps_identity_fresh(tmp_path, monkeypatch):
     manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1"}}
-    rows = [{"id": rid, "status": "ok", "detail": f"{rid} done", "data": {"k": rid}}
-            for rid in (*doctor.REUSABLE_ROWS, *SAFETY_ROWS)]
+    rows = [{"id": rid, "status": "ok", "detail": f"{rid} done",
+             "data": {"k": rid, "target_kind": "databricks"}}
+            for rid in (*doctor.REUSABLE_ROWS, *SAFETY_ROWS, *LOCAL_ROWS)]
     record, manifest_bytes = _signed_record(manifest, rows=rows)
     reused, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
     assert reused is record
@@ -2822,12 +2824,13 @@ def test_run_reuses_the_signed_source_side_rows_and_keeps_identity_fresh(tmp_pat
     def boom(*a, **k):
         raise AssertionError("computed a reusable row")
 
-    for name in ("check_harness", "check_drivers", "check_type_map_audit", "check_delete_evidence_all",
-                 "check_dictionary_readable_all"):
+    for name in ("check_type_map_audit", "check_delete_evidence_all", "check_dictionary_readable_all"):
         monkeypatch.setattr(doctor, name, boom)
     for name, rid in (("check_recon_family_supported", "recon_family_supported"),
                       ("check_source_principal_all", "source_principal_read_only"),
-                      ("check_named_secrets", "named_secrets_exist")):
+                      ("check_named_secrets", "named_secrets_exist"),
+                      ("check_harness", "recon_harness"),
+                      ("check_drivers", "recon_drivers")):
         monkeypatch.setattr(doctor, name, lambda *a, _rid=rid, **k: doctor.Check(_rid, "ok", "fresh"))
     monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
         doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1",
@@ -2842,9 +2845,41 @@ def test_run_reuses_the_signed_source_side_rows_and_keeps_identity_fresh(tmp_pat
         assert rows[rid]["reusable"] is True
     for rid in SAFETY_ROWS:
         assert rows[rid]["detail"] == "fresh" and rows[rid]["reusable"] is False, rid
+    assert rows["recon_harness"]["reusable"] is False
+    assert "reused from" not in rows["recon_harness"]["detail"]
     assert rows["databricks_identity"]["reusable"] is False
     assert report["reused_doctor"] == reused["signed_at"]
     assert "reused from" not in rows["databricks_identity"]["detail"]
+
+
+def test_run_recomputes_type_map_audit_when_the_recorded_target_kind_differs(tmp_path, monkeypatch):
+    """Type maps are keyed by source family and target kind: a Lakebase child must not stand on the
+    orchestrator's Databricks audit, and a recorded row that names no target kind proves nothing."""
+    manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1"}}
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1",
+                                                          "host": "https://adb-1"})])
+    monkeypatch.setattr(doctor, "check_type_map_audit",
+                        lambda *a, target_kind="databricks", **k:
+                        doctor.Check("type_map_audit", "ok", "fresh", {"target_kind": target_kind}))
+    ws = make_workspace(tmp_path)
+    for recorded, child in (("databricks", "lakebase"), (None, "databricks")):
+        data = {"k": "x"} if recorded is None else {"k": "x", "target_kind": recorded}
+        rows = [{"id": "type_map_audit", "status": "ok", "detail": "audited", "data": data}]
+        record, manifest_bytes = _signed_record(manifest, rows=rows)
+        reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+        assert reused is record
+        report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True,
+                            expect_host="https://adb-1", target_kind=child, reused=reused)
+        row = by_id(report)["type_map_audit"]
+        assert row["detail"] == "fresh" and row["data"]["target_kind"] == child, (recorded, child)
+    rows = [{"id": "type_map_audit", "status": "ok", "detail": "audited",
+             "data": {"target_kind": "lakebase"}}]
+    record, manifest_bytes = _signed_record(manifest, rows=rows)
+    reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True,
+                        expect_host="https://adb-1", target_kind="lakebase", reused=reused)
+    assert by_id(report)["type_map_audit"]["detail"].startswith("reused from")
 
 
 def test_run_computes_a_reusable_row_the_record_lacks(tmp_path, monkeypatch):

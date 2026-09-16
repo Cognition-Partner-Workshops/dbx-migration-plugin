@@ -39,13 +39,15 @@ record, committed beside the wave manifest). When the record is an orchestrator'
 for the same manifest bytes, fresher than the manifest's `doctor_max_age` minutes (default 15),
 signed for the `--expect-identity`/`--expect-host` principal, and its `inputs_sha` equals this
 checkout's (sha256 over `.migration/units/**` and `.migration/*.json` except `09_capabilities.json`,
-by relative path), the rows marked `reusable` (`recon_harness`, `type_map_audit`, `delete_evidence`,
+by relative path), the rows marked `reusable` (`type_map_audit`, `delete_evidence`,
 `dictionary_readable`) are taken from it — every other row, and the whole run when the record fails
-any check, is computed fresh. The signature's key is derivable from the manifest and the identity
+any check, is computed fresh; `type_map_audit` is reused only when its recorded `data.target_kind`
+equals the child's `--target-kind`. The signature's key is derivable from the manifest and the identity
 (see the module docstring of `doctor.py`), so reuse is a cost policy, not trust: the rows that guard
 the source and the secrets (`source_principal_read_only`, `named_secrets_exist`,
-`recon_family_supported`), `databricks_identity`, and the workspace/hook/allowlist rows always run
-in the child; each row of the report carries `reusable: true|false`. The `doctor_record` row says
+`recon_family_supported`), `databricks_identity`, `recon_harness` (its driver imports describe the
+machine running the doctor), and the workspace/hook/allowlist rows always run in the child; each row
+of the report carries `reusable: true|false`. The `doctor_record` row says
 what happened; a rejected record prints `doctor record not reused: <why>` on stderr and does not
 change the exit code. `--reuse-record` takes the source block from the manifest: pass the same
 `--source-family`/`--source-secret`/`--param` values or none (different values are an error), and

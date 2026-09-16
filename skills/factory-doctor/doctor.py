@@ -131,12 +131,13 @@ def sign_wave_report(report: dict, manifest_bytes: bytes, signed_at: str | None 
     return body
 
 
-# Rows a child may take from the orchestrator's signed record: the ones whose failure the child's own
-# run would surface anyway (a package, a type map, a dictionary, delete evidence). The rows that guard the
-# source and the secrets (source_principal_read_only, named_secrets_exist, recon_family_supported) and
-# databricks_identity always run in the child: the record's key is derivable from the manifest, so reuse
+# Rows a child may take from the orchestrator's signed record: the ones that read the checkout and the
+# source (a type map, a dictionary, delete evidence), which the child's own run would surface anyway.
+# The rows that guard the source and the secrets (source_principal_read_only, named_secrets_exist,
+# recon_family_supported), databricks_identity and recon_harness (its driver imports describe the machine
+# running the doctor) always run in the child: the record's key is derivable from the manifest, so reuse
 # is a policy on cost, not a trust decision.
-REUSABLE_ROWS = ("recon_harness", "type_map_audit", "delete_evidence", "dictionary_readable")
+REUSABLE_ROWS = ("type_map_audit", "delete_evidence", "dictionary_readable")
 DOCTOR_MAX_AGE_MINUTES = 15
 
 
@@ -1998,11 +1999,14 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         source_attested: str | None = None, live_playbooks: Path | None = None,
         target_kind: str = "databricks", secret_names: list[str] | None = None,
         list_secrets=None, reused: dict | None = None) -> dict:
-    def _row(row_id, thunk):
+    def _row(row_id, thunk, **binds):
+        """`binds` are data keys the recorded row must carry with these exact values to stand in."""
         if isinstance(reused, dict) and row_id in REUSABLE_ROWS:
             row = next((c for c in reused.get("checks") or []
                         if isinstance(c, dict) and c.get("id") == row_id), None)
-            if isinstance(row, dict) and isinstance(row.get("status"), str) and isinstance(row.get("detail"), str):
+            data = row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {}
+            if (isinstance(row, dict) and isinstance(row.get("status"), str) and isinstance(row.get("detail"), str)
+                    and all(data.get(k) == v for k, v in binds.items())):
                 return Check(row["id"], row["status"],
                              f"reused from the orchestrator's record signed {reused.get('signed_at')}: "
                              f"{row['detail']}",
@@ -2016,13 +2020,13 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         check_playbooks_in_sync(ws, plugin_root, role, live_playbooks),
         _merge("hook_guard", check_hooks(plugin_root, ws, probe_result)),
         check_official_plugin(plugin_root),
-        _row("recon_harness",
-             lambda: _merge("recon_harness", [check_harness(plugin_root), check_drivers()])),
+        _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
         _row("recon_family_supported",
              lambda: check_recon_family_supported(plugin_root, source_family)),
         _row("type_map_audit",
              lambda: check_type_map_audit(ws, role, units or [], mappings or [], source_family,
-                                          plugin_root, params=params, target_kind=target_kind)),
+                                          plugin_root, params=params, target_kind=target_kind),
+             target_kind=target_kind),
         _row("delete_evidence",
              lambda: check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret,
                                                plugin_root, params=params)),
