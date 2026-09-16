@@ -34,14 +34,16 @@ def _wave_key(value):
 
 
 def _wave(result: dict, path: Path):
+    """The wave a result row is labelled with: the file name's tag (a hand-written sibling result may omit
+    `tag`), else the result's own tag or wave."""
+    match = _WAVE_NAME.fullmatch(path.name)
+    if match:
+        return match.group(1)
     tag = result.get("tag")
     if tag is not None:
         return tag
     wave = result.get("wave")
-    if wave is not None:
-        return wave
-    match = _WAVE_NAME.fullmatch(path.name)
-    return match.group(1) if match else ""
+    return wave if wave is not None else ""
 
 
 def _manifest_bytes(path: Path, expected_sha):
@@ -314,7 +316,7 @@ def render_progress(mig: Path) -> str:
             raise ValueError(f"{path}: wave does not match the manifest")
         if filename_tag is not None and result.get("tag") is not None and result["tag"] != filename_tag.group(1):
             raise ValueError(f"{path}: tag does not match the file name")
-        wave = result.get("tag", manifest_wave)
+        wave = _wave(result, path)
         merged_record = _merged_record(path)
         merged_record_entries = merged_record.get("merged", {}) if merged_record else {}
         verify = result.get("verify")

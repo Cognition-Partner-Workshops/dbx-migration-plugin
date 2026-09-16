@@ -1087,3 +1087,21 @@ def test_render_progress_rejects_a_tag_wave_that_differs_from_the_manifest(tmp_p
 
     with pytest.raises(ValueError, match=r"wave-orders-2\.result\.json: wave does not match the manifest"):
         render_progress(mig)
+
+
+def test_render_progress_takes_the_tag_from_the_file_name_when_a_hand_written_result_omits_it(tmp_path):
+    mig = tmp_path / ".migration"
+    for tag in ("orders-1", "payments-1"):
+        _write_tagged(mig, tag, 1, {
+            "batches": [{"id": "b-1", "status": "PASS", "recon_verdict": "PASS",
+                         "pr_url": f"https://example.invalid/{tag}"}],
+            "verify": {"unit_verdicts": {"b-1": "PASS"}, "merged_prs": []},
+        })
+
+    text = render_progress(mig)
+
+    assert "| orders-1 | b-1 | u1 |" in text
+    assert "| payments-1 | b-1 | u1 |" in text
+    assert "| 1 | b-1 |" not in text
+    assert "wave orders-1: closed=" in text and "wave payments-1: closed=" in text
+    assert "wave 1: closed=" not in text
