@@ -1,0 +1,37 @@
+{
+  "status": "fail",
+  "findings": [
+    {
+      "table": "app.events",
+      "check": "type_mismatch",
+      "column": "event_id",
+      "detail": "source bigint, fixture int"
+    },
+    {
+      "table": "app.events",
+      "check": "column_missing",
+      "column": "occurred_at",
+      "detail": "source timestamp, absent in fixture"
+    },
+    {
+      "table": "app.events",
+      "check": "column_extra",
+      "column": "timestamp",
+      "detail": "fixture timestamp, absent in source"
+    },
+    {
+      "table": "app.events",
+      "check": "cardinality_collapsed",
+      "column": "status",
+      "detail": "source 3 distinct in 4 rows, fixture 1 distinct in 3 rows"
+    }
+  ],
+  "tables": {
+    "app.events": {
+      "status": "fail",
+      "shape": "checked",
+      "cardinality": "checked"
+    }
+  },
+  "source_statements": 3
+}

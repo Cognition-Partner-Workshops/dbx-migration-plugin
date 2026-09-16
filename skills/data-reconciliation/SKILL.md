@@ -113,8 +113,9 @@ provenance warning and the run is not merge-eligible.
   never the DDL: the shape the fresh run landed is the expected shape and the evolved run, against the
   table pre-created in its previous committed shape, must land the identical one (`harness/fixtures/example_rerun/`
   is the canonical failing case, a `CREATE TABLE IF NOT EXISTS` that never lands the new column).
-  The previous shape is the last committed proof's observed `shape` (`--prior-proof`), or on a unit's
-  first run the manifest-declared old shape (`--prior-shape`). `rerun_proof.json` carries
+  The previous shape is the last committed proof's observed `shape` (`--prior-proof`; it must be this
+  unit's proof and its shape must still match its `shape_digest`), or on a unit's first run the
+  manifest-declared old shape (`--prior-shape`). `rerun_proof.json` carries
   `{fresh: pass|fail, evolved: pass|fail|unsupported, findings, shape, shape_digest, source_digest}`;
   without an evolved record, without a prior, when the pre-created shape equals the fresh one or
   differs from the prior one, or when the fresh leg failed, `evolved` is `unsupported` with the reason,
@@ -126,6 +127,25 @@ provenance warning and the run is not merge-eligible.
   failed leg adds `rerun_gap` to `merge_block_reasons`, an unsupported evolved leg adds
   `rerun_unsupported`, a `run` without `--rerun-proof` adds `rerun_missing` (every migrated unit
   writes its tables, so no proof is a missing control), and any of them sets `merge_eligible=false`.
+- Fixture shape (wave 0): `dbx-recon fixture-shape --family <f> --mapping <spec>
+  --source-dsn-secret <NAME> --fixture-dsn-secret <NAME> --source-statement-cap <n> --out <dir>`
+  compares the fixture copy with the real source per mapped table: column names, types (after
+  the rerun proof's normalisation), nullability, and a sample cardinality (distinct count and
+  null rate per mapped column, within the object's `root_where`), not just that the table exists.
+  Mapped columns are the object's comparison keys plus its fields; two objects on one root table
+  are each checked.
+  `fixture_shape.json` carries
+  `{status: pass|fail|unsupported, findings: [{table, check, column?, detail}], tables,
+  source_statements}`; checks are `table_missing`, `column_missing`, `column_extra`,
+  `type_mismatch`, `nullable_mismatch`, `empty_fixture`, `cardinality_collapsed`,
+  `null_profile`. Source reads are catalog queries plus one profile statement per column,
+  read-only and counted against the cap on the adapter's statement counter: shapes first, then
+  cardinality until the cap; a table past it, whose shape either side could not read, or whose
+  source scope has no rows to profile, is `unsupported` with the reason, never clean. The wave 0 manifest declares it
+  as a `custom` gate with this file as evidence; a `fail` is a listed finding the child reports as `failed`,
+  so wave 0 does not close and wave 1 is not launched on an unproven fixture.
+  `harness/fixtures/example_fixture_shape/` is the canonical gap (a column spelled differently,
+  a loosened type, one status for every row).
 - Tiers 5-7 run even when tier 1 fails, so a FAIL names the keys, lag, and schema gaps rather than just a count.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.

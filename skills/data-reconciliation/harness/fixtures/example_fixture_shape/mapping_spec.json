@@ -1,0 +1,35 @@
+{
+  "version": "m1",
+  "objects": [
+    {
+      "object": "events",
+      "root_table": "app.events",
+      "fields": [
+        {
+          "source": "event_id",
+          "target": "event_id",
+          "source_type": "bigint",
+          "target_type": "long"
+        },
+        {
+          "source": "occurred_at",
+          "target": "occurred_at",
+          "source_type": "timestamp",
+          "target_type": "timestamp"
+        },
+        {
+          "source": "status",
+          "target": "status",
+          "source_type": "varchar(12)",
+          "target_type": "string"
+        }
+      ],
+      "key": {
+        "source": [
+          "event_id"
+        ],
+        "target": "event_id"
+      }
+    }
+  ]
+}
