@@ -365,6 +365,27 @@ def validate_gates(b):
                              "(required for a waived gate)")
 
 
+def target_key(name, namespace=""):
+    """The one identity of a table however a manifest or mapping spells it: trimmed, unquoted, case-folded
+    segments, a name shorter than the manifest's target_namespace plus a table qualified with the leading
+    segments it lacks (the harness qualifies a bare object with the run's catalog and schema the same
+    way). So MIG.T, `mig`.`t` and, under namespace cat.mig, t and cat.mig.t are one target while other.t
+    is another. Without a namespace a bare name is only itself."""
+    def segments(s):
+        return [re.sub(r'^[`"\[]|[`"\]]$', "", p.strip()).casefold() for p in str(s).strip().split(".")] \
+            if str(s).strip() else []
+    parts, prefix = segments(name), segments(namespace)
+    if parts and all(parts) and len(parts) <= len(prefix):
+        parts = prefix[:len(prefix) + 1 - len(parts)] + parts
+    return ".".join(parts)
+
+
+def reads_target(obj, table, namespace=""):
+    """A mapping object reads the target when both resolve to the same identity."""
+    o = target_key(obj, namespace)
+    return bool(o) and o == target_key(table, namespace)
+
+
 def validate_manifest(m, doctor=None):
     """Fail here, in one line, instead of 20 children failing on a missing field. With the doctor's
     report (.migration/09_capabilities.json) the capability contract must repeat what the doctor
@@ -385,6 +406,10 @@ def validate_manifest(m, doctor=None):
     if not (isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"])
             and ".." not in m["base_branch"]):
         raise SystemExit("manifest 'base_branch' must be a plain branch name (letters, digits, _ . / -)")
+    if "target_namespace" in m and not (isinstance(m["target_namespace"], str) and all(
+            re.fullmatch(r"[a-z_][\w$]*", s) for s in target_key(m["target_namespace"]).split("."))):
+        raise SystemExit("manifest 'target_namespace' must be the dotted catalog.schema (or schema) the harness run is "
+                         "given, so a bare write target or mapping object is that table and no other")
     if m["base_branch"] in ("main", "master") and not (
             isinstance(m.get("trunk_base_decision"), str) and m["trunk_base_decision"].strip()):
         raise SystemExit("base_branch 'main' is the trunk: migration ledgers and unit PRs land on the engagement "
@@ -1051,19 +1076,6 @@ def unit_mapping(unit):
         raise SystemExit(f"{p} is not valid JSON ({e})") from None
 
 
-def target_key(name):
-    """One identity for a table however a manifest or mapping spells it: trimmed, unquoted, case-folded
-    segments, so MIG.T, `mig`.`t` and mig.t are the same target while mig.t and other.t are not."""
-    return ".".join(re.sub(r'^[`"\[]|[`"\]]$', "", s.strip()).casefold() for s in str(name).strip().split("."))
-
-
-def reads_target(obj, table):
-    """A mapping object reads the target when it names it, or names its trailing segments (the harness
-    qualifies a bare object with the run's catalog and schema)."""
-    o, t = target_key(obj), target_key(table)
-    return bool(o) and (o == t or t.endswith("." + o))
-
-
 _SEGMENT = r'(?:[A-Za-z_][\w$]*|\[[^\]]+\]|"(?:[^"]|"")+"|`[^`]+`)'
 PREDICATE_TOKEN = re.compile(
     r"\s+|(?P<string>'(?:[^']|'')*')|(?P<param>\$\{\w+\})|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
@@ -1151,7 +1163,7 @@ def bounded_predicate(where, scope):
     return bounded and end == len(tokens)
 
 
-def bounded_readers(spec, table):
+def bounded_readers(spec, table, namespace=""):
     """Why the mapping spec's readers of `table` are not bounded to the unit's slice, '' when every one is,
     None when the spec has no object for the table. Each reading object declares scope_columns (its
     partition or run-date columns) and pins one of them in target_where; each of its embeds pins one of
@@ -1160,7 +1172,7 @@ def bounded_readers(spec, table):
     objects = spec.get("objects", spec.get("tables")) if isinstance(spec, dict) else None
     if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
         raise SystemExit("mapping spec 'objects' must be a list of object rows")
-    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table)]
+    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
     if not mine:
         return None
 
@@ -1187,16 +1199,17 @@ def bounded_readers(spec, table):
     return ""
 
 
-def check_write_targets(batches, other_waves, mapping=None):
+def check_write_targets(batches, other_waves, mapping=None, namespace=""):
     """Two batches in one wave writing the same table means the lineage missed an edge: refuse to launch.
     A table written by units in different waves is shared: whole-table recon of the earlier unit is
     undone by the later one's rows, so every mapping that reads it must be bounded (target_where to the
-    unit's own partition or run date), or this wave does not launch."""
+    unit's own partition or run date), or this wave does not launch. Every name here, written or read,
+    goes through target_key with the manifest's target_namespace, so one table has one identity."""
     mapping = unit_mapping if mapping is None else mapping
     owners, spelled = {}, {}
     for b in batches:
         for t in b.get("write_targets", []):
-            k = target_key(t)
+            k = target_key(t, namespace)
             if k in owners:
                 raise SystemExit(f"write-target collision before launch: '{t}' is claimed by "
                                  f"{owners[k]} and {b['id']}. Fix the wave plan, then re-run.")
@@ -1205,7 +1218,7 @@ def check_write_targets(batches, other_waves, mapping=None):
     for name, others in other_waves.items():
         for b in others:
             for t in b["write_targets"]:
-                elsewhere.setdefault(target_key(t), []).append((name, b))
+                elsewhere.setdefault(target_key(t, namespace), []).append((name, b))
     for k, mine in owners.items():
         if k not in elsewhere:
             continue
@@ -1224,7 +1237,7 @@ def check_write_targets(batches, other_waves, mapping=None):
                 if spec is None:
                     raise SystemExit(f"{why}: {path} is missing, so unit {u}{where} cannot be scoped")
                 try:
-                    problem = bounded_readers(spec, t)
+                    problem = bounded_readers(spec, t, namespace)
                 except SystemExit as e:
                     raise SystemExit(f"{why}: {path}: {e}") from None
                 if problem is None:
@@ -1557,7 +1570,8 @@ async def main():
     if not resume:
         RUN_ID_PATH.unlink(missing_ok=True)
     await register_workflow(META)
-    check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name))
+    check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
+                        namespace=MANIFEST.get("target_namespace", ""))
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}")
 
     sem = asyncio.Semaphore(WIDTH)

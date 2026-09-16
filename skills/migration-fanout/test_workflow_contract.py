@@ -27,7 +27,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
-               other_waves=None, mappings=None):
+               other_waves=None, mappings=None, namespace=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -63,6 +63,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief",
                      "gates": gates if gates is not None else [GATE]}],
     }
+    if namespace is not None:
+        manifest["target_namespace"] = namespace
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
     manifest["stop_c"] = "D-2"
     ledger = f"| D-2 | 2026-01-05 | user:U0 | STOP C wave-0 gates_sha {manifest['gates_sha']} | plan approved |\n" if stop_c else ""
@@ -492,13 +494,19 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
     assert not [c for c in calls if c["kind"] == "agent"]
 
     bounded = {"objects": [{**BOUNDED_MAPPING["objects"][0], "object": "T"}]}
-    ws, cwd = _workspace(tmp_path / "prior", other_waves={"wave-1.json": WAVE_1}, mappings={"u": bounded})
+    ws, cwd = _workspace(tmp_path / "bare", other_waves={"wave-1.json": WAVE_1}, mappings={"u": bounded})
+    proc, calls = _run(cwd, tmp_path / "bare", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "units/u/mapping_spec.json has no object reading 'mig.t'" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "prior", other_waves={"wave-1.json": WAVE_1.replace('"mig.t"', '"t"')},
+                         mappings={"u": bounded}, namespace="MIG")
     proc, calls = _run(cwd, tmp_path / "prior", [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0 and "units/v/mapping_spec.json is missing" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
     ws, cwd = _workspace(tmp_path / "bounded", other_waves={"wave-1.json": WAVE_1},
-                         mappings={"u": bounded, "v": BOUNDED_MAPPING})
+                         mappings={"u": bounded, "v": BOUNDED_MAPPING}, namespace="cat.mig")
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "bounded", [_pass_report(pr), _verify_report()])
     assert proc.returncode == 0, proc.stderr

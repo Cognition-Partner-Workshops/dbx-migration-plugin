@@ -216,18 +216,57 @@ def test_shared_table_is_the_same_table_whatever_its_case_or_quoting():
         check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(u1=BOUNDED, u2=BOUNDED))
 
 
-def test_bare_mapping_object_reads_the_qualified_target_but_schemas_stay_distinct():
-    check = _functions()["check_write_targets"]
-    bare = lambda where: {"objects": [{"object": "T", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"],
-                                       "target_where": where}]}
-    check([B1], OTHERS, _specs(u1=bare("run_date = '${as_of}'"), u2=BOUNDED))
+BARE = lambda where: {"objects": [{"object": "T", "root_table": "dbo.t", "key": ["id"], "scope_columns": ["run_date"],
+                                   "target_where": where}]}
+
+
+@pytest.mark.parametrize("namespace", ["mig", "MIG", "`mig`", "cat.mig"])
+def test_one_normalizer_qualifies_bare_names_with_the_manifest_target_namespace(namespace):
+    """target_key is the one identity for manifests and mappings alike: a bare name is the table in the
+    manifest's target_namespace (the catalog and schema the harness run is given), so `t`, `mig.t` and
+    `cat.mig.t` are one target under `cat.mig` while `other.t` is not, in collisions and in readers."""
+    fn = _functions()
+    key, check = fn["target_key"], fn["check_write_targets"]
+    full = "cat.mig.t" if namespace == "cat.mig" else "mig.t"
+    assert key("t", namespace) == key("MIG.T", namespace) == key(full, namespace) == full
+    assert key("other.t", namespace) != key("t", namespace) and key("ig.t", namespace) != key("t", namespace)
+    assert fn["reads_target"]("T", "mig.t", namespace) and not fn["reads_target"]("other.t", "mig.t", namespace)
+    for current, previous in (("t", "mig.t"), ("mig.t", "t"), ("T", full), (full, "t")):
+        with pytest.raises(SystemExit, match=rf"'{re.escape(current)}'.*b-1.*wave-1\.json.*b-2.*u1.*target_where"):
+            check([{**B1, "write_targets": [current]}], {"wave-1.json": [{**B2, "write_targets": [previous]}]},
+                  _specs(u1=UNBOUNDED, u2=BOUNDED), namespace)
+        check([{**B1, "write_targets": [current]}], {"wave-1.json": [{**B2, "write_targets": [previous]}]},
+              _specs(u1=BARE("run_date = '${as_of}'"), u2=BOUNDED), namespace)
+    with pytest.raises(SystemExit, match=r"collision.*'(t|mig\.t)'.*b-1.*b-2"):
+        check([{**B1, "write_targets": ["t"]}, B2], {}, _specs(u1=BOUNDED, u2=BOUNDED), namespace)
     with pytest.raises(SystemExit, match=r"'mig.t'.*u1.*target_where"):
-        check([B1], OTHERS, _specs(u1=bare(""), u2=BOUNDED))
+        check([B1], OTHERS, _specs(u1=BARE(""), u2=BOUNDED), namespace)
+    for other in ("other.t", "ig.t"):
+        with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
+            check([B1], OTHERS, _specs(u1={"objects": [{"object": other, "target_where": "id = 1"}]}, u2=BOUNDED), namespace)
+        check([B1], {"wave-1.json": [{**B2, "write_targets": [other]}]}, _specs(), namespace)
+
+
+def test_without_a_target_namespace_a_bare_name_is_only_itself():
+    """No namespace, no guessing: `t` and `mig.t` are different targets everywhere, so a bare object does not
+    read a qualified shared table and the unit halts for having no reader of it rather than being scoped
+    by suffix."""
+    fn = _functions()
+    assert fn["target_key"]("T") == "t" != fn["target_key"]("mig.t") and fn["target_key"]("MIG.T") == "mig.t"
+    assert not fn["reads_target"]("T", "mig.t") and fn["reads_target"]("`MIG`.T", "mig.t")
+    check = fn["check_write_targets"]
+    check([B1], {"wave-1.json": [{**B2, "write_targets": ["t"]}]}, _specs())
+    check([{**B1, "write_targets": ["t"]}, B2], {}, _specs())
     with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
-        check([B1], OTHERS, _specs(u1={"objects": [{"object": "other.t", "target_where": "id = 1"}]}, u2=BOUNDED))
-    with pytest.raises(SystemExit, match=r"no object reading 'mig.t'"):
-        check([B1], OTHERS, _specs(u1={"objects": [{"object": "ig.t", "target_where": "id = 1"}]}, u2=BOUNDED))
-    check([B1], {"wave-1.json": [{**B2, "write_targets": ["other.t"]}]}, _specs())
+        check([B1], OTHERS, _specs(u1=BARE("run_date = '${as_of}'"), u2=BOUNDED))
+
+
+@pytest.mark.parametrize("namespace", [1, "", " ", "a b", "cat.", ".mig", "cat..mig", ["mig"]])
+def test_target_namespace_when_present_is_a_dotted_identifier(namespace):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="target_namespace"):
+        validate_manifest({**_manifest(), "target_namespace": namespace})
+    validate_manifest({**_manifest(), "target_namespace": "cat.mig"})
 
 
 @pytest.mark.parametrize("where", ["1 = 1", "1=1", "'a' = 'a'", "TRUE", "NOT (1 = 2)", "${as_of} = ${as_of}",
