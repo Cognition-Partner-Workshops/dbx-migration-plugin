@@ -4,7 +4,9 @@ with `--expect-catalogs` before each wave; the manifest copies identity, host, c
 and stop mode, which `workflow.py` compares before launch. Children and the verifier use expected
 identity and host; a child blocks only on its security controls (`hook_guard_functional`,
 `databricks_identity`) not being `ok` or a unit-mapping problem — every other `fail` is reported as
-an advisory `warn`.
+an advisory `warn`. A child also blocks when a required security sub-result is missing or a unit
+mapping is unreadable, and on `source_principal_read_only=fail` (a writable source principal);
+`unverified` stays advisory in a child.
 
 ### `workspace`
 Sub-checks: `workspace` verifies every required `.migration` setup file from `1-migration_setup` and requires a `## Glossary` section in `00_context.md` or legacy `02_glossary.md`;

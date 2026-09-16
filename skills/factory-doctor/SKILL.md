@@ -61,9 +61,12 @@ identity (`hook_guard_functional`, `databricks_identity`) and inherits `hook_pla
 through `--reuse-record`, which is the normal child path. In a child report every non-security
 `fail` is softened to an advisory `warn` (the orchestrator gated it before launch), so a child is
 ready when its two security controls are `ok` and no unit-mapping problem blocks it; a missing or
-unreadable unit mapping still blocks. `playbooks_in_sync` findings are `warn` for every role —
-only a missing lock at setup is `skipped`. `--source-attested D-<id>` yields an `ok` row whose
-data carries `attested`/`decision` when the ledger line qualifies. Sub-results live in
+unreadable unit mapping still blocks, and so does a required security sub-result that never ran.
+A `source_principal_read_only=fail` (a writable source principal) also blocks a child;
+`unverified` stays advisory.
+`playbooks_in_sync` findings are `warn` for every role — only a missing lock at setup is `skipped`.
+`--source-attested D-<id>` yields an `ok` row whose data carries `attested`/`decision` when the
+ledger line qualifies. Sub-results live in
 `data.sub_results`; `--no-databricks` leaves `databricks_identity=skipped` and never authorizes a
 wave. The report identity, host, catalogs, guard mode, and stop mode are the workflow capability
 contract.

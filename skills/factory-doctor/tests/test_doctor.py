@@ -939,6 +939,67 @@ def test_child_missing_unit_mapping_still_blocks(tmp_path):
     assert report["ready"] is False
 
 
+def test_child_blocks_when_a_security_control_is_missing(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    empty_plugin = tmp_path / "no_plugin"  # no hooks.json/dbx_guard.py: check_hooks returns only hooks_files=fail
+    empty_plugin.mkdir()
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "fail", "databricks CLI not on PATH"),
+    ])
+    report = doctor.run(ws, empty_plugin, "child", "unknown", None, False, units=["loans"])
+    assert "hook_guard_functional=missing" in report["blocking"]
+    assert "databricks_identity=missing" in report["blocking"]
+    assert report["ready"] is False
+
+
+def test_child_malformed_unit_mapping_still_blocks(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    spec = _unit_mapping(ws, "loans")
+    spec.write_text("{not json")
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "ok", "oauth-m2m (env)"),
+        doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
+        doctor.Check("databricks_warehouse", "warn", "none"),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"],
+                        source_family="sqlserver")
+    rows = by_id(report)
+    for rid in ("type_map_audit", "delete_evidence", "source_principal_read_only",
+                "dictionary_readable"):
+        assert rows[rid]["status"] == "fail" and rows[rid]["data"]["units_problem"] is True, rid
+        assert f"{rid}=fail" in report["blocking"], rid
+    assert report["ready"] is False
+
+
+def test_child_writable_source_principal_blocks(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans")
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "ok", "oauth-m2m (env)"),
+        doctor.Check("databricks_identity", "ok", "authenticated as 1234-sp (service principal)"),
+        doctor.Check("databricks_warehouse", "warn", "none"),
+    ])
+    monkeypatch.setattr(doctor, "check_source_principal", lambda tables, family, secret:
+                        doctor.Check("source_principal_read_only", "fail",
+                                     "principal can INSERT on raw.loans"))
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"],
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "source_principal_read_only=fail" in report["blocking"]
+    assert report["ready"] is False
+    # unverified stays advisory in a child
+    monkeypatch.setattr(doctor, "check_source_principal", lambda tables, family, secret:
+                        doctor.Check("source_principal_read_only", "unverified",
+                                     "cannot reach the source"))
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"],
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "unverified"
+    assert "source_principal_read_only=unverified" not in report["blocking"]
+
+
 def test_delete_evidence_declared_needs_a_named_source_secret(tmp_path, monkeypatch):
     monkeypatch.delenv("LEGACY_ODBC", raising=False)
     c = doctor.check_delete_evidence(_mapping(tmp_path), None, PLUGIN_ROOT)

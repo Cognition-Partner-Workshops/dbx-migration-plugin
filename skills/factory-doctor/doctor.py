@@ -716,6 +716,9 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
         family_known = target_known = False
         rel = None
         for _, p_ in sorted(todo.items(), key=lambda kv: str(kv[1])):
+            _, spec_err = _load_mapping(p_, params, plugin_root)
+            if spec_err:
+                return Check(cid, "fail", f"{p_}: {spec_err}", {**data, "units_problem": True})
             reg, rc, shown = _harness_json(cmd, ["type-map-audit", "--spec", str(p_), "--family", source_family,
                 "--target-kind", target_kind, *cargs, *pargs])
             if (not isinstance(reg, dict) or not isinstance(reg.get("findings"), list) or
@@ -803,9 +806,12 @@ def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: l
         rows = {label: check_delete_evidence(p, source_secret, plugin_root, connect=connect, params=params) for label,
             p in todo.items()}
         worst = "fail" if any(c.status == "fail" for c in rows.values()) else "ok"
-        return Check("delete_evidence", worst, "; ".join(f"{label}: {c.detail}" for label, c in rows.items()), {
-            "units": list(expected), "mappings": {label: {"status": c.status, "detail": c.detail, **(c.data or {
-            })} for label, c in rows.items()}})
+        data = {"units": list(expected), "mappings": {label: {"status": c.status, "detail": c.detail,
+            **(c.data or {})} for label, c in rows.items()}}
+        if any((c.data or {}).get("units_problem") for c in rows.values()):
+            data["units_problem"] = True
+        return Check("delete_evidence", worst, "; ".join(f"{label}: {c.detail}" for label, c in rows.items()),
+            data)
 
     return per_unit("delete_evidence", ws, role, units, mappings, evidence, setup=Check("delete_evidence", "skipped",
         f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}", {"units": [], "mappings": {}}),)
@@ -814,13 +820,9 @@ def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: l
 def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root: Path, connect=_pyodbc_connect,
     params: dict[str, str] | None = None) -> Check:
     """Every declared `delete_evidence` block must be answerable on the source (references/checks.md)."""
-    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
-    from recon.config import ConfigError, load_mapping_spec
-
-    try:
-        spec = load_mapping_spec(mapping, params)
-    except (ConfigError, OSError, ValueError) as e:
-        return Check("delete_evidence", "fail", f"{mapping}: {_redact(str(e))}")
+    spec, err = _load_mapping(mapping, params, plugin_root)
+    if spec is None:
+        return Check("delete_evidence", "fail", f"{mapping}: {err}", {"units_problem": True})
     declared = [(c.object, c.delete_evidence) for c in spec.objects if c.delete_evidence is not None]
     if not declared:
         return Check("delete_evidence", "ok",
@@ -1161,19 +1163,26 @@ def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
         "attestation in the ledger first", {"decision": decision})
 
 
-def _mapped_tables(todo: dict[str, Path], params: dict[str, str] | None, plugin_root: Path,
-    source_family: str | None):
-    """(tables, family) over every mapping in `todo`, or a Check (id set by the caller) when a spec does not load."""
+def _load_mapping(path: Path, params: dict[str, str] | None, plugin_root: Path):
+    """(spec, None) or (None, redacted error): the one place a resolved mapping file is parsed."""
     sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
     from recon.config import ConfigError, load_mapping_spec
 
+    try:
+        return load_mapping_spec(path, params), None
+    except (ConfigError, OSError, ValueError) as e:
+        return None, _redact(str(e))
+
+
+def _mapped_tables(todo: dict[str, Path], params: dict[str, str] | None, plugin_root: Path,
+    source_family: str | None):
+    """(tables, family) over every mapping in `todo`, or a Check (id set by the caller) when a spec does not load."""
     tables: dict[str, None] = {}
     kinds: set[str] = set()
     for p in todo.values():
-        try:
-            spec = load_mapping_spec(p, params)
-        except (ConfigError, OSError, ValueError) as e:
-            return Check("", "fail", f"{p}: {_redact(str(e))}")
+        spec, err = _load_mapping(p, params, plugin_root)
+        if spec is None:
+            return Check("", "fail", f"{p}: {err}", {"units_problem": True})
         for o in spec.objects:
             tables.update(dict.fromkeys([o.root_table, *(e.child_table for e in o.embeds)]))
             if o.delete_evidence is not None:
@@ -1690,8 +1699,10 @@ def check_analytical_target_grants(full_name: str) -> Check:
 
 
 def _advisory(c: Check) -> Check:
-    """In a child, non-security `fail` rows are advisory `warn` (the orchestrator gated them at launch)."""
-    if c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and not (c.data or {}).get("units_problem"):
+    """In a child, non-security `fail` rows are advisory `warn` (the orchestrator gated them at launch);
+    a writable source principal is a legacy-safety finding and stays `fail`."""
+    if (c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and c.id != "source_principal_read_only"
+            and not (c.data or {}).get("units_problem")):
         return Check(c.id, "warn", "advisory in a child (the orchestrator gates it before launch): " + c.detail,
             c.data)
     return c
@@ -1706,10 +1717,14 @@ def _blocking(role: str, checks: list[Check]) -> list[str]:
         if s.id in sec and s.status != "ok":
             return True
         if role == "child":
-            return bool((s.data or {}).get("units_problem"))
+            return (bool((s.data or {}).get("units_problem")) or
+                (s.id == "source_principal_read_only" and s.status == "fail"))
         return s.status == "fail" or (s.id == "source_principal_read_only" and s.status == "unverified")
 
-    return [f"{row.id}={row.status}" for row in checks if any(blocks(s) for s in _flat([row]))]
+    blocking = [f"{row.id}={row.status}" for row in checks if any(blocks(s) for s in _flat([row]))]
+    seen = {s.id for row in checks for s in _flat([row])}
+    # a security control with no row at all (hooks files absent, CLI missing) still blocks
+    return blocking + [f"{cid}=missing" for cid in sec if cid not in seen]
 
 
 def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identity: str | None, no_databricks: bool,

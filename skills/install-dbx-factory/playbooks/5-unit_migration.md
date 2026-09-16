@@ -5,7 +5,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 ### Before conversion
 - [ ] Read the complete hand-off: units, profiles, dictionary, dependencies, targets, branch, gate, tolerances, and `.migration/` path.
 - [ ] Read the dialect skill's `SKILL.md` and `references/contract.md` fan-out guards before the first unit.
-- [ ] Run `factory-doctor --role child` with the capability contract, every unit, source secret/parameters, and hook probe — or `--reuse-record` the orchestrator's signed record per `factory-doctor/SKILL.md`; report BLOCKED on any failed check.
+- [ ] Run `factory-doctor --role child --reuse-record <wave>.doctor.json` — the orchestrator's signed record committed beside the manifest — with `--expect-identity`, every unit in the batch, and the source secret/parameters the manifest carries; a bare `--role child` run is the fallback only when no signed record exists. Report BLOCKED on any blocking row.
 - [ ] At the brief's `max_minutes` budget, stop and report BLOCKED with findings (what landed, what did not, what blocked it); never grind past it.
 - [ ] Confirm every write target is declared; never edit `.migration/` outside `.migration/recon/<unit_id>/`, never edit `allowed_targets.json`, never write the ledger.
 - [ ] Never edit `05_progress.md`; it is generated from wave results, and report every changed path in `result.json`.
