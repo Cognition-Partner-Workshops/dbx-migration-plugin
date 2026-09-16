@@ -12,7 +12,7 @@ Playbook: Census the legacy estate, prove coverage, build the lineage DAG, and p
 5. Prove `N = pipelines + shared + PROPOSED-unused + confirmed exclusions`; cross-check every available external count and mark completeness UNVERIFIABLE when no check exists.
 6. Build the shared-object ownership map. Append governance rows (grantee, privilege, role, service account, masking policy, cited query) to `.migration/04_dependency_register.md`; credentials never enter the inventory.
 7. Run dependency resolution in register mode for D3–D9 crossings; append complete UNDECIDED contracts.
-8. Record per-pipeline width, serial floor, and D10-constrained concurrency. Write `<Estate>_inventory.md`, render the DAG, and present the recommendation at STOP B only when intake did not fix pipeline order.
+8. Record per-pipeline width, serial floor, and D10-constrained concurrency. Write `<Estate>_inventory.md`, render the DAG, and present the recommendation at STOP B unless intake fixed both pipeline and boundary (`references/contract.md`).
 
 ## Specifications
 - Deliverable: inventory, exact coverage arithmetic, pipeline catalog, shared-object map, parallelism profile, PROPOSED-unused set, governance section, and dependency entries.

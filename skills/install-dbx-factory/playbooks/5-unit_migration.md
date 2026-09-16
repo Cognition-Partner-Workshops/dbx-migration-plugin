@@ -32,4 +32,4 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 - Validation: all units green or escalated; scope is limited to the batch; legacy is untouched; evidence is rerunnable.
 
 ## Pointers
-The `data-reconciliation` skill owns tiers and finding codes; the workflow owns ledger and target enforcement.
+The `data-reconciliation` skill owns tiers and finding codes; the workflow owns ledger and target enforcement. `factory-doctor` `type_map_audit` rejects forbidden target types before recon queries.
