@@ -1266,6 +1266,14 @@ _TRIGGER_CENSUS = {
 }
 
 
+def _quote_ident(part: str) -> str:
+    """One probe identifier, backtick-delimited with inner backticks doubled (same rule as
+    recon.adapters.quote_ident): a mapped table name can only ever name an object."""
+    if not part or "." in part or "\x00" in part:
+        raise ValueError(f"invalid identifier part {part!r}")
+    return "`" + part.replace("`", "``") + "`"
+
+
 def check_dictionary_readable(tables: list[str], family: str, source_secret: str | None,
                               connect=None, views: list[tuple] | None = None) -> Check:
     """SELECT on the data is not visibility of the catalog: sys.triggers/pg_trigger rows are
@@ -1297,15 +1305,17 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
                     parts = {}
                     for t in tables:
                         p_ = t.replace("`", "").split(".")
-                        if len(p_) != 3:
+                        if len(p_) != 3 or any(not x or "." in x or "\x00" in x for x in p_):
                             return Check(cid, "fail", f"{t} is not catalog.schema.table; cannot "
                                          "scope the dictionary probe", data)
                         parts[t] = p_
                     if "{schema}" in sql or "{table}" in sql:
-                        probes = [(t, sql.format(catalog=p_[0], schema=p_[1], table=p_[2]))
+                        probes = [(t, sql.format(catalog=_quote_ident(p_[0]),
+                                               schema=_quote_ident(p_[1]),
+                                               table=_quote_ident(p_[2])))
                                   for t, p_ in parts.items()]
                     else:  # {catalog} only: information_schema is catalog-scoped, probe per catalog
-                        probes = [(None, sql.format(catalog=c)) for c in
+                        probes = [(None, sql.format(catalog=_quote_ident(c))) for c in
                                   sorted({p_[0] for p_ in parts.values()})]
                 for table, probe in probes:
                     try:
