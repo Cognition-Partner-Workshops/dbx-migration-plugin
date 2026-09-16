@@ -1141,8 +1141,26 @@ def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     for family, (prefixes, pattern) in _CLOUD_FAMILY.items():
         declared = [name for name in cfg.fixture_endpoints if any(name.startswith(prefix) for prefix in prefixes)]
         match = pattern.search(text)
-        effective = {**os.environ, **seg.env, **dict(a.split("=", 1) for a in seg.assigns if _ASSIGN.match(a))}
+        command_values = dict(a.split("=", 1) for a in seg.assigns if _ASSIGN.match(a))
+        effective = {**os.environ, **seg.env, **command_values}
+        lookup = {**effective}
+        for name in declared:
+            if name in effective:
+                value = effective[name]
+                for _ in range(len(lookup) + 1):
+                    resolved = _SHELL_VAR.sub(lambda m: lookup.get(m.group(1) or m.group(2), m.group()), value)
+                    if resolved == value:
+                        break
+                    value = resolved
+                effective[name] = value
         missing = [name for name in declared if not effective.get(name)]
+        unresolved = [name for name in declared if (name in command_values or name in seg.env)
+                      and effective.get(name) and ("$" in effective[name] or "`" in effective[name])]
+        if match and unresolved:
+            violations.append(f"run_mode is fixture and the command names {family} tooling (`{match.group()}`) but {unresolved} is set "
+                              "to an expansion the guard cannot resolve for this command; a fixture must fail closed rather than reach "
+                              f"the live {family} account (declared in fixture_endpoints)")
+            continue
         if match and missing:
             violations.append(f"run_mode is fixture and the command names {family} tooling (`{match.group()}`) but {missing} is unset "
                               f"for this command; a fixture must fail closed rather than reach the live {family} account "
