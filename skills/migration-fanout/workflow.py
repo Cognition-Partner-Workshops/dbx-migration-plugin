@@ -1497,6 +1497,29 @@ def validate_close(close, to_merge) -> list[str]:
         problems.append(f"wave-close step changed {p}; it writes nothing")
     return problems
 
+
+def merged_on_base(to_merge):
+    """{pr_url} of the verified PRs whose gated head is already an ancestor of origin's base tip — the only
+    proof a merge happened; whatever the close step reported or failed to report is reconciled against git."""
+    try:
+        tip = _base_tip()
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    git = ["git", "-C", str(ROOT)]
+    proven = set()
+    for p in to_merge:
+        head = p.get("pr_head")
+        if not (isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head)):
+            continue
+        try:
+            rc = subprocess.run(git + ["merge-base", "--is-ancestor", head, tip],
+                                check=False, capture_output=True, timeout=300).returncode
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if rc == 0:
+            proven.add(p["pr_url"])
+    return proven
+
 WAVE = MANIFEST["wave"]
 REPO = MANIFEST["repo"]
 BATCHES = sorted(MANIFEST["batches"], key=lambda b: b["id"])
@@ -1546,6 +1569,9 @@ CHILD_SCHEMA = {
                            "for your units; the workflow verifies the row. harness otherwise."},
         "review_clean": {"type": "boolean",
                          "description": "Devin Review on your PR has zero open actionable findings at pr_head"},
+        "review_head": {"type": "string",
+                        "description": "the 40-hex PR head sha Devin Review cleared; the workflow fails a "
+                                       "review_clean whose review_head is not the gated PR head"},
         "review_waiver": {
             "type": "object",
             "properties": {"decision_id": {"type": "string"}},
@@ -1626,8 +1652,10 @@ def child_prompt(batch):
         "any other .migration/ path in it turns your PASS into FAIL ledger_tampered.\n"
         "- Do not merge your own PR.\n"
         "- status=PASS also requires review_clean=true: finish the Devin Review round on your PR and fix "
-        "every actionable finding before reporting done; a wrong finding is waived only by a human's "
-        "review_waived row in .migration/06_decisions.md naming your units, reported as review_waiver.\n"
+        "every actionable finding before reporting done, then report review_head as the exact 40-hex PR head "
+        "sha Devin Review cleared (a push after the review needs a new clean round); a wrong finding is "
+        "waived only by a human's review_waived row in .migration/06_decisions.md naming your units, "
+        "reported as review_waiver.\n"
         f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
         "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
         "evidence is never PASS. Report merge_eligible=true only when every unit's "
@@ -1809,17 +1837,21 @@ async def run_batch(batch, sem, breaker):
                     f"PASS downgraded: recon evidence is not merge_eligible=true for every unit ({why}) "
                     f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
                     ".migration/06_decisions.md; " + out["one_line_summary"])
-        if out["status"] == "PASS" and out.get("review_clean") is not True:
+        if out["status"] == "PASS" and (out.get("review_clean") is not True
+                                       or out.get("review_head") != out.get("pr_head")):
             waiver = out.get("review_waiver")
             decision = waiver.get("decision_id") if isinstance(waiver, dict) else None
             if override_decision(decision, batch["units"], decision_ledger(), word="review_waived"):
                 out["review_waiver"] = {"decision_id": decision}
             else:
+                reason = ("Devin Review is not clean at the PR head"
+                          if out.get("review_clean") is not True else
+                          f"review_head {out.get('review_head')!r} is not the gated PR head {out.get('pr_head')!r}")
                 out["status"] = "FAIL"
                 out["failure_class"] = "review_open"
                 out.pop("review_waiver", None)
                 out["one_line_summary"] = (
-                    "PASS downgraded: Devin Review is not clean at the PR head and no review_waived row "
+                    f"PASS downgraded: {reason} and no review_waived row "
                     f"{decision or 'D-<n>'} naming {', '.join(batch['units'])} is in .migration/06_decisions.md; "
                     + out["one_line_summary"])
         if out["status"] == "PASS":
@@ -1996,7 +2028,8 @@ async def main():
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
-               "review_clean": r.get("review_clean"), "review_waiver": r.get("review_waiver"),
+               "review_clean": r.get("review_clean"), "review_head": r.get("review_head"),
+               "review_waiver": r.get("review_waiver"),
                "gates": r.get("gates", [])}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
     verify = None
@@ -2030,7 +2063,7 @@ async def main():
             close = await asyncio.wait_for(
                 agent(close_prompt(to_merge, CLOSE_MINUTES), phase="close", schema=CLOSE_SCHEMA,
                       label=f"close-wave-{WAVE}", repos=[REPO], soft_time_limit_minutes=CLOSE_MINUTES),
-                timeout=(CLOSE_MINUTES + 5) * 60)
+                timeout=CLOSE_MINUTES * 60)
         except (asyncio.TimeoutError, WorkflowAgentError) as e:
             close = {"merged_prs": [],
                      "unmerged": [{"pr_url": p["pr_url"],
@@ -2038,16 +2071,29 @@ async def main():
                                   for p in to_merge],
                      "changed_paths": []}
     close_problems = validate_close(close, to_merge) if close is not None else []
+    if close is not None:
+        raw, proven = close, merged_on_base(to_merge)
+        reported = raw.get("merged_prs") if isinstance(raw, dict) else None
+        reported = {u for u in reported if isinstance(u, str)} if isinstance(reported, list) else set()
+        reasons = {u["pr_url"]: u["reason"] for u in raw.get("unmerged", [])
+                   if isinstance(u, dict) and isinstance(u.get("pr_url"), str)
+                   and isinstance(u.get("reason"), str)} if isinstance(raw, dict) else {}
+        changed = raw.get("changed_paths") if isinstance(raw, dict) else None
+        close = {"merged_prs": [p["pr_url"] for p in to_merge if p["pr_url"] in proven],
+                 "unmerged": [{"pr_url": p["pr_url"],
+                               "reason": (f"reported merged but head not on origin/{BASE_BRANCH}"
+                                          if p["pr_url"] in reported
+                                          else reasons.get(p["pr_url"], "wave-close output invalid"))}
+                              for p in to_merge if p["pr_url"] not in proven],
+                 "changed_paths": changed if isinstance(changed, list) else []}
+        if close_problems:
+            close["invalid"] = raw
     if close_problems:
         if not isinstance(verify, dict):
             verify = {"wave_verdict": "FAIL", "unit_verdicts": {}, "findings": []}
         if not isinstance(verify.get("findings"), list):
             verify["findings"] = []
         verify["findings"].extend(f"wave close invalid: {p}" for p in close_problems)
-        close = {"merged_prs": [],
-                 "unmerged": [{"pr_url": p["pr_url"], "reason": "wave-close output invalid"}
-                              for p in to_merge],
-                 "changed_paths": [], "invalid": close}
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported
               and not verify_problems and not close_problems and (close is None or not close["unmerged"])
               and verify is not None and verify["wave_verdict"] == "PASS"

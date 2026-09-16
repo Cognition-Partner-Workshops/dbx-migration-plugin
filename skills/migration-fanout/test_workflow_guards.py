@@ -1134,7 +1134,7 @@ def _gate_batch(*gates):
 def _gate_report(**extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"],
-            "review_clean": True, "one_line_summary": "ok", **extra}
+            "review_clean": True, "review_head": "c" * 40, "one_line_summary": "ok", **extra}
 
 
 def _run_gates(batch, report, ledger=GATES_LEDGER):
@@ -1495,7 +1495,8 @@ def test_replayed_failures_do_not_refill_breaker():
                     "failure_class": "same", "one_line_summary": "replayed"}
         return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
                 "pr_url": "https://example/pr/held", "branch": "feature/held",
-                "changed_paths": ["src/held.sql"], "review_clean": True, "one_line_summary": "held passed"}
+                "changed_paths": ["src/held.sql"], "review_clean": True, "review_head": "c" * 40,
+                "one_line_summary": "held passed"}
 
     namespace["agent"] = agent
 
@@ -1555,7 +1556,8 @@ def _run_one(namespace, report):
 def test_pass_with_merge_evidence_mode_is_kept(mode):
     out = _run_one(_batch_runtime(), {"status": "PASS", "recon_verdict": "PASS", "recon_mode": mode, "merge_eligible": True,
                                       "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"],
-                                      "review_clean": True, "one_line_summary": "ok"})
+                                      "review_clean": True, "review_head": "c" * 40,
+                                      "one_line_summary": "ok"})
     assert out["status"] == "PASS" and "failure_class" not in out
     assert out["merge_authority"] == {"kind": "harness", "decision_id": None}
 
@@ -1582,7 +1584,8 @@ def _ns_with_ledger(text=LEDGER):
 
 
 _pass_nomerge = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "pr_url": "https://example/pr/1",
-                 "branch": "f", "changed_paths": ["src/a.sql"], "review_clean": True, "one_line_summary": "ok"}
+                 "branch": "f", "changed_paths": ["src/a.sql"], "review_clean": True, "review_head": "c" * 40,
+                 "one_line_summary": "ok"}
 
 
 @pytest.mark.parametrize("report", [
@@ -1708,7 +1711,7 @@ def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child
 
     base = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": [], "review_clean": True,
-            "one_line_summary": "ok"}
+            "review_head": "c" * 40, "one_line_summary": "ok"}
     out = run(base)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "merge_authority" not in out
     assert "recon/u2/result.json" in out["one_line_summary"] and "merge_eligible=False" in out["one_line_summary"]
@@ -1793,7 +1796,8 @@ LEDGER_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targe
 
 def _pass(**extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
-            "pr_url": "https://example/pr/1", "branch": "f", "review_clean": True, "one_line_summary": "ok", **extra}
+            "pr_url": "https://example/pr/1", "branch": "f", "review_clean": True, "review_head": "c" * 40,
+            "one_line_summary": "ok", **extra}
 
 
 def test_clean_diff_stays_pass_and_recon_evidence_for_its_own_units_is_allowed():
@@ -2360,22 +2364,36 @@ def test_child_schema_requires_review_clean_and_the_prompt_names_the_waiver():
                   if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
     assert "review_clean" in schema["required"] and schema["properties"]["review_clean"]["type"] == "boolean"
     assert "review_waiver" in schema["properties"]
+    assert schema["properties"]["review_head"]["type"] == "string" and "review_head" not in schema["required"]
     child = _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])
-    assert "review_clean" in child and "review_waived" in child
+    assert "review_clean" in child and "review_waived" in child and "review_head" in child
 
 
-def test_a_pass_needs_review_clean_or_a_review_waived_ledger_row():
+def test_a_pass_needs_review_clean_at_the_gated_pr_head_or_a_review_waived_ledger_row():
     out = _run_one(_batch_runtime(), _pass(changed_paths=["src/a.sql"], review_clean=False))
     assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
     assert out["one_line_summary"].startswith("PASS downgraded: Devin Review") and "review_waived" in out["one_line_summary"]
     assert "review_waiver" not in out
+
+    for bad in ({"review_head": "d" * 40}, {"review_head": None}):
+        out = _run_one(_batch_runtime(), _pass(changed_paths=["src/a.sql"], **bad))
+        assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
+        assert "review_head" in out["one_line_summary"] and "is not the gated PR head" in out["one_line_summary"]
+    no_head = _pass(changed_paths=["src/a.sql"])
+    del no_head["review_head"]
+    out = _run_one(_batch_runtime(), no_head)
+    assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
+
+    ledger = LEDGER + "| D-9 | 2024-05-04 | user:U1 | review_waived for u, the finding is a false positive |\n"
+    out = _run_one(_ns_with_ledger(ledger), _pass(changed_paths=["src/a.sql"], review_head="d" * 40,
+                                                 review_waiver={"decision_id": "D-9"}))
+    assert out["status"] == "PASS" and out["review_waiver"] == {"decision_id": "D-9"}
 
     missing = _pass(changed_paths=["src/a.sql"])
     missing.pop("review_clean")
     out = _run_one(_batch_runtime(), missing)
     assert out["status"] == "FAIL" and out["failure_class"] == "review_open"
 
-    ledger = LEDGER + "| D-9 | 2024-05-04 | user:U1 | review_waived for u, the finding is a false positive |\n"
     out = _run_one(_ns_with_ledger(ledger), _pass(changed_paths=["src/a.sql"], review_clean=False,
                                                  review_waiver={"decision_id": "D-9"}))
     assert out["status"] == "PASS" and out["review_waiver"] == {"decision_id": "D-9"}
