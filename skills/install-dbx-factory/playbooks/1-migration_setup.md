@@ -132,7 +132,7 @@ THIS PLAYBOOK  ->  .migration/00_context.md          engagement facts, topology,
 - **Tolerances are a business decision wearing a technical costume.** "AVG truncation differs between engines" is a classic first recon failure; deciding the rounding rule now saves a red wave later.
 - Fire access requests at maximum breadth now: service principal, federation connection approval, sample-data sign-off. They gate the fan-out width more often than compute does.
 - When production access is denied (a common enterprise pattern), set recon mode DEGRADED explicitly, with its own evidence standard: snapshot manifests (source, extraction time, row counts) for every comparison baseline, sample-coverage statistics (what fraction of rows/keys/distributions the sample exercises), the caveat that sample parity does not extrapolate to production distributions, and a mandatory in-perimeter recon run (executed by the customer with the delivered harness) as an entry criterion for STOP E. Every recon report in DEGRADED mode names the mode in its header; gate language never borrows LIVE-mode confidence.
-- The ledger (`05_progress.md`) is what makes 50 parallel children auditable: one row per unit rendered from wave results, status flowing NOT_STARTED -> IN_FLIGHT -> PR_OPEN -> RECON_GREEN -> MERGED.
+- The ledger (`05_progress.md`) is what makes 50 parallel children auditable: one row per unit rendered from wave results with the status the workflow recorded (PASS, FAIL, BLOCKED, NOT_LAUNCHED) and its recon verdict, PR, and cost.
 
 ### Forbidden Actions
 - Do NOT start Phase 2 without a completed Phase 1 target-state artifact.

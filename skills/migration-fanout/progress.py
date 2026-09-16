@@ -24,6 +24,14 @@ def _wave_key(value):
     return (0, value) if isinstance(value, int) and not isinstance(value, bool) else (1, _text(value))
 
 
+def _wave(result: dict, path: Path):
+    wave = result.get("wave")
+    if wave is not None:
+        return wave
+    match = _WAVE_NAME.fullmatch(path.name)
+    return int(match.group(1)) if match else ""
+
+
 def render_progress(mig: Path) -> str:
     waves = mig / "waves"
     results = []
@@ -38,10 +46,7 @@ def render_progress(mig: Path) -> str:
 
     rows = []
     for result, path in results:
-        wave = result.get("wave")
-        if wave is None:
-            match = _WAVE_NAME.fullmatch(path.name)
-            wave = int(match.group(1)) if match else ""
+        wave = _wave(result, path)
         for batch in result.get("batches", []):
             if not isinstance(batch, dict):
                 continue
@@ -62,11 +67,8 @@ def render_progress(mig: Path) -> str:
 
     lines = [_HEADER, _TABLE_HEADER, _TABLE_DIVIDER]
     lines.extend("| " + " | ".join(_text(value) for value in row) + " |" for row in rows)
-    for result, path in sorted(results, key=lambda item: _wave_key(item[0].get("wave", ""))):
-        wave = result.get("wave")
-        if wave is None:
-            match = _WAVE_NAME.fullmatch(path.name)
-            wave = int(match.group(1)) if match else ""
+    for result, path in sorted(results, key=lambda item: _wave_key(_wave(*item))):
+        wave = _wave(result, path)
         breaker = result.get("breaker_tripped_on") or "-"
         lines.append(
             f"wave {wave}: closed={_bool(result.get('closed'))}, "
