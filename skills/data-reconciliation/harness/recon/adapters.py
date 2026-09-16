@@ -89,6 +89,15 @@ class SchemaFacts:
     # (e.g. "lower(email)"); a unique one is a constraint the column-wise facts cannot see
     expression_unique: set[str] = field(default_factory=set)
     expression_indexes: set[str] = field(default_factory=set)
+    # name -> (timing, events): timing in {"before", "after", "instead of"}, events a sorted
+    # subset of {"insert", "update", "delete", "truncate"}; disabled triggers are left out
+    triggers: dict[str, tuple[str, tuple[str, ...]]] = field(default_factory=dict)
+    # grantee (lower) -> privileges (lower: select/insert/update/delete/...); the table owner's
+    # implicit rights are left out
+    grants: dict[str, frozenset[str]] = field(default_factory=dict)
+    # structural categories (see recon.structure.CATEGORIES) this reader cannot deliver;
+    # empty = it delivered them all
+    unsupported: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -791,6 +800,97 @@ def quote_ident(name: str, quote: str) -> str:
     return quote + name.replace(quote, quote * 2) + quote
 
 
+# pg_trigger.tgtype bit flags (row(1), before(2), then one bit per event, instead(64))
+_PG_TRIGGER_EVENTS = ((4, "insert"), (8, "delete"), (16, "update"), (32, "truncate"))
+
+
+def _pg_trigger_shape(tgtype: int) -> tuple[str, tuple[str, ...]]:
+    timing = "instead of" if tgtype & 64 else "before" if tgtype & 2 else "after"
+    return timing, tuple(ev for bit, ev in _PG_TRIGGER_EVENTS if tgtype & bit)
+
+
+def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> SchemaFacts:
+    """One table's Unity Catalog facts over information_schema, shared by the Databricks
+    adapters. Delta has no indexes or triggers, so both are declared unsupported rather than
+    silently empty. UC foreign keys are informational: no actions to read."""
+    facts = SchemaFacts(table=f"{catalog}.{schema}.{table}", unsupported=frozenset({"indexes", "triggers"}))
+    rows = run_query(
+        f"SELECT tc.constraint_type, tc.constraint_name, kcu.column_name, "
+        "uk.table_schema, uk.table_name, uk.column_name "
+        f"FROM {catalog}.information_schema.table_constraints tc "
+        f"LEFT JOIN {catalog}.information_schema.key_column_usage kcu "
+        "  ON kcu.constraint_catalog = tc.constraint_catalog "
+        " AND kcu.constraint_schema = tc.constraint_schema "
+        " AND kcu.constraint_name = tc.constraint_name "
+        " AND kcu.table_name = tc.table_name "
+        f"LEFT JOIN {catalog}.information_schema.referential_constraints rc "
+        "  ON rc.constraint_catalog = tc.constraint_catalog "
+        " AND rc.constraint_schema = tc.constraint_schema "
+        " AND rc.constraint_name = tc.constraint_name "
+        f"LEFT JOIN {catalog}.information_schema.key_column_usage uk "
+        "  ON uk.constraint_catalog = rc.unique_constraint_catalog "
+        " AND uk.constraint_schema = rc.unique_constraint_schema "
+        " AND uk.constraint_name = rc.unique_constraint_name "
+        " AND uk.ordinal_position = kcu.position_in_unique_constraint "
+        "WHERE tc.table_catalog = %(catalog)s AND tc.table_schema = %(schema)s "
+        "AND tc.table_name = %(table)s "
+        "ORDER BY tc.constraint_name, kcu.ordinal_position",
+        {"catalog": catalog, "schema": schema, "table": table})
+    by_con: dict[str, list] = {}
+    for ctype, cname, col, ref_schema, ref_table, ref_col in rows:
+        entry = by_con.setdefault(cname, [ctype, [], None, []])
+        if col is not None:
+            entry[1].append(col)
+        if ref_table is not None:
+            entry[2] = f"{ref_schema}.{ref_table}"
+            if ref_col is not None:
+                entry[3].append(ref_col)
+    for ctype, cols, ref, ref_cols in by_con.values():
+        kind = str(ctype).upper()
+        if kind == "PRIMARY KEY":
+            facts.primary_key = tuple(cols)
+        elif kind == "UNIQUE":
+            facts.unique.add(tuple(cols))
+        elif kind == "FOREIGN KEY" and ref is not None:
+            facts.foreign_keys.add((tuple(cols), ref, tuple(ref_cols)))
+        elif kind == "CHECK":
+            facts.check_count += 1
+    rows = run_query(
+        f"SELECT column_name, is_nullable, is_identity FROM {catalog}.information_schema.columns "
+        "WHERE table_catalog = %(catalog)s AND table_schema = %(schema)s AND table_name = %(table)s",
+        {"catalog": catalog, "schema": schema, "table": table})
+    for col, nullable, identity in rows:
+        if str(nullable).upper() == "NO":
+            facts.not_null.add(col)
+        if str(identity).upper() == "YES":
+            facts.identity_columns.add(col)
+    rows = run_query(
+        f"SELECT cc.check_clause FROM {catalog}.information_schema.check_constraints cc "
+        f"JOIN {catalog}.information_schema.table_constraints tc "
+        "  ON tc.constraint_catalog = cc.constraint_catalog "
+        " AND tc.constraint_schema = cc.constraint_schema "
+        " AND tc.constraint_name = cc.constraint_name "
+        "WHERE tc.table_catalog = %(catalog)s AND tc.table_schema = %(schema)s "
+        "AND tc.table_name = %(table)s",
+        {"catalog": catalog, "schema": schema, "table": table})
+    facts.check_count = max(facts.check_count, len(rows))
+    facts.checks = {clause for (clause,) in rows}
+    rows = run_query(
+        f"SELECT tp.grantee, tp.privilege_type FROM {catalog}.information_schema.table_privileges tp "
+        f"JOIN {catalog}.information_schema.tables t "
+        "  ON t.table_catalog = tp.table_catalog AND t.table_schema = tp.table_schema "
+        " AND t.table_name = tp.table_name "
+        "WHERE tp.table_catalog = %(catalog)s AND tp.table_schema = %(schema)s "
+        "AND tp.table_name = %(table)s AND tp.grantee <> t.owner "
+        "ORDER BY tp.grantee",
+        {"catalog": catalog, "schema": schema, "table": table})
+    grants: dict[str, set] = {}
+    for grantee, priv in rows:
+        grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
+    facts.grants = {g: frozenset(p) for g, p in grants.items()}
+    return facts
+
+
 def _split_table(table: str, default_schema: str | None) -> tuple[str | None, str]:
     parts = table.replace("[", "").replace("]", "").replace('"', "").split(".")
     return (parts[-2] if len(parts) > 1 else default_schema), parts[-1]
@@ -942,6 +1042,35 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             (schema, name))
         facts.check_count = len(rows)
         facts.checks = {definition for (definition,) in rows}
+        rows = self._rows(
+            "SELECT tr.name, tr.is_instead_of_trigger, te.type_desc "
+            "FROM sys.triggers tr "
+            "JOIN sys.objects o ON o.object_id = tr.parent_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "LEFT JOIN sys.trigger_events te ON te.object_id = tr.object_id "
+            "WHERE s.name = ? AND o.name = ? AND tr.parent_class = 1 AND tr.is_disabled = 0 "
+            "ORDER BY tr.name", (schema, name))
+        by_trigger: dict[str, tuple] = {}
+        for tname, is_instead, type_desc in rows:
+            timing, events = by_trigger.setdefault(
+                tname, ("instead of" if is_instead else "after", []))
+            if type_desc:
+                events.append(str(type_desc).lower())
+        for tname, (timing, events) in by_trigger.items():
+            facts.triggers[tname] = (timing, tuple(sorted(set(events))))
+        rows = self._rows(
+            "SELECT dp.name, p.permission_name "
+            "FROM sys.database_permissions p "
+            "JOIN sys.database_principals dp ON dp.principal_id = p.grantee_principal_id "
+            "JOIN sys.objects o ON o.object_id = p.major_id "
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "WHERE p.class = 1 AND s.name = ? AND o.name = ? AND p.state IN ('G', 'W') "
+            "AND dp.principal_id <> s.principal_id "  # the schema owner's implicit rights are not grants
+            "ORDER BY dp.name", (schema, name))
+        grants: dict[str, set] = {}
+        for grantee, priv in rows:
+            grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
+        facts.grants = {g: frozenset(p) for g, p in grants.items()}
         return facts
 
     def numeric_columns(self, table: str) -> set[str]:
@@ -1063,6 +1192,7 @@ class DatabricksTargetAdapter:
 
     def __init__(self, secret_name: str, catalog: str, schema: str):
         # names are validated before a session is opened so a bad name never leaks one
+        self._catalog, self._schema = catalog, schema
         self._prefix = f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
         self._conn = _databricks_connect(secret_name)
         self._sql = _SqlAdapterBase(self._conn)
@@ -1078,6 +1208,10 @@ class DatabricksTargetAdapter:
 
     def _q(self, object: str) -> str:
         return self._prefix + quote_ident(object, "`")
+
+    def schema_facts(self, object: str) -> SchemaFacts:
+        return _uc_schema_facts(lambda sql, params: self._sql._rows(sql, params),
+                                self._catalog, self._schema, object)
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None) -> dict[str, dict[str, Any]]:
@@ -1248,6 +1382,27 @@ class _PostgresBase(_SqlAdapterBase):
                 facts.not_null.add(col)
             if has_seq:
                 facts.identity_columns.add(col)
+        rows = self._rows(
+            "SELECT t.tgname, t.tgtype::int "
+            "FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND NOT t.tgisinternal AND t.tgenabled <> 'D' "
+            "ORDER BY t.tgname", (schema, name))
+        for tname, tgtype in rows:
+            facts.triggers[tname] = _pg_trigger_shape(int(tgtype))
+        rows = self._rows(
+            "SELECT tp.grantee, tp.privilege_type "
+            "FROM information_schema.table_privileges tp "
+            "JOIN pg_class c ON c.relname = tp.table_name "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = tp.table_schema "
+            "WHERE tp.table_schema = %s AND tp.table_name = %s "
+            "AND tp.grantee <> pg_get_userbyid(c.relowner) "
+            "ORDER BY tp.grantee", (schema, name))
+        grants: dict[str, set] = {}
+        for grantee, priv in rows:
+            grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
+        facts.grants = {g: frozenset(p) for g, p in grants.items()}
         return facts
 
     # In-flight keys travel as one text[] per key column and are cast to the column's declared
