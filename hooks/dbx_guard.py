@@ -401,7 +401,7 @@ class _Seg:
     ctx: str = ""                                      # text of the prefixes / wrapper (`ssh host`) it runs under
     remote: str = ""                                   # remote execution wrapper, when the command runs outside this workspace
     env: dict[str, str] = field(default_factory=dict)  # environment inherited by this command after shell assignments and unset
-    depth: int = 0
+    multi: frozenset[str] = frozenset()
     at: str | None = ""                                # directory it runs in ('' the workspace root, None unresolvable)
     alts: list[str] = field(default_factory=list)      # the directories it may run in when `at` is None because of `x || cd d`
     sub: int = 0                                       # how many `( )` subshells enclose it
@@ -671,32 +671,38 @@ def _shell_runs(seg: _Seg) -> tuple[str | None, str | None, bool]:
     return None, positional[0] if positional else seg.scripts[0] if seg.scripts else None, False
 
 
-def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | None = None, at: str | None = "") -> list[_Seg]:
+def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | None = None,
+              at: str | None = "", multi: set[str] | None = None) -> list[_Seg]:
     """The simple commands of the text and of every literal it hands another shell, each with its program, what feeds it and
     the directory it runs in (`at`, moved by `cd`/`pushd`/`popd`, `env -C` for its own command only)."""
     aliases: dict[str, list[str]] = {}
     env = dict(_ENV_DEFAULTS) if env is None else env
+    multi = set() if multi is None else multi
     out: list[_Seg] = []
     dirs: list[str | None] = []
     alts: list[str] = []                                      # the directories `at` may be when it is None after `x || cd d`
-    scopes: list[tuple[str | None, list[str], list[str | None], dict[str, str]]] = []   # state outside each open subshell
-    bg, saved = 0, (at, alts, dirs, dict(env))                # the background list being read and the state before it
+    scopes: list[tuple[str | None, list[str], list[str | None], dict[str, str], set[str]]] = []   # state outside each open subshell
+    bg, saved = 0, (at, alts, dirs, dict(env), set(multi))     # the background list being read and the state before it
     before: list[str | None] = [at]                           # where the shell was before the previous command
     lost = False
     for seg in _commands(text):
         if seg.bg != bg:                                      # a `&` list runs in a subshell: what it changes ends with it
             if bg:
-                at, alts, dirs, saved_env = saved
+                at, alts, dirs, saved_env, saved_multi = saved
                 env.clear()
                 env.update(saved_env)
+                multi.clear()
+                multi.update(saved_multi)
                 before = [at] if at is not None else alts
-            bg, saved = seg.bg, (at, list(alts), list(dirs), dict(env))
+            bg, saved = seg.bg, (at, list(alts), list(dirs), dict(env), set(multi))
         while len(scopes) < seg.sub:
-            scopes.append((at, list(alts), list(dirs), dict(env)))
+            scopes.append((at, list(alts), list(dirs), dict(env), set(multi)))
         while len(scopes) > seg.sub:                          # `( ... ) || cd d`: the parent is where it was before the group
-            at, alts, dirs, saved_env = scopes.pop()
+            at, alts, dirs, saved_env, saved_multi = scopes.pop()
             env.clear()
             env.update(saved_env)
+            multi.clear()
+            multi.update(saved_multi)
             before = [at] if at is not None else alts
         seg.words = [w if not env or "$" not in w or "$" not in re.sub(r"\\.|'[^']*'?", "", r) else
                      _SHELL_VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group()), w) for w, r in zip(seg.words, seg.raw)]
@@ -711,12 +717,17 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
         if not seg.remote and seg.argv[:3] == ["aws", "ssm", "send-command"] or not seg.remote and seg.argv[:4] == [
                 "az", "vm", "run-command", "invoke"]:
             seg.remote = seg.argv0
-        env.update(a.split("=", 1) for a in (seg.assigns if not seg.argv else seg.argv[1:] if seg.argv0 in _DECLARERS else ())
-                   if _ASSIGN.match(a))   # a bare or declared assignment persists for later commands
+        assignments = (seg.assigns if not seg.argv else seg.argv[1:] if seg.argv0 in _DECLARERS else ())
+        for assignment in assignments:
+            if _ASSIGN.match(assignment):
+                name, value = assignment.split("=", 1)
+                if name not in multi:
+                    env[name] = value
         if seg.argv0 == "unset":
-            env.update((name, "") for name in seg.argv[1:] if re.fullmatch(r"[A-Za-z_]\w*", name))
+            env.update((name, "") for name in seg.argv[1:]
+                       if re.fullmatch(r"[A-Za-z_]\w*", name) and name not in multi)
         seg.env = dict(env)
-        seg.depth = depth
+        seg.multi = frozenset(multi)
         for p in seg.feeds:
             pargs, base = p.args, p.args[0].rsplit("/", 1)[-1] if p.args else ""
             if base not in ("cat", "echo", "printf", "tee") or _expands(" ".join(p.raw)):
@@ -746,8 +757,13 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
             aliases.update((a.split("=", 1)[0], shlex.split(a.split("=", 1)[1])) for a in seg.argv[1:] if "=" in a)
         before = now
         out.append(seg)
+        if seg.argv0 == "for" and len(seg.argv) >= 4 and seg.argv[2] == "in":
+            var, values = seg.argv[1], seg.argv[3:]
+            if re.fullmatch(r"[A-Za-z_]\w*", var) and values:
+                env[var] = " ".join(values)
+                multi.add(var)
         if (nested := _shell_runs(seg)[0]) is not None:
-            out.extend(_segments(nested, seg.ctx, depth + 1, env, seg.at))
+            out.extend(_segments(nested, seg.ctx, depth + 1, dict(env), seg.at, set(multi)))
     return out
 
 
@@ -1328,6 +1344,19 @@ def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[tuple[st
     return w
 
 
+def _multi_paths(s: _Seg, path: str) -> list[str]:
+    """Expand a path through every value of a loop-bound variable."""
+    paths = [path]
+    for name in s.multi:
+        joined = s.env.get(name, "")
+        if not joined:
+            continue
+        values = joined.split()
+        paths = ([*values] if path == joined else
+                 [value + path[len(joined):] for value in values] if path.startswith(joined + "/") else paths)
+    return paths
+
+
 def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[tuple[str, str, tuple[str, ...], bool, str | None]]:
     """(path, how, the `.migration` relations that block, destructive, directory) for every operand the segment may write: `>`
     redirections, output flags, interpreter code with a write call, `find` with an action, archive extraction, a SQL client's output
@@ -1336,8 +1365,10 @@ def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[tuple[str, s
     ops = [w for w in argv[1:] if not w.startswith("-")]
     values = ops + [w.split("=", 1)[1] for w in argv[1:] if "=" in w]   # `dd of=`, `--output=`
     inplace = _mutates(base, argv)
-    w = [(f, f"{op} {f}", _IN, False, at) for op, f in s.redirects() if ">" in op]
-    w += [(v, f"{base} {flag}", _IN, False, at) for flag, v in itertools.pairwise(argv) if flag in _OUTPUT_FLAGS]
+    w = [(path, f"{op} {path}", _IN, False, at) for op, f in s.redirects() if ">" in op
+         for path in _multi_paths(s, f)]
+    w += [(path, f"{base} {flag}", _IN, False, at) for flag, v in itertools.pairwise(argv) if flag in _OUTPUT_FLAGS
+          for path in _multi_paths(s, v)]
     if base == "git":
         return w + _git_writes(s, here, root, out)
     if base == "patch":
@@ -1349,21 +1380,25 @@ def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[tuple[str, s
                   for p in [*_MIGRATION_PATH.findall(text), *_PATH_LITERAL.findall(text), *_GUARD_LITERAL.findall(text)]]
             w += [(m.group(1) if m.group(1) is not None else ".", f"{base} rmtree", _ALL, False, at) for m in _RMTREE.finditer(text)]
     elif base == "find" and _mutates(base, argv):
-        w += [(o, "find with an action", _ALL, False, at) for o in ops]
+        w += [(path, "find with an action", _ALL, False, at) for o in ops for path in _multi_paths(s, o)]
     elif base in ("tar", "bsdtar") and (any(re.match(r"-?[a-zA-Z]*x", x) for x in argv[1:2]) or "--extract" in argv or "--get" in argv):
-        w += [(d, f"{base} extract into", _ALL, False, at) for d in _flag_values(argv, ("-C", "--directory")) or ["."]]
+        w += [(path, f"{base} extract into", _ALL, False, at)
+              for d in _flag_values(argv, ("-C", "--directory")) or ["."] for path in _multi_paths(s, d)]
     elif base == "unzip" and not any(x in argv for x in ("-l", "-t", "-p", "-z", "-Z")):
-        w += [(d, "unzip into", _ALL, False, at) for d in _flag_values(argv, ("-d",)) or ["."]]
+        w += [(path, "unzip into", _ALL, False, at)
+              for d in _flag_values(argv, ("-d",)) or ["."] for path in _multi_paths(s, d)]
     elif base in _GENERIC or base in _LEGACY_ONLY:
         sql = " ".join([*_flag_values(argv, _SQL_VALUE_FLAGS), *s.heredocs, *s.stdin, s.herestring or ""])
-        w += [(p, f"{base} output", _IN, False, at) for p in [*values, *_SQL_OUT_PATH.findall(sql)]]
+        w += [(path, f"{base} output", _IN, False, at)
+              for p in [*values, *_SQL_OUT_PATH.findall(sql)] for path in _multi_paths(s, p)]
     elif base not in _READERS or inplace:
         recursive = base in _RECURSIVE_HEADS and any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*", x) or x in ("--recursive", "--delete")
                                                     for x in argv[1:])
         if "xargs" in s.words and any(_touch(x, at, root) for p in s.feeds for x in p.words):
             out.append(f"`xargs {base}` on names listed from .migration/; ledgers and the allowlist change only through a recorded decision")
-        w += [(o, base, _ALL if recursive else _IN, base in _DESTRUCTIVE, at)
-              for o in (values[-1:] if base in _WRITE_LAST_OPERAND else values)]
+        w += [(path, base, _ALL if recursive else _IN, base in _DESTRUCTIVE, at)
+              for o in (values[-1:] if base in _WRITE_LAST_OPERAND else values)
+              for path in _multi_paths(s, o)]
     return w
 
 
