@@ -109,9 +109,13 @@ provenance warning and the run is not merge-eligible.
   `CREATE TABLE IF NOT EXISTS` that never lands the new column). `rerun_proof.json` carries
   `{fresh: pass|fail, evolved: pass|fail|unsupported, findings}`; without an evolved record,
   or when the pre-created shape equals the declared one, `evolved` is `unsupported` with the
-  reason, never clean; a reordered column is a `column_order` finding. `run --rerun-proof <file>`
-  copies it into `result.json`; a failed leg adds `rerun_gap` to `merge_block_reasons`, an
-  unsupported evolved leg adds `rerun_unsupported`, and either sets `merge_eligible=false`.
+  reason, never clean; a reordered column is a `column_order` finding. The DDL parser applies
+  `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN(S)` only and refuses any other `ALTER TABLE`
+  (use `--expected-shape`). `run --rerun-proof <file> --rerun-ddl <unit ddl>` (or
+  `--rerun-expected-shape`) copies it into `result.json` after checking its `expected_digest`
+  against the shape the unit declares now (a proof from an older DDL is stale and refused); a
+  failed leg adds `rerun_gap` to `merge_block_reasons`, an unsupported evolved leg adds
+  `rerun_unsupported`, and either sets `merge_eligible=false`.
 - Tiers 5-7 run even when tier 1 fails, so a FAIL names the keys, lag, and schema gaps rather than just a count.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.

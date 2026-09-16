@@ -11,7 +11,9 @@ from recon import cli
 from recon.config import ConfigError
 from recon.report import build_result
 from recon.rerun import (
+    _check_shape,
     check_proof,
+    expected_digest,
     RERUN_RECORD_KEYS,
     declared_shape,
     grade_rerun,
@@ -46,6 +48,14 @@ NEW_SHAPE = {"tables": {"orders": [
     {"name": "tags", "type": "array<struct<k:string,v:string>>", "nullable": True},
 ]}}
 OLD_SHAPE = {"tables": {"orders": NEW_SHAPE["tables"]["orders"][:2] + NEW_SHAPE["tables"]["orders"][3:]}}
+NEW_SHAPE_QUALIFIED = {"tables": {"mig.sales.orders": NEW_SHAPE["tables"]["orders"]}}
+
+
+def load_shape_dict(shape):
+    return _check_shape(shape, "test")
+
+
+DIGEST = expected_digest(load_shape_dict(NEW_SHAPE_QUALIFIED))
 
 
 def _record(run, shape, pre_shape=None, status="pass", evidence="job-run/1"):
@@ -86,7 +96,22 @@ def test_declared_shape_handles_quoted_identifiers_and_inline_constraints():
     cols = declared_shape(sql)["tables"]["mig.t"]
     assert cols == [{"name": "id", "type": "bigint", "nullable": False},
                     {"name": "name", "type": "varchar(40)", "nullable": False},
-                    {"name": "n", "type": "numeric(10,2)", "nullable": True}]
+                    {"name": "n", "type": "decimal(10,2)", "nullable": True}]
+
+
+def test_declared_shape_makes_table_level_primary_key_columns_not_null():
+    """`PRIMARY KEY (a, b)` as a table constraint is what the catalog reports as NOT NULL on a and
+    b, so the declared shape says so too; a key over a column the table lacks is a broken DDL."""
+    sql = """CREATE TABLE t (id BIGINT, day DATE, note STRING,
+      CONSTRAINT pk_t PRIMARY KEY (id, `day`));
+    CREATE TABLE u (id BIGINT, PRIMARY KEY (id));"""
+    shape = declared_shape(sql)
+    assert shape["tables"]["t"] == [{"name": "id", "type": "bigint", "nullable": False},
+                                   {"name": "day", "type": "date", "nullable": False},
+                                   {"name": "note", "type": "string", "nullable": True}]
+    assert shape["tables"]["u"] == [{"name": "id", "type": "bigint", "nullable": False}]
+    with pytest.raises(ConfigError, match="PRIMARY KEY.*missing"):
+        declared_shape("CREATE TABLE t (id BIGINT, PRIMARY KEY (id, missing));")
 
 
 def test_declared_shape_reads_nullability_only_from_top_level_clauses():
@@ -107,6 +132,28 @@ def test_declared_shape_reads_nullability_only_from_top_level_clauses():
     assert cols["code"] == {"name": "code", "type": "varchar(8)", "nullable": False}
 
 
+@pytest.mark.parametrize("alter", [
+    "ALTER TABLE t DROP COLUMN b",
+    "ALTER TABLE t RENAME COLUMN b TO c",
+    "ALTER TABLE t ALTER COLUMN b TYPE BIGINT",
+    "ALTER TABLE t CHANGE COLUMN b b STRING",
+    "ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (a)",
+    "ALTER TABLE t REPLACE COLUMNS (a INT)",
+])
+def test_declared_shape_fails_closed_on_an_alter_it_cannot_apply(alter):
+    """A schema change the parser does not apply would leave a stale declared shape that a broken
+    job could match, so it is a refusal (use --expected-shape), never harmless `other` SQL."""
+    with pytest.raises(ConfigError, match=r"ALTER TABLE.*--expected-shape"):
+        declared_shape(f"CREATE TABLE t (a INT, b INT); {alter};")
+
+
+def test_declared_shape_lets_property_and_owner_alters_through_as_other():
+    shape = declared_shape("CREATE TABLE t (a INT); ALTER TABLE t SET TBLPROPERTIES ('k' = 'v');\n"
+                           "ALTER TABLE t UNSET TBLPROPERTIES ('k'); ALTER TABLE t SET OWNER TO `grp`;")
+    assert shape["tables"]["t"] == [{"name": "a", "type": "int", "nullable": True}]
+    assert shape["statements"] == {"create_table": 1, "alter_table": 0, "other": 3}
+
+
 def test_declared_shape_refuses_ddl_without_a_create_table():
     with pytest.raises(ConfigError, match="no CREATE TABLE"):
         declared_shape("INSERT INTO t SELECT 1;")
@@ -119,6 +166,8 @@ def test_declared_shape_refuses_ddl_without_a_create_table():
     ("character varying(40)", "varchar(40)"),
     ("timestamp without time zone", "timestamp"),
     ("INTEGER", "int"),
+    ("NUMERIC(18, 2)", "decimal(18,2)"),
+    ("numeric", "decimal"),
 ])
 def test_normalize_type_folds_case_whitespace_and_common_spellings(raw, norm):
     assert normalize_type(raw) == norm
@@ -237,9 +286,14 @@ def test_column_order_drift_is_a_finding():
 
 def test_check_proof_rejects_contradictory_or_malformed_artifacts():
     good = {"unit": "u", "fresh": "pass", "evolved": "unsupported", "passed": True, "findings": [],
-            "notes": [], "evidence": {"fresh": "job/1"}, "unsupported_reason": "no evolved record"}
-    assert check_proof(good, "u", "x") == good
+            "notes": [], "evidence": {"fresh": "job/1"}, "unsupported_reason": "no evolved record",
+            "expected_digest": DIGEST}
+    assert check_proof(good, "u", "x", DIGEST) == good
+    with pytest.raises(ConfigError, match="stale"):
+        check_proof(good, "u", "x", expected_digest(load_shape_dict(OLD_SHAPE)))
     bad = [
+        {k: v for k, v in good.items() if k != "expected_digest"},
+        {**good, "expected_digest": ""},
         {**good, "passed": False},                                   # disagrees with the legs
         {**good, "evolved": "fail", "passed": True},
         {**good, "evolved": "pass", "evidence": {"fresh": "job/1"}},  # no evolved evidence
@@ -263,12 +317,12 @@ def test_check_proof_rejects_contradictory_or_malformed_artifacts():
     ]
     for proof in bad:
         with pytest.raises(ConfigError):
-            check_proof(proof, "u", "x")
+            check_proof(proof, "u", "x", DIGEST)
     failed = {**good, "evolved": "fail", "passed": False, "evidence": {"fresh": "j/1", "evolved": "j/2"},
               "findings": [{"run": "evolved", "table": "t", "check": "job_failed", "column": None,
                             "detail": "d"}]}
     del failed["unsupported_reason"]
-    assert check_proof(failed, "u", "x") == failed
+    assert check_proof(failed, "u", "x", DIGEST) == failed
 
 
 def test_evolved_is_unsupported_never_clean_when_no_prior_shape_was_exercised():
@@ -284,6 +338,26 @@ def test_evolved_is_unsupported_never_clean_when_no_prior_shape_was_exercised():
     assert out["evolved"] == "unsupported"
     assert out["unsupported_reason"] == ("evolved pre_shape equals the declared shape: nothing evolved, "
                                          "so the run proves only what fresh proved")
+
+
+def test_evolved_is_unsupported_when_the_pre_shape_lacks_a_declared_table():
+    """A table absent before the run met an empty target, so that leg was another fresh run;
+    only a table that existed in an older shape evolves."""
+    expected = declared_shape(DDL)
+    for pre in ({"tables": {}}, {"tables": {"other": OLD_SHAPE["tables"]["orders"]}}):
+        out = grade_rerun(expected, _record("fresh", NEW_SHAPE),
+                          _record("evolved", NEW_SHAPE, pre_shape=pre))
+        assert out["evolved"] == "unsupported" and out["findings"] == []
+        assert out["unsupported_reason"] == ("evolved pre_shape has no mig.sales.orders: the table did "
+                                             "not exist before the run, so that leg was a fresh run")
+
+
+def test_the_proof_carries_a_digest_of_the_shape_it_graded_against():
+    expected = declared_shape(DDL)
+    out = grade_rerun(expected, _record("fresh", NEW_SHAPE), None)
+    assert out["expected_digest"] == expected_digest(expected)
+    assert expected_digest(expected) == expected_digest(load_shape_dict(NEW_SHAPE_QUALIFIED))
+    assert expected_digest(expected) != expected_digest(load_shape_dict(OLD_SHAPE))
 
 
 def test_a_fresh_record_is_required_and_the_run_label_must_match():
@@ -334,7 +408,8 @@ def test_a_proof_with_findings_is_a_rerun_gap_whatever_its_legs_say():
     r = build_result("u", "live", "m1", "t1", [_ok()], rerun_proof=proof)
     assert r["merge_eligible"] is False and r["merge_block_reasons"] == ["rerun_gap"]
     with pytest.raises(ConfigError, match="lists a finding"):
-        check_proof(dict(proof, unit="u", notes=[], evidence={"fresh": "a", "evolved": "b"}), "u", "x")
+        check_proof(dict(proof, unit="u", notes=[], evidence={"fresh": "a", "evolved": "b"},
+                         expected_digest=DIGEST), "u", "x", DIGEST)
 
 
 def test_run_recon_carries_the_proof_into_result_json(tmp_path):
@@ -414,21 +489,35 @@ def test_run_reads_a_rerun_proof_file_and_refuses_a_malformed_one(tmp_path, monk
     monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "postgres", lambda s: object())
     monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: object())
     proof = tmp_path / "rerun_proof.json"
+    ddl = tmp_path / "ddl.sql"
+    ddl.write_text(DDL)
+    digest = expected_digest(declared_shape(DDL))
     proof.write_text(json.dumps({"unit": "u", "fresh": "pass", "evolved": "fail", "passed": False,
                                  "findings": [{"run": "evolved", "table": "t", "check": "job_failed",
                                                "column": None, "detail": "d"}],
-                                 "notes": [], "evidence": {"fresh": "j/1", "evolved": "j/2"}}))
-    args = ["run", "--unit", "u", "--family", "postgres", "--mapping", "m", "--tolerances", "t",
+                                 "notes": [], "evidence": {"fresh": "j/1", "evolved": "j/2"},
+                                 "expected_digest": digest}))
+    base = ["run", "--unit", "u", "--family", "postgres", "--mapping", "m", "--tolerances", "t",
             "--canonicalization", "c", "--mode", "live", "--source-dsn-secret", "S",
             "--target-secret", "T", "--target-catalog", "mig", "--target-schema", "s",
             "--out", str(tmp_path / "out"), "--rerun-proof", str(proof)]
+    args = base + ["--rerun-ddl", str(ddl)]
     assert cli.main(args) == 0
     assert seen["rerun_proof"]["evolved"] == "fail"
+    # the proof is bound to the DDL it graded: a DDL that moved on makes it stale
+    with pytest.raises(SystemExit, match="rerun-ddl or --rerun-expected-shape"):
+        cli.main(base)
+    ddl.write_text(DDL + "\nALTER TABLE mig.sales.orders ADD COLUMN region STRING;\n")
+    with pytest.raises(SystemExit, match="stale"):
+        cli.main(args)
+    shape = tmp_path / "expected.json"
+    shape.write_text(json.dumps(NEW_SHAPE_QUALIFIED))
+    assert cli.main(base + ["--rerun-expected-shape", str(shape)]) == 0
     proof.write_text(json.dumps({"fresh": "pass"}))
     with pytest.raises(SystemExit, match="rerun-proof"):
         cli.main(args)
     proof.write_text(json.dumps({"unit": "other", "fresh": "pass", "evolved": "pass", "passed": True,
-                                 "findings": [], "notes": [], "evidence": {}}))
+                                 "findings": [], "notes": [], "evidence": {}, "expected_digest": digest}))
     with pytest.raises(SystemExit, match="unit"):
         cli.main(args)
 
@@ -469,6 +558,6 @@ def test_lakebase_target_reads_the_observed_shape_from_pg_attribute(monkeypatch)
     conn.rows = [("order_id", "bigint", True, 1), ("amount", "numeric(18,2)", False, 2)]
     assert target.column_shape("orders") == [
         {"name": "order_id", "type": "bigint", "nullable": False},
-        {"name": "amount", "type": "numeric(18,2)", "nullable": True}]
+        {"name": "amount", "type": "decimal(18,2)", "nullable": True}]
     sql, params = conn.executed[-1]
     assert "pg_attribute" in sql and "format_type" in sql and params == ("sales", "orders")
