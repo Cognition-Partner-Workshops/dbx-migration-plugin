@@ -61,7 +61,7 @@ def test_host_matching_is_case_insensitive():
 def test_database_matching_depends_on_client():
     psql = block("psql -h lakebase-host -d ordersdb -c 'DELETE FROM t'")
     assert "legacy source" not in psql.reason
-    assert "target_hosts" in psql.reason
+    assert "allowlist" in psql.reason
     assert "legacy source" in block("sqlcmd -S lakebase-host -d ordersdb -Q 'DELETE FROM t'").reason
 
 

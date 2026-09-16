@@ -813,6 +813,13 @@ def _mentions(seg: _Seg, cfg: GuardConfig) -> bool:
     return False
 
 
+def _context(text: str, cfg: GuardConfig, legacy_only: bool = False) -> list[str]:
+    """Compatibility context lookup for checks not yet migrated to connection positions."""
+    hits = [token for token in cfg.legacy_sources
+            if re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", text, re.IGNORECASE)]
+    return hits if legacy_only else [m.group() for m in _CLIENT_WORD.finditer(text)] + hits
+
+
 # ---------------------------------------------------------------- policy
 
 def _flag_values(argv: list[str], flags: tuple[str, ...]) -> list[str]:
@@ -910,6 +917,116 @@ def _hosts(seg: _Seg, recon: list[list[str]] = ()) -> list[str]:
             for h in out if h]
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """Blank SQL comments outside string literals while preserving offsets and strings."""
+    out = list(sql)
+    quote = ""
+    i = 0
+    while i < len(sql):
+        if quote:
+            if sql[i] == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote and quote == "'":
+                    i += 2
+                    continue
+                quote = ""
+            i += 1
+            continue
+        if sql[i] in "'\"`":
+            quote = sql[i]
+            i += 1
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            end = len(sql) if end < 0 else end
+            for j in range(i, end):
+                out[j] = " "
+            i = end
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            end = len(sql) if end < 0 else end + 2
+            for j in range(i, end):
+                if sql[j] != "\n":
+                    out[j] = " "
+            i = end
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _conn(seg: _Seg, cfg: GuardConfig, sql: str) -> tuple[list[str], list[str], set[str], bool]:
+    """Resolve legacy hits, hosts, databases, and unresolved connection positions."""
+    argv = seg.argv
+    stripped = _strip_sql_comments(sql)
+    host_values = list(_flag_values(argv, _HOST_FLAGS))
+    host_values += [a.split("=", 1)[1] for a in seg.assigns if a.split("=", 1)[0] in _HOST_ENV]
+    host_values += [w for w in argv[1:2] if seg.argv0 in _DSN_POSITIONAL and not w.startswith("-")]
+    host_values += [
+        w for i, w in enumerate(argv[1:], 1)
+        if re.fullmatch(r"\$\{?\w+\}?", w) and (not argv[i - 1].startswith("-") or argv[i - 1] in _HOST_FLAGS)
+    ]
+    for match in _RECONNECT.finditer(stripped):
+        words = match.group(2).split()
+        host_values += words[:1] if match.group(1).lower() == ":connect" else words[1:2]
+    joined = " ".join(argv[1:] + list(seg.assigns))
+    host_values += re.findall(r"://(?:[^@/\s]*@)?([^:/?\s;]+)", joined + " " + stripped)
+    host_values += re.findall(r"(?i)\b(?:host|hostaddr|server|data source|addr)=([^;\s]+)", joined + " " + stripped)
+    host_values += re.findall(r"(?im)^\s*\.LOGON\s+([^/\s;]+)", stripped)
+
+    def host_value(value: str) -> str:
+        value = re.sub(r"^(?:tcp|np|lpc):", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^\$\{?(\w+)\}?$", r"\1", value)
+        return re.split(r"[,:\\]", value, 1)[0].lower()
+
+    hosts = [host_value(value) for value in host_values if value]
+    secret_hosts = {
+        match.group(1) or match.group(2)
+        for value in host_values
+        for match in [_SHELL_VAR.fullmatch(value)]
+        if match
+    }
+    literal_hosts = [host for value, host in zip(host_values, hosts)
+                     if not _SHELL_VAR.fullmatch(value)]
+    db_values = list(_flag_values(argv, ("-d", "-D", "--dbname", "--database")))
+    db_values += [words[0] for verb, *words in _RECONNECT.findall(stripped) if words]
+    db_values += re.findall(r"(?i)\b(?:database|initial catalog)=([^;\s]+)", joined + " " + stripped)
+    db_values += re.findall(r"(?i)\bUSE\s+(?:\[?DATABASE\]?\s+)?([A-Za-z_][\w$.-]*)", stripped)
+    db_values += re.findall(r"://[^/\s]+/([^/?\s;]+)", joined)
+    dbs = {value for value in db_values if value}
+
+    secret_names = {
+        match.group(1) or match.group(2)
+        for word in [*argv, *seg.assigns]
+        for match in [_SHELL_VAR.fullmatch(word.split("=", 1)[-1])]
+        if match
+    }
+    secret_names.update(
+        match.group(1) or match.group(2)
+        for word in argv
+        for match in [_SHELL_VAR.search(word)]
+        if match
+    )
+    secret_names.update(word for word in argv if "jdbc:" in word.lower() or "://" in word)
+    known_names = set(cfg.target_hosts) | set(cfg.legacy_sources)
+    def unknown(value: str) -> bool:
+        match = _SHELL_VAR.search(value)
+        return bool(match and (match.group(1) or match.group(2)) not in known_names)
+    unresolved = any(
+        unknown(value)
+        or "`" in value or "$(" in value
+        for value in [*host_values, *db_values]
+    )
+
+    hits = []
+    for token in cfg.legacy_sources:
+        if token in secret_names:
+            hits.append(token)
+        if any(token.lower() == host.lower() for host in literal_hosts):
+            hits.append(token)
+        if any((token == db if seg.argv0 in ("psql", "pgcli", "mysql", "mariadb", "usql") else
+                token.lower() == db.lower()) for db in dbs):
+            hits.append(token)
+    return list(dict.fromkeys(hits)), hosts, dbs, unresolved
+
+
 def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
     """Constructs that only produce the statement at run time. Always: `eval`/`sh -c` on a `$`-built string, an opaque producer
     piped into a shell, a shell fed by process substitution. Where a client is involved: an unmodelled wrapper in front of the
@@ -959,10 +1076,13 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     elsewhere may write when every host candidate (line and reconnect meta-commands) is allowlisted and the write resolves to an
     allowlisted catalog / database (default: the one database named by `-d`/`-D`/`--dbname`, URI, `dbname=` or a reconnect)."""
     base, tail = seg.argv0, _LEGACY_TAIL
-    legacy, hits = base in _LEGACY_ONLY, _context(seg.text, cfg, legacy_only=True)
+    if seg.remote:
+        return []
     if base in _LOADERS:
         return [_Legacy(f"`{base}` is a loader: nothing but reads ever runs against a legacy source" + tail)]
     sql, unreadable = _sql_text(seg, root, [seg.argv[1]] if base == "bcp" and len(seg.argv) > 2 and "queryout" in seg.argv[2:4] else [])
+    hits, hosts, dbs, unresolved = _conn(seg, cfg, sql)
+    legacy = base in _LEGACY_ONLY
     non_reads = _non_reads(sql)
     bad = [b.split("\n", 1)[0][:80] for b in [
         *([f"stdin from `{seg.opaque}`, a program or expansion the guard cannot read"] if seg.opaque else []),
@@ -986,16 +1106,25 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                               "(legacy_write_authorized row in .migration/06_decisions.md)")
         else:
             violations.append(_Legacy(f"{violation}; a recorded decision would allow it, but {missing}{tail}"))
-    elif not (hosts := _hosts(seg, recon)) or not all(h in cfg.target_hosts for h in hosts):
+    elif unresolved and bad:
+        violations.append(f"non-read statement through `{base}` to a connection built at run time (`{bad[0]}`); spell the host and database "
+                          f"out so the guard can resolve them: `{bad[0]}` (`target_hosts` cannot resolve it)")
+    elif not hosts or not all(
+        (host in cfg.target_hosts if host in {
+            match.group(1) or match.group(2)
+            for word in [*seg.argv, *seg.assigns]
+            for match in [_SHELL_VAR.search(word)]
+            if match
+        } else any(host.lower() == target.lower() for target in cfg.target_hosts))
+        for host in hosts
+    ):
         violations.append(f"non-read statement through `{base}` to a host that is not a literal in target_hosts {cfg.target_hosts} "
                           f"(seen: {sorted(set(hosts))[:6]}; every host must be listed, an empty list blocks every write): `{bad[0]}`")
     else:
         line = "\n".join([" ".join(w for w in seg.argv[1:] if w not in set(_flag_values(seg.argv, _SQL_VALUE_FLAGS)) | set(seg.scripts)),
                           *map(" ".join, recon)])
-        dbs = {_norm(a or b or c) for a, b, c in re.findall(
-            r"(?i)(?<![-\w])dbname=([^;\s]+)|://[^/\s]*/([^/?\s;]+)|(?:^|\s)(?:-d|-D|--dbname|--database|\\c(?:onnect)?|connect|\\r)"
-            r"[\s=](?!\S*(?:=|://))(\S+)", line)}
-        violations += _catalog_violations(sql, cfg, dbs.pop() if len(dbs) == 1 else None, f"`{base}` client")
+        default = _norm(next(iter(dbs))) if len(dbs) == 1 else None
+        violations += _catalog_violations(sql, cfg, default, f"`{base}` client")
     return violations
 
 
@@ -1271,8 +1400,16 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
     for seg in segs:
         if not seg.remote:
             continue
-        hits = _context(seg.text, cfg, legacy_only=True)
+        inner = seg.argv[seg.argv.index("--") + 1:] if "--" in seg.argv else seg.argv
+        inner_seg = _Seg(argv=inner, words=inner, raw=inner)
+        outer_words = [word.rsplit("@", 1)[-1] for word in seg.ctx.split()]
+        hits = [token for token in cfg.legacy_sources
+                if any(word.lower() == token.lower() for word in outer_words)]
+        inner_hits, _, _, _ = _conn(inner_seg, cfg, seg.text)
+        hits = list(dict.fromkeys([*hits, *inner_hits]))
         if not hits:
+            if inner_seg.argv0 in (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC):
+                violations += _check_sql_client(inner_seg, cfg, root)
             continue
         if not seg.argv:
             violations.append(f"`{seg.remote}` opens an interactive session on legacy source {hits}; the guard cannot read what would run")
@@ -1335,6 +1472,9 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
             if output:
                 violations.append(f"remote client `{base}` on legacy host {hits} writes query output to a file on the legacy host; "
                                   "legacy hosts are read-only")
+                continue
+            if _non_reads(sql):
+                violations.append(f"remote client `{base}` on legacy host {hits} is not read-only; legacy hosts are read-only")
                 continue
         modelled = (*_DBX_CLIENTS, *_LEGACY_ONLY, *_GENERIC, *_REST_CLIENTS)
         read_shape = base in _READERS and not _mutates(base, seg.argv)
