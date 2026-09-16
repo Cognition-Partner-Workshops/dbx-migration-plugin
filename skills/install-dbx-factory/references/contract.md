@@ -55,7 +55,7 @@ Message style and the one-message-per-event rule are `AGENTS.md`.
 ## Branch, PR and merge
 
 - Unit PRs and migration ledgers land on the engagement feature branch: `base_branch` is required; `main`/`master` require a recorded `trunk_base_decision`.
-- `auto_merge` is false by default and may be true only under a decision recorded at STOP A; hard `stop_mode` requires false.
+- `auto_merge` is false by default and may be true only under a decision recorded at STOP A; hard `stop_mode` requires false. In hard mode, the merge owner merges PASS PRs listed under "Awaiting manual merge" in the brief without a wave-close reply gate; rejected or paused PASS PRs need a `06_decisions.md` row, while a workflow safety halt waits for a human.
 - The normal unit deliverable is one PR per unit batch.
 - Only a live, snapshot, or transactional PASS from the independent verifier is merge-eligible.
 - Detailed manifest and PR-diff enforcement remains in `skills/migration-fanout/SKILL.md`; plan/manifest construction remains in `playbooks/4-migration_plan.md`.
@@ -66,6 +66,7 @@ Each row names the check that enforces it; the always-on rules (secrets, write s
 
 | If this happens | What catches it |
 |---|---|
+| A source probe runs before the write scope exists | Create `.migration/allowed_targets.json` with `catalogs` and `legacy_sources` before any source probe; authorized legacy writes carry `DBX_DECISION=D-<id>` with `legacy_write_authorized` and the object in `06_decisions.md`. |
 | A stop is skipped or an old approval is reused | Every stop is a dated row in `06_decisions.md`; the orchestrator re-reads it on resume and re-asks if the inputs changed. |
 | A child gets an incomplete brief | It reports BLOCKED, does nothing, and the brief says which item was missing. It never guesses. |
 | Two children write the same table | `workflow.py` collision check refuses to launch the wave; found afterwards, merges are held and the brief says so. |

@@ -6,7 +6,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 - [ ] Read the complete hand-off: units, profiles, dictionary, dependencies, targets, branch, gate, tolerances, and `.migration/` path.
 - [ ] Read the dialect skill's `SKILL.md` and `references/contract.md` fan-out guards before the first unit.
 - [ ] Run `factory-doctor --role child` with the capability contract, every unit, source secret/parameters, and hook probe; report BLOCKED on any failed check.
-- [ ] Confirm every write target is declared; never edit `.migration/` outside `.migration/recon/<unit_id>/`, `allowed_targets.json`, or the ledger.
+- [ ] Confirm every write target is declared; never edit `.migration/` outside `.migration/recon/<unit_id>/`, never edit `allowed_targets.json`, never write the ledger.
 - [ ] Never edit `05_progress.md`; it is generated from wave results, and report every changed path in `result.json`.
 
 ### Convert and deploy
