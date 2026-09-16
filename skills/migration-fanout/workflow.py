@@ -144,6 +144,7 @@ MANIFEST = json.loads(MANIFEST_BYTES)
 BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
+RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
 BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")
@@ -280,13 +281,19 @@ def override_decision(decision_id, units, ledger, word="merge_override"):
     return False
 
 
-def ledger_waiver(gate_id, units, ledger):
-    """The D-<n> of the human row that waives this gate for every unit of the batch, or None. The declaration
-    is frozen by gates_sha, so a waiver decided after STOP C is found here, not in the manifest."""
+def ledger_waiver(gate_id, units, ledger, stop_c):
+    """The D-<n> of the human row, written after this run's STOP C row, that waives this gate for every unit
+    of the batch, or None. The declaration is frozen by gates_sha, so a waiver decided after STOP C is found
+    here, not in the manifest; and a run's STOP C row is its own, so a waiver above it was an earlier run's
+    and does not carry. No stop_c row in the ledger, no waiver."""
+    after = False
     for line in ledger.splitlines():
-        for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
-            if override_decision(decision_id, [gate_id, *units], line, word="waive"):
-                return decision_id
+        if after:
+            for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
+                if override_decision(decision_id, [gate_id, *units], line, word="waive"):
+                    return decision_id
+        elif any(row_id == stop_c for row_id, _ in ledger_rows(line)):
+            after = True
     return None
 
 
@@ -588,8 +595,8 @@ def gate_outcomes(batch, reported, ledger, head):
     """The batch's gates after the child's report: every gate but a waived one takes the child's passed (with
     evidence the gated PR head carries under the unit's recon dir) or failed; the plan's status is what
     STOP C expects, never proof, so a gate the child did not report is unmet. A waived gate is the ledger's
-    and stays; a gate the child did not prove is waived if a human's row written since STOP C waives it for
-    every unit. Returns the gates and what keeps the unit from closing: any gate not proven passed, or
+    and stays; a gate the child did not prove is waived if a human's row written after this run's STOP C
+    row waives it for every unit. Returns the gates and what keeps the unit from closing: any gate not proven passed, or
     waived without its ledger row naming gate and units."""
     declared = {g["id"]: {**g, "decision_id": g.get("decision_id")} for g in batch.get("gates", [])}
     unmet = []
@@ -616,7 +623,7 @@ def gate_outcomes(batch, reported, ledger, head):
             g.update(status=r["status"], evidence=r["evidence"])
     for g in declared.values():
         if g["status"] != "waived" and (not seen[g["id"]] or g["status"] == "failed"):
-            waiver = ledger_waiver(g["id"], batch["units"], ledger)
+            waiver = ledger_waiver(g["id"], batch["units"], ledger, MANIFEST["stop_c"])
             if waiver:
                 g.update(status="waived", decision_id=waiver)
                 continue
@@ -673,19 +680,40 @@ if not gates_approved(MANIFEST.get("stop_c"), MANIFEST.get("wave"), MANIFEST.get
                      f"{' or default-accepted' if STOP_MODE == 'soft' else ''} | STOP C wave-{MANIFEST.get('wave')} "
                      "gates_sha <value> |); the manifest cannot approve its own gate list, so this run halts until STOP C "
                      "records it")
-if MODE == "rerun" and RESULT_PATH.exists():
-    try:
-        previous = json.loads(RESULT_PATH.read_text())
-    except (OSError, ValueError) as e:
-        previous = e
-    if not isinstance(previous, dict):
-        raise SystemExit(f"{RESULT_PATH} cannot say which STOP C row the wave's last run spent ({previous!r}); inspect "
-                         "or restore it before rerunning, the old approval is not reusable on its word")
-    spent = previous.get("stop_c")
-    if spent == MANIFEST["stop_c"]:
-        raise SystemExit(f"{RESULT_PATH} records a run this wave already made under STOP C row {spent}; a rerun is a new "
-                         "run of the wave, so STOP C fires again: record its new row in the ledger and name it in the "
-                         "manifest's stop_c")
+
+
+def spent_stop_c():
+    """The STOP C rows this wave's runs have spent, from its append-only run log (one {stop_c, mode, run_id}
+    line per launch) and the last result. The result holds one run, so the log is what remembers a row two
+    reruns back; a log that cannot be read is not proof a row is unspent and halts."""
+    spent = []
+    if RUNS_PATH.exists():
+        try:
+            for n, line in enumerate(RUNS_PATH.read_text().splitlines(), 1):
+                run = json.loads(line) if line.strip() else None
+                if run is not None and not (isinstance(run, dict) and isinstance(run.get("stop_c"), str)):
+                    raise ValueError(f"line {n} is not a {{stop_c, ...}} record")
+                if run is not None:
+                    spent.append(run["stop_c"])
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"{RUNS_PATH} cannot say which STOP C rows this wave's runs spent ({e}); inspect or restore "
+                             "it before running, no approval is reusable on its word") from None
+    if MODE == "rerun" and RESULT_PATH.exists():
+        try:
+            previous = json.loads(RESULT_PATH.read_text())
+        except (OSError, ValueError) as e:
+            previous = e
+        if not isinstance(previous, dict):
+            raise SystemExit(f"{RESULT_PATH} cannot say which STOP C row the wave's last run spent ({previous!r}); inspect "
+                             "or restore it before rerunning, the old approval is not reusable on its word")
+        spent.append(previous.get("stop_c"))
+    return spent
+
+
+if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
+    raise SystemExit(f"{RUNS_PATH} or {RESULT_PATH} records a run this wave already made under STOP C row "
+                     f"{MANIFEST['stop_c']}; a rerun is a new run of the wave, so STOP C fires again: record its new row in "
+                     "the ledger and name it in the manifest's stop_c")
 if sys.argv[1:2] == ["gates"]:
     validate_manifest(MANIFEST)
     sys.exit(gates_command(*sys.argv[2:3]) if len(sys.argv) == 3 else "usage: workflow.py gates <results.json>")
@@ -1344,4 +1372,7 @@ async def main():
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 
 
+if not resume and not SMOKE:
+    with RUNS_PATH.open("a") as f:
+        f.write(json.dumps({"stop_c": MANIFEST["stop_c"], "mode": MODE, "run_id": RUN_ID}, sort_keys=True) + "\n")
 asyncio.run(main())

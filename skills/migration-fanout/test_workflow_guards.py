@@ -56,6 +56,7 @@ def _batch_runtime():
         "hashlib": hashlib,
         "re": re,
         "decision_ledger": lambda: "",
+        "MANIFEST": {"stop_c": "D-2"},
         "REPLAYED": {},
         "CHILD_SCHEMA": {},
         "REPO": ".",
@@ -274,7 +275,8 @@ def test_declared_gate_list_is_hashed_into_the_manifest():
 
 
 GATES_LEDGER = ("| D-12 | user:U1 waive g-w for u, export leg retired with the legacy feed |\n"
-                "| D-13 | user:U1 waive g-other for u |\n")
+                "| D-13 | user:U1 waive g-other for u |\n"
+                f"| D-2 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n")
 
 
 def _gate_batch(*gates):
@@ -378,6 +380,26 @@ def test_a_human_waiver_recorded_after_stop_c_closes_a_declared_gate_the_child_d
                      _gate_report(gates=[{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}]), ledger)
     assert out["status"] == "PASS", out.get("one_line_summary")
     assert out["gates"] == [{**GATE, "status": "waived", "evidence": "3 rows differ", "decision_id": "D-14"}]  # what was waived over stays visible
+
+
+def test_a_waiver_written_before_this_stop_c_row_does_not_carry_into_the_run_it_approved():
+    """A wave rerun fires STOP C again and the manifest names the new row; a waiver a human wrote for the
+    earlier run sits above that row and is that run's, so it does not waive the gate here. Only rows
+    strictly after the manifest's stop_c row are post-STOP C waivers; no stop_c row, no waiver."""
+    ledger_waiver = _batch_runtime()["ledger_waiver"]
+    old = "| D-14 | user:U2 | waive g-rows for u |\n"
+    stop_c = f"| D-20 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n"
+    new = "| D-21 | user:U2 | waive g-rows for u |\n"
+    assert ledger_waiver("g-rows", ["u"], old + stop_c + new, "D-20") == "D-21"
+    assert ledger_waiver("g-rows", ["u"], old + stop_c, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], old + new, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], old + "| D-19 | user:U0 | STOP C, see D-20 for the hash |\n" + new, "D-20") is None
+    assert ledger_waiver("g-rows", ["u"], "| D-20 | user:U2 | STOP C wave-0 gates_sha x; waive g-rows for u |\n", "D-20") is None
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), old + GATES_LEDGER)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert out["gates"] == [{**GATE, "decision_id": None}]
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), GATES_LEDGER + new.replace("D-21", "D-14"))
+    assert out["status"] == "PASS", out.get("one_line_summary")
 
 
 @pytest.mark.parametrize("row", [

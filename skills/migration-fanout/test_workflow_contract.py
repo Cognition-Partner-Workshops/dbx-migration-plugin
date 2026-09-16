@@ -197,6 +197,27 @@ def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_le
     assert _result(ws)["batches"][0]["failure_class"] == "gates"
 
 
+def test_a_waiver_a_human_wrote_for_an_earlier_run_does_not_waive_the_gate_after_a_new_stop_c(tmp_path):
+    """A rerun's STOP C is a new row the manifest names; a post-STOP C waiver counts only when it is written
+    after that row, so the earlier run's waiver of the same gate and units is not silently reused."""
+    waiver = "| D-4 | user:U1 | waive g-rows for u |\n"
+    ws, cwd = _workspace(tmp_path / "before")
+    ledger = ws / ".migration" / "06_decisions.md"
+    ledger.write_text(waiver + ledger.read_text())
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "before", [_pass_report(pr, gates=[])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["batches"][0]["failure_class"] == "gates" and result["waived_gates"] == []
+    assert "D-4" not in json.dumps(result["batches"][0]["gates"])
+
+    ws, cwd = _workspace(tmp_path / "after", decisions=waiver)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "after", [_pass_report(pr, gates=[]), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["waived_gates"] == [{"batch": "b-1", "units": ["u"], "gate": "g-rows", "decision_id": "D-4"}]
+
+
 @pytest.mark.parametrize("ledger", [
     None,                                                                   # no ledger at all
     "",
@@ -313,6 +334,59 @@ def test_a_stop_c_approval_launches_one_run_of_its_wave(tmp_path):
     (ws / ".migration/waves/wave-0.base_sha").write_text(base)
     proc, calls = _run(cwd, tmp_path / "resume", [_pass_report()])
     assert proc.returncode == 0, proc.stderr  # the same run continuing is not a second run
+
+
+def test_every_run_is_appended_to_the_wave_run_log_and_a_stop_c_row_spent_by_any_of_them_is_not_reused(tmp_path):
+    """The result file holds the last run only, so alternating two STOP C rows would reuse each in turn; the
+    wave's run log is append-only and every run's stop_c is checked against all of it."""
+    ws, cwd = _workspace(tmp_path / "log")
+    proc, _ = _run(cwd, tmp_path / "log", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    assert [json.loads(l)["stop_c"] for l in runs.read_text().splitlines()] == ["D-2"]
+
+    prior = {"closed": False, "run_id": "wfr-old", "base_sha": "a" * 40, "stop_c": "D-1"}
+    log = json.dumps({"stop_c": "D-2", "mode": "start"}) + "\n" + json.dumps({"stop_c": "D-1", "mode": "rerun"}) + "\n"
+    ws, cwd = _workspace(tmp_path / "alternating", mode="rerun", prior_result=prior)
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(log)
+    proc, calls = _run(cwd, tmp_path / "alternating", [_pass_report()])
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr and "runs.jsonl" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert (ws / ".migration/waves/wave-0.runs.jsonl").read_text() == log
+
+    ws, cwd = _workspace(tmp_path / "deleted_result")  # start mode, result removed, log remembers
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start"}) + "\n")
+    proc, calls = _run(cwd, tmp_path / "deleted_result", [_pass_report()])
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "fresh", mode="rerun", prior_result=prior)
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-1", "mode": "start"}) + "\n")
+    proc, calls = _run(cwd, tmp_path / "fresh", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert [json.loads(l)["stop_c"] for l in (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()] == ["D-1", "D-2"]
+
+    ws, cwd = _workspace(tmp_path / "resume", mode="resume", run_id="wfr-old", prior_result={**prior, "stop_c": "D-2"})
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": "wfr-old"}) + "\n")
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-old\n")
+    base = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
+    (ws / ".migration/waves/wave-0.base_sha").write_text(base)
+    proc, _ = _run(cwd, tmp_path / "resume", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr  # continuing the run that spent it
+    assert len((ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("log", ["{not json\n", "[]\n", '{"mode": "start"}\n', ""])
+def test_a_run_log_that_cannot_say_which_stop_c_rows_were_spent_halts(tmp_path, log):
+    ws, cwd = _workspace(tmp_path / "ws", mode="rerun", prior_result={"closed": False, "stop_c": "D-1"})
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(log)
+    proc, calls = _run(cwd, tmp_path / "ws", [_pass_report()])
+    if log == "":
+        assert proc.returncode == 0, proc.stderr
+        return
+    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert (ws / ".migration/waves/wave-0.runs.jsonl").read_text() == log
 
 
 @pytest.mark.parametrize("prior", ["{not json", '"a string"', "[]", "null"])
