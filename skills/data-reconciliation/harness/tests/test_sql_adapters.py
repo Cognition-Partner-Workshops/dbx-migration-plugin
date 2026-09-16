@@ -1,6 +1,7 @@
 """SQL adapter statements, identifiers, literals and the source-family registry, offline."""
 import datetime as dt
 import json
+from pathlib import Path
 
 import pytest
 from recon import adapters, cli
@@ -56,6 +57,42 @@ def test_families_reports_the_registry(capsys):
     assert set(reg["untested"]) == set(UNTESTED_FAMILIES)
     assert set(reg["live_tested"]) == {"sqlserver", "postgres", "databricks"}
     assert all(f in SOURCE_ADAPTERS for f in reg["live_tested"] + reg["untested"])
+
+def test_type_map_audit_reports_findings_as_json(tmp_path, capsys):
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({"version": "m1", "objects": [{
+        "object": "orders", "root_table": "ORDERS",
+        "key": {"source": ["ORDER_ID"], "target": ["order_id"]},
+        "fields": [{"source": "AMOUNT", "target": "amount",
+                    "source_type": "NUMBER(12,2)", "target_type": "double"}]}]}))
+    canon = Path(__file__).resolve().parents[3] / "oracle-plsql" / "canonicalization.json"
+    assert cli.main(["type-map-audit", "--spec", str(spec), "--family", "oracle",
+                     "--target-kind", "databricks", "--canonicalization", str(canon)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["family_known"] and out["target_known"] and out["error"] is None
+    assert out["map"].endswith("oracle-plsql/canonicalization.json")
+    assert out["findings"][0]["field"] == "orders.AMOUNT"
+    assert out["findings"][0]["verdict"] == "contradiction" and out["findings"][0]["detail"]
+
+
+def test_type_map_audit_flags_an_unknown_family_and_multiple_maps(tmp_path, capsys):
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({"version": "m1", "objects": []}))
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "canonicalization.json").write_text(json.dumps(
+            {"type_map": {"oracle": {"databricks": {"types": []}}}}))
+    capsys.readouterr()
+    assert cli.main(["type-map-audit", "--spec", str(spec), "--family", "mysql",
+                     "--canonicalization", str(tmp_path / "a" / "canonicalization.json")]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["family_known"] is False and out["error"] is None
+    assert cli.main(["type-map-audit", "--spec", str(spec), "--family", "oracle",
+                     "--canonicalization", str(tmp_path / "a" / "canonicalization.json"),
+                     "--canonicalization", str(tmp_path / "b" / "canonicalization.json")]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] and "multiple" in out["error"]
+
 
 
 @pytest.mark.parametrize("name, quote, expected", [

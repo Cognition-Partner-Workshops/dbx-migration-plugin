@@ -39,7 +39,7 @@ You are one of potentially dozens of concurrent sessions. Everything you need is
 - Validation: (1) every unit in the batch converted and recon-green, or explicitly escalated; (2) no file outside the batch's scope touched; (3) no legacy source modified; (4) evidence sufficient for a reviewer to re-run the gate from the PR alone.
 
 ## Advice and Pointers
-- The first recon failure is usually types, not logic: numeric truncation, AVG semantics, timestamp zones. Check the field dictionary's INFERRED rows first.
+- The first recon failure is usually types, not logic: numeric truncation, AVG semantics, timestamp zones. Check the field dictionary's INFERRED rows first. `type_map_audit` in the doctor and the harness's `type map:` refusal catch a declared target type the family map forbids (zoned timestamps for Oracle `TIMESTAMP`, float/double for `NUMBER(p,s)`) before any query runs.
 - Nondeterministic legacy output diffs are resolved by the determinism rule in the recon plan, not by sorting until it passes; if no rule exists, escalate.
 - SKILL FEEDBACK is how 50 children make each other smarter; a systematic finding reported once saves 49 repeats.
 - Keep the batch's wall time short; a batch too big to finish in one session was mis-planned, so escalate rather than half-deliver.

@@ -40,7 +40,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  params: dict[str, str] | None = None,
                  snapshot: dict | None = None,
                  provenance_warnings: list[str] | None = None,
-                 depth: str = "threshold", cost: dict | None = None) -> dict:
+                 depth: str = "threshold", cost: dict | None = None,
+                 type_map: dict | None = None) -> dict:
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -68,6 +69,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "verdict": verdict,
         "merge_eligible": merge_eligible,
         "merge_authority": {"kind": "harness", "decision_id": None},
+        "type_map": type_map,
     }
 
 

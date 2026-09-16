@@ -64,6 +64,8 @@ _RANK = {"ok": 0, "skipped": 1, "warn": 2, "unverified": 3, "fail": 4}
 DRIVERS = {"databricks": "databricks.sql", "sqlserver": "pyodbc", "postgres": "psycopg"}
 # The families `dbx-recon run --family` accepts; only sqlserver and postgres have a privilege query.
 SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", "sqlserver", "teradata")
+# The harness's --target-kind values; the type map is keyed by family AND kind.
+TARGET_KINDS = ("databricks", "lakebase")
 # The committed wave contract: the guard and the harness read the working copy, so a working copy
 # that differs from HEAD is a contract nobody reviewed.
 LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
@@ -638,6 +640,85 @@ def check_recon_family_supported(plugin_root: Path, source_family: str | None) -
     if source_family not in live:
         return Check(cid, "fail", f"{source_family}: no source adapter in the harness; live-tested families: {live} ({how})", data)
     return Check(cid, "ok", f"{source_family}: live-tested source adapter ({how})", data)
+
+
+def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[Path], source_family: str | None,
+                         plugin_root: Path, params: dict[str, str] | None = None,
+                         target_kind: str = "databricks") -> Check:
+    """Committed specs' declared target types against the dialect skill's type_map for the
+    source family: the same table the harness fills undeclared targets from and refuses
+    contradictions on at run time."""
+    cid = "type_map_audit"
+    _, todo, problem = resolve_mappings(ws, role, units, mappings)
+    if problem:
+        return Check(cid, *problem)
+    if not todo:
+        return Check(cid, "skipped",
+                     f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}")
+    if not source_family:
+        return Check(cid, "unverified", "pass --source-family (or run with --wave): target types "
+                     "cannot be audited without the source family")
+    cmd = _harness_command(plugin_root)
+    if cmd is None:
+        return Check(cid, "fail", "cannot audit target types: dbx-recon not on PATH and no "
+                     "checkout harness", {"family": source_family, "target_kind": target_kind})
+    argv, cwd, how = cmd
+    canon = sorted(plugin_root.glob("skills/*/canonicalization.json"))
+    cargs = [a for c in canon for a in ("--canonicalization", str(c))]
+    pargs = [a for k, v in (params or {}).items() for a in ("--param", f"{k}={v}")]
+    data = {"family": source_family, "target_kind": target_kind, "harness": how}
+    contradictions, unmapped, undeclared, fields = [], [], 0, 0
+    family_known = target_known = False
+    rel = None
+    for _, p_ in sorted(todo.items(), key=lambda kv: str(kv[1])):
+        rc, out, err = _run(argv + ["type-map-audit", "--spec", str(p_), "--family", source_family,
+                                  "--target-kind", target_kind, *cargs, *pargs],
+                            **({"cwd": cwd} if cwd else {}))
+        reg = None
+        if rc == 0:
+            try:
+                reg = json.loads(out)
+            except ValueError:
+                pass
+        if not isinstance(reg, dict) or not isinstance(reg.get("findings"), list)                 or not all(isinstance(f.get("verdict"), str) for f in reg["findings"]):
+            return Check(cid, "fail", f"cannot audit target types ({how} type-map-audit rc={rc}): "
+                         f"{_redact(err or out)}", data)
+        if reg.get("error"):
+            return Check(cid, "fail", f"{p_}: {_redact(str(reg['error']))} ({how})", data)
+        family_known |= bool(reg.get("family_known"))
+        target_known |= bool(reg.get("target_known"))
+        if reg.get("map"):
+            mp = Path(reg["map"])
+            rel = str(mp.relative_to(plugin_root)) if mp.is_relative_to(plugin_root) else str(mp)
+        for row in reg["findings"]:
+            fields += 1
+            if row["verdict"] in ("contradiction", "unrepresentable"):
+                contradictions.append(row)
+            elif row["verdict"] == "unmapped":
+                unmapped.append(row)
+            elif row["verdict"] == "undeclared":
+                undeclared += 1
+    if not target_known:
+        if family_known:
+            return Check(cid, "warn", f"no {source_family}->{target_kind} type map in any "
+                         f"skills/*/canonicalization.json ({how}); the spec's target types are "
+                         "unaudited", {**data, "family_known": True})
+        return Check(cid, "warn", f"no type map for {source_family} in any "
+                     "skills/*/canonicalization.json; the spec's target types are unaudited "
+                     "(adding a family is JSON)", {**data, "family_known": False})
+    data.update({"map": rel, "fields": fields,
+                 "unmapped": [r["field"] for r in unmapped], "undeclared": undeclared})
+    if contradictions:
+        shown = "; ".join(f"{r['field']} {r['source_type']} -> declared "
+                          f"{r['target_type']}, map says {r['detail']}"
+                          for r in contradictions[:5])
+        more = f" …and {len(contradictions) - 5} more" if len(contradictions) > 5 else ""
+        return Check(cid, "fail", f"{len(contradictions)} field(s) declare a target type the "
+                     f"{source_family} type map forbids: {shown}{more} ({how})",
+                     {**data, "contradictions": contradictions})
+    return Check(cid, "ok", f"{fields} typed fields agree with {rel}; {len(unmapped)} unmapped "
+                 f"source types recorded, {undeclared} undeclared targets the harness fills at run "
+                 f"time ({how})", data)
 
 
 # ------------------------------------------------------------------ delete evidence (source CDC)
@@ -1596,7 +1677,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         expect_host: str | None = None, lakebase_project: str | None = None,
         lakebase_parent_branch: str | None = None, lakebase_dsn: str | None = None,
         lakebase_schema: str | None = None, analytical_schema: str | None = None,
-        source_attested: str | None = None, live_playbooks: Path | None = None) -> dict:
+        source_attested: str | None = None, live_playbooks: Path | None = None,
+        target_kind: str = "databricks") -> dict:
     checks: list[Check] = [
         _merge("workspace", [check_workspace(ws), check_stop_mode(ws)]),
         _merge("allowed_targets", [check_allowed_targets(ws, plugin_root),
@@ -1607,6 +1689,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         check_official_plugin(plugin_root),
         _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
         check_recon_family_supported(plugin_root, source_family),
+        check_type_map_audit(ws, role, units or [], mappings or [], source_family,
+                             plugin_root, params=params, target_kind=target_kind),
         check_delete_evidence_all(ws, role, units or [], mappings or [], source_secret, plugin_root,
                                   params=params),
         check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
@@ -1677,6 +1761,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source-secret", help="env var NAME holding the read-only source DSN (value never printed)")
     p.add_argument("--source-family", choices=SOURCE_FAMILIES,
                    help="source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
+    p.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks",
+                   help="recon target the type_map is audited against (same default the harness "
+                        "run uses: databricks)")
     p.add_argument("--source-attested", metavar="D-<id>",
                    help="decision id in .migration/06_decisions.md attesting the source has no principal to query "
                         "(files in object storage, a read-only share, a static dump); rejected for families with a "
@@ -1733,7 +1820,8 @@ def main(argv: list[str] | None = None) -> int:
                  a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params,
                  a.expect_catalogs, a.source_family, a.expect_host, a.lakebase_project,
                  a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema, a.analytical_schema,
-                 source_attested=a.source_attested, live_playbooks=a.live_playbooks)
+                 source_attested=a.source_attested, live_playbooks=a.live_playbooks,
+                 target_kind=a.target_kind)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
