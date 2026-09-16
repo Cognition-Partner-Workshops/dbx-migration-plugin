@@ -11,6 +11,7 @@ AGENTS.md                   always-on guardrails
 hooks.json, hooks/          PreToolUse write-scope guard (fail closed, see below)
 skills/                     one directory per skill; install-dbx-factory/playbooks/ carries the playbook chain
 skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills
+skills-extra/               optional dialect skills + Lakebridge wrapper, not loaded by the core plugin (see skills-extra/README.md)
 ```
 
 ## Install (private repo is fine)

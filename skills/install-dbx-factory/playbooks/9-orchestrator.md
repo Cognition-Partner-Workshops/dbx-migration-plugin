@@ -68,6 +68,7 @@ Process contract (stops, stop_mode, D1–D10, notifications, branch/merge, fan-o
 ## Forbidden Actions
 - Do NOT advance past a stop without writing its decision row with honest provenance; never write `user:` without a human reply, never accept a default at STOP E or in hard mode.
 - Do NOT post per-PR merge prompts; merge authority is decided by `stop_mode`/`auto_merge`, and manual merges are batched into the wave-close message.
+- Do NOT merge a unit whose `result.json` says `merge_eligible=false` without a human's `merge_override` row in `06_decisions.md` naming the unit; the workflow enforces this (`merge-authority` guard in `migration-fanout`) and its result's `merge_overrides` list goes into the wave-close brief.
 - Do NOT choose or widen the pipeline, and do NOT adjust tolerances or dependency decisions mid-wave; changes go back through the plan and its stop.
 - Do NOT convert units, author recon queries, or write application code in the parent, and do NOT re-verify targets by re-querying them yourself: the parent gates on the children's evidence and the independent `!dbx_data_reconciliation` session's report; parent-side re-verification duplicates that work at parent-session cost.
 - Do NOT sit in multi-hour polling loops on in-flight children; use the dynamic workflow (or gather with generous timeouts, notify-on-settle where the platform offers it) and spend parent compute only on exceptions and wave close.

@@ -26,6 +26,15 @@ def _mode_note(mode: str) -> str:
     return MODE_NOTES.get(mode, "")
 
 
+def _authority_line(result: dict) -> str:
+    """The harness is the only authority this file writes. A merge past merge_eligible=false needs a
+    human_override the workflow checks against a merge_override row of .migration/06_decisions.md."""
+    authority = result.get("merge_authority") or {"kind": "harness", "decision_id": None}
+    return (f"- Merge authority: `{authority['kind']}`"
+            + (f" ({authority['decision_id']})" if authority.get("decision_id") else "")
+            + " (human_override needs a merge_override row in .migration/06_decisions.md naming the unit)")
+
+
 def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: str,
                  tiers: list[TierResult], seed: int = 0,
                  params: dict[str, str] | None = None,
@@ -58,6 +67,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "warnings": warnings,
         "verdict": verdict,
         "merge_eligible": merge_eligible,
+        "merge_authority": {"kind": "harness", "decision_id": None},
     }
 
 
@@ -69,6 +79,7 @@ def render_report(result: dict) -> str:
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
         (f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
          "(fixture/continuous evidence never merges)"),
+        _authority_line(result),
         f"- Mapping version: `{result['mapping_version']}`",
         f"- Tolerance version: `{result['tolerance_version']}`",
         f"- Seed: `{result.get('seed', 0)}`" + (f" | Params: `{result['params']}`"
@@ -121,6 +132,7 @@ def render_summary(result: dict) -> str:
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
         (f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
          "(fixture/continuous evidence never merges)"),
+        _authority_line(result),
         f"- Mapping `{result['mapping_version']}` / tolerances `{result['tolerance_version']}`"
         f" / seed `{result.get('seed', 0)}` / depth `{result.get('depth', 'threshold')}`"
         + (f" / params `{result['params']}`" if result.get("params") else ""),

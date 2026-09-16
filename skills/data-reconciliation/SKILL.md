@@ -90,6 +90,7 @@ provenance warning and the run is not merge-eligible.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.
 - Only PASS results in `live`, `snapshot`, or `transactional` mode have `merge_eligible=true`; fixture and continuous evidence never merges.
+- `result.json` always names `merge_authority: {kind: harness, decision_id: null}`; the harness never writes `human_override`. Merging past `merge_eligible=false` is the workflow's `merge_authority` check against a `merge_override` row in `.migration/06_decisions.md` (see `migration-fanout`).
 
 ## Source access
 

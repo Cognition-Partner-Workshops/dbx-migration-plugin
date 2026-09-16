@@ -521,6 +521,15 @@ def test_merge_eligibility_by_mode():
                         [TierResult(1, "x", False, 1, [])])["merge_eligible"] is False
 
 
+def test_result_names_the_harness_as_merge_authority():
+    from recon.report import build_result, render_report, render_summary
+    from recon.tiers import TierResult
+    for mode in ("live", "fixture"):
+        result = build_result("u", mode, "m", "t", [TierResult(1, "x", True, 1, [])])
+        assert result["merge_authority"] == {"kind": "harness", "decision_id": None}
+        assert "human_override" in render_report(result) and "06_decisions.md" in render_summary(result)
+
+
 def test_unversioned_inputs_rejected(tmp_path: Path):
     import pytest
     from recon.config import ConfigError
