@@ -41,9 +41,9 @@ Committed = Callable[[str], bool]
 
 def git_committed(repo: Path) -> Committed:
     """`committed(path)`: the file is in HEAD's tree of `repo`, present on disk at that path and
-    byte-identical to the committed blob. Untracked, staged-only, edited, deleted and out-of-tree
-    paths are not committed artifacts, and neither is anything reached through a symlink (the link
-    may be committed; what it points at is not)."""
+    byte-identical to the committed blob in both the index and the worktree. Untracked, staged-only,
+    edited, deleted and out-of-tree paths are not committed artifacts, and neither is anything reached
+    through a symlink (the link may be committed; what it points at is not)."""
     repo = Path(repo)
 
     def git(*args: str) -> bool:
@@ -61,6 +61,7 @@ def git_committed(repo: Path) -> Committed:
             if node.is_symlink():
                 return False
         return (git("cat-file", "-e", f"HEAD:{path}")
+                and git("diff", "--cached", "--quiet", "HEAD", "--", path)
                 and git("diff", "--quiet", "HEAD", "--", path))
     return committed
 

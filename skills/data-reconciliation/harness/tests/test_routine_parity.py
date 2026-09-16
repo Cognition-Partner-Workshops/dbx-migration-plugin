@@ -156,7 +156,9 @@ def test_git_committed_is_true_only_for_a_file_present_on_disk_and_in_head(tmp_p
     _git(repo, "add", "recon/a.run.json")
     assert not committed("recon/a.run.json")  # the edit staged, HEAD still differs
     (repo / "recon" / "a.run.json").write_text("{}\n")
-    assert committed("recon/a.run.json")  # back to the committed blob
+    assert not committed("recon/a.run.json")  # disk back to HEAD, but the index still holds the edit
+    _git(repo, "add", "recon/a.run.json")
+    assert committed("recon/a.run.json")  # index and disk both back to the committed blob
     (repo / "fixtures" / "snap").unlink()
     assert not committed("fixtures/snap")  # in HEAD, gone from disk
     assert not committed("../outside") and not committed("/etc/hostname") and not committed("")
