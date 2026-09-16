@@ -35,6 +35,25 @@
 
 The `--expect-catalogs` list (the wave's capability contract) differs from the allowlist's `catalogs`; `skipped` without the flag.
 
+### `playbooks_in_sync`
+
+`.migration/playbooks.lock.json` (written by `install-dbx-factory` after it syncs the org playbook
+library) holds every macro's repo-file sha256; the row fails when a macro is `stale` (hash differs),
+`missing` from the lock, or `unknown` in the lock but gone from the repo, or when a `*.md` in
+`playbooks/` is not in the 0-README Files table. An entry whose `sha256`/`repo_file`/`installed_at`
+is not all strings is `malformed` (named first). Missing lock: `skipped` under `--role setup` (the
+setup step of `1-migration_setup` runs with it), `fail` for orchestrator/child — re-run
+`install-dbx-factory`, the only fix.
+
+The lock alone proves repo == last sync receipt. Under `--role orchestrator` the row also requires
+`.migration/live_playbooks.json` — the `[{"macro","playbook_id","content"}]` export the orchestrator
+writes with `devin_playbook_manage` right before the doctor (see `9-orchestrator` step 6) —
+absent, older than 15 minutes, or malformed is `fail`; `child`/`setup` only check it when present.
+Each repo macro's live body is compared to the repo file (line-ending and trailing-newline
+normalized): a mismatch is `live_stale`, no record is `live_missing`, more than one record is
+`duplicate` (the fix is to archive the extra live playbook, then re-sync). With a fresh export,
+`ok` proves live == repo, not just repo == receipt.
+
 ### `hooks_files`
 
 `hooks.json` missing/malformed or does not register `hooks/dbx_guard.py` as `PreToolUse`.
@@ -85,6 +104,7 @@ The detailed privilege and remediation text remains here so the invocation contr
 | `allowed_targets` | `allowed_targets.json` missing, invalid, or rejected by the guard; `warn` if `guard_mode: warn` or `legacy_sources` empty | `hooks/dbx_guard.py` |
 | `allowlist_committed` | `.migration/allowed_targets.json` or `.migration/03_recon_tolerances.json` is not byte-equal to `git show HEAD:<path>`: the row names the file and its state (`modified since HEAD`, `untracked`, `missing`). A tolerance or catalog changes through a recorded decision and a commit, never on a working copy | `git` |
 | `allowlist_matches_contract` | the `--expect-catalogs` list (the wave's capability contract) differs from the allowlist's `catalogs`; `skipped` without the flag | `allowed_targets.json` |
+| `playbooks_in_sync` | the lock `.migration/playbooks.lock.json` is missing (fail; `skipped` only under `--role setup`), unreadable, has a `malformed` entry (non-string `sha256`/`repo_file`/`installed_at`), or differs from the repo playbook files — `stale` sha, `missing` macro, `unknown` macro in the lock but not the repo, or a `*.md` under `playbooks/` absent from the 0-README Files table. Under `--role orchestrator` a fresh (<15 min) `.migration/live_playbooks.json` export is also required: absent/stale/malformed fails, and each live body must equal its repo file — mismatched is `live_stale`, no record `live_missing`, more than one `duplicate` (archive the extra). `ok` with the export proves live == repo; without it, repo == last sync receipt. Re-run `install-dbx-factory` | `.migration/playbooks.lock.json`, `.migration/live_playbooks.json` |
 | `hooks_files` | `hooks.json` missing/malformed or does not register `hooks/dbx_guard.py` as `PreToolUse` | plugin root |
 | `hook_guard_functional` | the guard, invoked directly, fails to block the probe with a reason naming the full `__dbx_guard_probe__<nonce>` token the doctor sent, with a nonce fresh per run (a blanket deny, even one that hardcodes the prefix or a token seen before, is not proof it read the command) | `hooks/dbx_guard.py` |
 | `hook_platform_loaded` | live probe ran unblocked; `unverified` until `--hook-probe-result blocked:<nonce>` repeats the pending nonce (`data.probe_nonce`, `data.probe_command`) | this session |

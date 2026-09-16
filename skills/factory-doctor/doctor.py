@@ -13,7 +13,7 @@ Usage:
                       [--mapping mapping_spec.json ...] [--source-secret NAME] [--source-family F]
                       [--param NAME=VALUE ...] [--lakebase-project NAME] [--lakebase-parent-branch NAME]
                       [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME]
-                      [--analytical-schema CATALOG.SCHEMA] [--out PATH]
+                      [--analytical-schema CATALOG.SCHEMA] [--live-playbooks PATH] [--out PATH]
 
 Exit code 0 when `ready`; 1 otherwise. `ready` requires no `fail` anywhere, every security
 control (SECURITY_CONTROLS: guard functional, hooks loaded by the platform, identity) to be `ok`,
@@ -67,6 +67,9 @@ SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", 
 # that differs from HEAD is a contract nobody reviewed.
 LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
 CAPABILITIES = ".migration/09_capabilities.json"
+PLAYBOOKS_LOCK = ".migration/playbooks.lock.json"
+LIVE_PLAYBOOKS = ".migration/live_playbooks.json"
+LIVE_PLAYBOOKS_MAX_AGE = datetime.timedelta(minutes=15)
 HOOK_PROBE_NONCE = ".migration/.hook_probe_nonce"
 HOOK_PROBE_NONCE_TTL = 8 * 60 * 60
 
@@ -364,6 +367,139 @@ def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None
                      f"allowlist catalogs {cats} differ from the contract's {expected}; a catalog is "
                      "added by a recorded decision and a new doctor run, never by editing either side", data)
     return Check("allowlist_matches_contract", "ok", f"allowlist catalogs match the contract: {cats}", data)
+
+
+# Files in the playbooks dir that are documentation, not importable playbooks (the README itself
+# and the pre-kickoff intake form the front doors consume).
+_NOT_PLAYBOOKS = frozenset({"0-README.md", "00_intake_template.md"})
+_README_MACRO_ROW = re.compile(r"\|\s*`([^`]+\.md)`\s*\|[^|]*\|\s*`(![\w]+)`\s*\|")
+
+
+def _repo_playbooks(plugin_root: Path) -> dict[str, tuple[str, str]]:
+    """macro -> (repo_file, sha256 of the file bytes). Macros come from the Files table in
+    playbooks/0-README.md: rows `| `<file>` | <title> | `!<macro>` |`."""
+    playbooks = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
+    macros: dict[str, tuple[str, str]] = {}
+    readme = playbooks / "0-README.md"
+    if readme.is_file():
+        for line in readme.read_text().splitlines():
+            m = _README_MACRO_ROW.match(line)
+            if not m:
+                continue
+            p = playbooks / m.group(1)
+            if p.is_file() and p.name not in _NOT_PLAYBOOKS:
+                macros[m.group(2)] = (p.name, hashlib.sha256(p.read_bytes()).hexdigest())
+    return macros
+
+
+def _norm(s: str) -> str:
+    return s.replace("\r\n", "\n").rstrip("\n")
+
+
+def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str,
+                            live_playbooks: Path | None = None) -> Check:
+    """The playbooks installed in the org library, proven against the repo copies the wave contract
+    was reviewed from: install-dbx-factory records each macro's file sha256 in the lock it writes,
+    and the orchestrator exports the live library to .migration/live_playbooks.json right before
+    the doctor so the live bodies can be compared too; any drift means a live playbook is not the
+    reviewed one."""
+    cid = "playbooks_in_sync"
+    lock = ws / PLAYBOOKS_LOCK
+    if not lock.is_file():
+        if role == "setup":
+            return Check(cid, "skipped", f"no {PLAYBOOKS_LOCK} yet; install-dbx-factory writes it "
+                         "(warning: live playbooks unverified)", {"lock": PLAYBOOKS_LOCK})
+        return Check(cid, "fail", f"no {PLAYBOOKS_LOCK}: the playbooks installed in the org library "
+                     "are unverified; run install-dbx-factory", {"lock": PLAYBOOKS_LOCK})
+    try:
+        lock_data = json.loads(lock.read_text())
+    except (OSError, ValueError) as e:
+        return Check(cid, "fail", f"{PLAYBOOKS_LOCK} unreadable: {_redact(str(e))}", {"lock": PLAYBOOKS_LOCK})
+    if not isinstance(lock_data, dict):
+        return Check(cid, "fail", f"{PLAYBOOKS_LOCK} is not a JSON object", {"lock": PLAYBOOKS_LOCK})
+    repo = _repo_playbooks(plugin_root)
+    data: dict = {"malformed": [], "stale": [], "missing": [], "unknown": [], "unlisted": [],
+                  "checked": len(repo)}
+    for macro, (_repo_file, sha) in repo.items():
+        entry = lock_data.get(macro)
+        if entry is None:
+            data["missing"].append(macro)
+        elif not isinstance(entry, dict) or not all(
+                isinstance(entry.get(k), str) for k in ("sha256", "repo_file", "installed_at")):
+            data["malformed"].append(macro)
+        elif entry["sha256"] != sha:
+            data["stale"].append(macro)
+    data["unknown"] = sorted(m for m in lock_data if m not in repo)
+    repo_files = {f for f, _sha in repo.values()}
+    playbooks_dir = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
+    data["unlisted"] = sorted(p.name for p in playbooks_dir.glob("*.md")
+                              if p.name not in _NOT_PLAYBOOKS and p.name not in repo_files)
+    findings = [f"{k}: {', '.join(v)}" for k, v in
+                (("malformed", data["malformed"]), ("stale", data["stale"]),
+                 ("missing", data["missing"]), ("unknown", data["unknown"])) if v]
+    if data["unlisted"]:
+        findings.append(f"not in the 0-README Files table: {', '.join(data['unlisted'])}")
+    live = live_playbooks or ws / LIVE_PLAYBOOKS
+    data["live"] = None
+    data["duplicate"] = {}
+    data["live_missing"] = []
+    data["live_stale"] = []
+    age_min = None
+    if not live.is_file():
+        if role == "orchestrator" or live_playbooks is not None:
+            findings.append(f"no {live if live_playbooks else LIVE_PLAYBOOKS}: export the live library with "
+                            "devin_playbook_manage right before the doctor (see 9-orchestrator)")
+    else:
+        age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromtimestamp(
+            live.stat().st_mtime, datetime.timezone.utc)
+        age_min = int(age.total_seconds() // 60)
+        if age > LIVE_PLAYBOOKS_MAX_AGE:
+            findings.append(f"stale export ({age_min} min old, max 15): re-export")
+        else:
+            try:
+                records = json.loads(live.read_text())
+            except (OSError, ValueError):
+                records = None
+            bad = next((i for i, r in enumerate(records) if not isinstance(r, dict)
+                        or not isinstance(r.get("macro"), str)
+                        or not isinstance(r.get("content"), str)), -1) \
+                if isinstance(records, list) else -2
+            if records is None or bad != -1:
+                findings.append("live export malformed"
+                                + (f" (record {bad})" if bad >= 0 else ""))
+            else:
+                grouped: dict[str, list[dict]] = {}
+                for r in records:
+                    grouped.setdefault(r["macro"], []).append(r)
+                data["duplicate"] = {m: [r.get("playbook_id") for r in rs]
+                                     for m, rs in grouped.items() if len(rs) > 1}
+                findings += [f"duplicate: {m} ({', '.join(str(i) for i in ids)})"
+                             for m, ids in data["duplicate"].items()]
+                for macro, (f, _sha) in repo.items():
+                    rs = grouped.get(macro)
+                    if not rs:
+                        data["live_missing"].append(macro)
+                    elif _norm(rs[0]["content"]) != _norm((playbooks_dir / f).read_text()):
+                        data["live_stale"].append(macro)
+                if data["live_stale"]:
+                    findings.append(f"live stale: {', '.join(data['live_stale'])}")
+                if data["live_missing"]:
+                    findings.append(f"live missing: {', '.join(data['live_missing'])}")
+                data["live"] = {"checked": len(repo), "age_minutes": age_min}
+    if findings:
+        detail = "; ".join(findings)
+        if data["duplicate"]:
+            detail += "; duplicates: archive the extra"
+        return Check(cid, "fail", detail + " — re-run install-dbx-factory", data)
+    installed = [e["installed_at"] for e in lock_data.values()
+                 if isinstance(e, dict) and isinstance(e.get("installed_at"), str)]
+    installed_at = max(installed) if installed else "unknown"
+    detail = f"{len(repo)} playbooks match the lock written at the last " \
+             f"install-dbx-factory sync ({installed_at})"
+    if data["live"]:
+        detail += f" and the live export ({age_min} min old)"
+    return Check(cid, "ok", detail,
+                 {**data, "checked": len(repo), "installed_at": installed_at if installed else None})
 
 
 def check_official_plugin(plugin_root: Path) -> Check:
@@ -1373,9 +1509,10 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         expect_host: str | None = None, lakebase_project: str | None = None,
         lakebase_parent_branch: str | None = None, lakebase_dsn: str | None = None,
         lakebase_schema: str | None = None, analytical_schema: str | None = None,
-        source_attested: str | None = None) -> dict:
+        source_attested: str | None = None, live_playbooks: Path | None = None) -> dict:
     checks: list[Check] = [check_workspace(ws), check_stop_mode(ws), check_allowed_targets(ws, plugin_root),
-                           check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs)]
+                           check_allowlist_committed(ws), check_allowlist_matches_contract(ws, expect_catalogs),
+                           check_playbooks_in_sync(ws, plugin_root, role, live_playbooks)]
     checks += check_hooks(plugin_root, ws, probe_result)
     checks.append(check_official_plugin(plugin_root))
     checks.append(check_harness(plugin_root))
@@ -1424,7 +1561,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--workspace", type=Path, default=Path.cwd())
     p.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parents[2])
-    p.add_argument("--role", choices=("orchestrator", "child"), default="orchestrator")
+    p.add_argument("--role", choices=("orchestrator", "child", "setup"), default="orchestrator")
     p.add_argument("--wave", type=Path,
                    help="wave manifest; also writes <manifest>.doctor.json, the signed record the fan-out workflow launches from")
     p.add_argument("--hook-probe-result", default="unknown", metavar="blocked:<nonce>|not-blocked|unknown",
@@ -1456,6 +1593,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lakebase-schema", help="optional Lakebase schema to check for CREATE")
     p.add_argument("--analytical-schema", metavar="CATALOG.SCHEMA",
                    help="analytical target schema to check the principal can create and write tables in (or owns)")
+    p.add_argument("--live-playbooks", type=Path, metavar="PATH",
+                   help="JSON export of the live [DBX v1] playbooks (list of {macro, playbook_id, content}) "
+                        "written with devin_playbook_manage right before this run; default "
+                        ".migration/live_playbooks.json; required and <15 min old for --role orchestrator")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="mapping ${NAME} placeholder value, same rules and values as dbx-recon run --param")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
@@ -1497,7 +1638,7 @@ def main(argv: list[str] | None = None) -> int:
                  a.expect_identity, a.no_databricks, a.unit, a.mapping, a.source_secret, params,
                  a.expect_catalogs, a.source_family, a.expect_host, a.lakebase_project,
                  a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema, a.analytical_schema,
-                 source_attested=a.source_attested)
+                 source_attested=a.source_attested, live_playbooks=a.live_playbooks)
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
