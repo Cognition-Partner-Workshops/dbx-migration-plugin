@@ -2895,6 +2895,14 @@ def test_reuse_record_reuses_rows_and_reports_it(tmp_path):
                        capture_output=True, text=True, check=False)
     assert "doctor_record" in r.stdout and "reused" in r.stdout
     assert "reused from the orchestrator's record" in r.stdout
+    out = tmp_path / "caps.json"
+    subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
+                    "--role", "child", "--reuse-record", str(record_path), "--expect-identity", "sp-1",
+                    "--expect-host", "https://adb-1", "--out", str(out)],
+                   capture_output=True, text=True, check=False)
+    rows = json.loads(out.read_text())["checks"]
+    assert all(isinstance(c.get("reusable"), bool) for c in rows)
+    assert next(c for c in rows if c["id"] == "doctor_record")["reusable"] is False
 
 
 def test_reuse_record_falls_back_to_a_full_run_when_not_reusable(tmp_path):

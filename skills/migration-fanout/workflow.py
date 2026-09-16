@@ -319,14 +319,17 @@ def ledger_waiver(gate_id, units, ledger, stop_c):
     return None
 
 
-def declared_gates_sha(wave, batches):
+def declared_gates_sha(wave, batches, degraded=False):
     """What STOP C approved, whole: the wave, each batch's units and every gate row as declared (id, kind,
-    status, evidence, decision_id). Outcomes reach the result through the children's reports, never by
-    editing the manifest, so any edit to it after STOP C changes the hash and halts."""
+    status, evidence, decision_id), and `degraded: true` when the wave verifies at the structural tier only.
+    Outcomes reach the result through the children's reports, never by editing the manifest, so any edit to
+    it after STOP C changes the hash and halts."""
     declared = {"wave": wave, "batches": {
         b["id"]: {"units": sorted(b["units"]),
                   "gates": [[g["id"], g["kind"], g["status"], g["evidence"], g.get("decision_id")] for g in b["gates"]]}
         for b in batches}}
+    if degraded:
+        declared["degraded"] = True
     return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -506,12 +509,12 @@ def validate_manifest(m, doctor=None):
     if not (isinstance(m.get("stop_c"), str) and DECISION_ID.fullmatch(m["stop_c"])):
         raise SystemExit("manifest 'stop_c' must be the D-<n> row of 06_decisions.md that resolved STOP C for this wave "
                          "(the row that records its gates_sha)")
-    want = declared_gates_sha(m["wave"], m["batches"])
+    want = declared_gates_sha(m["wave"], m["batches"], m.get("degraded") is True)
     if m.get("gates_sha") != want:
         raise SystemExit(f"manifest 'gates_sha' is {m.get('gates_sha')!r} but the declared gate list hashes to {want}: "
                          "record that value at STOP C with the approved gates; a gate renamed, added, dropped, swapped "
-                         "for another kind or given another status or evidence since is a plan change, not a child's "
-                         "call, so this run halts")
+                         "for another kind or given another status or evidence since, or the wave declared DEGRADED "
+                         "since, is a plan change, not a child's call, so this run halts")
     src = m.get("source")
     if src is not None and (not isinstance(src, dict) or not isinstance(src.get("params", {}), dict)
                             or not all(isinstance(v, str) and WORD.fullmatch(v) for v in
@@ -1756,9 +1759,12 @@ def verify_prompt(passed, auto_merge):
         "ledger_tampered. "
         + ("This wave is declared DEGRADED (no live source read): run the harness with `--mode structural` "
            "for every unit (Tier 0 `structural_parity` only: keys, constraints, indexes, triggers, identity "
-           "columns, grants, read from both catalogs, no row tier) and mark the unit PASS on that run's "
-           "verdict=PASS, FAIL with finding structural_drift otherwise; its result.json is never "
-           "merge_eligible and that is expected here. Do not re-run Tier 1-3 and do not lower or raise a "
+           "columns, grants, read from both catalogs, no row tier) and mark the unit PASS only when that run's "
+           "result.json says verdict=PASS and its merge_block_reasons is exactly [\"mode\"]: a structural_gap "
+           "or warnings entry means a catalog the harness could not read or a category it does not cover, "
+           "which is unverified structure, so FAIL with finding structure_unverifiable; verdict=FAIL is FAIL "
+           "with finding structural_drift. Its result.json is never merge_eligible and the mode reason alone is "
+           "expected here. Do not re-run Tier 1-3 and do not lower or raise a "
            "depth: the child's snapshot row parity stands. "
            if MANIFEST.get("degraded") is True else
            f"Mark a unit PASS only if you re-ran the harness in one of {list(MERGE_EVIDENCE_MODES)} "

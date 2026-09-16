@@ -2214,9 +2214,10 @@ def main(argv: list[str] | None = None) -> int:
                  source_attested=a.source_attested, live_playbooks=a.live_playbooks,
                  target_kind=a.target_kind, secret_names=a.secret, reused=reused)
     if a.reuse_record:
-        report["checks"].append(asdict(Check(
+        report["checks"].append({**asdict(Check(
             "doctor_record", "ok" if reused else "skipped",
-            f"reused the orchestrator's record signed {reused['signed_at']}" if reused else reuse_why)))
+            f"reused the orchestrator's record signed {reused['signed_at']}" if reused else reuse_why)),
+            "reusable": False})
         if not reused:
             print(f"doctor record not reused: {reuse_why}", file=sys.stderr)
     text = json.dumps(report, indent=2, sort_keys=True)
