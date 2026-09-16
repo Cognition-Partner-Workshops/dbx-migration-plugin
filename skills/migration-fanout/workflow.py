@@ -1031,13 +1031,15 @@ def bounded_readers(spec, table, namespace=""):
 
 
 def reader_slices(spec, table, namespace=""):
-    """The slices of `table` the spec's readers recon, every reading object's boxes together (call after
-    bounded_readers found them bounded); None when no object reads it."""
+    """The slices of `table` the spec's readers recon, every reading object's boxes and each of its embeds'
+    together (the harness scopes an embed's nested reads by the embed's own predicate, so each is a read of
+    its own; call after bounded_readers found them all bounded); None when no object reads it."""
     objects = spec.get("objects", spec.get("tables"))
     mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
     if not mine:
         return None
-    return [box for o in mine for box in predicate_slices(o.get("target_where"), o.get("scope_columns", []))]
+    return [box for o in mine for row in (o, *o.get("embeds", []))
+            for box in predicate_slices(row.get("target_where"), row.get("scope_columns", o.get("scope_columns", [])))]
 
 
 def check_write_targets(batches, other_waves, mapping=None, namespace=""):

@@ -436,15 +436,42 @@ def test_shared_table_readers_whose_slices_may_overlap_halt_naming_both_units(a,
         check([{**B1, "units": ["u1", "u3"]}], _others({**B2, "units": ["u2"]}), _specs(u1=u1, u3=u2, u2=PRIOR))
 
 
-def test_reader_slices_are_the_union_of_every_object_reading_the_table():
+def test_reader_slices_are_the_union_of_every_object_and_embed_reading_the_table():
+    """Every read of the table is a slice the other readers must be apart from: each object's and, since the
+    harness scopes an embed's nested reads by the embed's own predicate, each embed's (on its own
+    scope_columns or the object's)."""
     fn = _functions()
     two = {"objects": [{**UNBOUNDED["objects"][0], "target_where": "region = 'eu'"},
-                       {**UNBOUNDED["objects"][0], "object": "MIG.T", "target_where": "region = 'us'"},
+                       {**UNBOUNDED["objects"][0], "object": "MIG.T", "target_where": "region = 'us'",
+                        "embeds": [{"array_path": "items", "target_where": "run_id = 7"},
+                                   {"array_path": "lines", "scope_columns": ["line_no"], "target_where": "line_no = 1"}]},
                        {"object": "mig.other", "target_where": "region = 'apac'"}]}
-    assert fn["reader_slices"](two, "mig.t") == _slices("region = 'eu' OR region = 'us'")
-    assert fn["disjoint_slices"](fn["reader_slices"](two, "mig.t"), _slices("region = 'apac'"))
-    assert not fn["disjoint_slices"](fn["reader_slices"](two, "mig.t"), _slices("region = 'us'"))
+    assert fn["reader_slices"](two, "mig.t") == (_slices("region = 'eu' OR region = 'us' OR run_id = 7")
+                                                 + fn["predicate_slices"]("line_no = 1", ["line_no"]))
+    other = fn["predicate_slices"]("region = 'apac' AND run_id = 8 AND line_no = 2", SCOPE + ["line_no"])
+    assert fn["disjoint_slices"](fn["reader_slices"](two, "mig.t"), other)
+    assert not fn["disjoint_slices"](fn["reader_slices"](two, "mig.t"), _slices("region = 'apac' AND run_id = 7"))
     assert fn["reader_slices"](two, "mig.none") is None
+
+
+@pytest.mark.parametrize("a, b, apart", [
+    ("run_date = '${as_of}'", "run_date = '${as_of}'", False),
+    ("run_date = '2024-01-01'", "run_date = '2024-01-01'", False),
+    ("unit_id = 'u1'", "unit_id = 'u2'", True),
+])
+def test_shared_table_embeds_must_be_apart_even_when_their_objects_are(a, b, apart):
+    """Disjoint object predicates prove nothing about the embeds' reads: two units whose embeds recon the same
+    rows of the shared table halt as an overlap; embeds apart on their own pass."""
+    check = _functions()["check_write_targets"]
+    u1 = {"objects": [{**UNBOUNDED["objects"][0], "target_where": "unit_id = 'u1'",
+                       "embeds": [{"array_path": "items", "target_where": a}]}]}
+    u2 = {"objects": [{**UNBOUNDED["objects"][0], "target_where": "unit_id = 'u2'",
+                       "embeds": [{"array_path": "items", "target_where": b}]}]}
+    if apart:
+        check([B1], OTHERS, _specs(u1=u1, u2=u2))
+    else:
+        with pytest.raises(SystemExit, match=r"'mig.t'.*u1 .*u2 .*overlap"):
+            check([B1], OTHERS, _specs(u1=u1, u2=u2))
 
 
 @pytest.mark.parametrize("scope", [None, [], "run_date", [1], [""]])
@@ -471,7 +498,8 @@ def test_embed_of_a_shared_table_reader_needs_its_own_bound(embed):
 
 
 @pytest.mark.parametrize("embed", [{"target_where": "run_date = '${as_of}'"},
-                                   {"scope_columns": ["item_run"], "target_where": "item_run = '${as_of}'"}])
+                                   {"scope_columns": ["item_run", "run_date"],
+                                    "target_where": "item_run = 1 AND run_date = '${as_of}'"}])
 def test_embed_bounded_on_its_own_or_the_objects_scope_columns_passes(embed):
     check = _functions()["check_write_targets"]
     check([B1], OTHERS, _specs(u1=_embedded(embed), u2=PRIOR))
