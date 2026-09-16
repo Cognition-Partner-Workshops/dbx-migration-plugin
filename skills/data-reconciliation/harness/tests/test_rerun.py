@@ -11,6 +11,7 @@ import pytest
 from recon import cli
 from recon.config import ConfigError
 from recon.report import build_result
+from recon.rerun import _resolve_tables
 from recon.rerun import (
     _check_shape,
     check_proof,
@@ -186,9 +187,35 @@ def test_declared_shape_refuses_ddl_without_a_create_table():
     ("INTEGER", "int"),
     ("NUMERIC(18, 2)", "decimal(18,2)"),
     ("numeric", "decimal"),
+    ("timestamp(6) without time zone", "timestamp(6)"),
+    ("timestamp(3) with time zone", "timestamptz(3)"),
+    ("time(3) without time zone", "time(3)"),
+    ("time with time zone", "timetz"),
+    ("TIMESTAMP(6)", "timestamp(6)"),
 ])
 def test_normalize_type_folds_case_whitespace_and_common_spellings(raw, norm):
     assert normalize_type(raw) == norm
+
+
+def test_declared_shape_expands_postgres_serial_to_what_the_catalog_reports():
+    """`SERIAL` is an integer column with NOT NULL and a sequence default once created, and that is
+    what format_type and is_nullable report; the declared shape says the same."""
+    cols = declared_shape("CREATE TABLE t (id SERIAL, big BIGSERIAL, small SMALLSERIAL NULL, "
+                          "n serial4 PRIMARY KEY, at TIMESTAMP(6));")["tables"]["t"]
+    assert cols == [{"name": "id", "type": "int", "nullable": False},
+                    {"name": "big", "type": "bigint", "nullable": False},
+                    {"name": "small", "type": "smallint", "nullable": False},
+                    {"name": "n", "type": "int", "nullable": False},
+                    {"name": "at", "type": "timestamp(6)", "nullable": True}]
+    observed = {"tables": {"t": [
+        {"name": "id", "type": "integer", "nullable": False},
+        {"name": "big", "type": "bigint", "nullable": False},
+        {"name": "small", "type": "smallint", "nullable": False},
+        {"name": "n", "type": "integer", "nullable": False},
+        {"name": "at", "type": "timestamp(6) without time zone", "nullable": True}]}}
+    expected = declared_shape("CREATE TABLE t (id SERIAL, big BIGSERIAL, small SMALLSERIAL NULL, "
+                              "n serial4 PRIMARY KEY, at TIMESTAMP(6));")
+    assert grade_rerun(expected, _record("fresh", observed), None)["findings"] == []
 
 
 # ---- shape and record files -------------------------------------------------------------------
@@ -490,6 +517,42 @@ def test_one_observed_table_cannot_stand_in_for_two_declared_tables_that_share_a
     # a qualified observation of one and an exact match of the other still resolve one-to-one
     mixed = {"tables": {"mig.sales.orders": one["tables"]["orders"], "archive.orders": one["tables"]["orders"]}}
     assert grade_rerun(expected, _record("fresh", mixed), None)["findings"] == []
+
+
+def test_a_forced_one_to_one_assignment_resolves_tables_that_share_a_trailing_name():
+    """`orders` could be either declared table on its own, but only sales.orders can take
+    `mig.sales.orders`, which leaves `orders` for archive.orders: every complete matching agrees, so
+    both resolve. A table whose observation varies between matchings stays missing."""
+    cols = [{"name": "id", "type": "int", "nullable": True}]
+    expected = declared_shape("CREATE TABLE sales.orders (id INT); CREATE TABLE archive.orders (id INT);")
+    forced = {"tables": {"mig.sales.orders": cols, "orders": cols}}
+    assert grade_rerun(expected, _record("fresh", forced), None)["findings"] == []
+    assert _resolve_tables(expected["tables"], forced["tables"]) == {
+        "sales.orders": "mig.sales.orders", "archive.orders": "orders"}
+    three = declared_shape("CREATE TABLE sales.orders (id INT); CREATE TABLE archive.orders (id INT); "
+                           "CREATE TABLE stage.orders (id INT);")
+    varies = {"tables": {"mig.sales.orders": cols, "orders": cols, "x.orders": cols}}
+    assert _resolve_tables(three["tables"], varies["tables"]) == {
+        "sales.orders": "mig.sales.orders", "archive.orders": None, "stage.orders": None}
+    out = grade_rerun(three, _record("fresh", varies), None)
+    assert [(f["table"], f["check"]) for f in out["findings"]] == [
+        ("archive.orders", "table_missing"), ("stage.orders", "table_missing")]
+
+
+def test_drop_table_lets_a_later_create_land_its_own_shape():
+    """A drop-and-recreate job is valid DDL: after DROP TABLE the next CREATE is the first one
+    again and its columns are the declared shape."""
+    shape = declared_shape("CREATE TABLE t (a INT); DROP TABLE t; CREATE TABLE t (b INT);")
+    assert [c["name"] for c in shape["tables"]["t"]] == ["b"]
+    assert shape["statements"] == {"create_table": 2, "alter_table": 0, "other": 1}
+    shape = declared_shape("CREATE TABLE t (a INT); ALTER TABLE t ADD COLUMN c INT; DROP TABLE IF EXISTS `t`; "
+                           "CREATE TABLE IF NOT EXISTS t (b INT);")
+    assert [c["name"] for c in shape["tables"]["t"]] == ["b"]
+    assert declared_shape("CREATE TABLE t (a INT); DROP TABLE t;")["tables"] == {}
+    assert declared_shape("DROP TABLE IF EXISTS t; CREATE TABLE t (a INT);")["tables"]["t"] == [
+        {"name": "a", "type": "int", "nullable": True}]
+    with pytest.raises(ConfigError, match="t is created twice"):
+        declared_shape("CREATE TABLE t (a INT); DROP TABLE other; CREATE TABLE t (b INT);")
 
 
 # ---- result.json wiring -----------------------------------------------------------------------
