@@ -759,3 +759,25 @@ def test_docs_describe_the_pointer_and_doctor_wave_steps():
         assert "run_id" in doc
         assert '"workspace"' in doc or "workspace" in doc
         assert "W" + "AVE_" not in doc
+
+
+def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tmp_path):
+    def run(ws_dir, **kw):
+        ws, cwd = _workspace(ws_dir, **kw)
+        proc = subprocess.run([sys.executable, str(WORKFLOW), "preflight"], cwd=cwd, env={},
+                              capture_output=True, text=True)
+        assert not (ws / ".migration/waves/wave-0.result.json").exists()
+        assert not (ws / ".migration/waves/wave-0.base_sha").exists()
+        return proc
+
+    proc = run(tmp_path / "ok", dependencies={"u": _analysis("MIG.T")})
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"wave": 0, "ready": True, "batches": ["b-1"]}
+    proc = run(tmp_path / "drift", dependencies={"u": _analysis("mig.t", "mig.audit")})
+    assert proc.returncode != 0 and "b-1" in proc.stderr and "mig.audit" in proc.stderr
+    proc = run(tmp_path / "shared", other_waves={"wave-1.json": WAVE_1}, mappings={"u": MAPPING})
+    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "target_where" in proc.stderr
+    proc = run(tmp_path / "nodoctor", doctor=False)
+    assert proc.returncode != 0 and "doctor" in proc.stderr
+    proc = run(tmp_path / "stopc", stop_c=False)
+    assert proc.returncode != 0 and "gates_sha" in proc.stderr

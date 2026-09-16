@@ -808,8 +808,9 @@ if sys.argv[1:2] == ["gates"]:
     sys.exit(code)
 if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
     raise spent_halt()
+PREFLIGHT = sys.argv[1:] == ["preflight"]
 validate_manifest(MANIFEST)
-BASE_SHA = launch_base()
+BASE_SHA = None if PREFLIGHT else launch_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
 if not SMOKE:
     validate_manifest(MANIFEST, DOCTOR)
@@ -1752,6 +1753,12 @@ async def main():
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 
 
+if PREFLIGHT:  # `workflow.py preflight`: the launch checks for a wave launched by hand; writes nothing
+    check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
+                        namespace=MANIFEST.get("target_namespace", ""))
+    check_dependencies(BATCHES)
+    print(json.dumps({"wave": WAVE, "ready": True, "batches": [b["id"] for b in BATCHES]}, sort_keys=True))
+    sys.exit(0)
 if not resume and not SMOKE:
     record_run(MODE, RUN_ID)
 asyncio.run(main())
