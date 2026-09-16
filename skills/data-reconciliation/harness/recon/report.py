@@ -101,12 +101,13 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         reasons.append("mode")
     if mode == "snapshot" and snapshot is None:
         reasons.append("snapshot_missing")
-    if rerun_missing(rerun_proof):
-        reasons.append("rerun_missing")
-    if rerun_gap(rerun_proof):
-        reasons.append("rerun_gap")
-    if rerun_unsupported(rerun_proof):
-        reasons.append("rerun_unsupported")
+    if mode != "structural":  # no row tier ran, so there is no rerun to prove
+        if rerun_missing(rerun_proof):
+            reasons.append("rerun_missing")
+        if rerun_gap(rerun_proof):
+            reasons.append("rerun_gap")
+        if rerun_unsupported(rerun_proof):
+            reasons.append("rerun_unsupported")
     return {
         "unit": unit,
         "mode": mode,

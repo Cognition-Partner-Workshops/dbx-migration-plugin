@@ -136,6 +136,29 @@ def test_validate_manifest_rejects_max_minutes_over_sixty():
         validate_manifest(m)
 
 
+@pytest.mark.parametrize("value", [0, True, "3", 1441])
+def test_validate_manifest_rejects_invalid_doctor_max_age(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="doctor_max_age"):
+        validate_manifest(_manifest(doctor_max_age=value))
+
+
+def test_validate_manifest_accepts_doctor_max_age():
+    _functions()["validate_manifest"](_manifest(doctor_max_age=15))
+
+
+@pytest.mark.parametrize("value", [1, "true", {"x": 1}])
+def test_validate_manifest_rejects_non_bool_degraded(value):
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match="degraded"):
+        validate_manifest(_manifest(degraded=value))
+
+
+def test_validate_manifest_accepts_degraded_bool():
+    _functions()["validate_manifest"](_manifest(degraded=True))
+    _functions()["validate_manifest"](_manifest(degraded=False))
+
+
 @pytest.mark.parametrize("bad", ["a/b", 7, {"scope": "key"}])
 def test_validate_manifest_rejects_non_list_secrets(bad):
     validate_manifest = _functions()["validate_manifest"]
@@ -177,7 +200,7 @@ def _manifest(**extra):
     m.update(extra)
     m["batches"] = _gated(m["batches"])
     m.setdefault("stop_c", "D-2")
-    m.setdefault("gates_sha", _functions()["declared_gates_sha"](m["wave"], m["batches"]))
+    m.setdefault("gates_sha", _functions()["declared_gates_sha"](m["wave"], m["batches"], m.get("degraded") is True))
     return m
 
 
@@ -1227,6 +1250,13 @@ def test_declared_gate_list_is_hashed_into_the_manifest():
         assert sha(m["wave"], changed) != good
         with pytest.raises(SystemExit, match="gates_sha"):
             validate_manifest({**m, "batches": changed})
+    # a wave declared DEGRADED verifies at the structural tier only: that scope is part of what STOP C
+    # approved, so flipping it after the row is a plan change
+    assert sha(m["wave"], m["batches"], True) != good
+    assert sha(m["wave"], m["batches"], False) == good
+    with pytest.raises(SystemExit, match="gates_sha"):
+        validate_manifest({**m, "degraded": True})
+    validate_manifest({**m, "degraded": True, "gates_sha": sha(m["wave"], m["batches"], True)})
     # the same declaration for another wave is another approval
     assert sha(m["wave"] + 1, m["batches"]) != good
     with pytest.raises(SystemExit, match="gates_sha"):
@@ -1586,6 +1616,31 @@ def test_verifier_prompt_carries_per_batch_depth_defaulting_to_sampled():
 def test_child_prompt_asks_for_recon_cost():
     ns = _prompt_ns(_manifest())
     assert "recon_cost" in ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+
+
+def test_capability_block_points_children_at_the_signed_wave_doctor_record():
+    text = _prompt_ns(_manifest())["capability_block"](["u"])
+    assert "--reuse-record .migration/waves/wave-0.doctor.json" in text
+    assert "15" in text
+    text = _prompt_ns(_manifest(doctor_max_age=30))["capability_block"](["u"])
+    assert "doctor_max_age" in text and "30" in text
+
+
+def test_a_degraded_wave_runs_only_the_structural_tier_in_verify():
+    """A declared-DEGRADED wave's verifier runs the harness in `--mode structural` (Tier 0 only, no
+    source rows) and marks PASS on that run's verdict; the merge-eligible full run is not asked for."""
+    text = _prompt_ns(_manifest(degraded=True))["verify_prompt"](
+        [{"batch": "b", "units": ["u"], "pr_url": ""}], True)
+    assert "--mode structural" in text and "Tier 0" in text and "structural_drift" in text
+    # structural_parity records catalogs it could not read as gaps without failing; a PASS over a gap is
+    # unverified structure, so the verifier needs the gap-free run, not the verdict alone
+    assert 'merge_block_reasons is exactly ["mode"]' in text
+    assert "structural_gap" in text and "structure_unverifiable" in text
+    assert "merge_eligible=true" not in text and "--depth" not in text
+    assert "Mark a unit PASS only if you re-ran the harness in one of" not in text
+    text = _prompt_ns(_manifest())["verify_prompt"](
+        [{"batch": "b", "units": ["u"], "pr_url": ""}], True)
+    assert "--mode structural" not in text and "merge_eligible=true" in text
 
 
 def test_cost_line_compares_estimate_with_summed_actuals():

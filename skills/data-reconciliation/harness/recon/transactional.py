@@ -1339,14 +1339,15 @@ def _covered(leading: tuple, facts: SchemaFacts) -> bool:
 
 
 def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, source, target,
-                  strict: bool) -> TierResult:
+                  strict: bool, catalog_only: bool = False) -> TierResult:
     """Constraints are compared both ways: a source constraint the target lacks lets bad data in,
     a target constraint the source lacks rejects writes the legacy application makes today.
     Indexes stay one-directional (an extra target index changes cost, not acceptance). Triggers
     compare by (timing, event) coverage and grants through the spec's principal_map. `strict`
     (tier 7) records an unreadable catalog as `unverified`; tier 0 records it as
     `dictionary_unavailable` with every category unsupported for that object — a hole the
-    report turns into a structural_gap warning, so an unread dictionary blocks merge."""
+    report turns into a structural_gap warning, so an unread dictionary blocks merge.
+    `catalog_only` (structural mode) skips the row-backed identity bounds."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
     obj_uns: dict[str, set] = {}  # categories a live read failed for this object
@@ -1622,10 +1623,13 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                 uns = uns | {"sequences_identity"}
                 s, t_lower = (mask_unsupported(f_, uns) for f_ in (s, t_lower))
             else:
-                s_min, s_max = _key_bounds(source, c.root_table, c.identity_source, c.root_where)
+                s_min, s_max = ((None, None) if catalog_only else
+                                _key_bounds(source, c.root_table, c.identity_source, c.root_where))
                 seq_note = {"source_next": None if s_state is None else s_state.next,
                             "source_max": s_max,
                             "target_next": None if t_state is None else t_state.next}
+                if catalog_only:
+                    seq_note["source_bounds"] = "unread"
                 collides = False
                 # the source identity frontier (its own next value) is compared only when both
                 # sides step the same way; opposite directions are a finding of their own

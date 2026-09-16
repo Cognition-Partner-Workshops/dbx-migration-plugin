@@ -20,7 +20,7 @@ dbx-recon run \
   --mapping .migration/units/<unit_id>/mapping_spec.json \
   --tolerances .migration/03_recon_tolerances.json \
   --canonicalization skills/<source>-sql/canonicalization.json \
-  --mode fixture|live|snapshot|continuous|transactional \
+  --mode fixture|live|snapshot|continuous|transactional|structural \
   --source-dsn-secret <SOURCE_SECRET_NAME> \
   --target-kind databricks|lakebase \
   --target-secret DATABRICKS_MIGRATION_SQL --target-catalog <migration catalog> \
@@ -83,13 +83,19 @@ provenance warning and the run is not merge-eligible.
 - `transactional`: both sides live under a consistency window, Lakebase target only. A PASS is
   scoped to the window that held and the target's applied CDC watermark; the summary names the
   isolation each side actually ran under.
+- `structural`: Tier 0 `structural_parity` only, both catalogs read and no row read on either
+  side — the identity frontier-vs-rows collision check needs source MIN/MAX, so it is not checked
+  here (`source_bounds` reports `unread`). The independent verifier's run on a wave the manifest declares `degraded`; never merge
+  evidence: a clean run's `merge_block_reasons` is exactly `["mode"]` (no rerun proof applies, no
+  row tier ran), and `estimate` counts only Tier 0's catalog statements per adapter
+  (`CATALOG_STATEMENTS`), so `--family` is required in structural mode.
 
 
 
 ### Legal combinations
 
 - `--mode transactional` (operational track, Lakebase target only; refused for `--target-kind databricks`) wraps tiers 1-3 in a consistency window and adds the tiers an OLTP target needs.
-- Tier 0 `structural_parity` runs first in every mode except `continuous`/`transactional` (which
+- Tier 0 `structural_parity` runs first in every mode except `continuous`/`transactional`, and alone in `structural` (which
   get the same comparison as tier 7 `schema_parity`): primary keys, uniques, foreign keys,
   not-nulls, checks, indexes, triggers (by timing+event, names ignored), identity columns, and
   grants (source grantees mapped through the spec's `principal_map` before comparing). The

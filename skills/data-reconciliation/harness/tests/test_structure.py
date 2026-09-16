@@ -5,8 +5,11 @@ import json
 from pathlib import Path
 
 import pytest
-from recon.adapters import IdentityState, SchemaFacts
+from recon.adapters import (DatabricksTargetAdapter, IdentityState, PostgresSourceAdapter,
+                            SchemaFacts, SqlServerSourceAdapter, _uc_identity_state,
+                            _uc_schema_facts)
 from recon.config import ConfigError, Tolerances, load_mapping_spec
+from recon.cost import estimate_cost
 from recon.engine import run_recon
 from recon.report import build_result
 from recon.structure import (
@@ -217,6 +220,157 @@ def test_tier0_unsupported_indexes_are_not_a_warning():
     assert "index_missing" not in {f["check"] for f in t0["findings"]}
     assert not t0["stats"].get("unverified")
     assert result["merge_eligible"] is (result["verdict"] == "PASS")
+
+
+def test_structural_mode_runs_tier0_only_and_reads_no_source_rows():
+    """`--mode structural` is the declared-DEGRADED verifier's run: the structural tier against both
+    catalogs, no row tier, never merge evidence."""
+    loans, borrowers = _rows(12)
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 13})
+    target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                        schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS},
+                        sequences={("loans", "loan_id"): 13})
+    result = run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, target)
+    assert [t["name"] for t in result["tiers"]] == ["structural_parity"]
+    assert result["verdict"] == "PASS" and result["mode"] == "structural"
+    assert result["merge_eligible"] is False and result["merge_block_reasons"] == ["mode"]
+    assert source.rows_fetched == 0 and not {"count", "fetch_keyed", "sample_keys"} & set(source.calls)
+    bad = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                     schema={"loans": BORROWER_FACTS, "borrowers": BORROWER_FACTS},
+                     sequences={("loans", "loan_id"): 13})
+    assert run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, bad)["verdict"] == "FAIL"
+
+
+def test_structural_mode_never_reads_identity_row_bounds():
+    """A degraded wave's structural run is catalog-only: the identity frontier-vs-rows collision
+    check needs source MIN/MAX, so `--mode structural` must not issue that row read at all."""
+    from recon.transactional import schema_parity
+    loans, borrowers = _rows(12)
+    kw = dict(schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+              sequences={("dbo.loans", "loan_id"): 13})
+    target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                        schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS},
+                        sequences={("loans", "loan_id"): 13})
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers}, **kw)
+    source.fail_on["field_aggregates"] = AssertionError("row read in structural mode")
+    result = run_recon("u1", "structural", _spec(), Tolerances("t1"), [], source, target)
+    assert [t["name"] for t in result["tiers"]] == ["structural_parity"]
+    assert result["merge_block_reasons"] == ["mode"]
+    assert source.calls["field_aggregates"] == 0
+
+    # the live tier-0 run still reads the bounds — catalog_only is a flag, not a removal
+    live_src = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers}, **kw)
+    t0 = schema_parity(0, "structural_parity", _spec(), Tolerances("t1"), live_src, target,
+                       strict=False)
+    assert live_src.calls["field_aggregates"] > 0
+
+
+def test_catalog_only_identity_note_marks_the_bounds_unread():
+    """catalog_only still runs the catalog-backed identity checks but reports the skipped row
+    read, and cannot raise the collision finding the bounds would carry."""
+    from recon.transactional import schema_parity
+    loans, borrowers = _rows(12)
+    # source identity next (7) is already past the target's (10): only the row-backed source
+    # max (12) would collide — the catalog-visible checks alone see nothing wrong
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 7})
+    target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+                        schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS},
+                        sequences={("loans", "loan_id"): 10})
+    t0 = schema_parity(0, "structural_parity", _spec(), Tolerances("t1"), source, target,
+                       strict=False, catalog_only=True)
+    assert "sequence_behind_source" not in {f.check for f in t0.findings}
+    assert t0.stats["loans"]["identity"]["source_bounds"] == "unread"
+    live = schema_parity(0, "structural_parity", _spec(), Tolerances("t1"), source, target,
+                         strict=False)
+    assert "sequence_behind_source" in {f.check for f in live.findings}
+
+
+def test_structural_estimate_counts_each_adapters_catalog_reads():
+    """`estimate --mode structural` describes the run it names: Tier 0's catalog statements per
+    object and side from the adapters' own CATALOG_STATEMENTS (schema_facts per object,
+    identity_state only when both identities are declared, one session read), no row tier, no
+    rows transferred."""
+    spec = _spec()
+    n = len(spec.objects)
+    n_id = sum(1 for c in spec.objects if c.identity_source and c.identity_target)
+    est = estimate_cost(spec, Tolerances("t1"),
+                        row_counts={"dbo.loans": 1_000_000, "dbo.borrowers": 3},
+                        mode="structural", family="sqlserver", target_kind="databricks")
+    assert est["mode"] == "structural" and est["tier3_mode"] == {}
+    assert est["source_statements"]["tier0"] == 6 * n + n_id
+    assert est["target_statements"]["tier0"] == 5 * n + 2 * n_id
+    for side in ("source_statements", "target_statements"):
+        assert est[side]["total"] == est[side]["tier0"]
+        assert {k for k, v in est[side].items() if v and k not in ("tier0", "total")} == set()
+    assert est["source_rows_fetched"] == 0 and est["target_rows_fetched"] == 0
+    pg = estimate_cost(spec, Tolerances("t1"), mode="structural",
+                       family="postgres", target_kind="lakebase")
+    assert pg["source_statements"]["tier0"] == 5 * n + 2 * n_id + 1
+    assert pg["target_statements"]["tier0"] == 5 * n + 2 * n_id + 1
+    with pytest.raises(ValueError, match="--family"):
+        estimate_cost(spec, Tolerances("t1"), mode="structural")
+    assert estimate_cost(spec, Tolerances("t1"), mode="structural",
+                         family="redshift")["source_statements"]["tier0"] == 0
+
+
+def test_catalog_statements_match_what_the_adapters_issue():
+    """CATALOG_STATEMENTS is bound to the code that issues the statements: two schema_facts plus
+    one identity_state plus the session read cost exactly the counted statements."""
+    for cls in (SqlServerSourceAdapter, PostgresSourceAdapter):
+        calls = []
+        inst = object.__new__(cls)
+
+        def stub(sql, params=()):
+            calls.append(sql)
+            if "server_version_num" in sql:
+                return [("150000",)]
+            if sql.startswith("SELECT pg_get_serial_sequence"):
+                return [("seq1",)]
+            if "FROM seq1" in sql:
+                return [(5, True, 1)]
+            return []
+
+        inst._rows = stub
+        inst.schema_facts("dbo.loans")
+        inst.schema_facts("dbo.loans")
+        inst.identity_state("dbo.loans", "loan_id")
+        st = cls.CATALOG_STATEMENTS
+        assert len(calls) == 2 * st["schema_facts"] + st["identity_state"] + st["session"], cls
+
+    calls = []
+
+    def run_query(sql, params=None):
+        calls.append(sql)
+        if "SHOW CREATE TABLE" in sql:
+            return [("CREATE TABLE `c`.`s`.`t` (\n"
+                     "  `col` BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1)\n)",)]
+        if "MAX(`col`)" in sql:
+            return [(7,)]
+        return []
+
+    _uc_schema_facts(run_query, "c", "s", "t")
+    _uc_schema_facts(run_query, "c", "s", "t")
+    _uc_identity_state(run_query, "c", "s", "t", "col")
+    st = DatabricksTargetAdapter.CATALOG_STATEMENTS
+    assert len(calls) == 2 * st["schema_facts"] + st["identity_state"] + st["session"]
+
+
+def test_estimate_cli_structural_needs_family(tmp_path, capsys, monkeypatch):
+    """`estimate --mode structural` refuses without --family (the counts are per adapter) and
+    prints tier0 with one."""
+    import recon.cli as cli
+    monkeypatch.setattr(cli, "_load_spec", lambda *a: (_spec(), None))
+    monkeypatch.setattr(cli, "load_tolerances", lambda p: Tolerances("t1"))
+    with pytest.raises(SystemExit, match="--family"):
+        cli.main(["estimate", "--mapping", "m", "--tolerances", "t", "--mode", "structural"])
+    rc = cli.main(["estimate", "--mapping", "m", "--tolerances", "t", "--mode", "structural",
+                   "--family", "sqlserver"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["source_statements"]["tier0"] == 13
 
 
 def test_tier0_unreadable_catalog_blocks_merge():
