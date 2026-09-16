@@ -30,6 +30,7 @@ from .config import (
 )
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
+from .typemap import apply_type_map, load_type_map
 
 SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres")
 # databricks: Delta under Unity Catalog (analytical track). lakebase: a schema in a Lakebase
@@ -135,11 +136,33 @@ def selftest() -> int:
     return 0
 
 
+def _load_spec(mapping, canonicalization, family, target_kind, params):
+    """Mapping spec with the family's type map applied for the given target kind — the same
+    shape `run` reconciles, so `estimate` counts the statements the run will issue."""
+    spec = load_mapping_spec(mapping, params)
+    type_map = None
+    if canonicalization and family:
+        try:
+            tm = load_type_map(canonicalization, family, target_kind)
+            if tm:
+                spec, type_map = apply_type_map(tm, spec)
+        except ConfigError as exc:
+            raise SystemExit(f"type map: {exc}") from None
+    return spec, type_map
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="dbx-recon")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="verify the harness install (no connections needed)")
     sub.add_parser("families", help="print the live-tested vs refused source families as JSON")
+    t = sub.add_parser("type-map-audit", help="audit a spec's declared target types against the "
+                       "family type_map (JSON, no connections)")
+    t.add_argument("--spec", required=True, type=Path)
+    t.add_argument("--family", required=True)
+    t.add_argument("--target-kind", default="databricks", choices=TARGET_KINDS)
+    t.add_argument("--canonicalization", action="append", type=Path, default=[])
+    t.add_argument("--param", action="append", default=[])
     e = sub.add_parser("estimate", help="statements/rows a run would cost (no connections); "
                                         "summed per wave for the STOP C cost line")
     e.add_argument("--mapping", required=True, type=Path)
@@ -151,6 +174,13 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--ops-count", type=int, default=0, help="number of Tier 4 recorded ops")
     e.add_argument("--mode", choices=MODES, default="live",
                    help="transactional adds the window, PK-set and schema-parity statements")
+    e.add_argument("--family", choices=SOURCE_FAMILIES,
+                   help="source engine; with --canonicalization its type_map is applied so the "
+                        "estimate counts the statements the run will actually issue")
+    e.add_argument("--canonicalization", type=Path,
+                   help="the source-dialect skill's canonicalization.json (optional; fills "
+                        "undeclared target types like `run` does)")
+    e.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
     e.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
     r = sub.add_parser("run", help="run the recon gate for one unit")
     r.add_argument("--unit", required=True)
@@ -198,6 +228,36 @@ def main(argv: list[str] | None = None) -> int:
         }))
         return 0
 
+    if args.cmd == "type-map-audit":
+        from .typemap import audit_spec, load_type_map, type_map_families, type_map_targets
+        out = {"family_known": False, "target_known": False, "map": None,
+               "findings": [], "error": None}
+        try:
+            maps = []
+            for c in args.canonicalization:
+                if args.family in type_map_families(c):
+                    out["family_known"] = True
+                    if args.target_kind in type_map_targets(c, args.family):
+                        out["target_known"] = True
+                tm = load_type_map(c, args.family, args.target_kind)
+                if tm:
+                    maps.append((c, tm))
+            if len(maps) > 1:
+                out["error"] = (f"multiple canonicalization files carry a type_map for "
+                                f"{args.family}")
+            elif maps:
+                out["map"] = str(maps[0][0])
+                spec = load_mapping_spec(args.spec, parse_params(args.param))
+                for row in audit_spec(maps[0][1], spec):
+                    out["findings"].append({"field": f"{row['object']}.{row['source']}",
+                                            "verdict": row["status"], "detail": row["expected"],
+                                            "source_type": row["source_type"],
+                                            "target_type": row["target_type"]})
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+        print(json.dumps(out))
+        return 0
+
     if args.cmd == "run" and args.mode in PLANNED_MODES:
         raise SystemExit(f"--mode {args.mode} is not implemented in this harness version")
     if args.cmd == "run" and args.mode == "transactional" \
@@ -210,7 +270,10 @@ def main(argv: list[str] | None = None) -> int:
 
     params = parse_params(args.param)
     if args.cmd == "estimate":
-        spec = load_mapping_spec(args.mapping, params)
+        if args.canonicalization and not args.family:
+            raise SystemExit("--canonicalization needs --family so its type_map is selected")
+        spec, _ = _load_spec(args.mapping, args.canonicalization, args.family,
+                             args.target_kind, params)
         tol = load_tolerances(args.tolerances)
         row_counts = None
         if args.row_counts is not None:
@@ -241,7 +304,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--family {args.family}: {args.family} source adapter is untested; "
                          "see SKILL.md")
 
-    spec = load_mapping_spec(args.mapping, params)
+    spec, type_map = _load_spec(args.mapping, args.canonicalization, args.family,
+                                args.target_kind, params)
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
 
@@ -272,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
-                       source_family=args.family, depth=args.depth)
+                       source_family=args.family, depth=args.depth, type_map=type_map)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")
