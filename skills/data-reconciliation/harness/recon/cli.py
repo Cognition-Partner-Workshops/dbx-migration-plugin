@@ -248,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                         "(e.g. partition/date scoping); repeatable; recorded in result.json")
     r.add_argument("--rerun-proof", type=Path,
                    help="rerun_proof.json from `dbx-recon rerun-proof`; a failed leg blocks merge "
-                        "with reason rerun_gap")
+                        "with reason rerun_gap; an unsupported evolved leg with rerun_unsupported")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 

@@ -11,6 +11,7 @@ from recon import cli
 from recon.config import ConfigError
 from recon.report import build_result
 from recon.rerun import (
+    check_proof,
     RERUN_RECORD_KEYS,
     declared_shape,
     grade_rerun,
@@ -189,6 +190,58 @@ def test_a_job_the_child_reports_failed_fails_regardless_of_shape():
     assert [f["check"] for f in out["findings"]] == ["job_failed", "job_failed"]
 
 
+def test_a_failed_evolved_job_is_fail_even_without_a_usable_pre_shape():
+    expected = declared_shape(DDL)
+    for rec in (_record("evolved", NEW_SHAPE, status="fail"),
+                _record("evolved", NEW_SHAPE, pre_shape=NEW_SHAPE, status="fail")):
+        out = grade_rerun(expected, _record("fresh", NEW_SHAPE), rec)
+        assert out["evolved"] == "fail" and out["passed"] is False
+        assert [f["check"] for f in out["findings"]] == ["job_failed"]
+        assert "unsupported_reason" not in out
+
+
+def test_column_order_drift_is_a_finding():
+    expected = declared_shape(DDL)
+    cols = NEW_SHAPE["tables"]["orders"]
+    reordered = {"tables": {"orders": [cols[0], cols[1], cols[3], cols[2]]}}
+    out = grade_rerun(expected, _record("fresh", NEW_SHAPE),
+                      _record("evolved", reordered, pre_shape=OLD_SHAPE))
+    assert out["fresh"] == "pass" and out["evolved"] == "fail"
+    assert out["findings"] == [{"run": "evolved", "table": "mig.sales.orders", "check": "column_order",
+                                "column": None,
+                                "detail": "declared order_id, amount, channel, tags; observed "
+                                          "order_id, amount, tags, channel"}]
+    # a missing column is reported as missing, not also as an order drift
+    out = grade_rerun(expected, _record("fresh", OLD_SHAPE), None)
+    assert [f["check"] for f in out["findings"]] == ["column_missing"]
+
+
+def test_check_proof_rejects_contradictory_or_malformed_artifacts():
+    good = {"unit": "u", "fresh": "pass", "evolved": "unsupported", "passed": True, "findings": [],
+            "notes": [], "evidence": {"fresh": "job/1"}, "unsupported_reason": "no evolved record"}
+    assert check_proof(good, "u", "x") == good
+    bad = [
+        {**good, "passed": False},                                   # disagrees with the legs
+        {**good, "evolved": "fail", "passed": True},
+        {**good, "evolved": "pass", "evidence": {"fresh": "job/1"}},  # no evolved evidence
+        {**good, "evidence": {}},                                    # no fresh evidence
+        {**good, "evidence": {"fresh": ""}},
+        {**good, "findings": [{"check": "job_failed"}]},             # findings shape
+        {**good, "findings": {}},
+        {**good, "notes": "x"},
+        {k: v for k, v in good.items() if k != "unsupported_reason"},
+        {**good, "fresh": "fail", "passed": False, "findings": []},  # a failed leg names why
+    ]
+    for proof in bad:
+        with pytest.raises(ConfigError):
+            check_proof(proof, "u", "x")
+    failed = {**good, "evolved": "fail", "passed": False, "evidence": {"fresh": "j/1", "evolved": "j/2"},
+              "findings": [{"run": "evolved", "table": "t", "check": "job_failed", "column": None,
+                            "detail": "d"}]}
+    del failed["unsupported_reason"]
+    assert check_proof(failed, "u", "x") == failed
+
+
 def test_evolved_is_unsupported_never_clean_when_no_prior_shape_was_exercised():
     expected = declared_shape(DDL)
     out = grade_rerun(expected, _record("fresh", NEW_SHAPE), None)
@@ -235,9 +288,11 @@ def test_build_result_records_the_proof_and_blocks_on_rerun_gap():
     r = build_result("u", "live", "m1", "t1", [_ok()], rerun_proof=proof)
     assert r["merge_eligible"] is False and r["merge_block_reasons"] == ["rerun_gap"]
     assert r["verdict"] == "PASS"  # the tiers passed; the rerun gap is its own reason
+    # an unsupported evolved leg is not a failure, but it is not proof either: a supplied proof
+    # that did not exercise the previous shape blocks merge under its own reason
     proof = {"fresh": "pass", "evolved": "unsupported", "passed": True, "findings": []}
     r = build_result("u", "live", "m1", "t1", [_ok()], rerun_proof=proof)
-    assert r["merge_eligible"] is True and r["merge_block_reasons"] == []
+    assert r["merge_eligible"] is False and r["merge_block_reasons"] == ["rerun_unsupported"]
 
 
 def test_run_recon_carries_the_proof_into_result_json(tmp_path):
@@ -318,7 +373,9 @@ def test_run_reads_a_rerun_proof_file_and_refuses_a_malformed_one(tmp_path, monk
     monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: object())
     proof = tmp_path / "rerun_proof.json"
     proof.write_text(json.dumps({"unit": "u", "fresh": "pass", "evolved": "fail", "passed": False,
-                                 "findings": [], "notes": [], "evidence": {}}))
+                                 "findings": [{"run": "evolved", "table": "t", "check": "job_failed",
+                                               "column": None, "detail": "d"}],
+                                 "notes": [], "evidence": {"fresh": "j/1", "evolved": "j/2"}}))
     args = ["run", "--unit", "u", "--family", "postgres", "--mapping", "m", "--tolerances", "t",
             "--canonicalization", "c", "--mode", "live", "--source-dsn-secret", "S",
             "--target-secret", "T", "--target-catalog", "mig", "--target-schema", "s",
