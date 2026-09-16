@@ -248,6 +248,11 @@ def test_expected_target_lakebase(oracle_lakebase_map, source_type, expected):
     ("TIMESTAMP WITH TIME ZONE", "timestamp", "contradiction"),
     ("VARCHAR2(30)", "text", "ok"),
     ("VARCHAR2(30)", "string", "contradiction"),
+    # postgres float means double: kind aliases must not fold real into it
+    ("BINARY_FLOAT", "float", "contradiction"),
+    ("BINARY_FLOAT", "real", "ok"),
+    ("BINARY_DOUBLE", "float", "ok"),
+    ("BINARY_DOUBLE", "double precision", "ok"),
     ("NUMBER(10,2)", "numeric(10,2)", "ok"),
     ("NUMBER(10,2)", "double precision", "contradiction"),
 ])
@@ -457,3 +462,7 @@ def test_lakebase_scale_range_allows_postgres_wide_scales(oracle_lakebase_map):
     assert audit_field(oracle_lakebase_map, "NUMBER(5,-2)", "numeric(5,-2)") ==         ("contradiction", "bigint")
     status, detail = audit_field(oracle_lakebase_map, "NUMBER(2,5)", "numeric(5,1001)")
     assert status == "contradiction" and "not a valid lakebase decimal" in detail
+
+
+def test_databricks_still_folds_real_to_float(oracle_map):
+    assert audit_field(oracle_map, "BINARY_FLOAT", "real")[0] == "ok"

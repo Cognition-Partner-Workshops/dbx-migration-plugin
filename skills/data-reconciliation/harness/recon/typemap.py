@@ -32,7 +32,11 @@ _ALIASES = {
 # spellings that mean something else on a specific target kind, applied before _ALIASES
 # when parsing types spelled for that kind (declared targets and map patterns)
 _KIND_ALIASES = {
-    "lakebase": {"timestamp without time zone": "timestamp"},
+    # postgres: bare float is double, real is its own type — pin both so _ALIASES' fold
+    # into `float` never collapses them
+    "lakebase": {"timestamp without time zone": "timestamp", "float": "double",
+                 "float8": "double", "double precision": "double", "float4": "real",
+                 "real": "real"},
 }
 
 # decimal-like source types whose (p,s) edge shapes normalise before matching
