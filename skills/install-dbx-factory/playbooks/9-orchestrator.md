@@ -19,7 +19,7 @@ Read `references/contract.md` once per session for stops, `stop_mode`, D1–D10,
 7. **Coexistence.** After all waves merge, run parallel-run monitoring with its paused job, live window, evidence ledger, and remediation rules.
 8. **Cutover.** Run cutover signoff and present the evidence pack for STOP E; the customer-held principal authorizes execution.
 9. **Notifications.** See `references/contract.md`.
-10. **Ledger.** Regenerate `05_progress.md` with `python3 skills/migration-fanout/progress.py .migration` at every wave close; keep dependency and decision ledgers current.
+10. **Ledger.** Regenerate `05_progress.md` with `python3 skills/migration-fanout/progress.py .migration --refresh-merged` at every wave close and after manual merges; keep dependency and decision ledgers current.
 
 ## Specifications
 - Deliverable: committed artifacts, manifests, wave results/briefs, PR set, evidence pack, and current ledger.
