@@ -1976,10 +1976,12 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, 
                      + "; ".join(f"{o['batch']} ({', '.join(o['units'])}) by {o['decision_id']}"
                                 for o in overrides) + ".")
     if resync:
-        report = resync.get("report") or {}
+        report = resync.get("report") if isinstance(resync.get("report"), dict) else {}
         lines += ["", f"Identity resync (`{resync['command']}` over {', '.join(resync['units'])}): "
                   f"{report.get('status', 'no report')}. {report.get('one_line_summary', '')}".rstrip()]
-        lines += [f"- {r['object']}: {r['before']} -> {r['after']}" for r in report.get("sequences") or []]
+        rows = report.get("sequences") if isinstance(report.get("sequences"), list) else []
+        lines += [f"- {r['object']}: {r['before']} -> {r['after']}"
+                  for r in rows if isinstance(r, dict) and {"object", "before", "after"} <= set(r)]
         lines += [f"- problem: {p}" for p in resync.get("problems", [])]
         if resync.get("held_batches"):
             lines.append("- held from merge this run: " + ", ".join(resync["held_batches"]))

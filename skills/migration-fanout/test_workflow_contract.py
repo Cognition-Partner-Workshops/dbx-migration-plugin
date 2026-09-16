@@ -1197,7 +1197,9 @@ def test_a_resync_that_wrote_files_or_died_is_a_recorded_problem_that_holds_the_
               "findings": [], "changed_paths": []}
     for sub, out, what in [("wrote", _resync_report(changed_paths=["load/x.sql"]), "load/x.sql"),
                            ("dead", {"error": "boom"}, "boom"),
-                           ("failed", _resync_report(status="failed"), "resync command failed")]:
+                           ("failed", _resync_report(status="failed"), "resync command failed"),
+                           ("malformed", _resync_report(sequences=[{"object": "mig.u.seq"}]),
+                            "sequences must be")]:
         ws, cwd = _two_batch_workspace(tmp_path / sub, resync=resync, auto_merge=True)
         pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
         proc, calls = _run(cwd, tmp_path / sub,
