@@ -1696,7 +1696,6 @@ def verify_prompt(passed):
         "Sum result.json['cost'] over your runs into recon_cost.\n"
         f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{WAVE}/report.md, "
         f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
-        f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
         "report_path. Do not edit any other file under .migration/; report your branch's "
         "`git diff --name-only <base>...<head>` in changed_paths. Each finding is one plain "
         "sentence a lead can read without opening anything."
@@ -2045,6 +2044,10 @@ async def main():
         if not isinstance(verify.get("findings"), list):
             verify["findings"] = []
         verify["findings"].extend(f"wave close invalid: {p}" for p in close_problems)
+        close = {"merged_prs": [],
+                 "unmerged": [{"pr_url": p["pr_url"], "reason": "wave-close output invalid"}
+                              for p in to_merge],
+                 "changed_paths": [], "invalid": close}
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported
               and not verify_problems and not close_problems and (close is None or not close["unmerged"])
               and verify is not None and verify["wave_verdict"] == "PASS"

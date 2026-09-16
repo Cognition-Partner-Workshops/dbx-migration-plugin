@@ -1012,6 +1012,7 @@ def test_the_wave_close_step_merges_the_verifier_pass_prs(tmp_path):
     assert close_phase["soft_time_limit_minutes"] == 10
     verify_prompt = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
     assert "Merge every PR" not in verify_prompt and "wave-close" in verify_prompt
+    assert verify_prompt.count("commit it on branch recon/wave-0, push, and give") == 1
     close = [c for c in calls if c.get("label") == "close-wave-0"]
     assert close and close[0]["kwargs"]["soft_time_limit_minutes"] == 10 and pr in close[0]["prompt"]
     result = _result(ws)
@@ -1094,6 +1095,20 @@ def test_an_unmerged_verified_pr_keeps_the_wave_open_and_lands_in_the_brief(tmp_
     assert result["closed"] is False
     brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
     assert f"Not merged: {pr}" in brief and f"Awaiting manual merge: {pr}" in brief
+
+
+def test_a_malformed_close_reply_still_writes_the_brief(tmp_path):
+    for i, bad in enumerate(({"merged_prs": [], "unmerged": [{"pr_url": "x"}], "changed_paths": []},
+                            {"merged_prs": [], "unmerged": "nope", "changed_paths": []})):
+        ws, cwd = _workspace(tmp_path / f"bad{i}", auto_merge=True)
+        pr = _push_pr(ws)
+        proc, _ = _run(cwd, tmp_path / f"bad{i}", [_pass_report(pr), _verify_report(), bad])
+        assert proc.returncode == 0, proc.stderr
+        result = _result(ws)
+        assert result["closed"] is False
+        assert any("wave close invalid" in f for f in result["verify"]["findings"])
+        brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+        assert f"Awaiting manual merge: {pr}" in brief
 
 
 def test_a_dead_close_session_leaves_every_verified_pr_unmerged(tmp_path):

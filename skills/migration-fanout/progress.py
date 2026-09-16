@@ -217,6 +217,12 @@ def refresh_merged(mig: Path) -> None:
         merged_prs = verify.get("merged_prs") if isinstance(verify, dict) else None
         if merged_prs is not None and not isinstance(merged_prs, list):
             raise ValueError(f"{path}: verify merged_prs is not a list")
+        close = result.get("close")
+        if close is not None and not isinstance(close, dict):
+            raise ValueError(f"{path}: close is not a dict")
+        close_merged = close.get("merged_prs") if isinstance(close, dict) else None
+        if close_merged is not None and not isinstance(close_merged, list):
+            raise ValueError(f"{path}: close merged_prs is not a list")
         candidates = [
             (batch.get("pr_url"), batch.get("pr_head"))
             for batch in result["batches"]
@@ -316,6 +322,13 @@ def render_progress(mig: Path) -> str:
         merged_prs = verify.get("merged_prs") if isinstance(verify, dict) else None
         if merged_prs is not None and not isinstance(merged_prs, list):
             raise ValueError(f"{path}: verify merged_prs is not a list")
+        close = result.get("close")
+        if close is not None and not isinstance(close, dict):
+            raise ValueError(f"{path}: close is not a dict")
+        close_merged = close.get("merged_prs") if isinstance(close, dict) else None
+        if close_merged is not None and not isinstance(close_merged, list):
+            raise ValueError(f"{path}: close merged_prs is not a list")
+        merged_prs = (merged_prs or []) + (close_merged or [])
         manifest_units = _manifest_units(manifest_path, manifest)
         result_batches = {}
         result_order = []
