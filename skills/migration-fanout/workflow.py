@@ -145,6 +145,8 @@ if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE
     raise SystemExit(f"{POINTER_PATH} hook_probe must be blocked:<nonce>, not-blocked or unknown (the probe run in the "
                      "orchestrator's shell; the doctor was given the same value)")
 ROOT = Path(POINTER["workspace"]).resolve() if isinstance(POINTER.get("workspace"), str) else POINTER_PATH.parents[2]
+PLUGIN = Path(POINTER["plugin"]).resolve() if isinstance(POINTER.get("plugin"), str) else None
+PIPELINE_UPDATES = (PLUGIN or ROOT) / "skills" / "target-routing" / "pipeline_updates.py"
 WAVES_DIR = ROOT / ".migration" / "waves"
 MANIFEST_PATH = (WAVES_DIR / POINTER["manifest"]).resolve()
 if not (MANIFEST_PATH.name.startswith("wave-")
@@ -891,6 +893,35 @@ def _is_manifest(name):
             and TAG_RE.fullmatch(name[len("wave-"):-len(".json")]) is not None)
 
 
+def check_pipeline_updates(script, manifest_path):
+    """One active update per Lakeflow pipeline per wave: the plugin's target-routing/pipeline_updates.py, run as a
+    subprocess on the manifest (this script imports nothing). Any non-zero exit halts the launch, `unsupported`
+    included. Its `order` ({later batch: [earlier batches]}) is what serializes batches that share a pipeline."""
+    if not Path(script).is_file():
+        raise SystemExit(f"{script} is missing: the pointer's `plugin` must name the plugin root so the wave can run "
+                         "skills/target-routing/pipeline_updates.py before launching")
+    try:
+        proc = subprocess.run([sys.executable, str(script), str(manifest_path)], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SystemExit(f"pipeline_updates.py did not run ({e}); the wave does not launch unchecked")
+    try:
+        result = json.loads(proc.stdout)
+        order = result["order"]
+        assert isinstance(order, dict) and all(isinstance(v, list) for v in order.values())
+    except (ValueError, KeyError, TypeError, AssertionError):
+        result, order = {}, None
+    if proc.returncode != 0:
+        why = [f"pipeline {s.get('pipeline')!r} is shared by {', '.join(map(str, s.get('batches', [])))} without a "
+               f"pipeline_serialized decision" for s in result.get("shared", []) if s.get("serialized") is False]
+        if result.get("unchecked_batches"):
+            why.append(f"unsupported: {', '.join(map(str, result['unchecked_batches']))} declare no lakeflow_pipelines")
+        raise SystemExit(f"pipeline_updates.py exit {proc.returncode}, the wave does not launch: "
+                         + ("; ".join(why) or f"{proc.stdout.strip()} {proc.stderr.strip()}".strip()))
+    if order is None:
+        raise SystemExit(f"pipeline_updates.py printed no order: {proc.stdout.strip()[:500]}")
+    return order
+
+
 def published_manifests():
     """{name: text} of every manifest under .migration/waves/ on origin's base branch, now."""
     git = ["git", "-C", str(ROOT)]
@@ -1418,6 +1449,7 @@ if sys.argv[1:2] == ["reserve"]:
                         namespace=MANIFEST.get("target_namespace", ""))
     check_dependencies(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                        namespace=MANIFEST.get("target_namespace", ""))
+    check_pipeline_updates(PIPELINE_UPDATES, MANIFEST_PATH)
     record_run("reserve")
     print(json.dumps({"wave": MANIFEST["wave"], "stop_c": MANIFEST["stop_c"], "reserved": True}))
     sys.exit(0)
@@ -1998,7 +2030,19 @@ class Breaker:
                 "No new children will launch this run.")
 
 
-async def run_batch(batch, sem, breaker):
+async def run_batch(batch, sem, breaker, waits=(), done=None):
+    """`waits` are the done events of the batches this one must follow (a shared, serialized pipeline); `done`
+    is set when this batch is over, launched or not."""
+    try:
+        for event in waits:
+            await event.wait()
+        return await _run_batch(batch, sem, breaker)
+    finally:
+        if done is not None:
+            done.set()
+
+
+async def _run_batch(batch, sem, breaker):
     async with sem:
         if breaker.tripped_on:
             return {"status": "NOT_LAUNCHED", "recon_verdict": "NOT_RUN",
@@ -2227,11 +2271,15 @@ async def main():
     check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
                         namespace=MANIFEST.get("target_namespace", ""))
     check_dependencies(BATCHES, namespace=MANIFEST.get("target_namespace", ""))
-    log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}")
+    order = check_pipeline_updates(PIPELINE_UPDATES, MANIFEST_PATH)
+    log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}"
+        + (f", serialized {order}" if order else ""))
 
     sem = asyncio.Semaphore(WIDTH)
     breaker = Breaker(BREAKER)
-    results = await asyncio.gather(*(run_batch(b, sem, breaker) for b in BATCHES))
+    done = {b["id"]: asyncio.Event() for b in BATCHES}
+    results = await asyncio.gather(*(run_batch(b, sem, breaker, waits=[done[d] for d in order.get(b["id"], []) if d in done],
+                                               done=done[b["id"]]) for b in BATCHES))
 
     namespace = MANIFEST.get("target_namespace", "")
     reported = Counter(t for r in results for t in {target_key(t, namespace) for t in r.get("write_targets", [])})
@@ -2357,6 +2405,7 @@ async def main():
         "write_target_overlaps": surprises,
         "undeclared_write_targets": undeclared,
         "unreported_write_targets": unreported,
+        "pipeline_order": order,
         "merge_overrides": merge_overrides(results),
         "waived_gates": waived_gates(results),
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
@@ -2373,7 +2422,9 @@ if PREFLIGHT:  # `workflow.py preflight`: the launch checks for a wave launched 
     check_write_targets(BATCHES, other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
                         namespace=MANIFEST.get("target_namespace", ""))
     check_dependencies(BATCHES, namespace=MANIFEST.get("target_namespace", ""))
-    print(json.dumps({"wave": WAVE, "ready": True, "batches": [b["id"] for b in BATCHES]}, sort_keys=True))
+    order = check_pipeline_updates(PIPELINE_UPDATES, MANIFEST_PATH)
+    print(json.dumps({"wave": WAVE, "ready": True, "batches": [b["id"] for b in BATCHES], "pipeline_order": order},
+                     sort_keys=True))
     sys.exit(0)
 if not resume and not SMOKE:
     record_run(MODE, RUN_ID)

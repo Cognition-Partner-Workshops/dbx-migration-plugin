@@ -31,14 +31,15 @@ def _functions():
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
                                       "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
                                       "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices", "check_wave_tag",
-                                      "check_pipelines_published", "_is_manifest", "validate_close"})
+                                      "check_pipelines_published", "_is_manifest", "validate_close", "check_pipeline_updates"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
                                                          "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED", "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE"}
                     for t in node.targets))]
-    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate"}
+    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
+                 "subprocess": subprocess, "sys": sys}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -47,7 +48,7 @@ def _batch_runtime():
     tree = ast.parse(WORKFLOW.read_text())
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
-                or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
+                or (isinstance(node, ast.AsyncFunctionDef) and node.name in {"run_batch", "_run_batch"})
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
                                                                          "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes", "review_outcome"})
                 or (isinstance(node, ast.Assign) and any(
@@ -1631,6 +1632,100 @@ def test_replayed_failures_do_not_refill_breaker():
     outputs, breaker = asyncio.run(exercise())
     assert outputs[-1]["status"] == "PASS"
     assert breaker.tripped_on is None
+
+
+PIPELINE_UPDATES = WORKFLOW.parents[1] / "target-routing" / "pipeline_updates.py"
+
+
+def _pipeline_wave(tmp_path, batches, ledger="", **manifest):
+    waves = tmp_path / ".migration" / "waves"
+    waves.mkdir(parents=True)
+    (tmp_path / ".migration" / "06_decisions.md").write_text(ledger)
+    path = waves / "wave-1.json"
+    path.write_text(json.dumps({"wave": 1, "width": 4, "batches": batches, **manifest}))
+    return path
+
+
+def test_check_pipeline_updates_runs_the_script_on_the_manifest_and_returns_its_order(tmp_path):
+    """The workflow can import nothing, so the pipeline check is the plugin's script run as a subprocess on
+    the manifest; a clean run hands back `order` (later batch -> the earlier batches it waits for)."""
+    check = _functions()["check_pipeline_updates"]
+    ledger = "| D-7 | 2026-02-01 | user:U1 | pipeline_serialized p: b1 then b2 |\n"
+    path = _pipeline_wave(tmp_path, [{"id": "b1", "lakeflow_pipelines": ["p"]}, {"id": "b2", "lakeflow_pipelines": ["p"]}],
+                          ledger, serialized_pipelines={"p": "D-7"})
+    assert check(PIPELINE_UPDATES, path) == {"b2": ["b1"]}
+    assert check(PIPELINE_UPDATES, _pipeline_wave(tmp_path / "solo", [{"id": "b1", "lakeflow_pipelines": ["p"]}])) == {}
+
+
+def test_check_pipeline_updates_halts_on_a_shared_pipeline_and_on_an_undeclared_batch(tmp_path):
+    """Any non-zero exit halts the launch, `unsupported` included: a batch that declares no
+    lakeflow_pipelines cannot be checked, and an unchecked wave is not a clean one."""
+    check = _functions()["check_pipeline_updates"]
+    shared = _pipeline_wave(tmp_path / "shared", [{"id": "b1", "lakeflow_pipelines": ["p"]}, {"id": "b2", "lakeflow_pipelines": ["p"]}])
+    with pytest.raises(SystemExit, match=r"pipeline_updates.*'p'.*b1.*b2"):
+        check(PIPELINE_UPDATES, shared)
+    undeclared = _pipeline_wave(tmp_path / "undeclared", [{"id": "b1"}])
+    with pytest.raises(SystemExit, match="unsupported.*b1"):
+        check(PIPELINE_UPDATES, undeclared)
+
+
+def test_check_pipeline_updates_halts_when_the_script_is_missing_or_crashes(tmp_path):
+    check = _functions()["check_pipeline_updates"]
+    path = _pipeline_wave(tmp_path, [{"id": "b1", "lakeflow_pipelines": []}])
+    with pytest.raises(SystemExit, match="pipeline_updates.py"):
+        check(tmp_path / "nowhere" / "pipeline_updates.py", path)
+    broken = tmp_path / "pipeline_updates.py"
+    broken.write_text("raise RuntimeError('boom')\n")
+    with pytest.raises(SystemExit, match="boom"):
+        check(broken, path)
+    silent = tmp_path / "silent.py"
+    silent.write_text("print('not json')\n")
+    with pytest.raises(SystemExit, match="not json"):
+        check(silent, path)
+
+
+def test_run_batch_waits_for_the_batches_its_pipeline_order_names(tmp_path):
+    """Serialization is enforced, not just authorized: with width 2 and order {b2: [b1]}, b2's child
+    launches only after b1's finished, while b3 (no order) runs alongside b1."""
+    namespace = _batch_runtime()
+    events = []
+
+    async def agent(prompt, **kwargs):
+        events.append(("start", kwargs["label"]))
+        if kwargs["label"] == "b1":
+            await asyncio.sleep(0.05)
+        events.append(("end", kwargs["label"]))
+        return {"status": "FAIL", "recon_verdict": "NOT_RUN", "failure_class": kwargs["label"], "one_line_summary": "x"}
+
+    namespace["agent"] = agent
+    batches = [{"id": i, "units": ["u"], "write_targets": ["t"], "brief": "b"} for i in ("b1", "b2", "b3")]
+
+    async def exercise():
+        sem, breaker = asyncio.Semaphore(2), namespace["Breaker"](9)
+        done = {b["id"]: asyncio.Event() for b in batches}
+        order = {"b2": ["b1"]}
+        return await asyncio.gather(*(namespace["run_batch"](b, sem, breaker, done=done[b["id"]],
+                                                            waits=[done[d] for d in order.get(b["id"], [])])
+                                      for b in batches))
+
+    asyncio.run(exercise())
+    assert events.index(("start", "b2")) > events.index(("end", "b1"))
+    assert events.index(("start", "b3")) < events.index(("end", "b1"))
+
+
+def test_run_batch_releases_its_waiters_even_when_the_breaker_held_it_back():
+    namespace = _batch_runtime()
+    namespace["agent"] = None  # never reached
+
+    async def exercise():
+        breaker = namespace["Breaker"](1)
+        breaker.record("x")
+        done = asyncio.Event()
+        out = await namespace["run_batch"](dict(BATCH), asyncio.Semaphore(1), breaker, done=done)
+        return out, done.is_set()
+
+    out, released = asyncio.run(exercise())
+    assert out["status"] == "NOT_LAUNCHED" and released
 
 
 def test_pass_without_pr_is_downgraded():
