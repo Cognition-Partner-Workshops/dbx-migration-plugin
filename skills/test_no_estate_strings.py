@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from skills.repo_text import read_text
+
 ROOT = Path(__file__).resolve().parents[1]
 DENYLIST = json.loads((Path(__file__).parent / "estate_denylist.json").read_text())
 TERMS = [t for k, v in DENYLIST.items() if not k.startswith("_") for t in v]
@@ -28,7 +30,7 @@ def repo_files():
             continue
         if SKIP_DIRS & set(path.relative_to(ROOT).parts):
             continue
-        if path.name.endswith(".egg-info") or path == Path(__file__):
+        if any(part.endswith(".egg-info") for part in path.relative_to(ROOT).parts):
             continue
         if path.name == "estate_denylist.json" or _in_example_fixture(path):
             continue
@@ -44,9 +46,8 @@ def test_denylist_is_nonempty():
 
 @pytest.mark.parametrize("path", list(repo_files()), ids=lambda p: str(p.relative_to(ROOT)))
 def test_no_estate_strings(path):
-    try:
-        text = path.read_text(errors="strict")
-    except UnicodeDecodeError:
+    text = read_text(path)
+    if text is None:
         return
     hits = {m.group(0) for m in PATTERN.finditer(text)}
     assert not hits, f"engagement-specific identifiers in {path.relative_to(ROOT)}: {sorted(hits)}"
