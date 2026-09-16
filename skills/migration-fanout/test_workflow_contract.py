@@ -1,3 +1,5 @@
+import fcntl
+import hashlib
 import json
 import subprocess
 import sys
@@ -8,16 +10,26 @@ import pytest
 
 WORKFLOW = Path(__file__).with_name("workflow.py")
 DOCTOR = Path(__file__).parents[1] / "factory-doctor" / "doctor.py"
+GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": ""}
+
+
+def _gates_sha(batches, wave=0):
+    """The recipe the fanout skill documents: sha256 of the compact JSON {wave, batches: {id: {units (sorted),
+    gates: [[id, kind, status, evidence, decision_id or null], ...]}}} with sorted keys."""
+    declared = {"wave": wave, "batches": {
+        b["id"]: {"units": sorted(b["units"]),
+                  "gates": [[g["id"], g["kind"], g["status"], g["evidence"], g.get("decision_id")] for g in b["gates"]]}
+        for b in batches}}
+    return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
-               doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None):
+               doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
+               gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft"):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
-    if decisions is not None:
-        (ws / ".migration" / "06_decisions.md").write_text(decisions)
     recon = {u: True for u in units} if recon is None else recon
     for u, eligible in recon.items():
         d = ws / ".migration" / "recon" / u
@@ -38,11 +50,19 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "host": "https://adb-1.azuredatabricks.net",
             "catalogs": ["mig"],
             "guard_mode": "block",
-            "stop_mode": "soft",
+            "stop_mode": stop_mode,
             "ready": True,
         },
-        "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief"}],
+        "batches": [{"id": "b-1", "units": list(units), "write_targets": ["mig.t"], "brief": "brief",
+                     "gates": gates if gates is not None else [GATE]}],
     }
+    manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
+    manifest["stop_c"] = "D-2"
+    ledger = f"| D-2 | 2026-01-05 | user:U0 | STOP C wave-0 gates_sha {manifest['gates_sha']} | plan approved |\n" if stop_c else ""
+    if prior_result is not None:
+        waves.joinpath("wave-0.result.json").write_text(json.dumps(prior_result))
+    if decisions is not None or stop_c:
+        (ws / ".migration" / "06_decisions.md").write_text(ledger + (decisions or ""))
     if smoke:
         manifest["smoke"] = True
     manifest_path = waves / "wave-0.json"
@@ -63,7 +83,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "checks": [
                 {"id": "allowed_targets", "status": "ok",
                  "data": {"catalogs": ["mig"], "guard_mode": "block"}},
-                {"id": "workspace", "status": "ok", "data": {"stop_mode": "soft"}},
+                {"id": "workspace", "status": "ok", "data": {"stop_mode": stop_mode}},
             ],
             "hook_probe": doctor_hook_probe,
             "source": doctor_source,
@@ -140,7 +160,306 @@ def log(message):
 def _pass_report(pr_url="", **extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": pr_url, "branch": "feature/x", "changed_paths": [],
+            "gates": [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}],
             "write_targets": ["mig.t"], "one_line_summary": "ok", **extra}
+
+
+def _result(ws):
+    return json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
+
+
+def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_ledger(tmp_path):
+    ws, cwd = _workspace(tmp_path / "pending")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "pending", [_pass_report(pr, gates=[])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["batches"][0]["status"] == "FAIL" and result["batches"][0]["failure_class"] == "gates"
+    assert result["batches"][0]["gates"][0]["status"] == "pending" and result["closed"] is False
+    assert "g-rows" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+
+    waived = {"id": "g-export", "kind": "export_file", "status": "waived", "evidence": "", "decision_id": "D-4"}
+    ws, cwd = _workspace(tmp_path / "waived", gates=[GATE, waived],
+                         decisions="| D-4 | user:U1 | waive g-export for u, the downstream feed is retired |\n")
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["closed"] is True
+    assert [g["status"] for g in result["batches"][0]["gates"]] == ["passed", "waived"]
+    assert result["waived_gates"] == [{"batch": "b-1", "units": ["u"], "gate": "g-export", "decision_id": "D-4"}]
+    assert "D-4" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert "g-rows" in [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+
+    ws, cwd = _workspace(tmp_path / "unwaived", gates=[GATE, waived])
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "unwaived", [_pass_report(pr)])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["batches"][0]["failure_class"] == "gates"
+
+
+def test_a_waiver_a_human_wrote_for_an_earlier_run_does_not_waive_the_gate_after_a_new_stop_c(tmp_path):
+    """A rerun's STOP C is a new row the manifest names; a post-STOP C waiver counts only when it is written
+    after that row, so the earlier run's waiver of the same gate and units is not silently reused."""
+    waiver = "| D-4 | user:U1 | waive g-rows for u |\n"
+    ws, cwd = _workspace(tmp_path / "before")
+    ledger = ws / ".migration" / "06_decisions.md"
+    ledger.write_text(waiver + ledger.read_text())
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "before", [_pass_report(pr, gates=[])])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["batches"][0]["failure_class"] == "gates" and result["waived_gates"] == []
+    assert "D-4" not in json.dumps(result["batches"][0]["gates"])
+
+    ws, cwd = _workspace(tmp_path / "after", decisions=waiver)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "after", [_pass_report(pr, gates=[]), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["waived_gates"] == [{"batch": "b-1", "units": ["u"], "gate": "g-rows", "decision_id": "D-4"}]
+
+
+@pytest.mark.parametrize("ledger", [
+    None,                                                                   # no ledger at all
+    "",
+    "| D-2 | user:U0 | STOP C wave-0 gates_sha {other} |\n",                     # a different approved list
+    "| D-2 | user:U0 | STOP C wave-0 {sha} |\n",                                 # the hash without its name
+    "| D-2 | user:U0 | tolerance note, gates_sha {sha} |\n",                     # a human row that is not STOP C
+    "| D-2 | user:U0 | STOP C wave-1 gates_sha {sha} |\n",                       # another wave's approval
+    "| D-3 | user:U0 | STOP C wave-0 gates_sha {sha} |\n",                       # not the row the manifest names
+    "| D-2 | user:U0 STOP C wave-0 gates_sha {sha} approved |\n",                # prose, not a parsed row
+])
+def test_gates_sha_must_be_the_one_a_human_approved_in_the_ledger(tmp_path, ledger):
+    ws, cwd = _workspace(tmp_path, stop_c=False)
+    sha = json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
+    if ledger is not None:
+        (ws / ".migration" / "06_decisions.md").write_text(ledger.format(sha=sha, other="0" * 64))
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "gates_sha" in proc.stderr and "06_decisions.md" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+@pytest.mark.parametrize("stop_mode,launches", [("soft", True), ("hard", False)])
+def test_a_default_accepted_stop_c_row_launches_only_a_soft_stop_mode_wave(tmp_path, stop_mode, launches):
+    """STOP C resolves per stop_mode, like the other stops: the orchestrator's default-accepted row approves
+    the gate plan in soft mode; hard mode needs a human's row."""
+    ws, cwd = _workspace(tmp_path, stop_c=False, stop_mode=stop_mode)
+    sha = json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
+    (ws / ".migration" / "06_decisions.md").write_text(
+        f"| D-2 | 2026-01-05 | default-accepted (soft, 60s) | STOP C wave-0 gates_sha {sha} |\n")
+    proc, calls = _run(cwd, tmp_path, [_pass_report(_push_pr(ws)), _verify_report()])
+    if launches:
+        assert proc.returncode == 0, proc.stderr
+        assert _result(ws)["batches"][0]["status"] == "PASS"
+    else:
+        assert proc.returncode != 0 and "gates_sha" in proc.stderr and "user:<id>" in proc.stderr
+        assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(tmp_path):
+    ws, cwd = _workspace(tmp_path, doctor=False, gates=[GATE, {**GATE, "id": "g-w", "kind": "export_file",
+                                                                 "status": "waived", "decision_id": "D-4"}],
+                         decisions="| D-4 | user:U1 | waive g-w for u |\n")
+    results = tmp_path / "results.json"
+
+    def run(reports):
+        results.write_text(json.dumps(reports))
+        return subprocess.run([sys.executable, str(WORKFLOW), "gates", str(results)], cwd=cwd, env={},
+                              capture_output=True, text=True)
+
+    pr = _push_pr(ws)
+    passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    assert proc.returncode != 0 and "workflow.py reserve" in proc.stderr and "D-2" in proc.stderr  # no reservation
+    assert _workflow(cwd, "reserve").returncode == 0
+    for reports in ([{"batch": "b-1", "pr_url": pr, "gates": []}],                                   # g-rows still pending
+                    [],                                                                               # batch not gathered
+                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": ""}]}],
+                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": ".migration/recon/u/absent.md"}]}],
+                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": "recon/u/result.json"}]}],
+                    [{"batch": "b-1", "pr_url": "https://github.com/acme/target/pull/7", "gates": [passed]}],  # no such PR
+                    [{"batch": "b-1", "gates": [passed]}],                                            # no PR named
+                    [{"batch": "b-9", "pr_url": pr, "gates": []}]):                                  # not in the manifest
+        proc = run(reports)
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr, reports
+        assert "g-rows" in proc.stdout or "b-1" in proc.stdout or "b-9" in proc.stderr or "pr_url" in proc.stderr, reports
+    proc = run([{"batch": "b-1", "pr_url": "https://github.com/acme/target/pull/7", "gates": [passed]}])
+    assert "pull/7 is not a PR of github.com/acme/target whose head git can fetch" in json.dumps(json.loads(proc.stdout)["batches"]["b-1"]["unmet"])
+    proc = run("not a list")
+    assert proc.returncode != 0 and "{batch, pr_url, gates}" in proc.stderr
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    assert [json.loads(l)["mode"] for l in runs.read_text().splitlines()] == ["reserve"]  # unmet gates: the run stays open
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == []
+    assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
+    assert [(json.loads(l)["stop_c"], json.loads(l)["mode"]) for l in runs.read_text().splitlines()] == [("D-2", "reserve"), ("D-2", "gates")]
+    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
+    assert proc.returncode != 0 and "closed" in proc.stderr and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def _workflow(cwd, *args, **kw):
+    return subprocess.run([sys.executable, str(WORKFLOW), *args], cwd=cwd, env={}, capture_output=True, text=True, **kw)
+
+
+def test_a_hand_run_wave_reserves_its_stop_c_row_before_launch_and_a_spent_row_reserves_nothing(tmp_path):
+    """`workflow.py reserve` is the hand-run path's launch record: it spends the manifest's STOP C row in the
+    run log as a workflow start does, so a second hand launch, or a workflow start over it, halts."""
+    ws, cwd = _workspace(tmp_path / "hand", doctor=False)
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"wave": 0, "stop_c": "D-2", "reserved": True}
+    assert [json.loads(l) for l in runs.read_text().splitlines()] == [{"stop_c": "D-2", "mode": "reserve", "run_id": None}]
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert len(runs.read_text().splitlines()) == 1
+
+    ws, cwd = _workspace(tmp_path / "then_workflow")
+    assert _workflow(cwd, "reserve").returncode == 0
+    proc, calls = _run(cwd, tmp_path / "then_workflow", [_pass_report()])
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "after_workflow", doctor=False)
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": None}) + "\n")
+    proc = _workflow(cwd, "reserve")
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    (tmp_path / "after_workflow" / "results.json").write_text("[]")
+    proc = _workflow(cwd, "gates", str(tmp_path / "after_workflow" / "results.json"))
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr and "Traceback" not in proc.stderr
+
+
+def test_the_stop_c_row_is_spent_under_the_run_log_lock_so_two_starts_cannot_both_take_it(tmp_path):
+    """The check that a row is unspent and the record that spends it happen under an exclusive lock on the
+    run log: a start that finds the log locked waits, then sees the other start's record and halts."""
+    ws, cwd = _workspace(tmp_path / "ws", doctor=False)
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    runs.touch()
+    with runs.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        waiting = subprocess.Popen([sys.executable, str(WORKFLOW), "reserve"], cwd=cwd, env={},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with pytest.raises(subprocess.TimeoutExpired):
+            waiting.wait(timeout=2)
+        held.write(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": None}) + "\n")
+        held.flush()
+        fcntl.flock(held, fcntl.LOCK_UN)
+    _, err = waiting.communicate(timeout=30)
+    assert waiting.returncode != 0 and "D-2" in err and "STOP C" in err
+    assert len(runs.read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("changed", [{"gates": [{**GATE, "kind": "custom"}]}, {"units": ("other_unit",)}])
+def test_gate_list_changed_after_stop_c_halts_before_launch(tmp_path, changed):
+    approved = [{"id": "b-1", "units": ["u"], "gates": [GATE]}]
+    ws, cwd = _workspace(tmp_path, gates_sha=_gates_sha(approved), **changed)
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "gates_sha" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_a_gate_marked_passed_in_the_manifest_after_stop_c_halts_before_launch(tmp_path):
+    approved = [{"id": "b-1", "units": ["u"], "gates": [GATE]}]
+    ws, cwd = _workspace(tmp_path, gates_sha=_gates_sha(approved),
+                         gates=[{**GATE, "status": "passed", "evidence": "note.txt"}])
+    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "gates_sha" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_a_stop_c_approval_launches_one_run_of_its_wave(tmp_path):
+    """The manifest's stop_c row is the one STOP C occurrence that approved this wave; a rerun after a run
+    that recorded it needs STOP C to fire again (a new row, named in the manifest), not the old approval."""
+    spent = {"closed": False, "run_id": "wfr-old", "base_sha": "a" * 40, "stop_c": "D-2"}
+    ws, cwd = _workspace(tmp_path / "spent", mode="rerun", prior_result=spent)
+    proc, calls = _run(cwd, tmp_path / "spent", [_pass_report()])
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert json.loads((ws / ".migration/waves/wave-0.result.json").read_text()) == spent
+
+    ws, cwd = _workspace(tmp_path / "fresh", mode="rerun", prior_result={**spent, "stop_c": "D-1"})
+    proc, calls = _run(cwd, tmp_path / "fresh", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
+    assert _result(ws)["stop_c"] == "D-2"
+
+    ws, cwd = _workspace(tmp_path / "resume", mode="resume", run_id="wfr-old", prior_result=spent)
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-old\n")
+    base = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
+    (ws / ".migration/waves/wave-0.base_sha").write_text(base)
+    proc, calls = _run(cwd, tmp_path / "resume", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr  # the same run continuing is not a second run
+
+
+def test_every_run_is_appended_to_the_wave_run_log_and_a_stop_c_row_spent_by_any_of_them_is_not_reused(tmp_path):
+    """The result file holds the last run only, so alternating two STOP C rows would reuse each in turn; the
+    wave's run log is append-only and every run's stop_c is checked against all of it."""
+    ws, cwd = _workspace(tmp_path / "log")
+    proc, _ = _run(cwd, tmp_path / "log", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    assert [json.loads(l)["stop_c"] for l in runs.read_text().splitlines()] == ["D-2"]
+
+    prior = {"closed": False, "run_id": "wfr-old", "base_sha": "a" * 40, "stop_c": "D-1"}
+    log = json.dumps({"stop_c": "D-2", "mode": "start"}) + "\n" + json.dumps({"stop_c": "D-1", "mode": "rerun"}) + "\n"
+    ws, cwd = _workspace(tmp_path / "alternating", mode="rerun", prior_result=prior)
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(log)
+    proc, calls = _run(cwd, tmp_path / "alternating", [_pass_report()])
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr and "runs.jsonl" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert (ws / ".migration/waves/wave-0.runs.jsonl").read_text() == log
+
+    ws, cwd = _workspace(tmp_path / "deleted_result")  # start mode, result removed, log remembers
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start"}) + "\n")
+    proc, calls = _run(cwd, tmp_path / "deleted_result", [_pass_report()])
+    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "fresh", mode="rerun", prior_result=prior)
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-1", "mode": "start"}) + "\n")
+    proc, calls = _run(cwd, tmp_path / "fresh", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert [json.loads(l)["stop_c"] for l in (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()] == ["D-1", "D-2"]
+
+    ws, cwd = _workspace(tmp_path / "resume", mode="resume", run_id="wfr-old", prior_result={**prior, "stop_c": "D-2"})
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": "wfr-old"}) + "\n")
+    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-old\n")
+    base = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
+    (ws / ".migration/waves/wave-0.base_sha").write_text(base)
+    proc, _ = _run(cwd, tmp_path / "resume", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr  # continuing the run that spent it
+    assert len((ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("log", ["{not json\n", "[]\n", '{"mode": "start"}\n', ""])
+def test_a_run_log_that_cannot_say_which_stop_c_rows_were_spent_halts(tmp_path, log):
+    ws, cwd = _workspace(tmp_path / "ws", mode="rerun", prior_result={"closed": False, "stop_c": "D-1"})
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(log)
+    proc, calls = _run(cwd, tmp_path / "ws", [_pass_report()])
+    if log == "":
+        assert proc.returncode == 0, proc.stderr
+        return
+    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert (ws / ".migration/waves/wave-0.runs.jsonl").read_text() == log
+
+
+@pytest.mark.parametrize("prior", ["{not json", '"a string"', "[]", "null"])
+def test_a_rerun_over_a_result_that_cannot_say_which_stop_c_it_spent_halts(tmp_path, prior):
+    """A prior result the workflow cannot read is not proof the approval is unspent; the rerun halts until a
+    human inspects or restores it, rather than launching on the old row."""
+    ws, cwd = _workspace(tmp_path / "ws", mode="rerun")
+    (ws / ".migration/waves/wave-0.result.json").write_text(prior)
+    proc, calls = _run(cwd, tmp_path / "ws", [_pass_report()])
+    assert proc.returncode != 0 and "wave-0.result.json" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert (ws / ".migration/waves/wave-0.result.json").read_text() == prior
 
 
 def _push_pr(ws, n=1):
@@ -154,7 +473,7 @@ def _verify_report(**extra):
 
 
 def test_merge_eligible_false_is_recorded_as_merged_only_by_a_ledger_override(tmp_path):
-    ledger = "| D-3 | user:U1 merge_override for u, watermark gap accepted |\n"
+    ledger = "| D-3 | user:U1 | merge_override for u, watermark gap accepted |\n"
     override = {"kind": "human_override", "decision_id": "D-3"}
     ws, cwd = _workspace(tmp_path, decisions=ledger)
     pr = _push_pr(ws)
@@ -169,7 +488,7 @@ def test_merge_eligible_false_is_recorded_as_merged_only_by_a_ledger_override(tm
     assert "D-3" in (ws / ".migration/waves/wave-0.brief.md").read_text()
     assert "D-3" in [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
 
-    ws, cwd = _workspace(tmp_path / "no_row", decisions="| D-3 | user:U1 widen tolerance for u |\n")
+    ws, cwd = _workspace(tmp_path / "no_row", decisions="| D-3 | user:U1 | widen tolerance for u |\n")
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "no_row", [_pass_report(pr, merge_eligible=False, merge_authority=override)])
     assert proc.returncode == 0, proc.stderr
@@ -194,7 +513,7 @@ def test_every_unit_of_the_batch_must_be_merge_eligible_in_its_own_result_json(t
     assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
     assert "u2" in batch["one_line_summary"] and "merge_authority" not in batch
 
-    ledger = "| D-3 | user:U1 merge_override for u, u2 |\n"
+    ledger = "| D-3 | user:U1 | merge_override for u, u2 |\n"
     override = {"kind": "human_override", "decision_id": "D-3"}
     ws, cwd = _workspace(tmp_path / "override", units=("u", "u2"), recon={"u": True, "u2": False}, decisions=ledger)
     pr = _push_pr(ws)
