@@ -156,6 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="verify the harness install (no connections needed)")
     sub.add_parser("families", help="print the live-tested vs refused source families as JSON")
+    d = sub.add_parser("dictionary-objects", help="print the catalog objects a family's "
+                       "dictionary readers probe as JSON (doctor's dictionary_readable table)")
+    d.add_argument("--family", required=True)
     t = sub.add_parser("type-map-audit", help="audit a spec's declared target types against the "
                        "family type_map (JSON, no connections)")
     t.add_argument("--spec", required=True, type=Path)
@@ -230,6 +233,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "live_tested": sorted(f for f in SOURCE_ADAPTERS if not is_untested_source_family(f)),
             "untested": sorted(f for f in SOURCE_ADAPTERS if is_untested_source_family(f)),
+        }))
+        return 0
+
+    if args.cmd == "dictionary-objects":
+        from .adapters import DICTIONARY_OBJECTS
+        print(json.dumps({
+            "family": args.family,
+            "family_known": args.family in DICTIONARY_OBJECTS,
+            "objects": [list(x) for x in DICTIONARY_OBJECTS.get(args.family, ())],
         }))
         return 0
 

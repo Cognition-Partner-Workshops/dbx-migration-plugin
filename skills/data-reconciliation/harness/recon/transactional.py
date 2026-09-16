@@ -1472,7 +1472,9 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                 ref_map = next((_column_map(spec, o) for o in spec.objects
                                 if o.object.lower() == found[0]), {})
                 want = (_map_cols(cols, colmap), found[0], _map_cols(rcols, ref_map))
-                if want not in t_fks and want not in t_fks_info:
+                if want in t_fks:
+                    expected_fks.add(want)
+                elif want not in t_fks_info:
                     findings.append(Finding(c.object, "foreign_key_informational_missing",
                                             f"source FK {cols} -> {ref}{rcols} is informational and "
                                             "absent on the target"))

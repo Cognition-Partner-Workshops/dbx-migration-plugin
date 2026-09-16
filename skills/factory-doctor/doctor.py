@@ -1240,59 +1240,29 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
 # The structural tier reads these catalog objects; a principal whose view of them is filtered by
 # permission passes the tier on an empty dictionary. `views` probes readability; `trigger_census`
 # cross-checks what the table declares against what the principal can list, per in-scope table.
-_DICTIONARY_QUERIES = {
-    "sqlserver": {
-        "views": [
-            ("sys.indexes", "SELECT TOP 1 1 FROM sys.indexes"),
-            ("sys.index_columns", "SELECT TOP 1 1 FROM sys.index_columns"),
-            ("sys.columns", "SELECT TOP 1 1 FROM sys.columns"),
-            ("sys.objects", "SELECT TOP 1 1 FROM sys.objects"),
-            ("sys.schemas", "SELECT TOP 1 1 FROM sys.schemas"),
-            ("sys.foreign_keys", "SELECT TOP 1 1 FROM sys.foreign_keys"),
-            ("sys.foreign_key_columns", "SELECT TOP 1 1 FROM sys.foreign_key_columns"),
-            ("sys.check_constraints", "SELECT TOP 1 1 FROM sys.check_constraints"),
-            ("sys.identity_columns", "SELECT TOP 1 1 FROM sys.identity_columns"),
-            ("sys.triggers", "SELECT TOP 1 1 FROM sys.triggers"),
-            ("sys.trigger_events", "SELECT TOP 1 1 FROM sys.trigger_events"),
-            ("sys.database_permissions", "SELECT TOP 1 1 FROM sys.database_permissions"),
-            ("sys.database_principals", "SELECT TOP 1 1 FROM sys.database_principals"),
-        ],
-        "trigger_census": (
-            "SELECT CASE WHEN OBJECTPROPERTY(OBJECT_ID(?), 'TableHasInsertTrigger') = 1 "
-            "OR OBJECTPROPERTY(OBJECT_ID(?), 'TableHasUpdateTrigger') = 1 "
-            "OR OBJECTPROPERTY(OBJECT_ID(?), 'TableHasDeleteTrigger') = 1 THEN 1 ELSE 0 END",
-            "SELECT COUNT(*) FROM sys.triggers WHERE parent_id = OBJECT_ID(?)"),
-    },
-    "postgres": {
-        "views": [
-            ("pg_constraint", "SELECT 1 FROM pg_constraint LIMIT 1"),
-            ("pg_index", "SELECT 1 FROM pg_index LIMIT 1"),
-            ("pg_class", "SELECT 1 FROM pg_class LIMIT 1"),
-            ("pg_namespace", "SELECT 1 FROM pg_namespace LIMIT 1"),
-            ("pg_attribute", "SELECT 1 FROM pg_attribute LIMIT 1"),
-            ("pg_sequence", "SELECT 1 FROM pg_sequence LIMIT 1"),
-            ("pg_get_serial_sequence", "SELECT pg_get_serial_sequence('pg_class', 'oid')"),
-            ("server_version_num", "SELECT current_setting('server_version_num')"),
-            ("pg_trigger", "SELECT 1 FROM pg_trigger LIMIT 1"),
-            ("information_schema.table_privileges",
-             "SELECT 1 FROM information_schema.table_privileges LIMIT 1"),
-        ],
-        "trigger_census": (
-            "SELECT relhastriggers::int FROM pg_class WHERE oid = to_regclass(%s)",
-            "SELECT COUNT(*) FROM pg_trigger WHERE tgrelid = to_regclass(%s) AND NOT tgisinternal"),
-    },
+_TRIGGER_CENSUS = {
+    "sqlserver": (
+        "SELECT CASE WHEN OBJECTPROPERTY(OBJECT_ID(?), 'TableHasInsertTrigger') = 1 "
+        "OR OBJECTPROPERTY(OBJECT_ID(?), 'TableHasUpdateTrigger') = 1 "
+        "OR OBJECTPROPERTY(OBJECT_ID(?), 'TableHasDeleteTrigger') = 1 THEN 1 ELSE 0 END",
+        "SELECT COUNT(*) FROM sys.triggers WHERE parent_id = OBJECT_ID(?)"),
+    "postgres": (
+        "SELECT relhastriggers::int FROM pg_class WHERE oid = to_regclass(%s)",
+        "SELECT COUNT(*) FROM pg_trigger WHERE tgrelid = to_regclass(%s) AND NOT tgisinternal"),
 }
 
 
 def check_dictionary_readable(tables: list[str], family: str, source_secret: str | None,
-                              connect=None) -> Check:
+                              connect=None, views: list[tuple] | None = None) -> Check:
     """SELECT on the data is not visibility of the catalog: sys.triggers/pg_trigger rows are
     filtered by permission, so a principal that sees none grades the trigger comparison on an
-    empty view — the missing-trigger defect reported as clean. Deliberately separate from
-    source_principal_read_only; a failure names the view, never the credential."""
+    empty view — the missing-trigger defect reported as clean. `views` is the harness's
+    DICTIONARY_OBJECTS table for the family (recon.adapters), so the probe list cannot drift
+    from the reader queries. Deliberately separate from source_principal_read_only; a failure
+    names the view, never the credential."""
     cid = "dictionary_readable"
-    q = _DICTIONARY_QUERIES.get(family)
-    if q is None:
+    q = _TRIGGER_CENSUS.get(family)
+    if not views:
         return Check(cid, "unverified", f"{family}: no dictionary probe for this family; structural "
                      "parity will record its categories as unsupported",
                      {"family": family, "tables": tables})
@@ -1307,14 +1277,14 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
         conn = (connect or _READ_ONLY_CONNECT[family])(os.environ[source_secret])
         try:
             cur = conn.cursor()
-            for label, sql in q["views"]:
+            for label, sql in views:
                 try:
                     cur.execute(sql).fetchall()
                 except Exception as e:  # noqa: BLE001
                     return Check(cid, "fail", f"cannot read {label}: {_redact(str(e))}: the "
                                  "structural tier would grade on an incomplete dictionary", data)
                 data["views"].append(label)
-            declared_sql, listed_sql = q["trigger_census"]
+            declared_sql, listed_sql = q
             mismatched = []
             for t in tables:
                 n = declared_sql.count("?") or declared_sql.count("%s")
@@ -1372,7 +1342,23 @@ def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mapping
         return Check(cid, "unverified", "source family not declared: pass --source-family "
                      f"{'|'.join(SOURCE_FAMILIES)} so catalog visibility can be checked",
                      {"tables": list(tables)})
-    return check_dictionary_readable(list(tables), family, source_secret)
+    cmd = _harness_command(plugin_root)
+    if cmd is None:
+        return Check(cid, "fail", "cannot ask the harness which catalog objects to probe: "
+                     "dbx-recon not on PATH and the checkout has no harness")
+    argv, cwd, how = cmd
+    rc, out, err = _run(argv + ["dictionary-objects", "--family", family],
+                      **({"cwd": cwd} if cwd else {}))
+    try:
+        d = json.loads(out) if rc == 0 else {}
+        views = [tuple(x) for x in d["objects"]] if d.get("family_known") else None
+    except (ValueError, KeyError, TypeError):
+        return Check(cid, "fail", f"cannot ask the harness which catalog objects to probe "
+                     f"({how} dictionary-objects rc={rc}): {_redact(err or out)}",
+                     {"family": family, "tables": list(tables)})
+    c = check_dictionary_readable(list(tables), family, source_secret, views=views)
+    c.data["harness"] = how
+    return c
 
 
 # ------------------------------------------------------------------ databricks identity

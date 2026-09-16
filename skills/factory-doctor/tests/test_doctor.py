@@ -1384,6 +1384,10 @@ def test_source_families_are_the_harness_families_and_databricks_without_cli_is_
 
 # ------------------------------------------------------------------ dictionary_readable (WS3.1)
 
+sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness"))
+from recon.adapters import DICTIONARY_OBJECTS  # noqa: E402
+
+
 class FakeDictConn:
     """A source seen through the doctor's dictionary probes. `fail_views` names catalog views
     whose probe raises; `census` maps a table to (declared, listed) trigger answers. Records
@@ -1424,24 +1428,28 @@ def test_dictionary_readable_unverified_for_unprobed_families(monkeypatch):
 
 
 def test_dictionary_readable_fails_without_the_secret(monkeypatch):
-    c = doctor.check_dictionary_readable(TABLES, "sqlserver", None)
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", None,
+                                         views=DICTIONARY_OBJECTS["sqlserver"])
     assert c.status == "fail" and "--source-secret" in c.detail
     monkeypatch.delenv("LEGACY_ODBC", raising=False)
-    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC")
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC",
+                                         views=DICTIONARY_OBJECTS["sqlserver"])
     assert c.status == "fail" and "not set" in c.detail
 
 
 def test_dictionary_readable_fails_when_a_catalog_view_is_unreadable(monkeypatch):
     monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
     conn = FakeDictConn(fail_views={"sys.triggers"})
-    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
     assert c.status == "fail" and "sys.triggers" in c.detail and "DSN" not in c.detail
 
 
 def test_dictionary_readable_fails_when_sqlserver_hides_triggers(monkeypatch):
     monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
     conn = FakeDictConn(census={"raw.loans": (1, 0), "raw.payments": (0, 0)})
-    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
     assert c.status == "fail" and "raw.loans" in c.detail and "filtered by permission" in c.detail
     assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 0}
 
@@ -1450,7 +1458,8 @@ def test_dictionary_readable_fails_when_a_constraint_view_is_unreadable(monkeypa
     monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
     conn = FakeDictConn(fail_views={"pg_index"})
     c = doctor.check_dictionary_readable(TABLES, "postgres", "LEGACY_ODBC",
-                                         connect=lambda dsn: conn)
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["postgres"])
     assert c.status == "fail" and "pg_index" in c.detail and "DSN" not in c.detail
 
 
@@ -1458,14 +1467,16 @@ def test_dictionary_readable_warns_on_a_postgres_census_lag(monkeypatch):
     monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
     conn = FakeDictConn(census={"public.loans": (1, 0)})
     c = doctor.check_dictionary_readable(["public.loans"], "postgres", "LEGACY_ODBC",
-                                         connect=lambda dsn: conn)
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["postgres"])
     assert c.status == "warn" and "relhastriggers" in c.detail
 
 
 def test_dictionary_readable_ok_with_data(monkeypatch):
     monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
     conn = FakeDictConn(census={"raw.loans": (1, 2), "raw.payments": (0, 0)})
-    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn)
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
     assert c.status == "ok"
     assert "sys.triggers" in c.data["views"] and "sys.database_permissions" in c.data["views"]
     assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 2}

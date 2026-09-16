@@ -826,6 +826,64 @@ def _pg_trigger_shape(tgtype: int) -> tuple[str, tuple[str, ...], str]:
             "row" if tgtype & 1 else "statement")
 
 
+# Every catalog object the schema_facts/identity_state readers touch, per family, as
+# (label, SELECT-1 probe) pairs. Doctor's dictionary_readable row consumes this table through
+# `dbx-recon dictionary-objects --family`, so a new reader query cannot drift past the probe
+# list (test_dictionary_objects_cover_every_reader_view enforces it).
+DICTIONARY_OBJECTS = {
+    "sqlserver": (
+        ("sys.indexes", "SELECT TOP 1 1 FROM sys.indexes"),
+        ("sys.index_columns", "SELECT TOP 1 1 FROM sys.index_columns"),
+        ("sys.columns", "SELECT TOP 1 1 FROM sys.columns"),
+        ("sys.types", "SELECT TOP 1 1 FROM sys.types"),
+        ("sys.objects", "SELECT TOP 1 1 FROM sys.objects"),
+        ("sys.schemas", "SELECT TOP 1 1 FROM sys.schemas"),
+        ("sys.foreign_keys", "SELECT TOP 1 1 FROM sys.foreign_keys"),
+        ("sys.foreign_key_columns", "SELECT TOP 1 1 FROM sys.foreign_key_columns"),
+        ("sys.check_constraints", "SELECT TOP 1 1 FROM sys.check_constraints"),
+        ("sys.identity_columns", "SELECT TOP 1 1 FROM sys.identity_columns"),
+        ("sys.triggers", "SELECT TOP 1 1 FROM sys.triggers"),
+        ("sys.trigger_events", "SELECT TOP 1 1 FROM sys.trigger_events"),
+        ("sys.database_permissions", "SELECT TOP 1 1 FROM sys.database_permissions"),
+        ("sys.database_principals", "SELECT TOP 1 1 FROM sys.database_principals"),
+        ("sys.dm_db_index_usage_stats", "SELECT TOP 1 1 FROM sys.dm_db_index_usage_stats"),
+    ),
+    "postgres": (
+        ("pg_constraint", "SELECT 1 FROM pg_constraint LIMIT 1"),
+        ("pg_index", "SELECT 1 FROM pg_index LIMIT 1"),
+        ("pg_class", "SELECT 1 FROM pg_class LIMIT 1"),
+        ("pg_namespace", "SELECT 1 FROM pg_namespace LIMIT 1"),
+        ("pg_attribute", "SELECT 1 FROM pg_attribute LIMIT 1"),
+        ("pg_type", "SELECT 1 FROM pg_type LIMIT 1"),
+        ("pg_sequence", "SELECT 1 FROM pg_sequence LIMIT 1"),
+        ("pg_trigger", "SELECT 1 FROM pg_trigger LIMIT 1"),
+        ("pg_get_serial_sequence", "SELECT pg_get_serial_sequence('pg_class', 'oid')"),
+        ("pg_get_indexdef", "SELECT pg_get_indexdef(0)"),
+        ("pg_get_constraintdef", "SELECT pg_get_constraintdef(0)"),
+        ("pg_get_userbyid", "SELECT pg_get_userbyid(0)"),
+        ("server_version_num", "SELECT current_setting('server_version_num')"),
+        ("information_schema.table_privileges",
+         "SELECT 1 FROM information_schema.table_privileges LIMIT 1"),
+    ),
+    "databricks": (
+        ("information_schema.table_constraints",
+         "SELECT 1 FROM information_schema.table_constraints LIMIT 1"),
+        ("information_schema.key_column_usage",
+         "SELECT 1 FROM information_schema.key_column_usage LIMIT 1"),
+        ("information_schema.referential_constraints",
+         "SELECT 1 FROM information_schema.referential_constraints LIMIT 1"),
+        ("information_schema.columns", "SELECT 1 FROM information_schema.columns LIMIT 1"),
+        ("information_schema.check_constraints",
+         "SELECT 1 FROM information_schema.check_constraints LIMIT 1"),
+        ("information_schema.table_privileges",
+         "SELECT 1 FROM information_schema.table_privileges LIMIT 1"),
+        ("information_schema.tables", "SELECT 1 FROM information_schema.tables LIMIT 1"),
+        ("SHOW CREATE TABLE", "SHOW CREATE TABLE {catalog}.{schema}.{table}"),
+    ),
+}
+DICTIONARY_OBJECTS["lakebase"] = DICTIONARY_OBJECTS["postgres"]
+
+
 def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> SchemaFacts:
     """One table's Unity Catalog facts, shared by the Databricks adapters: constraints and
     grants over information_schema, identity columns from the SHOW CREATE TABLE DDL (the

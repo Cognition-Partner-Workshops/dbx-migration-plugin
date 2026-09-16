@@ -72,19 +72,19 @@ def structural_checks(pairs: list[tuple[SchemaFacts, SchemaFacts]]) -> dict[str,
             else "unsupported" for cat in CATEGORIES}
 
 
-def _trigger_cover(facts: SchemaFacts) -> dict[tuple[str, str], str]:
-    cov = {}
+def _trigger_cover(facts: SchemaFacts) -> dict[tuple[str, str], set[str]]:
+    cov: dict[tuple[str, str], set[str]] = {}
     for timing, events, gran in facts.triggers.values():
         for ev in events:
-            cov.setdefault((timing, ev), gran)
+            cov.setdefault((timing, ev), set()).add(gran)
     return cov
 
 
 def compare_triggers(obj: str, s: SchemaFacts, t: SchemaFacts) -> tuple[list[Finding], list[Finding]]:
     """(findings, extra): trigger names are ignored (conversion renames them) — coverage is by
     (timing, event) pairs at matching granularity. A source pair the target lacks is
-    trigger_missing; the same pair firing per-statement where the source fires per-row is
-    trigger_granularity_mismatch; a target pair with no source counterpart is trigger_extra."""
+    trigger_missing; the pair exists on both sides but the target's granularity set is disjoint
+    is trigger_granularity_mismatch; a target pair with no source counterpart is trigger_extra."""
     s_cov, t_cov = _trigger_cover(s), _trigger_cover(t)
     findings, extra = [], []
     for name, (timing, events, gran) in sorted(s.triggers.items()):
@@ -94,10 +94,11 @@ def compare_triggers(obj: str, s: SchemaFacts, t: SchemaFacts) -> tuple[list[Fin
                                         f"source trigger {name} ({timing} "
                                         f"{','.join(sorted(events))}) has no target trigger for "
                                         f"{timing} {ev}"))
-            elif t_cov[(timing, ev)] != gran:
+            elif t_cov[(timing, ev)].isdisjoint({gran}):
                 findings.append(Finding(obj, "trigger_granularity_mismatch",
                                         f"source trigger {name} fires {timing} {ev} per {gran}, "
-                                        f"target fires it per {t_cov[(timing, ev)]}"))
+                                        f"target fires it per "
+                                        f"{'/'.join(sorted(t_cov[(timing, ev)]))}"))
     for name, (timing, events, _g) in sorted(t.triggers.items()):
         for ev in sorted(e for e in events if (timing, e) not in s_cov):
             extra.append(Finding(obj, "trigger_extra",

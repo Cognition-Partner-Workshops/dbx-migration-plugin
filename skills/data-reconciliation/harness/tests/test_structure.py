@@ -323,6 +323,22 @@ def test_compare_triggers_flags_a_granularity_mismatch():
     assert [f.check for f in findings] == ["trigger_granularity_mismatch"] and tight == []
 
 
+def test_compare_triggers_passes_when_both_granularities_are_covered():
+    both = {"a": ("after", ("insert",), "row"), "b": ("after", ("insert",), "statement")}
+    findings, tight = compare_triggers("o", SchemaFacts(triggers=both),
+                                       SchemaFacts(triggers=dict(both)))
+    assert findings == [] and tight == []
+
+
+def test_tier0_informational_source_fk_met_by_an_enforced_target_fk_is_clean():
+    src = _facts(LOANS_FACTS, foreign_keys=set(),
+                 foreign_keys_informational={(("borrower_id",), "borrowers", ("borrower_id",))})
+    tgt = _facts(TARGET_LOANS_FACTS)
+    result = _live(loans_src_facts=src, loans_tgt_facts=tgt)
+    t0 = result["tiers"][0]
+    assert t0["passed"] is True and not t0["stats"].get("structural_diff")
+
+
 def test_tier0_target_only_trigger_fails_despite_accept_target_only_constraints():
     loans, borrowers = _rows(12)
     source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
