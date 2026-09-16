@@ -64,8 +64,8 @@ def _manifest_units(path: Path, expected_sha) -> dict:
             continue
         if not isinstance(batch_units, list):
             raise ValueError(f"{manifest_path}: manifest batch {batch_id!r} units is not a list")
-        if isinstance(batch_id, str):
-            units[batch_id] = batch_units
+        if batch_id not in (None, ""):
+            units[_text(batch_id)] = batch_units
     return units
 
 
@@ -97,8 +97,9 @@ def render_progress(mig: Path) -> str:
             if not isinstance(batch, dict):
                 raise ValueError(f"{path}: result batch is not an object")
             batch_id = batch.get("id")
-            if not isinstance(batch_id, str):
+            if batch_id in (None, ""):
                 raise ValueError(f"{path}: result batch has no id")
+            batch_id = _text(batch_id)
             cost = batch.get("recon_cost")
             cost_text = json.dumps(cost, sort_keys=True, separators=(",", ":")) \
                 if isinstance(cost, dict) else ""
@@ -116,10 +117,10 @@ def render_progress(mig: Path) -> str:
                         raise ValueError(
                             f"{path}: batch {batch.get('id')!r} has no units and no readable manifest entry"
                         ) from None
-                units = manifest_units.get(batch.get("id"))
+                units = manifest_units.get(batch_id)
                 if not isinstance(units, list):
                     raise ValueError(
-                        f"{path}: batch {batch.get('id')!r} has no units and no readable manifest entry"
+                        f"{path}: batch {batch_id!r} has no units and no readable manifest entry"
                     )
             if not units:
                 raise ValueError(f"{path}: batch {batch_id!r} has no units")

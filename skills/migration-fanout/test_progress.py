@@ -56,6 +56,38 @@ def test_render_progress_uses_manifest_units_when_result_omits_them(tmp_path):
     assert "| 1 | w1-b01 | u_b | PASS | PASS |  | https://example.invalid/1 | {\"rows\":2} |" in text
 
 
+def test_render_progress_normalizes_numeric_batch_ids(tmp_path):
+    mig = tmp_path / ".migration"
+    waves = mig / "waves"
+    waves.mkdir(parents=True)
+    manifest_text = json.dumps({
+        "wave": 1,
+        "batches": [{"id": 1, "units": ["u1"]}],
+    })
+    (waves / "wave-1.json").write_text(manifest_text)
+    (waves / "wave-1.result.json").write_text(json.dumps({
+        "wave": 1,
+        "manifest_sha": hashlib.sha256(manifest_text.encode()).hexdigest()[:12],
+        "batches": [{"id": 1, "status": "PASS", "recon_verdict": "PASS"}],
+        "verify": {"unit_verdicts": {"1": "FAIL"}},
+    }))
+
+    text = render_progress(mig)
+
+    assert "| 1 | 1 | u1 | FAIL | PASS | FAIL |  |  |" in text
+
+
+def test_render_progress_rejects_empty_batch_id(tmp_path):
+    mig = tmp_path / ".migration"
+    _write_result(mig, "wave-1.result.json", {
+        "wave": 1,
+        "batches": [{"id": "", "units": ["u1"]}],
+    })
+
+    with pytest.raises(ValueError, match=r"wave-1\.result\.json: result batch has no id"):
+        render_progress(mig)
+
+
 def test_render_progress_rejects_stale_manifest_units(tmp_path):
     mig = tmp_path / ".migration"
     waves = mig / "waves"
