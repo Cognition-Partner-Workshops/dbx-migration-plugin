@@ -49,13 +49,16 @@ _CREATE_ANY = re.compile(
     r"^CREATE\s+(?:OR\s+REPLACE\s+)?(?:EXTERNAL\s+|TEMPORARY\s+|TEMP\s+|UNLOGGED\s+)?"
     r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[^\s(]+)", re.IGNORECASE | re.DOTALL)
 _TABLE_PK = re.compile(r"^(?:CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\s*\(", re.IGNORECASE | re.DOTALL)
-_DROP = re.compile(r"^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<name>[^\s;]+)", re.IGNORECASE | re.DOTALL)
+_DROP = re.compile(r"^DROP\s+TABLE\b(?P<rest>.*)$", re.IGNORECASE | re.DOTALL)
+_DROP_HEAD = re.compile(r"^\s*(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?", re.IGNORECASE)
+_DROP_TAIL = re.compile(r"\s+(?:CASCADE|RESTRICT)\s*$", re.IGNORECASE)
+_NAME = re.compile(r"^(?:(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][\w$]*)\.)*(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][\w$]*)$")
 
 
 _SERIAL = {"serial": "int", "serial4": "int", "bigserial": "bigint", "serial8": "bigint",
            "smallserial": "smallint", "serial2": "smallint"}
 # PostgreSQL format_type puts the precision before the zone words: timestamp(6) without time zone
-_TZ = re.compile(r"\b(timestamp|time)(\(\d+\))? (with|without) time zone")
+_TZ = re.compile(r"\b(timestamp|time)\s*(\(\s*\d+\s*\))?\s+(with|without)\s+time\s+zone")
 
 
 def normalize_type(raw: str) -> str:
@@ -186,6 +189,17 @@ def _table_columns(body: str) -> list[dict]:
     return cols
 
 
+def _dropped_tables(rest: str) -> list[str]:
+    """Every table a DROP TABLE names: `[IF EXISTS] [ONLY] t1, t2 [CASCADE|RESTRICT]`. Anything
+    else in the statement is a refusal, never a partial reading."""
+    body = _DROP_TAIL.sub("", rest[_DROP_HEAD.match(rest).end():]).strip()
+    names = [n.strip() for n in _split_top(body, angle=False)] if body else []
+    if not names or body.endswith(",") or any(not _NAME.match(n) for n in names):
+        raise ConfigError(f"cannot read DROP TABLE{rest.rstrip(';')[:60]}: only "
+                          "[IF EXISTS] [ONLY] <table>[, <table>...] [CASCADE|RESTRICT] is understood")
+    return [_ident(n) for n in names]
+
+
 def _strip_comments(sql: str) -> str:
     """Blank `-- ...` and `/* ... */` outside quoted literals and identifiers (a `--` inside a
     string is text, not a comment)."""
@@ -296,9 +310,12 @@ def declared_shape(sql: str) -> dict:
             continue
         m = _DROP.match(stmt)
         if m:
-            name = _ident(m.group("name"))
-            created.discard(name)
-            tables.pop(name, None)
+            for name in _dropped_tables(m.group("rest")):
+                created.discard(name)
+                tables.pop(name, None)
+                for lst in (if_not_exists, altered):
+                    if name in lst:
+                        lst.remove(name)
             counts["other"] += 1
             continue
         m = _ALTER_ADD.match(stmt)
@@ -414,28 +431,31 @@ def _resolve_tables(expected: dict[str, list[dict]], observed: dict[str, list[di
             taken.add(table)
         else:
             pending[table] = [c for c in _candidates(observed, table) if c not in taken]
-    names = list(pending)
-    best: list[dict[str, str]] = []
-
-    def walk(i: int, used: set[str], picked: dict[str, str]) -> None:
-        if i == len(names):
-            if not best or len(picked) > len(best[0]):
-                best[:] = [dict(picked)]
-            elif len(picked) == len(best[0]):
-                best.append(dict(picked))
-            return
-        for c in pending[names[i]]:
-            if c not in used:
-                picked[names[i]] = c
-                walk(i + 1, used | {c}, picked)
-                del picked[names[i]]
-        walk(i + 1, used, picked)
-
-    walk(0, set(), {})
-    for table in names:
-        picks = {m.get(table) for m in best}
-        out[table] = picks.pop() if len(picks) == 1 else None
+    full = _matching_size(pending)
+    for table, cands in pending.items():
+        # an edge every maximum matching uses is the one whose removal shrinks the maximum
+        forced = [c for c in cands
+                  if _matching_size({**pending, table: [x for x in cands if x != c]}) < full]
+        out[table] = forced[0] if len(forced) == 1 else None
     return out
+
+
+def _matching_size(edges: dict[str, list[str]]) -> int:
+    """Size of a maximum one-to-one matching of the left keys to their right candidates
+    (augmenting paths; polynomial in the number of tables)."""
+    owner: dict[str, str] = {}
+
+    def place(left: str, seen: set[str]) -> bool:
+        for right in edges[left]:
+            if right in seen:
+                continue
+            seen.add(right)
+            if right not in owner or place(owner[right], seen):
+                owner[right] = left
+                return True
+        return False
+
+    return sum(place(left, set()) for left in edges)
 
 
 def _find_table(observed: dict[str, list[dict]], name: str) -> list[dict] | None:

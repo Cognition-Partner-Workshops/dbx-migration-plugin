@@ -5,6 +5,7 @@ records `rerun_proof: {fresh, evolved}`; a failing run is `rerun_gap` and never 
 
 import json
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -192,6 +193,8 @@ def test_declared_shape_refuses_ddl_without_a_create_table():
     ("time(3) without time zone", "time(3)"),
     ("time with time zone", "timetz"),
     ("TIMESTAMP(6)", "timestamp(6)"),
+    ("TIMESTAMP (6) WITHOUT TIME ZONE", "timestamp(6)"),
+    ("time  (3)  with   time   zone", "timetz(3)"),
 ])
 def test_normalize_type_folds_case_whitespace_and_common_spellings(raw, norm):
     assert normalize_type(raw) == norm
@@ -519,6 +522,22 @@ def test_one_observed_table_cannot_stand_in_for_two_declared_tables_that_share_a
     assert grade_rerun(expected, _record("fresh", mixed), None)["findings"] == []
 
 
+def test_table_resolution_stays_fast_when_every_table_has_one_obvious_candidate():
+    """Thirty expected tables, each observed once under a catalog prefix, resolve at once; a search
+    over every partial assignment would visit 2^30 branches here."""
+    cols = [{"name": "id", "type": "int", "nullable": True}]
+    expected = {f"s.t{i}": cols for i in range(30)}
+    observed = {f"cat.s.t{i}": cols for i in range(30)}
+    started = time.monotonic()
+    assert _resolve_tables(expected, observed) == {f"s.t{i}": f"cat.s.t{i}" for i in range(30)}
+    assert time.monotonic() - started < 2
+    observed["orders"] = cols
+    expected.update({"sales.orders": cols, "archive.orders": cols})
+    out = _resolve_tables(expected, observed)
+    assert out["sales.orders"] is None and out["archive.orders"] is None
+    assert out["s.t7"] == "cat.s.t7"
+
+
 def test_a_forced_one_to_one_assignment_resolves_tables_that_share_a_trailing_name():
     """`orders` could be either declared table on its own, but only sales.orders can take
     `mig.sales.orders`, which leaves `orders` for archive.orders: every complete matching agrees, so
@@ -553,6 +572,31 @@ def test_drop_table_lets_a_later_create_land_its_own_shape():
         {"name": "a", "type": "int", "nullable": True}]
     with pytest.raises(ConfigError, match="t is created twice"):
         declared_shape("CREATE TABLE t (a INT); DROP TABLE other; CREATE TABLE t (b INT);")
+
+
+def test_drop_table_starts_the_table_over_including_its_create_and_alter_history():
+    """The IF NOT EXISTS / ALTER notes describe how the surviving shape came to be; a dropped
+    table's earlier statements are not part of that story."""
+    shape = declared_shape("CREATE TABLE t (a INT); ALTER TABLE t ADD COLUMN c INT; DROP TABLE t; "
+                           "CREATE TABLE IF NOT EXISTS t (b INT);")
+    assert shape["if_not_exists"] == ["t"] and shape["altered"] == []
+    shape = declared_shape("CREATE TABLE IF NOT EXISTS t (a INT); DROP TABLE t; CREATE TABLE t (b INT); "
+                           "ALTER TABLE t ADD COLUMN c INT;")
+    assert shape["if_not_exists"] == [] and shape["altered"] == ["t"]
+    assert [c["name"] for c in shape["tables"]["t"]] == ["b", "c"]
+
+
+def test_drop_table_takes_every_table_in_its_list_and_the_dialect_modifiers():
+    shape = declared_shape("CREATE TABLE a (x INT); CREATE TABLE b (x INT); DROP TABLE a,b;")
+    assert shape["tables"] == {}
+    shape = declared_shape("CREATE TABLE a (x INT); CREATE TABLE b (y INT); DROP TABLE a, b; CREATE TABLE b (z INT);")
+    assert shape["tables"] == {"b": [{"name": "z", "type": "int", "nullable": True}]}
+    shape = declared_shape('CREATE TABLE s.a (x INT); CREATE TABLE `b` (x INT); CREATE TABLE c (x INT); '
+                           'DROP TABLE IF EXISTS ONLY s.a, `b` CASCADE; DROP TABLE c RESTRICT;')
+    assert shape["tables"] == {}
+    for bad in ("DROP TABLE t PURGE;", "DROP TABLE t, ;", "DROP TABLE;", "DROP TABLE t CASCADE CONSTRAINTS;"):
+        with pytest.raises(ConfigError, match="DROP TABLE"):
+            declared_shape("CREATE TABLE t (a INT); " + bad)
 
 
 # ---- result.json wiring -----------------------------------------------------------------------
