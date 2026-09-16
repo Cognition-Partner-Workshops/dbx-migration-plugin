@@ -306,7 +306,7 @@ class GuardConfig:
                 raise ValueError(f"fixture_endpoints: cannot tell the cloud family of {endpoint}")
         return cls(catalogs=[_norm(c) for c in catalogs], legacy_sources=lists["legacy_sources"], mode=mode,
                    forbidden_bundle_targets=tuple(t.lower() for t in lists["forbidden_bundle_targets"]),
-                   target_hosts=[h.lower() for h in lists["target_hosts"]], bundle_targets=lists["bundle_targets"],
+                   target_hosts=lists["target_hosts"], bundle_targets=lists["bundle_targets"],
                    lakebase_projects=lists["lakebase_projects"], lakebase_branches=lists["lakebase_branches"],
                    run_mode=run_mode, fixture_endpoints=tuple(endpoints), path=path)
 
@@ -386,6 +386,10 @@ def _shell_tokens(cmd: str) -> tuple[list[str], list[str]]:
             i += 2
         elif ch in "'\"":
             quote, plain, started, rword, i = ch, False, True, rword + ch, i + 1
+        elif ch == "#" and not started:
+            i = cmd.find("\n", i)
+            if i < 0:
+                break
         elif ch in " \t\r" or (m := _OP.match(cmd, i)):
             op = m.group() if ch not in " \t\r" else ""
             i += len(op) or 1
@@ -653,7 +657,7 @@ def _scripts_of(seg: _Seg, argv: list[str] | None = None) -> list[str]:
 
 def _script_inputs(cmd: str, cfg: GuardConfig | None = None) -> list[str]:
     """Script files of every simple command; given a config, only of those naming a client or a legacy source."""
-    return [f for c in _commands(cmd) if cfg is None or _context(" ".join(c.args), cfg) for f in _scripts_of(c)]
+    return [f for c in _commands(cmd) if cfg is None or _mentions(c, cfg) for f in _scripts_of(c)]
 
 
 def _join(at: str | None, d: str) -> str | None:
@@ -798,10 +802,15 @@ def _segments(text: str, ctx: str = "", depth: int = 0, env: dict[str, str] | No
     return out
 
 
-def _context(text: str, cfg: GuardConfig, legacy_only: bool = False) -> list[str]:
-    """The client words, `--target-catalog` and legacy-source names the text mentions (only the latter with `legacy_only`)."""
-    hits = [tok for tok in cfg.legacy_sources if re.search(rf"(?<![\w-]){re.escape(tok)}(?![\w-])", text, re.IGNORECASE)]
-    return hits if legacy_only else [m.group() for m in _CLIENT_WORD.finditer(text)] + (["--target-catalog"] if "--target-catalog" in text else []) + hits
+def _mentions(seg: _Seg, cfg: GuardConfig) -> bool:
+    """Whether a segment's argv names a client, target catalog, or legacy source."""
+    for word in seg.argv or seg.args:
+        if _CLIENT_WORD.search(word) or "--target-catalog" in word:
+            return True
+        if any(re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", word, re.IGNORECASE)
+               for token in cfg.legacy_sources):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- policy
@@ -905,7 +914,7 @@ def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
     """Constructs that only produce the statement at run time. Always: `eval`/`sh -c` on a `$`-built string, an opaque producer
     piped into a shell, a shell fed by process substitution. Where a client is involved: an unmodelled wrapper in front of the
     client, a variable in command position, any substitution, an expansion inside the SQL argument, an expanding heredoc, `xargs`."""
-    violations, ctx = [], bool(_context(cmd, cfg))
+    violations, ctx = [], any(_mentions(s, cfg) for s in segs)
     for s in segs:
         base, _, _, built = s.argv0, *_shell_runs(s)
         if built:
@@ -924,7 +933,7 @@ def _check_opaque(segs: list[_Seg], cmd: str, cfg: GuardConfig) -> list[str]:
                               "run (same class as `eval`)")
         elif s.argv and base not in _KNOWN and not _PYTHON.fullmatch(base) and (
                 base not in _INERT or base == "find" and any(w.startswith(("-exec", "-ok")) for w in s.argv)) \
-                and (wrapped := _context(" ".join(s.argv[1:]), cfg)):
+                and (wrapped := next((m.group() for m in _CLIENT_WORD.finditer(" ".join(s.argv[1:]))), None)):
             violations.append(f"unrecognised wrapper `{base}` in front of client `{wrapped[0]}`; the guard has no rule for `{base}`, so "
                               "it cannot tell how or where the client would run (run the client directly)")
         for i, (r, w, prev) in enumerate(zip(s.raw, s.words, ["", *s.words])):   # an expansion inside what is (or looks like) SQL
