@@ -55,7 +55,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
             "checks": [
                 {"id": "allowed_targets", "status": "ok",
                  "data": {"catalogs": ["mig"], "guard_mode": "block"}},
-                {"id": "stop_mode", "status": "ok", "data": {"stop_mode": "soft"}},
+                {"id": "workspace", "status": "ok", "data": {"stop_mode": "soft"}},
             ],
             "hook_probe": doctor_hook_probe,
             "source": doctor_source,

@@ -285,7 +285,7 @@ def validate_manifest(m, doctor=None):
     recorded = {"identity": ident["userName"], "host": ident["host"],
                 "catalogs": sorted(rows.get("allowed_targets", {}).get("catalogs") or []),
                 "guard_mode": rows.get("allowed_targets", {}).get("guard_mode"),
-                "stop_mode": rows.get("stop_mode", {}).get("stop_mode")}
+                "stop_mode": rows.get("workspace", {}).get("stop_mode")}
     for key, want in recorded.items():
         # the doctor records catalogs under the guard's rule (trimmed, unquoted, case-folded)
         got = sorted(c.strip().strip("`").lower() for c in caps["catalogs"]) if key == "catalogs" else caps.get(key)
