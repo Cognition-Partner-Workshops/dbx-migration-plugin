@@ -3,7 +3,7 @@
   "routine": "app_pkg.archive_entries",
   "target_family": "lakebase",
   "target_branch": "mig-ledger-exec",
-  "snapshot": "fixture:ledger-2024q1",
+  "snapshot": "fixture:.migration/fixtures/ledger-2024q1.sql",
   "evidence": ".migration/recon/ledger/archive_entries.run.json",
   "golden": {
     "app.ledger_entry_hist": [
@@ -16,7 +16,14 @@
         "amount": "-80.25"
       }
     ],
-    "app.ledger_entry": []
+    "app.ledger_entry": [],
+    "app.run_log": [
+      {
+        "run_id": 8,
+        "routine": "app_pkg.archive_entries",
+        "period_id": 1
+      }
+    ]
   },
   "observed": {
     "app.ledger_entry_hist": [
@@ -33,6 +40,13 @@
       {
         "entry_id": 11,
         "amount": "-80.25"
+      }
+    ],
+    "app.run_log": [
+      {
+        "run_id": 8,
+        "routine": "app_pkg.archive_entries",
+        "period_id": 1
       }
     ]
   }

@@ -191,6 +191,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="the unit's dependencies.json ({routines: [{routine, writes, ...}]})")
     rp.add_argument("--runs", required=True, type=Path,
                     help="a *.run.json file or a directory of them, one committed run per routine")
+    rp.add_argument("--repo", type=Path, default=Path("."),
+                    help="the repository whose committed tree must hold each run's evidence and "
+                         "fixture snapshot (default: the current directory)")
     rp.add_argument("--out", required=True, type=Path)
     r = sub.add_parser("run", help="run the recon gate for one unit")
     r.add_argument("--unit", required=True)
@@ -239,13 +242,13 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "routine-parity":
-        from .routines import grade_routines, load_runs
+        from .routines import git_committed, grade_routines, load_runs
         try:
             deps = json.loads(args.dependencies.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise SystemExit(f"cannot read {args.dependencies}: {exc}") from None
         try:
-            out = grade_routines(deps, load_runs(args.runs))
+            out = grade_routines(deps, load_runs(args.runs), git_committed(args.repo))
         except ConfigError as exc:
             raise SystemExit(f"routine-parity: {exc}") from None
         args.out.mkdir(parents=True, exist_ok=True)
@@ -393,12 +396,13 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--routine-parity needs --routine-dependencies: the unit's dependency analysis "
                          "says which writing routines the file must cover")
     if args.routine_dependencies:
-        from .routines import check_parity
+        from .routines import check_parity, git_committed
         try:
             deps = json.loads(args.routine_dependencies.read_text())
             rows = (json.loads(args.routine_parity.read_text()).get("routine_parity")
                     if args.routine_parity else [])
-            routine_parity = check_parity(rows, str(args.routine_parity or "routine_parity"), deps)
+            routine_parity = check_parity(rows, str(args.routine_parity or "routine_parity"), deps,
+                                          git_committed(Path(".")))
         except (OSError, json.JSONDecodeError, AttributeError) as exc:
             raise SystemExit(f"cannot read {args.routine_parity or args.routine_dependencies}: {exc}") from None
         except ConfigError as exc:

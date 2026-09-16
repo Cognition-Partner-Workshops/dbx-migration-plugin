@@ -10,8 +10,7 @@
         "app.ledger_balance"
       ],
       "calls": [
-        "app_pkg.write_run_log",
-        "app_pkg.archive_entries"
+        "app_pkg.write_run_log"
       ]
     },
     {

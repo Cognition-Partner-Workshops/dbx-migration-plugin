@@ -144,11 +144,13 @@ The output is a machine-readable table of object, class, method, partition key, 
 
 ## Routine parity (writing routines)
 
-A converted routine whose `dependencies.json` row has `writes` is proven only by one committed run on a
-dedicated execution target (Lakebase branch `mig-<pipeline>-exec`; Unity Catalog schema
-`<catalog>.<pipeline>_exec`; never the migration target itself) against a committed fixture snapshot
-(`snapshot: "fixture:<id>"`; anything else, a production or ad hoc snapshot, is `unproven`), with the rows it
-left in every written table compared to a golden set. Record each run as `<routine>.run.json`
+A converted routine that writes, itself or through a routine it `calls` (its `dependencies.json` row,
+transitively), is proven only by one committed run on a dedicated execution target (Lakebase branch
+`mig-<pipeline>-exec`; Unity Catalog schema `<catalog>.<pipeline>_exec`; never the migration target itself)
+against a committed fixture snapshot (`snapshot: "fixture:<path in the repo>"`; anything else, a production
+or ad hoc snapshot, is `unproven`), with the rows it left in every written table compared to a golden set.
+The run record and the snapshot must both be files in the committed tree (`--repo`, default the current
+directory); a run naming a file that is untracked, staged or missing is `unproven`. Record each run as `<routine>.run.json`
 (`{routine, target_family, target_branch, snapshot, evidence, golden: {table: [rows]}, observed: {table: [rows]}}`;
 fixture: `harness/fixtures/example_routine_parity/`) and grade them:
 
