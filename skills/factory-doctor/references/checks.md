@@ -56,19 +56,11 @@ are `unverified`. Unsupported/uninferred families are `unverified`; `--source-at
 is `attested` only for families without a query and a human-provenance decision line. Rows name
 objects/privileges, never credentials; `readonly=True`/`default_transaction_read_only` are hints.
 ### `databricks_identity`
-Sub-checks: `databricks_cli` verifies CLI on `PATH`; `databricks_auth_kind` warns unless
-`DATABRICKS_HOST/CLIENT_ID/CLIENT_SECRET` OAuth M2M is present; `databricks_identity` verifies
-`current-user me`, expected principal, workspace host, and service-principal status (human warns
-and blocks `ready`); `databricks_warehouse` warns when the default warehouse is absent. Identity
-data records `userName`, `service_principal`, and `host`.
-### `lakebase_branch_create`
-Optional check creates and deletes a one-hour Lakebase child branch; failure means project or parent
-expiry permissions are insufficient.
-### `lakebase_target_grants`
-Optional check verifies the Lakebase DSN role has database and requested schema `CREATE`.
-### `analytical_target_grants`
-Optional Unity Catalog promotion-schema check passes when absent or owned by the principal.
-Otherwise it requires `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, `MODIFY`, and `SELECT`; failure
-detail contains exact `GRANT` statements, or a full schema grant when unreadable/owner unknown.
-Every red row is a D10. Never widen permissions, edit the allowlist outside a decision, enable
-source CDC here, or substitute a client read-only flag for source grants.
+### `recon_family_supported`
+
+`fail` when `--source-family` names a family the harness has no live-tested source adapter for —
+asked of the same harness `recon_harness` ran (`dbx-recon` on PATH, else the checkout's
+`python -m recon.cli families`); a missing harness or unreadable output also fails.
+`skipped` when no family is declared. Kept apart from `source_principal_read_only` on purpose:
+attestation says the principal is read-only; this row says whether we can reconcile the family.
+### `databricks_identity`
