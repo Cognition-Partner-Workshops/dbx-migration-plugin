@@ -467,8 +467,8 @@ def test_cli_fixture_shape_refuses_source_and_fixture_on_the_same_connection(
     """Same secret name, or two names holding the same DSN: comparing a copy against itself proves
     nothing. The refusal names only the secret names, never their values."""
     from recon import adapters
-    monkeypatch.setenv("SRC_DSN", "postgresql://h/legacy")
-    monkeypatch.setenv("FIX_DSN", "postgresql://h/legacy")
+    monkeypatch.setenv("SRC_DSN", "postgresql://h/dsn-value-xyz")
+    monkeypatch.setenv("FIX_DSN", "postgresql://h/dsn-value-xyz")
     made = []
     monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "postgres", lambda s: made.append(s))
     mapping = tmp_path / "mapping.json"
@@ -477,7 +477,7 @@ def test_cli_fixture_shape_refuses_source_and_fixture_on_the_same_connection(
         cli.main(["fixture-shape", "--family", "postgres", "--mapping", str(mapping),
                   "--source-dsn-secret", "SRC_DSN", "--fixture-dsn-secret", fixture_secret,
                   "--source-statement-cap", "10", "--out", str(tmp_path / "w0")])
-    assert "legacy" not in str(exc.value) and made == []
+    assert "dsn-value-xyz" not in str(exc.value) and made == []
     assert not (tmp_path / "w0").exists()
 
 
