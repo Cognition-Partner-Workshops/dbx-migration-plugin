@@ -315,6 +315,18 @@ def test_a_stop_c_approval_launches_one_run_of_its_wave(tmp_path):
     assert proc.returncode == 0, proc.stderr  # the same run continuing is not a second run
 
 
+@pytest.mark.parametrize("prior", ["{not json", '"a string"', "[]", "null"])
+def test_a_rerun_over_a_result_that_cannot_say_which_stop_c_it_spent_halts(tmp_path, prior):
+    """A prior result the workflow cannot read is not proof the approval is unspent; the rerun halts until a
+    human inspects or restores it, rather than launching on the old row."""
+    ws, cwd = _workspace(tmp_path / "ws", mode="rerun")
+    (ws / ".migration/waves/wave-0.result.json").write_text(prior)
+    proc, calls = _run(cwd, tmp_path / "ws", [_pass_report()])
+    assert proc.returncode != 0 and "wave-0.result.json" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert (ws / ".migration/waves/wave-0.result.json").read_text() == prior
+
+
 def _push_pr(ws, n=1):
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", f"HEAD:refs/pull/{n}/head", "HEAD:recon/wave-0"], check=True)
     return f"https://github.com/acme/target/pull/{n}"

@@ -280,6 +280,16 @@ def override_decision(decision_id, units, ledger, word="merge_override"):
     return False
 
 
+def ledger_waiver(gate_id, units, ledger):
+    """The D-<n> of the human row that waives this gate for every unit of the batch, or None. The declaration
+    is frozen by gates_sha, so a waiver decided after STOP C is found here, not in the manifest."""
+    for line in ledger.splitlines():
+        for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
+            if override_decision(decision_id, [gate_id, *units], line, word="waive"):
+                return decision_id
+    return None
+
+
 def declared_gates_sha(wave, batches):
     """What STOP C approved, whole: the wave, each batch's units and every gate row as declared (id, kind,
     status, evidence, decision_id). Outcomes reach the result through the children's reports, never by
@@ -578,7 +588,8 @@ def gate_outcomes(batch, reported, ledger, head):
     """The batch's gates after the child's report: every gate but a waived one takes the child's passed (with
     evidence the gated PR head carries under the unit's recon dir) or failed; the plan's status is what
     STOP C expects, never proof, so a gate the child did not report is unmet. A waived gate is the ledger's
-    and stays. Returns the gates and what keeps the unit from closing: any gate not proven passed, or
+    and stays; a gate the child did not prove is waived if a human's row written since STOP C waives it for
+    every unit. Returns the gates and what keeps the unit from closing: any gate not proven passed, or
     waived without its ledger row naming gate and units."""
     declared = {g["id"]: {**g, "decision_id": g.get("decision_id")} for g in batch.get("gates", [])}
     unmet = []
@@ -604,6 +615,11 @@ def gate_outcomes(batch, reported, ledger, head):
         else:
             g.update(status=r["status"], evidence=r["evidence"])
     for g in declared.values():
+        if g["status"] != "waived" and (not seen[g["id"]] or g["status"] == "failed"):
+            waiver = ledger_waiver(g["id"], batch["units"], ledger)
+            if waiver:
+                g.update(status="waived", decision_id=waiver)
+                continue
         if g["status"] != "waived" and not seen[g["id"]]:
             unmet.append(f"gate {g['id']} ({g['kind']}) has no child result; the plan's {g['status']} is not proof")
         elif g["status"] == "waived":
@@ -659,9 +675,13 @@ if not gates_approved(MANIFEST.get("stop_c"), MANIFEST.get("wave"), MANIFEST.get
                      "records it")
 if MODE == "rerun" and RESULT_PATH.exists():
     try:
-        spent = json.loads(RESULT_PATH.read_text()).get("stop_c")
-    except (ValueError, AttributeError):
-        spent = None
+        previous = json.loads(RESULT_PATH.read_text())
+    except (OSError, ValueError) as e:
+        previous = e
+    if not isinstance(previous, dict):
+        raise SystemExit(f"{RESULT_PATH} cannot say which STOP C row the wave's last run spent ({previous!r}); inspect "
+                         "or restore it before rerunning, the old approval is not reusable on its word")
+    spent = previous.get("stop_c")
     if spent == MANIFEST["stop_c"]:
         raise SystemExit(f"{RESULT_PATH} records a run this wave already made under STOP C row {spent}; a rerun is a new "
                          "run of the wave, so STOP C fires again: record its new row in the ledger and name it in the "

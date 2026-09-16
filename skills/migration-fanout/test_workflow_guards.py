@@ -44,7 +44,7 @@ def _batch_runtime():
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name == "run_batch")
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
-                                                                         "gate_outcomes"})
+                                                                         "gate_outcomes", "ledger_waiver"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA"}
                     for t in node.targets))]
@@ -365,6 +365,31 @@ def test_waived_gate_whose_decision_is_not_in_the_ledger_fails_closed(ledger):
     batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
     out = _run_gates(batch, _gate_report(), ledger)
     assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "D-12" in out["one_line_summary"]
+
+
+def test_a_human_waiver_recorded_after_stop_c_closes_a_declared_gate_the_child_did_not_pass():
+    """The declaration is frozen by gates_sha, so a waiver decided after STOP C lives in the ledger alone: a
+    human's D-<n> row that says waive and names the gate and every unit stands in for the child's result."""
+    ledger = GATES_LEDGER + "| D-14 | user:U2 | waive g-rows for u, parity proven on the wave-1 rerun |\n"
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), ledger)
+    assert out["status"] == "PASS", out.get("one_line_summary")
+    assert out["gates"] == [{**GATE, "status": "waived", "decision_id": "D-14"}]
+    out = _run_gates(_gate_batch(dict(GATE)),
+                     _gate_report(gates=[{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}]), ledger)
+    assert out["status"] == "PASS", out.get("one_line_summary")
+    assert out["gates"] == [{**GATE, "status": "waived", "evidence": "3 rows differ", "decision_id": "D-14"}]  # what was waived over stays visible
+
+
+@pytest.mark.parametrize("row", [
+    "| D-14 | default-accepted | waive g-rows for u |\n",   # the orchestrator's row, not a human's
+    "| D-14 | user:U2 | waive g-rows for other_unit |\n",
+    "| D-14 | user:U2 | waive g-other for u |\n",
+    "| D-14 | user:U2 | g-rows for u |\n",
+])
+def test_a_ledger_row_that_does_not_waive_this_gate_for_every_unit_leaves_it_unmet(row):
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), GATES_LEDGER + row)
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert out["gates"] == [{**GATE, "decision_id": None}]
 
 
 def test_evidence_in_pr_is_a_file_of_the_units_recon_dir_at_the_gated_head(tmp_path):
