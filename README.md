@@ -1,7 +1,8 @@
 # dbx-migration-factory (Devin plugin)
 
 Private, installable Devin plugin for Databricks migrations. What it is and how a migration runs:
-`OVERVIEW.md`. This file covers installation and the write-scope guard's policy file.
+`OVERVIEW.md`. This file covers installation and the write-scope guard's policy file. Oracle PL/SQL is the
+core dialect skill; other dialects and the Lakebridge wrapper are optional under `skills-extra/`.
 
 The repo root *is* the plugin:
 
@@ -108,6 +109,7 @@ for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row the
 `tool_name`; the guard reads `tool_input.file_path` and its new content. It blocks writes under `.migration/` except
 `recon/` and `waves/`, and permits `06_decisions.md` only when the edit adds a `D-<id>` row. This covers only file-edit
 tools the platform routes through PreToolUse under those names.
+
 **Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
 `DBX_DECISION=D-<id>` prefix matching a `legacy_write_authorized` row in `.migration/06_decisions.md` that names every
 object written. `guard_mode: warn` never downgrades an unauthorized legacy write. Decision rows that authorize legacy writes
