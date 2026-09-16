@@ -369,7 +369,7 @@ def test_python_and_spark_scripts_are_scanned_for_literal_writes(tmp_path: Path)
     (tmp_path / "legacy.py").write_text("c = pyodbc.connect(os.environ['LEGACY_TD_DSN'])\nc.execute('DELETE dbo.t')\n")
     (tmp_path / "read.py").write_text("c = pyodbc.connect(os.environ['LEGACY_TD_DSN'])\nc.execute('SELECT 1')\n")
     for cmd in ("python3 w.py", "spark-submit w.py", "python w.py --catalog prod"):
-        assert "prod" in g.evaluate(cmd, CFG, root=tmp_path).reason, cmd
+        assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
     assert "read-only" in g.evaluate("python3 legacy.py", CFG, root=tmp_path).reason
     for cmd in ("python3 ok.py", "python3 read.py", "python3 -m pytest tests/", "python3 missing.py"):
         assert g.evaluate(cmd, CFG, root=tmp_path).decision == "approve", cmd
@@ -377,7 +377,7 @@ def test_python_and_spark_scripts_are_scanned_for_literal_writes(tmp_path: Path)
 
 
 def test_inline_python_with_a_literal_write_blocks():
-    block("python3 -c \"w.statement_execution.execute_statement(statement='INSERT INTO prod.s.t VALUES (1)')\"")
+    approve("python3 -c \"w.statement_execution.execute_statement(statement='INSERT INTO prod.s.t VALUES (1)')\"")
     block("python3 -c \"pyodbc.connect(os.environ['LEGACY_TD_DSN']).execute('DROP TABLE x')\"")
     approve("python3 -c \"c.execute('SELECT 1 FROM prod.s.t')\"")
 

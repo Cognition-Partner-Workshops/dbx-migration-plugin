@@ -191,7 +191,7 @@ def test_probe_sentinel_is_blocked(command):
     ("sqlcmd -S tdprod.corp -Q 'EXEC dbo.purge_orders'", "legacy source"),
     ('psql "$LEGACY_TD_DSN" -c "SELECT setval(\'s\', 1)"', "legacy source"),
     ("psql -h lakebase-host -d mig_cat -c 'GRANT ALL ON t TO x'", "permission"),
-    ("psql -h lakebase-host -d other_db -c 'INSERT INTO t VALUES (1)'", "target_hosts"),
+    ("psql -h lakebase-host -d other_db -c 'INSERT INTO t VALUES (1)'", "allowlist"),
 ])
 def test_keep_list_remains_blocked(command, needle):
     assert needle in block(command).reason
