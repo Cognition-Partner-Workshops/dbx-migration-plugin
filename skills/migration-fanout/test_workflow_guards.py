@@ -559,6 +559,21 @@ def test_check_dependencies_halts_when_a_mapped_unit_writes_a_source_table_its_m
         check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=_spec(("app.ledger", "ledger"))), "mig")
 
 
+def test_mapped_target_reads_the_legacy_tables_mapping_like_the_harness():
+    """The harness accepts both `objects` (object/root_table) and the older `tables`
+    (target_table/source_table) mapping shape; the call-graph check resolves through either."""
+    mapped = _functions()["mapped_target"]
+    legacy = {"tables": [{"source_table": "public.orders", "target_table": "orders", "key": ["id"]}]}
+    assert mapped(legacy, "PUBLIC.ORDERS", "cat.mig") == "cat.mig.orders"
+    assert mapped(legacy, "public.other", "cat.mig") is None
+    assert mapped({"objects": [], "tables": legacy["tables"]}, "public.orders", "mig") == "mig.orders"
+    assert mapped({"tables": "nope"}, "public.orders") is None
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["cat.mig.orders"], "brief": "b"}
+    check([b], _deps(u=[{"routine": "p", "reads": [], "writes": ["public.orders"], "calls": []}]),
+          _maps(u=legacy), "cat.mig")
+
+
 def test_check_dependencies_without_a_mapping_spec_keeps_the_source_name():
     check = _functions()["check_dependencies"]
     b = {"id": "b", "units": ["u"], "write_targets": ["app.ledger", "app.run_log"], "brief": "b"}

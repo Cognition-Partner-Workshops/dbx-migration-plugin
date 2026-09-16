@@ -1333,7 +1333,8 @@ def mapped_target(spec, table, namespace=""):
     """The target the unit's mapping spec gives a source table (the object whose root_table or
     source_table it is), None when no object names it."""
     k = target_key(table)
-    for o in spec.get("objects", []) if isinstance(spec, dict) else []:
+    objects = (spec.get("objects") or spec.get("tables") or []) if isinstance(spec, dict) else []
+    for o in objects if isinstance(objects, list) else []:
         if isinstance(o, dict) and target_key(o.get("root_table") or o.get("source_table") or "") == k:
             return target_key(o.get("object") or o.get("target_table") or "", namespace)
     return None
@@ -1730,12 +1731,13 @@ async def main():
     breaker = Breaker(BREAKER)
     results = await asyncio.gather(*(run_batch(b, sem, breaker) for b in BATCHES))
 
-    reported = Counter(t for r in results for t in {target_key(t) for t in r.get("write_targets", [])})
+    namespace = MANIFEST.get("target_namespace", "")
+    reported = Counter(t for r in results for t in {target_key(t, namespace) for t in r.get("write_targets", [])})
     surprises = sorted(t for t, c in reported.items() if c > 1)
     undeclared = {}
     for b, r in zip(BATCHES, results):
-        declared = {target_key(t) for t in b["write_targets"]}
-        extra = sorted({t for t in r.get("write_targets", []) if target_key(t) not in declared})
+        declared = {target_key(t, namespace) for t in b["write_targets"]}
+        extra = sorted({t for t in r.get("write_targets", []) if target_key(t, namespace) not in declared})
         if extra:
             undeclared[b["id"]] = extra
     unreported = [b["id"] for b, r in zip(BATCHES, results)

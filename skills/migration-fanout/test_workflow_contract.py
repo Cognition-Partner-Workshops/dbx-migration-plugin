@@ -596,6 +596,27 @@ def test_call_graph_writes_are_compared_as_the_mapping_specs_target_names(tmp_pa
     assert not [c for c in calls if c["kind"] == "agent"]
 
 
+def test_child_reported_targets_compare_under_the_manifests_namespace_after_the_run(tmp_path):
+    """The manifest declares `orders` under target_namespace `cat.mig`; a child reports the same table
+    as `CAT.MIG.orders`. That is one declared target, not an undeclared write and not an overlap."""
+    ws, cwd = _workspace(tmp_path / "ok", namespace="cat.mig", write_targets=("orders",))
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["CAT.MIG.orders", "orders"]),
+                                           _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert "outside their declared targets" not in proc.stdout and "overlapping" not in proc.stdout
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "other", namespace="cat.mig", write_targets=("orders",))
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "other", [_pass_report(pr, write_targets=["cat.mig.orders", "cat.mig.other"]),
+                                              _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert "outside their declared targets" in proc.stdout and "cat.mig.other" in proc.stdout
+    assert "cat.mig.orders" not in proc.stdout.split("outside their declared targets")[1].splitlines()[0]
+    assert "cat.mig.other" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+
+
 def test_read_only_batch_declares_no_targets_only_with_an_analysis_that_writes_nothing(tmp_path):
     ws, cwd = _workspace(tmp_path / "bare", write_targets=())
     proc, calls = _run(cwd, tmp_path / "bare", [_pass_report("https://github.com/acme/target/pull/1")])
