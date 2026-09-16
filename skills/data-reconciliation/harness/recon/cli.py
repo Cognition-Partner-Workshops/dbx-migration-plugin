@@ -188,6 +188,16 @@ def main(argv: list[str] | None = None) -> int:
                         "undeclared target types like `run` does)")
     e.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
     e.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
+    rp = sub.add_parser("routine-parity", help="grade committed runs of writing routines against "
+                        "their golden sets (no connections); exit 0 all proven, 2 some unproven, 1 any failed")
+    rp.add_argument("--dependencies", required=True, type=Path,
+                    help="the unit's dependencies.json ({routines: [{routine, writes, ...}]})")
+    rp.add_argument("--runs", required=True, type=Path,
+                    help="a *.run.json file or a directory of them, one committed run per routine")
+    rp.add_argument("--repo", type=Path, default=Path("."),
+                    help="the repository whose committed tree must hold each run's evidence and "
+                         "fixture snapshot (default: the current directory)")
+    rp.add_argument("--out", required=True, type=Path)
     fs = sub.add_parser("fixture-shape", help="wave 0: compare the fixture copy's column shape "
                         "and sample cardinality with the real source (read-only, capped); "
                         "writes <out>/fixture_shape.json")
@@ -268,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="resolve a ${name} placeholder in the mapping spec's where clauses "
                         "(e.g. partition/date scoping); repeatable; recorded in result.json")
+    r.add_argument("--routine-parity", type=Path,
+                   help="routine_parity.json from `routine-parity`; carried into result.json, a "
+                        "failed routine blocks merge (routine_gap); needs --routine-dependencies")
+    r.add_argument("--routine-dependencies", type=Path,
+                   help="the unit's dependencies.json (default .migration/units/<unit>/dependencies.json); "
+                        "every writing routine it lists must have a routine_parity row, otherwise it is "
+                        "carried as unproven; no analysis at all blocks merge (routine_parity_missing)")
     r.add_argument("--rerun-proof", type=Path,
                    help="rerun_proof.json from `dbx-recon rerun-proof`; a failed leg blocks merge "
                         "with reason rerun_gap; an unsupported evolved leg with rerun_unsupported")
@@ -276,6 +293,24 @@ def main(argv: list[str] | None = None) -> int:
                         "rerun-proof was given); a proof of other files is stale and refused")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
+
+    if args.cmd == "routine-parity":
+        from .routines import git_committed, grade_routines, load_runs
+        try:
+            deps = json.loads(args.dependencies.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot read {args.dependencies}: {exc}") from None
+        try:
+            out = grade_routines(deps, load_runs(args.runs, args.repo), git_committed(args.repo))
+        except ConfigError as exc:
+            raise SystemExit(f"routine-parity: {exc}") from None
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "routine_parity.json").write_text(json.dumps(out, indent=2) + "\n")
+        parity = out["routine_parity"]
+        counts = {s: sum(1 for r in parity if r["status"] == s) for s in ("proven", "unproven", "failed")}
+        print(f"dbx-recon routine-parity: {counts['proven']} proven, {counts['unproven']} unproven, "
+              f"{counts['failed']} failed -> {args.out}/routine_parity.json")
+        return 1 if counts["failed"] else 2 if counts["unproven"] else 0
 
     if args.cmd == "selftest":
         return selftest()
@@ -491,13 +526,46 @@ def main(argv: list[str] | None = None) -> int:
                 target = DictionaryOverlay(target, load_dictionary(args.target_dictionary))
         except ConfigError as exc:
             raise SystemExit(f"dictionary: {exc}") from None
+    routine_parity = routine_writers = routine_dependencies = None
+    if args.routine_parity and not args.routine_dependencies:
+        raise SystemExit("--routine-parity needs --routine-dependencies: the unit's dependency analysis "
+                         "says which writing routines the file must cover")
+    deps_path = args.routine_dependencies or Path(".migration/units") / args.unit / "dependencies.json"
+    if args.routine_dependencies is not None and not deps_path.is_file():
+        raise SystemExit(f"--routine-dependencies {deps_path} is not a file")
+    routine_analysis_missing = not deps_path.is_file()
+    if not routine_analysis_missing:
+        from .routines import check_parity, git_committed, writers
+        repo, committed = Path("."), git_committed(Path("."))
+        try:
+            rel = deps_path.resolve().relative_to(repo.resolve()).as_posix()
+        except ValueError:
+            rel = None
+        if rel is None or not committed(rel):
+            raise SystemExit(f"{deps_path} is not a committed file of the repository: the dependency analysis "
+                             "names the unit's writing routines, so only the committed one counts (commit it, "
+                             "or pass --routine-dependencies with the committed path)")
+        routine_dependencies = rel
+        try:
+            deps = json.loads(deps_path.read_text())
+            rows = json.loads(args.routine_parity.read_text()).get("routine_parity") if args.routine_parity else []
+            routine_writers = list(writers(deps))
+            if args.routine_parity or not routine_writers:
+                routine_parity = check_parity(rows, str(args.routine_parity or "routine_parity"), deps,
+                                              committed, repo)
+        except (OSError, json.JSONDecodeError, AttributeError) as exc:
+            raise SystemExit(f"cannot read {args.routine_parity or deps_path}: {exc}") from None
+        except ConfigError as exc:
+            raise SystemExit(str(exc)) from None
     run_source = (lambda op: source.run_query(op["source_sql"])) if ops else None
     run_target = (lambda op: target.run_query(op["target_sql"])) if ops else None
     result = run_recon(args.unit, args.mode, spec, tol, rules, source, target,
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=args.out, seed=args.seed, params=params, snapshot=snapshot,
                        source_family=args.family, depth=args.depth, type_map=type_map,
-                       rerun_proof=rerun_proof)
+                       routine_parity=routine_parity, routine_writers=routine_writers,
+                       routine_analysis_missing=routine_analysis_missing,
+                       routine_dependencies=routine_dependencies, rerun_proof=rerun_proof)
     print(f"dbx-recon {result['verdict']}: unit={args.unit} mode={args.mode} depth={result['depth']} "
           f"mapping={spec.version} tolerances={tol.version} merge_eligible={result['merge_eligible']} "
           f"-> {args.out}/result.json")

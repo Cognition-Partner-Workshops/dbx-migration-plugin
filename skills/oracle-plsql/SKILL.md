@@ -149,6 +149,7 @@ Track: **A** analytical DBSQL, **L** Lakebase, **J** Lakeflow Jobs, **P** Lakefl
 Before a unit is routed or planned, walk every routine in scope (package members, standalone procedures and
 functions, triggers, scheduler job actions) and write one row per routine to
 `.migration/units/<unit>/dependencies.json`; fixture: `fixtures/example_dependencies.json`.
+Each routine with `writes` also needs a routine-parity run record (`skills/data-reconciliation/SKILL.md`, "Routine parity").
 
 ```json
 {"routines": [{"routine": "<schema>.<pkg>.<member>", "reads": ["<schema>.<table>"], "writes": ["<schema>.<table>"], "calls": ["<routine>"]}]}

@@ -1,0 +1,33 @@
+{
+  "routine_parity": [
+    {
+      "routine": "app_pkg.close_period",
+      "status": "proven",
+      "evidence": "recon/ledger/close_period.run.json"
+    },
+    {
+      "routine": "app_pkg.archive_entries",
+      "status": "failed",
+      "evidence": "recon/ledger/archive_entries.run.json",
+      "findings": [
+        {
+          "table": "app.ledger_entry",
+          "check": "rows_differ",
+          "detail": "golden 0 rows, observed 1 rows; 0 only in golden, 1 only in observed"
+        }
+      ]
+    },
+    {
+      "routine": "app_pkg.write_run_log",
+      "status": "unproven",
+      "evidence": null,
+      "reason": "no committed run"
+    }
+  ],
+  "unproven": [
+    "app_pkg.write_run_log"
+  ],
+  "failed": [
+    "app_pkg.archive_entries"
+  ]
+}
