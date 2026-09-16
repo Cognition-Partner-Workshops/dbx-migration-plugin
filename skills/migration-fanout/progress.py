@@ -37,7 +37,7 @@ def _wave(result: dict, path: Path):
     return int(match.group(1)) if match else ""
 
 
-def _manifest_units(path: Path, expected_sha) -> dict:
+def _manifest_bytes(path: Path, expected_sha):
     manifest_path = path.with_name(path.name[:-len(_RESULT_SUFFIX)] + ".json")
     if not manifest_path.is_file():
         raise ValueError(f"{manifest_path}: manifest is missing")
@@ -48,6 +48,10 @@ def _manifest_units(path: Path, expected_sha) -> dict:
     actual_sha = hashlib.sha256(manifest_bytes).hexdigest()[:12]
     if not isinstance(expected_sha, str) or expected_sha != actual_sha:
         raise ValueError(f"{manifest_path}: manifest_sha does not match the manifest")
+    return manifest_path, manifest_bytes
+
+
+def _manifest_units(manifest_path: Path, manifest_bytes: bytes) -> dict:
     try:
         manifest = json.loads(manifest_bytes)
     except (UnicodeDecodeError, ValueError) as exc:
@@ -311,6 +315,14 @@ def render_progress(mig: Path) -> str:
         wave = _wave(result, path)
         if not isinstance(result.get("batches"), list):
             raise ValueError(f"{path}: result batches is not a list")
+        try:
+            manifest_path, manifest_bytes = _manifest_bytes(path, result.get("manifest_sha"))
+        except ValueError as exc:
+            if "manifest_sha does not match the manifest" in str(exc):
+                raise ValueError(
+                    f"{path}: manifest_sha does not match the manifest (regenerate the result)"
+                ) from None
+            raise
         merged_record = _merged_record(path)
         merged_record_entries = merged_record.get("merged", {}) if merged_record else {}
         verify = result.get("verify")
@@ -337,13 +349,8 @@ def render_progress(mig: Path) -> str:
             if not isinstance(units, list):
                 if manifest_units is None:
                     try:
-                        manifest_units = _manifest_units(path, result.get("manifest_sha"))
+                        manifest_units = _manifest_units(manifest_path, manifest_bytes)
                     except ValueError as exc:
-                        if "manifest_sha does not match the manifest" in str(exc):
-                            raise ValueError(
-                                f"{path}: batch {batch.get('id')!r} has no units and manifest_sha does not match the manifest "
-                                "(embed units in the result or regenerate it)"
-                            ) from None
                         raise ValueError(
                             f"{path}: batch {batch.get('id')!r} has no units and no readable manifest entry"
                         ) from None
@@ -363,7 +370,7 @@ def render_progress(mig: Path) -> str:
                 verifier_verdict
                 if verifier_verdict
                 else "UNVERIFIED"
-                if isinstance(verify, dict) and _text(batch.get("status")) == "PASS"
+                if _text(batch.get("status")) == "PASS"
                 else _text(batch.get("status"))
             )
             pr_url = batch.get("pr_url")
