@@ -29,7 +29,8 @@ def _functions():
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
                                       "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
-                                      "column_key", "unit_dependencies", "transitive_writes", "check_dependencies"})
+                                      "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
+                                      "mapped_target"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
@@ -514,6 +515,86 @@ def test_check_dependencies_compares_targets_as_one_case_insensitive_identity():
     b = {"id": "b", "units": ["u"], "write_targets": ["`MIG`.`Ledger`", " mig.RUN_LOG "], "brief": "b"}
     check([b], _deps(u=[CLOSE, LOG]))
     assert _functions()["transitive_writes"]([_routine("a", writes=['"MIG"."T"', "mig.t"])]) == {"mig.t"}
+
+
+def _spec(*pairs):
+    return {"objects": [{"object": tgt, "root_table": src, "key": ["id"]} for src, tgt in pairs]}
+
+
+def _maps(**by_unit):
+    return lambda unit: by_unit.get(unit)
+
+
+SRC_CLOSE = _routine("app.close_period", reads=["app.period"], writes=["APP.LEDGER"], calls=["app.log_run"])
+SRC_LOG = _routine("app.log_run", writes=["app.run_log"])
+
+
+def test_check_dependencies_resolves_source_writes_through_the_units_mapping_spec():
+    """The analysis names the legacy tables a routine writes; the manifest names what the child deploys.
+    A written source table is the target its mapping object (root_table -> object) gives it, and the
+    manifest's bare names are the manifest's target_namespace, so a renamed target compares as itself."""
+    check = _functions()["check_dependencies"]
+    spec = _spec(("app.ledger", "finance.ledger"), ("APP.RUN_LOG", "run_log"))
+    b = {"id": "b", "units": ["u"], "write_targets": ["mig.finance.ledger", "MIG.app.run_log"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=spec), "mig.app")
+    with pytest.raises(SystemExit, match=r"b.*missing.*mig\.finance\.ledger.*extra.*mig\.app\.ledger"):
+        check([{**b, "write_targets": ["app.ledger", "run_log"]}], _deps(u=[SRC_CLOSE, SRC_LOG]),
+              _maps(u=spec), "mig.app")
+
+
+def test_check_dependencies_resolves_a_callees_writes_through_the_callees_own_unit():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u", "v"], "write_targets": ["mig.app.ledger", "mig.audit.run_log"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE], v=[SRC_LOG]),
+          _maps(u=_spec(("app.ledger", "ledger")), v=_spec(("app.run_log", "audit.run_log"))), "mig.app")
+    with pytest.raises(SystemExit, match=r"missing.*mig\.app\.run_log"):
+        check([b], _deps(u=[SRC_CLOSE], v=[SRC_LOG]),
+              _maps(u=_spec(("app.ledger", "ledger")), v=_spec(("app.run_log", "run_log"))), "mig.app")
+
+
+def test_check_dependencies_halts_when_a_mapped_unit_writes_a_source_table_its_mapping_does_not_name():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-2", "units": ["u"], "write_targets": ["mig.ledger", "mig.run_log"], "brief": "b"}
+    with pytest.raises(SystemExit, match=r"b-2.*u.*app\.run_log.*mapping_spec"):
+        check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=_spec(("app.ledger", "ledger"))), "mig")
+
+
+def test_check_dependencies_without_a_mapping_spec_keeps_the_source_name():
+    check = _functions()["check_dependencies"]
+    b = {"id": "b", "units": ["u"], "write_targets": ["app.ledger", "app.run_log"], "brief": "b"}
+    check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(), "mig")
+
+
+def test_deploy_objects_are_declared_targets_outside_the_table_comparison():
+    """A procedure, view or job the unit deploys is a write target (it collides like any other) but no
+    routine's DML writes it; the batch lists it in deploy_objects so the graph comparison leaves it alone.
+    A deploy object that is also a written table halts (one outside write_targets fails the manifest check)."""
+    check = _functions()["check_dependencies"]
+    b = {"id": "b-5", "units": ["u"], "write_targets": ["mig.ledger", "mig.run_log", "MIG.close_period"],
+         "deploy_objects": ["mig.close_period"], "brief": "b"}
+    check([b], _deps(u=[CLOSE, LOG]))
+    with pytest.raises(SystemExit, match=r"b-5.*extra.*mig\.close_period"):
+        check([{**b, "deploy_objects": []}], _deps(u=[CLOSE, LOG]))
+    with pytest.raises(SystemExit, match=r"b-5.*deploy_objects.*mig\.ledger.*writes"):
+        check([{**b, "deploy_objects": ["mig.close_period", "mig.ledger"]}], _deps(u=[CLOSE, LOG]))
+
+
+@pytest.mark.parametrize("value", ["x", [1], [""], ["mig.p", "MIG.P"]])
+def test_manifest_deploy_objects_must_be_a_list_of_distinct_names_in_write_targets(value):
+    m = _manifest()
+    m["batches"][0]["deploy_objects"] = value
+    m["batches"][0]["write_targets"] = m["batches"][0]["write_targets"] + ["mig.p"]
+    with pytest.raises(SystemExit, match=r"deploy_objects"):
+        _functions()["validate_manifest"](m)
+
+
+def test_manifest_deploy_objects_outside_write_targets_halt():
+    m = _manifest()
+    m["batches"][0]["deploy_objects"] = ["mig.p"]
+    with pytest.raises(SystemExit, match=r"deploy_objects.*mig\.p.*write_targets"):
+        _functions()["validate_manifest"](m)
+    m["batches"][0]["write_targets"] = m["batches"][0]["write_targets"] + ["MIG.P"]
+    _functions()["validate_manifest"](m)
 
 
 def test_check_dependencies_halts_on_an_uncovered_callee_naming_the_unit():

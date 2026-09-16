@@ -46,8 +46,10 @@ union its `reads` and `writes`:
 - A routine on the analytical track routes its reads and writes to the DBSQL/Lakeflow skills above; a
   table it writes that an OLTP routine also writes is a routing conflict to decide (`06_decisions.md`), not
   something to split silently.
-- The transitive `writes` of a unit's routines are its write targets. The fan-out workflow refuses a wave
-  whose declared `write_targets` differ from them (rule in `skills/migration-fanout/SKILL.md`).
+- The transitive `writes` of a unit's routines, each taken to the target its `mapping_spec.json` names for
+  that source table, are its write targets; the routines, views and jobs it deploys are its
+  `deploy_objects`. The fan-out workflow refuses a wave whose declared `write_targets` differ from them
+  (rule in `skills/migration-fanout/SKILL.md`).
 
 ## Migration-only deltas (these override nothing in the official skills; they narrow them)
 

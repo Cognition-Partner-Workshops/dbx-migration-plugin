@@ -27,7 +27,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
-               other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",)):
+               other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
+               deploy_objects=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -67,6 +68,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         "batches": [{"id": "b-1", "units": list(units), "write_targets": list(write_targets), "brief": "brief",
                      "gates": gates if gates is not None else [GATE]}],
     }
+    if deploy_objects is not None:
+        manifest["batches"][0]["deploy_objects"] = list(deploy_objects)
     if namespace is not None:
         manifest["target_namespace"] = namespace
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
@@ -557,6 +560,40 @@ def test_declared_write_targets_must_equal_the_call_graphs_transitive_writes(tmp
     proc, _ = _run(cwd, tmp_path / "same", [_pass_report(pr), _verify_report()])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
+
+
+def test_call_graph_writes_are_compared_as_the_mapping_specs_target_names(tmp_path):
+    """The analysis names legacy tables; the manifest names deployed targets. A source write resolves
+    through the unit's mapping object (root_table -> object) before the comparison, and a deployed
+    procedure listed in deploy_objects is a write target no DML has to produce."""
+    spec = {"objects": [{"object": "t", "root_table": "SRC.LEDGER", "key": ["id"]}]}
+    ws, cwd = _workspace(tmp_path / "ok", dependencies={"u": _analysis("src.ledger")}, mappings={"u": spec},
+                         namespace="mig", write_targets=("mig.t", "mig.run"), deploy_objects=("MIG.run",))
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["mig.t", "mig.run"]), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["closed"] is True
+
+    ws, cwd = _workspace(tmp_path / "raw", dependencies={"u": _analysis("src.ledger")}, mappings={"u": spec},
+                         namespace="mig", write_targets=("src.ledger",))
+    proc, calls = _run(cwd, tmp_path / "raw", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "missing from the declaration: ['mig.t']" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "unmapped", dependencies={"u": _analysis("src.ledger", "src.other")},
+                         mappings={"u": spec}, namespace="mig", write_targets=("mig.t", "mig.other"))
+    proc, calls = _run(cwd, tmp_path / "unmapped", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "'src.other'" in proc.stderr and "mapping_spec.json" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    ws, cwd = _workspace(tmp_path / "proc", dependencies={"u": _analysis("mig.t")}, write_targets=("mig.t", "mig.run"))
+    proc, calls = _run(cwd, tmp_path / "proc", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "extra in the declaration: ['mig.run']" in proc.stderr
+
+    ws, cwd = _workspace(tmp_path / "outside", write_targets=("mig.t",), deploy_objects=("mig.run",))
+    proc, calls = _run(cwd, tmp_path / "outside", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "deploy_objects" in proc.stderr and "write_targets" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def test_read_only_batch_declares_no_targets_only_with_an_analysis_that_writes_nothing(tmp_path):
