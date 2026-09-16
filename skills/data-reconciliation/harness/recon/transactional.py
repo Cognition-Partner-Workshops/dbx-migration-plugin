@@ -1405,7 +1405,8 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                 findings.append(Finding(c.object, "primary_key_mismatch",
                                         f"source {s.primary_key} -> expected {pk}, target "
                                         f"{t.primary_key}", s.primary_key, t.primary_key))
-        if pk_info and not s.primary_key and                 pk_info != t_lower.primary_key and pk_info != t_lower.primary_key_informational:
+        if (pk_info and not s.primary_key and pk_info != t_lower.primary_key
+                and pk_info != t_lower.primary_key_informational):
             findings.append(Finding(c.object, "primary_key_informational_missing",
                                     f"source PK {s.primary_key_informational} is informational and "
                                     "absent on the target: duplicate keys would be accepted"))
