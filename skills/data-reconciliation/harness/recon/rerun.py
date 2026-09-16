@@ -52,7 +52,8 @@ _TABLE_PK = re.compile(r"^(?:CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\s*\(", re.IGNORE
 _DROP = re.compile(r"^DROP\s+TABLE\b(?P<rest>.*)$", re.IGNORECASE | re.DOTALL)
 _DROP_HEAD = re.compile(r"^\s*(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?", re.IGNORECASE)
 _DROP_TAIL = re.compile(r"\s+(?:CASCADE|RESTRICT)\s*$", re.IGNORECASE)
-_NAME = re.compile(r"^(?:(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][\w$]*)\.)*(?:`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][\w$]*)$")
+_QNAME = r"(?:`[^`]+`|\"[^\"]+\"|\[(?:[^\]]|\]\])+\]|[A-Za-z_][\w$]*)"
+_NAME = re.compile(rf"^(?:{_QNAME}\.)*{_QNAME}$")
 
 
 _SERIAL = {"serial": "int", "serial4": "int", "bigserial": "bigint", "serial8": "bigint",
@@ -70,22 +71,41 @@ def normalize_type(raw: str) -> str:
 
 
 def _ident(raw: str) -> str:
-    return ".".join(p.strip('`"[]').lower() for p in raw.strip().split("."))
+    return ".".join(p.strip('`"[]').replace("]]", "]").lower() for p in raw.strip().split("."))
+
+
+def _chars(text: str):
+    """(char, quoted) per character. Quotes are '...', \"...\", `...` and T-SQL [...] where a
+    doubled `]]` is a literal bracket."""
+    quote, i = None, 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                if quote == "]" and text[i + 1:i + 2] == "]":
+                    yield ch, True
+                    yield ch, True
+                    i += 2
+                    continue
+                quote = None
+            yield ch, True
+        elif ch in "'\"`[":
+            quote = "]" if ch == "[" else ch
+            yield ch, True
+        else:
+            yield ch, False
+        i += 1
 
 
 def _split_top(body: str, sep: str = ",", angle: bool = True) -> list[str]:
     """Split on `sep` outside quotes and parentheses; `<...>` nests too when `angle` (a column
     list, where it is a type's brackets), never when splitting statements (where it compares)."""
-    parts, depth, angles, buf, quote = [], 0, 0, [], None
-    for ch in body:
-        if quote:
+    parts, depth, angles, buf = [], 0, 0, []
+    for ch, quoted in _chars(body):
+        if quoted:
             buf.append(ch)
-            if ch == quote:
-                quote = None
             continue
-        if ch in "'\"`":
-            quote = ch
-        elif ch == "(":
+        if ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
@@ -105,15 +125,11 @@ def _split_top(body: str, sep: str = ",", angle: bool = True) -> list[str]:
 
 def _balanced(text: str, start: int) -> int:
     """Index just past the parenthesis group opening at text[start] == '('."""
-    depth, quote = 0, None
-    for i in range(start, len(text)):
-        ch = text[i]
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in "'\"`":
-            quote = ch
-        elif ch == "(":
+    depth = 0
+    for i, (ch, quoted) in enumerate(_chars(text[start:]), start):
+        if quoted:
+            continue
+        if ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
@@ -125,14 +141,9 @@ def _balanced(text: str, start: int) -> int:
 def _top_level(text: str) -> str:
     """`text` with every quoted literal and bracketed group blanked to spaces (same length), so
     keyword searches see only the top level and offsets still index the original."""
-    out, depth, angles, quote = [], 0, 0, None
-    for ch in text:
-        if quote:
-            out.append(" ")
-            if ch == quote:
-                quote = None
-        elif ch in "'\"`":
-            quote = ch
+    out, depth, angles = [], 0, 0
+    for ch, quoted in _chars(text):
+        if quoted:
             out.append(" ")
         elif ch == "(":
             depth += 1
@@ -154,7 +165,7 @@ def _top_level(text: str) -> str:
 def _column(defn: str) -> dict | None:
     if _CONSTRAINT_START.match(defn):
         return None
-    m = re.match(r"^(`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z_][\w$]*)\s+(.*)$", defn, re.DOTALL)
+    m = re.match(r"^(`[^`]+`|\"[^\"]+\"|\[(?:[^\]]|\]\])+\]|[A-Za-z_][\w$]*)\s+(.*)$", defn, re.DOTALL)
     if not m:
         raise ConfigError(f"cannot read column definition: {defn[:60]!r}")
     name, rest = _ident(m.group(1)), m.group(2)
