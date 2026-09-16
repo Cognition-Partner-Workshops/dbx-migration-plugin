@@ -662,6 +662,28 @@ def test_a_deploy_object_outside_target_namespace_never_stands_for_a_root(row):
               namespace="cat.mig")
 
 
+def test_a_bare_root_takes_the_one_row_of_its_name_and_halts_when_several_could_be_it():
+    """A root the analysis names without a schema (`close`) is the deploy_objects row under target_namespace
+    whose trailing name is `close`: exactly one (`mig.close` or `mig.app.close`) is its row; two candidates
+    (`mig.app.close` and `mig.legacy.close`) make the root ambiguous, which halts like an undeclared one rather
+    than guessing; a qualified root (`app.close`) still takes only its exact spelling or the bare row."""
+    check = _functions()["check_dependencies"]
+    root = _routine("close", writes=["mig.a"])
+    b = {"id": "b-9", "units": ["u"], "write_targets": ["mig.a", "mig.close"], "deploy_objects": ["mig.close"], "brief": "b"}
+    check([b], _deps(u=[root]), namespace="mig")
+    check([{**b, "write_targets": ["mig.a", "mig.app.close"], "deploy_objects": ["mig.app.close"]}], _deps(u=[root]),
+          namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*close.*ambiguous.*mig\.app\.close.*mig\.legacy\.close"):
+        check([{**b, "write_targets": ["mig.a", "mig.app.close", "mig.legacy.close"],
+                "deploy_objects": ["mig.app.close", "mig.legacy.close"]}], _deps(u=[root]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*deploy_objects"):
+        check([{**b, "write_targets": ["mig.a", "mig.legacy.close"], "deploy_objects": ["mig.legacy.close"]}],
+              _deps(u=[_routine("app.close", writes=["mig.a"])]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-9.*app\.close.*ambiguous.*x\.app\.close.*y\.app\.close"):
+        check([{**b, "write_targets": ["a", "x.app.close", "y.app.close"], "deploy_objects": ["x.app.close", "y.app.close"]}],
+              _deps(u=[_routine("app.close", writes=["a"])]))
+
+
 def test_a_complete_analysis_with_no_routines_is_a_graph_that_writes_and_deploys_nothing():
     """Every unit analysed and none converting a routine is a real (empty) graph: a declared table is then
     an extra nothing writes, the same mismatch as with routines. A deploy object is not: the analysis has

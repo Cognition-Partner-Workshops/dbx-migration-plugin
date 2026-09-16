@@ -1185,8 +1185,9 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
     so anything declared is extra. The routines nothing else in the batch calls are its entry points and
     ship as deployed objects: each takes a deploy_objects row of its own, the one spelled with its own
     trailing segments under target_namespace (`mig.app.close` for `app.close`), or a bare one there (`mig.close`)
-    when no other root ends in that name (`mig.other.close` and `prod.app.close` are somebody else's); a callee may
-    be inlined into its
+    when no other root ends in that name (`mig.other.close` and `prod.app.close` are somebody else's); a root
+    named without a schema (`close`) takes the one row ending in its name, and halts as ambiguous when several
+    could be it; a callee may be inlined into its
     caller and keep its row. A root left without a row is the same mismatch as an undeclared table. A row no
     root takes is a view or job the analysis has no routine for; it stays a declared target and the collision
     check's business."""
@@ -1244,12 +1245,16 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
             segs = target_key(root).split(".")
             found = sorted(d for d in free if d.split(".")[:len(prefix)] == prefix
                            and fits(d.split(".")[len(prefix):], segs))
+            if len(found) > 1:
+                raise SystemExit(f"batch {b['id']}: analysed routine {root} is ambiguous: deploy_objects {found} could "
+                                 "each be it. Spell the routine and its row alike, then re-run.")
             if found:
                 free.discard(found[0])
             return bool(found)
 
         trailing = Counter(target_key(root).rsplit(".", 1)[-1] for root in roots)
-        exact = {root for root in roots if take(root, lambda d, s: d == s if prefix else d[-len(s):] == s)}
+        exact = {root for root in roots
+                 if take(root, lambda d, s: d == s if prefix and len(s) > 1 else d[-len(s):] == s)}
         undeclared = [root for root in roots if root not in exact
                       and not take(root, lambda d, s: d[-1] == s[-1] and len(d) < len(s) and trailing[s[-1]] == 1)]
         if undeclared:
