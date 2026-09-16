@@ -97,6 +97,7 @@ class SchemaFacts:
     grants: dict[str, frozenset[str]] = field(default_factory=dict)
     # structural categories (see recon.structure.CATEGORIES) this reader cannot deliver;
     # empty = it delivered them all
+    primary_key_informational: tuple[str, ...] = ()
     foreign_keys_informational: set[tuple[tuple[str, ...], str, tuple[str, ...]]] =         field(default_factory=set)  # declared but not enforced (UC foreign keys)
     unsupported: frozenset[str] = frozenset()
 
@@ -872,7 +873,7 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
     for ctype, cols, ref, ref_cols in by_con.values():
         kind = str(ctype).upper()
         if kind == "PRIMARY KEY":
-            facts.primary_key = tuple(cols)
+            facts.primary_key_informational = tuple(cols)  # UC PKs are RELY, never enforced
         elif kind == "UNIQUE":
             facts.unique.add(tuple(cols))
         elif kind == "FOREIGN KEY" and ref is not None:

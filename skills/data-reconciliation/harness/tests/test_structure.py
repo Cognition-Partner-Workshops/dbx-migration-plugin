@@ -42,7 +42,7 @@ def test_load_dictionary_reads_each_family_fixture(family):
     if family == "databricks":
         assert d.unsupported == frozenset({"indexes", "triggers", "sequences_identity"})
         assert all(f.unsupported == d.unsupported for f in d.tables.values())
-    loans = next(f for f in d.tables.values() if f.primary_key)
+    loans = next(f for f in d.tables.values() if f.primary_key or f.primary_key_informational)
     assert loans.identity_columns
     if family != "databricks":
         assert ("after", ("insert", "update")) in loans.triggers.values()
@@ -108,6 +108,23 @@ def test_compare_grants_with_principal_map():
     extra_priv = compare_grants("o", s, SchemaFacts(
         grants={"app_rw": frozenset({"select", "insert", "delete"})}), {})
     assert [f.check for f in extra_priv] == ["grant_extra"]
+
+
+def test_compare_grants_expands_compound_privileges():
+    s = SchemaFacts(grants={"app_rw": frozenset({"select", "insert", "update", "delete"})})
+    # UC MODIFY stands for the same capabilities
+    assert compare_grants("o", s, SchemaFacts(grants={"app_rw": frozenset({"select", "modify"})}),
+                          {}) == []
+    thin = compare_grants("o", SchemaFacts(grants={"ro": frozenset({"select"})}),
+                          SchemaFacts(grants={"ro": frozenset({"select", "modify"})}), {})
+    assert [f.check for f in thin] == ["grant_extra"]
+    assert "insert" in thin[0].detail and "update" in thin[0].detail and "delete" in thin[0].detail
+
+
+def test_compare_grants_folds_many_to_one_principal_map():
+    s = SchemaFacts(grants={"reader": frozenset({"select"}), "writer": frozenset({"insert"})})
+    t = SchemaFacts(grants={"app": frozenset({"select", "insert"})})
+    assert compare_grants("o", s, t, {"reader": "app", "writer": "app"}) == []
 
 
 def test_compare_identity_columns():
@@ -250,6 +267,29 @@ def test_tier0_informational_target_fk_is_a_finding_not_a_pass():
     assert "structural_gap" in result["merge_block_reasons"]
 
 
+def test_tier0_informational_target_pk_is_a_finding_not_a_pass():
+    tgt_facts = _facts(TARGET_LOANS_FACTS, primary_key=(),
+                       primary_key_informational=("loan_id",))
+    result = _live(loans_tgt_facts=tgt_facts)
+    t0 = result["tiers"][0]
+    codes = {f["check"] for f in t0["findings"]}
+    assert "primary_key_informational_only" in codes and "primary_key_mismatch" not in codes
+    assert t0["stats"]["structural_diff"]["loans"]["constraints"]
+    assert result["merge_eligible"] is False
+    assert "structural_gap" in result["merge_block_reasons"]
+
+
+def test_tier0_source_unsupported_category_with_target_content_warns():
+    src_facts = _facts(LOANS_FACTS, unsupported=frozenset({"triggers"}), triggers={})
+    tgt_facts = _facts(TARGET_LOANS_FACTS, triggers={"trg": ("after", ("insert",))})
+    result = _live(loans_src_facts=src_facts, loans_tgt_facts=tgt_facts)
+    t0 = result["tiers"][0]
+    assert result["verdict"] == "PASS" and t0["passed"] is True
+    assert any("target has 1 triggers the source dictionary cannot expose" in n
+               for n in t0["stats"]["unverified"])
+    assert result["merge_eligible"] is False
+
+
 def test_tier0_absent_target_fk_is_still_missing():
     result = _live(loans_tgt_facts=_facts(TARGET_LOANS_FACTS, foreign_keys=set()))
     assert "foreign_key_missing" in {f["check"] for f in result["tiers"][0]["findings"]}
@@ -382,7 +422,8 @@ def test_databricks_schema_facts_maps_information_schema():
             return []
     a._sql = Sql()
     facts = a.schema_facts("loans")
-    assert facts.primary_key == ("loan_id",)
+    # UC constraints are informational, never enforced
+    assert facts.primary_key_informational == ("loan_id",) and not facts.primary_key
     # UC foreign keys are informational, never enforced
     assert facts.foreign_keys_informational == {(("borrower_id",), "s.borrowers", ("borrower_id",))}
     assert not facts.foreign_keys
@@ -433,7 +474,7 @@ def test_databricks_source_adapter_reads_uc_dictionary():
     a._conn = Conn()
     a.statements = a.rows_fetched = 0
     facts = a.schema_facts("cat.s.loans")
-    assert facts.primary_key == ("loan_id",)
+    assert facts.primary_key_informational == ("loan_id",)
     assert "information_schema.table_constraints" in " ".join(answers)
     with pytest.raises(NotImplementedError):
         a.identity_state("cat.s.loans", "loan_id")

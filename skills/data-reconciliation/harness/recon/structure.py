@@ -21,6 +21,7 @@ CATEGORIES = ("constraints", "triggers", "indexes", "sequences_identity", "grant
 # finding.check -> category, for the per-object structural diff
 _CHECK_CATEGORY = {
     "primary_key_mismatch": "constraints",
+    "primary_key_informational_only": "constraints",
     "unique_missing": "constraints", "unique_extra": "constraints",
     "unique_nulls_equal_missing": "constraints", "unique_nulls_equal_extra": "constraints",
     "foreign_key_missing": "constraints", "foreign_key_extra": "constraints",
@@ -46,7 +47,7 @@ def mask_unsupported(facts: SchemaFacts, categories) -> SchemaFacts:
     hole as an absence."""
     fields = {}
     if "constraints" in categories:
-        fields.update(primary_key=(), unique=frozenset(), unique_nulls_equal=frozenset(),
+        fields.update(primary_key=(), primary_key_informational=(), unique=frozenset(), unique_nulls_equal=frozenset(),
                       foreign_keys=frozenset(), foreign_keys_informational=frozenset(),
                       foreign_key_actions={}, not_null=frozenset(), check_count=0,
                       checks=frozenset(), expression_unique=frozenset())
@@ -94,6 +95,16 @@ def compare_triggers(obj: str, s: SchemaFacts, t: SchemaFacts) -> tuple[list[Fin
     return findings, tight
 
 
+_PRIVILEGE_CAPABILITIES = {"modify": ("insert", "update", "delete")}
+
+
+def _capabilities(privs) -> set[str]:
+    out = set()
+    for priv in privs:
+        out.update(_PRIVILEGE_CAPABILITIES.get(priv.lower(), (priv.lower(),)))
+    return out
+
+
 def compare_grants(obj: str, s: SchemaFacts, t: SchemaFacts,
                    principal_map: dict[str, str]) -> list[Finding]:
     """Source grantee g is expected on the target as principal_map.get(g, g). Missing grantee or
@@ -101,23 +112,26 @@ def compare_grants(obj: str, s: SchemaFacts, t: SchemaFacts,
     a mapped one, -> grant_extra (a finding, not tightened: a wider target grant is a blast-radius
     defect, and the allowlist forbids grants beyond it)."""
     findings = []
-    mapped = {principal_map.get(g, g): g for g in s.grants}
+    mapped: dict[str, list[str]] = {}
+    for g in s.grants:
+        mapped.setdefault(principal_map.get(g, g), []).append(g)
     for g in sorted(s.grants):
-        tg, s_privs = principal_map.get(g, g), set(s.grants[g])
+        tg, s_privs = principal_map.get(g, g), _capabilities(s.grants[g])
         if tg not in t.grants:
             findings.append(Finding(obj, "grant_missing",
                                     f"source grant {g} ({','.join(sorted(s_privs))}) has no target "
                                     f"grant for {tg}"))
-        elif missing := sorted(s_privs - set(t.grants[tg])):
+        elif missing := sorted(s_privs - _capabilities(t.grants[tg])):
             findings.append(Finding(obj, "grant_missing",
                                     f"source grant {g} is missing {','.join(missing)} on target "
                                     f"grantee {tg}"))
     for tg in sorted(t.grants):
         if tg in mapped:
-            if extra := sorted(set(t.grants[tg]) - set(s.grants[mapped[tg]])):
+            union = set().union(*(_capabilities(s.grants[g]) for g in mapped[tg]))
+            if extra := sorted(_capabilities(t.grants[tg]) - union):
                 findings.append(Finding(obj, "grant_extra",
                                         f"target grant {tg} carries {','.join(extra)} the source "
-                                        f"grant {mapped[tg]} lacks"))
+                                        f"grant {','.join(sorted(mapped[tg]))} lacks"))
         else:
             findings.append(Finding(obj, "grant_extra",
                                     f"target grant {tg} ({','.join(sorted(t.grants[tg]))}) has no "
@@ -193,6 +207,7 @@ def load_dictionary(path: Path) -> FixtureDictionary:
             tables[name] = SchemaFacts(
                 table=name,
                 primary_key=tuple(t.get("primary_key") or ()),
+                primary_key_informational=tuple(t.get("primary_key_informational") or ()),
                 unique={tuple(u) for u in (t.get("unique") or [])},
                 unique_nulls_equal={tuple(u) for u in (t.get("unique_nulls_equal") or [])},
                 foreign_keys=fks, foreign_key_actions=fk_actions,

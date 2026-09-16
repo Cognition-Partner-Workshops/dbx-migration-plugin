@@ -8,9 +8,6 @@
   ],
   "tables": {
     "loans": {
-      "primary_key": [
-        "loan_id"
-      ],
       "unique": [
         [
           "loan_number"
@@ -51,12 +48,12 @@
           "on_update": "no action",
           "on_delete": "no action"
         }
+      ],
+      "primary_key_informational": [
+        "loan_id"
       ]
     },
     "borrowers": {
-      "primary_key": [
-        "borrower_id"
-      ],
       "not_null": [
         "borrower_id"
       ],
@@ -68,7 +65,10 @@
           "next": 500,
           "increment": 1
         }
-      }
+      },
+      "primary_key_informational": [
+        "borrower_id"
+      ]
     }
   }
 }

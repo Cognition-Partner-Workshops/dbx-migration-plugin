@@ -881,6 +881,7 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         primary_key=tuple(x.lower() for x in f.primary_key),
         unique={tuple(x.lower() for x in u) for u in f.unique},
         unique_nulls_equal={tuple(x.lower() for x in u) for u in f.unique_nulls_equal},
+        primary_key_informational=tuple(k.lower() for k in f.primary_key_informational),
         foreign_keys={_lower_fk(fk) for fk in f.foreign_keys},
         foreign_keys_informational={_lower_fk(fk) for fk in f.foreign_keys_informational},
         foreign_key_actions={_lower_fk(fk): a for fk, a in f.foreign_key_actions.items()},
@@ -1392,9 +1393,14 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
             s, t, t_lower = (mask_unsupported(f_, uns) for f_ in (s, t, t_lower))
         pk = _map_cols(s.primary_key, colmap)
         if pk != t_lower.primary_key:
-            findings.append(Finding(c.object, "primary_key_mismatch",
-                                    f"source {s.primary_key} -> expected {pk}, target {t.primary_key}",
-                                    s.primary_key, t.primary_key))
+            if pk and not t_lower.primary_key and t_lower.primary_key_informational == pk:
+                findings.append(Finding(c.object, "primary_key_informational_only",
+                                        "target PK is informational, not enforced: duplicate keys "
+                                        "would be accepted"))
+            else:
+                findings.append(Finding(c.object, "primary_key_mismatch",
+                                        f"source {s.primary_key} -> expected {pk}, target "
+                                        f"{t.primary_key}", s.primary_key, t.primary_key))
         # a unique constraint rejects the same duplicates whatever order its columns are
         # declared in, so parity is by column set; the declared order is an access path and
         # is kept for the coverage check (`_covered`) and noted when only the order differs
@@ -1676,6 +1682,15 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                     stats.setdefault("unverified", []).append(
                         f"{c.object}: {n} source {cat} cannot be checked: the target catalog "
                         f"has no {cat} dictionary")
+            m = _category_content(t_raw, cat)
+            if m and cat in (s_raw.unsupported | obj_uns.get(c.object, set())):
+                if cat == "indexes":
+                    stats.setdefault("index_unsupported", []).append(
+                        f"{c.object}: {m} target indexes cannot be checked: the source catalog "
+                        "has no indexes dictionary")
+                else:
+                    stats.setdefault("unverified", []).append(
+                        f"{c.object}: target has {m} {cat} the source dictionary cannot expose")
         stats[c.object] = {"source": _facts_dict(s_raw), "target": _facts_dict(t_raw), "identity": seq_note}
     checks_map = structural_checks(list(facts.values()))
     for cat in {c for cats in obj_uns.values() for c in cats}:
