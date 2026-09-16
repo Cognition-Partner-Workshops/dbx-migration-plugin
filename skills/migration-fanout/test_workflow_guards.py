@@ -364,10 +364,10 @@ def test_pass_without_merge_evidence_is_downgraded(mode):
 
 # ---------------------------------------------------------------- merge authority (WS3.2)
 
-LEDGER = ("| D-6 | 2024-05-01 | user: widen tolerance for orders_dim | \n"
-          "| D-7 | 2024-05-02 | user: merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
+LEDGER = ("| D-6 | 2024-05-01 | user:U1 widen tolerance for orders_dim | \n"
+          "| D-7 | 2024-05-02 | user:U1 merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
           "| D-8 | 2024-05-02 | default-accepted: merge_override for other_unit |\n"
-          "| D-70 | 2024-05-03 | user: merge_override for u2 |\n")
+          "| D-70 | 2024-05-03 | user:U1 merge_override for u2 |\n")
 
 
 def _ns_with_ledger(text=LEDGER):
@@ -434,7 +434,7 @@ def test_override_decision_row_must_name_every_unit_and_say_merge_override():
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
     ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
-    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user: merge_override for u, u2, u3 |\n"
+    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 merge_override for u, u2, u3 |\n"
 
     def run(report):
         async def agent(prompt, **kwargs):
@@ -458,7 +458,8 @@ def test_override_decision_row_needs_human_provenance():
     assert not override_decision("D-8", ["other_unit"], LEDGER)          # default-accepted is not a human
     assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "bot:"))
     assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "user"))
-    assert override_decision("D-7", ["u"], LEDGER.replace("user: merge", "user:a.b@x.io merge"))
+    assert not override_decision("D-7", ["u"], LEDGER.replace("user:U1", "user:"))      # user: with no event id
+    assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 merge", "user:a.b@x.io merge"))
 
 
 def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():

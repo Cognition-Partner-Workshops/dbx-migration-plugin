@@ -19,7 +19,7 @@ What this script guarantees, so the orchestrator does not have to:
   - Merge authority is the harness (every unit's .migration/recon/<unit>/result.json at the PR head
     says merge_eligible=true) or a human: a batch with a unit whose evidence says otherwise is
     recorded PASS only with merge_authority {kind: human_override, decision_id: D-<n>} where that
-    D-<n> row of .migration/06_decisions.md is a human's (user:), names every unit of the batch and
+    D-<n> row of .migration/06_decisions.md is a human's (user:<id>), names every unit of the batch and
     says merge_override. The result lists every override.
   - Re-running with the same run_id in the pointer replays finished children and only launches
     the rest.
@@ -200,8 +200,8 @@ PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
 PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
 # A row of the decision ledger (.migration/06_decisions.md).
 DECISION_ID = re.compile(r"D-[0-9]+")
-# Its provenance when a human wrote it (`user:<id>`), as the ledger convention names it.
-HUMAN_PROVENANCE = re.compile(r"(?<![A-Za-z0-9_])user:")
+# Its provenance when a human wrote it (`user:<message/event id>`), as the ledger convention names it.
+HUMAN_PROVENANCE = re.compile(r"(?<![\w-])user:[\w][\w.@/-]*")
 
 
 def decision_ledger():
@@ -214,7 +214,7 @@ def decision_ledger():
 def override_decision(decision_id, units, ledger):
     """Whether the ledger holds the D-<n> row that lets a human merge past merge_eligible=false: one
     line carrying that id, the word merge_override, the id of every unit in the batch, and human
-    provenance (`user:`; a default-accepted row is the orchestrator's, not a human's)."""
+    provenance (`user:<id>`; a default-accepted row is the orchestrator's, not a human's)."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
         return False
     words = [decision_id, "merge_override", *units]
