@@ -445,3 +445,13 @@ def test_a_declared_decimal_outside_the_kinds_shape_is_a_contradiction(oracle_ma
 
 def test_lakebases_larger_decimal_ceiling_accepts_wider_declarations(oracle_lakebase_map):
     assert audit_field(oracle_lakebase_map, "NUMBER(39,39)", "numeric(39,39)")[0] == "ok"
+
+
+def test_lakebase_scale_range_allows_postgres_wide_scales(oracle_lakebase_map):
+    # postgres 17 scales run -1000..1000 independent of precision: s > p is legal there, so
+    # these fail on the expected type, never on a shape error
+    assert audit_field(oracle_lakebase_map, "NUMBER(2,5)", "numeric(5,5)")[0] == "ok"
+    assert audit_field(oracle_lakebase_map, "NUMBER(2,5)", "numeric(2,5)") ==         ("contradiction", "numeric(5,5)")
+    assert audit_field(oracle_lakebase_map, "NUMBER(5,-2)", "numeric(5,-2)") ==         ("contradiction", "bigint")
+    status, detail = audit_field(oracle_lakebase_map, "NUMBER(2,5)", "numeric(5,1001)")
+    assert status == "contradiction" and "not a valid lakebase decimal" in detail

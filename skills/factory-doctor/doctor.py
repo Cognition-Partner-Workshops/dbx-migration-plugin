@@ -605,7 +605,6 @@ def check_drivers() -> Check:
                  {"drivers": present})
 
 
-<<<<<<< HEAD
 def check_recon_family_supported(plugin_root: Path, source_family: str | None) -> Check:
     """Whether the harness can reconcile the declared source family, asked of the same harness
     `recon_harness` ran (dbx-recon on PATH, else the checkout). Deliberately not folded into
@@ -643,8 +642,6 @@ def check_recon_family_supported(plugin_root: Path, source_family: str | None) -
     return Check(cid, "ok", f"{source_family}: live-tested source adapter ({how})", data)
 
 
-||||||| parent of 17dcfe2 (doctor: type_map_audit row — fail on spec targets the family type map forbids)
-=======
 def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[Path], source_family: str | None,
                          plugin_root: Path, params: dict[str, str] | None = None,
                          target_kind: str = "databricks") -> Check:
@@ -723,7 +720,6 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
                   "undeclared": undeclared})
 
 
->>>>>>> 17dcfe2 (doctor: type_map_audit row — fail on spec targets the family type map forbids)
 # ------------------------------------------------------------------ delete evidence (source CDC)
 
 _CDC_QUERIES = {

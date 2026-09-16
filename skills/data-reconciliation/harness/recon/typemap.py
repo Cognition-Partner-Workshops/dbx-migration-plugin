@@ -57,6 +57,7 @@ class TypeMap:
     note: str
     rules: tuple[TypeRule, ...]
     decimal_max_precision: int | None = None
+    decimal_scale_range: tuple[int, int] | None = None
 
 
 def _parse(text: str, aliases: bool = True, kind: str | None = None) -> tuple[str, tuple]:
@@ -167,8 +168,10 @@ def load_type_map(path: Path, family: str, target_kind: str) -> TypeMap | None:
                               accepts=tuple(r.get("accepts", ())),
                               conditional=tuple(sorted((r.get("conditional") or {}).items())),
                               arg_max=tuple(sorted(arg_max.items()))))
+    scale_range = entry.get("decimal_scale_range")
     return TypeMap(family=family, target_kind=target_kind, note=entry.get("note", ""),
-                   rules=tuple(rules), decimal_max_precision=entry.get("decimal_max_precision"))
+                   rules=tuple(rules), decimal_max_precision=entry.get("decimal_max_precision"),
+                   decimal_scale_range=tuple(scale_range) if scale_range else None)
 
 
 def type_map_families(path: Path) -> list[str]:
@@ -228,10 +231,15 @@ def audit_field(tm: TypeMap, source_type: str, target_type: str,
     if (dname in _DECIMAL_SOURCES and len(dargs) == 2
             and all(isinstance(a, int) for a in dargs)):
         p_, s_ = dargs
-        bad = "s > p" if s_ > p_ else ("s < 0" if s_ < 0 else
-              ("p < 1" if p_ < 1 else
-               f"precision past {tm.target_kind}'s {tm.decimal_max_precision}"
-               if tm.decimal_max_precision is not None and p_ > tm.decimal_max_precision else None))
+        if p_ < 1:
+            bad = "p < 1"
+        elif tm.decimal_scale_range is not None:
+            lo, hi = tm.decimal_scale_range
+            bad = f"scale outside {tm.target_kind}'s {lo}..{hi}" if not lo <= s_ <= hi else None
+        else:
+            bad = "s > p" if s_ > p_ else ("s < 0" if s_ < 0 else None)
+        if not bad and tm.decimal_max_precision is not None and p_ > tm.decimal_max_precision:
+            bad = f"precision past {tm.target_kind}'s {tm.decimal_max_precision}"
         if bad:
             cap = (f"; {tm.target_kind} decimals stop at {tm.decimal_max_precision}"
                    if tm.decimal_max_precision is not None else "")

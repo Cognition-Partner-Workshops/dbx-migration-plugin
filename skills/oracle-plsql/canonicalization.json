@@ -1,13 +1,53 @@
 {
   "rules": [
-    {"rule": "empty_string_is_null", "applies_to": "VARCHAR2,NVARCHAR2,CHAR,NCHAR,CLOB->STRING", "params": {"policy": "SET_AT_STOP_A", "default": "treat_empty_as_null"}},
-    {"rule": "decimal_round", "applies_to": "NUMBER (no scale),NUMBER(*),FLOAT(b)->DECIMAL(38,10) only; NUMBER(p,s)->DECIMAL(p,s) and BINARY_FLOAT/BINARY_DOUBLE->FLOAT/DOUBLE use identity", "params": {"mode": "half_even", "places": 10}},
-    {"rule": "datetime_utc_truncate_ms", "applies_to": "DATE,TIMESTAMP(n<=3)->TIMESTAMP_NTZ only; TIMESTAMP(n>3) uses identity; TIMESTAMP WITH [LOCAL] TIME ZONE uses identity on SYS_EXTRACT_UTC()/to_utc_timestamp() in the recon query", "params": {"assume_source_tz_for_DATE": "DBTIMEZONE"}},
-    {"rule": "rstrip_spaces", "applies_to": "CHAR,NCHAR->STRING", "params": {}},
-    {"rule": "null_missing_equiv", "applies_to": "*", "params": {}},
-    {"rule": "collation_casefold", "applies_to": "STRING (unconditional on any field that names it: name it only where NLS_COMP=LINGUISTIC or UPPER()/NLS_UPPER() compares are found in census)", "params": {}},
-    {"rule": "uuid_normalize", "applies_to": "RAW(16)->STRING (unconditional on any field that names it: name it only where a SYS_GUID() default or RAWTOHEX consumers are found in census)", "params": {}},
-    {"rule": "identity", "applies_to": "*", "params": {}}
+    {
+      "rule": "empty_string_is_null",
+      "applies_to": "VARCHAR2,NVARCHAR2,CHAR,NCHAR,CLOB->STRING",
+      "params": {
+        "policy": "SET_AT_STOP_A",
+        "default": "treat_empty_as_null"
+      }
+    },
+    {
+      "rule": "decimal_round",
+      "applies_to": "NUMBER (no scale),NUMBER(*),FLOAT(b)->DECIMAL(38,10) only; NUMBER(p,s)->DECIMAL(p,s) and BINARY_FLOAT/BINARY_DOUBLE->FLOAT/DOUBLE use identity",
+      "params": {
+        "mode": "half_even",
+        "places": 10
+      }
+    },
+    {
+      "rule": "datetime_utc_truncate_ms",
+      "applies_to": "DATE,TIMESTAMP(n<=3)->TIMESTAMP_NTZ only; TIMESTAMP(n>3) uses identity; TIMESTAMP WITH [LOCAL] TIME ZONE uses identity on SYS_EXTRACT_UTC()/to_utc_timestamp() in the recon query",
+      "params": {
+        "assume_source_tz_for_DATE": "DBTIMEZONE"
+      }
+    },
+    {
+      "rule": "rstrip_spaces",
+      "applies_to": "CHAR,NCHAR->STRING",
+      "params": {}
+    },
+    {
+      "rule": "null_missing_equiv",
+      "applies_to": "*",
+      "params": {}
+    },
+    {
+      "rule": "collation_casefold",
+      "applies_to": "STRING (unconditional on any field that names it: name it only where NLS_COMP=LINGUISTIC or UPPER()/NLS_UPPER() compares are found in census)",
+      "params": {}
+    },
+    {
+      "rule": "uuid_normalize",
+      "applies_to": "RAW(16)->STRING (unconditional on any field that names it: name it only where a SYS_GUID() default or RAWTOHEX consumers are found in census)",
+      "params": {}
+    },
+    {
+      "rule": "identity",
+      "applies_to": "*",
+      "params": {}
+    }
   ],
   "type_map": {
     "oracle": {
@@ -15,86 +55,447 @@
         "decimal_max_precision": 38,
         "note": "Delta targets, lower case; first matching entry wins. NUMBER without a scale keeps fractions, so it is decimal(38,10) (any decimal(38,s) accepted; raise s when the census shows MAX(scale) > 10) and never decimal(38,0), double or float. NUMBER(p)/NUMBER(p,0) is whole: bigint for p<=18, decimal(p,0) above. TIMESTAMP is zone-less: timestamp_ntz, timestamp accepted, never a zoned type. Anything not listed is reported as unmapped, not passed. A `conditional` alternative needs the named token in the field's `evidence` list.",
         "types": [
-          {"source": "NUMBER(p,0)", "p_max": 18, "target": "bigint", "accepts": ["decimal(p,0)"]},
-          {"source": "NUMBER(p,s)", "target": "decimal(p,s)"},
-          {"source": "NUMBER(*,s)", "target": "decimal(38,s)"},
-          {"source": "NUMBER(p)", "p_max": 18, "target": "bigint", "accepts": ["decimal(p,0)"]},
-          {"source": "NUMBER(p)", "target": "decimal(p,0)"},
-          {"source": "NUMBER", "target": "decimal(38,10)", "accepts": ["decimal(38,*)"]},
-          {"source": "NUMBER(*)", "target": "decimal(38,10)", "accepts": ["decimal(38,*)"]},
-          {"source": "INTEGER", "target": "decimal(38,0)", "conditional": {"bigint": "census_fits_int64"}},
-          {"source": "INT", "target": "decimal(38,0)", "conditional": {"bigint": "census_fits_int64"}},
-          {"source": "SMALLINT", "target": "decimal(38,0)", "conditional": {"bigint": "census_fits_int64"}},
-          {"source": "FLOAT", "target": "decimal(38,10)", "accepts": ["double"]},
-          {"source": "FLOAT(b)", "target": "decimal(38,10)", "accepts": ["double"]},
-          {"source": "BINARY_FLOAT", "target": "float"},
-          {"source": "BINARY_DOUBLE", "target": "double"},
-          {"source": "VARCHAR2(n)", "target": "string"}, {"source": "VARCHAR2", "target": "string"},
-          {"source": "NVARCHAR2(n)", "target": "string"},
-          {"source": "CHAR(n)", "target": "string"}, {"source": "CHAR", "target": "string"},
-          {"source": "NCHAR(n)", "target": "string"},
-          {"source": "CLOB", "target": "string"}, {"source": "NCLOB", "target": "string"}, {"source": "LONG", "target": "string"},
-          {"source": "RAW(n)", "target": "binary", "accepts": ["string"]},
-          {"source": "BLOB", "target": "binary"}, {"source": "LONG RAW", "target": "binary"},
-          {"source": "DATE", "target": "timestamp_ntz", "conditional": {"date": "census_midnight_only"}},
-          {"source": "TIMESTAMP", "target": "timestamp_ntz", "accepts": ["timestamp"]},
-          {"source": "TIMESTAMP(n)", "target": "timestamp_ntz", "accepts": ["timestamp"]},
-          {"source": "TIMESTAMP WITH TIME ZONE", "target": "timestamp"},
-          {"source": "TIMESTAMP(n) WITH TIME ZONE", "target": "timestamp"},
-          {"source": "TIMESTAMP WITH LOCAL TIME ZONE", "target": "timestamp"},
-          {"source": "TIMESTAMP(n) WITH LOCAL TIME ZONE", "target": "timestamp"},
-          {"source": "INTERVAL YEAR TO MONTH", "target": "interval year to month"},
-          {"source": "INTERVAL DAY TO SECOND", "target": "interval day to second"},
-          {"source": "INTERVAL DAY(p) TO SECOND(s)", "target": "interval day to second"},
-          {"source": "BOOLEAN", "target": "boolean"},
-          {"source": "XMLTYPE", "target": "string", "accepts": ["variant"]},
-          {"source": "JSON", "target": "variant", "accepts": ["string"]}
+          {
+            "source": "NUMBER(p,0)",
+            "p_max": 18,
+            "target": "bigint",
+            "accepts": [
+              "decimal(p,0)"
+            ]
+          },
+          {
+            "source": "NUMBER(p,s)",
+            "target": "decimal(p,s)"
+          },
+          {
+            "source": "NUMBER(*,s)",
+            "target": "decimal(38,s)"
+          },
+          {
+            "source": "NUMBER(p)",
+            "p_max": 18,
+            "target": "bigint",
+            "accepts": [
+              "decimal(p,0)"
+            ]
+          },
+          {
+            "source": "NUMBER(p)",
+            "target": "decimal(p,0)"
+          },
+          {
+            "source": "NUMBER",
+            "target": "decimal(38,10)",
+            "accepts": [
+              "decimal(38,*)"
+            ]
+          },
+          {
+            "source": "NUMBER(*)",
+            "target": "decimal(38,10)",
+            "accepts": [
+              "decimal(38,*)"
+            ]
+          },
+          {
+            "source": "INTEGER",
+            "target": "decimal(38,0)",
+            "conditional": {
+              "bigint": "census_fits_int64"
+            }
+          },
+          {
+            "source": "INT",
+            "target": "decimal(38,0)",
+            "conditional": {
+              "bigint": "census_fits_int64"
+            }
+          },
+          {
+            "source": "SMALLINT",
+            "target": "decimal(38,0)",
+            "conditional": {
+              "bigint": "census_fits_int64"
+            }
+          },
+          {
+            "source": "FLOAT",
+            "target": "decimal(38,10)",
+            "accepts": [
+              "double"
+            ]
+          },
+          {
+            "source": "FLOAT(b)",
+            "target": "decimal(38,10)",
+            "accepts": [
+              "double"
+            ]
+          },
+          {
+            "source": "BINARY_FLOAT",
+            "target": "float"
+          },
+          {
+            "source": "BINARY_DOUBLE",
+            "target": "double"
+          },
+          {
+            "source": "VARCHAR2(n)",
+            "target": "string"
+          },
+          {
+            "source": "VARCHAR2",
+            "target": "string"
+          },
+          {
+            "source": "NVARCHAR2(n)",
+            "target": "string"
+          },
+          {
+            "source": "CHAR(n)",
+            "target": "string"
+          },
+          {
+            "source": "CHAR",
+            "target": "string"
+          },
+          {
+            "source": "NCHAR(n)",
+            "target": "string"
+          },
+          {
+            "source": "CLOB",
+            "target": "string"
+          },
+          {
+            "source": "NCLOB",
+            "target": "string"
+          },
+          {
+            "source": "LONG",
+            "target": "string"
+          },
+          {
+            "source": "RAW(n)",
+            "target": "binary",
+            "accepts": [
+              "string"
+            ]
+          },
+          {
+            "source": "BLOB",
+            "target": "binary"
+          },
+          {
+            "source": "LONG RAW",
+            "target": "binary"
+          },
+          {
+            "source": "DATE",
+            "target": "timestamp_ntz",
+            "conditional": {
+              "date": "census_midnight_only"
+            }
+          },
+          {
+            "source": "TIMESTAMP",
+            "target": "timestamp_ntz",
+            "accepts": [
+              "timestamp"
+            ]
+          },
+          {
+            "source": "TIMESTAMP(n)",
+            "target": "timestamp_ntz",
+            "accepts": [
+              "timestamp"
+            ]
+          },
+          {
+            "source": "TIMESTAMP WITH TIME ZONE",
+            "target": "timestamp"
+          },
+          {
+            "source": "TIMESTAMP(n) WITH TIME ZONE",
+            "target": "timestamp"
+          },
+          {
+            "source": "TIMESTAMP WITH LOCAL TIME ZONE",
+            "target": "timestamp"
+          },
+          {
+            "source": "TIMESTAMP(n) WITH LOCAL TIME ZONE",
+            "target": "timestamp"
+          },
+          {
+            "source": "INTERVAL YEAR TO MONTH",
+            "target": "interval year to month"
+          },
+          {
+            "source": "INTERVAL DAY TO SECOND",
+            "target": "interval day to second"
+          },
+          {
+            "source": "INTERVAL DAY(p) TO SECOND(s)",
+            "target": "interval day to second"
+          },
+          {
+            "source": "BOOLEAN",
+            "target": "boolean"
+          },
+          {
+            "source": "XMLTYPE",
+            "target": "string",
+            "accepts": [
+              "variant"
+            ]
+          },
+          {
+            "source": "JSON",
+            "target": "variant",
+            "accepts": [
+              "string"
+            ]
+          }
         ]
       },
       "lakebase": {
         "decimal_max_precision": 1000,
         "note": "Lakebase Postgres targets, lower case; first matching entry wins. NUMBER without a scale keeps fractions, so it is numeric (any numeric(38,s) accepted) and never double precision/real. NUMBER(p)/NUMBER(p,0) is whole: bigint for p<=18, numeric(p,0) above. TIMESTAMP is zone-less. Anything not listed is reported as unmapped, not passed. A `conditional` alternative needs the named token in the field's `evidence` list.",
         "types": [
-        {"source": "NUMBER(p,0)", "p_max": 18, "target": "bigint", "accepts": ["numeric(p,0)"]},
-        {"source": "NUMBER(p,s)", "target": "numeric(p,s)"},
-        {"source": "NUMBER(*,s)", "target": "numeric(38,s)"},
-        {"source": "NUMBER(p)", "p_max": 18, "target": "bigint", "accepts": ["numeric(p,0)"]},
-        {"source": "NUMBER(p)", "target": "numeric(p,0)"},
-        {"source": "NUMBER", "target": "numeric", "accepts": ["numeric(38,*)"]},
-        {"source": "NUMBER(*)", "target": "numeric", "accepts": ["numeric(38,*)"]},
-        {"source": "INTEGER", "target": "numeric(38,0)", "conditional": {"bigint": "census_fits_int64"}},
-        {"source": "INT", "target": "numeric(38,0)", "conditional": {"bigint": "census_fits_int64"}},
-        {"source": "SMALLINT", "target": "numeric(38,0)", "conditional": {"bigint": "census_fits_int64"}},
-        {"source": "BINARY_FLOAT", "target": "real"},
-        {"source": "BINARY_DOUBLE", "target": "double precision"},
-        {"source": "VARCHAR2(n)", "target": "varchar(n)", "accepts": ["text"]},
-        {"source": "VARCHAR2", "target": "varchar", "accepts": ["text"]},
-        {"source": "NVARCHAR2(n)", "target": "varchar(n)", "accepts": ["text"]},
-        {"source": "CHAR(n)", "target": "char(n)"},
-        {"source": "CHAR", "target": "char"},
-        {"source": "NCHAR(n)", "target": "char(n)"},
-        {"source": "CLOB", "target": "text"},
-        {"source": "NCLOB", "target": "text"},
-        {"source": "LONG", "target": "text"},
-        {"source": "RAW(n)", "target": "bytea"},
-        {"source": "BLOB", "target": "bytea"},
-        {"source": "LONG RAW", "target": "bytea"},
-        {"source": "DATE", "target": "timestamp(0)", "accepts": ["timestamp"], "conditional": {"date": "census_midnight_only"}},
-        {"source": "TIMESTAMP", "target": "timestamp"},
-        {"source": "TIMESTAMP(n)", "arg_max": {"n": 6}, "target": "timestamp(n)", "accepts": ["timestamp"]},
-        {"source": "TIMESTAMP(n)", "target": "timestamp(6)", "accepts": ["timestamp"]},
-        {"source": "TIMESTAMP WITH TIME ZONE", "target": "timestamp with time zone"},
-        {"source": "TIMESTAMP(n) WITH TIME ZONE", "arg_max": {"n": 6}, "target": "timestamp(n) with time zone", "accepts": ["timestamp with time zone"]},
-        {"source": "TIMESTAMP(n) WITH TIME ZONE", "target": "timestamp(6) with time zone", "accepts": ["timestamp with time zone"]},
-        {"source": "TIMESTAMP WITH LOCAL TIME ZONE", "target": "timestamp with time zone"},
-        {"source": "TIMESTAMP(n) WITH LOCAL TIME ZONE", "arg_max": {"n": 6}, "target": "timestamp(n) with time zone", "accepts": ["timestamp with time zone"]},
-        {"source": "TIMESTAMP(n) WITH LOCAL TIME ZONE", "target": "timestamp(6) with time zone", "accepts": ["timestamp with time zone"]},
-        {"source": "INTERVAL YEAR TO MONTH", "target": "interval year to month"},
-        {"source": "INTERVAL DAY TO SECOND", "target": "interval day to second"},
-        {"source": "INTERVAL DAY(p) TO SECOND(s)", "target": "interval day to second"},
-        {"source": "BOOLEAN", "target": "boolean"},
-        {"source": "XMLTYPE", "target": "xml", "accepts": ["text"]},
-        {"source": "JSON", "target": "jsonb"}
+          {
+            "source": "NUMBER(p,0)",
+            "p_max": 18,
+            "target": "bigint",
+            "accepts": [
+              "numeric(p,0)"
+            ]
+          },
+          {
+            "source": "NUMBER(p,s)",
+            "target": "numeric(p,s)"
+          },
+          {
+            "source": "NUMBER(*,s)",
+            "target": "numeric(38,s)"
+          },
+          {
+            "source": "NUMBER(p)",
+            "p_max": 18,
+            "target": "bigint",
+            "accepts": [
+              "numeric(p,0)"
+            ]
+          },
+          {
+            "source": "NUMBER(p)",
+            "target": "numeric(p,0)"
+          },
+          {
+            "source": "NUMBER",
+            "target": "numeric",
+            "accepts": [
+              "numeric(38,*)"
+            ]
+          },
+          {
+            "source": "NUMBER(*)",
+            "target": "numeric",
+            "accepts": [
+              "numeric(38,*)"
+            ]
+          },
+          {
+            "source": "INTEGER",
+            "target": "numeric(38,0)",
+            "conditional": {
+              "bigint": "census_fits_int64"
+            }
+          },
+          {
+            "source": "INT",
+            "target": "numeric(38,0)",
+            "conditional": {
+              "bigint": "census_fits_int64"
+            }
+          },
+          {
+            "source": "SMALLINT",
+            "target": "numeric(38,0)",
+            "conditional": {
+              "bigint": "census_fits_int64"
+            }
+          },
+          {
+            "source": "BINARY_FLOAT",
+            "target": "real"
+          },
+          {
+            "source": "BINARY_DOUBLE",
+            "target": "double precision"
+          },
+          {
+            "source": "VARCHAR2(n)",
+            "target": "varchar(n)",
+            "accepts": [
+              "text"
+            ]
+          },
+          {
+            "source": "VARCHAR2",
+            "target": "varchar",
+            "accepts": [
+              "text"
+            ]
+          },
+          {
+            "source": "NVARCHAR2(n)",
+            "target": "varchar(n)",
+            "accepts": [
+              "text"
+            ]
+          },
+          {
+            "source": "CHAR(n)",
+            "target": "char(n)"
+          },
+          {
+            "source": "CHAR",
+            "target": "char"
+          },
+          {
+            "source": "NCHAR(n)",
+            "target": "char(n)"
+          },
+          {
+            "source": "CLOB",
+            "target": "text"
+          },
+          {
+            "source": "NCLOB",
+            "target": "text"
+          },
+          {
+            "source": "LONG",
+            "target": "text"
+          },
+          {
+            "source": "RAW(n)",
+            "target": "bytea"
+          },
+          {
+            "source": "BLOB",
+            "target": "bytea"
+          },
+          {
+            "source": "LONG RAW",
+            "target": "bytea"
+          },
+          {
+            "source": "DATE",
+            "target": "timestamp(0)",
+            "accepts": [
+              "timestamp"
+            ],
+            "conditional": {
+              "date": "census_midnight_only"
+            }
+          },
+          {
+            "source": "TIMESTAMP",
+            "target": "timestamp"
+          },
+          {
+            "source": "TIMESTAMP(n)",
+            "arg_max": {
+              "n": 6
+            },
+            "target": "timestamp(n)",
+            "accepts": [
+              "timestamp"
+            ]
+          },
+          {
+            "source": "TIMESTAMP(n)",
+            "target": "timestamp(6)",
+            "accepts": [
+              "timestamp"
+            ]
+          },
+          {
+            "source": "TIMESTAMP WITH TIME ZONE",
+            "target": "timestamp with time zone"
+          },
+          {
+            "source": "TIMESTAMP(n) WITH TIME ZONE",
+            "arg_max": {
+              "n": 6
+            },
+            "target": "timestamp(n) with time zone",
+            "accepts": [
+              "timestamp with time zone"
+            ]
+          },
+          {
+            "source": "TIMESTAMP(n) WITH TIME ZONE",
+            "target": "timestamp(6) with time zone",
+            "accepts": [
+              "timestamp with time zone"
+            ]
+          },
+          {
+            "source": "TIMESTAMP WITH LOCAL TIME ZONE",
+            "target": "timestamp with time zone"
+          },
+          {
+            "source": "TIMESTAMP(n) WITH LOCAL TIME ZONE",
+            "arg_max": {
+              "n": 6
+            },
+            "target": "timestamp(n) with time zone",
+            "accepts": [
+              "timestamp with time zone"
+            ]
+          },
+          {
+            "source": "TIMESTAMP(n) WITH LOCAL TIME ZONE",
+            "target": "timestamp(6) with time zone",
+            "accepts": [
+              "timestamp with time zone"
+            ]
+          },
+          {
+            "source": "INTERVAL YEAR TO MONTH",
+            "target": "interval year to month"
+          },
+          {
+            "source": "INTERVAL DAY TO SECOND",
+            "target": "interval day to second"
+          },
+          {
+            "source": "INTERVAL DAY(p) TO SECOND(s)",
+            "target": "interval day to second"
+          },
+          {
+            "source": "BOOLEAN",
+            "target": "boolean"
+          },
+          {
+            "source": "XMLTYPE",
+            "target": "xml",
+            "accepts": [
+              "text"
+            ]
+          },
+          {
+            "source": "JSON",
+            "target": "jsonb"
+          }
+        ],
+        "decimal_scale_range": [
+          -1000,
+          1000
         ]
       }
     }
