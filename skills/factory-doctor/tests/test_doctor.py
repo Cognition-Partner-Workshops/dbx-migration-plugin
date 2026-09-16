@@ -221,8 +221,8 @@ def test_run_core_rows_are_ten(tmp_path):
     assert [c["id"] for c in report["checks"] if c["id"] not in optional] == [
         "workspace", "allowed_targets", "allowlist_committed", "playbooks_in_sync", "hook_guard",
         "official_databricks_plugin", "recon_harness", "recon_family_supported", "type_map_audit",
-        "delete_evidence",
-        "source_principal_read_only", "databricks_identity",
+        "delete_evidence", "source_principal_read_only", "dictionary_readable",
+        "databricks_identity",
     ]
 
 
@@ -1380,6 +1380,214 @@ def test_source_families_are_the_harness_families_and_databricks_without_cli_is_
                         source_family="databricks")
     assert by_id(report)["source_principal_read_only"]["status"] == "unverified"
     assert "source_principal_read_only=unverified" in report["blocking"] and report["ready"] is False
+
+
+# ------------------------------------------------------------------ dictionary_readable (WS3.1)
+
+sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness"))
+from recon.adapters import DICTIONARY_OBJECTS  # noqa: E402
+
+
+class FakeDictConn:
+    """A source seen through the doctor's dictionary probes. `fail_views` names catalog views
+    whose probe raises; `census` maps a table to (declared, listed) trigger answers. Records
+    every statement."""
+
+    def __init__(self, *, fail_views=(), census=None):
+        self.fail_views, self.census, self.statements = set(fail_views), census or {}, []
+
+    def cursor(self):
+        outer = self
+
+        class Cur:
+            def execute(self, sql, params=()):
+                outer.statements.append(sql)
+                sql_l = sql.lower()
+                for label in outer.fail_views:
+                    if label.lower() in sql_l:
+                        raise RuntimeError(f"permission denied for {label} secret=DSN://leak")
+                outer.result = [(1,)]
+                if "tablehasinserttrigger" in sql_l or "relhastriggers" in sql_l:
+                    outer.result = [(outer.census.get(params[0], (0, 0))[0],)]
+                elif "count(*)" in sql_l:
+                    outer.result = [(outer.census.get(params[0], (0, 0))[1],)]
+                return self
+
+            def fetchall(self):
+                return outer.result
+        return Cur()
+
+    def close(self):
+        pass
+
+
+def test_dictionary_readable_unverified_for_unprobed_families(monkeypatch):
+    for family in ("teradata", "databricks"):
+        c = doctor.check_dictionary_readable(TABLES, family, "LEGACY_ODBC")
+        assert c.status == "unverified" and "unsupported" in c.detail
+
+
+def test_dictionary_readable_fails_without_the_secret(monkeypatch):
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", None,
+                                         views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "fail" and "--source-secret" in c.detail
+    monkeypatch.delenv("LEGACY_ODBC", raising=False)
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC",
+                                         views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "fail" and "not set" in c.detail
+
+
+def test_dictionary_readable_fails_when_a_catalog_view_is_unreadable(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"sys.triggers"})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "fail" and "sys.triggers" in c.detail and "DSN" not in c.detail
+
+
+def test_dictionary_readable_fails_when_sqlserver_hides_triggers(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"raw.loans": (1, 0), "raw.payments": (0, 0)})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "fail" and "raw.loans" in c.detail and "filtered by permission" in c.detail
+    assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 0}
+
+
+def test_dictionary_readable_fails_when_a_constraint_view_is_unreadable(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"pg_index"})
+    c = doctor.check_dictionary_readable(TABLES, "postgres", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["postgres"])
+    assert c.status == "fail" and "pg_index" in c.detail and "DSN" not in c.detail
+
+
+def test_dictionary_readable_warns_on_a_postgres_census_lag(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"public.loans": (1, 0)})
+    c = doctor.check_dictionary_readable(["public.loans"], "postgres", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["postgres"])
+    assert c.status == "warn" and "relhastriggers" in c.detail
+
+
+def test_dictionary_readable_ok_with_data(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(census={"raw.loans": (1, 2), "raw.payments": (0, 0)})
+    c = doctor.check_dictionary_readable(TABLES, "sqlserver", "LEGACY_ODBC", connect=lambda dsn: conn,
+                                 views=DICTIONARY_OBJECTS["sqlserver"])
+    assert c.status == "ok"
+    assert "sys.triggers" in c.data["views"] and "sys.database_permissions" in c.data["views"]
+    assert c.data["trigger_census"]["raw.loans"] == {"declared": 1, "listed": 2}
+
+
+def test_dictionary_readable_probes_per_table_ddl_for_databricks(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "ok" and "trigger_census" not in {
+        k for k, v in c.data.items() if v}
+    assert any("SHOW CREATE TABLE `cat`.`s`.`loans`" in q for q in conn.statements)
+    assert any("`cat`.information_schema" in q for q in conn.statements)
+
+
+def test_dictionary_readable_probes_each_catalog_once_for_databricks(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["a.s.loans", "a.s.fees", "b.s.loans"],
+                                         "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "ok"
+    cat_scoped = [q for q in conn.statements if "information_schema" in q]
+    per_catalog = [q for q in cat_scoped if ".information_schema" in q]
+    assert per_catalog and all(q.startswith("SELECT 1") for q in per_catalog)
+    assert sum("`a`.information_schema" in q for q in per_catalog) == 7
+    assert sum("`b`.information_schema" in q for q in per_catalog) == 7
+    assert sum("SHOW CREATE TABLE" in q for q in conn.statements) == 3
+    assert "SHOW CREATE TABLE `a`.`s`.`loans`" in conn.statements
+
+
+def test_dictionary_readable_fails_on_a_two_part_databricks_table(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "s.loans" in c.detail and "catalog.schema.table" in c.detail
+
+
+def test_dictionary_readable_registers_a_databricks_connector():
+    assert "databricks" in doctor._READ_ONLY_CONNECT
+
+
+def test_dictionary_readable_databricks_without_the_connector_names_the_package(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "{}")
+    monkeypatch.setitem(sys.modules, "databricks", None)  # import fails
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "databricks-sql-connector" in c.detail
+    assert "{" not in c.detail  # never the secret
+
+
+def test_dictionary_readable_quotes_probe_identifiers(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["cat.`a;b`.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "ok"
+    assert conn.statements
+    for q in conn.statements:
+        assert "a;b" not in q or "`a;b`" in q  # the part only ever appears backtick-quoted
+    assert any("`a;b`" in q for q in conn.statements)
+
+
+def test_dictionary_readable_fails_on_an_empty_databricks_name_part(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn()
+    c = doctor.check_dictionary_readable(["a..t"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "a..t" in c.detail
+
+
+def test_dictionary_readable_fails_on_an_unreadable_databricks_table(monkeypatch):
+    monkeypatch.setenv("LEGACY_ODBC", "DSN=x")
+    conn = FakeDictConn(fail_views={"SHOW CREATE TABLE"})
+    c = doctor.check_dictionary_readable(["cat.s.loans"], "databricks", "LEGACY_ODBC",
+                                         connect=lambda dsn: conn,
+                                         views=DICTIONARY_OBJECTS["databricks"])
+    assert c.status == "fail" and "SHOW CREATE TABLE" in c.detail and "cat.s.loans" in c.detail
+
+
+def test_dictionary_readable_all_resolves_units_and_children(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    row = by_id(report)["dictionary_readable"]
+    assert row["status"] == "skipped"
+    _unit_mapping(ws, "loans")
+    seen = {}
+    monkeypatch.setattr(doctor, "check_dictionary_readable",
+                        lambda tables, family, secret, **kw: seen.update(tables=tables) or
+                        doctor.Check("dictionary_readable", "ok", "stub"))
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    assert by_id(report)["dictionary_readable"]["status"] == "ok" and seen["tables"]
+
+
+def test_dictionary_readable_fail_blocks_the_run(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans")
+    monkeypatch.setattr(doctor, "check_dictionary_readable",
+                        lambda *a, **k: doctor.Check("dictionary_readable", "fail", "stub"))
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="LEGACY_ODBC", source_family="sqlserver")
+    assert "dictionary_readable=fail" in report["blocking"] and report["ready"] is False
 
 
 # ------------------------------------------------------------------ databricks source principal + attested

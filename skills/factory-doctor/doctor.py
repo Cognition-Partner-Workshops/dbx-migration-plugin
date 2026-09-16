@@ -978,7 +978,21 @@ _PRIVILEGE_QUERIES = {
         "read_only": "SELECT current_setting('transaction_read_only')",
     },
 }
-_READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect}
+def _databricks_sql_connect(secret_value: str):
+    """Same secret contract the harness's Databricks adapter uses (JSON server_hostname /
+    http_path / access_token); the connector is an optional extra, so its absence is reported
+    as a package name, never the secret."""
+    try:
+        from databricks import sql  # optional extra (databricks-sql-connector)
+    except ImportError:
+        raise RuntimeError("databricks-sql-connector is not installed") from None
+    cfg = json.loads(secret_value)
+    return sql.connect(server_hostname=cfg["server_hostname"], http_path=cfg["http_path"],
+                       access_token=cfg["access_token"])
+
+
+_READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect,
+                      "databricks": _databricks_sql_connect}
 _ADVISORY = ("driver-level read-only (SQL Server readonly=True, Postgres default_transaction_read_only) is advisory, "
              "a hint the server may ignore; only the principal's grants stop writes")
 
@@ -1233,6 +1247,163 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
     if attested:
         return _attested(ws, attested, family, list(tables))
     return check_source_principal(list(tables), family, source_secret)
+
+
+# ------------------------------------------------------------------ catalog dictionary (structural parity)
+
+# The structural tier reads these catalog objects; a principal whose view of them is filtered by
+# permission passes the tier on an empty dictionary. `views` probes readability; `trigger_census`
+# cross-checks what the table declares against what the principal can list, per in-scope table.
+_TRIGGER_CENSUS = {
+    "sqlserver": (
+        "SELECT CASE WHEN OBJECTPROPERTY(OBJECT_ID(?), 'TableHasInsertTrigger') = 1 "
+        "OR OBJECTPROPERTY(OBJECT_ID(?), 'TableHasUpdateTrigger') = 1 "
+        "OR OBJECTPROPERTY(OBJECT_ID(?), 'TableHasDeleteTrigger') = 1 THEN 1 ELSE 0 END",
+        "SELECT COUNT(*) FROM sys.triggers WHERE parent_id = OBJECT_ID(?)"),
+    "postgres": (
+        "SELECT relhastriggers::int FROM pg_class WHERE oid = to_regclass(%s)",
+        "SELECT COUNT(*) FROM pg_trigger WHERE tgrelid = to_regclass(%s) AND NOT tgisinternal"),
+}
+
+
+def _quote_ident(part: str) -> str:
+    """One probe identifier, backtick-delimited with inner backticks doubled (same rule as
+    recon.adapters.quote_ident): a mapped table name can only ever name an object."""
+    if not part or "." in part or "\x00" in part:
+        raise ValueError(f"invalid identifier part {part!r}")
+    return "`" + part.replace("`", "``") + "`"
+
+
+def check_dictionary_readable(tables: list[str], family: str, source_secret: str | None,
+                              connect=None, views: list[tuple] | None = None) -> Check:
+    """SELECT on the data is not visibility of the catalog: sys.triggers/pg_trigger rows are
+    filtered by permission, so a principal that sees none grades the trigger comparison on an
+    empty view — the missing-trigger defect reported as clean. `views` is the harness's
+    DICTIONARY_OBJECTS table for the family (recon.adapters), so the probe list cannot drift
+    from the reader queries. Deliberately separate from source_principal_read_only; a failure
+    names the view, never the credential."""
+    cid = "dictionary_readable"
+    q = _TRIGGER_CENSUS.get(family)
+    if not views:
+        return Check(cid, "unverified", f"{family}: no dictionary probe for this family; structural "
+                     "parity will record its categories as unsupported",
+                     {"family": family, "tables": tables})
+    if not source_secret:
+        return Check(cid, "fail", f"{family} source with {len(tables)} in-scope table(s); pass "
+                     "--source-secret NAME so catalog visibility can be checked",
+                     {"family": family, "tables": tables})
+    if not os.environ.get(source_secret):
+        return Check(cid, "fail", f"source secret {source_secret} is not set in the environment")
+    data: dict = {"family": family, "tables": tables, "views": [], "trigger_census": {}}
+    try:
+        conn = (connect or _READ_ONLY_CONNECT[family])(os.environ[source_secret])
+        try:
+            cur = conn.cursor()
+            for label, sql in views:
+                probes = [(None, sql)]
+                if "{" in sql:
+                    parts = {}
+                    for t in tables:
+                        p_ = t.replace("`", "").split(".")
+                        if len(p_) != 3 or any(not x or "." in x or "\x00" in x for x in p_):
+                            return Check(cid, "fail", f"{t} is not catalog.schema.table; cannot "
+                                         "scope the dictionary probe", data)
+                        parts[t] = p_
+                    if "{schema}" in sql or "{table}" in sql:
+                        probes = [(t, sql.format(catalog=_quote_ident(p_[0]),
+                                               schema=_quote_ident(p_[1]),
+                                               table=_quote_ident(p_[2])))
+                                  for t, p_ in parts.items()]
+                    else:  # {catalog} only: information_schema is catalog-scoped, probe per catalog
+                        probes = [(None, sql.format(catalog=_quote_ident(c))) for c in
+                                  sorted({p_[0] for p_ in parts.values()})]
+                for table, probe in probes:
+                    try:
+                        cur.execute(probe).fetchall()
+                    except Exception as e:  # noqa: BLE001
+                        where = f" on {table}" if table else ""
+                        return Check(cid, "fail", f"cannot read {label}{where}: "
+                                     f"{_redact(str(e))}: the structural tier would grade on an "
+                                     "incomplete dictionary", data)
+                data["views"].append(label)
+            if q is None:
+                return Check(cid, "ok", f"{family}: catalog views readable on "
+                             f"{len(tables)} in-scope table(s)", data)
+            declared_sql, listed_sql = q
+            mismatched = []
+            for t in tables:
+                n = declared_sql.count("?") or declared_sql.count("%s")
+                declared = cur.execute(declared_sql, (t,) * n).fetchall()[0][0]
+                listed = cur.execute(listed_sql, (t,)).fetchall()[0][0]
+                data["trigger_census"][t] = {"declared": declared, "listed": listed}
+                if family == "sqlserver":
+                    if declared and not listed:
+                        mismatched.append(t)
+                elif bool(declared) != bool(listed):
+                    mismatched.append(t)
+            if mismatched and family == "sqlserver":
+                return Check(cid, "fail", f"{mismatched[0]} has triggers the principal cannot "
+                             "list: sys.triggers is filtered by permission, so the trigger tier "
+                             "would pass on an empty view", data)
+            if mismatched:
+                return Check(cid, "warn", f"declared vs listed trigger census differs on "
+                             f"{', '.join(mismatched[:3])}: relhastriggers can stay true after a "
+                             "drop until vacuum", data)
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - a driver failure is a finding, never a DSN traceback
+        return Check(cid, "fail", f"dictionary probe failed: {_redact(str(e))}", data)
+    return Check(cid, "ok", f"{family}: catalog views readable and the trigger census agrees on "
+                 f"{len(tables)} in-scope table(s)", data)
+
+
+def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mappings: list[Path],
+                                  source_secret: str | None, source_family: str | None,
+                                  plugin_root: Path, params: dict[str, str] | None = None) -> Check:
+    """Every source table the resolved mappings read (root and embedded child tables), against
+    --source-family, or the family the mappings' delete_evidence kind implies."""
+    cid = "dictionary_readable"
+    _, todo, problem = resolve_mappings(ws, role, units, mappings)
+    if problem:
+        return Check(cid, *problem)
+    if not todo:
+        return Check(cid, "skipped",
+                     f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}")
+    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
+    from recon.config import ConfigError, load_mapping_spec
+    tables: dict[str, None] = {}
+    kinds: set[str] = set()
+    for p in todo.values():
+        try:
+            spec = load_mapping_spec(p, params)
+        except (ConfigError, OSError, ValueError) as e:
+            return Check(cid, "fail", f"{p}: {_redact(str(e))}")
+        for o in spec.objects:
+            tables.update(dict.fromkeys([o.root_table, *(e.child_table for e in o.embeds)]))
+            if o.delete_evidence is not None:
+                kinds.add(o.delete_evidence.kind)
+    family = source_family or ("sqlserver" if kinds == {"sqlserver_cdc"} else None)
+    if not family:
+        return Check(cid, "unverified", "source family not declared: pass --source-family "
+                     f"{'|'.join(SOURCE_FAMILIES)} so catalog visibility can be checked",
+                     {"tables": list(tables)})
+    cmd = _harness_command(plugin_root)
+    if cmd is None:
+        return Check(cid, "fail", "cannot ask the harness which catalog objects to probe: "
+                     "dbx-recon not on PATH and the checkout has no harness")
+    argv, cwd, how = cmd
+    rc, out, err = _run(argv + ["dictionary-objects", "--family", family],
+                      **({"cwd": cwd} if cwd else {}))
+    try:
+        d = json.loads(out) if rc == 0 else {}
+        views = [tuple(x) for x in d["objects"]] if d.get("family_known") else None
+    except (ValueError, KeyError, TypeError):
+        return Check(cid, "fail", f"cannot ask the harness which catalog objects to probe "
+                     f"({how} dictionary-objects rc={rc}): {_redact(err or out)}",
+                     {"family": family, "tables": list(tables)})
+    c = check_dictionary_readable(list(tables), family, source_secret, views=views)
+    c.data["harness"] = how
+    return c
 
 
 # ------------------------------------------------------------------ databricks identity
@@ -1695,6 +1866,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
                                   params=params),
         check_source_principal_all(ws, role, units or [], mappings or [], source_secret, source_family,
                                    plugin_root, params=params, attested=source_attested),
+        check_dictionary_readable_all(ws, role, units or [], mappings or [], source_secret,
+                                      source_family, plugin_root, params=params),
     ]
     if no_databricks:
         checks.append(Check("databricks_identity", "skipped", "--no-databricks"))

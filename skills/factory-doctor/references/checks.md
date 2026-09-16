@@ -62,6 +62,10 @@ asked of the same harness `recon_harness` ran (`dbx-recon` on PATH, else the che
 `python -m recon.cli families`); a missing harness or unreadable output also fails.
 `skipped` when no family is declared. Kept apart from `source_principal_read_only` on purpose:
 attestation says the principal is read-only; this row says whether we can reconcile the family.
+### `dictionary_readable`
+
+The `--source-secret` principal can read the catalog views the recon structural tier queries. SQL Server and Postgres: every view probe the adapter's `schema_facts` issues must return a row, plus a trigger census per in-scope table — SQL Server `OBJECTPROPERTY(...,'TableHas*Trigger')` (declared) against `sys.triggers WHERE parent_id` (listed), Postgres `pg_class.relhastriggers` against `pg_trigger`. A failing view probe fails naming the view: the tier would grade on an incomplete dictionary. A sqlserver table with declared=1/listed=0 fails (sys.triggers is filtered by permission, so the trigger check would pass on an empty view); the same mismatch on Postgres warns (relhastriggers can stay true after a drop until vacuum). Families without a dictionary probe report `unverified` — structural parity will record their categories as unsupported. `skipped` only at setup; `fail` when the secret is absent like `source_principal_read_only`.
+
 ### `databricks_identity`
 ### `type_map_audit`
 
