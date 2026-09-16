@@ -28,7 +28,8 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
                other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
-               deploy_objects=None, max_minutes=None, batch_max_minutes=None):
+               deploy_objects=None, max_minutes=None, batch_max_minutes=None,
+               auto_merge=None, close_minutes=None, other_batch=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -74,6 +75,12 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
         manifest["max_minutes"] = max_minutes
     if batch_max_minutes is not None:
         manifest["batches"][0]["max_minutes"] = batch_max_minutes
+    if auto_merge is not None:
+        manifest["auto_merge"] = auto_merge
+    if close_minutes is not None:
+        manifest["close_minutes"] = close_minutes
+    if other_batch is not None:
+        manifest["batches"].append(other_batch)
     if namespace is not None:
         manifest["target_namespace"] = namespace
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"])
@@ -165,6 +172,8 @@ async def agent(prompt, **kwargs):
     reports = json.loads(REPORTS.read_text())
     report = reports.pop(0)
     REPORTS.write_text(json.dumps(reports))
+    if report.get("error"):
+        raise WorkflowAgentError(report["error"])
     return report
 def log(message):
     print(message)
@@ -181,7 +190,7 @@ def _pass_report(pr_url="", **extra):
     return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
             "pr_url": pr_url, "branch": "feature/x", "changed_paths": [],
             "gates": [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}],
-            "write_targets": ["mig.t"], "one_line_summary": "ok", **extra}
+            "write_targets": ["mig.t"], "review_clean": True, "one_line_summary": "ok", **extra}
 
 
 def _result(ws):
@@ -712,7 +721,7 @@ def _push_pr(ws, n=1):
 
 
 def _verify_report(**extra):
-    return {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS"}, "merged_prs": [],
+    return {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS"},
             "findings": [], "changed_paths": [], **extra}
 
 
@@ -948,3 +957,149 @@ def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tm
     assert proc.returncode != 0 and "doctor" in proc.stderr
     proc = run(tmp_path / "stopc", stop_c=False)
     assert proc.returncode != 0 and "gates_sha" in proc.stderr
+
+
+def _close_report(**extra):
+    return {"merged_prs": [], "unmerged": [], "changed_paths": [], **extra}
+
+
+def test_a_pass_needs_review_clean_or_a_review_waived_ledger_row(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False)])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "review_open"
+    assert "review_waived" in batch["one_line_summary"] and "review_waiver" not in batch
+
+    ws, cwd = _workspace(tmp_path / "missing")
+    pr = _push_pr(ws)
+    report = _pass_report(pr)
+    del report["review_clean"]
+    proc, _ = _run(cwd, tmp_path / "missing", [report])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["batches"][0]["failure_class"] == "review_open"
+
+
+def test_a_review_waived_ledger_row_carries_a_dirty_review(tmp_path):
+    ws, cwd = _workspace(tmp_path, decisions="| D-5 | user:U1 | review_waived for u, the finding is a false positive |\n")
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False,
+                                                   review_waiver={"decision_id": "D-5"}), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "PASS" and batch["review_waiver"] == {"decision_id": "D-5"}
+    verify_prompt = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+    assert "review_waiver" in verify_prompt
+
+
+def test_a_merge_override_row_does_not_waive_the_review(tmp_path):
+    ws, cwd = _workspace(tmp_path, decisions="| D-5 | user:U1 | merge_override for u |\n")
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, review_clean=False, review_waiver={"decision_id": "D-5"})])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["batches"][0]["failure_class"] == "review_open"
+
+
+def test_the_wave_close_step_merges_the_verifier_pass_prs(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(),
+                                     _close_report(merged_prs=[pr])])
+    assert proc.returncode == 0, proc.stderr
+    register = [c for c in calls if c["kind"] == "register"][0]
+    close_phase = [p for p in register["meta"]["phases"] if p["title"] == "close"][0]
+    assert close_phase["soft_time_limit_minutes"] == 10
+    verify_prompt = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+    assert "Merge every PR" not in verify_prompt and "wave-close" in verify_prompt
+    close = [c for c in calls if c.get("label") == "close-wave-0"]
+    assert close and close[0]["kwargs"]["soft_time_limit_minutes"] == 10 and pr in close[0]["prompt"]
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["close_minutes"] == 10
+    assert result["closed"] is True
+
+
+def test_close_minutes_from_the_manifest_propagates_and_a_bad_one_halts(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True, close_minutes=20)
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _close_report(merged_prs=[pr])])
+    assert proc.returncode == 0, proc.stderr
+    close = [c for c in calls if c.get("label") == "close-wave-0"][0]
+    assert close["kwargs"]["soft_time_limit_minutes"] == 20 and "20 minutes" in close["prompt"]
+    assert _result(ws)["close_minutes"] == 20
+    for i, bad in enumerate((0, "10", True, 61)):
+        ws, cwd = _workspace(tmp_path / f"bad{i}", auto_merge=True, close_minutes=bad)
+        proc, calls = _run(cwd, tmp_path / f"bad{i}", [_pass_report()])
+        assert proc.returncode != 0 and "close_minutes" in proc.stderr
+        assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_hard_mode_runs_no_close_step_and_the_brief_lists_the_prs(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert not [c for c in calls if c.get("label") == "close-wave-0"]
+    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert f"Awaiting manual merge: {pr}" in brief
+    assert _result(ws)["close"] is None
+
+
+def test_a_failed_sibling_does_not_hold_back_a_verified_pr_merge(tmp_path):
+    """The verifier sees only PASS children; a wave FAIL on one still leaves the other's PR to merge."""
+    ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
+                         other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
+                                      "brief": "b", "gates": [GATE]})
+    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
+    pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
+                                                             "evidence": ".migration/recon/v/result.json"}])
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), pass2,
+                                       {"wave_verdict": "FAIL", "unit_verdicts": {"b-1": "PASS", "b-2": "FAIL"},
+                                        "findings": [], "changed_paths": []},
+                                       _close_report(merged_prs=[pr])])
+    assert proc.returncode == 0, proc.stderr
+    close = [c for c in calls if c.get("label") == "close-wave-0"]
+    assert close and pr in close[0]["prompt"] and "b-2" not in close[0]["prompt"] and pr2 not in close[0]["prompt"]
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is False
+
+
+def test_wave_close_output_is_validated(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(),
+                                     _close_report(merged_prs=[pr, "https://github.com/acme/target/pull/9"],
+                                                   changed_paths=["x.sql"])])
+    result = _result(ws)
+    assert result["closed"] is False
+    findings = " ".join(result["verify"]["findings"])
+    assert "wave close invalid" in findings and "outside the wave" in findings and "x.sql" in findings
+
+
+def test_a_verified_pr_the_close_step_dropped_is_a_finding(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _close_report()])
+    result = _result(ws)
+    assert result["closed"] is False
+    assert any("wave close invalid" in f and pr in f for f in result["verify"]["findings"])
+
+
+def test_an_unmerged_verified_pr_keeps_the_wave_open_and_lands_in_the_brief(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(),
+                                     _close_report(unmerged=[{"pr_url": pr, "reason": "head moved"}])])
+    result = _result(ws)
+    assert result["closed"] is False
+    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert f"Not merged: {pr}" in brief and f"Awaiting manual merge: {pr}" in brief
+
+
+def test_a_dead_close_session_leaves_every_verified_pr_unmerged(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), {"error": "boom"}])
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [] and result["close"]["unmerged"][0]["pr_url"] == pr
+    assert result["closed"] is False

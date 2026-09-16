@@ -420,6 +420,9 @@ def validate_manifest(m, doctor=None):
     if "max_minutes" in m and (isinstance(m["max_minutes"], bool) or not isinstance(m["max_minutes"], int)
                               or not 0 < m["max_minutes"] <= 60):
         raise SystemExit("manifest key 'max_minutes' must be a positive integer of at most 60 minutes")
+    if "close_minutes" in m and (isinstance(m["close_minutes"], bool) or not isinstance(m["close_minutes"], int)
+                               or not 0 < m["close_minutes"] <= 60):
+        raise SystemExit("manifest key 'close_minutes' must be a positive integer of at most 60 minutes")
     if "secrets" in m and (not isinstance(m["secrets"], list)
                            or not all(isinstance(s, str) for s in m["secrets"])):
         raise SystemExit("wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
@@ -1416,7 +1419,7 @@ def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
             if p.startswith(".migration/") and not p.startswith(allowed)]
 
 
-def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> list[str]:
+def validate_verify(verify, passed, wave=None, observed=None) -> list[str]:
     """Return verifier-output problems without reading files or mutating input. `observed` is what git
     says the verifier itself changed on recon/wave-N (None: it could not be fetched or diffed)."""
     problems = []
@@ -1447,18 +1450,6 @@ def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> lis
             problems.append(f"verifier output invalid: wave PASS contradicts {batch}={verdict}")
     if wave_verdict == "FAIL" and expected and all(verdicts.get(b) == "PASS" for b in expected):
         problems.append("verifier output invalid: wave FAIL contradicts all unit verdicts PASS")
-    merged = verify.get("merged_prs")
-    if merged is not None and not isinstance(merged, list):
-        problems.append("verifier output invalid: merged_prs must be a list")
-        merged = []
-    if auto_merge:
-        if merged is None:
-            problems.append("verifier output invalid: merged_prs must be a list when auto_merge is on")
-            merged = []
-        for batch in passed:
-            url = batch.get("pr_url")
-            if url and url not in merged:
-                problems.append(f"verifier output invalid: merged_prs is missing {url} for {batch['batch']}")
     if not isinstance(verify.get("findings"), list):
         problems.append("verifier output invalid: findings must be a list")
     changed = verify.get("changed_paths")
@@ -1472,6 +1463,40 @@ def validate_verify(verify, passed, auto_merge, wave=None, observed=None) -> lis
                  for p in ledger_violations(sorted({*changed, *(observed or [])}), [], wave)]
     return problems
 
+
+def validate_close(close, to_merge) -> list[str]:
+    """Wave-close output problems without reading anything: every verified PR is in exactly one of
+    merged_prs/unmerged, nothing outside the wave is merged, and the step changed nothing (it writes
+    no files)."""
+    problems = []
+    if not isinstance(close, dict):
+        return ["expected an object"]
+    merged = close.get("merged_prs")
+    if not isinstance(merged, list) or not all(isinstance(u, str) for u in merged):
+        problems.append("merged_prs must be a list of PR urls")
+        merged = []
+    unmerged = close.get("unmerged")
+    if not isinstance(unmerged, list) or not all(
+            isinstance(u, dict) and isinstance(u.get("pr_url"), str) and isinstance(u.get("reason"), str)
+            for u in unmerged):
+        problems.append("unmerged must be a list of {pr_url, reason} rows")
+        unmerged = []
+    want = {p.get("pr_url") for p in to_merge}
+    for url in merged:
+        if url not in want:
+            problems.append(f"merged a PR outside the wave ({url})")
+    listed = Counter([*merged, *(u["pr_url"] for u in unmerged)])
+    for url in sorted(want):
+        if listed.get(url, 0) != 1:
+            problems.append(f"{url} is in {listed.get(url, 0)} of merged_prs/unmerged, expected exactly one")
+    changed = close.get("changed_paths")
+    if not isinstance(changed, list) or not all(isinstance(p, str) for p in changed):
+        problems.append("changed_paths must be a list of paths (git diff --name-only)")
+        changed = []
+    for p in changed:
+        problems.append(f"wave-close step changed {p}; it writes nothing")
+    return problems
+
 WAVE = MANIFEST["wave"]
 REPO = MANIFEST["repo"]
 BATCHES = sorted(MANIFEST["batches"], key=lambda b: b["id"])
@@ -1479,6 +1504,7 @@ WIDTH = int(MANIFEST.get("width", 20))
 BREAKER = int(MANIFEST.get("breaker_threshold", 3))
 AUTO_MERGE = bool(MANIFEST.get("auto_merge", False))
 MAX_MINUTES = int(MANIFEST.get("max_minutes", 45))
+CLOSE_MINUTES = int(MANIFEST.get("close_minutes", 10))
 VERIFY_DEPTH = MANIFEST.get("verify_depth", "sampled")
 
 
@@ -1496,8 +1522,10 @@ META = {
         {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
          "labels": [b["id"] for b in BATCHES],
          "soft_time_limit_minutes": max(batch_max_minutes(b) for b in BATCHES)},
-        {"title": "verify", "detail": "independent recon over the wave, merge green PRs",
+        {"title": "verify", "detail": "independent recon over the wave",
          "count": 1, "soft_time_limit_minutes": 60},
+        {"title": "close", "detail": "merge verifier-PASS PRs within the deadline",
+         "count": 1, "soft_time_limit_minutes": CLOSE_MINUTES},
     ],
 }
 
@@ -1516,6 +1544,13 @@ CHILD_SCHEMA = {
                            "decision_id": {"type": "string"}},
             "description": "human_override with the D-<n> row of .migration/06_decisions.md that says merge_override "
                            "for your units; the workflow verifies the row. harness otherwise."},
+        "review_clean": {"type": "boolean",
+                         "description": "Devin Review on your PR has zero open actionable findings at pr_head"},
+        "review_waiver": {
+            "type": "object",
+            "properties": {"decision_id": {"type": "string"}},
+            "description": "the D-<n> row of .migration/06_decisions.md that says review_waived for your units "
+                           "when a finding is wrong; the workflow verifies the row"},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
         "changed_paths": {"type": "array", "items": {"type": "string"},
@@ -1534,7 +1569,7 @@ CHILD_SCHEMA = {
         "one_line_summary": {"type": "string"},
     },
     "required": ["status", "recon_verdict", "recon_mode", "merge_eligible", "write_targets", "changed_paths",
-                 "one_line_summary"],
+                 "review_clean", "one_line_summary"],
 }
 
 VERIFY_SCHEMA = {
@@ -1542,7 +1577,6 @@ VERIFY_SCHEMA = {
     "properties": {
         "wave_verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
         "unit_verdicts": {"type": "object"},
-        "merged_prs": {"type": "array", "items": {"type": "string"}},
         "findings": {"type": "array", "items": {"type": "string"}},
         "report_path": {"type": "string"},
         "changed_paths": {"type": "array", "items": {"type": "string"},
@@ -1551,6 +1585,19 @@ VERIFY_SCHEMA = {
                        "description": "summed result.json['cost'] over the verifier's re-runs"},
     },
     "required": ["wave_verdict", "unit_verdicts", "findings", "changed_paths"],
+}
+
+CLOSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "merged_prs": {"type": "array", "items": {"type": "string"}},
+        "unmerged": {"type": "array",
+                     "items": {"type": "object",
+                               "properties": {"pr_url": {"type": "string"}, "reason": {"type": "string"}},
+                               "required": ["pr_url", "reason"]}},
+        "changed_paths": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["merged_prs", "unmerged", "changed_paths"],
 }
 
 
@@ -1578,6 +1625,9 @@ def child_prompt(batch):
         "- Report every path your PR changes in changed_paths (`git diff --name-only <base>...<head>`); "
         "any other .migration/ path in it turns your PASS into FAIL ledger_tampered.\n"
         "- Do not merge your own PR.\n"
+        "- status=PASS also requires review_clean=true: finish the Devin Review round on your PR and fix "
+        "every actionable finding before reporting done; a wrong finding is waived only by a human's "
+        "review_waived row in .migration/06_decisions.md naming your units, reported as review_waiver.\n"
         f"- status=PASS requires a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} (result.json "
         "merge_eligible=true; transactional is the mode for Lakebase/operational units). Fixture "
         "evidence is never PASS. Report merge_eligible=true only when every unit's "
@@ -1619,17 +1669,11 @@ def capability_block(units):
     )
 
 
-def verify_prompt(passed, auto_merge):
+def verify_prompt(passed):
     by_id = {b["id"]: b for b in BATCHES}
     depths = {p["batch"]: batch_verify_depth(by_id[p["batch"]]) for p in passed}
-    merge_line = (
-        "Merge every PR you mark PASS and list it in merged_prs, even if another unit in the wave failed; "
-        "failed units are reopened next launch."
-        if auto_merge else
-        "Do not merge anything; return per-unit verdicts. The orchestrator surfaces the PASS PRs in the "
-        "wave brief, merges them at wave close (or records the human's decision in the kit's decision log "
-        "under .migration/), "
-        "and the next wave does not launch until that is done.")
+    merge_line = ("Do not merge anything; return per-unit verdicts. The workflow's wave-close step merges "
+                  "the PRs you mark PASS (or the brief lists them for the merge owner in hard mode).")
     return (
         f"You are the independent verifier for wave {WAVE}. Repo: {REPO}. You did not write "
         f"any of this code.\nRun the playbook {MANIFEST['verify_macro']} exactly as written over "
@@ -1652,9 +1696,23 @@ def verify_prompt(passed, auto_merge):
         "Sum result.json['cost'] over your runs into recon_cost.\n"
         f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{WAVE}/report.md, "
         f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
+        f"commit it on branch recon/wave-{WAVE}, push, and give '<branch>:<path>' in "
         "report_path. Do not edit any other file under .migration/; report your branch's "
         "`git diff --name-only <base>...<head>` in changed_paths. Each finding is one plain "
         "sentence a lead can read without opening anything."
+    )
+
+
+def close_prompt(to_merge, deadline_minutes):
+    return (
+        f"You are the wave-close step for wave {WAVE}. Repo: {REPO}. Merge exactly these PRs, nothing else: "
+        f"{json.dumps(to_merge, sort_keys=True)}. Each was verified PASS by the independent verifier at "
+        "pr_head; before merging, check the PR head still equals it and the PR is open and mergeable, "
+        "otherwise leave it and list it in unmerged with a one-sentence reason. Do it within "
+        f"{deadline_minutes} minutes; when time is up, stop and list the rest as unmerged. Write nothing: "
+        "no commits, no files, no other PR; report `git diff --name-only` of anything you changed in "
+        "changed_paths (it must be empty). The orchestrator commits the wave's ledger artifacts in one "
+        "wave-close PR afterwards."
     )
 
 
@@ -1752,6 +1810,19 @@ async def run_batch(batch, sem, breaker):
                     f"PASS downgraded: recon evidence is not merge_eligible=true for every unit ({why}) "
                     f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
                     ".migration/06_decisions.md; " + out["one_line_summary"])
+        if out["status"] == "PASS" and out.get("review_clean") is not True:
+            waiver = out.get("review_waiver")
+            decision = waiver.get("decision_id") if isinstance(waiver, dict) else None
+            if override_decision(decision, batch["units"], decision_ledger(), word="review_waived"):
+                out["review_waiver"] = {"decision_id": decision}
+            else:
+                out["status"] = "FAIL"
+                out["failure_class"] = "review_open"
+                out.pop("review_waiver", None)
+                out["one_line_summary"] = (
+                    "PASS downgraded: Devin Review is not clean at the PR head and no review_waived row "
+                    f"{decision or 'D-<n>'} naming {', '.join(batch['units'])} is in .migration/06_decisions.md; "
+                    + out["one_line_summary"])
         if out["status"] == "PASS":
             out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger(), out["pr_head"])
             if unmet:
@@ -1820,7 +1891,7 @@ def merge_overrides(results):
             if r["status"] == "PASS" and (r.get("merge_authority") or {}).get("kind") == "human_override"]
 
 
-def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
+def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close=None, to_merge=None):
     """Ten lines a lead reads in one minute. The orchestrator posts this at wave close."""
     n = len(BATCHES)
     passed = sum(1 for r in results if r["status"] == "PASS")
@@ -1832,8 +1903,7 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
         f"# Wave {WAVE} close",
         "",
         f"Landed: {passed} of {n} batches passed their own recon.",
-        f"Independent verify: {verify['wave_verdict'] if verify else 'NOT RUN'}"
-        + (f", {len(verify.get('merged_prs', []))} PRs merged." if verify else "."),
+        f"Independent verify: {verify['wave_verdict'] if verify else 'NOT RUN'}.",
         f"Failed: {', '.join(failed) or 'none'}.",
         f"Blocked on missing inputs: {', '.join(blocked) or 'none'}.",
         f"Held back by circuit breaker: {', '.join(held) or 'none'}.",
@@ -1856,10 +1926,19 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge):
     if overrides:
         lines.append("Human override authority (merge_eligible=false; merged only if listed above): "
                      + "; ".join(f"{o['batch']} ({', '.join(o['units'])}) by {o['decision_id']}" for o in overrides) + ".")
+    if close is not None:
+        merged_n = len(close.get("merged_prs", [])) if isinstance(close, dict) else 0
+        lines.append(f"Wave close: {merged_n} of {len(to_merge or [])} verified PRs merged within "
+                     f"{CLOSE_MINUTES} min.")
+        unmerged = close.get("unmerged", []) if isinstance(close, dict) else []
+        if unmerged:
+            lines.append("Not merged: " + "; ".join(f"{u['pr_url']} ({u['reason']})" for u in unmerged) + ".")
     if not auto_merge:
         urls = [r["pr_url"] for r in results
                 if r["status"] == "PASS" and r.get("pr_url")]
         lines.append("Awaiting manual merge: " + (", ".join(urls) or "none reported"))
+    elif isinstance(close, dict) and close.get("unmerged"):
+        lines.append("Awaiting manual merge: " + ", ".join(u["pr_url"] for u in close["unmerged"]))
     lines.append(cost_line(results, verify))
     lines += [
         "",
@@ -1918,13 +1997,14 @@ async def main():
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
+               "review_clean": r.get("review_clean"), "review_waiver": r.get("review_waiver"),
                "gates": r.get("gates", [])}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
     verify = None
     if passed:
         log(f"verify: {len(passed)} batches to an independent session")
         try:
-            verify = await agent(verify_prompt(passed, auto_merge), phase="verify", schema=VERIFY_SCHEMA,
+            verify = await agent(verify_prompt(passed), phase="verify", schema=VERIFY_SCHEMA,
                                  label=f"verify-wave-{WAVE}", repos=[REPO])
         except WorkflowAgentError as e:
             verify = {"wave_verdict": "FAIL", "unit_verdicts": {},
@@ -1932,7 +2012,7 @@ async def main():
     else:
         log("verify: skipped, no batch passed")
 
-    verify_problems = (validate_verify(verify, passed, auto_merge, WAVE, verifier_changed_paths(WAVE, passed))
+    verify_problems = (validate_verify(verify, passed, WAVE, verifier_changed_paths(WAVE, passed))
                        if verify is not None else [])
     if verify_problems:
         if not isinstance(verify, dict):
@@ -1941,8 +2021,33 @@ async def main():
         if not isinstance(verify.get("findings"), list):
             verify["findings"] = []
         verify["findings"].extend(verify_problems)
+    to_merge = []
+    if not verify_problems and isinstance(verify, dict) and isinstance(verify.get("unit_verdicts"), dict):
+        to_merge = [{"batch": p["batch"], "units": p["units"], "pr_url": p["pr_url"], "pr_head": p.get("pr_head")}
+                    for p in passed if verify["unit_verdicts"].get(p["batch"]) == "PASS" and p.get("pr_url")]
+    close = None
+    if auto_merge and to_merge:
+        try:
+            close = await asyncio.wait_for(
+                agent(close_prompt(to_merge, CLOSE_MINUTES), phase="close", schema=CLOSE_SCHEMA,
+                      label=f"close-wave-{WAVE}", repos=[REPO], soft_time_limit_minutes=CLOSE_MINUTES),
+                timeout=(CLOSE_MINUTES + 5) * 60)
+        except (asyncio.TimeoutError, WorkflowAgentError) as e:
+            close = {"merged_prs": [],
+                     "unmerged": [{"pr_url": p["pr_url"],
+                                   "reason": f"wave-close step did not finish within {CLOSE_MINUTES} minutes: {e}"}
+                                  for p in to_merge],
+                     "changed_paths": []}
+    close_problems = validate_close(close, to_merge) if close is not None else []
+    if close_problems:
+        if not isinstance(verify, dict):
+            verify = {"wave_verdict": "FAIL", "unit_verdicts": {}, "findings": []}
+        if not isinstance(verify.get("findings"), list):
+            verify["findings"] = []
+        verify["findings"].extend(f"wave close invalid: {p}" for p in close_problems)
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported
-              and not verify_problems and verify is not None and verify["wave_verdict"] == "PASS"
+              and not verify_problems and not close_problems and (close is None or not close["unmerged"])
+              and verify is not None and verify["wave_verdict"] == "PASS"
               and all(r["status"] == "PASS" for r in results))
     result_tmp = RESULT_PATH.with_suffix(".result.json.tmp")
     result_tmp.write_text(json.dumps({
@@ -1957,10 +2062,10 @@ async def main():
         "merge_overrides": merge_overrides(results),
         "waived_gates": waived_gates(results),
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
-        "verify": verify,
+        "verify": verify, "close": close, "close_minutes": CLOSE_MINUTES,
     }, indent=2, sort_keys=True) + "\n")
     result_tmp.replace(RESULT_PATH)
-    write_brief(results, verify, surprises, undeclared, unreported, auto_merge)
+    write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close, to_merge)
     log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 
