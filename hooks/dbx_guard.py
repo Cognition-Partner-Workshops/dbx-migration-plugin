@@ -1073,6 +1073,11 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     known = set(cfg.target_hosts) | set(cfg.legacy_sources)
     unresolved = any(n not in known for n in env_names) or any(
         m.group(1).lower() in ("connect", "create_engine") and not re.search(r"""['"]""", m.group(2)) and not _PY_ENV.search(m.group(2)) for m in calls)
+    hosts = [h.lower() for h in re.findall(r"(?i)(?:host|server|data source)\s*=\s*['\"]?([^'\";,\s)]+)|://(?:[^@/\s]*@)?([^:/?\s;'\"]+)", conn) for h in h if h]
+    foreign = [h for h in hosts if h not in {t.lower() for t in cfg.target_hosts}]
+    resolved_target = (hosts and not foreign) or any(n in cfg.target_hosts for n in env_names)
+    dbs = {_norm(d) for d in re.findall(r"(?i)(?:dbname|database|initial catalog)\s*=\s*['\"]?([^'\";,\s)]+)|://[^/\s'\"]+/([^?\s'\";]+)", conn) for d in d if d}
+    default = next(iter(dbs)) if len(dbs) == 1 else None
     databricks = bool(re.search(r"\b(?:databricks|spark)\b", text + " " + " ".join(seg.argv), re.IGNORECASE))
     literals = list(_PY_LITERAL.finditer(text))
     if not (calls or env_names or _PY_DSN.search(text)):
@@ -1085,17 +1090,18 @@ def _check_python(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
             elif unresolved:
                 violations.append(f"non-read statement in a program on a connection built at run time: `{bad[0][:80]}`; spell the connection "
                                   "out (a literal host or a secret name in target_hosts) so the guard can resolve it")
-            elif databricks:
+            elif foreign or not (databricks or resolved_target):
+                violations.append(f"non-read statement in a program to host(s) {sorted(set(hosts))} not in target_hosts {cfg.target_hosts}: "
+                                  f"`{bad[0][:80]}`")
+            elif databricks and not resolved_target:
                 violations += _catalog_violations(m.group(2), cfg, None, "Databricks client")
             else:
-                hosts = [h.lower() for h in re.findall(r"(?i)(?:host|server|data source)\s*=\s*['\"]?([^'\";,\s)]+)|://(?:[^@/\s]*@)?([^:/?\s;'\"]+)", conn) for h in h if h]
-                if not hosts or any(h not in {t.lower() for t in cfg.target_hosts} for h in hosts):
-                    violations.append(f"non-read statement in a program to host(s) {sorted(set(hosts))} not in target_hosts {cfg.target_hosts}: "
-                                      f"`{bad[0][:80]}`")
-                else:
-                    violations += _catalog_violations(m.group(2), cfg, None, "program")
-    if not literals and unresolved and _non_reads(text):
-        violations.append("Python connection is built at run time; the guard cannot resolve a non-read statement")
+                violations += _catalog_violations(m.group(2), cfg, default, "program")
+    opaque = len(re.findall(_DYNAMIC_SQL_EXECUTOR, text, re.IGNORECASE)) > len(literals)
+    if opaque and hits:
+        violations.append(_Legacy(f"statement built at run time against legacy source {hits} in a program" + _LEGACY_TAIL))
+    elif opaque and (foreign or (unresolved and (not literals or _non_reads(text)))):
+        violations.append("Python statement or connection is built at run time; the guard cannot resolve a non-read statement")
     return violations
 
 def _check_fixture(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
@@ -1368,7 +1374,7 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
         elif base in ("spark-sql", "dbsqlcli"):
             sql, unreadable = _sql_text(seg, root)
             violations += ([_UNREADABLE.format(who="Databricks client", files=unreadable)] if unreadable else []) + _catalog_violations(
-                sql, cfg, None, f"`{base}` client")
+                sql, cfg, None, "Databricks SQL client")
         elif base == "dbx-recon":
             violations += [f"--target-catalog {_norm(c)!r} outside allowlist {sorted(cfg.catalogs)}"
                            for c in _flag_values(seg.argv, ("--target-catalog",)) if _norm(c) not in cfg.catalogs]

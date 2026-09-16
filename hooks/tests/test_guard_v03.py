@@ -169,6 +169,36 @@ def test_python_runtime_connection_only_blocks_writes(command, expected):
     assert g.evaluate(command, CFG).decision == expected
 
 
+def test_python_variable_sql_on_a_legacy_connection_fails_closed():
+    verdict = block('python3 -c "c = psycopg2.connect(host=\'tdprod.corp\'); q = \'DROP TABLE t\'; c.cursor().execute(q)"')
+    assert "legacy source" in verdict.reason
+    approve('python3 -c "c = psycopg2.connect(host=\'lakebase-host\', dbname=\'mig_cat\'); c.cursor().execute(q)"')
+
+
+def test_python_foreign_host_is_checked_even_when_databricks_is_imported():
+    verdict = block(
+        'python3 -c "import databricks; c = psycopg2.connect(host=\'evil.corp\'); '
+        "c.cursor().execute('DROP TABLE mig_cat.s.t')\""
+    )
+    assert "evil.corp" in verdict.reason
+
+
+def test_python_connection_database_is_the_default_catalog():
+    approve('python3 -c "c = psycopg2.connect(host=\'lakebase-host\', dbname=\'mig_cat\'); c.cursor().execute(\'DROP TABLE staging\')"')
+    approve('python3 -c "c = psycopg2.connect(\'postgresql://u@lakebase-host:5432/mig_cat\'); c.cursor().execute(\'DROP TABLE staging\')"')
+    block('python3 -c "c = psycopg2.connect(host=\'lakebase-host\', dbname=\'other\'); c.cursor().execute(\'DROP TABLE staging\')"')
+
+
+def test_python_allowlisted_secret_is_a_resolved_target():
+    approve('python3 -c "c = psycopg2.connect(os.environ[\'LAKEBASE_DSN\']); c.cursor().execute(\'DROP TABLE mig_cat.s.t\')"')
+    block('python3 -c "c = psycopg2.connect(os.environ[\'LAKEBASE_DSN\']); c.cursor().execute(\'DROP TABLE prod.s.t\')"')
+
+
+def test_spark_sql_dynamic_statement_fails_closed():
+    block("spark-sql -e 'EXECUTE IMMEDIATE stmt'")
+    block("dbsqlcli -e 'EXECUTE IMMEDIATE stmt'")
+
+
 def test_python_databricks_destination_still_checks_catalog():
     verdict = block(
         "python3 -c \"from databricks.sdk import WorkspaceClient; "
