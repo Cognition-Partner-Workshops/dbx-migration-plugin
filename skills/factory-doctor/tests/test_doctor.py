@@ -2214,12 +2214,13 @@ def test_type_map_audit_asks_the_installed_harness_first(tmp_path, monkeypatch):
 def test_allowlist_committed_is_ok_only_when_both_contract_files_equal_head(tmp_path):
     ws = make_workspace(tmp_path)
     c = doctor.check_allowlist_committed(ws)
-    assert c.status == "ok" and c.data == {".migration/allowed_targets.json": "clean",
-                                           ".migration/03_recon_tolerances.json": "clean"}
+    assert c.status == "ok" and "byte-equal to HEAD" in c.detail
+    assert c.data == {".migration/allowed_targets.json": "clean",
+                      ".migration/03_recon_tolerances.json": "clean"}
     (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat", "prod"]}))
     c = doctor.check_allowlist_committed(ws)
-    assert c.status == "fail" and c.data[".migration/allowed_targets.json"] == "modified since HEAD"
-    assert "allowed_targets.json modified since HEAD" in c.detail and "03_recon_tolerances" not in c.detail
+    assert c.status == "fail" and c.data[".migration/allowed_targets.json"] == "modified"
+    assert "allowed_targets.json modified" in c.detail and "03_recon_tolerances" not in c.detail
     _git(ws, "add", "-A")  # staging is not committing
     assert doctor.check_allowlist_committed(ws).status == "fail"
     _git(ws, "commit", "-qm", "decision")
@@ -2238,7 +2239,24 @@ def test_allowlist_committed_compares_bytes_not_git_status(tmp_path):
     (ws / ".migration" / "03_recon_tolerances.json").write_text("{}")
     assert _git(ws, "status", "--porcelain").strip() == ""
     c = doctor.check_allowlist_committed(ws)
-    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "modified since HEAD"
+    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "modified"
+
+
+def test_allowlist_committed_compares_to_origin_main_not_a_feature_head(tmp_path):
+    ws = make_workspace(tmp_path)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    _git(ws, "remote", "add", "origin", str(origin))
+    _git(ws, "push", "-q", "-u", "origin", "HEAD:main")
+    _git(ws, "fetch", "-q", "origin")
+    _git(ws, "remote", "set-head", "origin", "main")
+    # a feature branch may commit whatever it likes: the contract is origin's copy
+    _git(ws, "checkout", "-qb", "feature")
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat", "prod"]}))
+    _git(ws, "commit", "-qam", "widened on a branch")
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "fail" and c.data[".migration/allowed_targets.json"] == "modified"
+    assert "modified" in c.detail
 
 
 def test_allowlist_committed_fails_outside_a_repository(tmp_path):
@@ -3191,3 +3209,20 @@ def test_reuse_record_accepts_the_manifests_own_source_flags(tmp_path):
     for extra in (["--source-family", "sqlserver"], ["--source-secret", "OTHER"], ["--param", "db=cards"]):
         r = subprocess.run(base + extra, capture_output=True, text=True, check=False)
         assert r.returncode == 2 and "manifest" in r.stderr, (extra, r.stderr)
+
+
+def test_allowlist_committed_other_contract_files_resolve_the_same_ref(tmp_path):
+    ws = make_workspace(tmp_path)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    _git(ws, "rm", "-q", "--cached", ".migration/03_recon_tolerances.json")
+    _git(ws, "commit", "-qm", "contract is the allowlist only")
+    _git(ws, "remote", "add", "origin", str(origin))
+    _git(ws, "push", "-q", "-u", "origin", "HEAD:main")
+    _git(ws, "fetch", "-q", "origin")
+    _git(ws, "remote", "set-head", "origin", "main")
+    _git(ws, "checkout", "-qb", "feature")
+    _git(ws, "add", ".migration/03_recon_tolerances.json")
+    _git(ws, "commit", "-qm", "tolerances committed on a branch")
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "untracked"

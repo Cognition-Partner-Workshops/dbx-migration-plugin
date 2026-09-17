@@ -375,33 +375,49 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
     return out
 
 
+_POLICY_REFS = ("refs/remotes/origin/HEAD", "origin/main", "origin/master", "HEAD")
+
+
+def _committed(ws: Path, rel: str, refs: tuple[str, ...] = _POLICY_REFS) -> tuple[bytes | None, str | None]:
+    """(bytes, ref) of `rel` from the first ref that has it (dbx_guard._committed, byte-precise)."""
+    for ref in refs:
+        try:
+            r = subprocess.run(["git", "-C", str(ws), "show", f"{ref}:{rel}"], capture_output=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None, None
+        if r.returncode == 0:
+            return r.stdout, ref
+    return None, None
+
+
 def check_allowlist_committed(ws: Path) -> Check:
-    """The working copy of each contract file must be byte-equal to `git show HEAD:<path>`."""
+    """The working copy of each contract file must be byte-equal to the copy on the protected
+    branch (origin/HEAD, else origin/main|master, else HEAD)."""
+    try:
+        r = subprocess.run(["git", "-C", str(ws), "rev-parse", "--git-dir"], capture_output=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return Check("allowlist_committed", "fail", f"git rev-parse failed under {ws}: {_redact(str(e))}")
+    if r.returncode != 0:
+        return Check("allowlist_committed", "fail",
+            f"git cannot read the repository under {ws}: {_redact(r.stderr.decode(errors='replace').strip())}; "
+            "the workspace must be the committed repository the wave is planned from")
+    _, ref = _committed(ws, LEDGER_CONTRACT_FILES[0])   # the whole contract is pinned to the one ref the allowlist is on
     states: dict[str, str] = {}
     for rel in LEDGER_CONTRACT_FILES:
-        try:
-            r = subprocess.run(["git", "-C", str(ws), "show", f"HEAD:{rel}"], capture_output=True, timeout=60,
-                check=False)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            return Check("allowlist_committed", "fail", f"git show HEAD:{rel} failed under {ws}: {_redact(str(e))}")
-        err = r.stderr.decode(errors="replace").strip()
-        in_head = r.returncode == 0
-        if not in_head and not re.search(r"exist in 'HEAD'|not in 'HEAD'|invalid object name 'HEAD'", err):
-            return Check("allowlist_committed", "fail", f"git cannot read HEAD:{rel} under {ws}: {_redact(err)}; the "
-                "workspace must be the committed repository the wave is planned from")
-        try:
-            disk = (ws / rel).read_bytes()
-        except OSError:
+        committed, _ = _committed(ws, rel, (ref,) if ref else ())
+        if not (ws / rel).is_file():
             states[rel] = "missing"
-            continue
-        states[rel] = "untracked" if not in_head else "clean" if disk == r.stdout else "modified since HEAD"
+        elif committed is None:
+            states[rel] = "untracked"
+        else:
+            states[rel] = "clean" if (ws / rel).read_bytes() == committed else "modified"
     bad = [f"{rel} {state}" for rel, state in states.items() if state != "clean"]
     if bad:
         shown = "; ".join(bad)
         return Check("allowlist_committed", "fail", "the working copy is not the committed contract: " + shown
-            + ". Restore HEAD's copy, or commit the change through a recorded decision, then re-run", states)
+            + ". Merge the allowlist PR into the protected branch and `git fetch`, then re-run", states)
     return Check("allowlist_committed", "ok",
-        "allowed_targets.json and 03_recon_tolerances.json are byte-equal to HEAD", states)
+        f"allowed_targets.json and 03_recon_tolerances.json are byte-equal to {ref}", states)
 
 
 def _norm_catalog(name) -> str:
@@ -425,7 +441,7 @@ def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None
     if not isinstance(cats, list) or sorted(cats) != sorted(expected):
         return Check("allowlist_matches_contract", "fail",
             f"allowlist catalogs {cats} differ from the contract's {expected}; "
-            "a catalog is added by a recorded decision and a new doctor run, never by editing either side", data)
+            "a catalog is added by a PR to the protected branch carrying a `D-<id>` row, then a new doctor run", data)
     return Check("allowlist_matches_contract", "ok", f"allowlist catalogs match the contract: {cats}", data)
 
 

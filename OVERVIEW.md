@@ -42,7 +42,7 @@ For each wave the orchestrator: writes `.migration/waves/wave-N.json` → runs `
 
 | Control | Where | What it does |
 |---|---|---|
-| Write-scope guard | `hooks/dbx_guard.py` (PreToolUse) | blocks writes outside `.migration/allowed_targets.json`, non-read statements against legacy sources, identity swaps, unreadable commands, `.migration/` edits outside `recon/` and `waves/`; policy table in `README.md` |
+| Write-scope guard | `hooks/dbx_guard.py` (PreToolUse) | blocks writes outside `.migration/allowed_targets.json` — the allowlist in force is the copy committed on the protected branch, so `.migration/` is writable and scope widens only by PR — non-read statements against legacy sources, identity swaps, unreadable commands; policy table in `README.md` |
 | Preflight doctor | `skills/factory-doctor/doctor.py` | CLI and identity, harness self-test, `.migration/` integrity, committed allowlist equal to the wave contract, source principal cannot write, hook nonce probe, playbooks in sync with the org library; signs the wave's doctor file |
 | Fan-out workflow | `skills/migration-fanout/workflow.py` | doctor-file gate, collision check, duplicate-wave refusal, circuit breaker, single writer of wave results |
 | Reconciliation harness | `skills/data-reconciliation/harness` (`dbx-recon`) | tiered parity with agreed tolerances, transactional mode for Lakebase, delete evidence, verdict line names fixture vs live; the merge authority |

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tokenize
 from dataclasses import dataclass, field
@@ -110,7 +111,6 @@ _PY_ENV = re.compile(r"(?:environ\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]|getenv\s*
 _PY_DSN = re.compile(r"""['"][^'"]*(?:://|jdbc:|Server=|host=|Database=|Initial Catalog=)[^'"]*['"]""", re.IGNORECASE)
 _PY_WRITE = re.compile(r"""['"](?:[wax]\+?|\+?>>?|\+<)['"]|\.write\w*\(|json\.dump\(|os\.(?:remove|unlink|rename|replace|chmod|rmdir|makedirs|mkdir)\(|"""
                        r"""shutil\.|\.(?:unlink|rename|rmdir|mkdir|touch|chmod)\(|\bunlink\b|\bwriteFile\w*\(""")
-_MIGRATION_PATH = re.compile(r"[^\s'\"()]*\.migration(?:/[^\s'\"()]*)?")
 _DECISION_ROW = re.compile(r"(?m)^\s*(?:\|\s*|#{1,6}\s*)?(D-[A-Za-z0-9][\w.-]*)\b")
 _DECISION_ID = re.compile(r"D-[A-Za-z0-9][\w.-]*")
 _WRITE_OBJECT = re.compile(
@@ -127,7 +127,6 @@ class _Legacy(str):
     """A violation on a legacy source; never downgraded by warn mode."""
 
 _RMTREE = re.compile(r"rmtree\(\s*(?:['\"]([^'\"]*)['\"]|(os\.getcwd\(\)|Path\.cwd\(\)|Path\(\s*(?:['\"]\.?['\"])?\s*\)))")
-_SQL_OUT_PATH = re.compile(r"(?i)(?:\bTO\s+|\\[ow]\s+|:out\s+|\bSPOOL\s+|\bFILE\s*=\s*)'?([^\s'\"]*\.migration(?:/[^\s'\"]*)?)")
 _SQL_OPAQUE = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)|'(?:[^']|'')*(?:'|\Z)", re.DOTALL)
 _SQL_COMMENT = re.compile(r"'(?:[^']|'')*'|\"[^\"]*\"|`[^`]*`|(--[^\n]*|/\*.*?(?:\*/|\Z))", re.DOTALL)
 _CLOUD_FAMILY = {
@@ -201,7 +200,6 @@ _FLAG_WORD = re.compile(r"-{1,2}[\w.-]+(?:=\S*)?")
 _UNREADABLE = (f"{{who}} fed script(s) {{files}} that the guard cannot read in full (missing, unreadable or over "
                f"{_MAX_SCRIPT_BYTES >> 20} MiB); inline the SQL or split it so it can be inspected")
 
-_IN, _ALL = ("inside", "self"), ("inside", "self", "above")
 _WRITE_LAST_OPERAND = ("cp", "rsync", "install", "ln", "scp")
 _RECURSIVE_HEADS = ("rm", "chmod", "chown", "chgrp", "rsync", "chattr", "setfacl")
 _DESTRUCTIVE = ("mv", "truncate", "dd", "shred", *_WRITE_LAST_OPERAND, *_RECURSIVE_HEADS, *_FIXERS)
@@ -214,8 +212,6 @@ _GUARD_FILE = Path(__file__).name
 _PATH_LITERAL = re.compile(r"['\"]((?:[~./$]|/)[^'\"\n]{0,300})['\"]")
 _GUARD_LITERAL = re.compile(r"['\"]((?:[^'\"\n/]*/)*(?:hooks(?:/[^'\"\n]*)?|hooks\.json|" + re.escape(_GUARD_FILE) + r"))['\"]")
 _OUTPUT_FLAGS = ("-o", "-O", "--output", "--out", "--out-file", "--output-file", "--outfile", "--file")
-_GIT_DISCARDS = {"clean": (), "reset": ("--hard", "--merge", "--keep"), "checkout": ("-f", "--force"),
-                 "switch": ("-f", "--force", "--discard-changes"), "stash": ("", "push", "save")}
 _GIT_READS = frozenset(("log", "diff", "status", "show", "fetch", "blame", "annotate", "describe", "grep", "shortlog", "reflog",
                         "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "cat-file", "for-each-ref", "show-ref",
                         "merge-base", "name-rev", "diff-tree", "diff-index", "diff-files", "count-objects", "check-ignore",
@@ -246,6 +242,7 @@ class GuardConfig:
     run_mode: str = "live"
     fixture_endpoints: tuple[str, ...] = ()
     path: Path | None = None
+    policy_ref: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict, path: Path | None = None) -> GuardConfig:
@@ -287,7 +284,8 @@ class Verdict:
         if not real:
             return cls("approve", "dbx-migration-factory guard: " + "; ".join(notes) if notes else "", violations)
         reason = ("dbx-migration-factory guard: " + "; ".join(violations) + ". Fix the command or, if the target is legitimate, add "
-                  "it to .migration/allowed_targets.json via a recorded decision (.migration/06_decisions.md); never work around the guard.")
+                  "it to .migration/allowed_targets.json by a PR to the protected branch carrying a `D-<id>` row in "
+                  f"06_decisions.md (allowlist in force: {cfg.policy_ref}); never work around the guard.")
         if cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
             return cls("approve", "WARN (guard_mode=warn): " + reason, violations)
         return cls("block", reason, violations)
@@ -295,15 +293,38 @@ class Verdict:
 def _norm(ident: str) -> str:
     return ident.strip().strip('`"[]').lower()
 
+_POLICY_REFS = ("refs/remotes/origin/HEAD", "origin/main", "origin/master", "HEAD")
+
+def _committed(ws: Path, rel: str) -> tuple[str | None, str | None]:
+    """(text, ref) of `rel` from the first ref that has it: origin/HEAD, origin/main, origin/master, then HEAD; (None, None) when git has none."""
+    for ref in _POLICY_REFS:
+        try:
+            r = subprocess.run(["git", "-C", str(ws), "show", f"{ref}:{rel}"], capture_output=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None, None
+        if r.returncode == 0:
+            return r.stdout.decode(errors="replace"), ref
+    return None, None
+
 def load_config(start: Path) -> GuardConfig | None:
     start = start.resolve()
-    path = next((d / CONFIG_REL for d in [start, *start.parents] if (d / CONFIG_REL).is_file() or (d / CONFIG_REL.parent).is_dir()), None)
-    if path is None:
-        return None
-    data = json.loads(path.read_text())
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} must be a JSON object")
-    return GuardConfig.from_dict(data, path)
+    for d in [start, *start.parents]:
+        path = d / CONFIG_REL
+        if not (path.is_file() or path.parent.is_dir() or (d / ".git").exists()):
+            continue
+        text, ref = _committed(d, str(CONFIG_REL))
+        if text is None:
+            if not path.is_file() and not path.parent.is_dir():
+                return None
+            text = path.read_text()
+        policy_ref = f"{ref}:{CONFIG_REL}" if ref else "working copy"
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} must be a JSON object")
+        cfg = GuardConfig.from_dict(data, path)
+        cfg.policy_ref = policy_ref
+        return cfg
+    return None
 
 def _sql_view(text: str) -> str:
     """Blank comments and string literals, keeping a literal that is the argument of a dynamic-SQL executor."""
@@ -725,13 +746,12 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
     did = next((a.split("=", 1)[1] for a in reversed(seg.assigns) if a.startswith("DBX_DECISION=")), None)
     if not did:
         return None, "no `DBX_DECISION=D-<id>` prefix on the command"
-    try:
-        ledger = (root / ".migration" / "06_decisions.md").read_text(errors="replace") if _DECISION_ID.fullmatch(did) else ""
-    except OSError:
-        return did, "cannot read .migration/06_decisions.md"
+    ledger, ref = _committed(root, ".migration/06_decisions.md") if _DECISION_ID.fullmatch(did) else ("", None)
+    if ledger is None:
+        return did, "no committed .migration/06_decisions.md on the protected branch (or HEAD); a session cannot author its own authorization"
     row = next((ln for ln in ledger.splitlines() if (m := _DECISION_ROW.search(ln)) and m.group(1).lower() == did.lower()), None)
     if row is None:
-        return did, f"`{did}` is not a row in .migration/06_decisions.md"
+        return did, f"`{did}` is not a row in {ref or 'working copy'}:.migration/06_decisions.md"
     if "legacy_write_authorized" not in row.lower():
         return did, f"row `{did}` does not contain `legacy_write_authorized`"
     objects = _write_objects(statements)
@@ -860,7 +880,7 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
             violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {', '.join(objects)} "
                               "(legacy_write_authorized row in .migration/06_decisions.md)")
         else:
-            violations.append(_Legacy(f"{violation}; a recorded decision would allow it, but {missing}{tail}"))
+            violations.append(_Legacy(f"{violation}; a committed `legacy_write_authorized` row would allow it, but {missing}{tail}"))
     elif unresolved:
         violations.append(f"non-read statement through `{base}` to a connection built at run time ({sorted(set(unresolved))[:4]} is not a "
                           f"literal and not a name in target_hosts / legacy_sources): `{bad[0]}`; spell the host and database out so the guard "
@@ -1253,8 +1273,7 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
     return [_Legacy(v) for v in violations]
 
 def _touch(path: str, at: str | None, root: Path) -> str:
-    """How a path relates to what must not be written: 'inside'/'self'/'above' `.migration/`, 'identity', 'guard', 'guard-above',
-    'unresolved', or ''."""
+    """'inside'/'self'/'above' `.migration/` (writable: the allowlist in force is upstream), 'identity', 'guard', 'guard-above', 'unresolved', or ''."""
     p = os.path.expanduser(re.sub(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", "*", re.sub(r"\$\{?PWD\}?|\$\(pwd\)", ".", path)))
     if p in ("", "-") or p.isdigit():
         return ""
@@ -1268,8 +1287,7 @@ def _touch(path: str, at: str | None, root: Path) -> str:
                                 and (not spelled or any(len(w) >= 3 and w in name for w in re.findall(r"\w+", part))))
     for i, part in enumerate(parts):   # a literal `.migration` anywhere; a glob only at the top of the workspace
         if part == ".migration" or (i == 0 and not p.startswith("/") and like(".migration", part)):
-            rest = parts[i + 1:]
-            return "self" if not rest else "" if len(rest) > 1 and rest[0] in ("recon", "waves") else "inside"
+            return "self" if not parts[i + 1:] else "inside"
     rel = [x for x in os.path.relpath(p, root).split("/") if x not in ("", ".")] if p.startswith("/") else parts
     if all(x == ".." for x in rel):
         return "above"
@@ -1290,16 +1308,7 @@ def _touch(path: str, at: str | None, root: Path) -> str:
 def _patch_texts(s: _Seg, files: list[str], root: Path, how: str) -> list[str]:
     if s.opaque or (not files and not s.stdin and not s.heredocs):
         return [f"`{how}` on a patch the guard cannot read (stdin from a program or the terminal); write it to a file first"]
-    out = []
-    for f in files:
-        body = _read_script(f, root, s.at)
-        if body is None:
-            out.append(_UNREADABLE.format(who=f"`{how}`", files=[f]))
-        elif _MIGRATION_PATH.search(body):
-            out.append(f"`{how}` of a patch that touches .migration/ ({f}); ledgers and the allowlist change only through a recorded decision")
-    if _MIGRATION_PATH.search("\n".join([*s.stdin, *s.heredocs])):
-        out.append(f"`{how}` of a patch that touches .migration/; ledgers and the allowlist change only through a recorded decision")
-    return out
+    return [_UNREADABLE.format(who=f"`{how}`", files=[f]) for f in files if _read_script(f, root, s.at) is None]
 
 def _git_reads(gargv: list[str]) -> bool:
     verb, rest = gargv[0], gargv[1:]
@@ -1315,7 +1324,7 @@ def _git_reads(gargv: list[str]) -> bool:
             w == "-e" or w.startswith(("--unset", "--add", "--replace", "--edit", "--rename", "--remove")) for w in flags)
     return verb in _GIT_READS
 
-_Write = tuple[str, str, tuple[str, ...], bool, str | None]   # (path, how, .migration relations that block, destructive, directory)
+_Write = tuple[str, str, bool, bool, str | None]   # (path, how, acts on a whole tree, destructive, directory)
 
 def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[_Write]:
     argv, env, i, tree = s.argv, dict(a.split("=", 1) for a in s.assigns), 1, {}
@@ -1339,14 +1348,11 @@ def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[_Write]:
     verb, gops = (gargv[0] if gargv else ""), [w for w in gargv[1:] if not w.startswith("-")]
     if verb == "push" and any(o in ("--force", "-f", "--force-with-lease") or o.startswith("--force-with-lease=") for o in gargv[1:]):
         out.append("`git push --force` rewrites protected remote history; force pushes are never allowed")
-    w = [(".", f"git {verb}", (), True, run_in)] if gargv and not _git_reads(gargv) else []
+    w = [(".", f"git {verb}", False, True, run_in)] if gargv and not _git_reads(gargv) else []
     if verb in ("clone", "init") or (verb == "worktree" and gops[:1] == ["add"]):
-        w += [(o, f"git {verb}", _IN, True, at) for o in (gops[-1:] if verb != "worktree" else gops[1:2])]
-    if verb in _GIT_DISCARDS and (not (x := _GIT_DISCARDS[verb]) or any(o in x for o in gargv[1:] + [(gops[:1] or [""])[0]])):
-        out.append(f"`git {verb}` rewrites the working copy across the workspace, .migration/ included; revert a ledger only "
-                   "through a recorded decision")
+        w += [(o, f"git {verb}", False, True, at) for o in (gops[-1:] if verb != "worktree" else gops[1:2])]
     elif verb in ("checkout", "restore", "rm", "mv"):
-        w += [(o, f"git {verb}", _ALL if verb in ("checkout", "restore") else _IN, False, at) for o in gops]
+        w += [(o, f"git {verb}", verb in ("checkout", "restore"), False, at) for o in gops]
     elif verb in ("apply", "am"):
         out += _patch_texts(s, gops + s.scripts, root, f"git {verb}")
     return w
@@ -1364,8 +1370,8 @@ def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[_Write]:
     ops = [w for w in argv[1:] if not w.startswith("-")]
     values = ops + [w.split("=", 1)[1] for w in argv[1:] if "=" in w]   # `dd of=`, `--output=`
     inplace = _mutates(base, argv)
-    w = [(path, f"{op} {path}", _IN, False, at) for op, f in s.redirects() if ">" in op for path in _multi_paths(s, f)]
-    w += [(path, f"{base} {flag}", _IN, False, at) for flag, v in itertools.pairwise(argv) if flag in _OUTPUT_FLAGS for path in _multi_paths(s, v)]
+    w = [(path, f"{op} {path}", False, False, at) for op, f in s.redirects() if ">" in op for path in _multi_paths(s, f)]
+    w += [(path, f"{base} {flag}", False, False, at) for flag, v in itertools.pairwise(argv) if flag in _OUTPUT_FLAGS for path in _multi_paths(s, v)]
     if base == "git":
         return w + _git_writes(s, here, root, out)
     if base == "patch":
@@ -1373,41 +1379,35 @@ def _writes(s: _Seg, root: Path, here: str, out: list[str]) -> list[_Write]:
     elif _PYTHON.fullmatch(base) or base in ("perl", "ruby", "node") and not inplace:
         text = "\n".join([*_flag_values(argv, ("-c", "-e")), *s.heredocs, *s.stdin])
         if _PY_WRITE.search(text):
-            w += [(p, f"{base} script", _IN, False, at)
-                  for p in [*_MIGRATION_PATH.findall(text), *_PATH_LITERAL.findall(text), *_GUARD_LITERAL.findall(text)]]
-            w += [(m.group(1) if m.group(1) is not None else ".", f"{base} rmtree", _ALL, False, at) for m in _RMTREE.finditer(text)]
+            w += [(p, f"{base} script", False, False, at)
+                  for p in [*_PATH_LITERAL.findall(text), *_GUARD_LITERAL.findall(text)]]
+            w += [(m.group(1) if m.group(1) is not None else ".", f"{base} rmtree", True, False, at) for m in _RMTREE.finditer(text)]
     elif base == "find" and inplace:
-        w += [(path, "find with an action", _ALL, False, at) for o in ops for path in _multi_paths(s, o)]
+        w += [(path, "find with an action", True, False, at) for o in ops for path in _multi_paths(s, o)]
     elif base in ("tar", "bsdtar") and (any(re.match(r"-?[a-zA-Z]*x", x) for x in argv[1:2]) or "--extract" in argv or "--get" in argv):
-        w += [(path, f"{base} extract into", _ALL, False, at) for d in _flag_values(argv, ("-C", "--directory")) or ["."] for path in _multi_paths(s, d)]
+        w += [(path, f"{base} extract into", True, False, at) for d in _flag_values(argv, ("-C", "--directory")) or ["."] for path in _multi_paths(s, d)]
     elif base == "unzip" and not any(x in argv for x in ("-l", "-t", "-p", "-z", "-Z")):
-        w += [(path, "unzip into", _ALL, False, at) for d in _flag_values(argv, ("-d",)) or ["."] for path in _multi_paths(s, d)]
+        w += [(path, "unzip into", True, False, at) for d in _flag_values(argv, ("-d",)) or ["."] for path in _multi_paths(s, d)]
     elif base in _GENERIC or base in _LEGACY_ONLY:
-        sql = " ".join([*_flag_values(argv, _SQL_VALUE_FLAGS), *s.heredocs, *s.stdin, s.herestring or ""])
-        w += [(path, f"{base} output", _IN, False, at) for p in [*values, *_SQL_OUT_PATH.findall(sql)] for path in _multi_paths(s, p)]
+        w += [(path, f"{base} output", False, False, at) for p in values for path in _multi_paths(s, p)]
     elif base not in _READERS or inplace:
         recursive = base in _RECURSIVE_HEADS and any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*", x) or x in ("--recursive", "--delete") for x in argv[1:])
-        if "xargs" in s.words and any(_touch(x, at, root) for p in s.feeds for x in p.words):
-            out.append(f"`xargs {base}` on names listed from .migration/; ledgers and the allowlist change only through a recorded decision")
-        w += [(path, base, _ALL if recursive else _IN, base in _DESTRUCTIVE, at)
+        w += [(path, base, recursive, base in _DESTRUCTIVE, at)
               for o in (values[-1:] if base in _WRITE_LAST_OPERAND else values) for path in _multi_paths(s, o)]
     return w
 
 def _check_integrity(segs: list[_Seg], root: Path, here: str = "") -> list[str]:
     violations: list[str] = []
     for s in segs:
-        for path, how, kinds, destructive, at in _writes(s, root, here, violations):
+        for path, how, tree, destructive, at in _writes(s, root, here, violations):
             kind = _touch(path, at, root)
-            if kind in kinds:
-                violations.append(f"`{how}` writes `{path}` under .migration/ (only .migration/recon/ and .migration/waves/ are "
-                                  "written by commands; ledgers and the allowlist change only through a recorded decision)")
-            elif kind == "unresolved" and destructive:
+            if kind == "unresolved" and destructive:
                 violations.append(f"`{how}` writes `{path}`, a destination built at run time that the guard cannot resolve; spell the "
                                   "path out (a variable the command itself sets is followed)")
             elif kind == "identity":
                 violations.append(f"`{how}` writes `{path}`, the Databricks CLI's credential store; the session runs as the "
                                   "doctor-verified migration principal only")
-            elif kind == "guard" or (kind == "guard-above" and (destructive or "above" in kinds)):
+            elif kind == "guard" or (kind == "guard-above" and (destructive or tree)):
                 violations.append(f"`{how}` on `{path}` inside the running guard's plugin tree ({_GUARD_TREE}); the hook is never edited, "
                                   "disabled or removed from a session (a block is a finding to report)")
     return violations
@@ -1442,7 +1442,8 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd: str) -> Verdict:
-    """File-edit tools: `.migration/` accepts only an appended `D-<id>` row in 06_decisions.md; the credential store and the guard tree never."""
+    """File-edit tools: `.migration/` is writable (the allowlist in force is upstream), but 06_decisions.md still accepts only an
+    appended `D-<id>` row; the credential store and the guard tree never take an edit."""
     file_path = tool_input.get("file_path")
     if not isinstance(file_path, str) or not file_path:
         return Verdict.of([], cfg)
@@ -1455,17 +1456,12 @@ def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd
         except OSError:
             old = ""
     kind, violations = _touch(file_path, cwd or "", root), []
-    if kind in ("inside", "self"):
-        ledger, added = Path(file_path).name == "06_decisions.md", new[len(old):] if new.startswith(old) else new
-        authorized = "legacy_write_authorized" in added.lower()
-        if ledger and authorized:
+    if kind == "inside" and Path(file_path).name == "06_decisions.md":
+        added = new[len(old):] if new.startswith(old) else new
+        if "legacy_write_authorized" in added.lower():
             violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
-        elif ledger and not (tool != "MultiEdit" and new.startswith(old) and added and _DECISION_ROW.search(added)):
+        elif not (tool != "MultiEdit" and new.startswith(old) and added and _DECISION_ROW.search(added)):
             violations.append("06_decisions.md is append-only: the edit must keep the existing text and only add `D-<id>` rows")
-        elif not ledger:
-            violations.append(f"file-edit tool `{tool}` writes `{file_path}` under .migration/ (only .migration/recon/<unit_id>/ and "
-                              ".migration/waves/ are written by a session; ledgers and the allowlist change only through a recorded "
-                              "decision — 06_decisions.md accepts only an added `D-<id>` row)")
     elif kind == "identity":
         violations.append(f"file-edit tool `{tool}` writes `{file_path}`, the Databricks CLI's credential store; the session runs as the "
                           "doctor-verified migration principal only")

@@ -1,5 +1,6 @@
 """Section C tests for the guard rewrite."""
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -252,6 +253,11 @@ def test_decision_authorizes_the_pinned_legacy_write(tmp_path: Path):
         "| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC "
         "prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n"
     )
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                    "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                    "commit", "-qm", "ws"], check=True)
     verdict = g.evaluate(
         "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q "
         "'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'",
@@ -261,8 +267,9 @@ def test_decision_authorizes_the_pinned_legacy_write(tmp_path: Path):
     assert verdict.decision == "approve", verdict.reason
 
 
-def test_allowlist_tampering_blocks():
-    assert ".migration" in block("rm .migration/allowed_targets.json").reason
+def test_allowlist_working_copy_is_writable():
+    # the allowlist in force is the committed copy upstream; a local edit never widens scope
+    assert g.evaluate("rm .migration/allowed_targets.json", CFG).decision == "approve"
 
 
 def test_force_push_decision_is_unchanged():

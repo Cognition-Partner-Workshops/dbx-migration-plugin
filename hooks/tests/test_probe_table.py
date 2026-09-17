@@ -113,16 +113,16 @@ PROBES = [
     ("docker exec into fixture sqlcmd write", "docker exec sqlserver-demo /opt/mssql-tools/bin/sqlcmd -S localhost -Q 'DELETE FROM dbo.t'", "block"),
     ("odbc via ssh", "ssh tdprod.corp 'sqlcmd -Q \"DELETE FROM dbo.t\"'", "block"),
     pytest.param("perl DBI write", "perl -e 'use DBI; DBI->connect($ENV{LEGACY_TD_DSN})->do(\"DROP TABLE t\")'", "block", marks=OUT_OF_SCOPE),
-    # --- config tampering (A2a) and identity (A3)
-    ("edit allowlist via shell", "echo '{\"catalogs\":[\"prod\"]}' > .migration/allowed_targets.json", "block"),
-    ("edit allowlist via sed", "sed -i 's/mig_cat/prod/' .migration/allowed_targets.json", "block"),
-    ("python rewrite allowlist", "python3 -c \"open('.migration/allowed_targets.json','w').write('{}')\"", "block"),
-    ("rm allowlist (guard then approves everything)", "rm .migration/allowed_targets.json", "block"),
-    ("mv workspace .migration", "mv .migration .m", "block"),
-    ("switch guard_mode to warn", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json > x && mv x .migration/allowed_targets.json", "block"),
-    ("edit tolerances", "sed -i 's/0.001/0.5/' .migration/units/u/tolerances.json", "block"),
-    ("edit decisions ledger", "echo '| tol change | accepted |' >> .migration/06_decisions.md", "block"),
-    ("edit capabilities manifest", "python3 -c \"import json;json.dump({'ready':True},open('.migration/09_capabilities.json','w'))\"", "block"),
+    # --- config tampering (A2a) and identity (A3): `.migration/` is writable — the allowlist in force is upstream
+    ("edit allowlist via shell", "echo '{\"catalogs\":[\"prod\"]}' > .migration/allowed_targets.json", "approve"),
+    ("edit allowlist via sed", "sed -i 's/mig_cat/prod/' .migration/allowed_targets.json", "approve"),
+    ("python rewrite allowlist", "python3 -c \"open('.migration/allowed_targets.json','w').write('{}')\"", "approve"),
+    ("rm allowlist (working copy only; the guard reads the committed copy)", "rm .migration/allowed_targets.json", "approve"),
+    ("mv workspace .migration", "mv .migration .m", "approve"),
+    ("switch guard_mode to warn", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json > x && mv x .migration/allowed_targets.json", "approve"),
+    ("edit tolerances", "sed -i 's/0.001/0.5/' .migration/units/u/tolerances.json", "approve"),
+    ("edit decisions ledger", "echo '| tol change | accepted |' >> .migration/06_decisions.md", "approve"),
+    ("edit capabilities manifest", "python3 -c \"import json;json.dump({'ready':True},open('.migration/09_capabilities.json','w'))\"", "approve"),
     ("run from outside workspace (cd out first)", "cd /tmp && databricks sql execute -e 'INSERT INTO prod.s.t VALUES (1)'", "block"),
     ("run with absolute path outside ws", "databricks sql execute -e 'INSERT INTO prod.s.t VALUES (1)' --profile x", "block"),
     ("databricks auth login (identity swap)", "databricks auth login --host https://x.cloud.databricks.com", "block"),
@@ -153,8 +153,8 @@ PROBES = [
 # Second and third review probes (shapes not in the 108-row table), in a workspace whose allowlist
 # names `lakebase-host` and bundle target `migration`. `{ws}` is the workspace's absolute path.
 # Rows the review marked out of contract are pinned to the decision the design gives: Java/Perl/
-# make stay xfail, `git rebase` approves (`git stash` blocks since round 8: it rewrites the working copy), `catalogs: ["*"]` is not a wildcard, warn mode
-# downgrades to approve-with-reason.
+# make stay xfail, `git rebase` and `git stash` approve (the allowlist in force is the committed copy upstream),
+# `catalogs: ["*"]` is not a wildcard, warn mode downgrades to approve-with-reason.
 ALLOWLIST2 = {
     "catalogs": ["mig_cat"],
     "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp", "sqlserver-demo"],
@@ -428,9 +428,9 @@ PROBES2 = [
     ("psql -d lakebase-host is a database, not a host", "psql -h 10.1.1.1 -d lakebase-host -c 'INSERT INTO t VALUES (1)'", "block"),
     ("sqlcmd -d lakebase-host is a database, not a host", "sqlcmd -S 10.1.1.1 -d lakebase-host -Q 'INSERT dbo.t VALUES (1)'", "block"),
     ("mysql positional database named like the host", "mysql -h 10.1.1.1 lakebase-host -e 'INSERT INTO t VALUES (1)'", "block"),
-    ("psql \\copy to .migration", "psql -h lakebase-host -c \"\\copy (select 1) to '.migration/allowed_targets.json'\"", "block"),
-    ("psql -o .migration", "psql -h lakebase-host -c 'select 1' -o .migration/allowed_targets.json", "block"),
-    ("sqlcmd -o .migration", "sqlcmd -S sqlserver-demo -Q 'select 1' -o .migration/allowed_targets.json", "block"),
+    ("psql \\copy to .migration", "psql -h lakebase-host -c \"\\copy (select 1) to '.migration/allowed_targets.json'\"", "approve"),
+    ("psql -o .migration", "psql -h lakebase-host -c 'select 1' -o .migration/allowed_targets.json", "approve"),
+    ("sqlcmd -o .migration", "sqlcmd -S sqlserver-demo -Q 'select 1' -o .migration/allowed_targets.json", "approve"),
     ("sqlcmd -o .migration/recon (approve)", "sqlcmd -S sqlserver-demo -Q 'select 1' -o .migration/recon/u1/rows.txt", "approve"),
     ("pg_dump legacy (read, approve)", "pg_dump 'host=tdprod.corp dbname=x' -t t", "approve"),
     ("pg_restore into target (approve)", "pg_restore -h lakebase-host -d x f.dump", "approve"),
@@ -450,63 +450,64 @@ PROBES2 = [
     ("dbt snapshot -t migration (approve)", "dbt snapshot -t migration", "approve"),
     ("dbt snapshot without target", "dbt snapshot", "block"),
     ("dbt compile (approve)", "dbt compile", "approve"),
-    # --- .migration integrity: any head, any spelling of the path
-    ("cd .migration; rm", "cd .migration && rm allowed_targets.json", "block"),
-    ("rm ./.migration", "rm ./.migration/allowed_targets.json", "block"),
-    ("rm glob", "rm .migratio*/allowed_targ*", "block"),
-    ("rm ? glob", "rm .migratio?/allowed_targets.json", "block"),
-    ("rm brace", "rm .migration{,.bak}/allowed_targets.json", "block"),
-    ("rm via $PWD", "rm $PWD/.migration/allowed_targets.json", "block"),
-    ("rm via $(pwd)", "rm \"$(pwd)/.migration/allowed_targets.json\"", "block"),
-    ("rm abs path", "rm {ws}/.migration/allowed_targets.json", "block"),
-    ("rm -rf . (whole ws)", "rm -rf .", "block"),
-    ("rm -rf ws parent", "rm -rf {ws}", "block"),
-    ("rm -rf .. ", "rm -rf ..", "block"),
-    ("rm -rf $PWD", "rm -rf $PWD", "block"),
-    ("rm -rf *", "rm -rf *", "block"),
+    # --- .migration is writable: the allowlist in force is the committed copy upstream
+    ("cd .migration; rm", "cd .migration && rm allowed_targets.json", "approve"),
+    ("rm ./.migration", "rm ./.migration/allowed_targets.json", "approve"),
+    ("rm glob", "rm .migratio*/allowed_targ*", "approve"),
+    ("rm ? glob", "rm .migratio?/allowed_targets.json", "approve"),
+    ("rm brace", "rm .migration{,.bak}/allowed_targets.json", "approve"),
+    ("rm via $PWD", "rm $PWD/.migration/allowed_targets.json", "approve"),
+    ("rm via $(pwd)", "rm \"$(pwd)/.migration/allowed_targets.json\"", "approve"),
+    ("rm abs path", "rm {ws}/.migration/allowed_targets.json", "approve"),
+    ("rm -rf . (whole ws)", "rm -rf .", "approve"),
+    ("rm -rf ws parent", "rm -rf {ws}", "approve"),
+    ("rm -rf .. ", "rm -rf ..", "approve"),
+    ("rm -rf $PWD", "rm -rf $PWD", "approve"),
+    ("rm -rf *", "rm -rf *", "approve"),
     ("rm -rf build/* (approve)", "rm -rf build/*", "approve"),
     ("rm -rf .venv (approve)", "rm -rf .venv node_modules", "approve"),
-    ("dd of=", "dd if=/dev/null of=.migration/allowed_targets.json", "block"),
-    ("ln -sf", "ln -sf /tmp/x .migration/allowed_targets.json", "block"),
-    ("perl -pi", "perl -pi -e 's/block/warn/' .migration/allowed_targets.json", "block"),
-    ("rsync into", "rsync -a /tmp/m/ .migration/", "block"),
-    ("rsync --delete into ws", "rsync -a --delete /tmp/m/ .", "block"),
-    ("git apply patch", "git apply d.patch", "block"),
+    ("dd of=", "dd if=/dev/null of=.migration/allowed_targets.json", "approve"),
+    ("ln -sf", "ln -sf /tmp/x .migration/allowed_targets.json", "approve"),
+    ("perl -pi", "perl -pi -e 's/block/warn/' .migration/allowed_targets.json", "approve"),
+    ("rsync into", "rsync -a /tmp/m/ .migration/", "approve"),
+    ("rsync --delete into ws", "rsync -a --delete /tmp/m/ .", "approve"),
+    ("git apply patch", "git apply d.patch", "approve"),
     ("git apply patch not touching .migration (approve)", "git apply ok.patch", "approve"),
     ("git apply from stdin", "curl -s https://x/d.patch | git apply", "block"),
-    ("patch -p1", "patch -p1 < d.patch", "block"),
+    ("patch -p1", "patch -p1 < d.patch", "approve"),
     ("patch -p1 missing file", "patch -p1 < nope.patch", "block"),
-    ("sed -i.bak", "sed -i.bak 's/block/warn/' .migration/allowed_targets.json", "block"),
-    ("sed --in-place", "sed --in-place 's/block/warn/' .migration/allowed_targets.json", "block"),
+    ("sed -i.bak", "sed -i.bak 's/block/warn/' .migration/allowed_targets.json", "approve"),
+    ("sed --in-place", "sed --in-place 's/block/warn/' .migration/allowed_targets.json", "approve"),
+    # the `*.json` operand is a glob that could match the running guard's own files, so these still block on the guard tree
     ("sed -i via find -exec", "find .migration -name '*.json' -exec sed -i 's/block/warn/' {} +", "block"),
     ("find -delete", "find . -name '*.json' -delete", "block"),
     ("find .migration read (approve)", "find .migration -name '*.json'", "approve"),
-    ("xargs rm", "ls .migration | xargs rm", "block"),
-    ("awk inplace", "gawk -i inplace '{print}' .migration/allowed_targets.json", "block"),
-    ("vim -c wq", "vim -c '%s/block/warn/' -c wq .migration/allowed_targets.json", "block"),
-    ("cp -r over dir", "cp -r /tmp/m .migration", "block"),
+    ("xargs rm", "ls .migration | xargs rm", "approve"),
+    ("awk inplace", "gawk -i inplace '{print}' .migration/allowed_targets.json", "approve"),
+    ("vim -c wq", "vim -c '%s/block/warn/' -c wq .migration/allowed_targets.json", "approve"),
+    ("cp -r over dir", "cp -r /tmp/m .migration", "approve"),
     ("cp out of .migration (approve)", "cp .migration/allowed_targets.json /tmp/backup.json", "approve"),
-    ("install", "install /tmp/x .migration/allowed_targets.json", "block"),
-    ("tar extract", "tar -xf m.tar -C .migration", "block"),
-    ("tar extract into ws", "tar -xf m.tar -C .", "block"),
-    ("tar extract default cwd", "tar -xf m.tar", "block"),
+    ("install", "install /tmp/x .migration/allowed_targets.json", "approve"),
+    ("tar extract", "tar -xf m.tar -C .migration", "approve"),
+    ("tar extract into ws", "tar -xf m.tar -C .", "approve"),
+    ("tar extract default cwd", "tar -xf m.tar", "approve"),
     ("tar create of .migration (read, approve)", "tar -czf /tmp/m.tgz .migration", "approve"),
-    ("unzip -o", "unzip -o m.zip -d .migration", "block"),
-    ("unzip into ws", "unzip m.zip", "block"),
-    ("git checkout -- .migration", "git checkout -- .migration/03_recon_tolerances.json", "block"),
-    ("git checkout -- .", "git checkout -- .", "block"),
-    ("git -C ws checkout -- .migration", "git -C {ws} checkout -- .migration/03_recon_tolerances.json", "block"),      # round 4
-    ("git -C ws/src checkout -- ../.migration", "git -C {ws}/src checkout -- ../.migration/06_decisions.md", "block"),  # round 4
-    ("git -C ws checkout -- .", "git -C {ws} checkout -- .", "block"),                                                  # round 4
-    ("git -C ws reset --hard", "git -C {ws} reset --hard", "block"),                                                    # round 4
-    ("git -C ws clean -fdx", "git -C {ws} clean -fdx", "block"),                                                        # round 4
+    ("unzip -o", "unzip -o m.zip -d .migration", "approve"),
+    ("unzip into ws", "unzip m.zip", "approve"),
+    ("git checkout -- .migration", "git checkout -- .migration/03_recon_tolerances.json", "approve"),
+    ("git checkout -- .", "git checkout -- .", "approve"),
+    ("git -C ws checkout -- .migration", "git -C {ws} checkout -- .migration/03_recon_tolerances.json", "approve"),      # round 4
+    ("git -C ws/src checkout -- ../.migration", "git -C {ws}/src checkout -- ../.migration/06_decisions.md", "approve"),  # round 4
+    ("git -C ws checkout -- .", "git -C {ws} checkout -- .", "approve"),                                                  # round 4
+    ("git -C ws reset --hard", "git -C {ws} reset --hard", "approve"),                                                    # round 4
+    ("git -C ws clean -fdx", "git -C {ws} clean -fdx", "approve"),                                                        # round 4
     ("git -C ws log (approve)", "git -C {ws} log --oneline", "approve"),                                                # round 4
     ("git -C ws add .migration (approve)", "git -C {ws} add .migration/06_decisions.md", "approve"),                    # round 4
     ("git checkout branch (approve)", "git checkout -b feature/x", "approve"),
-    ("git stash", "git stash", "block"),                                                                            # round 8: rewrites the working copy
-    ("git reset --hard", "git reset --hard HEAD~1", "block"),
+    ("git stash", "git stash", "approve"),                                                                            # the working copy carries no policy
+    ("git reset --hard", "git reset --hard HEAD~1", "approve"),
     ("git reset soft (approve)", "git reset HEAD~1", "approve"),
-    ("git clean -fdx", "git clean -fdx", "block"),
+    ("git clean -fdx", "git clean -fdx", "approve"),
     ("git rebase (approve)", "git rebase main", "approve"),
     ("git commit -am (approve)", "git commit -am 'recon evidence'", "approve"),
     ("git commit -m mentioning rm .migration (approve)", "git commit -m \"rm .migration\"", "approve"),
@@ -520,36 +521,36 @@ PROBES2 = [
     ("echo into .migration/recon/u1/log (approve)", "echo x > .migration/recon/u1/log", "approve"),
     ("ls -la .migration (approve)", "ls -la .migration", "approve"),
     ("jq . .migration (approve)", "jq . .migration/allowed_targets.json", "approve"),
-    ("jq -o? no: jq output to .migration", "jq . x.json > .migration/allowed_targets.json", "block"),
-    ("python heredoc write .migration", "python3 - <<EOF\nopen('.migration/allowed_targets.json','w').write('{}')\nEOF", "block"),
-    ("python -c pathlib write_text", "python3 -c \"from pathlib import Path; Path('.migration/allowed_targets.json').write_text('{}')\"", "block"),
-    ("python -c os.remove", "python3 -c \"import os; os.remove('.migration/allowed_targets.json')\"", "block"),
-    ("python -c Path.unlink", "python3 -c \"from pathlib import Path; Path('.migration/allowed_targets.json').unlink()\"", "block"),
-    ("python -c shutil.rmtree", "python3 -c \"import shutil; shutil.rmtree('.migration')\"", "block"),
-    ("python -c shutil.rmtree('.')", "python3 -c \"import shutil; shutil.rmtree('.')\"", "block"),
-    ("python -c write via variable path", "python3 -c \"p='.migration/'+'allowed_targets.json'; open(p,'w')\"", "block"),
+    ("jq -o? no: jq output to .migration", "jq . x.json > .migration/allowed_targets.json", "approve"),
+    ("python heredoc write .migration", "python3 - <<EOF\nopen('.migration/allowed_targets.json','w').write('{}')\nEOF", "approve"),
+    ("python -c pathlib write_text", "python3 -c \"from pathlib import Path; Path('.migration/allowed_targets.json').write_text('{}')\"", "approve"),
+    ("python -c os.remove", "python3 -c \"import os; os.remove('.migration/allowed_targets.json')\"", "approve"),
+    ("python -c Path.unlink", "python3 -c \"from pathlib import Path; Path('.migration/allowed_targets.json').unlink()\"", "approve"),
+    ("python -c shutil.rmtree", "python3 -c \"import shutil; shutil.rmtree('.migration')\"", "approve"),
+    ("python -c shutil.rmtree('.')", "python3 -c \"import shutil; shutil.rmtree('.')\"", "approve"),
+    ("python -c write via variable path", "python3 -c \"p='.migration/'+'allowed_targets.json'; open(p,'w')\"", "approve"),
     ("python -c read .migration (approve)", "python3 -c \"print(open('.migration/allowed_targets.json').read())\"", "approve"),
     ("python script file (unreadable, approve)", "python3 edit_ledger.py", "approve"),
-    ("node -e fs.writeFileSync", "node -e \"require('fs').writeFileSync('.migration/allowed_targets.json','{}')\"", "block"),
-    ("ruby -e File.write", "ruby -e \"File.write('.migration/allowed_targets.json','{}')\"", "block"),
-    ("jq edit redirect", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json > .migration/allowed_targets.json", "block"),
-    ("sponge", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json | sponge .migration/allowed_targets.json", "block"),
+    ("node -e fs.writeFileSync", "node -e \"require('fs').writeFileSync('.migration/allowed_targets.json','{}')\"", "approve"),
+    ("ruby -e File.write", "ruby -e \"File.write('.migration/allowed_targets.json','{}')\"", "approve"),
+    ("jq edit redirect", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json > .migration/allowed_targets.json", "approve"),
+    ("sponge", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json | sponge .migration/allowed_targets.json", "approve"),
     ("write to .migration/recon (approve)", "echo x > .migration/recon/u1/out.json", "approve"),
-    ("write to .migration/recon/../ traversal", "echo x > .migration/recon/../allowed_targets.json", "block"),
+    ("write to .migration/recon/../ traversal", "echo x > .migration/recon/../allowed_targets.json", "approve"),
     ("cat .migration (approve)", "cat .migration/allowed_targets.json", "approve"),
     ("echo >> notes.md (approve)", "echo 'INSERT INTO x' >> notes.md", "approve"),
-    ("here-string into .migration", "cat <<< '{}' > .migration/allowed_targets.json", "block"),
-    ("redirect with fd", "exec 3>.migration/allowed_targets.json", "block"),
-    ("printf > with spaces path", "printf '{}' > './.migration/allowed_targets.json'", "block"),
-    ("curl -o .migration", "curl -s https://x/a.json -o .migration/allowed_targets.json", "block"),
-    ("wget -O .migration", "wget https://x/a.json -O .migration/allowed_targets.json", "block"),
-    ("--output=.migration", "some-tool --output=.migration/allowed_targets.json", "block"),
-    ("mkdir .migration/waves", "mkdir .migration/waves", "block"),
-    ("touch .migration/06_decisions.md", "touch .migration/06_decisions.md", "block"),
-    ("chattr", "chattr -i .migration/allowed_targets.json", "block"),
-    ("setfacl", "setfacl -m u:x:rw .migration/allowed_targets.json", "block"),
-    ("chmod -R on ws", "chmod -R 777 .", "block"),
-    ("unknown program with .migration operand", "frobnicate .migration/allowed_targets.json", "block"),
+    ("here-string into .migration", "cat <<< '{}' > .migration/allowed_targets.json", "approve"),
+    ("redirect with fd", "exec 3>.migration/allowed_targets.json", "approve"),
+    ("printf > with spaces path", "printf '{}' > './.migration/allowed_targets.json'", "approve"),
+    ("curl -o .migration", "curl -s https://x/a.json -o .migration/allowed_targets.json", "approve"),
+    ("wget -O .migration", "wget https://x/a.json -O .migration/allowed_targets.json", "approve"),
+    ("--output=.migration", "some-tool --output=.migration/allowed_targets.json", "approve"),
+    ("mkdir .migration/waves", "mkdir .migration/waves", "approve"),
+    ("touch .migration/06_decisions.md", "touch .migration/06_decisions.md", "approve"),
+    ("chattr", "chattr -i .migration/allowed_targets.json", "approve"),
+    ("setfacl", "setfacl -m u:x:rw .migration/allowed_targets.json", "approve"),
+    ("chmod -R on ws", "chmod -R 777 .", "approve"),
+    ("unknown program with .migration operand", "frobnicate .migration/allowed_targets.json", "approve"),
     ("unknown program, .migration only in prose (approve)", "frobnicate 'see .migration/06_decisions.md for context'", "approve"),
     # --- wrappers / opacity
     ("bash -c literal legacy write", "bash -c 'sqlcmd -S sqlserver-demo -Q \"DROP TABLE t\"'", "block"),
@@ -665,17 +666,17 @@ PROBES2 = [
     ("R3 for loop read over .migration waves", "for f in .migration/waves/*.json; do cat \"$f\"; done", "approve"),
     ("R3 for loop read over .migration units", "for f in .migration/units/*/tolerances.json; do cat \"$f\"; done", "approve"),
     ("R3 for loop jq read over .migration units", "for u in .migration/units/*; do jq .id \"$u/mapping_spec.json\"; done", "approve"),
-    ("R3 for loop redirect write into .migration units", "for f in .migration/units/*/tolerances.json; do echo x > \"$f\"; done", "block"),
-    ("R3 for loop sed -i over .migration units", "for f in .migration/units/*/tolerances.json; do sed -i 's/a/b/' \"$f\"; done", "block"),
-    ("R3 for loop mv over .migration units", "for f in .migration/units/*/tolerances.json; do mv \"$f\" \"$f.bak\"; done", "block"),
-    ("R3 for loop rm over .migration units", "for f in .migration/units/*/tolerances.json; do rm \"$f\"; done", "block"),
-    ("R3 for loop tee into .migration units", "for f in .migration/units/*/tolerances.json; do echo x | tee \"$f\"; done", "block"),
-    ("R3 for loop rm over .migration ledger glob", "for f in .migration/0*.md; do rm \"$f\"; done", "block"),
+    ("R3 for loop redirect write into .migration units", "for f in .migration/units/*/tolerances.json; do echo x > \"$f\"; done", "approve"),
+    ("R3 for loop sed -i over .migration units", "for f in .migration/units/*/tolerances.json; do sed -i 's/a/b/' \"$f\"; done", "approve"),
+    ("R3 for loop mv over .migration units", "for f in .migration/units/*/tolerances.json; do mv \"$f\" \"$f.bak\"; done", "approve"),
+    ("R3 for loop rm over .migration units", "for f in .migration/units/*/tolerances.json; do rm \"$f\"; done", "approve"),
+    ("R3 for loop tee into .migration units", "for f in .migration/units/*/tolerances.json; do echo x | tee \"$f\"; done", "approve"),
+    ("R3 for loop rm over .migration ledger glob", "for f in .migration/0*.md; do rm \"$f\"; done", "approve"),
     ("R3 for loop over non-migration paths writes", "for f in build/*.json; do rm \"$f\"; done", "approve"),
-    ("R5 loop var reassigned to a ledger path blocks", "for f in a b; do f=.migration/06_decisions.md; echo x > \"$f\"; done", "block"),
+    ("R5 loop var reassigned to a ledger path (approve)", "for f in a b; do f=.migration/06_decisions.md; echo x > \"$f\"; done", "approve"),
     ("R3 for loop over build output paths writes", "for d in build out; do echo x > \"$d/x.json\"; done", "approve"),
-    ("R3 while loop body write into .migration", "while true; do rm .migration/units/x; done", "block"),
-    ("R3 if-then body write into .migration", "if true; then rm .migration/units/x; fi", "block"),
+    ("R3 while loop body write into .migration", "while true; do rm .migration/units/x; done", "approve"),
+    ("R3 if-then body write into .migration", "if true; then rm .migration/units/x; fi", "approve"),
     ("R3 for loop over legacy hosts read", "for h in tdprod.corp; do psql -h $h -c 'SELECT 1'; done", "approve"),
     ("R3 for loop over legacy hosts write", "for h in tdprod.corp; do psql -h $h -c 'DROP TABLE t'; done", "block"),
     ("R3 for loop write checks every host", "for h in lakebase-host tdprod.corp; do psql -h \"$h\" -d mig -c 'DROP TABLE t'; done", "block"),
@@ -734,12 +735,21 @@ WARN_PROBES = [
 ]
 
 
+def _commit_ws(ws: Path) -> None:
+    """The allowlist and ledger in force are the committed copies; every probe workspace is a repo."""
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    subprocess.run(["git", "-C", str(ws), "-c", "user.email=t@example.com", "-c", "user.name=t", "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                    "commit", "-qm", "ws"], check=True)
+
+
 def _make_ws(tmp_path_factory, name: str, allowlist: dict, files: dict) -> Path:
     ws = tmp_path_factory.mktemp(name)
     (ws / ".migration").mkdir()
     (ws / ".migration" / "allowed_targets.json").write_text(json.dumps(allowlist))
     for fname, body in files.items():
         (ws / fname).write_text(body)
+    _commit_ws(ws)
     return ws
 
 
@@ -751,6 +761,7 @@ def _make_tmp_ws(tmp_path: Path, name: str, allowlist: dict, files: dict) -> Pat
         path = ws / fname
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
+    _commit_ws(ws)
     return ws
 
 
@@ -801,7 +812,7 @@ def test_probe2(label: str, command: str, expected: str, workspace2: Path):
 
 def test_table_covers_every_probe():
     assert len(PROBES) == 108
-    assert sum(1 for p in PROBES if _row(p)[2] == "approve") == 21
+    assert sum(1 for p in PROBES if _row(p)[2] == "approve") == 30
     assert len({p[0] for p in PROBES2}) == len(PROBES2)
 
 
@@ -1089,8 +1100,8 @@ def plugin(tmp_path_factory) -> Path:
     ("git -C plugin diff (approve)", "git -C {plugin} diff -- hooks/dbx_guard.py", "approve"),
     ("git -C plugin stash list (approve)", "git -C {plugin} stash list", "approve"),
     ("git -C plugin stash show (approve)", "git -C {plugin} stash show -p", "approve"),
-    ("git stash in the workspace", "git stash", "block"),                                                           # round 8: rewrites the working copy
-    ("git -C ws stash", "git -C {ws} stash", "block"),                                                              # round 8
+    ("git stash in the workspace (approve)", "git stash", "approve"),                                               # working copy only; the allowlist is upstream
+    ("git -C ws stash (approve)", "git -C {ws} stash", "approve"),                                                  # only the running guard's tree is protected
     # round 4: no `cwd` in the event -> a relative operand that could be the running guard blocks
     ("relative sed -i hooks/dbx_guard.py, no event cwd", "sed -i 's/a/b/' hooks/dbx_guard.py", "block"),
     ("relative ../hooks/dbx_guard.py, no event cwd", "sed -i 's/a/b/' ../hooks/dbx_guard.py", "block"),
@@ -1163,7 +1174,7 @@ def plugin(tmp_path_factory) -> Path:
     ("git -C plugin config core.hooksPath", "git -C {plugin} config core.hooksPath /tmp/h", "block"),
     ("git clone into plugin/hooks", "git clone https://x/y.git {plugin}/hooks", "block"),
     ("git clone over the plugin", "git clone https://x/y.git {plugin}", "block"),
-    ("git clone into .migration", "git clone https://x/y.git .migration/vendor", "block"),
+    ("git clone into .migration", "git clone https://x/y.git .migration/vendor", "approve"),
     ("env -C plugin git pull", "env -C {plugin} git pull", "block"),
     ("GIT_WORK_TREE=plugin git pull", "GIT_WORK_TREE={plugin} GIT_DIR={plugin}/.git git pull", "block"),
     ("GIT_DIR=plugin/.git git checkout", "GIT_DIR={plugin}/.git git checkout main", "block"),
@@ -1216,8 +1227,8 @@ def test_running_guard_tree_is_tamper_proof(label: str, command: str, expected: 
     ("cwd=ws: relative hooks/ is not the running guard (approve)", "ws", "sed -i 's/a/b/' hooks/dbx_guard.py", "approve"),
     ("cwd=ws: relative hooks.json is not the running guard (approve)", "ws", "echo '{{}}' > hooks.json", "approve"),
     ("cwd=ws: ruff --fix hooks/ is not the running guard (approve)", "ws", "ruff check --fix hooks/", "approve"),
-    ("cwd=ws: .migration write still blocks", "ws", "echo x > .migration/06_decisions.md", "block"),
-    ("cwd=ws/src: ../.migration write still blocks", "src", "echo x > ../.migration/06_decisions.md", "block"),
+    ("cwd=ws: .migration write (approve)", "ws", "echo x > .migration/06_decisions.md", "approve"),
+    ("cwd=ws/src: ../.migration write (approve)", "src", "echo x > ../.migration/06_decisions.md", "approve"),
     # round 5
     ("cwd=plugin: git pull", "plugin", "git pull", "block"),
     ("cwd=plugin: git checkout <branch>", "plugin", "git checkout main", "block"),
@@ -1314,15 +1325,15 @@ _COMMENT_GAP = "\n-- a long comment " + "x" * 80 + "\n"
 
 PROBES3 = [
     # F1: a `.migration/` path assigned to a shell variable, then written through it
-    ("F1 var path redirect", 'P=.migration/allowed_targets.json; printf \'{}\' > "$P"', "block"),
-    ("F1 var path braces redirect", 'P=.migration/06_decisions.md; echo x >> "${P}"', "block"),
-    ("F1 export var path tee", 'export OUT=.migration/06_decisions.md && echo x | tee $OUT', "block"),
-    ("F1 var dir + file", 'D=.migration; echo x > $D/06_decisions.md', "block"),
-    ("F1 var path rm", 'F=".migration/allowed_targets.json"; rm -f "$F"', "block"),
-    ("F1 var path sed -i", 'F=.migration/allowed_targets.json; sed -i "s/a/b/" "$F"', "block"),
-    ("F1 var path cp dest", 'T=.migration/allowed_targets.json; cp /tmp/x "$T"', "block"),
-    ("F1 chained var", 'D=.migration; F=$D/allowed_targets.json; echo x > $F', "block"),
-    ("F1 var abs ws path", 'W={ws}; echo x > $W/.migration/allowed_targets.json', "block"),
+    ("F1 var path redirect", 'P=.migration/allowed_targets.json; printf \'{}\' > "$P"', "approve"),
+    ("F1 var path braces redirect", 'P=.migration/06_decisions.md; echo x >> "${P}"', "approve"),
+    ("F1 export var path tee", 'export OUT=.migration/06_decisions.md && echo x | tee $OUT', "approve"),
+    ("F1 var dir + file", 'D=.migration; echo x > $D/06_decisions.md', "approve"),
+    ("F1 var path rm", 'F=".migration/allowed_targets.json"; rm -f "$F"', "approve"),
+    ("F1 var path sed -i", 'F=.migration/allowed_targets.json; sed -i "s/a/b/" "$F"', "approve"),
+    ("F1 var path cp dest", 'T=.migration/allowed_targets.json; cp /tmp/x "$T"', "approve"),
+    ("F1 chained var", 'D=.migration; F=$D/allowed_targets.json; echo x > $F', "approve"),
+    ("F1 var abs ws path", 'W={ws}; echo x > $W/.migration/allowed_targets.json', "approve"),
     ("F1 var path read (approve)", 'F=.migration/06_decisions.md; cat "$F"', "approve"),
     ("F1 var path recon write (approve)", 'F=.migration/recon/u1/log; echo x > "$F"', "approve"),
     ("F1 var other path write (approve)", 'F=notes.md; echo x > "$F"', "approve"),
@@ -1533,17 +1544,18 @@ PROBES3 = [
     ("G2 dbx sql execute positional SQL allowlisted write (approve)", "databricks sql execute 'DELETE FROM mig_cat.s.t'", "approve"),
     ("G2 dbx sql execute positional SQL read (approve)", "databricks sql execute 'SELECT 1 FROM prod.s.t'", "approve"),
     ("G2 dbx sql execute --warehouse-id then positional write", "databricks sql execute --warehouse-id abc 'DELETE FROM prod.s.t'", "block"),
-    # G3 (class): git forms that rewrite the working copy in the workspace block like `git clean` / `reset --hard`
-    ("G3 git stash", "git stash", "block"),
-    ("G3 git stash -u", "git stash -u", "block"),
-    ("G3 git stash push", "git stash push", "block"),
-    ("G3 git stash push -m msg", "git stash push -m wip", "block"),
-    ("G3 git stash save", "git stash save wip", "block"),
-    ("G3 git -C ws stash", "git -C {ws} stash", "block"),
-    ("G3 git checkout -f main", "git checkout -f main", "block"),
-    ("G3 git checkout --force main", "git checkout --force main", "block"),
-    ("G3 git switch -f main", "git switch -f main", "block"),
-    ("G3 git switch --discard-changes main", "git switch --discard-changes main", "block"),
+    # G3 (class): git forms that rewrite the working copy approve — the allowlist in force is upstream,
+    # and the same verb on the guard tree still blocks through the guard-tree rule
+    ("G3 git stash", "git stash", "approve"),
+    ("G3 git stash -u", "git stash -u", "approve"),
+    ("G3 git stash push", "git stash push", "approve"),
+    ("G3 git stash push -m msg", "git stash push -m wip", "approve"),
+    ("G3 git stash save", "git stash save wip", "approve"),
+    ("G3 git -C ws stash", "git -C {ws} stash", "approve"),
+    ("G3 git checkout -f main", "git checkout -f main", "approve"),
+    ("G3 git checkout --force main", "git checkout --force main", "approve"),
+    ("G3 git switch -f main", "git switch -f main", "approve"),
+    ("G3 git switch --discard-changes main", "git switch --discard-changes main", "approve"),
     ("G3 git stash pop (approve)", "git stash pop", "approve"),
     ("G3 git stash list (approve)", "git stash list", "approve"),
     ("G3 git stash show (approve)", "git stash show -p", "approve"),
@@ -1620,6 +1632,7 @@ def workspace3(tmp_path_factory) -> Path:
     (ws / "sub").mkdir()
     for fname, body in FILES3.items():
         (ws / fname).write_text(body)
+    _commit_ws(ws)
     return ws
 
 

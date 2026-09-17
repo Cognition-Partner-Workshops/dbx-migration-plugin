@@ -2,6 +2,7 @@
 Databricks CLI/REST read shapes, identity swaps, `.migration/` integrity, legacy read shapes,
 and the cheap Python/Spark script scan."""
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -338,6 +339,8 @@ def test_identity_variables_without_a_client_in_the_segment_are_not_the_guards_b
 
 
 # ---------------------------------------------------------------- A2(a) `.migration/` integrity
+# `.migration/` is writable: the allowlist in force is the committed copy on the protected
+# branch, so a session-side write can never widen its own scope.
 
 @pytest.mark.parametrize("cmd", [
     "echo x > .migration/allowed_targets.json", "echo x >> .migration/06_decisions.md", "sed -i 's/a/b/' .migration/x.json",
@@ -347,8 +350,8 @@ def test_identity_variables_without_a_client_in_the_segment_are_not_the_guards_b
     "python3 - <<'EOF'\nopen('.migration/x', 'w').write('1')\nEOF", "cat y > ./.migration/x", "echo x > /ws/.migration/x",
     "cd .migration && echo x > allowed_targets.json",
 ])
-def test_writes_under_migration_block(cmd):
-    assert ".migration" in block(cmd).reason
+def test_writes_under_migration_are_working_copy_only(cmd):
+    approve(cmd)
 
 
 @pytest.mark.parametrize("cmd", [
@@ -403,3 +406,124 @@ def test_doctor_probe_command_blocks_via_subprocess(tmp_path: Path):
     r = subprocess.run([sys.executable, str(HOOKS / "dbx_guard.py")], input=json.dumps(event), text=True, check=False,
                        capture_output=True, cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(tmp_path)})
     assert r.returncode == 2 and "block" in r.stdout
+
+
+# ---------------------------------------------------------------- the allowlist in force is the committed copy
+
+def _git(ws: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(ws), *args], check=True, capture_output=True)
+
+
+@pytest.fixture
+def git_workspace(tmp_path: Path) -> Path:
+    origin = tmp_path / "origin.git"
+    ws = tmp_path / "ws"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    subprocess.run(["git", "init", "-b", "main", "-q", str(ws)], check=True)
+    _git(ws, "config", "user.email", "t@example.com")
+    _git(ws, "config", "user.name", "t")
+    (ws / ".migration").mkdir()
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["tdprod.corp"]}))
+    (ws / ".migration" / "06_decisions.md").write_text("# Decisions\n")
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "setup")
+    _git(ws, "remote", "add", "origin", str(origin))
+    _git(ws, "push", "-q", "-u", "origin", "main")
+    _git(ws, "remote", "set-head", "origin", "main")
+    return ws
+
+
+def test_working_copy_edit_never_widens_scope(git_workspace: Path):
+    ws = git_workspace
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat", "wide"]}))
+    cfg = g.load_config(ws)
+    assert cfg.catalogs == ["mig_cat"]
+    assert cfg.policy_ref == "refs/remotes/origin/HEAD:.migration/allowed_targets.json"
+    v = g.evaluate("databricks sql execute --catalog wide -e 'CREATE TABLE s.t AS SELECT 1'", cfg, root=ws, cwd=str(ws))
+    assert v.decision == "block" and "allowlist in force: refs/remotes/origin/HEAD" in v.reason
+
+
+def test_no_git_reads_the_working_copy(tmp_path: Path):
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"]}))
+    cfg = g.load_config(tmp_path)
+    assert cfg.policy_ref == "working copy" and cfg.catalogs == ["mig_cat"]
+
+
+def test_committed_widening_still_reads_upstream(git_workspace: Path):
+    ws = git_workspace
+    _git(ws, "checkout", "-qb", "feature")
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat", "wide"]}))
+    _git(ws, "commit", "-qam", "widen")
+    cfg = g.load_config(ws)
+    assert cfg.catalogs == ["mig_cat"] and cfg.policy_ref == "refs/remotes/origin/HEAD:.migration/allowed_targets.json"
+    v = g.evaluate("databricks sql execute --catalog wide -e 'CREATE TABLE s.t AS SELECT 1'", cfg, root=ws, cwd=str(ws))
+    assert v.decision == "block"
+
+
+def test_no_remote_falls_back_to_head(git_workspace: Path):
+    ws = git_workspace
+    _git(ws, "remote", "remove", "origin")
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat", "wide"]}))
+    cfg = g.load_config(ws)
+    assert cfg.catalogs == ["mig_cat"] and cfg.policy_ref == "HEAD:.migration/allowed_targets.json"
+
+
+def test_edit_tool_writes_in_a_git_workspace(git_workspace: Path):
+    ws = git_workspace
+    cfg = g.load_config(ws)
+    def verdict(tool: str, tool_input: dict) -> g.Verdict:
+        return g.evaluate_edit(tool, tool_input, cfg, ws, str(ws))
+    assert verdict("write", {"file_path": str(ws / ".migration" / "allowed_targets.json"), "content": "{}"}).decision == "approve"
+    assert verdict("write", {"file_path": str(ws / ".migration" / "00_context.md"), "content": "# ctx\n"}).decision == "approve"
+    blocked = verdict("edit", {"file_path": str(ws / ".migration" / "06_decisions.md"),
+                               "old_string": "# Decisions\n", "new_string": "# Decisions\nmore prose\n"})
+    assert blocked.decision == "block" and "append-only" in blocked.reason
+    blocked = verdict("edit", {"file_path": str(ws / ".migration" / "06_decisions.md"), "old_string": "# Decisions\n",
+                               "new_string": "# Decisions\n| D-7 | 2026-01-01 | legacy_write_authorized: drop dbo.orders |\n"})
+    assert blocked.decision == "block"
+    assert verdict("edit", {"file_path": str(ws / ".migration" / "06_decisions.md"), "old_string": "# Decisions\n",
+                            "new_string": "# Decisions\n| D-7 | 2026-01-01 | accept tolerances |\n"}).decision == "approve"
+
+
+def test_decision_row_must_be_committed(git_workspace: Path):
+    ws = git_workspace
+    cfg = g.load_config(ws)
+    cmd = "DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.customers ADD cdc_ts DATETIME2'"
+    ledger = ws / ".migration" / "06_decisions.md"
+    ledger.write_text(ledger.read_text() +
+        "| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n")
+    v = g.evaluate(cmd, g.load_config(ws), root=ws, cwd=str(ws))
+    assert v.decision == "block" and "is not a row in refs/remotes/origin/HEAD:.migration/06_decisions.md" in v.reason
+    _git(ws, "add", ".migration/06_decisions.md")
+    _git(ws, "commit", "-qm", "decision")
+    _git(ws, "push", "-q", "origin", "main")
+    cfg = g.load_config(ws)
+    assert g.evaluate(cmd, cfg, root=ws, cwd=str(ws)).decision == "approve"
+
+
+def test_uncommitted_ledger_never_authorizes(git_workspace: Path):
+    ws = git_workspace
+    _git(ws, "rm", "-q", "--cached", ".migration/06_decisions.md")
+    _git(ws, "commit", "-qm", "drop the committed ledger")
+    _git(ws, "push", "-q", "origin", "main")
+    (ws / ".migration" / "06_decisions.md").write_text(
+        "# Decisions\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n")
+    v = g.evaluate("DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.customers ADD cdc_ts DATETIME2'",
+                   g.load_config(ws), root=ws, cwd=str(ws))
+    assert v.decision == "block" and "no committed .migration/06_decisions.md" in v.reason
+
+
+def test_policy_survives_migration_dir_deletion(git_workspace: Path):
+    ws = git_workspace
+    _git(ws, "fetch", "-q", "origin")
+    _git(ws, "symbolic-ref", "-d", "refs/remotes/origin/HEAD")
+    shutil.rmtree(ws / ".migration")
+    cfg = g.load_config(ws)
+    assert cfg.catalogs == ["mig_cat"] and cfg.policy_ref == "origin/main:.migration/allowed_targets.json"
+    v = g.evaluate("databricks sql execute --catalog wide -e 'CREATE TABLE s.t AS SELECT 1'", cfg, root=ws, cwd=str(ws))
+    assert v.decision == "block"
+
+
+def test_no_git_and_no_migration_dir_is_not_a_workspace(tmp_path: Path):
+    assert g.load_config(tmp_path) is None

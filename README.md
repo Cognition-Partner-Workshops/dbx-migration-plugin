@@ -35,7 +35,7 @@ Pin a version instead of tracking the default branch:
 ```json
 {
   "requiredPlugins": [
-    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.3.0" }
+    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.3.1" }
   ]
 }
 ```
@@ -58,7 +58,10 @@ After installing, run the `install-dbx-factory` skill once per org (see `OVERVIE
 
 The PreToolUse hook recognises the client a shell command runs and lets only known read shapes
 through; everything else it recognises blocks. It is a no-op outside a workspace (no
-`.migration/allowed_targets.json` up the tree) and reads its policy from that file:
+`.migration/allowed_targets.json` up the tree). The allowlist in force is the copy committed
+on the protected branch (`refs/remotes/origin/HEAD`, else `origin/main`/`origin/master`, else
+`HEAD`, else the working copy at bootstrap before any git history): a session may edit
+`.migration/` and open a PR, but a local edit never widens its own scope. Policy:
 
 ```json
 {
@@ -95,9 +98,7 @@ securable is not in `catalogs`, non-GET or bodied REST calls to a Databricks hos
 token), `EXPLAIN ANALYZE <write>` and side-effecting functions (`nextval`, `pg_terminate_backend`,
 `dblink`, `DBMS_*`, `OPENROWSET`, ...) and lock / transaction tokens that hold the source (`WITH (TABLOCKX|XLOCK|UPDLOCK|HOLDLOCK|SERIALIZABLE)`,
 `FOR UPDATE|SHARE`, `LOCKING ... FOR WRITE|EXCLUSIVE`, `SET TRANSACTION READ WRITE`) on a legacy source -- `SET TRANSACTION
-ISOLATION LEVEL <any>` / `READ ONLY`, `NOLOCK`-style hints and Teradata `LOCKING ... FOR ACCESS|READ` are reads --, writes under `.migration/` except
-`recon/` and `waves/` (including the git forms that rewrite the whole working copy: `stash [push|save]`, `checkout|switch -f`, `reset
---hard|--merge|--keep`, `clean`, `restore .`), edits to the running guard's own plugin tree, a program the guard has no rule for in front of a SQL
+ISOLATION LEVEL <any>` / `READ ONLY`, `NOLOCK`-style hints and Teradata `LOCKING ... FOR ACCESS|READ` are reads --, edits to the running guard's own plugin tree, a program the guard has no rule for in front of a SQL
 client (`strace`, `chroot`, `firejail`, ...; `env`, `nice`, `nohup`, `timeout`, `sudo`, `ssh host`, `docker exec|run`, `kubectl exec` are modelled), and anything the guard cannot
 read (unreadable scripts, `eval`, `$(...)`, decoder pipes, `sh -c "$X"`, `xargs`, a relative script after a `cd` it cannot resolve). Remote executions on a legacy source through
 `ssh`, `docker exec`, `kubectl exec`, `aws ssm send-command`, or `az vm run-command invoke` are read through like direct commands and block for remote scripts or unreadable payloads. Every relative
@@ -106,14 +107,16 @@ only cheaply inspected for literal SQL; the factory-doctor's read-only-principal
 for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row there to pin a new shape.
 
 **File-edit tools.** `hooks.json` has a second PreToolUse matcher, `^(edit|write|MultiEdit)$`, over the event's
-`tool_name`; the guard reads `tool_input.file_path` and its new content. It blocks writes under `.migration/` except
-`recon/` and `waves/`, and permits `06_decisions.md` only when the edit adds a `D-<id>` row. This covers only file-edit
-tools the platform routes through PreToolUse under those names.
+`tool_name`; the guard reads `tool_input.file_path` and its new content. Writes under `.migration/` are the
+session's working copy and pass; `06_decisions.md` stays append-only for `D-<id>` rows and never accepts a
+`legacy_write_authorized` row from a session. This covers only file-edit tools the platform routes through PreToolUse
+under those names.
 
 **Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
 `DBX_DECISION=D-<id>` prefix matching a `legacy_write_authorized` row in `.migration/06_decisions.md` that names every
 object written. `guard_mode: warn` never downgrades an unauthorized legacy write. Decision rows that authorize legacy writes
-are added by a human via PR; the edit tool cannot add them.
+are added by a human via PR; the edit tool cannot add them, and the ledger the guard reads is only the committed copy on
+the protected branch (no working-copy fallback), so an unmerged row never authorizes.
 
 The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
 `.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
