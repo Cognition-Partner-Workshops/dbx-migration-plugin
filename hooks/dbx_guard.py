@@ -1455,9 +1455,7 @@ def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd
         except OSError:
             old = ""
     kind, violations = _touch(file_path, cwd or "", root), []
-    resolved = os.path.normpath(file_path if os.path.isabs(file_path) else os.path.join(cwd or "", file_path)).split(os.sep)
-    ledger = Path(file_path).name == "06_decisions.md" and ".migration" in resolved
-    if ledger:
+    if kind == "inside" and Path(file_path).name == "06_decisions.md":
         added = new[len(old):] if new.startswith(old) else new
         if "legacy_write_authorized" in added.lower():
             violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
