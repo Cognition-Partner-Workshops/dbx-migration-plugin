@@ -68,10 +68,9 @@ def mask_unsupported(facts: SchemaFacts, categories) -> SchemaFacts:
 
 def structural_checks(pairs: list[tuple[SchemaFacts, SchemaFacts]]) -> dict[str, str]:
     """category -> "checked" when at least one object was read and no facts on either side
-    marks it unsupported; "unsupported" is a hole, not a pass. Grants are "direct_only":
-    the readers see direct object grants (class-1 / table_privileges rows); role-inherited
-    and schema/database-scope grants are not expanded."""
-    return {cat: ("direct_only" if cat == "grants" else "checked")
+    marks it unsupported; "unsupported" is a hole, not a pass. Grants are "effective":
+    role membership is expanded on both sides."""
+    return {cat: ("effective" if cat == "grants" else "checked")
             if pairs and not any(cat in f.unsupported for pair in pairs for f in pair)
             else "unsupported" for cat in CATEGORIES}
 

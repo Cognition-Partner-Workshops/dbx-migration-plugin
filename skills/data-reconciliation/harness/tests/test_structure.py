@@ -75,11 +75,11 @@ def test_overlay_serves_fixture_facts_and_delegates_the_rest():
 
 def test_structural_checks_mark_a_reader_hole():
     full = SchemaFacts()
-    assert set(structural_checks([(full, full)]).values()) == {"checked", "direct_only"}
+    assert set(structural_checks([(full, full)]).values()) == {"checked", "effective"}
     d = load_dictionary(FIXTURES / "example_databricks" / "dictionary.json")
     t = next(iter(d.tables.values()))
     sc = structural_checks([(full, t)])
-    assert sc["indexes"] == "unsupported" and sc["grants"] == "direct_only"
+    assert sc["indexes"] == "unsupported" and sc["grants"] == "effective"
     assert sc["triggers"] == sc["constraints"] == "checked"
     assert set(structural_checks([]).values()) == {"unsupported"}
 
@@ -182,7 +182,7 @@ def test_tier0_fails_on_missing_trigger_and_grant():
     assert result["merge_eligible"] is False
     assert result["merge_block_reasons"][0] == "structural_gap"
     assert t0["stats"]["structural_checks"] == {
-        c: "direct_only" if c == "grants" else "checked" for c in CATEGORIES}
+        c: "effective" if c == "grants" else "checked" for c in CATEGORIES}
     assert t0["stats"]["structural_diff"]["loans"]["triggers"]
 
 
@@ -434,7 +434,7 @@ def test_build_result_structural_gap_from_checks_alone():
     t = TierResult(0, "structural_parity", True, 1, [],
                    {"structural_checks": {"constraints": "checked", "triggers": "unsupported",
                                           "indexes": "checked", "sequences_identity": "checked",
-                                          "grants": "direct_only"}})
+                                          "grants": "effective"}})
     r = build_result("u", "live", "m1", "t1", [t], rerun_proof=PROVEN_RERUN)
     assert "structural_gap" in r["merge_block_reasons"] and r["merge_eligible"] is False
     t = TierResult(0, "structural_parity", True, 1, [],
@@ -481,7 +481,7 @@ def test_databricks_fixture_marks_triggers_checked_not_a_hole():
     sc = structural_checks([(t, t)])
     # Delta reads every category but indexes (identity comes from SHOW CREATE TABLE DDL)
     assert sc == {c: ("unsupported" if c == "indexes" else
-                      "direct_only" if c == "grants" else "checked") for c in sc}
+                      "effective" if c == "grants" else "checked") for c in sc}
 
 
 def test_tier0_informational_source_keys_must_exist_on_the_target():
@@ -714,6 +714,65 @@ def test_postgres_schema_facts_reads_triggers_and_grants():
     assert facts.triggers["trg_a"] == ("before", ("insert", "update"), "row")
     assert facts.triggers["trg_i"] == ("instead of", ("delete",), "statement")
     assert facts.grants == {"app_rw": frozenset({"select"}), "reporting_ro": frozenset({"select"})}
+
+
+def test_sqlserver_grants_query_expands_role_membership():
+    from tests.loans import _StubConn
+
+    class Conn(_StubConn):
+        def cursor(self):
+            outer = self
+
+            class Cur:
+                def execute(self, sql, params=()):
+                    outer.executed.append((sql, params))
+                    outer.rows = []
+
+                def fetchall(self):
+                    return outer.rows
+            return Cur()
+    from recon.adapters import SqlServerSourceAdapter
+    a = SqlServerSourceAdapter.__new__(SqlServerSourceAdapter)
+    a._conn = Conn()
+    a.statements = a.rows_fetched = 0
+    a.schema_facts("dbo.loans")
+    grants = next((s, p) for s, p in a._conn.executed if "database_permissions" in s)
+    sql, params = grants
+    for fragment in ("sys.database_role_members", "db_datareader", "db_datawriter", "db_owner"):
+        assert fragment in sql
+    assert params == ("dbo", "loans", "dbo")
+
+
+def test_postgres_grants_query_expands_role_membership():
+    from tests.loans import _StubConn
+
+    class Conn(_StubConn):
+        def cursor(self):
+            outer = self
+
+            class Cur:
+                def execute(self, sql, params=()):
+                    outer.executed.append((sql, params))
+                    sql_l = sql.lower()
+                    if "server_version" in sql_l or "current_setting" in sql_l:
+                        outer.rows = [(150000,)]
+                    else:
+                        outer.rows = []
+
+                def fetchall(self):
+                    return outer.rows
+            return Cur()
+    from recon.adapters import PostgresSourceAdapter
+    a = PostgresSourceAdapter.__new__(PostgresSourceAdapter)
+    a._conn = Conn()
+    a.statements = a.rows_fetched = 0
+    a.schema_facts("public.loans")
+    grants = next((s, p) for s, p in a._conn.executed if "table_privileges" in s)
+    sql, params = grants
+    for fragment in ("pg_auth_members", "pg_read_all_data", "pg_write_all_data",
+                     "rolsuper", "relowner"):
+        assert fragment in sql
+    assert params == ("public", "loans", "public", "loans")
 
 
 def test_databricks_schema_facts_maps_information_schema():
