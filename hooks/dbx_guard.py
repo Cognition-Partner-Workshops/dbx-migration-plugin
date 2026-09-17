@@ -315,8 +315,8 @@ def load_config(start: Path) -> GuardConfig | None:
         text, ref = _committed(d, str(CONFIG_REL))
         if text is None:
             if not path.is_file() and not path.parent.is_dir():
-                return None   # matched only through .git and the policy is committed nowhere
-            text = path.read_text()   # a .migration/ dir with no allowlist fails closed, as before
+                return None
+            text = path.read_text()
         policy_ref = f"{ref}:{CONFIG_REL}" if ref else "working copy"
         data = json.loads(text)
         if not isinstance(data, dict):
