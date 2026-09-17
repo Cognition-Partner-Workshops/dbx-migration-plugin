@@ -738,9 +738,10 @@ def test_sqlserver_grants_query_expands_role_membership():
     a.schema_facts("dbo.loans")
     grants = next((s, p) for s, p in a._conn.executed if "database_permissions" in s)
     sql, params = grants
-    for fragment in ("sys.database_role_members", "db_datareader", "db_datawriter", "db_owner"):
+    for fragment in ("sys.database_role_members", "db_datareader", "db_datawriter", "db_owner",
+                     "p.class = 3", "p.class = 0"):
         assert fragment in sql
-    assert params == ("dbo", "loans", "dbo")
+    assert params == ("dbo", "loans", "dbo", "dbo")
 
 
 def test_postgres_grants_query_expands_role_membership():
@@ -773,6 +774,47 @@ def test_postgres_grants_query_expands_role_membership():
                      "rolsuper", "relowner"):
         assert fragment in sql
     assert params == ("public", "loans", "public", "loans")
+
+
+def _pg_grants_sql(version_num):
+    from tests.loans import _StubConn
+
+    class Conn(_StubConn):
+        def cursor(self):
+            outer = self
+
+            class Cur:
+                def execute(self, sql, params=()):
+                    outer.executed.append((sql, params))
+                    sql_l = sql.lower()
+                    if "server_version" in sql_l or "current_setting" in sql_l:
+                        outer.rows = [(version_num,)]
+                    else:
+                        outer.rows = []
+
+                def fetchall(self):
+                    return outer.rows
+            return Cur()
+    from recon.adapters import PostgresSourceAdapter
+    a = PostgresSourceAdapter.__new__(PostgresSourceAdapter)
+    a._conn = Conn()
+    a.statements = a.rows_fetched = 0
+    a.schema_facts("public.loans")
+    return next(s for s, _ in a._conn.executed if "table_privileges" in s)
+
+
+def test_postgres_grants_query_honours_pg16_inherit_option():
+    sql16 = _pg_grants_sql(160000)
+    assert "am.inherit_option" in sql16 and "u.rolinherit" not in sql16
+    sql15 = _pg_grants_sql(150000)
+    assert "u.rolinherit" in sql15 and "am.inherit_option" not in sql15
+
+
+def test_structural_checks_marks_direct_only_grants():
+    s = SchemaFacts()
+    t = SchemaFacts(grants_effective=False)
+    assert structural_checks([(s, t)])["grants"] == "direct_only"
+    assert structural_checks([(s, s)])["grants"] == "effective"
 
 
 def test_databricks_schema_facts_maps_information_schema():

@@ -100,7 +100,8 @@ provenance warning and the run is not merge-eligible.
   not-nulls, checks, indexes, triggers (by timing+event, names ignored), identity columns, and
   grants (source grantees mapped through the spec's `principal_map` before comparing). The
   tier's `stats.structural_checks` records each category as `checked`, `effective` (grants:
-  role membership is expanded on both sides),
+  direct grants plus role membership on SQL Server/Postgres) or `direct_only` (Databricks:
+  Unity Catalog group membership is not expanded),
   or `unsupported`, and `stats.structural_diff` the per-object detail; an unsupported category
   is unchecked, not
   clean. `result.json`'s `merge_block_reasons` puts `structural_gap` first when a structural

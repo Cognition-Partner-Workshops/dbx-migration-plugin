@@ -68,11 +68,17 @@ def mask_unsupported(facts: SchemaFacts, categories) -> SchemaFacts:
 
 def structural_checks(pairs: list[tuple[SchemaFacts, SchemaFacts]]) -> dict[str, str]:
     """category -> "checked" when at least one object was read and no facts on either side
-    marks it unsupported; "unsupported" is a hole, not a pass. Grants are "effective":
-    role membership is expanded on both sides."""
-    return {cat: ("effective" if cat == "grants" else "checked")
-            if pairs and not any(cat in f.unsupported for pair in pairs for f in pair)
-            else "unsupported" for cat in CATEGORIES}
+    marks it unsupported; "unsupported" is a hole, not a pass. Grants are "effective"
+    when every reader expanded role membership, "direct_only" when any could only see
+    direct grants (Unity Catalog)."""
+    def label(cat: str) -> str:
+        if not pairs or any(cat in f.unsupported for pair in pairs for f in pair):
+            return "unsupported"
+        if cat == "grants":
+            return "effective" if all(f.grants_effective for pair in pairs for f in pair) \
+                else "direct_only"
+        return "checked"
+    return {cat: label(cat) for cat in CATEGORIES}
 
 
 def _trigger_cover(facts: SchemaFacts) -> Counter:
