@@ -308,19 +308,23 @@ def _committed(ws: Path, rel: str) -> tuple[str | None, str | None]:
 
 def load_config(start: Path) -> GuardConfig | None:
     start = start.resolve()
-    path = next((d / CONFIG_REL for d in [start, *start.parents] if (d / CONFIG_REL).is_file() or (d / CONFIG_REL.parent).is_dir()), None)
-    if path is None:
-        return None
-    text, ref = _committed(path.parent.parent, str(CONFIG_REL))
-    if text is None:
-        text = path.read_text()
-    policy_ref = f"{ref}:{CONFIG_REL}" if ref else "working copy"
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} must be a JSON object")
-    cfg = GuardConfig.from_dict(data, path)
-    cfg.policy_ref = policy_ref
-    return cfg
+    for d in [start, *start.parents]:
+        path = d / CONFIG_REL
+        if not (path.is_file() or path.parent.is_dir() or (d / ".git").exists()):
+            continue
+        text, ref = _committed(d, str(CONFIG_REL))
+        if text is None:
+            if not path.is_file() and not path.parent.is_dir():
+                return None   # matched only through .git and the policy is committed nowhere
+            text = path.read_text()   # a .migration/ dir with no allowlist fails closed, as before
+        policy_ref = f"{ref}:{CONFIG_REL}" if ref else "working copy"
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} must be a JSON object")
+        cfg = GuardConfig.from_dict(data, path)
+        cfg.policy_ref = policy_ref
+        return cfg
+    return None
 
 def _sql_view(text: str) -> str:
     """Blank comments and string literals, keeping a literal that is the argument of a dynamic-SQL executor."""
@@ -744,10 +748,7 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
         return None, "no `DBX_DECISION=D-<id>` prefix on the command"
     ledger, ref = _committed(root, ".migration/06_decisions.md") if _DECISION_ID.fullmatch(did) else ("", None)
     if ledger is None:
-        try:
-            ledger = (root / ".migration" / "06_decisions.md").read_text(errors="replace")
-        except OSError:
-            return did, "cannot read .migration/06_decisions.md"
+        return did, "no committed .migration/06_decisions.md on the protected branch (or HEAD); a session cannot author its own authorization"
     row = next((ln for ln in ledger.splitlines() if (m := _DECISION_ROW.search(ln)) and m.group(1).lower() == did.lower()), None)
     if row is None:
         return did, f"`{did}` is not a row in {ref or 'working copy'}:.migration/06_decisions.md"

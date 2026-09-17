@@ -3209,3 +3209,20 @@ def test_reuse_record_accepts_the_manifests_own_source_flags(tmp_path):
     for extra in (["--source-family", "sqlserver"], ["--source-secret", "OTHER"], ["--param", "db=cards"]):
         r = subprocess.run(base + extra, capture_output=True, text=True, check=False)
         assert r.returncode == 2 and "manifest" in r.stderr, (extra, r.stderr)
+
+
+def test_allowlist_committed_other_contract_files_resolve_the_same_ref(tmp_path):
+    ws = make_workspace(tmp_path)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    _git(ws, "rm", "-q", "--cached", ".migration/03_recon_tolerances.json")
+    _git(ws, "commit", "-qm", "contract is the allowlist only")
+    _git(ws, "remote", "add", "origin", str(origin))
+    _git(ws, "push", "-q", "-u", "origin", "HEAD:main")
+    _git(ws, "fetch", "-q", "origin")
+    _git(ws, "remote", "set-head", "origin", "main")
+    _git(ws, "checkout", "-qb", "feature")
+    _git(ws, "add", ".migration/03_recon_tolerances.json")
+    _git(ws, "commit", "-qm", "tolerances committed on a branch")
+    c = doctor.check_allowlist_committed(ws)
+    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "untracked"

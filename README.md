@@ -115,8 +115,8 @@ under those names.
 **Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
 `DBX_DECISION=D-<id>` prefix matching a `legacy_write_authorized` row in `.migration/06_decisions.md` that names every
 object written. `guard_mode: warn` never downgrades an unauthorized legacy write. Decision rows that authorize legacy writes
-are added by a human via PR; the edit tool cannot add them, and the ledger the guard reads is the committed copy on the
-protected branch, so an unmerged row never authorizes.
+are added by a human via PR; the edit tool cannot add them, and the ledger the guard reads is only the committed copy on
+the protected branch (no working-copy fallback), so an unmerged row never authorizes.
 
 The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
 `.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same

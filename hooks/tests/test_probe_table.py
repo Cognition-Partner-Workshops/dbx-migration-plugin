@@ -735,12 +735,21 @@ WARN_PROBES = [
 ]
 
 
+def _commit_ws(ws: Path) -> None:
+    """The allowlist and ledger in force are the committed copies; every probe workspace is a repo."""
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    subprocess.run(["git", "-C", str(ws), "-c", "user.email=t@example.com", "-c", "user.name=t", "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                    "commit", "-qm", "ws"], check=True)
+
+
 def _make_ws(tmp_path_factory, name: str, allowlist: dict, files: dict) -> Path:
     ws = tmp_path_factory.mktemp(name)
     (ws / ".migration").mkdir()
     (ws / ".migration" / "allowed_targets.json").write_text(json.dumps(allowlist))
     for fname, body in files.items():
         (ws / fname).write_text(body)
+    _commit_ws(ws)
     return ws
 
 
@@ -752,6 +761,7 @@ def _make_tmp_ws(tmp_path: Path, name: str, allowlist: dict, files: dict) -> Pat
         path = ws / fname
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
+    _commit_ws(ws)
     return ws
 
 
@@ -1622,6 +1632,7 @@ def workspace3(tmp_path_factory) -> Path:
     (ws / "sub").mkdir()
     for fname, body in FILES3.items():
         (ws / fname).write_text(body)
+    _commit_ws(ws)
     return ws
 
 

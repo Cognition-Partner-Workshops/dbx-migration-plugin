@@ -2,6 +2,7 @@
 Databricks CLI/REST read shapes, identity swaps, `.migration/` integrity, legacy read shapes,
 and the cheap Python/Spark script scan."""
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -499,3 +500,30 @@ def test_decision_row_must_be_committed(git_workspace: Path):
     _git(ws, "push", "-q", "origin", "main")
     cfg = g.load_config(ws)
     assert g.evaluate(cmd, cfg, root=ws, cwd=str(ws)).decision == "approve"
+
+
+def test_uncommitted_ledger_never_authorizes(git_workspace: Path):
+    ws = git_workspace
+    _git(ws, "rm", "-q", "--cached", ".migration/06_decisions.md")
+    _git(ws, "commit", "-qm", "drop the committed ledger")
+    _git(ws, "push", "-q", "origin", "main")
+    (ws / ".migration" / "06_decisions.md").write_text(
+        "# Decisions\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n")
+    v = g.evaluate("DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.customers ADD cdc_ts DATETIME2'",
+                   g.load_config(ws), root=ws, cwd=str(ws))
+    assert v.decision == "block" and "no committed .migration/06_decisions.md" in v.reason
+
+
+def test_policy_survives_migration_dir_deletion(git_workspace: Path):
+    ws = git_workspace
+    _git(ws, "fetch", "-q", "origin")
+    _git(ws, "symbolic-ref", "-d", "refs/remotes/origin/HEAD")
+    shutil.rmtree(ws / ".migration")
+    cfg = g.load_config(ws)
+    assert cfg.catalogs == ["mig_cat"] and cfg.policy_ref == "origin/main:.migration/allowed_targets.json"
+    v = g.evaluate("databricks sql execute --catalog wide -e 'CREATE TABLE s.t AS SELECT 1'", cfg, root=ws, cwd=str(ws))
+    assert v.decision == "block"
+
+
+def test_no_git_and_no_migration_dir_is_not_a_workspace(tmp_path: Path):
+    assert g.load_config(tmp_path) is None

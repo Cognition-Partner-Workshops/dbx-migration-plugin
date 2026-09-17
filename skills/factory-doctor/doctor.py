@@ -378,9 +378,9 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
 _POLICY_REFS = ("refs/remotes/origin/HEAD", "origin/main", "origin/master", "HEAD")
 
 
-def _committed(ws: Path, rel: str) -> tuple[bytes | None, str | None]:
+def _committed(ws: Path, rel: str, refs: tuple[str, ...] = _POLICY_REFS) -> tuple[bytes | None, str | None]:
     """(bytes, ref) of `rel` from the first ref that has it (dbx_guard._committed, byte-precise)."""
-    for ref in _POLICY_REFS:
+    for ref in refs:
         try:
             r = subprocess.run(["git", "-C", str(ws), "show", f"{ref}:{rel}"], capture_output=True, timeout=5, check=False)
         except (OSError, subprocess.TimeoutExpired):
@@ -401,27 +401,23 @@ def check_allowlist_committed(ws: Path) -> Check:
         return Check("allowlist_committed", "fail",
             f"git cannot read the repository under {ws}: {_redact(r.stderr.decode(errors='replace').strip())}; "
             "the workspace must be the committed repository the wave is planned from")
+    _, ref = _committed(ws, LEDGER_CONTRACT_FILES[0])   # the whole contract is pinned to the one ref the allowlist is on
     states: dict[str, str] = {}
-    refs: dict[str, str] = {}
     for rel in LEDGER_CONTRACT_FILES:
-        committed, ref = _committed(ws, rel)
+        committed, _ = _committed(ws, rel, (ref,) if ref else ())
         if not (ws / rel).is_file():
             states[rel] = "missing"
-            continue
-        if committed is None:
+        elif committed is None:
             states[rel] = "untracked"
-            continue
-        refs[rel] = ref
-        disk = (ws / rel).read_bytes()
-        states[rel] = "clean" if disk == committed else "modified"
+        else:
+            states[rel] = "clean" if (ws / rel).read_bytes() == committed else "modified"
     bad = [f"{rel} {state}" for rel, state in states.items() if state != "clean"]
     if bad:
         shown = "; ".join(bad)
         return Check("allowlist_committed", "fail", "the working copy is not the committed contract: " + shown
             + ". Merge the allowlist PR into the protected branch and `git fetch`, then re-run", states)
-    matched = next(iter(refs.values()), "HEAD")
     return Check("allowlist_committed", "ok",
-        f"allowed_targets.json and 03_recon_tolerances.json are byte-equal to {matched}", states)
+        f"allowed_targets.json and 03_recon_tolerances.json are byte-equal to {ref}", states)
 
 
 def _norm_catalog(name) -> str:
