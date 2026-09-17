@@ -51,9 +51,9 @@ def decide(tool: str, tool_input: dict, ws: Path, env: dict[str, str] | None = N
 
 
 @pytest.mark.parametrize("tool,path,tool_input,expected", [
-    ("write", ".migration/allowed_targets.json", {"content": "{}"}, "block"),
-    ("edit", ".migration/00_context.md", {"old_string": "a", "new_string": "b"}, "block"),
-    ("MultiEdit", ".migration/05_progress.md", {"edits": [{"old_string": "a", "new_string": "b"}]}, "block"),
+    ("write", ".migration/allowed_targets.json", {"content": "{}"}, "approve"),
+    ("edit", ".migration/00_context.md", {"old_string": "a", "new_string": "b"}, "approve"),
+    ("MultiEdit", ".migration/05_progress.md", {"edits": [{"old_string": "a", "new_string": "b"}]}, "approve"),
     ("write", ".migration/recon/u1/result.json", {"content": "{}"}, "approve"),
     ("write", ".migration/waves/wave-1.json", {"content": "{}"}, "approve"),
     ("edit", "src/etl.py", {"old_string": "ok", "new_string": "better"}, "approve"),
@@ -108,9 +108,9 @@ def test_nested_workspace_edit_falls_back_to_file_config(tmp_path):
         "old_string": "# Decisions\n",
         "new_string": "# Decisions\n| D-8 | 2026-01-01 | accept tolerances |\n",
     }, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
-    blocked = run_hook("write", {"file_path": str(allowlist), "content": "{}"}, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
+    edited = run_hook("write", {"file_path": str(allowlist), "content": "{}"}, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
     assert added.returncode == 0
-    assert blocked.returncode == 2
+    assert edited.returncode == 0   # .migration/ is writable; the allowlist in force is upstream
 
 
 def test_hooks_json_has_exec_then_edit_matcher():

@@ -191,13 +191,14 @@ def test_lakebase_branch_globs_block_nonmatching_writes(cmd, needle):
     "cat > analysis.md <<'EOF'\nThe legacy job runs INSERT INTO prod_cat.sales.orders nightly.\nEOF",
     "grep -rn 'INSERT INTO prod_cat' converted/ | wc -l",
     "sed -i 's/INSERT INTO prod_cat.s.t/INSERT INTO mig_cat.s.t/' converted/load.sql",
+    # .migration/ is writable: the allowlist in force is the committed copy upstream, not the working copy
+    "echo 'CREATE TABLE prod_cat.sales.orders_v2 (id INT)' >> .migration/05_findings.md",
 ])
 def test_sql_text_outside_any_client_is_prose(cmd):
     approve(cmd)
 
 
 @pytest.mark.parametrize("cmd", [
-    "echo 'CREATE TABLE prod_cat.sales.orders_v2 (id INT)' >> .migration/05_findings.md",  # A2a: ledger write
     "databricks --profile $PROFILE experimental aitools tools query \"SELECT 1\"",  # A3: profile swap
     "databricks --profile demo experimental aitools tools query \"SELECT 1 -- DROP TABLE prod_cat.s.t\"",  # A3: profile swap
     "bash -c \"databricks --profile demo experimental aitools tools query 'INSERT INTO mig_cat.s.t SELECT 1'\"",  # A3: profile swap

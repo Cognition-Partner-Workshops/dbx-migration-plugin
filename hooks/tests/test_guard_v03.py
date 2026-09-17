@@ -261,8 +261,9 @@ def test_decision_authorizes_the_pinned_legacy_write(tmp_path: Path):
     assert verdict.decision == "approve", verdict.reason
 
 
-def test_allowlist_tampering_blocks():
-    assert ".migration" in block("rm .migration/allowed_targets.json").reason
+def test_allowlist_working_copy_is_writable():
+    # the allowlist in force is the committed copy upstream; a local edit never widens scope
+    assert g.evaluate("rm .migration/allowed_targets.json", CFG).decision == "approve"
 
 
 def test_force_push_decision_is_unchanged():
