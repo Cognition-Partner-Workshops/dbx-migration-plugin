@@ -7,7 +7,7 @@ description: Preflight for a DBX migration workspace. Verifies setup, hooks, con
 
 | `workspace` | setup files or `stop_mode` are missing | rerun `1-migration_setup` |
 | `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
-| `allowlist_committed` | allowlist or tolerances differ from `HEAD` | commit through a recorded decision |
+| `allowlist_committed` | allowlist or tolerances differ from the upstream ref (`origin/HEAD`, else `origin/main`/`master`, else `HEAD`) | merge the allowlist PR into the protected branch and `git fetch` |
 | `playbooks_in_sync` | lock/live playbooks are missing, stale, malformed, duplicated, or differ from repo | rerun `install-dbx-factory` |
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
@@ -87,7 +87,7 @@ shell): <probe_command>` — run it in the lead session's exec tool, never a sid
 |---|---|---|
 | `workspace` | setup files or `stop_mode` are missing | rerun `1-migration_setup` |
 | `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
-| `allowlist_committed` | allowlist or tolerances differ from `HEAD` | commit through a recorded decision |
+| `allowlist_committed` | allowlist or tolerances differ from the upstream ref (`origin/HEAD`, else `origin/main`/`master`, else `HEAD`) | merge the allowlist PR into the protected branch and `git fetch` |
 | `playbooks_in_sync` | lock/live playbooks are missing, stale, malformed, duplicated, or differ from repo | rerun `install-dbx-factory` |
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
