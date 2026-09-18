@@ -79,7 +79,7 @@ def test_structural_checks_mark_a_reader_hole():
     d = load_dictionary(FIXTURES / "example_databricks" / "dictionary.json")
     t = next(iter(d.tables.values()))
     sc = structural_checks([(full, t)])
-    assert sc["indexes"] == "unsupported" and sc["grants"] == "effective"
+    assert sc["indexes"] == "unsupported" and sc["grants"] == "direct_only"
     assert sc["triggers"] == sc["constraints"] == "checked"
     assert set(structural_checks([]).values()) == {"unsupported"}
 
@@ -481,7 +481,7 @@ def test_databricks_fixture_marks_triggers_checked_not_a_hole():
     sc = structural_checks([(t, t)])
     # Delta reads every category but indexes (identity comes from SHOW CREATE TABLE DDL)
     assert sc == {c: ("unsupported" if c == "indexes" else
-                      "effective" if c == "grants" else "checked") for c in sc}
+                      "direct_only" if c == "grants" else "checked") for c in sc}
 
 
 def test_tier0_informational_source_keys_must_exist_on_the_target():
@@ -739,9 +739,9 @@ def test_sqlserver_grants_query_expands_role_membership():
     grants = next((s, p) for s, p in a._conn.executed if "database_permissions" in s)
     sql, params = grants
     for fragment in ("sys.database_role_members", "db_datareader", "db_datawriter", "db_owner",
-                     "p.class = 3", "p.class = 0"):
+                     "p.class = 3", "p.class = 0", "p.state = 'D'", "EXCEPT"):
         assert fragment in sql
-    assert params == ("dbo", "loans", "dbo", "dbo")
+    assert params == ("dbo", "loans", "dbo", "dbo", "loans", "dbo", "dbo")
 
 
 def test_postgres_grants_query_expands_role_membership():
@@ -815,6 +815,15 @@ def test_structural_checks_marks_direct_only_grants():
     t = SchemaFacts(grants_effective=False)
     assert structural_checks([(s, t)])["grants"] == "direct_only"
     assert structural_checks([(s, s)])["grants"] == "effective"
+
+
+def test_dictionary_grants_effective_follows_family():
+    d = load_dictionary(FIXTURES / "example_databricks" / "dictionary.json")
+    assert all(f.grants_effective is False for f in d.tables.values())
+    for family in ("example_sqlserver", "example_postgres"):
+        p = FIXTURES / family / "dictionary.json"
+        if p.exists():
+            assert all(f.grants_effective for f in load_dictionary(p).tables.values()), family
 
 
 def test_databricks_schema_facts_maps_information_schema():

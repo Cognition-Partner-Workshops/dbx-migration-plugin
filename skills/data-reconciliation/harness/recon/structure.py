@@ -224,6 +224,8 @@ def load_dictionary(path: Path) -> FixtureDictionary:
     if not isinstance(data, dict) or not isinstance(data.get("tables"), dict):
         raise ConfigError(f"{path}: a fixture dictionary is an object with a `tables` map")
     unsupported = frozenset(str(c) for c in (data.get("unsupported") or []))
+    # UC group membership is not expanded: databricks fixture facts are direct-only
+    grants_effective = str(data.get("family") or "") != "databricks"
     tables: dict[str, SchemaFacts] = {}
     identity: dict[tuple[str, str], IdentityState] = {}
     for name, t in data["tables"].items():
@@ -260,7 +262,8 @@ def load_dictionary(path: Path) -> FixtureDictionary:
                           for n, v in (t.get("triggers") or {}).items()},
                 grants={str(g).lower(): frozenset(str(p).lower() for p in ps)
                         for g, ps in (t.get("grants") or {}).items()},
-                unsupported=unsupported | frozenset(str(c) for c in (t.get("unsupported") or [])))
+                unsupported=unsupported | frozenset(str(c) for c in (t.get("unsupported") or [])),
+                grants_effective=grants_effective)
         except (KeyError, TypeError, ValueError) as e:
             raise ConfigError(f"{path}: table {name}: bad shape: {e}") from None
     return FixtureDictionary(family=str(data.get("family") or ""), path=str(path),

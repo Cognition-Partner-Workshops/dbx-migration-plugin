@@ -105,7 +105,8 @@ class SchemaFacts:
     # effective privileges: direct grants at object, schema and database scope plus role
     # membership (db_datareader/db_datawriter, pg_read_all_data/pg_write_all_data, group roles);
     # the owner, roles inheriting from the owner, superusers and Lakebase platform roles are
-    # left out
+    # left out; SQL Server DENY at any scope removes the privilege (column-level denies
+    # are not modelled)
     grants: dict[str, frozenset[str]] = field(default_factory=dict)
     # False when the reader could only see direct grants (Unity Catalog)
     grants_effective: bool = True
@@ -1313,6 +1314,18 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
             "  WHERE p.class = 0 AND p.state IN ('G', 'W') "
             "    AND p.permission_name IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'REFERENCES')), "
+            "denied(grantee_id, perm) AS ("
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  JOIN sys.objects o ON o.object_id = p.major_id "
+            "  JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "  WHERE p.class = 1 AND s.name = ? AND o.name = ? AND p.state = 'D' "
+            "  UNION ALL "
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  JOIN sys.schemas s ON s.schema_id = p.major_id "
+            "  WHERE p.class = 3 AND s.name = ? AND p.state = 'D' "
+            "  UNION ALL "
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  WHERE p.class = 0 AND p.state = 'D'), "
             "fixed(grantee_id, perm) AS ("
             "  SELECT m.member_id, v.perm FROM m "
             "  JOIN sys.database_principals r ON r.principal_id = m.role_id "
@@ -1320,14 +1333,19 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             "               ('db_datawriter', 'UPDATE'), ('db_datawriter', 'DELETE')) v(role_name, perm) "
             "    ON v.role_name = r.name), "
             "eff(grantee_id, perm) AS ("
-            "  SELECT grantee_id, perm FROM direct "
-            "  UNION SELECT m.member_id, d.perm FROM direct d JOIN m ON m.role_id = d.grantee_id "
-            "  UNION SELECT grantee_id, perm FROM fixed) "
+            "  SELECT grantee_id, perm FROM ("
+            "    SELECT grantee_id, perm FROM direct "
+            "    UNION SELECT m.member_id, d.perm FROM direct d JOIN m ON m.role_id = d.grantee_id "
+            "    UNION SELECT grantee_id, perm FROM fixed) g "
+            "  EXCEPT "
+            "  SELECT grantee_id, perm FROM ("
+            "    SELECT grantee_id, perm FROM denied "
+            "    UNION SELECT m.member_id, d.perm FROM denied d JOIN m ON m.role_id = d.grantee_id) x) "
             "SELECT DISTINCT dp.name, e.perm FROM eff e "
             "JOIN sys.database_principals dp ON dp.principal_id = e.grantee_id "
             "WHERE dp.principal_id <> (SELECT principal_id FROM sys.schemas WHERE name = ?) "
             "  AND dp.principal_id NOT IN (SELECT member_id FROM m WHERE role_id = DATABASE_PRINCIPAL_ID('db_owner')) "
-            "ORDER BY dp.name", (schema, name, schema, schema))
+            "ORDER BY dp.name", (schema, name, schema, schema, name, schema, schema))
         grants: dict[str, set] = {}
         for grantee, priv in rows:
             grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
