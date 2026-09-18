@@ -102,9 +102,14 @@ class SchemaFacts:
     triggers: dict[str, tuple[str, tuple[str, ...], str]] = field(default_factory=dict)
     # grantee (lower) -> privileges (lower: select/insert/update/delete/...); the table owner's
     # implicit rights are left out
-    # direct object grants only (class-1 rows / table_privileges): role-inherited and
-    # schema/database-scope grants are not expanded
+    # effective privileges: direct grants at object, schema and database scope plus role
+    # membership (db_datareader/db_datawriter, pg_read_all_data/pg_write_all_data, group roles);
+    # the owner, roles inheriting from the owner, superusers and Lakebase platform roles are
+    # left out; SQL Server DENY at any scope removes the privilege (column-level denies
+    # are not modelled)
     grants: dict[str, frozenset[str]] = field(default_factory=dict)
+    # False when the reader could only see direct grants (Unity Catalog)
+    grants_effective: bool = True
     # structural categories (see recon.structure.CATEGORIES) this reader cannot deliver;
     # empty = it delivered them all
     primary_key_informational: tuple[str, ...] = ()
@@ -883,6 +888,7 @@ DICTIONARY_OBJECTS = {
         ("sys.trigger_events", "SELECT TOP 1 1 FROM sys.trigger_events"),
         ("sys.database_permissions", "SELECT TOP 1 1 FROM sys.database_permissions"),
         ("sys.database_principals", "SELECT TOP 1 1 FROM sys.database_principals"),
+        ("sys.database_role_members", "SELECT TOP 1 1 FROM sys.database_role_members"),
     ),
     "postgres": (
         ("pg_constraint", "SELECT 1 FROM pg_constraint LIMIT 1"),
@@ -900,6 +906,10 @@ DICTIONARY_OBJECTS = {
         ("server_version_num", "SELECT current_setting('server_version_num')"),
         ("information_schema.table_privileges",
          "SELECT 1 FROM information_schema.table_privileges LIMIT 1"),
+        ("pg_auth_members", "SELECT 1 FROM pg_auth_members LIMIT 1"),
+        ("pg_roles", "SELECT 1 FROM pg_roles LIMIT 1"),
+        ("pg_read_all_data", "SELECT 1 FROM pg_roles WHERE rolname = 'pg_read_all_data' LIMIT 1"),
+        ("pg_write_all_data", "SELECT 1 FROM pg_roles WHERE rolname = 'pg_write_all_data' LIMIT 1"),
     ),
     "databricks": (
         ("information_schema.table_constraints",
@@ -930,7 +940,9 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
     indexes or triggers; UC foreign keys and primary keys are informational: no actions to read."""
     facts = SchemaFacts(table=f"{catalog}.{schema}.{table}",
                         # indexes are unreadable on UC; triggers are provably absent
-                        unsupported=frozenset({"indexes"}))
+                        unsupported=frozenset({"indexes"}),
+                        # UC group membership is not expanded: direct grants only
+                        grants_effective=False)
 
     def q(view: str, sql: str, params: dict) -> list[tuple]:
         try:
@@ -1283,14 +1295,57 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             facts.triggers[tname] = (timing, tuple(sorted(set(events))), "statement")
         rows = self._dict_rows(
             table, "sys.database_permissions",
-            "SELECT dp.name, p.permission_name "
-            "FROM sys.database_permissions p "
-            "JOIN sys.database_principals dp ON dp.principal_id = p.grantee_principal_id "
-            "JOIN sys.objects o ON o.object_id = p.major_id "
-            "JOIN sys.schemas s ON s.schema_id = o.schema_id "
-            "WHERE p.class = 1 AND s.name = ? AND o.name = ? AND p.state IN ('G', 'W') "
-            "AND dp.principal_id <> s.principal_id "  # the schema owner's implicit rights are not grants
-            "ORDER BY dp.name", (schema, name))
+            "WITH m(role_id, member_id) AS ("
+            "  SELECT role_principal_id, member_principal_id FROM sys.database_role_members "
+            "  UNION ALL "
+            "  SELECT m.role_id, rm.member_principal_id FROM m "
+            "  JOIN sys.database_role_members rm ON rm.role_principal_id = m.member_id), "
+            "direct(grantee_id, perm) AS ("
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  JOIN sys.objects o ON o.object_id = p.major_id "
+            "  JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "  WHERE p.class = 1 AND s.name = ? AND o.name = ? AND p.state IN ('G', 'W') "
+            "  UNION ALL "
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  JOIN sys.schemas s ON s.schema_id = p.major_id "
+            "  WHERE p.class = 3 AND s.name = ? AND p.state IN ('G', 'W') "
+            "    AND p.permission_name IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'REFERENCES') "
+            "  UNION ALL "
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  WHERE p.class = 0 AND p.state IN ('G', 'W') "
+            "    AND p.permission_name IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'REFERENCES')), "
+            "denied(grantee_id, perm) AS ("
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  JOIN sys.objects o ON o.object_id = p.major_id "
+            "  JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "  WHERE p.class = 1 AND s.name = ? AND o.name = ? AND p.state = 'D' "
+            "  UNION ALL "
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  JOIN sys.schemas s ON s.schema_id = p.major_id "
+            "  WHERE p.class = 3 AND s.name = ? AND p.state = 'D' "
+            "  UNION ALL "
+            "  SELECT p.grantee_principal_id, p.permission_name FROM sys.database_permissions p "
+            "  WHERE p.class = 0 AND p.state = 'D'), "
+            "fixed(grantee_id, perm) AS ("
+            "  SELECT m.member_id, v.perm FROM m "
+            "  JOIN sys.database_principals r ON r.principal_id = m.role_id "
+            "  JOIN (VALUES ('db_datareader', 'SELECT'), ('db_datawriter', 'INSERT'), "
+            "               ('db_datawriter', 'UPDATE'), ('db_datawriter', 'DELETE')) v(role_name, perm) "
+            "    ON v.role_name = r.name), "
+            "eff(grantee_id, perm) AS ("
+            "  SELECT grantee_id, perm FROM ("
+            "    SELECT grantee_id, perm FROM direct "
+            "    UNION SELECT m.member_id, d.perm FROM direct d JOIN m ON m.role_id = d.grantee_id "
+            "    UNION SELECT grantee_id, perm FROM fixed) g "
+            "  EXCEPT "
+            "  SELECT grantee_id, perm FROM ("
+            "    SELECT grantee_id, perm FROM denied "
+            "    UNION SELECT m.member_id, d.perm FROM denied d JOIN m ON m.role_id = d.grantee_id) x) "
+            "SELECT DISTINCT dp.name, e.perm FROM eff e "
+            "JOIN sys.database_principals dp ON dp.principal_id = e.grantee_id "
+            "WHERE dp.principal_id <> (SELECT principal_id FROM sys.schemas WHERE name = ?) "
+            "  AND dp.principal_id NOT IN (SELECT member_id FROM m WHERE role_id = DATABASE_PRINCIPAL_ID('db_owner')) "
+            "ORDER BY dp.name", (schema, name, schema, schema, name, schema, schema))
         grants: dict[str, set] = {}
         for grantee, priv in rows:
             grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
@@ -1720,15 +1775,39 @@ class _PostgresBase(_SqlAdapterBase):
             "ORDER BY t.tgname", (schema, name))
         for tname, tgtype in rows:
             facts.triggers[tname] = _pg_trigger_shape(int(tgtype))
+        # PG16 grants inherit per-membership (pg_auth_members.inherit_option); older
+        # versions only have the member role's rolinherit flag.
+        inherit = "am.inherit_option" if self._server_version() >= 160000 else "u.rolinherit"
         rows = self._dict_rows(
             table, "information_schema.table_privileges",
-            "SELECT tp.grantee, tp.privilege_type "
-            "FROM information_schema.table_privileges tp "
-            "JOIN pg_class c ON c.relname = tp.table_name "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = tp.table_schema "
-            "WHERE tp.table_schema = %s AND tp.table_name = %s "
-            "AND tp.grantee <> pg_get_userbyid(c.relowner) "
-            "ORDER BY tp.grantee", (schema, name))
+            ("WITH RECURSIVE m(role, member) AS ("
+            "  SELECT r.rolname, u.rolname FROM pg_auth_members am "
+            "  JOIN pg_roles r ON r.oid = am.roleid JOIN pg_roles u ON u.oid = am.member "
+            "  WHERE {inherit} "
+            "  UNION "
+            "  SELECT m.role, u.rolname FROM m "
+            "  JOIN pg_roles r ON r.rolname = m.member "
+            "  JOIN pg_auth_members am ON am.roleid = r.oid JOIN pg_roles u ON u.oid = am.member "
+            "  WHERE {inherit}), "
+            "rel AS ("
+            "  SELECT pg_get_userbyid(c.relowner) AS owner FROM pg_class c "
+            "  JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s AND c.relname = %s), "
+            "direct(grantee, priv) AS ("
+            "  SELECT tp.grantee, tp.privilege_type FROM information_schema.table_privileges tp "
+            "  WHERE tp.table_schema = %s AND tp.table_name = %s), "
+            "eff(grantee, priv) AS ("
+            "  SELECT grantee, priv FROM direct "
+            "  UNION SELECT m.member, d.priv FROM direct d JOIN m ON m.role = d.grantee "
+            "  UNION SELECT m.member, v.priv FROM m "
+            "  JOIN (VALUES ('pg_read_all_data', 'SELECT'), ('pg_write_all_data', 'INSERT'), "
+            "               ('pg_write_all_data', 'UPDATE'), ('pg_write_all_data', 'DELETE')) v(role, priv) "
+            "    ON v.role = m.role) "
+            "SELECT e.grantee, e.priv FROM eff e, rel "
+            "WHERE e.grantee <> rel.owner "
+            "  AND e.grantee NOT IN (SELECT member FROM m WHERE role = rel.owner) "
+            "  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = e.grantee "
+            "                  AND (r.rolsuper OR r.rolname LIKE 'databricks\\_%%')) "
+            "ORDER BY 1, 2").replace("{inherit}", inherit), (schema, name, schema, name))
         grants: dict[str, set] = {}
         for grantee, priv in rows:
             grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())

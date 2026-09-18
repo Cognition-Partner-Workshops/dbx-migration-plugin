@@ -99,8 +99,9 @@ provenance warning and the run is not merge-eligible.
   get the same comparison as tier 7 `schema_parity`): primary keys, uniques, foreign keys,
   not-nulls, checks, indexes, triggers (by timing+event, names ignored), identity columns, and
   grants (source grantees mapped through the spec's `principal_map` before comparing). The
-  tier's `stats.structural_checks` records each category as `checked`, `direct_only` (grants:
-  direct object grants only; role-inherited and schema/database-scope grants are not expanded),
+  tier's `stats.structural_checks` records each category as `checked`, `effective` (grants:
+  direct grants plus role membership on SQL Server/Postgres) or `direct_only` (Databricks:
+  Unity Catalog group membership is not expanded),
   or `unsupported`, and `stats.structural_diff` the per-object detail; an unsupported category
   is unchecked, not
   clean. `result.json`'s `merge_block_reasons` puts `structural_gap` first when a structural

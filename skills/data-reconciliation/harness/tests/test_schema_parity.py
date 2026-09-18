@@ -40,7 +40,7 @@ def test_schema_parity_findings_map_through_the_spec():
     parity = _tier(result, "schema_parity")
     # tier 7 grades the same structural categories tier 0 reports on the other tracks
     assert parity["stats"]["structural_checks"] == {
-        c: "direct_only" if c == "grants" else "checked"
+        c: "effective" if c == "grants" else "checked"
         for c in ("constraints", "triggers", "indexes", "sequences_identity", "grants")}
     assert parity["stats"]["dictionary"] == {"source": "live", "target": "live"}
 
