@@ -1,0 +1,79 @@
+version	2026.36
+int_div	3.5 3
+dec_div	decimal(14,6) 3.333333
+dec_div2	decimal(33,23) 3.33333333333333333333333
+avg_dec	decimal(14,6) 1.666667
+sum_dec	decimal(20,2)
+concat_null	<NULL>
+concat_ws_null	a
+round_half	3 -3 3.0 2
+datediff_day	1 0
+datediff_month	0 1.0
+ts_default_prec	timestamp timestamp timestamp_ntz
+char_pad_eq	false 2 [ab] string
+char_vs_varchar	true
+rtrim_collate	true
+substr_zero	[abc]
+array_idx	10 10
+array_oob	true
+map_missing	true
+approx_pct	2.0
+exact_pct	2.5 2.5 2.5
+approx_pct_type	decimal(10,2) double
+approx_distinct	10
+nulls_order	2,1
+nulls_order_desc	2,1
+array_agg_null	1 1
+greatest_null	false
+mod_neg	-1 -1 2
+div_zero	true
+cast_bad	true
+date_format	2026-03-07 14:05 Sat
+date_trunc_week	2026-03-02 00:00:00
+day_of_week	1 2 0 7
+week_of_year	1
+regexp_like	true true
+regexp_replace_all	a-b-c
+split_part	a []
+strpos	3 3
+json	1 1
+unnest_ord	1,2
+lambda	[2, 4]
+reduce	6 6
+from_unixtime	string timestamp
+to_unixtime	86400 86400000000
+session_tz	Etc/UTC
+count_if	2
+any_value	int
+max_by	b
+string_cmp_case	false
+like_case	false
+struct_type	struct<id:int,name:string> struct<col1:int,col2:string>
+real_type	decimal(2,1) double float
+varbinary	63613937383131326361316262646361666163323331623339613233646334646137383665666638313437633465373262393830373738356166656534386262 63613937383131326361316262646361666163323331623339613233646334646137383665666638313437633465373262393830373738356166656534386262
+uuid	string
+truncate	ERROR: { "state": "FAILED", "error": { "error_code": "BAD_REQUEST", "message": "[UNRESOLVED_ROUTINE] Cannot resolve routine `truncate` on search path [`system`.`session`, `system`.`builtin`, `system`.`ai`, `de_demo_workspace`.`default`].\nVerify the spelling of `truncate`, check that the routine exists, and confirm you have `USE` privilege on the catalog and schema, and EXECUTE on the routine. SQLSTATE: 42883; line 1 pos 24" }, "sql_state": "42883" }
+listagg	a,b
+string_pad	[a][abxy]
+cast_ts_to_date	2026-01-01
+cast_str_to_ts	2026-01-01 00:00:00
+cast_dec_str	1.50
+cast_double_str	1.5 1.0E21
+bigint_overflow	false
+integer_literal_type	int bigint
+sum_int_type	bigint
+avg_int_type	double 1.5
+count_type	bigint
+string_agg_distinct	a,b
+map_keys_sorted	[b, a]
+ts_ms_trunc	2026-01-01 00:00:00.123
+interval	2026-02-28
+add_months	2026-02-28
+last_day	2026-02-28
+hash	-8582455328737087284
+if_fn	1 true
+cast_dec_to_int	2
+cast_str_int_dec	true
+varchar_bounded_cast	[abcdef]
+explode_map	a=1,b=2
+ansi_mode	ERROR: { "state": "FAILED", "error": { "error_code": "BAD_REQUEST", "message": "[UNRESOLVED_ROUTINE] Cannot resolve routine `current_setting` on search path [`system`.`session`, `system`.`builtin`, `system`.`ai`, `de_demo_workspace`.`default`].\nVerify the spelling of `current_setting`, check that the routine exists, and confirm you have `USE` privilege on the catalog and schema, and EXECUTE on the routine. SQLSTATE: 42883; line 1 pos 25" }, "sql_state": "42883" }

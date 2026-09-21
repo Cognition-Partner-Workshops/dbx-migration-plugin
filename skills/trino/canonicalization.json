@@ -1,0 +1,78 @@
+{
+  "rules": [
+    {
+      "rule": "decimal_round",
+      "applies_to": "recomputed DECIMAL columns only (division, AVG, ratios): the Trino result scale the consumer saw; stored DECIMAL(p,s) uses identity",
+      "params": {
+        "mode": "half_up",
+        "places": 2
+      }
+    },
+    {
+      "rule": "datetime_utc_truncate_ms",
+      "applies_to": "TIMESTAMP(p)->TIMESTAMP_NTZ, TIMESTAMP(p) WITH TIME ZONE->TIMESTAMP; p>3 is declared as a precision loss in the mapping",
+      "params": {
+        "assume_source_tz_for_NTZ": "coordinator time_zone from SHOW SESSION"
+      }
+    },
+    {
+      "rule": "rstrip_spaces",
+      "applies_to": "CHAR(n)->STRING (Hive char, PostgreSQL bpchar through the JDBC connector)",
+      "params": {}
+    },
+    {
+      "rule": "uuid_normalize",
+      "applies_to": "UUID->STRING",
+      "params": {}
+    },
+    {
+      "rule": "null_missing_equiv",
+      "applies_to": "*",
+      "params": {}
+    },
+    {
+      "rule": "identity",
+      "applies_to": "*",
+      "params": {}
+    }
+  ],
+  "type_map": {
+    "trino": {
+      "databricks": {
+        "decimal_max_precision": 38,
+        "note": "Delta targets, lower case; first matching entry wins. Trino TIMESTAMP(p) is zone-less so it is timestamp_ntz; only TIMESTAMP(p) WITH TIME ZONE is Delta's session-zoned timestamp. CHAR(n) is string (rstrip_spaces); the RTRIM-collated spelling is accepted when the field names that rule. Sketch types (HyperLogLog, QDigest, TDigest, SetDigest) are unrepresentable: recompute. Anything not listed is reported as unmapped, not passed.",
+        "types": [
+          { "source": "BOOLEAN", "target": "boolean" },
+          { "source": "TINYINT", "target": "tinyint" },
+          { "source": "SMALLINT", "target": "smallint" },
+          { "source": "INTEGER", "target": "int" },
+          { "source": "BIGINT", "target": "bigint" },
+          { "source": "REAL", "target": "float" },
+          { "source": "DOUBLE", "target": "double" },
+          { "source": "DECIMAL(p,s)", "target": "decimal(p,s)" },
+          { "source": "DECIMAL(p)", "target": "decimal(p,0)" },
+          { "source": "DECIMAL", "target": "decimal(38,0)" },
+          { "source": "VARCHAR(n)", "target": "string", "accepts": ["varchar(n)"] },
+          { "source": "VARCHAR", "target": "string" },
+          { "source": "CHAR(n)", "target": "string", "conditional": { "string collate utf8_binary_rtrim": "rstrip_spaces" } },
+          { "source": "CHAR", "target": "string", "conditional": { "string collate utf8_binary_rtrim": "rstrip_spaces" } },
+          { "source": "VARBINARY", "target": "binary" },
+          { "source": "JSON", "target": "variant", "accepts": ["string"] },
+          { "source": "DATE", "target": "date" },
+          { "source": "TIME(p)", "target": "string" },
+          { "source": "TIME", "target": "string" },
+          { "source": "TIME(p) WITH TIME ZONE", "target": "string" },
+          { "source": "TIMESTAMP(p)", "target": "timestamp_ntz", "conditional": { "timestamp": "datetime_utc_truncate_ms" } },
+          { "source": "TIMESTAMP", "target": "timestamp_ntz", "conditional": { "timestamp": "datetime_utc_truncate_ms" } },
+          { "source": "TIMESTAMP(p) WITH TIME ZONE", "target": "timestamp" },
+          { "source": "TIMESTAMP WITH TIME ZONE", "target": "timestamp" },
+          { "source": "INTERVAL YEAR TO MONTH", "target": "interval year to month" },
+          { "source": "INTERVAL DAY TO SECOND", "target": "interval day to second" },
+          { "source": "UUID", "target": "string" },
+          { "source": "IPADDRESS", "target": "string" },
+          { "source": "IPPREFIX", "target": "string" }
+        ]
+      }
+    }
+  }
+}
