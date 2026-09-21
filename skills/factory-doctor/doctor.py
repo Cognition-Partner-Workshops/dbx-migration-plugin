@@ -38,7 +38,7 @@ DRIVERS = {
     "postgres": "psycopg",
 }  # the adapters the harness runs
 # The families `dbx-recon run --family` accepts; only sqlserver and postgres have a privilege query.
-SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", "sqlserver", "teradata")
+SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", "sqlserver", "teradata", "trino")
 TARGET_KINDS = ("databricks", "lakebase")  # the harness's --target-kind values; the type map is keyed by both
 # The committed wave contract: the guard and the harness read the working copy, so a working copy
 # that differs from HEAD is a contract nobody reviewed.

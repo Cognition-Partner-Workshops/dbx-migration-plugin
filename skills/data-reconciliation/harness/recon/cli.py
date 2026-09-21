@@ -35,7 +35,7 @@ from .fixture_shape import compare_fixture
 from .rerun import check_proof, grade_rerun, load_prior, load_record, source_digest
 from .typemap import apply_type_map, load_type_map
 
-SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres")
+SOURCE_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "sqlserver", "databricks", "postgres", "trino")
 # databricks: Delta under Unity Catalog (analytical track). lakebase: a schema in a Lakebase
 # branch database (operational track); --target-catalog then names the branch database and
 # must still appear in .migration/allowed_targets.json.

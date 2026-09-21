@@ -50,6 +50,7 @@ databricks labs lakebridge transpile --input-source <unit dir> --output-folder <
 | `ssis` | SparkSQL (experimental) | — | SDP | `tsql-ssis` |
 | `datastage` | SparkSQL, PySpark | — | SDP | none yet |
 | Informatica | not listed as a transpile source | | | `informatica-xml` (hand conversion; analyzer may still inventory the XML export, confirm `--source-tech`) |
+| Trino / Presto | not listed as a transpile source | | | `trino` (hand conversion; see the `trino` delta below) |
 
 Selection rule: deterministic first (BladeBridge/Morpheus) for anything they list; Switch only for procedural bodies they reject, and its output is a *draft with the same standing as an LLM-written conversion*: every statement reviewed against the dialect skill, then proved by recon. Never run Switch on a whole estate to save time; it removes the determinism that makes systematic-error detection cheap.
 
@@ -91,6 +92,31 @@ Additions to the `oracle` row above for `--source-dialect oracle`; the base row 
 | Rejects / hand-convert | SQL*Plus directives (`SET`, `DEFINE`/`&n`, `WHENEVER`, `SPOOL`, `EXIT`) | strip and re-express as job parameters / task outcome (trap 17); a transpiler run on a `.sql` with these produces parse errors for the whole file, so split the SQL body out first |
 | Rejects / hand-convert | PL/SQL bodies: packages, `BULK COLLECT`/`FORALL`, exception blocks, `CREATE OR REPLACE TRIGGER` with `:NEW`/`:OLD`, `PRAGMA AUTONOMOUS_TRANSACTION`, `FOR UPDATE SKIP LOCKED`, `SAVEPOINT`/`ROLLBACK TO` | OLTP-profile units go to Lakebase/Postgres by hand (`oracle-plsql` example 02); analytical units become set-based DBSQL procedures with trigger logic folded into the writer (example 03; traps 10, 13, 14) |
 | Rejects / hand-convert | `CREATE SYNONYM`, `@dblink` references, `CREATE DATABASE LINK`, VPD (`DBMS_RLS`) / `DBMS_REDACT` policies, `GRANT ... TO PUBLIC` | inventory only; resolve synonyms in lineage, external links stay `INFERRED` edges, policies map through `databricks-unity-catalog` or `GAP` (traps 18, 19) |
+
+### `trino` delta (SEEDED, 2026-09-21, from `skills/trino`; no engagement unit yet)
+The matrix above lists no `trino` or `presto` `--source-dialect` as of the 2026-09 read, so there is no transpiler
+row to add to. Status: **hand conversion under `skills/trino/SKILL.md`**. An operator may run the generic ANSI path
+once per engagement and paste `--help` plus the result here with a unit id; a flag in a newer release is not support
+until a unit's error log and recon say so. The rows below are what an ANSI-shaped pass is expected to do to Trino
+SQL; signatures name the `skills/trino` traps table ("Known traps with reconciliation signature").
+
+| Class | Construct | Expectation and recon signature |
+|---|---|---|
+| Converts | `SELECT`/CTEs/window functions/`GROUPING SETS`, `CREATE TABLE AS`, `INSERT ... SELECT`, `CREATE VIEW`, `LATERAL`, `FILTER (WHERE)`, `listagg`, `regexp_like`/`regexp_replace`, `date_trunc`, `COALESCE`/`NULLIF`/`IF` | trust after a read; still cast `AVG(decimal)` and decimal division to the Trino result scale (trap "Decimal division scale") |
+| Mangles silently | `a / b` on integers | comes out as `/` (returns `3.5` on Databricks): Tier 3 fractions on ratio columns, Tier 2 sum drift; must be `DIV` |
+| Mangles silently | `date_diff('day', a, b)` | usually rewritten to `datediff(b, a)` (calendar days): Tier 3 off-by-one on `*_days` for about half the rows (trap "Elapsed vs calendar days"); must be `timestampdiff(DAY, a, b)` |
+| Mangles silently | `approx_percentile` -> `percentile_approx`, `approx_distinct` -> `approx_count_distinct` | name-for-name swap of two different estimators: Tier 3 on `median_*`, Tier 4 ranking flips when groups sit inside the error band (trap "Approximate aggregates"); recon recomputes exact values on both sides |
+| Mangles silently | `array_agg(x ORDER BY k)`, `array_agg(DISTINCT x ORDER BY x)` | `ORDER BY` inside the aggregate dropped and NULL elements lost: Tier 3 array text diffs, `size()` shortfall (trap "NULLs in array_agg", "Aggregate ORDER BY") |
+| Mangles silently | `arr[1]`, `substr(s, 0, n)`, `split_part` out of range, `regexp_extract(s, re)` without a group, `greatest(a, NULL)` | index base, position-0, NULL-vs-`''`, group 0-vs-1 and NULL-skipping defaults all differ: Tier 3 on derived columns (traps "substr", "split_part", "greatest") |
+| Mangles silently | `ORDER BY x` without `NULLS FIRST/LAST`, `LIMIT n` on top of it | Trino NULLs last both directions, Databricks `ASC` NULLs first: Tier 4 first/last rows, Tier 1 on top-n marts |
+| Mangles silently | `CHAR(n)` columns (Hive `char`, PostgreSQL `bpchar` via JDBC), `CAST(s AS VARCHAR(n))` | padding and cast truncation lost: Tier 3 on `CHAR` keys and string lengths, Tier 1 join shortfall (trap "CHAR padding") |
+| Mangles silently | `TIMESTAMP(p)` (zone-less) typed as `TIMESTAMP`, `from_unixtime` (string on Databricks), `AT TIME ZONE` | whole-hour offsets and string-typed timestamps: Tier 3 offsets, Tier 1 day-boundary drift (traps "Zone-less vs zoned", "from_unixtime type") |
+| Mangles silently | `date_format(ts, '%Y-%m')` (MySQL tokens) | tokens passed through as literals or half-mapped: Tier 4 text diffs, wrong dates on parse |
+| Mangles silently | `DROP TABLE` + CTAS rebuild, `SET SESSION insert_existing_partitions_behavior` | translated literally or dropped: the load stops being idempotent / atomic (traps "DROP + CTAS", "insert_existing_partitions_behavior") |
+| Rejects / hand-convert | `CROSS JOIN UNNEST(...) AS t(a, b)`, `UNNEST ... WITH ORDINALITY`, `map_entries`/`map_agg`/`multimap_agg`, `ROW(...)` types and `.field` access | `LATERAL VIEW EXPLODE`/`POSEXPLODE`, `map_from_entries(collect_list(struct()))`, `named_struct` by hand (`skills/trino` rows 66-71, examples 02-03) |
+| Rejects / hand-convert | Hive `WITH (partitioned_by=, bucketed_by=, external_location=)`, Iceberg `ALTER TABLE ... EXECUTE`, `CALL system.*` | Delta `CLUSTER BY`, UC external tables, `OPTIMIZE`/`VACUUM` on the target only (`skills/trino` P1, P2, P15, P16) |
+| Rejects / hand-convert | `SECURITY INVOKER` views, `GRACE PERIOD` materialized views, `PREPARE`/`EXECUTE ... USING`, `WITH FUNCTION` inline UDFs, `MATCH_RECOGNIZE`, `TABLESAMPLE`, hidden `$path`/`$partition` columns, HyperLogLog/QDigest sketch columns | governance finding, Lakeflow MV, `EXECUTE IMMEDIATE`, UC SQL UDF, window rewrite, no like-for-like (`skills/trino` P7, P8, P22, rows 87, 92-93, 96, type map sketch rows) |
+| Rejects / hand-convert | dbt `type: trino` profiles, Airflow `TrinoOperator` DAGs, Trino Gateway routing rules | orchestration re-expressed as Lakeflow Jobs / dbt-databricks by hand (`skills/trino` P19-P21) |
 
 ## Reconciler [docs]
 Lakebridge ships its own reconcile module. It may run as a second opinion on a unit; it never replaces the kit's `dbx-recon` gate and never self-certifies (`AGENTS.md`). If both disagree, the kit's harness result stands and the disagreement is a finding.

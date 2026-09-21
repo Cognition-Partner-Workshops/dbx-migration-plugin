@@ -43,7 +43,7 @@ The depth is recorded in `result.json` and the summary.
 | `sqlserver` (pyodbc, `[sqlserver]` extra) | live-tested: SQL Server 2022 -> Lakebase rehearsal |
 | `postgres` (psycopg, `[lakebase]` extra) | live-tested: Postgres source and Lakebase target |
 | `databricks` (`[databricks]` extra) | live-tested: Delta target and Databricks-to-Databricks source |
-| `redshift`, `snowflake`, `teradata`, `oracle` | **untested**: the adapter raises `NotImplementedError("<family> source adapter is untested; see SKILL.md")` before any connection. Reconcile these through Lakehouse Federation (`--family databricks`) or land an adapter with a rehearsal first. |
+| `redshift`, `snowflake`, `teradata`, `oracle`, `trino` | **untested**: the adapter raises `NotImplementedError("<family> source adapter is untested; see SKILL.md")` before any connection. Reconcile these through Lakehouse Federation (`--family databricks`) or land an adapter with a rehearsal first. `trino`: no adapter yet; reconcile the Hive/Parquet side through Lakehouse Federation or a landed snapshot (`--family databricks`, `--mode snapshot` with a manifest) and JDBC-connector catalogs directly against their engine (e.g. `--family postgres`); the `trino` type map is still audited by the doctor via `--source-family trino`. |
 
 ```bash
 dbx-recon estimate --mapping <mapping_spec.json> --tolerances .migration/03_recon_tolerances.json \

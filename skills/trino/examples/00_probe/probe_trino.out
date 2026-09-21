@@ -1,0 +1,93 @@
+version	483
+int_div	3
+dec_div	decimal(21,13) 3.3333333333333
+dec_div2	decimal(32,22) 3.3333333333333333333333
+avg_dec	decimal(10,2) 1.67
+sum_dec	decimal(38,2)
+concat_null	<NULL>
+round_half	3 -3 3.0E0
+date_diff_day	0
+date_diff_month	1
+ts_default_prec	timestamp(0) timestamp(3) with time zone timestamp(3) with time zone
+ts_literal_p6	timestamp(6)
+char_pad_eq	true 4 [ab]
+char_vs_varchar	true
+substr_zero	[]
+array_idx	10
+array_oob	true
+map_missing	true
+approx_pct	3.0E0
+approx_pct_type	real
+approx_distinct	10
+nulls_order	1,2,NULL
+nulls_order_desc	2,1,NULL
+array_agg_null	2
+greatest_null	true
+mod_neg	-1 -1
+div_zero	true
+cast_bad	true
+format_datetime	2026-03-07 14:05 Sat
+date_format	2026-03-07 14:05 Saturday
+date_trunc_week	2026-03-02
+day_of_week	7 1
+week_of_year	1
+regexp_like	true
+regexp_replace_all	a-b-c
+split_part	a <NULL>
+strpos	3
+json	1
+unnest_ord	1,2
+lambda	ERROR: Query 20260921_153847_00039_m4iqz failed: line 1:23: Cannot cast array(integer) to varchar LINE 1: SELECT 'lambda' AS k, CAST(transform(ARRAY[1,2], x -> x * 2) AS varchar) AS v ^
+reduce	6
+from_unixtime	timestamp(3) with time zone
+to_unixtime	8.64E4
+current_date_type	date timestamp(3)
+at_tz	timestamp(0) with time zone
+bool_agg	true
+count_if	2
+arbitrary	integer
+max_by	b
+string_cmp_case	false
+like_case	false
+row_type	row(integer, varchar(1))
+row_field	a
+real_type	real decimal(2,1) double
+varbinary	CA978112CA1BBDCAFAC231B39A23DC4DA786EFF8147C4E72B9807785AFEE48BB
+uuid	uuid
+ipaddr	ipaddress
+truncate	ERROR: Query 20260921_153903_00057_m4iqz failed: line 1:72: Unexpected parameters (double, integer) for function truncate. Expected: truncate(decimal(p,s)), truncate(decimal(p,s), integer), truncate(double), truncate(number), truncate(real) LINE 1: SELECT 'truncate' AS k, CAST(truncate(2.79) AS varchar) || ' ' || CAST(truncate(CAST(2.79 AS double), 1) AS varchar) AS v ^
+percentile_exact	3
+listagg	a,b
+string_pad	[a][abxy]
+cast_ts_to_date	2026-01-01
+cast_str_to_ts	2026-01-01 00:00:00.000
+cast_dec_str	1.50
+cast_double_str	1.5E0 1.0E21
+bigint_overflow	true
+integer_literal_type	integer bigint
+sum_int_type	bigint
+avg_int_type	double 1.5E0
+count_type	bigint
+string_agg_distinct	a,b
+map_agg	{"a":1}
+map_keys_sorted	ERROR: Query 20260921_153917_00072_m4iqz failed: line 1:32: Cannot cast array(varchar(1)) to varchar LINE 1: SELECT 'map_keys_sorted' AS k, CAST(map_keys(MAP(ARRAY['b','a'], ARRAY[1,2])) AS varchar) AS v ^
+ts_ms_trunc	2026-01-01 00:00:00.123
+interval	2026-02-28
+date_add	2026-02-28
+last_day	2026-02-28
+hash	ERROR: Query 20260921_153921_00077_m4iqz failed: line 1:21: Cannot cast varbinary to varchar LINE 1: SELECT 'hash' AS k, CAST(xxhash64(to_utf8('a')) AS varchar) AS v ^
+if_fn	1 true
+try_cast_int_from_dec	3
+cast_str_int_dec	true
+varchar_bounded_cast	[abc]
+grouping_sets	1
+qualify_absent	trino has no QUALIFY
+approx_set	3
+row_number_ties	n/a
+catalog	lake
+catalog	ops
+catalog	system
+functions_count	901
+system_metadata_catalogs	ops | ops | postgresql | OPERATIONAL
+system_metadata_catalogs	system | system | system | OPERATIONAL
+system_metadata_catalogs	lake | lake | hive | OPERATIONAL

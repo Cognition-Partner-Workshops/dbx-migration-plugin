@@ -1,0 +1,11 @@
+-- Promo lift report: explode the order attribute map, keep the 'promo' key, count orders per promo code.
+SELECT
+    u.attr_value                                    AS promo,
+    COUNT(*)                                        AS orders,
+    SUM(CASE WHEN cardinality(o.attrs) > 2 THEN 1 ELSE 0 END) AS rich_attr_orders,
+    COUNT(DISTINCT element_at(o.attrs, 'channel'))  AS channels
+FROM lake.core.orders o
+CROSS JOIN UNNEST(map_entries(o.attrs)) AS u(attr_key, attr_value)
+WHERE u.attr_key = 'promo'
+GROUP BY u.attr_value
+ORDER BY orders DESC, promo;
