@@ -2310,7 +2310,6 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
              ("b" * 40, ".migration/recon/u/"): ".migration/recon/u/result.json\n.migration/recon/u/rows.csv\n",
              ("2" * 40, ".migration/recon/v/"): "", ("b" * 40, ".migration/recon/v/"): ".migration/recon/v/result.json\n",
              ("3" * 40, ".migration/recon/w/"): ".migration/recon/w/result.json\n", ("b" * 40, ".migration/recon/w/"): ""}
-
     def fake_run(cmd, **kw):
         calls.append(cmd)
         if cmd[3] == "fetch":
