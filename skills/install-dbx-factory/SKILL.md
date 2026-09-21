@@ -34,7 +34,7 @@ If the builtin playbook tools are unavailable or lack permission, fall back to t
 Propose an update to the org (or repo, if the user names one) environment blueprint so migration sessions start with the toolchain ready:
 - Databricks CLI installed and configured for auth via secret names (never values).
 - Python with the recon harness installed: `pip install -e "skills/data-reconciliation/harness[databricks,<source family>]"`, then `dbx-recon selftest` must print PASS. Add `databricks-sdk`.
-- (optional) Databricks Labs Lakebridge, if the `skills-extra/lakebridge` skill is in use.
+- (optional, from the dialects plugin) Databricks Labs Lakebridge, if the `lakebridge` skill from `dbx-migration-dialects` (`skills-extra/`) is in use.
 - Any source-system client the engagement needs (note as TODO until the front-door intake names the stack).
 
 Use your environment-config tools to submit this as a blueprint suggestion for the user to approve. Do not claim the blueprint is active until the user approves it.

@@ -1,6 +1,6 @@
 ---
 name: informatica-xml
-description: Source-dialect skill for Informatica PowerCenter estates. Use when enumerating a PowerCenter repository or its XML exports (workflows, sessions, mappings, mapplets, parameter files, pre/post-session shell and SQL), extracting mapping lineage, converting mappings/sessions/workflows to Databricks (Lakeflow Spark Declarative Pipelines, PySpark, Lakeflow Jobs, DBSQL procedures for pre/post SQL), or reconciling a converted Informatica unit with the harness. Hardened against the Albion insurance fixture estate; IICS (cloud) exports and DataStage are separate future skills and are not covered here.
+description: Source-dialect skill for Informatica PowerCenter estates (repository XML exports, workflows, sessions, mappings, mapplets, parameter files, pre/post-session shell and SQL). Use when extracting mapping lineage, converting PowerCenter units to Databricks (Lakeflow Spark Declarative Pipelines, PySpark, Lakeflow Jobs, DBSQL procedures), or reconciling a converted Informatica unit; IICS and DataStage are not covered.
 ---
 
 # Informatica PowerCenter Dialect
