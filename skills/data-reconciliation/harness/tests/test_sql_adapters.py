@@ -26,7 +26,7 @@ from tests.loans import (
     _StubConn,
 )
 
-UNTESTED_FAMILIES = ("redshift", "snowflake", "teradata", "oracle")
+UNTESTED_FAMILIES = ("redshift", "snowflake", "teradata", "oracle", "trino")
 
 
 _CATALOG_OBJECT_RE = re.compile(
