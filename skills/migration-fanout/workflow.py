@@ -56,7 +56,8 @@ PLUGIN = Path(POINTER["plugin"]).resolve() if isinstance(POINTER.get("plugin"), 
 PIPELINE_UPDATES = (PLUGIN or ROOT) / "skills" / "target-routing" / "pipeline_updates.py"
 WAVES_DIR = ROOT / ".migration" / "waves"
 MANIFEST_PATH = (WAVES_DIR / POINTER["manifest"]).resolve()
-if not (MANIFEST_PATH.name.startswith("wave-") and TAG_RE.fullmatch(MANIFEST_PATH.stem[len("wave-"):] or "")):
+if not (MANIFEST_PATH.name.startswith("wave-")
+        and TAG_RE.fullmatch(MANIFEST_PATH.stem[len("wave-"):] or "")):
     raise SystemExit(f"{POINTER_PATH} manifest must be named wave-<N>.json or wave-<pipeline>-<N>.json "
                      "so every sibling wave and pipeline sees it in the collision check")
 if (MANIFEST_PATH.suffix != ".json" or MANIFEST_PATH.parent != WAVES_DIR.resolve()
@@ -79,6 +80,7 @@ if sys.argv[1:]:
     raise SystemExit("workflow.py takes no arguments; it runs through run_workflow")
 
 def _tmp_write(path, text):
+    """Write `text` to `path` via a sibling tmp file, so the real path is replaced atomically."""
     tmp = path.with_suffix("".join(path.suffixes) + ".tmp")
     tmp.write_text(text)
     tmp.replace(path)
@@ -308,7 +310,8 @@ def validate_manifest(m, doctor=None):
         and all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in pipelines.values())),
         "manifest key 'pipelines' must map each pipeline the plan split (letters, digits, '_') to a "
         "positive wave count, the <pipeline>-<N> of its wave-<pipeline>-<N>.json manifests")
-    req(m["wave"] != 0 or m.get("width", 20) == 1, "wave 0 is the serial shared-objects wave: set width to 1")
+    req(m["wave"] != 0 or m.get("width", 20) == 1,
+        "wave 0 is the serial shared-objects wave: set width to 1")
     req(isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"]) and ".." not in m["base_branch"],
         "manifest 'base_branch' must be a plain branch name (letters, digits, _ . / -)")
     req("target_namespace" not in m or valid_namespace(m["target_namespace"]),
@@ -841,8 +844,6 @@ def disjoint_slices(a, b):
     def below(hi, lo):
         return (hi is not None and lo is not None and hi[0][0] == lo[0][0] and literal(hi[0], hi[0][0])
                 and (hi[0][1] < lo[0][1] or (hi[0][1] == lo[0][1] and not (hi[1] and lo[1]))))
-
-
     def apart(x, y):
         if x[0] == "like" or y[0] == "like":
             return False
@@ -1082,26 +1083,6 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
 
 def launch_checks():
     """The launch-time checks; returns the pipeline order."""
-    global BASE_SHA, DOCTOR
-    stop_mode = (
-        MANIFEST.get("capabilities", {}).get("stop_mode")
-        if isinstance(MANIFEST.get("capabilities"), dict) else None
-    )
-    if not gates_approved(
-        MANIFEST.get("stop_c"), MANIFEST.get("wave"), MANIFEST.get("gates_sha"),
-        decision_ledger(), stop_mode
-    ):
-        raise SystemExit(
-            f"manifest 'gates_sha' {MANIFEST.get('gates_sha')!r} is not approved by row "
-            f"{MANIFEST.get('stop_c')!r} of {DECISIONS_PATH} (a table row with cells | D-<n> | user:<id>"
-            f"{' or default-accepted' if stop_mode == 'soft' else ''} | STOP C wave-{MANIFEST.get('wave')} "
-            "gates_sha <value> |); this run halts until STOP C records it"
-        )
-    validate_manifest(MANIFEST)
-    check_wave_tag(TAG, MANIFEST)
-    BASE_SHA = wave_base()
-    DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
-    validate_manifest(MANIFEST, DOCTOR)
     check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                         other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
@@ -1109,6 +1090,21 @@ def launch_checks():
     check_dependencies(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                        namespace=MANIFEST.get("target_namespace", ""))
     return check_pipeline_updates(PIPELINE_UPDATES, MANIFEST_PATH)
+
+
+STOP_MODE = (MANIFEST.get("capabilities", {}).get("stop_mode")
+             if isinstance(MANIFEST.get("capabilities"), dict) else None)
+if not gates_approved(MANIFEST.get("stop_c"), MANIFEST.get("wave"), MANIFEST.get("gates_sha"),
+                      decision_ledger(), STOP_MODE):
+    raise SystemExit(f"manifest 'gates_sha' {MANIFEST.get('gates_sha')!r} is not approved by row "
+                     f"{MANIFEST.get('stop_c')!r} of {DECISIONS_PATH} (a table row with cells | D-<n> | user:<id>"
+                     f"{' or default-accepted' if STOP_MODE == 'soft' else ''} | STOP C wave-{MANIFEST.get('wave')} "
+                     "gates_sha <value> |); this run halts until STOP C records it")
+validate_manifest(MANIFEST)
+check_wave_tag(TAG, MANIFEST)
+BASE_SHA = wave_base()
+DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
+validate_manifest(MANIFEST, DOCTOR)
 
 
 def _git_paths(*args):
@@ -1170,7 +1166,8 @@ def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
     allowed = tuple(f".migration/recon/{u}/" for u in unit_ids)
     if wave is not None:
         allowed += (f".migration/recon/wave-{wave}/",)
-    return [p for p in changed_paths if p.startswith(".migration/") and not p.startswith(allowed)]
+    return [p for p in changed_paths
+            if p.startswith(".migration/") and not p.startswith(allowed)]
 
 
 def batch_verdicts(verdicts, passed):
@@ -1278,7 +1275,8 @@ def _applies_to(start, delta, commit):
     git = ["git", "-C", str(ROOT)]
     with tempfile.TemporaryDirectory() as d:
         env = {"GIT_INDEX_FILE": str(Path(d) / "index")}
-        subprocess.run(git + ["read-tree", start], check=True, env=env, capture_output=True, text=True, timeout=300)
+        subprocess.run(git + ["read-tree", start], check=True, env=env, capture_output=True,
+                       text=True, timeout=300)
         ok = subprocess.run(git + ["apply", "--cached", "--whitespace=nowarn"], input=delta, env=env,
                             capture_output=True, text=True, timeout=300)
         if ok.returncode:
@@ -1385,21 +1383,14 @@ def batch_max_minutes(batch) -> int:
     return int(batch.get("max_minutes", MAX_MINUTES))
 
 META = {
-    "name": f"smoke-wave-{TAG}" if SMOKE else f"migration-wave-{TAG}",
+    "name": f"migration-wave-{TAG}",
     "description": f"Wave {WAVE}: {len(BATCHES)} unit batches in parallel, then one independent verifier",
     "phases": [
-        {
-            "title": "migrate",
-            "detail": "one child per batch: convert, load, recon, open PR",
-            "labels": [b["id"] for b in BATCHES],
-            "soft_time_limit_minutes": max(batch_max_minutes(b) for b in BATCHES),
-        },
-        *([{
-            "title": "resync",
-            "detail": "parent-owned identity/sequence resync on the listed units' targets",
-            "count": 1,
-            "soft_time_limit_minutes": 30,
-        }] if RESYNC else []),
+        {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
+         "labels": [b["id"] for b in BATCHES],
+         "soft_time_limit_minutes": max(batch_max_minutes(b) for b in BATCHES)},
+        *([{"title": "resync", "detail": "parent-owned identity/sequence resync on the listed units' targets",
+            "count": 1, "soft_time_limit_minutes": 30}] if RESYNC else []),
         {"title": "verify", "detail": "independent recon over the wave",
          "count": 1, "soft_time_limit_minutes": 60},
         {"title": "close", "detail": "review round over verifier-PASS PRs; merges them when auto_merge is on",
@@ -1418,63 +1409,46 @@ CHILD_SCHEMA = {
         "merge_eligible": {"type": "boolean", "description": "result.json['merge_eligible'] of the evidence run"},
         "merge_authority": {
             "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": ["harness", "human_override"]},
-                "decision_id": {"type": "string"},
-            },
-            "description": "human_override with the D-<n> row of .migration/06_decisions.md that says "
-                           "merge_override for your units; the workflow verifies the row. harness otherwise.",
-        },
+            "properties": {"kind": {"type": "string", "enum": ["harness", "human_override"]},
+                           "decision_id": {"type": "string"}},
+            "description": "human_override with the D-<n> row of .migration/06_decisions.md that says merge_override "
+                           "for your units; the workflow verifies the row. harness otherwise."},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
-        "changed_paths": {
-            "type": "array", "items": {"type": "string"},
-            "description": "every path the PR changes: git diff --name-only <base>...<head>",
-        },
-        "skill_feedback": {
-            "type": "array", "items": {"type": "string"},
-            "description": "one line per rule you had to derive yourself",
-        },
+        "changed_paths": {"type": "array", "items": {"type": "string"},
+                          "description": "every path the PR changes: git diff --name-only <base>...<head>"},
+        "skill_feedback": {"type": "array", "items": {"type": "string"},
+                           "description": "one line per rule you had to derive yourself"},
         "gates": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "status": {"type": "string", "enum": ["passed", "failed"]},
-                    "evidence": {"type": "string"},
-                },
-                "required": ["id", "status", "evidence"],
-            },
-            "description": "outcome of each gate declared in your brief, by id; passed needs the evidence path",
-        },
-        "recon_cost": {
-            "type": "object",
-            "description": "result.json['cost'] of the final live/snapshot/transactional run, one line",
-        },
+            "items": {"type": "object",
+                      "properties": {"id": {"type": "string"},
+                                     "status": {"type": "string", "enum": ["passed", "failed"]},
+                                     "evidence": {"type": "string"}},
+                      "required": ["id", "status", "evidence"]},
+            "description": "outcome of each gate declared in your brief, by id; passed needs the evidence path"},
+        "recon_cost": {"type": "object",
+                       "description": "result.json['cost'] of the final live/snapshot/transactional run, one line"},
         "one_line_summary": {"type": "string"},
     },
-    "required": ["status", "recon_verdict", "recon_mode", "merge_eligible",
-                 "write_targets", "changed_paths", "one_line_summary"],
+    "required": ["status", "recon_verdict", "recon_mode", "merge_eligible", "write_targets", "changed_paths",
+                 "one_line_summary"],
 }
 
 VERIFY_SCHEMA = {
     "type": "object",
     "properties": {
         "wave_verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
-        "unit_verdicts": {
-            "type": "object",
-            "description": "PASS or FAIL per batch, keyed by batch id or by unit id (a unit key is "
-                           "normalised to its batch id; one verdict per batch, a batch whose keys "
-                           "disagree is rejected)",
-        },
+        "unit_verdicts": {"type": "object",
+                          "description": "PASS or FAIL per batch, keyed by batch id or by unit id (a unit key is "
+                                         "normalised to its batch id; one verdict per batch, a batch whose keys "
+                                         "disagree is rejected)"},
         "findings": {"type": "array", "items": {"type": "string"}},
         "report_path": {"type": "string"},
-        "changed_paths": {
-            "type": "array", "items": {"type": "string"},
-            "description": "every path your report branch changes: git diff --name-only <base>...<head>",
-        },
-        "recon_cost": {"type": "object", "description": "summed result.json['cost'] over the verifier's re-runs"},
+        "changed_paths": {"type": "array", "items": {"type": "string"},
+                          "description": "every path your report branch changes: git diff --name-only <base>...<head>"},
+        "recon_cost": {"type": "object",
+                       "description": "summed result.json['cost'] over the verifier's re-runs"},
     },
     "required": ["wave_verdict", "unit_verdicts", "findings", "changed_paths"],
 }
@@ -1482,28 +1456,18 @@ VERIFY_SCHEMA = {
 CLOSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "merged_prs": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "pr_url": {"type": "string"},
-                    "merge_commit_sha": {"type": "string"},
-                    "merged_head": {"type": "string"},
-                },
-                "required": ["pr_url", "merge_commit_sha", "merged_head"],
-            },
-            "description": "from `gh pr view <url> --json state,mergeCommit,headRefOid` after "
-                           "the merge; state must be MERGED",
-        },
-        "unmerged": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"pr_url": {"type": "string"}, "reason": {"type": "string"}},
-                "required": ["pr_url", "reason"],
-            },
-        },
+        "merged_prs": {"type": "array",
+                       "items": {"type": "object",
+                                 "properties": {"pr_url": {"type": "string"},
+                                                "merge_commit_sha": {"type": "string"},
+                                                "merged_head": {"type": "string"}},
+                                 "required": ["pr_url", "merge_commit_sha", "merged_head"]},
+                       "description": "from `gh pr view <url> --json state,mergeCommit,headRefOid` after "
+                                      "the merge; state must be MERGED"},
+        "unmerged": {"type": "array",
+                     "items": {"type": "object",
+                               "properties": {"pr_url": {"type": "string"}, "reason": {"type": "string"}},
+                               "required": ["pr_url", "reason"]}},
         "changed_paths": {"type": "array", "items": {"type": "string"}},
         "review_findings": {"type": "array", "items": {"type": "string"}},
     },
@@ -1514,19 +1478,17 @@ RESYNC_SCHEMA = {
     "type": "object",
     "properties": {
         "status": {"type": "string", "enum": ["ok", "failed"]},
-        "sequences": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"object": {"type": "string"}, "before": {}, "after": {}},
-                "required": ["object", "before", "after"],
-            },
-        },
+        "sequences": {"type": "array",
+                      "items": {"type": "object",
+                                "properties": {"object": {"type": "string"}, "before": {}, "after": {}},
+                                "required": ["object", "before", "after"]}},
         "changed_paths": {"type": "array", "items": {"type": "string"}},
         "one_line_summary": {"type": "string"},
     },
     "required": ["status", "sequences", "changed_paths", "one_line_summary"],
 }
+
+
 def resync_prompt(cfg):
     return (
         f"You are the parent-owned identity resync step of wave {WAVE}. Repo: {REPO}. From the repo root, on the "
@@ -1562,9 +1524,8 @@ def validate_resync(out) -> list[str]:
 def child_prompt(batch):
     gates = [g for g in batch.get("gates", []) if g["status"] != "waived"]
     return (
-        f"You are one fan-out child in wave {WAVE}. Repo: {REPO}. Playbook: "
-        f"{MANIFEST['child_macro']}, batch {batch['id']}. Anything missing from the brief stops you: "
-        "report it as blocked, never improvise.\n\n"
+        f"You are one fan-out child in wave {WAVE}. Repo: {REPO}. Playbook: {MANIFEST['child_macro']}, batch "
+        f"{batch['id']}. Anything missing from the brief stops you: report it as blocked, never improvise.\n\n"
         f"BRIEF:\n{batch['brief']}\n\n"
         f"Units: {json.dumps(batch['units'])}. Write targets you own, write nowhere else: "
         f"{json.dumps(batch.get('write_targets', []))}.\n"
@@ -1577,22 +1538,21 @@ def child_prompt(batch):
         "unreported gate fails the unit; a waived gate is the ledger's and is not listed; never rename or "
         f"re-kind one): {json.dumps(gates, sort_keys=True)}\n"
         + "Recon: run the harness fixture-first, then the merge-evidence run; at most 3 full runs, never change a "
-        "tolerance or 03_recon_tolerances.json; after 3 failing runs report status=FAIL with a one-word "
-        "failure_class (timestamp_precision, decimal_rounding, sequence_behind_source, missing_rule).\n"
-        f"The harness is the merge authority: status=PASS needs a recon PASS in one of "
-        f"{list(MERGE_EVIDENCE_MODES)} "
-        "(transactional for Lakebase/operational units) with every unit's "
-        ".migration/recon/<unit>/result.json saying merge_eligible=true; the workflow reads each file. "
-        "Fixture evidence is never PASS. If a unit is not eligible and a human recorded a merge_override "
-        "row for exactly your units in .migration/06_decisions.md, report "
+        "tolerance or 03_recon_tolerances.json; after 3 failing runs report status=FAIL with a one-word failure_class "
+        "(timestamp_precision, decimal_rounding, sequence_behind_source, missing_rule).\n"
+        f"The harness is the merge authority: status=PASS needs a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} "
+        "(transactional for Lakebase/operational units) with every unit's .migration/recon/<unit>/result.json saying "
+        "merge_eligible=true; the workflow reads each file. Fixture evidence is never PASS. If a unit is not "
+        "eligible and "
+        "a human recorded a merge_override row for exactly your units in .migration/06_decisions.md, report "
         "merge_authority {kind: human_override, decision_id: D-<n>}; never write that row.\n"
-        "Open exactly one PR; the first line of its description is PASS or FAIL. Do not merge it; review "
-        "happens at wave close.\n"
-        "Edit nothing under .migration/ except your own evidence under .migration/recon/<unit_id>/; report "
-        "every path the PR changes in changed_paths (`git diff --name-only <base>...<head>`); any other "
-        ".migration/ path turns PASS into FAIL ledger_tampered.\n"
-        "Report: skill_feedback one line per rule you had to derive; recon_cost = result.json['cost'] of the "
-        "final merge-evidence run; one_line_summary for a human skimming 20 of these: what landed, or why not."
+        "Open exactly one PR; the first line of its description is PASS or FAIL. Do not merge it; review happens at "
+        "wave close.\n"
+        "Edit nothing under .migration/ except your own evidence under .migration/recon/<unit_id>/; report every path "
+        "the PR changes in changed_paths (`git diff --name-only <base>...<head>`); any other .migration/ path turns "
+        "PASS into FAIL ledger_tampered.\n"
+        "Report: skill_feedback one line per rule you had to derive; recon_cost = result.json['cost'] of the final "
+        "merge-evidence run; one_line_summary for a human skimming 20 of these: what landed, or why not."
     )
 
 
@@ -1630,29 +1590,28 @@ def verify_prompt(passed):
         "loosened a tolerance must fail here). For each PR run `git diff --name-only <base>...<head>`: any "
         ".migration/ path outside .migration/recon/<unit_id>/ is a FAIL for that unit with finding "
         "ledger_tampered. "
-        + (
-            "This wave is declared DEGRADED (no live source read): run the harness with `--mode structural` "
-            "for every unit (Tier 0 `structural_parity` only: keys, constraints, indexes, triggers, identity "
-            "columns, grants, read from both catalogs, no row tier) and mark the unit PASS only when that run's "
-            "result.json says verdict=PASS and its merge_block_reasons is exactly [\"mode\"]: a structural_gap "
-            "or warnings entry means a catalog the harness could not read or a category it does not cover, "
-            "which is unverified structure, so FAIL with finding structure_unverifiable; verdict=FAIL is FAIL "
-            "with finding structural_drift. Its result.json is never merge_eligible and the mode reason alone "
-            "is expected here. Do not re-run Tier 1-3 and do not lower or raise a depth: the child's snapshot "
-            "row parity stands. "
-            if MANIFEST.get("degraded") is True else
-            f"Mark a unit PASS only if you re-ran the harness in one of {list(MERGE_EVIDENCE_MODES)} "
-            "(the same mode the child used: transactional for Lakebase/operational units) and result.json "
-            "says merge_eligible=true. "
-            f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
-            "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
-            "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. "
-        )
+        + ("This wave is declared DEGRADED (no live source read): run the harness with `--mode structural` "
+           "for every unit (Tier 0 `structural_parity` only: keys, constraints, indexes, triggers, identity "
+           "columns, grants, read from both catalogs, no row tier) and mark the unit PASS only when that run's "
+           "result.json says verdict=PASS and its merge_block_reasons is exactly [\"mode\"]: a structural_gap "
+           "or warnings entry means a catalog the harness could not read or a category it does not cover, "
+           "which is unverified structure, so FAIL with finding structure_unverifiable; verdict=FAIL is FAIL "
+           "with finding structural_drift. Its result.json is never merge_eligible and the mode reason alone is "
+           "expected here. Do not re-run Tier 1-3 and do not lower or raise a "
+           "depth: the child's snapshot row parity stands. "
+           if MANIFEST.get("degraded") is True else
+           f"Mark a unit PASS only if you re-ran the harness in one of {list(MERGE_EVIDENCE_MODES)} "
+           "(the same mode the child used: transactional for Lakebase/operational units) and result.json "
+           "says merge_eligible=true. "
+           f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
+           "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
+           "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. ")
         + "A batch listed with merge_authority kind human_override was cleared by the "
         "named D-<n> merge_override row of .migration/06_decisions.md: mark it PASS on a PASS verdict even if "
         "merge_eligible is false, and cite the decision id in findings. "
-        "Each batch lists its acceptance gates with the evidence the child gave; open the evidence of every "
-        "passed gate and FAIL the unit if it does not show what the gate's kind requires. "
+        "Each batch lists "
+        "its acceptance gates with the evidence the child gave; open the evidence of every passed gate and FAIL "
+        "the unit if it does not show what the gate's kind requires. "
         "Sum result.json['cost'] over your runs into recon_cost.\n"
         f"{merge_line}\nWrite the wave recon report to .migration/recon/wave-{TAG}/report.md, "
         f"commit it on branch recon/wave-{TAG}, push, and give '<branch>:<path>' in "
@@ -1739,7 +1698,8 @@ async def _run_batch(batch, sem, breaker):
                 out.pop(drop, None)
         if out["status"] == "PASS" and (out["recon_verdict"] != "PASS"
                                         or out.get("recon_mode") not in MERGE_EVIDENCE_MODES):
-            downgrade("non_merge_evidence", f"recon evidence was {out.get('recon_mode')}/{out.get('recon_verdict')}")
+            downgrade("non_merge_evidence",
+                      f"recon evidence was {out.get('recon_mode')}/{out.get('recon_verdict')}")
         if out["status"] == "PASS" and not (out.get("pr_url") and out.get("branch")):
             downgrade("missing_pr", "no PR URL/branch reported")
         reported = out.get("changed_paths")
@@ -1783,7 +1743,8 @@ async def _run_batch(batch, sem, breaker):
                 downgrade("gates", "; ".join(unmet))
         if out["status"] != "PASS":
             breaker.record(out.get("failure_class") or "unclassified")
-        log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: " f"{out['one_line_summary']}")
+        log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
+            f"{out['one_line_summary']}")
         return out
 
 
@@ -1915,14 +1876,12 @@ async def main():
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}"
         + (f", serialized {order}" if order else ""))
 
-
     sem = asyncio.Semaphore(WIDTH)
     breaker = Breaker(BREAKER)
     done = {b["id"]: asyncio.Event() for b in BATCHES}
     results = await asyncio.gather(
         *(run_batch(b, sem, breaker, waits=[done[d] for d in order.get(b["id"], []) if d in done],
                     done=done[b["id"]]) for b in BATCHES))
-
 
     namespace = MANIFEST.get("target_namespace", "")
     reported = Counter(t for r in results for t in {target_key(t, namespace) for t in r.get("write_targets", [])})
@@ -1962,7 +1921,6 @@ async def main():
             log("HALT: identity resync did not complete cleanly (" + "; ".join(problems)
                 + f"): {held} are held from merge this run.")
 
-
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
                "gates": r.get("gates", [])}
@@ -1974,10 +1932,10 @@ async def main():
             verify = await agent(verify_prompt(passed), phase="verify", schema=VERIFY_SCHEMA,
                                  label=f"verify-wave-{TAG}", repos=[REPO])
         except WorkflowAgentError as e:
-            verify = {"wave_verdict": "FAIL", "unit_verdicts": {}, "findings": [f"verifier session died: {e}"]}
+            verify = {"wave_verdict": "FAIL", "unit_verdicts": {},
+                      "findings": [f"verifier session died: {e}"]}
     else:
         log("verify: skipped, no batch passed")
-
 
     verify_problems = (validate_verify(verify, passed, TAG, verifier_changed_paths(TAG, passed))
                        if verify is not None else [])
@@ -2009,7 +1967,8 @@ async def main():
         reported = {}
         rows = raw.get("merged_prs") if isinstance(raw, dict) else None
         if isinstance(rows, list):
-            reported.update({u["pr_url"]: u for u in rows if isinstance(u, dict) and isinstance(u.get("pr_url"), str)})
+            reported.update({u["pr_url"]: u for u in rows
+                             if isinstance(u, dict) and isinstance(u.get("pr_url"), str)})
         proven, proof = proven_merged(to_merge, reported)
         reasons = {u["pr_url"]: u["reason"] for u in raw.get("unmerged", [])
                    if isinstance(u, dict) and isinstance(u.get("pr_url"), str)
@@ -2035,16 +1994,10 @@ async def main():
               and verify is not None and verify["wave_verdict"] == "PASS"
               and all(r["status"] == "PASS" for r in results))
     _tmp_write(RESULT_PATH, json.dumps({
-        "wave": WAVE,
-        "tag": TAG,
-        "manifest_sha": MANIFEST_SHA,
-        "width": WIDTH,
-        "base_sha": BASE_SHA,
-        "stop_c": MANIFEST["stop_c"],
-        "hook_probe": HOOK_PROBE_RESULT,
-        "doctor_signed_at": DOCTOR.get("signed_at"),
-        "breaker_tripped_on": breaker.tripped_on,
-        "auto_merge": auto_merge,
+        "wave": WAVE, "tag": TAG, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
+        "base_sha": BASE_SHA, "stop_c": MANIFEST["stop_c"],
+        "hook_probe": HOOK_PROBE_RESULT, "doctor_signed_at": DOCTOR.get("signed_at"),
+        "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
         "closed": closed,
         "write_target_overlaps": surprises,
         "undeclared_write_targets": undeclared,
@@ -2053,10 +2006,7 @@ async def main():
         "merge_overrides": merge_overrides(results),
         "waived_gates": waived_gates(results),
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
-        "verify": verify,
-        "resync": resync,
-        "close": close,
-        "close_minutes": CLOSE_MINUTES,
+        "verify": verify, "resync": resync, "close": close, "close_minutes": CLOSE_MINUTES,
     }, indent=2, sort_keys=True) + "\n")
     write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close, to_merge, resync)
     log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")

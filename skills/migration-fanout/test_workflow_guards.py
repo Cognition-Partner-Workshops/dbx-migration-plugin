@@ -2148,7 +2148,7 @@ def test_workflow_launches_from_the_signed_doctor_record_not_the_editable_one():
     src = WORKFLOW.read_text()
     assert "RECORDED" not in src
     assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)" in src
-    assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)\n    validate_manifest(MANIFEST, DOCTOR)" in src
+    assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)\nvalidate_manifest(MANIFEST, DOCTOR)" in src
     assert "fresh_doctor_report" not in src and "DOCTOR_PY" not in src
 
 
@@ -2297,7 +2297,8 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
     with pytest.raises(SystemExit, match="main"):
         _launch_ns(tmp_path, failing)["wave_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\n\s+check_wave_tag\(TAG, MANIFEST\)\n\s+BASE_SHA = wave_base\(\)\n\s+DOCTOR = signed_doctor_report", src)
+    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\)\nBASE_SHA = wave_base\(\)\n"
+                      r"DOCTOR = signed_doctor_report", src)
     assert 'BASE_SHA_PATH' not in src and '"base_sha": BASE_SHA' in src
 
 

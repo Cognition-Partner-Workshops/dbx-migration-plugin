@@ -1,6 +1,6 @@
 ---
 name: migration-fanout
-description: "Run one migration wave as a managed workflow: fan out unit children, verify independently, and write one guarded result."
+description: "Run one migration wave as a dynamic workflow: N unit-migration children in parallel, then one independent verifier, with write-target collision checks, a circuit breaker, and a ten-line wave brief. Use from the orchestrator for every wave with more than one batch. Never hand-manage child sessions when this exists."
 ---
 
 # migration-fanout
@@ -20,10 +20,9 @@ checks their reports, runs independent verification, and writes the result and b
 5. Read `.migration/waves/wave-<N>.result.json` and `.migration/waves/wave-<N>.brief.md`,
    then render progress with `python3 <plugin>/skills/migration-fanout/progress.py .migration`.
 
-There is no resume mode, run id, reserve command, or preflight command. A result file
-means the wave will not relaunch. To rerun deliberately, delete the result, obtain a new
-STOP C ledger row, put that row in the manifest's `stop_c`, refresh the doctor, and
-run the workflow again.
+A result file means the wave will not relaunch. To rerun deliberately, delete the result,
+obtain a new STOP C ledger row, put that row in the manifest's `stop_c`, refresh the doctor,
+and run the workflow again.
 
 ## Smoke check
 
@@ -42,7 +41,7 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Guard | Summary |
 |---|---|
 | Manifest check | Validates shape, source names, batches, units, width, and migration contract. |
-| Signed doctor gate | Requires a fresh HMAC-bound doctor record, hook probe, and matching capabilities. |
+| Signed doctor gate | Requires an HMAC-bound doctor record with 15-minute freshness, hook probe, and matching capabilities. |
 | STOP C gates_sha approval | Requires the ledger row named by `stop_c` to approve the exact gate hash. |
 | One approval one run | Locks `wave-N.runs.jsonl` and refuses a spent STOP C row. |
 | Duplicate wave | Refuses any existing result, including halted or unreadable files. |
@@ -64,13 +63,3 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Wave close | Proves merges against the gated PR head before closing the wave. |
 
 Detailed guard behavior is in [references/guards.md](references/guards.md).
-
-## Procedure
-
-0. Read the manifest, decision ledger, doctor record, and prior result.
-1. Launch every wave through doctor → pointer → `run_workflow`; wave 0 uses width 1.
-2. Let the workflow gather children, verify, close, and write its result and brief.
-3. Fix a halt, get a new STOP C row, delete the result, refresh the doctor, and relaunch.
-4. Render `.migration/05_progress.md` with `progress.py`.
-
-The workflow owns execution and result schemas; factory-doctor owns capability signatures.
