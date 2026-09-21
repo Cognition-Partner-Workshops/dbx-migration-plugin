@@ -1,6 +1,6 @@
 ---
 name: lakebridge
-description: Databricks Labs Lakebridge (analyzer, profiler, BladeBridge/Morpheus/Switch transpilers, reconciler) as a migration accelerator. Use during estate assessment and unit conversion for supported source dialects; carries the invocation, dialect flags, and the seeded per-dialect coverage table. Accelerator only, never the merge gate.
+description: Databricks Labs Lakebridge (analyzer, profiler, BladeBridge/Morpheus/Switch transpilers, reconciler) as a migration accelerator, never the merge gate. Use during estate assessment and unit conversion for supported source dialects; carries the invocation, dialect flags, and the seeded per-dialect coverage table.
 ---
 
 # Lakebridge

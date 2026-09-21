@@ -1,0 +1,5 @@
+{
+  "name": "dbx-migration-dialects",
+  "version": "0.1.0",
+  "description": "Optional source-dialect skills for the dbx-migration-factory plugin: Teradata/BTEQ, Informatica PowerCenter XML, SQL Server T-SQL/SSIS, and the Databricks Labs Lakebridge accelerator wrapper. Install alongside dbx-migration-factory only for engagements that need these dialects."
+}
