@@ -2,7 +2,7 @@
   "rules": [
     {
       "rule": "decimal_round",
-      "applies_to": "recomputed DECIMAL columns only (division, AVG, ratios): the Trino result scale the consumer saw; stored DECIMAL(p,s) uses identity",
+      "applies_to": "recomputed DECIMAL columns whose *contract* scale is 2 (money AVG/ratios that the converted SQL already casts to DECIMAL(p,2)); any other result scale must be pinned by an explicit CAST in the converted SQL and reconciled with identity — the harness has no per-field scale parameter",
       "params": {
         "mode": "half_up",
         "places": 2

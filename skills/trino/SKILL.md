@@ -25,7 +25,7 @@ Landing rule of thumb (the *decision* is the migration plan's, at STOP B):
 
 | Trino catalog connector | Databricks landing | Skill |
 |---|---|---|
-| `hive` on Parquet/ORC (external metastore) | UC external tables over the same files, then `CONVERT TO DELTA` or CTAS into managed Delta | `[uc:3-securables-ddl.md#Tables — Managed vs External]`, `[uc:2-external-locations.md]` |
+| `hive` on Parquet/ORC (external metastore) | UC external Parquet/ORC table over the same files, read-only, for parallel run; CTAS into a managed Delta table in the allowlisted migration catalog (never `CONVERT TO DELTA` on the legacy path) | `[uc:3-securables-ddl.md#Tables — Managed vs External]`, `[uc:2-external-locations.md]` |
 | `iceberg` | UC managed Iceberg / external Iceberg tables; keep the REST catalog only during parallel run | `databricks-unity-catalog` SKILL.md |
 | `delta_lake` | register the existing Delta location as a UC external table; no data movement | `[uc:3-securables-ddl.md#Tables — Managed vs External]` |
 | `postgresql`, `mysql`, `sqlserver`, `oracle`, `redshift`, `bigquery`, `snowflake` (JDBC) | Lakehouse Federation connection + foreign catalog for parallel run; Lakeflow Connect ingestion when the mart must be materialised | `databricks-dbsql` SKILL.md "Lakehouse Federation"; `[lakeflow-connect:2-database-connectors.md]` |
@@ -52,7 +52,7 @@ read access to `system.runtime.queries` (own queries by default; all users' quer
 | View SQL | `SHOW CREATE VIEW ...` / `information_schema.views.view_definition` | records `SECURITY DEFINER` vs `INVOKER`; views are Trino-SQL, connectors do not see them |
 | Table comments / properties | `system.metadata.table_comments`, `system.metadata.table_properties` | comments carry into UC `COMMENT` |
 | Statistics | `SHOW STATS FOR <table>` | row counts and NDV for the census; free on Hive when `ANALYZE` was run before, never run it yourself |
-| Recent queries (lineage seed) | `SELECT query_id, "user", source, query, started, "end", state FROM system.runtime.queries` | coordinator memory only (typically the last few hours); ask for the event-listener/query-log export (Starburst Insights, Trino Gateway history, or a Kafka event listener) for a 30-day window |
+| Recent queries (lineage seed) | `SELECT query_id, state, "user", source, query, resource_group_id, queued_time_ms, analysis_time_ms, planning_time_ms, created, started, last_heartbeat, "end", error_type, error_code FROM system.runtime.queries` | Trino 483 exposes exactly these columns and no catalog/schema columns **(probe 483)**; one- and two-part names are therefore UNRESOLVED lineage, not confirmed edges; ask for a query-log export carrying session catalog and schema for confirmed resolution and a 30-day window |
 | Functions incl. UDFs | `SHOW FUNCTIONS` | 900+ builtins on 483 **(probe)**; rows with a non-`system` catalog are SQL UDFs (`CREATE FUNCTION`) or plugin functions: each is a unit |
 | Session defaults | `SHOW SESSION` | `time_zone`, `legacy_timestamp`, `insert_existing_partitions_behavior`, `query_max_*`; the coordinator's `config.properties` is the source of truth, request a copy |
 | Grants | `SHOW GRANTS ON <table>`, `SHOW ROLES [IN <cat>]`, `SHOW ROLE GRANTS` | only meaningful under system access control that supports SQL-level grants; file-based rules live in `rules.json` (section 9) |
@@ -68,8 +68,12 @@ Trino has no server-side lineage table. Build edges from three sources, in this 
 
 1. **Query log** (`system.runtime.queries` now, event-listener export for history): parse every `INSERT`, `CREATE
    TABLE ... AS`, `CREATE [OR REPLACE] [MATERIALIZED] VIEW`, `MERGE`, `DELETE` for the target, and every
-   `FROM`/`JOIN`/`UNNEST(<col>)` reference for readers. Three-part names resolve against the query's `catalog`/
-   `schema` columns when a name is one- or two-part. Edges are CONFIRMED.
+   `FROM`/`JOIN`/`UNNEST(<col>)` reference for readers. Trino 483's `system.runtime.queries` columns are
+   `query_id`, `state`, `user`, `source`, `query`, `resource_group_id`, `queued_time_ms`, `analysis_time_ms`,
+   `planning_time_ms`, `created`, `started`, `last_heartbeat`, `end`, `error_type`, and `error_code` **(probe 483)**;
+   it has no catalog/schema columns. Three-part names are explicit, but one- and two-part names from this table are
+   recorded as UNRESOLVED lineage, not confirmed edges. Confirmed resolution of those names needs a query-log export
+   that carries the session catalog and schema.
 2. **View definitions**: `information_schema.views.view_definition` gives view -> base-table edges. Views store
    the *expanded* catalog-qualified SQL, so cross-catalog reads are explicit. CONFIRMED.
 3. **Repository SQL and dbt manifests**: `target/manifest.json` `depends_on.nodes` when the estate is dbt; otherwise
@@ -147,7 +151,7 @@ both engines; the rest are read from `[trino:functions/*]` and `[docs:functions/
 | # | Trino | Databricks SQL | sem | Edge case |
 |---|---|---|---|---|
 | 1 | `a / b` on integers | `a DIV b` | edge | Trino truncates to integer (`7/2` = `3`), Databricks `/` returns `3.5` **(probe)** |
-| 2 | `dec(p1,s1) / dec(p2,s2)` | `CAST(a / b AS DECIMAL(p,s))` with the *Trino* result scale | edge | Trino `decimal(10,2)/3` is `decimal(21,13)`, Databricks `decimal(14,6)` **(probe)**: cast to the scale the consumer sees, `decimal_round` at that scale |
+| 2 | `dec(p1,s1) / dec(p2,s2)` | `CAST(a / b AS DECIMAL(p,2))` for a money/ratio contract; pin any other contract scale with an explicit `CAST` and compare with `identity` | edge | Trino `decimal(10,2)/3` is `decimal(21,13)`, Databricks `decimal(14,6)` **(probe)**: do not infer a per-field harness scale from the Trino expression; make the converted SQL's contract cast explicit |
 | 3 | `AVG(dec(p,s))` | `CAST(AVG(x) AS DECIMAL(p,s))` | edge | Trino keeps the input scale (`1.67`), Databricks widens to `decimal(p+4,s+4)` (`1.666667`) **(probe)** |
 | 4 | `SUM(dec(p,s))` | `SUM(x)` | same | both widen precision only (`decimal(38,2)` vs `decimal(20,2)`) **(probe)** |
 | 5 | `AVG(int)` / `SUM(int)` / `COUNT(*)` | same | same | `double` / `bigint` / `bigint` on both **(probe)** |
@@ -251,7 +255,7 @@ and the orchestrator around the SQL. Every row lands through the cited official 
 | # | Trino construct | Databricks landing | Notes |
 |---|---|---|---|
 | P1 | `CREATE TABLE t (...) WITH (format = 'PARQUET', partitioned_by = ARRAY['dt'], bucketed_by = ARRAY['id'], bucket_count = 32, sorted_by = ARRAY['ts'])` | `CREATE TABLE t (...) USING DELTA CLUSTER BY (id, ts)`; `PARTITIONED BY (dt)` only above ~1 TB per table `[dbsql:best-practices.md#Liquid Clustering vs Traditional Partitioning]` | Hive partition columns are *trailing* columns in Trino DDL: keep column order for Tier 3 |
-| P2 | `CREATE TABLE t WITH (external_location = 's3://...')` (Hive external) | UC external table over the same location `[uc:2-external-locations.md#Create an External Location]`, `[uc:3-securables-ddl.md#Tables — Managed vs External]`; `CONVERT TO DELTA` is a *write* to that location and needs the target allowlist | Parquet stays readable by Trino during parallel run only if you do **not** convert in place |
+| P2 | `CREATE TABLE t WITH (external_location = 's3://...')` (Hive external) | UC external table over the same location `[uc:2-external-locations.md#Create an External Location]`, `[uc:3-securables-ddl.md#Tables — Managed vs External]`; CTAS into managed Delta in the allowlisted migration catalog for target materialisation; never `CONVERT TO DELTA` on the legacy path | Parquet remains readable by Trino during parallel run; the legacy location is never written |
 | P3 | `CREATE TABLE t AS SELECT ...` (CTAS, nightly rebuild via `DROP TABLE IF EXISTS` first) | `CREATE OR REPLACE TABLE t AS SELECT ...` (atomic, keeps history) `[dbsql:best-practices.md#Fact Table Patterns]` | never translate `DROP` + `CREATE` literally: readers see a gap on Trino and none on Delta (Tier 1 during parallel run is *stricter* on the target) |
 | P4 | `INSERT INTO t SELECT ...` with `SET SESSION <cat>.insert_existing_partitions_behavior = 'OVERWRITE'` | `INSERT OVERWRITE t PARTITION (...) SELECT ...` or `INSERT INTO ... REPLACE WHERE dt = ...` | the session property is the only signal that the load is idempotent: capture it in the unit mapping |
 | P5 | `INSERT INTO t SELECT ...` (append) | `INSERT INTO t SELECT ...` | re-run doubles rows on both: add a run-ledger guard on the target only if the source wrapper had one |
@@ -280,7 +284,7 @@ and the orchestrator around the SQL. Every row lands through the cited official 
 | Trap | Trino | Databricks | Recon signature | Fix |
 |---|---|---|---|---|
 | Elapsed vs calendar days | `date_diff('day', a, b)` counts whole 24 h periods | `datediff(b, a)` counts date boundaries | Tier 3 off-by-one on `*_days` columns for roughly half the rows; Tier 2 `SUM(active_days)` drift | `timestampdiff(DAY, a, b)` (row 34); example 04 |
-| Decimal division scale | `decimal(10,2) / 3` -> `decimal(21,13)`; `AVG(decimal)` keeps input scale | `decimal(14,6)`; `AVG` adds 4 to the scale | Tier 3 last-digit diffs on `avg_*`/`*_per_*` columns; Tier 2 sums equal | cast to the Trino result scale (rows 2-3); `decimal_round` at that scale; example 04 |
+| Decimal division scale | `decimal(10,2) / 3` -> `decimal(21,13)`; `AVG(decimal)` keeps input scale | `decimal(14,6)`; `AVG` adds 4 to the scale | Tier 3 last-digit diffs on `avg_*`/`*_per_*` columns; Tier 2 sums equal | cast money AVG/ratios to `DECIMAL(p,2)` and use `decimal_round` only for that contract scale; pin any other result scale with an explicit CAST in converted SQL and compare with `identity`; example 04 |
 | Integer division | `7 / 2` = `3` | `3.5` | Tier 3 fractions on ratio columns; Tier 2 sum drift | `DIV` (row 1) |
 | `CAST(decimal AS INTEGER)` | rounds | truncates | Tier 3 off-by-one on ~half the rows | `CAST(round(x) AS INT)` (row 9) |
 | Approximate aggregates | `approx_percentile` over `DECIMAL` returns `REAL`; T-Digest estimator | `percentile_approx` keeps `DECIMAL`; different estimator | Tier 3 on `median_*`; Tier 4 **ranking flips** when groups are within the error band (`ORDER BY median DESC` puts a different group first) | Approximate → exact changes observable values/rankings and requires a recorded `D-<id>` row in `.migration/06_decisions.md` naming affected consumers; without one, keep `percentile_approx`, reconcile estimator drift as a Tier 3 finding, and never add a tolerance; example 05 |
@@ -320,7 +324,7 @@ and the orchestrator around the SQL. Every row lands through the cited official 
 
 | Rule | Applies to | Params | Why |
 |---|---|---|---|
-| `decimal_round` | recomputed `DECIMAL` columns only (division, `AVG`, ratios); *not* stored decimals | `mode: half_up`, `places` = the Trino result scale the consumer saw (default 2 when the mapping declares none) | section 7 "Decimal division scale"; both engines round half away from zero **(probe)**, so `half_up` is the mode that changes nothing on equal inputs |
+| `decimal_round` | recomputed DECIMAL columns whose *contract* scale is 2 (money AVG/ratios that the converted SQL already casts to `DECIMAL(p,2)`); any other result scale must be pinned by an explicit `CAST` in converted SQL and reconciled with `identity` | `mode: half_up`, `places: 2`; the harness has no per-field scale parameter | section 7 "Decimal division scale"; both engines round half away from zero **(probe)**, so `half_up` is the mode that changes nothing on equal inputs |
 | `datetime_utc_truncate_ms` | `TIMESTAMP(p)` / `TIMESTAMP(p) WITH TIME ZONE` only when effective source precision <= 3 (Hive/Parquet millis, PostgreSQL timestamp(3)) | `assume_source_tz_for_NTZ: <coordinator time_zone>` | p 4-6 is exact in Databricks and uses `identity`; p > 6 is a declared harness gap with no microsecond rule: extract at microsecond precision and compare with identity |
 | `rstrip_spaces` | `CHAR(n)` -> `STRING` | — | padding |
 | `uuid_normalize` | `UUID` -> `STRING` | — | case/hyphen spelling |
