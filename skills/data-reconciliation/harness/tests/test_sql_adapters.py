@@ -2,6 +2,8 @@
 import datetime as dt
 import json
 import re
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -173,6 +175,52 @@ def test_databricks_target_validates_catalog_and_schema_before_it_connects(monke
     with pytest.raises(ConfigError, match="invalid SQL identifier"):
         adapters.DatabricksTargetAdapter("D", "", "silver")
     assert connects == []
+
+
+def _fake_databricks_sql(monkeypatch, captured):
+    import databricks  # real namespace package; its `sql` attribute is what `from databricks import sql` binds
+    fake_sql = types.ModuleType("databricks.sql")
+    fake_sql.connect = lambda **kw: captured.update(kw) or "conn"
+    monkeypatch.setitem(sys.modules, "databricks.sql", fake_sql)
+    monkeypatch.setattr(databricks, "sql", fake_sql, raising=False)
+
+
+def test_databricks_connect_uses_m2m_kwargs(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net/")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "sp-client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "sp-secret")
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/x")
+    captured = {}
+    _fake_databricks_sql(monkeypatch, captured)
+    assert adapters._databricks_connect() == "conn"
+    assert captured["server_hostname"] == "adb-1.azuredatabricks.net"
+    assert captured["http_path"] == "/sql/1.0/warehouses/x"
+    assert captured["oauth_client_id"] == "sp-client-id"
+    assert captured["oauth_client_secret"] == "sp-secret"
+    assert "access_token" not in captured
+
+
+def test_databricks_connect_env_oidc_uses_sdk_bearer(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "sp-client-id")
+    monkeypatch.delenv("DATABRICKS_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/x")
+    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "env-oidc")
+    monkeypatch.setenv("DATABRICKS_OIDC_TOKEN", "oidc-already-minted")
+    monkeypatch.setattr(adapters.subprocess, "run",
+                        lambda *a, **k: pytest.fail("devin-oidc must not be spawned"))
+    fake_core = types.ModuleType("databricks.sdk.core")
+    fake_core.Config = lambda: types.SimpleNamespace(
+        authenticate=lambda: {"Authorization": "Bearer tok"})
+    monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake_core)
+    fake_sdk = types.ModuleType("databricks.sdk")
+    fake_sdk.core = fake_core
+    monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
+    captured = {}
+    _fake_databricks_sql(monkeypatch, captured)
+    assert adapters._databricks_connect() == "conn"
+    assert captured["access_token"] == "tok"
+    assert "oauth_client_secret" not in captured
 
 
 def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkeypatch):

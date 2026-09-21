@@ -28,7 +28,6 @@ REQUIRED_FILES = ("00_context.md", "01_conventions.md", "03_recon_tolerances.md"
     "04_dependency_register.md", "06_decisions.md", "07_access_checklist.md", "allowed_targets.json")
 OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines", "databricks-jobs",
     "databricks-dabs", "databricks-unity-catalog", "databricks-lakeflow-connect", "databricks-lakebase")
-M2M_VARS = ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET")
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
 CHILD_SECURITY_CONTROLS = ("hook_guard_functional", "databricks_identity")
 _RANK = {"ok": 0, "skipped": 1, "warn": 2, "unverified": 3, "fail": 4}
@@ -969,15 +968,38 @@ _PRIVILEGE_QUERIES = {
         "read_only": "SELECT current_setting('transaction_read_only')"}}
 
 
-def _databricks_sql_connect(secret_value: str):
-    """Same secret contract the harness's Databricks adapter uses; the connector is an optional extra."""
+def _databricks_bearer() -> str:
+    """Workspace access token for the session's service principal (env-oidc or oauth-m2m), via the SDK."""
+    import databricks.sdk.core as _sdk_core  # optional extra (databricks-sdk)
+    if os.environ.get("DATABRICKS_AUTH_TYPE") == "env-oidc" and not os.environ.get("DATABRICKS_OIDC_TOKEN"):
+        audience = os.environ.get("DATABRICKS_DEVIN_AUDIENCE", "databricks")
+        os.environ["DATABRICKS_OIDC_TOKEN"] = subprocess.run(["devin-oidc", "token", "--audience", audience],
+            check=True, capture_output=True, text=True).stdout.strip()
+    headers = _sdk_core.Config().authenticate()
+    return headers["Authorization"].split(" ", 1)[1]
+
+
+def _databricks_session_connect(http_path: str | None = None):
+    """Session identity only: DATABRICKS_HOST + DATABRICKS_CLIENT_ID with DATABRICKS_CLIENT_SECRET
+    (oauth-m2m) or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from DATABRICKS_HTTP_PATH."""
     try:
         from databricks import sql  # optional extra (databricks-sql-connector)
     except ImportError:
         raise RuntimeError("databricks-sql-connector is not installed") from None
-    cfg = json.loads(secret_value)
-    return sql.connect(server_hostname=cfg["server_hostname"], http_path=cfg["http_path"],
-        access_token=cfg["access_token"])
+    host = os.environ.get("DATABRICKS_HOST", "").removeprefix("https://").removeprefix("http://").rstrip("/")
+    http_path = http_path or os.environ.get("DATABRICKS_HTTP_PATH")
+    if not http_path:
+        raise RuntimeError("DATABRICKS_HTTP_PATH is not set (SQL warehouse HTTP path)")
+    if os.environ.get("DATABRICKS_CLIENT_SECRET"):
+        return sql.connect(server_hostname=host, http_path=http_path,
+            oauth_client_id=os.environ["DATABRICKS_CLIENT_ID"],
+            oauth_client_secret=os.environ["DATABRICKS_CLIENT_SECRET"])
+    return sql.connect(server_hostname=host, http_path=http_path, access_token=_databricks_bearer())
+
+
+def _databricks_sql_connect(_dsn: str):
+    """The _READ_ONLY_CONNECT slot for a Databricks-family source: the session's own identity."""
+    return _databricks_session_connect()
 
 
 _READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect,
@@ -1012,7 +1034,7 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
     """The principal behind --source-secret must not be able to write any in-scope source object."""
     cid = "source_principal_read_only"
     if family == "databricks":
-        return _check_databricks_source_principal(tables, source_secret)
+        return _check_databricks_source_principal(tables)
     q = _PRIVILEGE_QUERIES.get(family)
     if q is None:
         return Check(cid, "unverified", f"{family}: no privilege query implemented for this family, so the "
@@ -1081,34 +1103,18 @@ def _uc_privileges(cli: str, kind: str, name: str, principal: str, env: dict | N
     return (None, "returned no privilege_assignments") if privileges is None else (privileges, shown)
 
 
-def _check_databricks_source_principal(tables: list[str], source_secret: str | None) -> Check:
-    """`grants get-effective` plus ownership for the --source-secret principal on every in-scope securable."""
+def _check_databricks_source_principal(tables: list[str]) -> Check:
+    """`grants get-effective` plus ownership for the session's service principal on every in-scope
+    securable; a Databricks-family source is read through the same identity, so its grants are what
+    is checked."""
     cid = "source_principal_read_only"
-    data: dict = {"family": "databricks", "tables": tables, "writable": {}, "unresolved": []}
-    if not source_secret:
-        return Check(cid, "fail", f"databricks source with {len(tables)} in-scope table(s); pass "
-            "--source-secret NAME (env var holding the source DSN) so the principal's "
-            "write privileges can be checked", data)
-    secret = os.environ.get(source_secret)
-    if not secret:
-        return Check(cid, "fail", f"source secret {source_secret} is not set in the environment", data)
-    try:
-        cfg = json.loads(secret)
-        host, token = cfg["server_hostname"], cfg["access_token"]
-    except (TypeError, ValueError, KeyError):
-        host = token = None
-    if not isinstance(host, str) or not isinstance(token, str):
-        return Check(cid, "unverified", f"databricks: secret {source_secret} is not the "
-            "{server_hostname,http_path,access_token} JSON the recon adapter uses", data)
-    data["host"] = host
-    env = {k: v for k, v in os.environ.items() if not k.startswith("DATABRICKS_")}
-    env.update({"DATABRICKS_HOST": host if "://" in host else f"https://{host}", "DATABRICKS_TOKEN": token,
-        "DATABRICKS_AUTH_TYPE": "pat"})
+    data: dict = {"family": "databricks", "tables": tables, "writable": {}, "unresolved": [],
+        "identity": "session"}
     cli = shutil.which("databricks")
     if not cli:
         return Check(cid, "unverified", "databricks: databricks CLI not on PATH, so the source "
             "principal's grants could not be read", data)
-    who, shown = _cli_json(cli, "current-user", "me", env=env)
+    who, shown = _cli_json(cli, "current-user", "me")
     who = who if isinstance(who, dict) else {}
     principal = who.get("applicationId") or who.get("userName")
     groups = {g["display"] for g in who.get("groups", []) if isinstance(g, dict) and isinstance(g.get("display"),
@@ -1125,13 +1131,13 @@ def _check_databricks_source_principal(tables: list[str], source_secret: str | N
         for kind, name in (("catalog", parts[0]), ("schema", f"{parts[0]}.{parts[1]}"), ("table", t)):
             securables.setdefault((kind, name))
     for kind, name in securables:
-        payload, shown = _cli_json(cli, _DBX_GET_COMMAND[kind], "get", name, env=env)
+        payload, shown = _cli_json(cli, _DBX_GET_COMMAND[kind], "get", name)
         owner = payload.get("owner") if isinstance(payload, dict) else None
         if not isinstance(owner, str):
             return Check(cid, "unverified", f"databricks: {_DBX_GET_COMMAND[kind]} get {name} failed: {shown}", data)
         if owner.lower() == principal.lower() or owner in groups:
             data["writable"].setdefault(name, []).append("OWNER")
-        privileges, shown = _uc_privileges(cli, kind, name, principal, env=env, strict=True)
+        privileges, shown = _uc_privileges(cli, kind, name, principal, strict=True)
         if privileges is None:
             return Check(cid, "unverified", f"databricks: grants get-effective {kind} {name} failed: {shown}", data)
         if offending := sorted(privileges - _DBX_READ_PRIVILEGES):
@@ -1257,15 +1263,17 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
     if not views:
         return Check(cid, "unverified", f"{family}: no dictionary probe for this family; structural "
             "parity will record its categories as unsupported", {"family": family, "tables": tables})
-    if not source_secret:
-        return Check(cid, "fail", f"{family} source with {len(tables)} in-scope table(s); pass "
-            "--source-secret NAME so catalog visibility can be checked", {"family": family, "tables": tables})
-    dsn = _env_dsn(cid, source_secret)
-    if isinstance(dsn, Check):
-        return dsn
+    if family != "databricks":  # a Databricks-family source is probed as the session identity
+        if not source_secret:
+            return Check(cid, "fail", f"{family} source with {len(tables)} in-scope table(s); pass "
+                "--source-secret NAME so catalog visibility can be checked", {"family": family,
+                "tables": tables})
+        dsn = _env_dsn(cid, source_secret)
+        if isinstance(dsn, Check):
+            return dsn
     data: dict = {"family": family, "tables": tables, "views": [], "trigger_census": {}}
     try:
-        conn = (connect or _READ_ONLY_CONNECT[family])(os.environ[source_secret])
+        conn = (connect or _READ_ONLY_CONNECT[family])(os.environ.get(source_secret) or "")
         try:
             cur = conn.cursor()
             for label, sql in views:
@@ -1445,34 +1453,35 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
     rc, ver, err = _run([cli, "--version"], timeout=20)
     out.append(Check("databricks_cli", "ok" if rc == 0 else "fail", (ver or err).strip()[:80], {"path": cli}))
 
-    set_vars = [v for v in M2M_VARS if os.environ.get(v)]
-    token, profile = os.environ.get("DATABRICKS_TOKEN"), os.environ.get("DATABRICKS_CONFIG_PROFILE")
-    auth_kind = next(kind for cond, kind in (
-        (token and len(set_vars) == len(M2M_VARS), "conflict (env)"),
-        (len(set_vars) == len(M2M_VARS), "oauth-m2m (env)"),
-        (token, "pat (env)"), (profile, f"profile {profile}"), (True, "unknown (CLI default chain)")) if cond)
-    if auth_kind == "conflict (env)":
-        status, detail = "fail", (
-            "auth: conflicting env — DATABRICKS_TOKEN is set beside DATABRICKS_CLIENT_ID/SECRET; "
-            "the CLI refuses ('more than one authorization method') and the guard blocks unsetting or "
-            "overriding them per command; remove DATABRICKS_TOKEN (and a foreign DATABRICKS_HOST) "
-            "from the org/session environment")
+    desc, _shown = _cli_json(cli, "auth", "describe")
+    details = desc.get("details") if isinstance(desc, dict) else None
+    host = details.get("host") if isinstance(details, dict) else None
+    auth_type = details.get("auth_type") if isinstance(details, dict) else None
+    auth_data = {"auth_kind": auth_type}
+    if os.environ.get("DATABRICKS_DEVIN_AUDIENCE"):
+        auth_data["audience"] = os.environ["DATABRICKS_DEVIN_AUDIENCE"]
+    if auth_type in ("env-oidc", "oauth-m2m"):
+        out.append(Check("databricks_auth_kind", "ok",
+            f"auth: {auth_type} (service principal via the org blueprint)", auth_data))
+    elif auth_type == "pat":
+        out.append(Check("databricks_auth_kind", "warn",
+            "auth: pat — a personal access token attributes the session's work to a human and "
+            "bypasses the migration service principal; authenticate via the org blueprint "
+            "(env-oidc or oauth-m2m), or record a waiver in 06_decisions.md", auth_data))
     else:
-        status = "ok" if auth_kind.startswith("oauth-m2m") else "warn"
-        detail = (f"auth: {auth_kind}; migration sessions should run as the migration service principal via "
-            f"DATABRICKS_CLIENT_ID/SECRET from named secrets")
-    out.append(Check("databricks_auth_kind", status, detail, {"auth_kind": auth_kind, "env_set": set_vars}))
+        out.append(Check("databricks_auth_kind", "fail",
+            f"auth: `databricks auth describe` reports {auth_type!r}; the org blueprint accepts "
+            "only env-oidc or oauth-m2m", auth_data))
 
     who, shown = _cli_json(cli, "current-user", "me")
     if not isinstance(who, dict):
         out.append(Check("databricks_identity", "fail", f"current-user me failed: {shown}"))
         return out
     name, is_sp = classify_identity(who)
-    desc, _shown = _cli_json(cli, "auth", "describe")
-    details = desc.get("details") if isinstance(desc, dict) else None
-    host = details.get("host") if isinstance(details, dict) else None
     display_name = name if is_sp else "<human user (redacted)>"
     data = {"userName": display_name, "service_principal": is_sp, "host": host}
+    if "audience" in auth_data:
+        data["audience"] = auth_data["audience"]
     status = "ok"
     detail = f"authenticated as {display_name} ({'service principal' if is_sp else 'user'}) on {host}"
     if expect_identity and str(name).lower() != expect_identity.lower():
@@ -1485,9 +1494,9 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
     elif expect_host and _norm_host(str(host)) != _norm_host(expect_host):
         status, detail = "fail", detail + f"; expected host {expect_host} (the capability contract's workspace)"
     elif not is_sp:
-        status, detail = "warn", detail + ("; unattended sessions must not run as a human identity: provide "
-            "DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET (plus DATABRICKS_HOST) as named "
-            "secrets for the migration service principal, or record a waiver in 06_decisions.md")
+        status, detail = "warn", detail + ("; unattended sessions must not run as a human identity: "
+            "authenticate as the migration service principal via the org blueprint (OIDC token "
+            "federation or OAuth M2M; see target-routing), or record a waiver in 06_decisions.md")
     out.append(Check("databricks_identity", status, detail, data))
 
     rc, wh, err = _run([cli, "experimental", "aitools", "tools", "get-default-warehouse"], timeout=60)

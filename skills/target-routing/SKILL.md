@@ -56,13 +56,19 @@ union its `reads` and `writes`:
 Analytical-track deltas (deploy/schedule, pipelines, governance): [references/analytical-deltas.md](references/analytical-deltas.md); load for warehouse/ETL/code units, not for Lakebase-only units.
 
 ### Auth for unattended sessions
-- Children and the orchestrator run as the engagement's **migration service principal** via
-  environment-variable OAuth M2M: `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`
-  populated from named org secrets. No interactive `databricks auth login`, no PAT, no
-  `~/.databrickscfg` with credential values. The official "never auto-select a profile" rule is
-  satisfied because there is exactly one identity and it is recorded in `.migration/00_context.md`.
-- Every session verifies identity once (`databricks current-user me`) and stops if the identity is
-  not the migration principal (an admin or a human user is a halt, not a convenience).
+- Children and the orchestrator run as the engagement's dedicated **migration service principal**,
+  configured by the org blueprint: OIDC token federation preferred (`DATABRICKS_AUTH_TYPE=env-oidc` —
+  the `databricks` binary is a wrapper that exports a fresh `DATABRICKS_OIDC_TOKEN` per call), OAuth
+  M2M fallback (`DATABRICKS_CLIENT_SECRET`). Auth arrives only from env vars the blueprint sets
+  (`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`); optional `DATABRICKS_DEVIN_AUDIENCE` sets a per-tier
+  OIDC audience. No PATs, no profiles, no config files, no interactive `databricks auth login`. The
+  official "never auto-select a profile" rule is satisfied because there is exactly one identity and
+  it is recorded in `.migration/00_context.md`.
+- Every session verifies identity once: the doctor reads `databricks auth describe` (env-oidc or
+  oauth-m2m is `ok`; a `pat` result is a warn requiring a waiver in `06_decisions.md`) plus
+  `databricks current-user me`, and stops if the identity is not the migration principal (an admin
+  or a human user is a halt, not a convenience). The recon harness connects with the same session
+  identity; `DATABRICKS_HTTP_PATH` (or `--target-http-path`) names the SQL warehouse.
 - Principal tiers: assessment (metadata + read-only, phase 0), migration (full rights on the
   migration catalog, USE elsewhere, no admin roles), cutover (customer-held, STOP E only, never in
   a child). Never request or use account-admin or workspace-admin permissions; escalate instead.

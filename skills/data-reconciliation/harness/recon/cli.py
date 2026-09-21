@@ -1,7 +1,9 @@
 """CLI: dbx-recon run --unit <id> --family <source> --mapping ... --tolerances ...
 
-Secrets are passed by environment-variable NAME (--source-dsn-secret, --target-secret);
-the harness reads the value from the environment and never accepts literals.
+Secrets are passed by environment-variable NAME (--source-dsn-secret, --target-secret for
+lakebase); the harness reads the value from the environment and never accepts literals. The
+Databricks target and Databricks-family sources connect as the session's service principal
+(org blueprint: env-oidc or oauth-m2m), no secret value needed.
 
 Exit code 0 = PASS, 1 = FAIL. The workflow script and the wave gate read result.json,
 never this stdout line.
@@ -234,7 +236,13 @@ def main(argv: list[str] | None = None) -> int:
     sh = sub.add_parser("shape", help="read the observed column shape of target tables into a "
                         "shape JSON (read-only; the rerun proof's record input)")
     sh.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
-    sh.add_argument("--target-secret", required=True)
+    sh.add_argument("--target-secret", required=False,
+                    help="for --target-kind lakebase: ENV VAR NAME holding the branch endpoint's "
+                         "libpq DSN (convention LAKEBASE_MIGRATION_DSN); not used for databricks, "
+                         "which connects as the session's service principal")
+    sh.add_argument("--target-http-path", required=False,
+                    help="SQL warehouse HTTP path for --target-kind databricks; default env "
+                         "DATABRICKS_HTTP_PATH")
     sh.add_argument("--target-catalog", required=True)
     sh.add_argument("--allowed-targets-file", type=Path,
                     default=Path(".migration/allowed_targets.json"))
@@ -252,12 +260,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="the source-dialect skill's recon_canonicalization rules, as JSON")
     r.add_argument("--mode", required=True, choices=MODES + PLANNED_MODES)
     r.add_argument("--source-dsn-secret", required=True,
-                   help="ENV VAR NAME holding the source connection (read-only principal)")
+                   help="ENV VAR NAME holding the source connection (read-only principal); "
+                        "ignored for --family databricks: the source is read as the session identity")
     r.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
-    r.add_argument("--target-secret", required=True,
-                   help="ENV VAR NAME holding Databricks SQL JSON (convention: "
-                        "DATABRICKS_MIGRATION_SQL) or, for --target-kind lakebase, the branch "
-                        "endpoint's libpq DSN (convention: LAKEBASE_MIGRATION_DSN)")
+    r.add_argument("--target-secret", required=False,
+                   help="for --target-kind lakebase: ENV VAR NAME holding the branch endpoint's "
+                        "libpq DSN (convention LAKEBASE_MIGRATION_DSN); not used for databricks, "
+                        "which connects as the session's service principal")
+    r.add_argument("--target-http-path", required=False,
+                   help="SQL warehouse HTTP path for --target-kind databricks; default env "
+                        "DATABRICKS_HTTP_PATH")
     r.add_argument("--target-catalog", required=True,
                    help="Unity Catalog catalog, or the Lakebase branch database name")
     r.add_argument("--allowed-targets-file", type=Path,
@@ -461,11 +473,13 @@ def main(argv: list[str] | None = None) -> int:
         is_untested_source_family,
     )
     if args.cmd == "shape":
+        if args.target_kind == "lakebase" and not args.target_secret:
+            raise SystemExit("--target-secret is required for --target-kind lakebase")
         try:
             if args.target_kind == "lakebase":
                 target = LakebaseTargetAdapter(args.target_secret, target_catalog, target_schema)
             else:
-                target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
+                target = DatabricksTargetAdapter(args.target_http_path, target_catalog, target_schema)
             tables = {_single_identifier(t, "table"): target.column_shape(t) for t in args.table}
             absent = [t for t, cols in tables.items() if not cols and not target.table_exists(t)]
             if absent:
@@ -511,8 +525,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"ops entry missing required keys: {op.get('name', '?')}")
             for key in ("source_sql", "target_sql"):
                 _validate_sql(op[key], op.get("name", "?"))
+    # --family databricks reads through the session identity, so the secret name is ignored
     source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
     if args.target_kind == "lakebase":
+        if not args.target_secret:
+            raise SystemExit("--target-secret is required for --target-kind lakebase")
         # --target-catalog names the Lakebase database; the adapter refuses a DSN that lands
         # anywhere else, so the allowlist binds the connection and not just the label
         try:
@@ -520,7 +537,7 @@ def main(argv: list[str] | None = None) -> int:
         except TargetIdentityError as exc:
             raise SystemExit(str(exc)) from None
     else:
-        target = DatabricksTargetAdapter(args.target_secret, target_catalog, target_schema)
+        target = DatabricksTargetAdapter(args.target_http_path, target_catalog, target_schema)
     if args.source_dictionary or args.target_dictionary:
         from .structure import DictionaryOverlay, load_dictionary
         try:
