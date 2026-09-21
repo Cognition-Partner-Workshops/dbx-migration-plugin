@@ -54,6 +54,8 @@ this one in the same change. If the org's managed manifest uses `"forbiddenPlugi
 
 After installing, run the `install-dbx-factory` skill once per org (see `OVERVIEW.md`).
 
+Databricks auth: one dedicated service principal via the org blueprint (OIDC token federation preferred, OAuth M2M fallback); see `skills/target-routing/SKILL.md`.
+
 ## Write-scope guard (`hooks/dbx_guard.py`)
 
 The PreToolUse hook recognises the client a shell command runs and lets only known read shapes

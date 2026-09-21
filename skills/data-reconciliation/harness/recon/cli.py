@@ -525,8 +525,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"ops entry missing required keys: {op.get('name', '?')}")
             for key in ("source_sql", "target_sql"):
                 _validate_sql(op[key], op.get("name", "?"))
-    # --family databricks reads through the session identity, so the secret name is ignored
-    source = SOURCE_ADAPTERS[args.family](args.source_dsn_secret)
+    source = SOURCE_ADAPTERS[args.family](
+        args.target_http_path if args.family == "databricks" else args.source_dsn_secret)
     if args.target_kind == "lakebase":
         if not args.target_secret:
             raise SystemExit("--target-secret is required for --target-kind lakebase")

@@ -223,6 +223,41 @@ def test_databricks_connect_env_oidc_uses_sdk_bearer(monkeypatch):
     assert "oauth_client_secret" not in captured
 
 
+def test_databricks_family_run_builds_the_source_with_the_http_path(monkeypatch, tmp_path):
+    """--family databricks reads through the session identity's warehouse: the source adapter arg
+    is --target-http-path (env fallback inside _databricks_connect), never the secret name."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
+    (tmp_path / "m.json").write_text(json.dumps({"version": "m", "objects": [
+        {"object": "orders", "root_table": "ORDERS",
+         "key": {"source": ["ORDER_ID"], "target": "order_id"},
+         "fields": [{"source": "ORDER_ID", "target": "order_id", "target_type": "long"}]}]}))
+    (tmp_path / "t.json").write_text(json.dumps({"version": "t"}))
+    (tmp_path / "c.json").write_text("{}")
+
+    class _Stop(Exception):
+        pass
+
+    seen = {}
+
+    class _Source:
+        def __init__(self, arg):
+            seen["arg"] = arg
+            raise _Stop
+
+    monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "databricks", _Source)
+    with pytest.raises(_Stop):
+        cli.main(["run", "--unit", "u", "--family", "databricks",
+                  "--mapping", str(tmp_path / "m.json"), "--tolerances", str(tmp_path / "t.json"),
+                  "--canonicalization", str(tmp_path / "c.json"), "--mode", "fixture",
+                  "--source-dsn-secret", "SOURCE_DSN",
+                  "--target-http-path", "/sql/1.0/warehouses/x",
+                  "--target-catalog", "mig", "--target-schema", "s",
+                  "--out", str(tmp_path / "out")])
+    assert seen["arg"] == "/sql/1.0/warehouses/x"
+
+
 def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkeypatch):
     psycopg = pytest.importorskip("psycopg")
     monkeypatch.setenv("T", "dsn-under-test")
