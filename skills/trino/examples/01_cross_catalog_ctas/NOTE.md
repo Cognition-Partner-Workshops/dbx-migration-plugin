@@ -7,9 +7,13 @@
 | `SET SESSION time_zone` | `SET TIME ZONE` | P12 |
 | `c.region` `CHAR(4)` (padded, e.g. `'NORT'`; value truncated at the source) | `rtrim(c.region)`; landed type `string` | §4 `CHAR(n)`, trap "CHAR padding" |
 | `format_datetime(ts, 'yyyy-MM')` | `date_format(ts, 'yyyy-MM')` | row 30 |
-| `approx_distinct(x)` | `COUNT(DISTINCT x)` (plan default; approximate only by decision row) | row 51 |
+| `approx_distinct(x)` | `COUNT(DISTINCT x)` only in a decision-approved exact variant; without a recorded `D-<id>` row naming this consumer, use `approx_count_distinct(x)` | row 51 |
 | `SUM(decimal(p,2))` | `CAST(SUM(...) AS DECIMAL(38,2))` so the declared type matches the Trino result | row 4 |
 | `arbitrary(x)` | `any_value(x)` | row 55 |
+
+The `COUNT(DISTINCT)` form in `converted.sql` is the decision-approved exact variant; cite the applicable
+`D-<id>` row in `.migration/06_decisions.md` before using it. Without that decision, the converted expression is
+`approx_count_distinct(o.customer_id)`.
 
 **Recon**: Tier 1 count per `(region, order_month)`; Tier 2 `SUM(gross_revenue)` (`decimal_round` places 2) and
 `SUM(orders)`; Tier 3 keyed on `(region, order_month)` for `active_customers` — the recon query recomputes

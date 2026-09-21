@@ -119,8 +119,8 @@ the residual difference during recon, never a licence to skip the conversion.
 | `JSON` | `VARIANT` (or `STRING` when the consumer only does `json_extract_scalar`) | none | `identity` on the extracted scalars | `parse_json` / `:` paths `[docs:functions/parse_json]` |
 | `DATE` | `DATE` | none | `identity` | |
 | `TIME(p)` / `TIME(p) WITH TIME ZONE` | `STRING` `'HH:mm:ss[.SSS]'` | semantics (no TIME type) | `identity` (harness gap `time_of_day_normalize`) | arithmetic moves to timestamps |
-| `TIMESTAMP(p)` (zone-less; literal default p=0..6 from the literal, `localtimestamp` p=3) | `TIMESTAMP_NTZ` (`TIMESTAMP` only when the estate decides once to treat all values as UTC instants) | precision above 6 lost; p=3 vs us grain | `datetime_utc_truncate_ms` | Trino keeps the literal's precision (`'..00'` is `timestamp(0)`, `'..123456'` is `timestamp(6)`) **(probe)**; the harness treats `TIMESTAMP` as session-zoned, so declare `timestamp_ntz` |
-| `TIMESTAMP(p) WITH TIME ZONE` (`now()`, `current_timestamp`, `from_unixtime`, `AT TIME ZONE`) | `TIMESTAMP` (UTC-normalised instant) | offset text dropped | `datetime_utc_truncate_ms` | `now()` is `timestamp(3) with time zone` on Trino **(probe)**; a Databricks `TIMESTAMP` renders in the session zone (`current_timezone()`, `Etc/UTC` on the probe warehouse): pin `spark.sql.session.timeZone` in the mapping |
+| `TIMESTAMP(p)` (zone-less; literal default p=0..6 from the literal, `localtimestamp` p=3) | `TIMESTAMP_NTZ` (`TIMESTAMP` only when the estate decides once to treat all values as UTC instants) | p <= 3 is millisecond precision; p 4-6 is exact; p > 6 is a declared harness gap | `datetime_utc_truncate_ms` only when effective p <= 3; `identity` otherwise | Trino keeps the literal's precision (`'..00'` is `timestamp(0)`, `'..123456'` is `timestamp(6)`) **(probe)**; Hive/Parquet timestamps are millis unless configured otherwise, so extract p > 6 at microsecond precision and compare with identity |
+| `TIMESTAMP(p) WITH TIME ZONE` (`now()`, `current_timestamp`, `from_unixtime`, `AT TIME ZONE`) | `TIMESTAMP` (UTC-normalised instant) | p <= 3 is millisecond precision; p 4-6 is exact; p > 6 is a declared harness gap; offset text dropped | `datetime_utc_truncate_ms` only when effective p <= 3; `identity` otherwise | `now()` is `timestamp(3) with time zone` on Trino **(probe)**; a Databricks `TIMESTAMP` renders in the session zone (`current_timezone()`, `Etc/UTC` on the probe warehouse): pin `spark.sql.session.timeZone` in the mapping |
 | `INTERVAL YEAR TO MONTH` / `INTERVAL DAY TO SECOND` | `INTERVAL YEAR TO MONTH` / `INTERVAL DAY TO SECOND` | none | `identity` | literal spelling `INTERVAL '1' MONTH` -> `INTERVAL 1 MONTH` (quoted form also parses on Databricks) |
 | `ARRAY(T)` | `ARRAY<T>` | none | `identity` (element rules apply inside) | 1-based on Trino, 0-based `[]` on Databricks (section 5) |
 | `MAP(K,V)` | `MAP<K,V>` | key order (unordered on Trino, insertion order on Databricks) | `identity` after `map_entries` sort in the recon query | never compare maps as text |
@@ -196,8 +196,8 @@ both engines; the rest are read from `[trino:functions/*]` and `[docs:functions/
 | 48 | `from_unixtime(x, 'UTC')` / `from_unixtime_nanos` | `from_utc_timestamp(timestamp_seconds(x), 'UTC')` / `timestamp_micros(x DIV 1000)` | edge | nanos lost |
 | 49 | `CAST(ts AS DATE)` / `CAST('2026-01-01' AS TIMESTAMP)` / `date(ts)` | same | same | **(probe)** |
 | 50 | `CAST(dec AS VARCHAR)` / `CAST(double AS VARCHAR)` | `CAST(dec AS STRING)` / `CAST(double AS STRING)` | edge | decimals equal (`1.50`); doubles differ (`1.5E0` vs `1.5`) **(probe)**: Tier 4 text diffs, compare as numbers |
-| 51 | `approx_distinct(x[, e])` | `approx_count_distinct(x[, rsd])` | none | different HLL parameters: equal on tiny sets **(probe)** only; recon on `COUNT(DISTINCT x)` recomputed on both sides |
-| 52 | `approx_percentile(x, p)` / `approx_percentile(x, w, p)` / `approx_percentile(x, ARRAY[...])` | exact `percentile(x, p)` / `median` / `percentile_cont(p) WITHIN GROUP (ORDER BY x)`; `percentile_approx` only if the decision record accepts approximate | none | `{1,2,3,4}` p50: Trino `3.0`, Databricks `percentile_approx` `2.0`, exact `2.5` **(probe)**; Trino returns `REAL` for `DECIMAL` input, Databricks keeps `DECIMAL` **(probe)**: rankings by median can flip (section 7) |
+| 51 | `approx_distinct(x[, e])` | `approx_count_distinct(x[, rsd])`; `COUNT(DISTINCT x)` only in a decision-approved exact variant | none | Approximate → exact changes observable counts and requires a recorded `D-<id>` row in `.migration/06_decisions.md` naming affected consumers; without one, keep the approximate contract and reconcile estimator drift as a Tier 3 finding, never a tolerance |
+| 52 | `approx_percentile(x, p)` / `approx_percentile(x, w, p)` / `approx_percentile(x, ARRAY[...])` | `percentile_approx` by default; exact `percentile(x, p)` / `median` / `percentile_cont(p) WITHIN GROUP (ORDER BY x)` only in a decision-approved exact variant | none | Approximate → exact changes observable values and rankings and requires a recorded `D-<id>` row in `.migration/06_decisions.md` naming affected consumers; without one, keep `percentile_approx` and reconcile estimator drift as a Tier 3 finding, never a tolerance. `{1,2,3,4}` p50: Trino `3.0`, Databricks `percentile_approx` `2.0`, exact `2.5` **(probe)**; Trino returns `REAL` for `DECIMAL` input, Databricks keeps `DECIMAL` **(probe)** |
 | 53 | `approx_set` / `merge` / `cardinality(hll)` / `empty_approx_set` | recompute with `approx_count_distinct` or `COUNT(DISTINCT)` | none | sketches are not portable |
 | 54 | `count_if(c)` / `bool_or` / `bool_and` / `every` | `count_if` / `bool_or` / `bool_and` / `every` | same | **(probe)** |
 | 55 | `arbitrary(x)` / `any_value(x)` | `any_value(x)` | same | non-deterministic on both: exclude from Tier 3, or replace with `min`/`max`/`max_by` |
@@ -283,8 +283,8 @@ and the orchestrator around the SQL. Every row lands through the cited official 
 | Decimal division scale | `decimal(10,2) / 3` -> `decimal(21,13)`; `AVG(decimal)` keeps input scale | `decimal(14,6)`; `AVG` adds 4 to the scale | Tier 3 last-digit diffs on `avg_*`/`*_per_*` columns; Tier 2 sums equal | cast to the Trino result scale (rows 2-3); `decimal_round` at that scale; example 04 |
 | Integer division | `7 / 2` = `3` | `3.5` | Tier 3 fractions on ratio columns; Tier 2 sum drift | `DIV` (row 1) |
 | `CAST(decimal AS INTEGER)` | rounds | truncates | Tier 3 off-by-one on ~half the rows | `CAST(round(x) AS INT)` (row 9) |
-| Approximate aggregates | `approx_percentile` over `DECIMAL` returns `REAL`; T-Digest estimator | `percentile_approx` keeps `DECIMAL`; different estimator | Tier 3 on `median_*`; Tier 4 **ranking flips** when groups are within the error band (`ORDER BY median DESC` puts a different group first) | exact `percentile`/`median` on both sides for recon and, unless the decision record says otherwise, in the converted unit; example 05 |
-| `approx_distinct` | HLL, `2.3 %` default error | `approx_count_distinct` HLL++, `5 %` default | Tier 2 count drift within error bands | recon compares `COUNT(DISTINCT)` recomputed on both; the converted unit uses `COUNT(DISTINCT)` unless the plan accepts approximation |
+| Approximate aggregates | `approx_percentile` over `DECIMAL` returns `REAL`; T-Digest estimator | `percentile_approx` keeps `DECIMAL`; different estimator | Tier 3 on `median_*`; Tier 4 **ranking flips** when groups are within the error band (`ORDER BY median DESC` puts a different group first) | Approximate → exact changes observable values/rankings and requires a recorded `D-<id>` row in `.migration/06_decisions.md` naming affected consumers; without one, keep `percentile_approx`, reconcile estimator drift as a Tier 3 finding, and never add a tolerance; example 05 |
+| `approx_distinct` | HLL, `2.3 %` default error | `approx_count_distinct` HLL++, `5 %` default | Tier 2 count drift within error bands | Approximate → exact changes observable counts and requires a recorded `D-<id>` row in `.migration/06_decisions.md` naming affected consumers; without one, keep `approx_count_distinct`, reconcile estimator drift as a Tier 3 finding, and never add a tolerance |
 | NULLs in `array_agg` | kept | dropped by `array_agg`/`collect_list` | Tier 3 `size()` shortfall; `array_join` text diffs | `collect_list(coalesce(x, '<NULL>'))` when NULLs carry meaning, or filter NULLs on the source-side recon query (`filter(arr, x -> x IS NOT NULL)`) and record it |
 | Aggregate `ORDER BY` | `array_agg(x ORDER BY k)` honoured | ignored | Tier 3 array text diffs, Tier 4 report order | `array_sort(collect_set)` for distinct, struct-sort for ordered (rows 57-58); example 03 |
 | `ORDER BY` NULL placement | NULLs last in both directions | NULLs first for `ASC` | Tier 4 first/last rows differ; `LIMIT n` picks different rows (Tier 1 on top-n marts) | spell `NULLS LAST` |
@@ -296,8 +296,8 @@ and the orchestrator around the SQL. Every row lands through the cited official 
 | `split_part` out of range | NULL | `''` | Tier 3 null-vs-empty; `null_missing_equiv` does **not** mask it (`''` is a value) | `nullif(..., '')` |
 | `greatest`/`least` with NULL | NULL | NULL skipped | Tier 3 value-vs-NULL | row 13 |
 | Integer overflow | error (`TRY` -> NULL) | wraps silently unless ANSI mode | Tier 2 sum drift with negative outliers; source job failed, target succeeded | `try_add`/`try_multiply`; enable ANSI on the warehouse for the parallel run |
-| Zone-less vs zoned timestamps | `timestamp(p)` has no zone; `now()`/`from_unixtime` are zoned; `AT TIME ZONE` changes display only | one zoned `TIMESTAMP` rendered in the session zone; `TIMESTAMP_NTZ` for zone-less | Tier 3 whole-hour offsets; Tier 1 day-boundary drift on `date_trunc('day')`/`CAST(ts AS DATE)` | declare `timestamp_ntz` for zone-less columns, pin the session zone (P12), `datetime_utc_truncate_ms` |
-| Timestamp precision | up to `timestamp(12)`, default 3 | microseconds | Tier 3 sub-ms diffs | `datetime_utc_truncate_ms`; declare precision > 6 as a loss in the mapping |
+| Zone-less vs zoned timestamps | `timestamp(p)` has no zone; `now()`/`from_unixtime` are zoned; `AT TIME ZONE` changes display only | one zoned `TIMESTAMP` rendered in the session zone; `TIMESTAMP_NTZ` for zone-less | Tier 3 whole-hour offsets; Tier 1 day-boundary drift on `date_trunc('day')`/`CAST(ts AS DATE)` | declare `timestamp_ntz` for zone-less columns, pin the session zone (P12), and use `datetime_utc_truncate_ms` only at effective p <= 3 |
+| Timestamp precision | up to `timestamp(12)`, default 3 | microseconds | Tier 3 sub-ms diffs | `datetime_utc_truncate_ms` only for effective p <= 3; p 4-6 uses `identity`; p > 6 is a declared harness gap, so extract at microsecond precision and compare with identity |
 | `from_unixtime` type | zoned timestamp | **string** | Tier 3 type mismatch or silent string compare | `timestamp_seconds` (row 46) |
 | `day_of_week` | ISO Mon=1 | Sun=1 | Tier 1 group counts on weekday reports | row 40 |
 | `date_format` `%` tokens | MySQL-style | Java pattern | Tier 4 text diffs or wrong dates parsing | hand-map every token (rows 31-32) |
@@ -321,15 +321,23 @@ and the orchestrator around the SQL. Every row lands through the cited official 
 | Rule | Applies to | Params | Why |
 |---|---|---|---|
 | `decimal_round` | recomputed `DECIMAL` columns only (division, `AVG`, ratios); *not* stored decimals | `mode: half_up`, `places` = the Trino result scale the consumer saw (default 2 when the mapping declares none) | section 7 "Decimal division scale"; both engines round half away from zero **(probe)**, so `half_up` is the mode that changes nothing on equal inputs |
-| `datetime_utc_truncate_ms` | `TIMESTAMP(p)` -> `TIMESTAMP_NTZ`, `TIMESTAMP(p) WITH TIME ZONE` -> `TIMESTAMP` | `assume_source_tz_for_NTZ: <coordinator time_zone>` | precision p > 3 and zone rendering |
+| `datetime_utc_truncate_ms` | `TIMESTAMP(p)` / `TIMESTAMP(p) WITH TIME ZONE` only when effective source precision <= 3 (Hive/Parquet millis, PostgreSQL timestamp(3)) | `assume_source_tz_for_NTZ: <coordinator time_zone>` | p 4-6 is exact in Databricks and uses `identity`; p > 6 is a declared harness gap with no microsecond rule: extract at microsecond precision and compare with identity |
 | `rstrip_spaces` | `CHAR(n)` -> `STRING` | — | padding |
 | `uuid_normalize` | `UUID` -> `STRING` | — | case/hyphen spelling |
 | `null_missing_equiv` | `*` | — | JDBC catalogs surface absent columns as NULL |
 | `identity` | `*` | — | everything else compares exactly |
 
+### Reconciliation routing
+
+`trino` has no live source adapter yet. Reconcile Hive/Parquet tables through Lakehouse Federation or a landed
+snapshot with `--family databricks --mode snapshot` and a manifest; reconcile JDBC-connector catalogs directly
+against their engine, such as `--family postgres`. The doctor still audits the Trino type map with
+`--source-family trino`, while `dbx-recon --family trino` fails fast by design until a Trino adapter is rehearsed.
+
 Not rules (recon-query shape instead): `ORDER BY ... NULLS LAST` on both sides; `map_entries` sorted by key for
 maps; `array_sort` only where the source aggregate was `DISTINCT` (otherwise order is part of the contract);
-approximate aggregates replaced by their exact counterpart **on both sides** of the recon query, never on one.
+approximate aggregates replaced by their exact counterpart **on both sides** of the recon query only after a recorded
+`D-<id>` decision names the affected consumers; without that decision, retain the approximate contract on both sides.
 Harness gaps filed, not faked: `time_of_day_normalize` (TIME columns), `approx_within_error_band` (would let an
 approximate aggregate pass within its documented error: rejected for merge authority, a decision row instead).
 
@@ -394,11 +402,11 @@ citations and the recon tier that catches a wrong conversion. `${catalog}`/`${sc
 
 | Dir | Constructs | Recon tier that catches a wrong conversion |
 |---|---|---|
-| `examples/01_cross_catalog_ctas/` | Hive + JDBC catalog join, `DROP` + CTAS -> `CREATE OR REPLACE TABLE`, `CHAR(n)` region key, `approx_distinct` -> `COUNT(DISTINCT)`, `format_datetime` | Tier 1 join shortfall on padded keys, Tier 2 distinct drift |
+| `examples/01_cross_catalog_ctas/` | Hive + JDBC catalog join, `DROP` + CTAS -> `CREATE OR REPLACE TABLE`, `CHAR(n)` region key, decision-approved `approx_distinct` -> `COUNT(DISTINCT)` (otherwise `approx_count_distinct`), `format_datetime` | Tier 1 join shortfall on padded keys, Tier 2 distinct drift |
 | `examples/02_map_unnest_report/` | `CROSS JOIN UNNEST(map_entries(m))` -> `LATERAL VIEW EXPLODE`, `element_at`, `cardinality` | Tier 1 exploded row count, Tier 4 report order |
 | `examples/03_ordered_distinct_array_agg/` | `array_agg(DISTINCT x ORDER BY x)` -> `array_sort(collect_set)`, `arbitrary` -> `any_value`, `listagg`, NULL handling | Tier 3 array text diffs, `size()` shortfall |
 | `examples/04_elapsed_days_decimal_scale/` | `date_diff('day')` -> `timestampdiff(DAY)`, decimal division and `AVG` scale casts, integer `DIV` | Tier 3 off-by-one on `active_days`, last-digit diffs on `avg_order_value`, Tier 2 sum drift |
-| `examples/05_approx_percentile_ranking/` | `approx_percentile` -> exact `percentile`/`median`, `ORDER BY ... NULLS LAST`, `REAL` vs `DECIMAL` result type | Tier 4 ranking flip, Tier 3 `median_*` |
+| `examples/05_approx_percentile_ranking/` | decision-approved `approx_percentile` -> exact `percentile`/`median` (otherwise `percentile_approx`), `ORDER BY ... NULLS LAST`, `REAL` vs `DECIMAL` result type | Tier 4 ranking flip, Tier 3 `median_*` |
 
 Not verified live (docs only): Iceberg/Delta connector `MERGE` multiple-match behaviour, `GRACE PERIOD` MVs, Python
 UDF port, Ranger/OPA policy shapes, `json_query`/`json_value` path mapping, `MATCH_RECOGNIZE` rewrites, hidden

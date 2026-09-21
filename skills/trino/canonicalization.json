@@ -10,7 +10,7 @@
     },
     {
       "rule": "datetime_utc_truncate_ms",
-      "applies_to": "TIMESTAMP(p)->TIMESTAMP_NTZ, TIMESTAMP(p) WITH TIME ZONE->TIMESTAMP; p>3 is declared as a precision loss in the mapping",
+      "applies_to": "TIMESTAMP(p) / TIMESTAMP(p) WITH TIME ZONE only when the source column's effective precision is <= 3 (Hive/Parquet millis, PostgreSQL timestamp(3)); p 4-6 is exact in Databricks and uses identity; p > 6 is a declared harness gap (no microsecond rule): extract at microsecond precision and compare with identity",
       "params": {
         "assume_source_tz_for_NTZ": "coordinator time_zone from SHOW SESSION"
       }
@@ -62,8 +62,8 @@
           { "source": "TIME(p)", "target": "string" },
           { "source": "TIME", "target": "string" },
           { "source": "TIME(p) WITH TIME ZONE", "target": "string" },
-          { "source": "TIMESTAMP(p)", "target": "timestamp_ntz", "conditional": { "timestamp": "datetime_utc_truncate_ms" } },
-          { "source": "TIMESTAMP", "target": "timestamp_ntz", "conditional": { "timestamp": "datetime_utc_truncate_ms" } },
+          { "source": "TIMESTAMP(p)", "target": "timestamp_ntz" },
+          { "source": "TIMESTAMP", "target": "timestamp_ntz" },
           { "source": "TIMESTAMP(p) WITH TIME ZONE", "target": "timestamp" },
           { "source": "TIMESTAMP WITH TIME ZONE", "target": "timestamp" },
           { "source": "INTERVAL YEAR TO MONTH", "target": "interval year to month" },

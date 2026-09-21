@@ -1,5 +1,5 @@
--- Exact median on the target (plan default). Trino's approx_percentile over DECIMAL returns REAL, so the
--- declared type of median_order_total is FLOAT unless the decision record moves the *source* report to exact too.
+-- Decision-approved exact median variant: cite the applicable D-<id> row in .migration/06_decisions.md.
+-- Trino's approx_percentile over DECIMAL returns REAL, so the declared type of median_order_total is FLOAT.
 SELECT
     u.attr_value                                                    AS promo,
     COUNT(*)                                                        AS orders,

@@ -828,6 +828,10 @@ class SnowflakeSourceAdapter(_UntestedSourceAdapter):
     family = "snowflake"
 
 
+class TrinoSourceAdapter(_UntestedSourceAdapter):
+    family = "trino"
+
+
 class TeradataSourceAdapter(_UntestedSourceAdapter):
     family = "teradata"
 
@@ -1487,6 +1491,7 @@ class DatabricksSourceAdapter(_SqlAdapterBase):
 SOURCE_ADAPTERS = {
     "redshift": RedshiftSourceAdapter,
     "snowflake": SnowflakeSourceAdapter,
+    "trino": TrinoSourceAdapter,
     "teradata": TeradataSourceAdapter,
     "oracle": OracleSourceAdapter,
     "sqlserver": SqlServerSourceAdapter,
