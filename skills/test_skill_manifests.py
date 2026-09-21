@@ -76,6 +76,17 @@ def test_required_databricks_plugin_is_pinned():
     assert len(dep.get("sha", "")) == 40
 
 
+def test_skills_extra_is_its_own_plugin():
+    manifest = json.loads((ROOT / "skills-extra" / ".devin-plugin" / "plugin.json").read_text())
+    assert manifest["name"] == "dbx-migration-dialects"
+    assert manifest["version"]
+    core = json.loads((ROOT / ".devin-plugin" / "plugin.json").read_text())
+    assert core["name"] != manifest["name"]
+    readme = (ROOT / "README.md").read_text()
+    assert "## Optional dialect skills" in readme
+    assert "dbx-migration-plugin/tree/main/skills-extra" in readme
+
+
 def test_source_access_folded_into_recon():
     assert not (ROOT / "skills" / "lakehouse-federation").exists()
     assert not (ROOT / "skills" / "backfill-planner").exists()

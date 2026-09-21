@@ -1,11 +1,20 @@
-# Optional source-dialect skills
+# dbx-migration-dialects (optional plugin)
 
-These optional source-dialect skills and the Lakebridge accelerator wrapper are not loaded by the core plugin; Devin loads only `skills/`.
-Their intended home is a separate `dbx-dialects-extra` plugin with the same layout once that repository exists.
-Until then, a fork that needs one copies `skills-extra/<name>` into `skills/` together with `skills-extra/lakebridge` (the dialect skills cite it by the relative path `../lakebridge/SKILL.md`, which resolves in either directory); references to core skills such as `skills/target-routing` already resolve.
-Each `canonicalization.json` still loads with `recon.config.load_canon_rules` (`dbx-recon run --canonicalization <path>`).
+This directory is its own Devin plugin (`.devin-plugin/plugin.json`, name `dbx-migration-dialects`). The core
+`dbx-migration-factory` plugin loads only `skills/` at the repo root and ships `oracle-plsql` as its one example
+dialect; nothing under `skills-extra/` is in a session's context unless this plugin is installed too.
 
-- `teradata-bteq` — Source-dialect skill for Teradata estates (Teradata SQL, BTEQ scripts, SPL stored procedures and macros, TPT/MLOAD/FASTLOAD control files).
-- `informatica-xml` — Source-dialect skill for Informatica PowerCenter estates.
-- `tsql-ssis` — Source-dialect skill for SQL Server T-SQL estates (with Sybase ASE deltas) and SSIS packages.
-- `lakebridge` — Databricks Labs Lakebridge (analyzer, profiler, BladeBridge/Morpheus/Switch transpilers, reconciler) as a migration accelerator.
+Install it from the subdirectory URL, next to the core plugin:
+
+```
+https://github.com/Cognition-Partner-Workshops/dbx-migration-plugin/tree/main/skills-extra
+```
+
+- `teradata-bteq` — Teradata SQL, BTEQ scripts, SPL stored procedures and macros, TPT/MLOAD/FASTLOAD control files.
+- `informatica-xml` — Informatica PowerCenter repository XML exports (workflows, sessions, mappings, mapplets).
+- `tsql-ssis` — SQL Server T-SQL (with Sybase ASE deltas) and SSIS `.dtsx` packages.
+- `lakebridge` — Databricks Labs Lakebridge (analyzer, profiler, transpilers, reconciler) as an accelerator; never the merge gate.
+
+The dialect skills cite Lakebridge by the relative path `../lakebridge/SKILL.md`, and references to core skills such as
+`skills/target-routing` resolve against the core plugin. Each `canonicalization.json` loads with
+`recon.config.load_canon_rules` (`dbx-recon run --canonicalization <path>`).
