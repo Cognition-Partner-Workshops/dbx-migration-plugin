@@ -2,6 +2,8 @@
 import datetime as dt
 import json
 import re
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -173,6 +175,87 @@ def test_databricks_target_validates_catalog_and_schema_before_it_connects(monke
     with pytest.raises(ConfigError, match="invalid SQL identifier"):
         adapters.DatabricksTargetAdapter("D", "", "silver")
     assert connects == []
+
+
+def _fake_databricks_sql(monkeypatch, captured):
+    import databricks  # real namespace package; its `sql` attribute is what `from databricks import sql` binds
+    fake_sql = types.ModuleType("databricks.sql")
+    fake_sql.connect = lambda **kw: captured.update(kw) or "conn"
+    monkeypatch.setitem(sys.modules, "databricks.sql", fake_sql)
+    monkeypatch.setattr(databricks, "sql", fake_sql, raising=False)
+
+
+def test_databricks_connect_uses_m2m_kwargs(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net/")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "sp-client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "sp-secret")
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/x")
+    captured = {}
+    _fake_databricks_sql(monkeypatch, captured)
+    assert adapters._databricks_connect() == "conn"
+    assert captured["server_hostname"] == "adb-1.azuredatabricks.net"
+    assert captured["http_path"] == "/sql/1.0/warehouses/x"
+    assert captured["oauth_client_id"] == "sp-client-id"
+    assert captured["oauth_client_secret"] == "sp-secret"
+    assert "access_token" not in captured
+
+
+def test_databricks_connect_env_oidc_uses_sdk_bearer(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "sp-client-id")
+    monkeypatch.delenv("DATABRICKS_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/x")
+    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "env-oidc")
+    monkeypatch.setenv("DATABRICKS_OIDC_TOKEN", "oidc-already-minted")
+    monkeypatch.setattr(adapters.subprocess, "run",
+                        lambda *a, **k: pytest.fail("devin-oidc must not be spawned"))
+    fake_core = types.ModuleType("databricks.sdk.core")
+    fake_core.Config = lambda: types.SimpleNamespace(
+        authenticate=lambda: {"Authorization": "Bearer tok"})
+    monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake_core)
+    fake_sdk = types.ModuleType("databricks.sdk")
+    fake_sdk.core = fake_core
+    monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
+    captured = {}
+    _fake_databricks_sql(monkeypatch, captured)
+    assert adapters._databricks_connect() == "conn"
+    assert captured["access_token"] == "tok"
+    assert "oauth_client_secret" not in captured
+
+
+def test_databricks_family_run_builds_the_source_with_the_http_path(monkeypatch, tmp_path):
+    """--family databricks reads through the session identity's warehouse: the source adapter arg
+    is --target-http-path (env fallback inside _databricks_connect), never the secret name."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
+    (tmp_path / "m.json").write_text(json.dumps({"version": "m", "objects": [
+        {"object": "orders", "root_table": "ORDERS",
+         "key": {"source": ["ORDER_ID"], "target": "order_id"},
+         "fields": [{"source": "ORDER_ID", "target": "order_id", "target_type": "long"}]}]}))
+    (tmp_path / "t.json").write_text(json.dumps({"version": "t"}))
+    (tmp_path / "c.json").write_text("{}")
+
+    class _Stop(Exception):
+        pass
+
+    seen = {}
+
+    class _Source:
+        def __init__(self, arg):
+            seen["arg"] = arg
+            raise _Stop
+
+    monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "databricks", _Source)
+    with pytest.raises(_Stop):
+        cli.main(["run", "--unit", "u", "--family", "databricks",
+                  "--mapping", str(tmp_path / "m.json"), "--tolerances", str(tmp_path / "t.json"),
+                  "--canonicalization", str(tmp_path / "c.json"), "--mode", "fixture",
+                  "--source-dsn-secret", "SOURCE_DSN",
+                  "--target-http-path", "/sql/1.0/warehouses/x",
+                  "--target-catalog", "mig", "--target-schema", "s",
+                  "--out", str(tmp_path / "out")])
+    assert seen["arg"] == "/sql/1.0/warehouses/x"
 
 
 def test_lakebase_target_binds_the_connection_to_the_allowlisted_database(monkeypatch):

@@ -23,7 +23,9 @@ dbx-recon run \
   --mode fixture|live|snapshot|continuous|transactional|structural \
   --source-dsn-secret <SOURCE_SECRET_NAME> \
   --target-kind databricks|lakebase \
-  --target-secret DATABRICKS_MIGRATION_SQL --target-catalog <migration catalog> \
+  [--target-http-path <warehouse path>] --target-catalog <migration catalog> \
+  # lakebase instead: --target-secret LAKEBASE_MIGRATION_DSN; databricks connects as the \
+  # session's service principal (DATABRICKS_HTTP_PATH names the warehouse; see target-routing) \
   --allowed-targets-file .migration/allowed_targets.json --target-schema <schema> \
   --snapshot-manifest .migration/snapshots/<unit_id>.json \
   --seed 0 --depth threshold|sampled|full [--param from_date=2024-01-01 ...] \

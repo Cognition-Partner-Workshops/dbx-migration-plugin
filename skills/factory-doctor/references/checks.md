@@ -58,9 +58,9 @@ Verifies the source principal cannot write mapped objects. SQL Server checks ser
 on every source procedure, and CDC. Postgres checks `rolsuper/rolcreaterole/rolcreatedb`,
 `pg_write_server_files/pg_execute_server_program`, table `INSERT/UPDATE/DELETE/TRUNCATE`, column
 `INSERT/UPDATE`, schema `CREATE`, security-definer/granted-function `EXECUTE`, and nested
-`pg_has_role` paths (only inheriting or `SET ROLE` memberships on Postgres 16+). Databricks uses
-the secret's host/token with inherited `DATABRICKS_*` stripped except host/token and `PAT`, then
-`grants get-effective` on each catalog/schema/table; ownership or anything beyond `SELECT`,
+`pg_has_role` paths (only inheriting or `SET ROLE` memberships on Postgres 16+). Databricks is
+read through the session's own service principal (see target-routing: env-oidc or oauth-m2m, no
+PAT), then `grants get-effective` on each catalog/schema/table; ownership or anything beyond `SELECT`,
 `USE_CATALOG`, `USE_SCHEMA`, `BROWSE`, and `READ_VOLUME` fails, owner-less/malformed assignments
 are `unverified`. Unsupported/uninferred families are `unverified`; `--source-attested D-<id>`
 yields `ok` with `attested`/`decision` in `data` only for families without a query and a
@@ -87,6 +87,11 @@ launch) or the scope cannot be listed; `fail` also on a name that is not `scope/
 references a secret, and under `--no-databricks` like every CLI check.
 
 ### `databricks_identity`
+`databricks auth describe` must report the session's service-principal auth: `env-oidc` or
+`oauth-m2m` is `ok`, `pat` is a `warn` that attributes work to a human and bypasses the service
+principal (waivable in `06_decisions.md`), anything else `fail`; `current-user me` then classifies
+the identity — a service principal on the manifest's host is `ok`, a human is a `warn` pointing at
+the org blueprint (see target-routing), a wrong identity or host is `fail`.
 ### `type_map_audit`
 
 `fail` when a resolved unit mapping declares a `target_type` the source family's

@@ -34,7 +34,7 @@ Pin a version instead of tracking the default branch:
 ```json
 {
   "requiredPlugins": [
-    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.3.2" }
+    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.4.0" }
   ]
 }
 ```
@@ -52,6 +52,8 @@ this one in the same change. If the org's managed manifest uses `"forbiddenPlugi
 `databricks/databricks-agent-skills` explicitly; transitive dependencies are not exempt.
 
 After installing, run the `install-dbx-factory` skill once per org (see `OVERVIEW.md`).
+
+Databricks auth: one dedicated service principal via the org blueprint (OIDC token federation preferred, OAuth M2M fallback); see `skills/target-routing/SKILL.md`.
 
 ## Optional dialect skills
 

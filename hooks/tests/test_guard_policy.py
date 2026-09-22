@@ -331,6 +331,11 @@ def test_reads_and_look_alikes_of_the_databricks_config_files_pass():
     approve("databricks auth describe")
 
 
+def test_env_oidc_auth_type_does_not_make_a_read_an_identity_swap(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "env-oidc")
+    approve("databricks current-user me")
+
+
 def test_identity_variables_without_a_client_in_the_segment_are_not_the_guards_business():
     block("export DATABRICKS_HOST=https://x; git status")  # probe2 #3: an export outlives the command; the next one runs as it
     approve("DATABRICKS_HOST=https://x git status; databricks jobs list")

@@ -282,7 +282,7 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
     monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
         doctor.Check("databricks_cli", "ok", "v0.2"),
-        doctor.Check("databricks_auth_kind", "warn", "pat (env)"),
+        doctor.Check("databricks_auth_kind", "warn", "pat"),
         doctor.Check("databricks_identity", "warn", "authenticated as someone@example.com (user)"),
         doctor.Check("databricks_warehouse", "warn", "none"),
     ])
@@ -291,15 +291,15 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
     assert not report["ready"] and report["blocking"] == ["databricks_identity=warn"]
 
 
-def test_human_identity_redacts_username_and_names_service_principal_secrets(monkeypatch):
+def test_human_identity_redacts_username_and_names_the_service_principal_waiver(monkeypatch):
     _fake_cli(monkeypatch, {"userName": "someone@example.com"},
-              {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
+              {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net",
+                                                "auth_type": "pat"}})
     row = by_id({"checks": [asdict(c) for c in doctor.check_databricks(None)]})["databricks_identity"]
     assert row["data"]["userName"] == "<human user (redacted)>"
     assert "someone@example.com" not in row["detail"]
-    assert "DATABRICKS_CLIENT_ID" in row["detail"]
-    assert "DATABRICKS_CLIENT_SECRET" in row["detail"]
-    assert "DATABRICKS_HOST" in row["detail"]
+    assert "service principal" in row["detail"]
+    assert "06_decisions.md" in row["detail"]
 
 
 def test_lakebase_rows_are_absent_without_flags(tmp_path):
@@ -1543,10 +1543,12 @@ def test_source_families_are_the_harness_families_and_databricks_without_cli_is_
     cli = (PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness" / "recon" / "cli.py").read_text()
     families = re.search(r"^SOURCE_FAMILIES = \((.*)\)$", cli, re.MULTILINE).group(1)
     assert set(doctor.SOURCE_FAMILIES) == set(re.findall(r'"(\w+)"', families)) and "databricks" in doctor.SOURCE_FAMILIES
-    monkeypatch.setenv("SRC_DBX", "token=never-printed")
     monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
-    assert c.status == "unverified" and "databricks" in c.detail and "never-printed" not in json.dumps(asdict(c))
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
+    assert c.status == "unverified" and "databricks" in c.detail
+    # offline: never let the session-identity connect reach a real warehouse
+    monkeypatch.setitem(doctor._READ_ONLY_CONNECT, "databricks",
+                        lambda _dsn: (_ for _ in ()).throw(RuntimeError("no connector in tests")))
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_secret="SRC_DBX",
@@ -1769,39 +1771,23 @@ DBX_TABLES = ["mig.raw.loans", "mig.raw.payments"]
 DBX_READ_GRANTS = {"mig": ["USE_CATALOG"], "mig.raw": ["USE_SCHEMA"],
                    "mig.raw.loans": ["SELECT"], "mig.raw.payments": ["SELECT"]}
 DBX_PRINCIPAL = "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d"
-DBX_SECRET = json.dumps({"server_hostname": "adb-source.example", "http_path": "/sql/1.0/warehouses/x",
-                         "access_token": "test-source-token"})
 
 
 def _dbx_source_cli(monkeypatch, *, grants, owners=None, groups=(), fail_op=None,
                     raw_get_effective=None):
-    """A databricks CLI bound to the --source-secret credential, not the session env: every call
-    must arrive with env carrying only the secret's host/token plus auth-type pat — every other
-    DATABRICKS_* variable set in the session must not reach the subprocess. `current-user me`
-    answers an applicationId in `groups`, `catalogs|schemas|tables get` the owners dict (default
-    owner@example.com, since a missing owner is now unverified), `grants get-effective` the
-    per-name grants dict (one assignment carried through a GROUP, the way inherited grants
-    arrive); `raw_get_effective` overrides the payload per securable for malformed-JSON cases.
-    Returns every command asked."""
+    """A databricks CLI answering as the session's own service principal: every call must arrive
+    with no env override (env is None) because the probe reads the source through the session
+    identity. `current-user me` answers an applicationId in `groups`, `catalogs|schemas|tables
+    get` the owners dict (default owner@example.com, since a missing owner is now unverified),
+    `grants get-effective` the per-name grants dict (one assignment carried through a GROUP, the
+    way inherited grants arrive); `raw_get_effective` overrides the payload per securable for
+    malformed-JSON cases. Returns every command asked."""
     asked = []
-    monkeypatch.setenv("SRC_DBX", DBX_SECRET)
-    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "oauth-m2m")
-    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "inherited-client-id")
-    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "inherited-secret")
-    monkeypatch.setenv("DATABRICKS_ACCOUNT_ID", "inherited-account")
-    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "inherited-profile")
-    monkeypatch.setenv("DATABRICKS_HOST", "https://wrong-workspace.example")
-    monkeypatch.setenv("DATABRICKS_TOKEN", "inherited-token")
     monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
 
     def fake_run(cmd, timeout=0, env=None):
         asked.append(cmd)
-        assert env is not None, cmd
-        dbx = {k for k in env if k.startswith("DATABRICKS_")}
-        assert dbx == {"DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_AUTH_TYPE"}, cmd
-        assert env["DATABRICKS_TOKEN"] == "test-source-token"
-        assert env["DATABRICKS_HOST"] == "https://adb-source.example"
-        assert env["DATABRICKS_AUTH_TYPE"] == "pat"
+        assert env is None, cmd
         op = tuple(cmd[1:3])
         if op == fail_op:
             return 1, "", "Error: default auth: cannot configure default credentials token=never-printed"
@@ -1822,24 +1808,19 @@ def _dbx_source_cli(monkeypatch, *, grants, owners=None, groups=(), fail_op=None
     return asked
 
 
-def test_databricks_source_principal_needs_and_parses_the_secret(monkeypatch):
+def test_databricks_source_principal_uses_the_session_identity(monkeypatch):
+    asked = _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
     c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
-    assert c.status == "fail" and "--source-secret" in c.detail
-    monkeypatch.delenv("SRC_DBX", raising=False)
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
-    assert c.status == "fail" and "SRC_DBX" in c.detail and "not set" in c.detail
-    monkeypatch.setenv("SRC_DBX", "token=never-printed")
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
-    assert c.status == "unverified" and "JSON" in c.detail
-    assert "never-printed" not in json.dumps(asdict(c))
+    assert c.status == "ok", c.detail
+    assert c.data["identity"] == "session" and c.data["principal"] == DBX_PRINCIPAL
+    assert asked and asked[0][1:3] == ["current-user", "me"]
 
 
 def test_databricks_source_principal_ok_reads_every_securable(monkeypatch):
     asked = _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
     assert c.status == "ok", c.detail
-    assert c.data["principal"] == DBX_PRINCIPAL and c.data["host"] == "adb-source.example"
-    assert c.data["writable"] == {} and "test-source-token" not in json.dumps(asdict(c))
+    assert c.data["principal"] == DBX_PRINCIPAL and c.data["writable"] == {}
     effective = [cmd[3:5] for cmd in asked if cmd[1:3] == ["grants", "get-effective"]]
     assert effective == [["catalog", "mig"], ["schema", "mig.raw"],
                          ["table", "mig.raw.loans"], ["table", "mig.raw.payments"]]
@@ -1848,7 +1829,7 @@ def test_databricks_source_principal_ok_reads_every_securable(monkeypatch):
 def test_databricks_source_principal_fails_on_write_privilege(monkeypatch):
     grants = dict(DBX_READ_GRANTS, **{"mig.raw.payments": ["SELECT", "MODIFY"]})
     _dbx_source_cli(monkeypatch, grants=grants)
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
     assert c.status == "fail" and "mig.raw.payments: MODIFY" in c.detail
     assert c.data["writable"]["mig.raw.payments"] == ["MODIFY"]
 
@@ -1856,7 +1837,7 @@ def test_databricks_source_principal_fails_on_write_privilege(monkeypatch):
 def test_databricks_source_principal_fails_on_group_ownership(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, owners={"mig.raw": "data_engineers"},
                     groups=("data_engineers",))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "fail" and "mig.raw: OWNER" in c.detail
     assert c.data["writable"]["mig.raw"] == ["OWNER"]
 
@@ -1864,30 +1845,28 @@ def test_databricks_source_principal_fails_on_group_ownership(monkeypatch):
 def test_databricks_source_principal_fails_on_inherited_write_grant(monkeypatch):
     grants = dict(DBX_READ_GRANTS, **{"mig.raw": ["USE_SCHEMA", "ALL_PRIVILEGES"]})
     _dbx_source_cli(monkeypatch, grants=grants, groups=("data_engineers",))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "fail" and "mig.raw: ALL_PRIVILEGES" in c.detail
 
 
 def test_databricks_source_principal_unverified_on_cli_error(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, fail_op=("grants", "get-effective"))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "get-effective" in c.detail
-    assert "never-printed" not in json.dumps(asdict(c))
     monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "CLI" in c.detail
 
 
 def test_databricks_source_principal_unverified_when_owner_is_unknown(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, fail_op=("schemas", "get"))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "schemas get mig.raw" in c.detail
-    assert "never-printed" not in json.dumps(asdict(c))
 
 
 def test_databricks_source_principal_unverified_on_malformed_grants_payload(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, raw_get_effective={"mig": {}})
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "catalog mig" in c.detail
     assert "no privilege_assignments" in c.detail
 
@@ -1896,7 +1875,7 @@ def test_databricks_source_principal_empty_assignments_are_read_only(monkeypatch
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS,
                     raw_get_effective={name: {"privilege_assignments": []}
                                        for name in ("mig", "mig.raw", "mig.raw.loans")})
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "ok", c.detail
 
 
@@ -1904,14 +1883,14 @@ def test_databricks_source_principal_unverified_on_string_privileges(monkeypatch
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS,
                     raw_get_effective={"mig.raw.loans": {"privilege_assignments": [
                         {"principal": DBX_PRINCIPAL, "privileges": "SELECT"}]}})
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "table mig.raw.loans" in c.detail
     assert "no privilege_assignments" in c.detail
 
 
 def test_databricks_source_principal_two_part_names_are_unresolved(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
-    c = doctor.check_source_principal(["raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["raw.loans"], "databricks", None)
     assert c.status == "unverified" and c.data["unresolved"] == ["raw.loans"]
 
 
@@ -2313,21 +2292,44 @@ def _fake_cli(monkeypatch, me, describe):
     monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/databricks")
 
 
-def test_auth_kind_fails_on_conflicting_pat_and_m2m_env(monkeypatch):
-    _fake_cli(monkeypatch, {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"},
-              {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
-    monkeypatch.setenv("DATABRICKS_TOKEN", "token")
-    for name in doctor.M2M_VARS:
-        monkeypatch.setenv(name, name.lower())
-    row = {c.id: c for c in doctor.check_databricks(None)}["databricks_auth_kind"]
+def _auth_kind(monkeypatch, auth_type, **env):
+    sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
+    _fake_cli(monkeypatch, sp, {"status": "success", "details": {
+        "host": "https://adb-1.azuredatabricks.net", **({"auth_type": auth_type} if auth_type else {})}})
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    return {c.id: c for c in doctor.check_databricks(None)}["databricks_auth_kind"]
+
+
+def test_auth_kind_env_oidc_is_ok(monkeypatch):
+    row = _auth_kind(monkeypatch, "env-oidc", DATABRICKS_DEVIN_AUDIENCE="databricks-prod")
+    assert row.status == "ok"
+    assert row.data["auth_kind"] == "env-oidc" and row.data["audience"] == "databricks-prod"
+
+
+def test_auth_kind_oauth_m2m_is_ok(monkeypatch):
+    row = _auth_kind(monkeypatch, "oauth-m2m")
+    assert row.status == "ok" and row.data["auth_kind"] == "oauth-m2m"
+    assert "audience" not in row.data
+
+
+def test_auth_kind_pat_warns_and_names_the_waiver(monkeypatch):
+    row = _auth_kind(monkeypatch, "pat")
+    assert row.status == "warn" and "06_decisions.md" in row.detail
+    assert "service principal" in row.detail
+
+
+def test_auth_kind_fails_when_describe_reports_no_known_type(monkeypatch):
+    row = _auth_kind(monkeypatch, None)
     assert row.status == "fail"
-    assert row.data["auth_kind"] == "conflict (env)"
-    assert "DATABRICKS_TOKEN" in row.detail
+    assert "databricks auth describe" in row.detail
+    assert "env-oidc" in row.detail and "oauth-m2m" in row.detail
 
 
 def test_identity_row_records_the_verified_host_and_the_report_exposes_it(tmp_path, monkeypatch):
     sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
-    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
+    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net",
+                                                                "auth_type": "oauth-m2m"}})
     checks = {c.id: c for c in doctor.check_databricks(None)}
     assert checks["databricks_identity"].status == "ok"
     assert checks["databricks_identity"].data == {"userName": sp["userName"], "service_principal": True,
@@ -2344,7 +2346,8 @@ def test_identity_row_fails_when_the_workspace_is_not_the_expected_host(tmp_path
     """The expected principal can resolve against another workspace (a child's own profile or env):
     the host is compared to --expect-host under one spelling rule, not merely required to be set."""
     sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
-    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-2.azuredatabricks.net"}})
+    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-2.azuredatabricks.net",
+                                                                "auth_type": "oauth-m2m"}})
 
     def row(host):
         return {c.id: c for c in doctor.check_databricks(sp["userName"], host)}["databricks_identity"]
