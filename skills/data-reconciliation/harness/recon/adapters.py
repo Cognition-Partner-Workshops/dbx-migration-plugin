@@ -1446,7 +1446,8 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
 
 
 class DatabricksSourceAdapter(_SqlAdapterBase):
-    """Databricks as the SOURCE (workspace-to-workspace or Hive-to-UC moves)."""
+    """Databricks as the SOURCE, same workspace as the target (Hive-to-UC, catalog-to-catalog,
+    federated catalogs): read as the session identity on DATABRICKS_HOST."""
 
     paramstyle = "pyformat"
     CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 0}

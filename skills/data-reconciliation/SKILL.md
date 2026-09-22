@@ -59,7 +59,7 @@ The depth is recorded in `result.json` and the summary.
 |---|---|
 | `sqlserver` (pyodbc, `[sqlserver]` extra) | live-tested: SQL Server 2022 -> Lakebase rehearsal |
 | `postgres` (psycopg, `[lakebase]` extra) | live-tested: Postgres source and Lakebase target |
-| `databricks` (`[databricks]` extra) | live-tested: Delta target and Databricks-to-Databricks source |
+| `databricks` (`[databricks]` extra) | live-tested: Delta target and Databricks-to-Databricks source. Same workspace only: the source is read as the session identity on `DATABRICKS_HOST` through `--target-http-path` (Hive-to-UC, catalog-to-catalog, federated catalogs); a source in another workspace is out of scope. |
 | `redshift`, `snowflake`, `teradata`, `oracle` | **untested**: the adapter raises `NotImplementedError("<family> source adapter is untested; see SKILL.md")` before any connection. Reconcile these through Lakehouse Federation (`--family databricks`) or land an adapter with a rehearsal first. |
 
 ```bash

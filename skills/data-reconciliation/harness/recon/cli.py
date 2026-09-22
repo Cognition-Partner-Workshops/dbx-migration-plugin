@@ -261,7 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--mode", required=True, choices=MODES + PLANNED_MODES)
     r.add_argument("--source-dsn-secret", required=True,
                    help="ENV VAR NAME holding the source connection (read-only principal); "
-                        "ignored for --family databricks: the source is read as the session identity")
+                        "ignored for --family databricks: the source is read as the session identity in the "
+                        "target workspace (same-workspace moves only)")
     r.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks")
     r.add_argument("--target-secret", required=False,
                    help="for --target-kind lakebase: ENV VAR NAME holding the branch endpoint's "

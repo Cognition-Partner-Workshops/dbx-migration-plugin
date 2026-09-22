@@ -246,7 +246,7 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
     assert not report["ready"] and report["blocking"] == ["databricks_identity=warn"]
 
 
-def test_human_identity_redacts_username_and_names_the_service_principal_waiver(monkeypatch):
+def test_human_identity_redacts_username_and_offers_no_waiver(monkeypatch):
     _fake_cli(monkeypatch, {"userName": "someone@example.com"},
               {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net",
                                                 "auth_type": "pat"}})
@@ -254,7 +254,7 @@ def test_human_identity_redacts_username_and_names_the_service_principal_waiver(
     assert row["data"]["userName"] == "<human user (redacted)>"
     assert "someone@example.com" not in row["detail"]
     assert "service principal" in row["detail"]
-    assert "06_decisions.md" in row["detail"]
+    assert "06_decisions.md" not in row["detail"]
 
 
 def test_lakebase_rows_are_absent_without_flags(tmp_path):
@@ -2268,9 +2268,9 @@ def test_auth_kind_oauth_m2m_is_ok(monkeypatch):
     assert "audience" not in row.data
 
 
-def test_auth_kind_pat_warns_and_names_the_waiver(monkeypatch):
+def test_auth_kind_pat_fails_with_no_waiver(monkeypatch):
     row = _auth_kind(monkeypatch, "pat")
-    assert row.status == "warn" and "06_decisions.md" in row.detail
+    assert row.status == "fail" and "06_decisions.md" not in row.detail
     assert "service principal" in row.detail
 
 

@@ -64,15 +64,15 @@ This section is the only home for the Databricks auth rules; other files point h
   the `databricks` binary is a wrapper that exports a fresh `DATABRICKS_OIDC_TOKEN` per call), OAuth
   M2M fallback (`DATABRICKS_AUTH_TYPE=oauth-m2m` with `DATABRICKS_CLIENT_SECRET`). Auth arrives only
   from env vars the blueprint sets (`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`); optional
-  `DATABRICKS_DEVIN_AUDIENCE` sets a per-tier OIDC audience. No PAT without a waiver row in
-  `06_decisions.md`, no profiles, no config files, no interactive `databricks auth login`. The
+  `DATABRICKS_DEVIN_AUDIENCE` sets a per-tier OIDC audience. No PATs (the doctor fails a `pat`
+  session; there is no waiver), no profiles, no config files, no interactive `databricks auth login`. The
   official "never auto-select a profile" rule is satisfied because there is exactly one identity and
   it is recorded in `.migration/00_context.md`.
 - The federation policy that lets the workspace accept the session's OIDC token is a deployment
   prerequisite the customer's workspace admin creates before intake; its issuer, subject and host
   values belong to the engagement's blueprint and access checklist, never to this repo.
 - Every session verifies identity once: the doctor reads `databricks auth describe` (env-oidc or
-  oauth-m2m is `ok`; `pat` is a warn that needs the waiver row) plus `databricks current-user me`,
+  oauth-m2m is `ok`; `pat` is a fail) plus `databricks current-user me`,
   and stops if the identity is not the migration principal (an admin or a human user is a halt, not
   a convenience). The recon harness connects with the same session identity; `DATABRICKS_HTTP_PATH`
   (or `--target-http-path`) names the SQL warehouse.

@@ -1398,10 +1398,10 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
         out.append(Check("databricks_auth_kind", "ok",
             f"auth: {auth_type} (service principal via the org blueprint)", auth_data))
     elif auth_type == "pat":
-        out.append(Check("databricks_auth_kind", "warn",
+        out.append(Check("databricks_auth_kind", "fail",
             "auth: pat — a personal access token attributes the session's work to a human and "
-            "bypasses the migration service principal; authenticate via the org blueprint "
-            "(env-oidc or oauth-m2m), or record a waiver in 06_decisions.md", auth_data))
+            "bypasses the migration service principal; unattended sessions authenticate via the "
+            "org blueprint (env-oidc or oauth-m2m); there is no waiver", auth_data))
     else:
         out.append(Check("databricks_auth_kind", "fail",
             f"auth: `databricks auth describe` reports {auth_type!r}; the org blueprint accepts "
@@ -1430,7 +1430,7 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
     elif not is_sp:
         status, detail = "warn", detail + ("; unattended sessions must not run as a human identity: "
             "authenticate as the migration service principal via the org blueprint (OIDC token "
-            "federation or OAuth M2M; see target-routing), or record a waiver in 06_decisions.md")
+            "federation or OAuth M2M; see target-routing); there is no waiver")
     out.append(Check("databricks_identity", status, detail, data))
 
     rc, wh, err = _run([cli, "experimental", "aitools", "tools", "get-default-warehouse"], timeout=60)
