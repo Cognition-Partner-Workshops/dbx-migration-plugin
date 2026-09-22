@@ -525,11 +525,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"ops entry missing required keys: {op.get('name', '?')}")
             for key in ("source_sql", "target_sql"):
                 _validate_sql(op[key], op.get("name", "?"))
+    if args.target_kind == "lakebase" and not args.target_secret:
+        raise SystemExit("--target-secret is required for --target-kind lakebase")
     source = SOURCE_ADAPTERS[args.family](
         args.target_http_path if args.family == "databricks" else args.source_dsn_secret)
     if args.target_kind == "lakebase":
-        if not args.target_secret:
-            raise SystemExit("--target-secret is required for --target-kind lakebase")
         # --target-catalog names the Lakebase database; the adapter refuses a DSN that lands
         # anywhere else, so the allowlist binds the connection and not just the label
         try:
