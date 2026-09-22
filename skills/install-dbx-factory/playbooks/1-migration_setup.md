@@ -65,7 +65,7 @@ Every child uses CORE + its workload profile + DATA / DEPENDENCY. No downstream 
 | `bundle_targets`, `lakebase_projects`, `lakebase_branches` | bundle, project, and branch allowlists |
 | `run_mode`, `fixture_endpoints` | `live` or `fixture`, plus required local cloud endpoints |
 
-Example: `{"catalogs":["mig_cat"],"legacy_sources":["LEGACY_DSN"],"guard_mode":"block","target_hosts":["MIG_DSN"],"bundle_targets":["migration"],"lakebase_projects":["project"],"lakebase_branches":["mig-*"]}`. Adding a catalog, host, or target later is a PR to the protected branch carrying a `D-<id>` row in `06_decisions.md`, merged before the write — a local edit never widens scope. Add `.migration/.hook_probe_nonce` and `.migration/live_playbooks.json` to `.gitignore`; bootstrap `.migration/playbooks.lock.json` with `install-dbx-factory` when absent, then run the setup doctor and commit `09_capabilities.json` with `source_principal`.
+Example: `{"catalogs":["mig_cat"],"legacy_sources":["LEGACY_DSN"],"guard_mode":"block","target_hosts":["MIG_DSN"],"bundle_targets":["migration"],"lakebase_projects":["project"],"lakebase_branches":["mig-*"]}`. Adding a catalog, host, or target later is a PR to the protected branch carrying a `D-<id>` row in `06_decisions.md`, merged before the write — a local edit never widens scope. Add `.migration/.hook_probe_nonce` to `.gitignore`; run `install-dbx-factory` once per org (and after plugin updates), then run the setup doctor and commit `09_capabilities.json` with `source_principal`.
 8. Attach target state, tolerances, and access checklist at STOP A; record proposed defaults and every D10 honestly.
 
 ## Specifications
