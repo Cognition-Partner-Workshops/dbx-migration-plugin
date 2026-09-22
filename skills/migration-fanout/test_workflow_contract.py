@@ -1,3 +1,4 @@
+import datetime
 import fcntl
 import hashlib
 import json
@@ -24,7 +25,7 @@ def _gates_sha(batches, wave=0):
     return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
+def _workspace(tmp_path, *, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
                doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
                gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
@@ -32,7 +33,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
                deploy_objects=None, max_minutes=None, batch_max_minutes=None, manifest_name="wave-0.json", wave=0,
                pipelines=None, auto_merge=None, close_minutes=None, other_batch=None,
                lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1,
-               manifest_extra=None):
+               manifest_extra=None, stop_c_id="D-2"):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -93,8 +94,9 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     if pipelines is not None:
         manifest["pipelines"] = dict(pipelines)
     manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"], wave)
-    manifest["stop_c"] = "D-2"
-    ledger = f"| D-2 | 2026-01-05 | user:U0 | STOP C wave-{wave} gates_sha {manifest['gates_sha']} | plan approved |\n" if stop_c else ""
+    manifest["stop_c"] = stop_c_id
+    ledger = (f"| {stop_c_id} | 2026-01-05 | user:U0 | STOP C wave-{wave} gates_sha "
+              f"{manifest['gates_sha']} | plan approved |\n") if stop_c else ""
     if prior_result is not None:
         waves.joinpath(manifest_name.replace(".json", ".result.json")).write_text(json.dumps(prior_result))
     if decisions is not None or stop_c:
@@ -150,8 +152,7 @@ def _workspace(tmp_path, *, mode="start", run_id=None, doctor=True, tamper=None,
     pointer_root = tmp_path / "home" if pointer_at == "home" else ws
     pointer_dir = pointer_root / ".migration" / "waves"
     pointer_dir.mkdir(parents=True, exist_ok=True)
-    pointer = {"manifest": manifest_name, "mode": mode, "run_id": run_id,
-               "hook_probe": hook_probe}
+    pointer = {"manifest": manifest_name, "hook_probe": hook_probe}
     if plugin is not None:
         pointer["plugin"] = str(plugin)
     if pointer_at == "home":
@@ -168,6 +169,7 @@ def _run(cwd, tmp_path, agent_reports):
     reports = tmp_path / "reports.json"
     calls = tmp_path / "calls.json"
     reports.write_text(json.dumps(agent_reports))
+    calls.write_text("[]")
     shim = f"""
 import json
 import subprocess
@@ -211,6 +213,23 @@ def _pass_report(pr_url="", **extra):
 
 def _result(ws):
     return json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
+
+
+def _new_stop_c(ws, stop_c):
+    manifest_path = ws / ".migration/waves/wave-0.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["stop_c"] = stop_c
+    manifest_path.write_text(json.dumps(manifest))
+    sys.path.insert(0, str(DOCTOR.parent))
+    import doctor as doctor_module
+    doctor_path = manifest_path.with_suffix(".doctor.json")
+    old = json.loads(doctor_path.read_text())
+    doctor_path.write_text(json.dumps(doctor_module.sign_wave_report(
+        {k: v for k, v in old.items() if k not in {"manifest_sha", "signed_at", "signature"}},
+        manifest_path.read_bytes(),
+        signed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))))
+    (ws / ".migration/06_decisions.md").write_text(
+        f"| {stop_c} | 2026-01-05 | user:U0 | STOP C wave-0 gates_sha {manifest['gates_sha']} |\n")
 
 
 def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_ledger(tmp_path):
@@ -303,102 +322,6 @@ def test_a_default_accepted_stop_c_row_launches_only_a_soft_stop_mode_wave(tmp_p
         assert not [c for c in calls if c["kind"] == "agent"]
 
 
-def test_gates_subcommand_applies_the_wave_close_rule_to_hand_gathered_results(tmp_path):
-    ws, cwd = _workspace(tmp_path, doctor=False, gates=[GATE, {**GATE, "id": "g-w", "kind": "export_file",
-                                                                 "status": "waived", "decision_id": "D-4"}],
-                         decisions="| D-4 | user:U1 | waive g-w for u |\n")
-    results = tmp_path / "results.json"
-
-    def run(reports):
-        results.write_text(json.dumps(reports))
-        return subprocess.run([sys.executable, str(WORKFLOW), "gates", str(results)], cwd=cwd, env={},
-                              capture_output=True, text=True)
-
-    pr = _push_pr(ws)
-    passed = {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/result.json"}
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
-    assert proc.returncode != 0 and "workflow.py reserve" in proc.stderr and "D-2" in proc.stderr  # no reservation
-    assert _workflow(cwd, "reserve").returncode == 0
-    for reports in ([{"batch": "b-1", "pr_url": pr, "gates": []}],                                   # g-rows still pending
-                    [],                                                                               # batch not gathered
-                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": ""}]}],
-                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": ".migration/recon/u/absent.md"}]}],
-                    [{"batch": "b-1", "pr_url": pr, "gates": [{**passed, "evidence": "recon/u/result.json"}]}],
-                    [{"batch": "b-1", "pr_url": "https://github.com/acme/target/pull/7", "gates": [passed]}],  # no such PR
-                    [{"batch": "b-1", "gates": [passed]}],                                            # no PR named
-                    [{"batch": "b-9", "pr_url": pr, "gates": []}]):                                  # not in the manifest
-        proc = run(reports)
-        assert proc.returncode != 0 and "Traceback" not in proc.stderr, reports
-        assert "g-rows" in proc.stdout or "b-1" in proc.stdout or "b-9" in proc.stderr or "pr_url" in proc.stderr, reports
-    proc = run([{"batch": "b-1", "pr_url": "https://github.com/acme/target/pull/7", "gates": [passed]}])
-    assert "pull/7 is not a PR of github.com/acme/target whose head git can fetch" in json.dumps(json.loads(proc.stdout)["batches"]["b-1"]["unmet"])
-    proc = run("not a list")
-    assert proc.returncode != 0 and "{batch, pr_url, gates}" in proc.stderr
-    runs = ws / ".migration/waves/wave-0.runs.jsonl"
-    assert [json.loads(l)["mode"] for l in runs.read_text().splitlines()] == ["reserve"]  # unmet gates: the run stays open
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
-    assert proc.returncode == 0, proc.stderr
-    out = json.loads(proc.stdout)
-    assert out["closed"] is True and out["batches"]["b-1"]["unmet"] == [] and "review_waiver" not in out["batches"]["b-1"]
-    assert [g["status"] for g in out["batches"]["b-1"]["gates"]] == ["passed", "waived"]
-    assert [(json.loads(l)["stop_c"], json.loads(l)["mode"]) for l in runs.read_text().splitlines()] == [("D-2", "reserve"), ("D-2", "gates")]
-    proc = run([{"batch": "b-1", "pr_url": pr, "gates": [passed]}])
-    assert proc.returncode != 0 and "closed" in proc.stderr and "D-2" in proc.stderr and "STOP C" in proc.stderr
-    assert not (ws / ".migration/waves/wave-0.result.json").exists()
-
-
-def _workflow(cwd, *args, **kw):
-    return subprocess.run([sys.executable, str(WORKFLOW), *args], cwd=cwd, env={}, capture_output=True, text=True, **kw)
-
-
-def test_a_hand_run_wave_reserves_its_stop_c_row_before_launch_and_a_spent_row_reserves_nothing(tmp_path):
-    """`workflow.py reserve` is the hand-run path's launch record: it spends the manifest's STOP C row in the
-    run log as a workflow start does, so a second hand launch, or a workflow start over it, halts."""
-    ws, cwd = _workspace(tmp_path / "hand", doctor=False)
-    runs = ws / ".migration/waves/wave-0.runs.jsonl"
-    proc = _workflow(cwd, "reserve")
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout) == {"wave": 0, "stop_c": "D-2", "reserved": True}
-    assert [json.loads(l) for l in runs.read_text().splitlines()] == [{"stop_c": "D-2", "mode": "reserve", "run_id": None}]
-    proc = _workflow(cwd, "reserve")
-    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
-    assert len(runs.read_text().splitlines()) == 1
-
-    ws, cwd = _workspace(tmp_path / "then_workflow")
-    assert _workflow(cwd, "reserve").returncode == 0
-    proc, calls = _run(cwd, tmp_path / "then_workflow", [_pass_report()])
-    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-
-    ws, cwd = _workspace(tmp_path / "after_workflow", doctor=False)
-    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": None}) + "\n")
-    proc = _workflow(cwd, "reserve")
-    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
-    (tmp_path / "after_workflow" / "results.json").write_text("[]")
-    proc = _workflow(cwd, "gates", str(tmp_path / "after_workflow" / "results.json"))
-    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr and "Traceback" not in proc.stderr
-
-
-def test_the_stop_c_row_is_spent_under_the_run_log_lock_so_two_starts_cannot_both_take_it(tmp_path):
-    """The check that a row is unspent and the record that spends it happen under an exclusive lock on the
-    run log: a start that finds the log locked waits, then sees the other start's record and halts."""
-    ws, cwd = _workspace(tmp_path / "ws", doctor=False)
-    runs = ws / ".migration/waves/wave-0.runs.jsonl"
-    runs.touch()
-    with runs.open("a") as held:
-        fcntl.flock(held, fcntl.LOCK_EX)
-        waiting = subprocess.Popen([sys.executable, str(WORKFLOW), "reserve"], cwd=cwd, env={},
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        with pytest.raises(subprocess.TimeoutExpired):
-            waiting.wait(timeout=2)
-        held.write(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": None}) + "\n")
-        held.flush()
-        fcntl.flock(held, fcntl.LOCK_UN)
-    _, err = waiting.communicate(timeout=30)
-    assert waiting.returncode != 0 and "D-2" in err and "STOP C" in err
-    assert len(runs.read_text().splitlines()) == 1
-
-
 @pytest.mark.parametrize("changed", [{"gates": [{**GATE, "kind": "custom"}]}, {"units": ("other_unit",)}])
 def test_gate_list_changed_after_stop_c_halts_before_launch(tmp_path, changed):
     approved = [{"id": "b-1", "units": ["u"], "gates": [GATE]}]
@@ -420,72 +343,29 @@ def test_a_gate_marked_passed_in_the_manifest_after_stop_c_halts_before_launch(t
 
 
 def test_a_stop_c_approval_launches_one_run_of_its_wave(tmp_path):
-    """The manifest's stop_c row is the one STOP C occurrence that approved this wave; a rerun after a run
-    that recorded it needs STOP C to fire again (a new row, named in the manifest), not the old approval."""
-    spent = {"closed": False, "run_id": "wfr-old", "base_sha": "a" * 40, "stop_c": "D-2"}
-    ws, cwd = _workspace(tmp_path / "spent", mode="rerun", prior_result=spent)
-    proc, calls = _run(cwd, tmp_path / "spent", [_pass_report()])
-    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-    assert json.loads((ws / ".migration/waves/wave-0.result.json").read_text()) == spent
-
-    ws, cwd = _workspace(tmp_path / "fresh", mode="rerun", prior_result={**spent, "stop_c": "D-1"})
-    proc, calls = _run(cwd, tmp_path / "fresh", [_pass_report()])
-    assert proc.returncode == 0, proc.stderr
-    assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
-    assert _result(ws)["stop_c"] == "D-2"
-
-    ws, cwd = _workspace(tmp_path / "resume", mode="resume", run_id="wfr-old", prior_result=spent)
-    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-old\n")
-    base = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
-    (ws / ".migration/waves/wave-0.base_sha").write_text(base)
-    proc, calls = _run(cwd, tmp_path / "resume", [_pass_report()])
-    assert proc.returncode == 0, proc.stderr  # the same run continuing is not a second run
-
-
-def test_every_run_is_appended_to_the_wave_run_log_and_a_stop_c_row_spent_by_any_of_them_is_not_reused(tmp_path):
-    """The result file holds the last run only, so alternating two STOP C rows would reuse each in turn; the
-    wave's run log is append-only and every run's stop_c is checked against all of it."""
     ws, cwd = _workspace(tmp_path / "log")
-    proc, _ = _run(cwd, tmp_path / "log", [_pass_report()])
+    proc, calls = _run(cwd, tmp_path / "log", [_pass_report()])
     assert proc.returncode == 0, proc.stderr
     runs = ws / ".migration/waves/wave-0.runs.jsonl"
     assert [json.loads(l)["stop_c"] for l in runs.read_text().splitlines()] == ["D-2"]
-
-    prior = {"closed": False, "run_id": "wfr-old", "base_sha": "a" * 40, "stop_c": "D-1"}
-    log = json.dumps({"stop_c": "D-2", "mode": "start"}) + "\n" + json.dumps({"stop_c": "D-1", "mode": "rerun"}) + "\n"
-    ws, cwd = _workspace(tmp_path / "alternating", mode="rerun", prior_result=prior)
-    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(log)
-    proc, calls = _run(cwd, tmp_path / "alternating", [_pass_report()])
-    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr and "runs.jsonl" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-    assert (ws / ".migration/waves/wave-0.runs.jsonl").read_text() == log
-
-    ws, cwd = _workspace(tmp_path / "deleted_result")  # start mode, result removed, log remembers
-    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start"}) + "\n")
-    proc, calls = _run(cwd, tmp_path / "deleted_result", [_pass_report()])
+    assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    proc, calls = _run(cwd, tmp_path / "log", [_pass_report()])
     assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
-
-    ws, cwd = _workspace(tmp_path / "fresh", mode="rerun", prior_result=prior)
-    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-1", "mode": "start"}) + "\n")
-    proc, calls = _run(cwd, tmp_path / "fresh", [_pass_report()])
+    assert "runs.jsonl" in proc.stderr
+    ws, cwd = _workspace(tmp_path / "new_stop", stop_c_id="D-3")
+    manifest = json.loads((ws / ".migration/waves/wave-0.json").read_text())
+    (ws / ".migration/06_decisions.md").write_text(
+        f"| D-3 | user:U0 | STOP C wave-0 gates_sha {manifest['gates_sha']} |\n")
+    proc, calls = _run(cwd, tmp_path / "new_stop", [_pass_report()])
     assert proc.returncode == 0, proc.stderr
-    assert [json.loads(l)["stop_c"] for l in (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()] == ["D-1", "D-2"]
-
-    ws, cwd = _workspace(tmp_path / "resume", mode="resume", run_id="wfr-old", prior_result={**prior, "stop_c": "D-2"})
-    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps({"stop_c": "D-2", "mode": "start", "run_id": "wfr-old"}) + "\n")
-    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-old\n")
-    base = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
-    (ws / ".migration/waves/wave-0.base_sha").write_text(base)
-    proc, _ = _run(cwd, tmp_path / "resume", [_pass_report()])
-    assert proc.returncode == 0, proc.stderr  # continuing the run that spent it
-    assert len((ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()) == 1
+    assert [json.loads(l)["stop_c"] for l in (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()] == ["D-3"]
 
 
 @pytest.mark.parametrize("log", ["{not json\n", "[]\n", '{"mode": "start"}\n', ""])
 def test_a_run_log_that_cannot_say_which_stop_c_rows_were_spent_halts(tmp_path, log):
-    ws, cwd = _workspace(tmp_path / "ws", mode="rerun", prior_result={"closed": False, "stop_c": "D-1"})
+    ws, cwd = _workspace(tmp_path / "ws")
     (ws / ".migration/waves/wave-0.runs.jsonl").write_text(log)
     proc, calls = _run(cwd, tmp_path / "ws", [_pass_report()])
     if log == "":
@@ -494,18 +374,6 @@ def test_a_run_log_that_cannot_say_which_stop_c_rows_were_spent_halts(tmp_path, 
     assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "STOP C" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
     assert (ws / ".migration/waves/wave-0.runs.jsonl").read_text() == log
-
-
-@pytest.mark.parametrize("prior", ["{not json", '"a string"', "[]", "null"])
-def test_a_rerun_over_a_result_that_cannot_say_which_stop_c_it_spent_halts(tmp_path, prior):
-    """A prior result the workflow cannot read is not proof the approval is unspent; the rerun halts until a
-    human inspects or restores it, rather than launching on the old row."""
-    ws, cwd = _workspace(tmp_path / "ws", mode="rerun")
-    (ws / ".migration/waves/wave-0.result.json").write_text(prior)
-    proc, calls = _run(cwd, tmp_path / "ws", [_pass_report()])
-    assert proc.returncode != 0 and "wave-0.result.json" in proc.stderr and "STOP C" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-    assert (ws / ".migration/waves/wave-0.result.json").read_text() == prior
 
 
 WAVE_1 = json.dumps({"wave": 1, "batches": [{"id": "b-2", "units": ["v"], "write_targets": ["mig.t"], "brief": "b"}]})
@@ -578,45 +446,6 @@ def test_shared_table_across_waves_halts_before_launch_unless_every_mapping_is_b
                                        {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
-
-
-def test_a_hand_run_wave_reserves_nothing_while_a_shared_table_is_unbounded(tmp_path):
-    """`reserve` is the small wave's launch: it runs the same cross-wave collision check the workflow does
-    before it spends the STOP C row, so an unbounded mapping on a shared table launches nothing by hand either."""
-    ws, cwd = _workspace(tmp_path / "open", doctor=False, other_waves={"wave-1.json": WAVE_1},
-                         mappings={"u": MAPPING, "v": BOUNDED_MAPPING})
-    proc = _workflow(cwd, "reserve")
-    assert proc.returncode != 0 and "Traceback" not in proc.stderr
-    assert "'mig.t'" in proc.stderr and "b-1" in proc.stderr and "b-2" in proc.stderr and "target_where" in proc.stderr
-    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
-
-    ws, cwd = _workspace(tmp_path / "overlap", doctor=False, other_waves={"wave-1.json": WAVE_1},
-                         mappings={"u": BOUNDED_MAPPING, "v": BOUNDED_MAPPING})
-    proc = _workflow(cwd, "reserve")
-    assert proc.returncode != 0 and "overlap" in proc.stderr
-    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
-
-    ws, cwd = _workspace(tmp_path / "bounded", doctor=False, other_waves={"wave-1.json": WAVE_1},
-                         mappings={"u": BOUNDED_MAPPING, "v": PRIOR_MAPPING})
-    proc = _workflow(cwd, "reserve")
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout)["reserved"] is True
-
-
-def test_a_hand_run_wave_reserves_nothing_while_its_declared_targets_differ_from_the_call_graph(tmp_path):
-    """`preflight` is advice about a manifest that may change before `reserve` runs; `reserve` checks the
-    manifest it spends the STOP C row on, call graph included."""
-    ws, cwd = _workspace(tmp_path / "drift", doctor=False, dependencies={"u": _analysis("mig.t", "mig.audit")})
-    proc = _workflow(cwd, "reserve")
-    assert proc.returncode != 0 and "Traceback" not in proc.stderr
-    assert "b-1" in proc.stderr and "mig.audit" in proc.stderr
-    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
-
-    ws, cwd = _workspace(tmp_path / "ok", doctor=False, dependencies={"u": _analysis("MIG.T")},
-                         write_targets=("mig.t", "mig.run"), deploy_objects=("mig.run",), namespace="mig")
-    proc = _workflow(cwd, "reserve")
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout)["reserved"] is True
 
 
 def _second_batch(pipelines, unit="v"):
@@ -931,17 +760,10 @@ def test_start_launches_children_and_writes_the_result(tmp_path):
     assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
     result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
     assert result["batches"][0]["status"] == "FAIL"
-    assert result["mode"] == "start" and result["run_id"] is None
+    assert "mode" not in result and "run_id" not in result
     assert result["hook_probe"] == "blocked:0123abcd"
     assert (ws / ".migration/waves/wave-0.brief.md").exists()
     assert not (ws / ".migration/waves/wave-0.run_id").exists()
-    ws2, cwd2 = _workspace(tmp_path / "second", run_id="wfr-x")
-    proc2, calls2 = _run(cwd2, tmp_path / "second", [_pass_report()])
-    assert proc2.returncode != 0
-    assert "Traceback" not in proc2.stderr
-    assert "run_id must be null unless mode is resume" in proc2.stderr
-    assert not [c for c in calls2 if c["kind"] == "agent"]
-    assert not (ws2 / ".migration/waves/wave-0.run_id").exists()
 
 
 def _migrate_limit(calls):
@@ -1062,42 +884,42 @@ def test_invalid_doctor_record_launches_nothing(tmp_path, tamper):
     assert any(word in proc.stderr.lower() for word in ("doctor", "manifest", "signature", "ready"))
 
 
-def test_smoke_mode_skips_readiness_only(tmp_path):
-    ws, cwd = _workspace(tmp_path, mode="smoke", smoke=True)
+def test_smoke_manifest_runs_through_the_runner_with_no_children(tmp_path):
+    ws, cwd = _workspace(tmp_path, doctor=False, smoke=True)
+    manifest_path = ws / ".migration/waves/wave-0.json"
+    manifest_path.write_text(json.dumps({"smoke": True, "wave": 0, "width": 1, "batches": []}))
+    proc, calls = _run(cwd, tmp_path, [])
+    assert proc.returncode == 0, proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert len([c for c in calls if c["kind"] == "register"]) == 1
+    assert _result(ws)["smoke"] is True
+    proc, calls = _run(cwd, tmp_path, [])
+    assert proc.returncode != 0 and "already ran" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    for name, updates in (("batch", {"batches": [{"id": "b", "units": []}]}),
+                          ("wave", {"wave": 1})):
+        ws, cwd = _workspace(tmp_path / name, doctor=False, smoke=True)
+        manifest = {"smoke": True, "wave": 0, "width": 1, "batches": []}
+        manifest.update(updates)
+        (ws / ".migration/waves/wave-0.json").write_text(json.dumps(manifest))
+        proc, calls = _run(cwd, tmp_path / name, [])
+        assert proc.returncode != 0 and "smoke manifest" in proc.stderr
+        assert not [c for c in calls if c["kind"] == "agent"]
+
+
+@pytest.mark.parametrize("prior", [
+    {"closed": True},
+    {"closed": False},
+    "{not json",
+])
+def test_an_existing_result_refuses_a_second_launch(tmp_path, prior):
+    ws, cwd = _workspace(tmp_path, doctor=False)
+    result_path = ws / ".migration/waves/wave-0.result.json"
+    result_path.write_text(prior if isinstance(prior, str) else json.dumps(prior))
     proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode == 0 and len([c for c in calls if c["kind"] == "agent"]) == 1
-    ws, cwd = _workspace(tmp_path / "start", mode="start", smoke=True)
-    proc, _ = _run(cwd, tmp_path / "start", [_pass_report()])
-    assert proc.returncode != 0 and "smoke" in proc.stderr
-    ws, cwd = _workspace(tmp_path / "bad", mode="smoke", smoke=False)
-    proc, _ = _run(cwd, tmp_path / "bad", [_pass_report()])
-    assert proc.returncode != 0
-
-
-def test_start_refuses_a_halted_result_and_resume_needs_the_recorded_run_id(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    waves = ws / ".migration/waves"
-    waves.joinpath("wave-0.result.json").write_text(json.dumps(
-        {"closed": False, "run_id": "wfr-a", "base_sha": "a" * 40}))
-    waves.joinpath("wave-0.run_id").write_text("wfr-a\n")
-    proc, _ = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode != 0 and "mode: resume" in proc.stderr
-    ws, cwd = _workspace(tmp_path / "wrong", mode="resume", run_id="wfr-b")
-    waves = ws / ".migration/waves"
-    waves.joinpath("wave-0.result.json").write_text(json.dumps(
-        {"closed": False, "run_id": "wfr-a", "base_sha": "a" * 40}))
-    waves.joinpath("wave-0.run_id").write_text("wfr-a\n")
-    proc, _ = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode != 0
-
-    ws, cwd = _workspace(tmp_path / "rerun", mode="rerun")
-    waves = ws / ".migration/waves"
-    waves.joinpath("wave-0.result.json").write_text(json.dumps(
-        {"closed": False, "run_id": "wfr-old", "base_sha": "a" * 40}))
-    waves.joinpath("wave-0.run_id").write_text("wfr-old\n")
-    proc, _ = _run(cwd, tmp_path / "rerun", [_pass_report()])
-    assert proc.returncode == 0
-    assert not waves.joinpath("wave-0.run_id").exists()
+    assert proc.returncode != 0 and "already ran" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def test_script_reads_no_environment_and_no_file_path():
@@ -1113,33 +935,10 @@ def test_docs_describe_the_pointer_and_doctor_wave_steps():
     orchestrator = (WORKFLOW.parents[1] / "install-dbx-factory" / "playbooks" / "9-orchestrator.md").read_text()
     for doc in (skill, orchestrator):
         assert "current.json" in doc
-        assert "--wave" in doc
-        assert "run_id" in doc
+        assert "run_workflow" in doc
+        assert '"mode"' not in doc and '"run_id"' not in doc
         assert '"workspace"' in doc or "workspace" in doc
         assert "W" + "AVE_" not in doc
-
-
-def test_preflight_subcommand_runs_the_launch_checks_for_a_hand_launched_wave(tmp_path):
-    def run(ws_dir, **kw):
-        ws, cwd = _workspace(ws_dir, **kw)
-        proc = subprocess.run([sys.executable, str(WORKFLOW), "preflight"], cwd=cwd, env={},
-                              capture_output=True, text=True)
-        assert not (ws / ".migration/waves/wave-0.result.json").exists()
-        assert not (ws / ".migration/waves/wave-0.base_sha").exists()
-        return proc
-
-    proc = run(tmp_path / "ok", dependencies={"u": _analysis("MIG.T")}, write_targets=("mig.t", "mig.run"),
-               deploy_objects=("mig.run",), namespace="mig")
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout) == {"wave": 0, "ready": True, "batches": ["b-1"], "pipeline_order": {}}
-    proc = run(tmp_path / "drift", dependencies={"u": _analysis("mig.t", "mig.audit")})
-    assert proc.returncode != 0 and "b-1" in proc.stderr and "mig.audit" in proc.stderr
-    proc = run(tmp_path / "shared", other_waves={"wave-1.json": WAVE_1}, mappings={"u": MAPPING})
-    assert proc.returncode != 0 and "'mig.t'" in proc.stderr and "target_where" in proc.stderr
-    proc = run(tmp_path / "nodoctor", doctor=False)
-    assert proc.returncode != 0 and "doctor" in proc.stderr
-    proc = run(tmp_path / "stopc", stop_c=False)
-    assert proc.returncode != 0 and "gates_sha" in proc.stderr
 
 
 def _close_report(**extra):
@@ -1225,38 +1024,6 @@ def test_a_resync_that_wrote_files_or_died_is_a_recorded_problem_that_holds_the_
     assert _result(ws)["resync"]["held_batches"] == []
     close = [c for c in calls if c.get("label") == "close-wave-0"][0]
     assert pr in close["prompt"] and pr2 in close["prompt"]
-
-
-def test_a_resume_after_a_resync_reruns_only_identity_failures_and_unreported_children(tmp_path):
-    """Run 1: b-1 fails on sequence_behind_source, b-2 passes, resync reseeds. Run 2 (resume): b-1 is
-    re-launched with the resync report in its prompt, b-2 replays its recorded PASS, the resync step and
-    the verifier see the new state."""
-    ws, cwd = _two_batch_workspace(tmp_path)
-    pr, pr2 = _push_pr(ws), _push_pr(ws, 2)
-    fail = {**_pass_report(pr), "status": "FAIL", "failure_class": "sequence_behind_source"}
-    proc, calls = _run(cwd, tmp_path, [fail, _pass2(pr2), _resync_report(),
-                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-2": "PASS"}, "findings": [], "changed_paths": []},
-                                       {"error": "close step stubbed"}])
-    assert proc.returncode == 0, proc.stderr
-    first = {c["label"]: c["prompt"] for c in calls if c["kind"] == "agent"}
-    result = _result(ws)
-    assert result["batches"][0]["status"] == "FAIL" and result["batches"][1]["status"] == "PASS"
-
-    pointer = ws / ".migration/waves/current.json"
-    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
-                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
-    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
-    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _pass2(pr2), _resync_report(),
-                                       {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
-                                        "findings": [], "changed_paths": []}, {"error": "close step stubbed"}])
-    assert proc.returncode == 0, proc.stderr
-    second = {c["label"]: c["prompt"] for c in calls if c["kind"] == "agent"}
-    assert second["b-2"] == first["b-2"], "an unaffected PASS keeps its prompt so the runtime replays it"
-    assert second["b-1"] != first["b-1"] and "resync" in second["b-1"] and "mig.u.orders_id_seq" in second["b-1"]
-    assert second["resync-wave-0"] == first["resync-wave-0"]
-    result = _result(ws)
-    assert [b["status"] for b in result["batches"]] == ["PASS", "PASS"] and result["resync"]["report"]["sequences"] == [SEQ]
-    assert result["batches"][0]["prompt_sha"] != result["batches"][1]["prompt_sha"]
 
 
 def test_the_wave_close_step_merges_the_verifier_pass_prs(tmp_path):
@@ -1429,8 +1196,7 @@ def test_the_close_reply_is_reconciled_against_git(tmp_path):
 
 
 def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
-    """Resume replays the PASS gated at head A; the PR has since moved to B (B merged, A's verdict stands
-    for nothing): the wave cannot close over a commit it never gated."""
+    """A later run cannot close over a commit whose PR head moved after it was gated."""
     ws, cwd = _workspace(tmp_path, auto_merge=True)
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path, [_pass_report(pr),
@@ -1440,10 +1206,8 @@ def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
     result = _result(ws)
     assert result["closed"] is False and result["batches"][0]["status"] == "PASS"
 
-    pointer = ws / ".migration/waves/current.json"
-    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
-                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
-    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    _new_stop_c(ws, "D-3")
     subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "b"], check=True)
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
                     "HEAD:migration/x"], check=True)
@@ -1454,7 +1218,7 @@ def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
     assert result["batches"][0]["status"] == "PASS"
     assert result["close"]["merged_prs"] == [] and result["closed"] is False
     unmerged = result["close"]["unmerged"]
-    assert unmerged[0]["pr_url"] == pr and "PR head moved" in unmerged[0]["reason"]
+    assert unmerged[0]["pr_url"] == pr and "not the gated head" in unmerged[0]["reason"]
 
 
 def test_a_close_reply_is_reconciled_against_git_per_pr(tmp_path):
@@ -1775,8 +1539,7 @@ def test_a_record_whose_merge_commit_is_not_on_the_base_is_not_proven(tmp_path):
 
 
 def test_a_moved_pr_head_is_not_proven_even_with_a_record(tmp_path):
-    """Resume replays the PASS gated at head A; the PR head has since moved to B, so even a well-formed
-    merge record for A cannot prove the merge."""
+    """A well-formed merge record for an old PR head cannot prove a later moved head."""
     ws, cwd = _workspace(tmp_path, auto_merge=True)
     pr = _unproven_pr(ws)
     proc, _ = _run(cwd, tmp_path, [_pass_report(pr),
@@ -1789,10 +1552,8 @@ def test_a_moved_pr_head_is_not_proven_even_with_a_record(tmp_path):
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
                     "HEAD:migration/x"], check=True)
     mc = _merge_commit(ws, _PR_HEADS[pr])
-    pointer = ws / ".migration/waves/current.json"
-    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
-                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
-    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    _new_stop_c(ws, "D-3")
     close = _close_report(merged_prs=[_merge_row(pr, mc)])
     close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
                          f"{mc}:refs/heads/migration/x"]]
@@ -1800,43 +1561,7 @@ def test_a_moved_pr_head_is_not_proven_even_with_a_record(tmp_path):
     assert proc.returncode == 0, proc.stderr
     result = _result(ws)
     assert result["close"]["merged_prs"] == [] and result["closed"] is False
-    assert "PR head moved" in result["close"]["unmerged"][0]["reason"]
-
-
-def test_proven_merges_are_recorded_before_the_result_and_reused_on_resume(tmp_path):
-    """The run writes .migration/waves/wave-0.merges.json with the proven {pr_url: merge_commit_sha}; a
-    resume whose close step dies with no record still proves the PR from that file."""
-    ws, cwd = _workspace(tmp_path, auto_merge=True, recon={"u": True, "v": True},
-                         other_batch={"id": "b-2", "units": ["v"], "write_targets": ["mig.u"],
-                                      "brief": "b", "gates": [GATE], "lakeflow_pipelines": []})
-    pr = _unproven_pr(ws)
-    pr2 = _unproven_pr(ws, 2)
-    pass2 = _pass_report(pr2, write_targets=["mig.u"], gates=[{"id": "g-rows", "status": "passed",
-                                                             "evidence": ".migration/recon/v/result.json"}])
-    verify = {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS", "b-2": "PASS"},
-              "findings": [], "changed_paths": []}
-    mc = _merge_commit(ws, _PR_HEADS[pr])
-    close = _close_report(merged_prs=[_merge_row(pr, mc)],
-                          unmerged=[{"pr_url": pr2, "reason": "not mergeable"}])
-    close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
-                         f"{mc}:refs/heads/migration/x"]]
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), pass2, verify, close])
-    assert proc.returncode == 0, proc.stderr
-    result = _result(ws)
-    assert result["close"]["merged_prs"] == [pr] and result["closed"] is False
-    merges = ws / ".migration/waves/wave-0.merges.json"
-    assert json.loads(merges.read_text()) == {pr: mc}
-
-    pointer = ws / ".migration/waves/current.json"
-    pointer.write_text(json.dumps({"manifest": "wave-0.json", "mode": "resume", "run_id": "wfr-1",
-                                   "hook_probe": "blocked:0123abcd", "plugin": str(PLUGIN)}))
-    (ws / ".migration/waves/wave-0.run_id").write_text("wfr-1\n")
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), pass2, verify, {"error": "boom"}])
-    assert proc.returncode == 0, proc.stderr
-    result = _result(ws)
-    assert result["close"]["merged_prs"] == [pr]
-    assert result["close"]["merges"] == [{"merge_commit_sha": mc, "pr_url": pr}]
-    assert result["close"]["unmerged"][0]["pr_url"] == pr2
+    assert "not the gated head" in result["close"]["unmerged"][0]["reason"]
 
 
 def test_validate_close_rejects_bare_url_rows_in_merged_prs(tmp_path):

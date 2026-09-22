@@ -2,8 +2,8 @@
 and the wave result the orchestrator gates on. Guarantees: no two batches share a write
 target, at most `width` children at once, a circuit breaker on repeated failure classes,
 this script is the single writer of the result and ledger rows, only verifier-PASS PRs
-merge (auto_merge or a recorded human merge_override), and a resume replays finished
-children. Hand-run waves spend their STOP C row with `reserve` and close it with `gates`.
+merge (auto_merge or a recorded human merge_override). Each invocation launches one
+wave run through `run_workflow`; a new run needs a new STOP C approval.
 """
 
 import asyncio
@@ -21,7 +21,6 @@ from collections import Counter
 from pathlib import Path
 
 POINTER_REL = Path(".migration/waves/current.json")
-MODES = ("start", "resume", "rerun", "smoke")
 HOOK_PROBE = re.compile(r"blocked:[0-9a-f]{8}|not-blocked|unknown")
 TAG_RE = re.compile(r"[A-Za-z0-9_-]+")
 PIPELINE_RE = re.compile(r"[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*")
@@ -41,16 +40,13 @@ try:
     POINTER = json.loads(POINTER_PATH.read_text())
 except ValueError as e:
     raise SystemExit(f"{POINTER_PATH} is not valid JSON: {e}") from None
-if not isinstance(POINTER, dict) or POINTER.get("mode") not in MODES or not isinstance(POINTER.get("manifest"), str):
-    raise SystemExit(f"{POINTER_PATH} must be {{manifest: 'wave-N.json', mode: start|resume|rerun|smoke, run_id, "
-                     "hook_probe, workspace?}}")
-MODE = POINTER["mode"]
-RUN_ID = POINTER.get("run_id")
-if RUN_ID is not None and (not isinstance(RUN_ID, str) or not RUN_ID.strip()):
-    raise SystemExit(f"{POINTER_PATH} run_id must be the run_workflow run_id string or null")
-if RUN_ID is not None and MODE != "resume":
-    raise SystemExit(f"{POINTER_PATH} run_id must be null unless mode is resume: run_workflow reports the run_id "
-                     "only once a fresh run starts; record it in <manifest>.run_id afterwards")
+if isinstance(POINTER, dict) and ("mode" in POINTER or "run_id" in POINTER):
+    raise SystemExit(
+        f"{POINTER_PATH} no longer takes mode or run_id; a rerun is "
+        "\"delete wave-<N>.result.json, get a new STOP C row, run again\""
+    )
+if not isinstance(POINTER, dict) or not isinstance(POINTER.get("manifest"), str):
+    raise SystemExit(f"{POINTER_PATH} must be {{manifest: 'wave-N.json', hook_probe, workspace, plugin}}")
 HOOK_PROBE_RESULT = POINTER.get("hook_probe")
 if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE_RESULT):
     raise SystemExit(f"{POINTER_PATH} hook_probe must be blocked:<nonce>, not-blocked or unknown (the probe run in the "
@@ -75,54 +71,61 @@ MANIFEST = json.loads(MANIFEST_BYTES)
 BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
-MERGES_PATH = MANIFEST_PATH.with_suffix(".merges.json")
 RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
-RUN_ID_PATH = MANIFEST_PATH.with_suffix(".run_id")
-BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")
 DOCTOR_PATH = MANIFEST_PATH.with_suffix(".doctor.json")
 DECISIONS_PATH = ROOT / ".migration" / "06_decisions.md"
-resume = MODE == "resume"
-SMOKE = MODE == "smoke"
-if SMOKE and not (MANIFEST.get("smoke") is True and MANIFEST.get("wave") == 0 and MANIFEST.get("width") == 1):
-    raise SystemExit("mode smoke exercises the runner only: it needs a manifest with smoke: true, wave: 0, width: 1")
-if not SMOKE and MANIFEST.get("smoke") is True:
-    raise SystemExit("a smoke manifest never runs a real wave")
-prior = None
+SMOKE = MANIFEST.get("smoke") is True
+if sys.argv[1:]:
+    raise SystemExit("workflow.py takes no arguments; it runs through run_workflow")
 
-if RESULT_PATH.exists() and MODE != "rerun":
+def _tmp_write(path, text):
+    """Write `text` to `path` via a sibling tmp file, so the real path is replaced atomically."""
+    tmp = path.with_suffix("".join(path.suffixes) + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+async def smoke_main():
+    await register_workflow({
+        "name": f"smoke-wave-{TAG}",
+        "description": "credential-free runner check: no child launches",
+        "phases": [{"title": "smoke", "detail": "pointer, manifest and result writer only"}],
+    })
+    log(f"smoke wave {TAG}: launched nothing")
+    _tmp_write(RESULT_PATH, json.dumps({
+        "wave": 0,
+        "tag": TAG,
+        "smoke": True,
+        "manifest_sha": MANIFEST_SHA,
+        "width": 1,
+        "hook_probe": HOOK_PROBE_RESULT,
+        "closed": True,
+        "batches": [],
+        "verify": None,
+        "auto_merge": False,
+        "breaker_tripped_on": None,
+    }, indent=2, sort_keys=True) + "\n")
+    _tmp_write(BRIEF_PATH, "# Wave 0 smoke\nlaunched nothing; runner, pointer and result writer work\n")
+
+
+if RESULT_PATH.exists():
     try:
         prior = json.loads(RESULT_PATH.read_text())
-        if not isinstance(prior, dict):
-            raise ValueError("result is not a JSON object")
-    except ValueError:
-        if not resume:
-            raise SystemExit(f"{RESULT_PATH} is not valid JSON (interrupted write?). Inspect it; to resume "
-                             "the same run set mode: resume with the recorded run_id, or set mode: rerun.") from None
-    else:
-        if prior.get("closed"):
-            raise SystemExit(f"{RESULT_PATH} says wave {prior.get('wave')} closed clean. To redo it on "
-                             "purpose, set mode: rerun.")
-        if not resume:
-            raise SystemExit(f"{RESULT_PATH} records a halted or failed run. To continue it, set mode: resume "
-                             "with the recorded run_id (finished children replay); set mode: rerun to redo.")
-if resume:
-    if not RUN_ID:
-        raise SystemExit("mode resume requires run_id in current.json; pass the recorded run_id")
-    if not RUN_ID_PATH.exists():
-        raise SystemExit(f"no run record at {RUN_ID_PATH}; cannot verify the pointer run_id belongs to this wave "
-                         "— set mode: rerun for a fresh run")
-    if RUN_ID_PATH.read_text().strip() != RUN_ID:
-        raise SystemExit(f"run_id does not match {RUN_ID_PATH}; pass the recorded run_id in current.json, "
-                         "or set mode: rerun for a fresh run")
-    if isinstance(prior, dict) and prior.get("run_id") and prior["run_id"] != RUN_ID:
-        raise SystemExit(f"run_id does not match prior result at {RESULT_PATH}; pass the recorded run_id in "
-                         "current.json, or set mode: rerun for a fresh run")
+        closed = prior.get("closed") if isinstance(prior, dict) else None
+    except (OSError, ValueError):
+        closed = "unreadable"
+    raise SystemExit(
+        f"{RESULT_PATH} exists: this wave already ran (closed={closed} when readable). "
+        "To redo it on purpose delete that file, record the new STOP C row in 06_decisions.md "
+        "and name it in the manifest's stop_c, then run again"
+    )
 
-REPLAYED = {
-    b["id"]: b for b in (prior or {}).get("batches", [])
-    if b.get("status") in ("PASS", "FAIL", "BLOCKED")
-} if resume and isinstance(prior, dict) else {}
+if SMOKE:
+    if not (MANIFEST.get("wave") == 0 and MANIFEST.get("width") == 1 and MANIFEST.get("batches") == []):
+        raise SystemExit("a smoke manifest exercises the runner only: {smoke: true, wave: 0, width: 1, batches: []}")
+    asyncio.run(smoke_main())
+    sys.exit(0)
 
 
 def prompt_sha(prompt):
@@ -482,23 +485,6 @@ def wave_base():
         raise SystemExit(f"cannot resolve origin/{BASE_BRANCH} in {ROOT} ({e}); the ledger gate needs the base commit")
 
 
-def launch_base():
-    if resume:
-        try:
-            sha = BASE_SHA_PATH.read_text().strip()
-        except OSError:
-            raise SystemExit(f"no launch base at {BASE_SHA_PATH}; the ledger gate cannot resume without it, "
-                             "set mode: rerun for a fresh run") from None
-        if not re.fullmatch(r"[0-9a-f]{40}", sha):
-            raise SystemExit(f"{BASE_SHA_PATH} does not hold a commit sha; set mode: rerun for a fresh run")
-        return sha
-    sha = wave_base()
-    tmp = BASE_SHA_PATH.with_suffix(".base_sha.tmp")
-    tmp.write_text(sha + "\n")
-    tmp.replace(BASE_SHA_PATH)
-    return sha
-
-
 def evidence_in_pr(head, path, units):
     if not (isinstance(head, str) and isinstance(path, str)):
         return False
@@ -573,52 +559,6 @@ def gate_outcomes(batch, reported, ledger, head):
     return list(declared.values()), unmet
 
 
-def gates_command(path):
-    try:
-        reports = json.loads(Path(path).read_text())
-    except (OSError, ValueError) as e:
-        raise SystemExit(f"{path}: cannot read the children's results: {e}") from None
-    if (not isinstance(reports, list)
-            or not all(isinstance(r, dict) and isinstance(r.get("batch"), str) for r in reports)):
-        raise SystemExit(f"{path} must be a list of {{batch, pr_url, gates}} rows, one per child")
-    if not all(isinstance(r.get("pr_url"), str) and PR_URL.fullmatch(r["pr_url"]) for r in reports):
-        raise SystemExit(f"{path}: every row needs the child's pr_url (a PR of {MANIFEST['repo']}); "
-                         "gate evidence is read at its head")
-    by_batch = Counter(r["batch"] for r in reports)
-    unknown = sorted(set(by_batch) - {b["id"] for b in MANIFEST["batches"]})
-    if unknown or any(c > 1 for c in by_batch.values()):
-        raise SystemExit(f"{path}: batches not in the manifest {unknown}, reported twice "
-                         f"{sorted(b for b, c in by_batch.items() if c > 1)}")
-    ledger = decision_ledger()
-    out = {}
-    for b in sorted(MANIFEST["batches"], key=lambda b: b["id"]):
-        report = next((r for r in reports if r["batch"] == b["id"]), None)
-        if report is None:
-            gates = [dict(g, decision_id=g.get("decision_id")) for g in b["gates"]]
-            unmet = [f"batch {b['id']} was not gathered"]
-        else:
-            head = pr_head(report["pr_url"])
-            gates, unmet = gate_outcomes(b, report.get("gates"), ledger, head)
-            if head is None:
-                unmet.append(f"{report['pr_url']} is not a PR of {MANIFEST['repo']} whose head git can fetch; "
-                             "no evidence stands")
-        out[b["id"]] = {"gates": gates, "unmet": unmet}
-    closed = not any(v["unmet"] for v in out.values())
-    print(json.dumps({"wave": MANIFEST["wave"], "tag": TAG, "closed": closed, "batches": out},
-                     indent=2, sort_keys=True))
-    return 0 if closed else 1
-
-
-STOP_MODE = (MANIFEST.get("capabilities", {}).get("stop_mode")
-             if isinstance(MANIFEST.get("capabilities"), dict) else None)
-if not gates_approved(MANIFEST.get("stop_c"), MANIFEST.get("wave"), MANIFEST.get("gates_sha"),
-                      decision_ledger(), STOP_MODE):
-    raise SystemExit(f"manifest 'gates_sha' {MANIFEST.get('gates_sha')!r} is not approved by row "
-                     f"{MANIFEST.get('stop_c')!r} of {DECISIONS_PATH} (a table row with cells | D-<n> | user:<id>"
-                     f"{' or default-accepted' if STOP_MODE == 'soft' else ''} | STOP C wave-{MANIFEST.get('wave')} "
-                     "gates_sha <value> |); this run halts until STOP C records it")
-
-
 def run_log():
     runs = []
     if RUNS_PATH.exists():
@@ -636,38 +576,18 @@ def run_log():
     return runs
 
 
-def spent_stop_c():
-    spent = [run["stop_c"] for run in run_log()]
-    if MODE == "rerun" and RESULT_PATH.exists():
-        try:
-            previous = json.loads(RESULT_PATH.read_text())
-        except (OSError, ValueError) as e:
-            previous = e
-        if not isinstance(previous, dict):
-            raise SystemExit(f"{RESULT_PATH} cannot say which STOP C row the wave's last run spent "
-                             f"({previous!r}); the old approval is not reusable on its word")
-        spent.append(previous.get("stop_c"))
-    return spent
-
-
-def spent_halt():
-    return SystemExit(f"{RUNS_PATH} or {RESULT_PATH} records a run this wave already made under STOP C row "
-                      f"{MANIFEST['stop_c']}; a rerun is a new run of the wave, so STOP C fires again: record "
-                      "its new row in the ledger and name it in the manifest's stop_c")
-
-
-def record_run(mode, run_id=None, unspent=True):
+def spend_stop_c():
+    """One STOP C approval launches one run under the log lock, or halts if already spent."""
     with RUNS_PATH.open("a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        if unspent and MANIFEST["stop_c"] in spent_stop_c():
-            raise spent_halt()
-        f.write(json.dumps({"stop_c": MANIFEST["stop_c"], "mode": mode, "run_id": run_id}, sort_keys=True) + "\n")
+        if MANIFEST["stop_c"] in {run["stop_c"] for run in run_log()}:
+            raise SystemExit(
+                f"{RUNS_PATH} records a run this wave already made under STOP C row "
+                f"{MANIFEST['stop_c']}; a rerun is a new run of the wave, so STOP C fires again: "
+                "record its new row in the ledger and name it in the manifest's stop_c"
+            )
+        f.write(json.dumps({"stop_c": MANIFEST["stop_c"]}, sort_keys=True) + "\n")
         f.flush()
-
-
-def hand_run_state():
-    modes = [run.get("mode") for run in run_log() if run["stop_c"] == MANIFEST["stop_c"]]
-    return {"reserve": "open", "gates": "closed"}.get(modes[-1], "workflow") if modes else None
 
 
 def check_wave_tag(tag, manifest):
@@ -924,7 +844,6 @@ def disjoint_slices(a, b):
     def below(hi, lo):
         return (hi is not None and lo is not None and hi[0][0] == lo[0][0] and literal(hi[0], hi[0][0])
                 and (hi[0][1] < lo[0][1] or (hi[0][1] == lo[0][1] and not (hi[1] and lo[1]))))
-
     def apart(x, y):
         if x[0] == "like" or y[0] == "like":
             return False
@@ -1163,7 +1082,7 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
 
 
 def launch_checks():
-    """The launch-time checks every entry point (reserve, preflight, run) applies; returns the pipeline order."""
+    """The launch-time checks; returns the pipeline order."""
     check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                         other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
@@ -1173,41 +1092,19 @@ def launch_checks():
     return check_pipeline_updates(PIPELINE_UPDATES, MANIFEST_PATH)
 
 
-if sys.argv[1:2] == ["reserve"]:
-    validate_manifest(MANIFEST)
-    check_wave_tag(TAG, MANIFEST)
-    launch_checks()
-    record_run("reserve")
-    print(json.dumps({"wave": MANIFEST["wave"], "stop_c": MANIFEST["stop_c"], "reserved": True}))
-    sys.exit(0)
-if sys.argv[1:2] == ["gates"]:
-    validate_manifest(MANIFEST)
-    check_wave_tag(TAG, MANIFEST)
-    state = hand_run_state()
-    if state == "closed":
-        raise SystemExit(f"{RUNS_PATH} records that the hand run under STOP C row {MANIFEST['stop_c']} closed "
-                         "already; a new launch is a new run, so STOP C fires again: record its new row and name "
-                         "it in the manifest's stop_c, then `workflow.py reserve`")
-    if state == "workflow":
-        raise spent_halt()
-    if state is None:
-        raise SystemExit(f"{RUNS_PATH} holds no reservation of STOP C row {MANIFEST['stop_c']}: run `python3 "
-                         "skills/migration-fanout/workflow.py reserve` before launching the children by hand")
-    if len(sys.argv) != 3:
-        sys.exit("usage: workflow.py gates <results.json>")
-    code = gates_command(sys.argv[2])
-    if code == 0:
-        record_run("gates", unspent=False)
-    sys.exit(code)
-if not resume and not SMOKE and MANIFEST.get("stop_c") in spent_stop_c():
-    raise spent_halt()
-PREFLIGHT = sys.argv[1:] == ["preflight"]
+STOP_MODE = (MANIFEST.get("capabilities", {}).get("stop_mode")
+             if isinstance(MANIFEST.get("capabilities"), dict) else None)
+if not gates_approved(MANIFEST.get("stop_c"), MANIFEST.get("wave"), MANIFEST.get("gates_sha"),
+                      decision_ledger(), STOP_MODE):
+    raise SystemExit(f"manifest 'gates_sha' {MANIFEST.get('gates_sha')!r} is not approved by row "
+                     f"{MANIFEST.get('stop_c')!r} of {DECISIONS_PATH} (a table row with cells | D-<n> | user:<id>"
+                     f"{' or default-accepted' if STOP_MODE == 'soft' else ''} | STOP C wave-{MANIFEST.get('wave')} "
+                     "gates_sha <value> |); this run halts until STOP C records it")
 validate_manifest(MANIFEST)
 check_wave_tag(TAG, MANIFEST)
-BASE_SHA = None if PREFLIGHT else launch_base()
+BASE_SHA = wave_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)
-if not SMOKE:
-    validate_manifest(MANIFEST, DOCTOR)
+validate_manifest(MANIFEST, DOCTOR)
 
 
 def _git_paths(*args):
@@ -1247,18 +1144,6 @@ def pr_changed_paths(pr_url):
     if not m or m["repo"].lower() != REPO.lower():
         return None
     return ref_changed_paths(f"refs/pull/{m['n']}/head")
-
-
-def replay_gate(record, pr_url):
-    got = pr_changed_paths(pr_url)
-    if got is None or got[0] == record["pr_head"]:
-        return got and (got[0], [])
-    try:
-        merged = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", record["pr_head"], _base_tip()],
-                                check=False, capture_output=True, timeout=300).returncode
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return (record["pr_head"], []) if merged == 0 else got if merged == 1 else None
 
 
 def verifier_changed_paths(wave, passed):
@@ -1488,7 +1373,6 @@ MAX_MINUTES = int(MANIFEST.get("max_minutes", 45))
 CLOSE_MINUTES = int(MANIFEST.get("close_minutes", 10))
 VERIFY_DEPTH = MANIFEST.get("verify_depth", "sampled")
 RESYNC = MANIFEST.get("resync")
-PRIOR_RESYNC = ((prior or {}).get("resync") or {}).get("report") if resume and isinstance(prior, dict) else None
 
 
 def batch_verify_depth(batch) -> str:
@@ -1499,7 +1383,7 @@ def batch_max_minutes(batch) -> int:
     return int(batch.get("max_minutes", MAX_MINUTES))
 
 META = {
-    "name": f"smoke-wave-{TAG}" if SMOKE else f"migration-wave-{TAG}",
+    "name": f"migration-wave-{TAG}",
     "description": f"Wave {WAVE}: {len(BATCHES)} unit batches in parallel, then one independent verifier",
     "phases": [
         {"title": "migrate", "detail": "one child per batch: convert, load, recon, open PR",
@@ -1603,16 +1487,6 @@ RESYNC_SCHEMA = {
     },
     "required": ["status", "sequences", "changed_paths", "one_line_summary"],
 }
-RESYNC_CLASS = re.compile(r"identity|sequence", re.IGNORECASE)
-
-
-def rerun_after_resync(record, resynced):
-    """After a resync, a resumed run re-launches a child that never reported or failed on an identity/sequence."""
-    if not resynced:
-        return False
-    if not isinstance(record, dict) or record.get("status") not in ("PASS", "FAIL", "BLOCKED"):
-        return True
-    return record.get("status") == "FAIL" and bool(RESYNC_CLASS.search(record.get("failure_class") or ""))
 
 
 def resync_prompt(cfg):
@@ -1649,11 +1523,6 @@ def validate_resync(out) -> list[str]:
 
 def child_prompt(batch):
     gates = [g for g in batch.get("gates", []) if g["status"] != "waived"]
-    replay = ""
-    if rerun_after_resync(REPLAYED.get(batch["id"]), PRIOR_RESYNC):
-        replay = (f"\nA parent-owned identity resync ran after your earlier attempt: "
-                  f"{json.dumps(PRIOR_RESYNC.get('sequences'), sort_keys=True)}. "
-                  "Start again from the merge-evidence recon.\n")
     return (
         f"You are one fan-out child in wave {WAVE}. Repo: {REPO}. Playbook: {MANIFEST['child_macro']}, batch "
         f"{batch['id']}. Anything missing from the brief stops you: report it as blocked, never improvise.\n\n"
@@ -1662,7 +1531,7 @@ def child_prompt(batch):
         f"{json.dumps(batch.get('write_targets', []))}.\n"
         "Converted files and mapping specs: .migration/units/<unit_id>/ per the brief, spec at "
         ".migration/units/<unit_id>/mapping_spec.json.\n"
-        + replay + "\n" + capability_block(batch["units"])
+        + "\n" + capability_block(batch["units"])
         + f"Time budget: {batch_max_minutes(batch)} minutes; at the budget report status=BLOCKED with what "
         "landed and what blocked.\n"
         f"Gates STOP C declared (report each by id in gates as passed with its evidence path or failed; an "
@@ -1835,12 +1704,7 @@ async def _run_batch(batch, sem, breaker):
             downgrade("missing_pr", "no PR URL/branch reported")
         reported = out.get("changed_paths")
         usable = isinstance(reported, list) and all(isinstance(p, str) for p in reported)
-        record = REPLAYED.get(batch["id"])
-        if (isinstance(record, dict) and record.get("status") == "PASS" and isinstance(record.get("pr_head"), str)
-                and record.get("prompt_sha") == out["prompt_sha"] and record.get("pr_url") == out.get("pr_url")):
-            gated = replay_gate(record, out["pr_url"])
-        else:
-            gated = pr_changed_paths(out.get("pr_url"))
+        gated = pr_changed_paths(out.get("pr_url"))
         observed = gated[1] if gated else None
         if gated:
             out["pr_head"] = gated[0]
@@ -1877,8 +1741,7 @@ async def _run_batch(batch, sem, breaker):
             out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger(), out["pr_head"])
             if unmet:
                 downgrade("gates", "; ".join(unmet))
-        if out["status"] != "PASS" and (record is None or (isinstance(record, dict) and (
-                record.get("status") == "PASS" or record.get("failure_class") != out.get("failure_class")))):
+        if out["status"] != "PASS":
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
             f"{out['one_line_summary']}")
@@ -1917,13 +1780,6 @@ def cost_line(results, verify) -> str:
             f"harness time {round(actual['elapsed_s'])}s. Verifier depth {VERIFY_DEPTH}"
             + (", overrides: " + ", ".join(f"{b['id']}={b['verify_depth']}" for b in BATCHES if "verify_depth" in b)
                if any("verify_depth" in b for b in BATCHES) else "") + ".")
-
-
-def _tmp_write(path, text):
-    """Write `text` to `path` via a sibling tmp file, so the real path is replaced atomically."""
-    tmp = path.with_suffix("".join(path.suffixes) + ".tmp")
-    tmp.write_text(text)
-    tmp.replace(path)
 
 
 def _verify_sink(verify, problems, fail=False):
@@ -2015,8 +1871,6 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, 
 
 
 async def main():
-    if not resume:
-        RUN_ID_PATH.unlink(missing_ok=True)
     await register_workflow(META)
     order = launch_checks()
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}"
@@ -2111,15 +1965,6 @@ async def main():
     if close is not None:
         raw = close
         reported = {}
-        if resume and MERGES_PATH.exists():
-            try:
-                stored = json.loads(MERGES_PATH.read_text())
-            except ValueError:
-                stored = {}
-            gated = {p["pr_url"]: p.get("pr_head") for p in to_merge}
-            reported.update({u: {"merge_commit_sha": mc, "merged_head": gated[u]}
-                             for u, mc in stored.items()
-                             if u in gated and isinstance(mc, str)} if isinstance(stored, dict) else {})
         rows = raw.get("merged_prs") if isinstance(raw, dict) else None
         if isinstance(rows, list):
             reported.update({u["pr_url"]: u for u in rows
@@ -2139,7 +1984,6 @@ async def main():
                  "changed_paths": changed if isinstance(changed, list) else [],
                  "review_findings": [f for f in (raw.get("review_findings") if isinstance(raw, dict) else None) or []
                                      if isinstance(f, str)]}
-        _tmp_write(MERGES_PATH, json.dumps(proven, indent=2, sort_keys=True) + "\n")
         if close_problems:
             close["invalid"] = raw
     if close_problems:
@@ -2151,7 +1995,7 @@ async def main():
               and all(r["status"] == "PASS" for r in results))
     _tmp_write(RESULT_PATH, json.dumps({
         "wave": WAVE, "tag": TAG, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
-        "run_id": RUN_ID, "base_sha": BASE_SHA, "mode": MODE, "stop_c": MANIFEST["stop_c"],
+        "base_sha": BASE_SHA, "stop_c": MANIFEST["stop_c"],
         "hook_probe": HOOK_PROBE_RESULT, "doctor_signed_at": DOCTOR.get("signed_at"),
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
         "closed": closed,
@@ -2169,11 +2013,5 @@ async def main():
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 
 
-if PREFLIGHT:
-    order = launch_checks()
-    print(json.dumps({"wave": WAVE, "ready": True, "batches": [b["id"] for b in BATCHES], "pipeline_order": order},
-                     sort_keys=True))
-    sys.exit(0)
-if not resume and not SMOKE:
-    record_run(MODE, RUN_ID)
+spend_stop_c()
 asyncio.run(main())

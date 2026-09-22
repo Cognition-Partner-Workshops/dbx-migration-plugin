@@ -66,14 +66,12 @@ def _batch_runtime():
         "decision_ledger": lambda: "",
         "MANIFEST": {"stop_c": "D-2"},
         "MAX_MINUTES": 45,
-        "REPLAYED": {},
         "CHILD_SCHEMA": {},
         "REPO": ".",
         "WorkflowAgentError": RuntimeError,
         "child_prompt": lambda batch: json.dumps(batch, sort_keys=True),
         "log": lambda message: None,
         "pr_changed_paths": lambda pr_url: ("c" * 40, []),
-        "replay_gate": lambda record, pr_url: (record["pr_head"], []),
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
@@ -1585,14 +1583,14 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
 def _prompt_ns(manifest):
     tree = ast.parse(WORKFLOW.read_text())
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
-             "sum_cost", "cost_line", "close_prompt", "rerun_after_resync"}
+             "sum_cost", "cost_line", "close_prompt"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES", "RESYNC_CLASS"}
                     for t in node.targets))]
     ns = {"json": __import__("json"), "shlex": __import__("shlex"), "re": re, "WAVE": 1, "TAG": "0",
-          "REPO": "repo", "MANIFEST": manifest, "REPLAYED": {}, "PRIOR_RESYNC": None,
+          "REPO": "repo", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
           "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
@@ -1657,36 +1655,6 @@ def test_cost_line_compares_estimate_with_summed_actuals():
     assert "target_statements=" not in line.split("actual")[1].split(",")[0]  # None side is omitted
     assert "harness time 2s" in line and "Verifier depth sampled" in line
     assert _prompt_ns(_manifest())["cost_line"]([{"status": "FAIL"}], None).startswith("Cost: no estimate")
-
-
-def test_replayed_failures_do_not_refill_breaker():
-    namespace = _batch_runtime()
-    namespace["REPLAYED"] = {f"b{i}": "FAIL" for i in range(3)}
-
-    async def agent(prompt, **kwargs):
-        if kwargs["label"] in namespace["REPLAYED"]:
-            return {"status": "FAIL", "recon_verdict": "NOT_RUN",
-                    "failure_class": "same", "one_line_summary": "replayed"}
-        return {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "merge_eligible": True,
-                "pr_url": "https://example/pr/held", "branch": "feature/held",
-                "changed_paths": ["src/held.sql"],
-                "one_line_summary": "held passed"}
-
-    namespace["agent"] = agent
-
-    async def exercise():
-        breaker = namespace["Breaker"](3)
-        sem = asyncio.Semaphore(1)
-        outputs = []
-        for batch_id in ("b0", "b1", "b2", "b3"):
-            outputs.append(await namespace["run_batch"](
-                {"id": batch_id, "units": ["u"], "write_targets": ["t"], "brief": "b"},
-                sem, breaker))
-        return outputs, breaker
-
-    outputs, breaker = asyncio.run(exercise())
-    assert outputs[-1]["status"] == "PASS"
-    assert breaker.tripped_on is None
 
 
 PIPELINE_UPDATES = WORKFLOW.parents[1] / "target-routing" / "pipeline_updates.py"
@@ -2031,29 +1999,6 @@ def test_prompts_name_every_merge_evidence_mode():
     assert "Fixture evidence is never PASS" in child
 
 
-def test_fresh_runs_reject_a_pointer_run_id_and_clear_the_stale_run_record(tmp_path):
-    tree = ast.parse(WORKFLOW.read_text())
-    selected = [node for node in tree.body
-                if isinstance(node, ast.AsyncFunctionDef) and node.name == "main"]
-    source = WORKFLOW.read_text()
-    assert "RUN_ID is not None and MODE != \"resume\"" in source
-    main_source = ast.get_source_segment(source, selected[0])
-    assert "RUN_ID_PATH.unlink(missing_ok=True)" in main_source
-    assert "write_text(RUN_ID" not in main_source
-    namespace = {
-        "resume": False,
-        "RUN_ID": None,
-        "RUN_ID_PATH": tmp_path / "w.run_id",
-        "META": {},
-        "register_workflow": _stop_register_workflow,
-    }
-    (tmp_path / "w.run_id").write_text("stale\n")
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
-    with pytest.raises(RuntimeError, match="stop"):
-        asyncio.run(namespace["main"]())
-    assert not (tmp_path / "w.run_id").exists()
-
-
 # ---------------------------------------------------------------- ledger gate (changed_paths)
 
 LEDGER_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targets.json",
@@ -2203,7 +2148,7 @@ def test_workflow_launches_from_the_signed_doctor_record_not_the_editable_one():
     src = WORKFLOW.read_text()
     assert "RECORDED" not in src
     assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)" in src
-    assert "if not SMOKE:\n    validate_manifest(MANIFEST, DOCTOR)" in src
+    assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)\nvalidate_manifest(MANIFEST, DOCTOR)" in src
     assert "fresh_doctor_report" not in src and "DOCTOR_PY" not in src
 
 
@@ -2212,17 +2157,16 @@ def _launch_ns(tmp_path, fake_run=None):
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"signed_doctor_report", "wave_signature", "pr_changed_paths",
-                                      "ref_changed_paths", "wave_base", "launch_base", "evidence_in_pr",
-                                      "verifier_changed_paths", "_git_paths", "_base_tip", "replay_gate",
+                                      "ref_changed_paths", "wave_base", "evidence_in_pr",
+                                      "verifier_changed_paths", "_git_paths", "_base_tip",
                                       "fetch_ref", "pr_head"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"PR_URL", "UNIT_ID"} for t in node.targets))]
     ns = {"datetime": datetime, "hashlib": hashlib, "hmac": hmac, "json": json, "os": os, "re": re,
           "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
-          "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target", "resume": False,
+          "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target",
           "TAG": "orders-1", "MANIFEST": {"repo": "github.com/acme/dbx-target"},
           "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json",
-          "BASE_SHA_PATH": tmp_path / ".migration" / "waves" / "wave-1.base_sha",
           "DOCTOR_MAX_AGE": datetime.timedelta(minutes=15),
           "HOOK_PROBE_RESULT": "blocked:0123abcd"}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
@@ -2294,8 +2238,7 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     assert calls[0] == ["git", "-C", str(tmp_path), "fetch", "-q", "origin", f"+refs/pull/42/head:{local}"]
     assert calls[1][3:] == ["rev-parse", "--verify", local + "^{commit}"]
     assert not any("FETCH_HEAD" in " ".join(c) for c in calls)
-    # the base is fetched now, not read from the launch snapshot: a child launched on a resume forked from
-    # a base the verifier had merged accepted units into, and those units are not its diff
+    # the base is fetched for the PR gate, while the launch snapshot remains fixed for verification
     assert calls[2][3:] == ["fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]
     assert calls[3][3:] == ["rev-parse", "--verify", "origin/main^{commit}"]
     assert calls[4][3:] == ["merge-base", "--is-ancestor", "c" * 40, "t" * 40]
@@ -2336,55 +2279,6 @@ def test_every_fetch_the_gate_makes_lands_in_this_workflows_own_ref(tmp_path):
     assert "FETCH_HEAD" not in WORKFLOW.read_text()
 
 
-def _replay_git(calls, head, record_merged, paths):
-    """git as replay_gate sees it: the PR's current head fetched into this workflow's ref, origin/main at 't'*40, `merge-base
-    --is-ancestor` true for the recorded head only when record_merged (the resumed run's verifier merged it),
-    never for the current head; one diff."""
-    def fake_run(cmd, **kw):
-        calls.append(cmd)
-        if cmd[3] == "fetch":
-            return subprocess.CompletedProcess(cmd, 0)
-        if cmd[3] == "rev-parse":
-            return subprocess.CompletedProcess(cmd, 0, stdout=("t" * 40 if "origin/main^{commit}" in cmd else head) + "\n")
-        if cmd[3] == "merge-base":
-            return subprocess.CompletedProcess(cmd, 0 if record_merged and cmd[5] == "c" * 40 else 1)
-        return subprocess.CompletedProcess(cmd, 0, stdout=paths)
-    return fake_run
-
-
-def test_replay_gate_reuses_the_recorded_head_only_while_the_pr_still_points_at_it(tmp_path):
-    """A PR URL names no tree: the PR may have gained commits between the halt and the resume. The recorded
-    gate stands only if the PR's head is still the recorded one, or the base already contains the recorded
-    head (the resumed run's verifier merged it; its diff now would attribute other units to it).
-    Otherwise the current head is gated like a new child's."""
-    url, record = "https://github.com/acme/dbx-target/pull/42", {"pr_head": "c" * 40}
-    calls = []
-    # the PR still points at the recorded head: its diff (anchored at the launch base once merged, so
-    # possibly naming other units' evidence) is not what gates it; the recorded head stands as gated
-    ns = _launch_ns(tmp_path, _replay_git(calls, "c" * 40, False, ".migration/recon/other/result.json\n"))
-    assert ns["replay_gate"](record, url) == ("c" * 40, [])
-    assert calls[0][3:] == ["fetch", "-q", "origin",
-                            "+refs/pull/42/head:refs/migration/wave-orders-1/refs/pull/42/head"]  # the PR's head, fetched now
-    calls.clear()
-    # the PR gained a commit touching the allowlist since the record: the new head is gated, and fails
-    ns = _launch_ns(tmp_path, _replay_git(calls, "e" * 40, False, ".migration/allowed_targets.json\nsrc/a.sql\n"))
-    assert ns["replay_gate"](record, url) == ("e" * 40, [".migration/allowed_targets.json", "src/a.sql"])
-    assert ["merge-base", "--is-ancestor", "c" * 40, "t" * 40] in [c[3:] for c in calls]  # was the record merged?
-    assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "t" * 40 + "..." + "e" * 40]
-    calls.clear()
-    # positive control: the recorded head is already in the base (merged by the resumed run's verifier);
-    # whatever the PR points at now, that merged tree is what passed
-    ns = _launch_ns(tmp_path, _replay_git(calls, "e" * 40, True, ".migration/allowed_targets.json\n"))
-    assert ns["replay_gate"](record, url) == ("c" * 40, [])
-    # not a PR of this repo, or git cannot answer: nothing to reuse, no PASS stands
-    assert ns["replay_gate"](record, "https://github.com/other/repo/pull/42") is None
-
-    def failing(cmd, **kw):
-        raise subprocess.CalledProcessError(128, cmd)
-
-    assert _launch_ns(tmp_path, failing)["replay_gate"](record, url) is None
-
-
 def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_merge(tmp_path):
     calls = []
 
@@ -2402,25 +2296,10 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
 
     with pytest.raises(SystemExit, match="main"):
         _launch_ns(tmp_path, failing)["wave_base"]()
-    # a fresh launch persists the sha beside the manifest before the doctor, any child or the verifier runs
-    ns["BASE_SHA_PATH"].parent.mkdir(parents=True)
-    assert ns["launch_base"]() == "a" * 40
-    assert ns["BASE_SHA_PATH"].read_text() == "a" * 40 + "\n"
-    # a resume reuses it rather than re-reading a base the verifier has merged into (the run may have
-    # stopped before writing any result), and cannot run without it
-    calls.clear()
-    ns["resume"] = True
-    assert ns["launch_base"]() == "a" * 40 and calls == []
-    for bad in ("origin/main\n", ""):
-        ns["BASE_SHA_PATH"].write_text(bad)
-        with pytest.raises(SystemExit, match="mode: rerun"):
-            ns["launch_base"]()
-    ns["BASE_SHA_PATH"].unlink()
-    with pytest.raises(SystemExit, match="mode: rerun"):
-        ns["launch_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\)\nBASE_SHA = None if PREFLIGHT else launch_base\(\)\nDOCTOR = signed_doctor_report", src)
-    assert 'BASE_SHA_PATH = MANIFEST_PATH.with_suffix(".base_sha")' in src and '"base_sha": BASE_SHA' in src
+    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\)\nBASE_SHA = wave_base\(\)\n"
+                      r"DOCTOR = signed_doctor_report", src)
+    assert 'BASE_SHA_PATH' not in src and '"base_sha": BASE_SHA' in src
 
 
 def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_it_merged(tmp_path):
@@ -2432,7 +2311,6 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
              ("b" * 40, ".migration/recon/u/"): ".migration/recon/u/result.json\n.migration/recon/u/rows.csv\n",
              ("2" * 40, ".migration/recon/v/"): "", ("b" * 40, ".migration/recon/v/"): ".migration/recon/v/result.json\n",
              ("3" * 40, ".migration/recon/w/"): ".migration/recon/w/result.json\n", ("b" * 40, ".migration/recon/w/"): ""}
-
     def fake_run(cmd, **kw):
         calls.append(cmd)
         if cmd[3] == "fetch":
@@ -2487,87 +2365,6 @@ def test_git_observed_ledger_changes_beat_a_clean_self_report():
     ns["pr_changed_paths"] = lambda pr_url: None
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and "git" in out["one_line_summary"]
-
-
-def test_a_replayed_pass_keeps_the_gate_it_passed_in_the_run_being_resumed():
-    """On a resume the finished child replays, but its PR has been merged by that run's verifier (or
-    forked after other accepted units were), so re-diffing it now would attribute their evidence to it.
-    The recorded record is the workflow's own ledger: its gated head stands, git is not asked again,
-    but only for the same result: the runtime replays a finished agent for an unchanged prompt only, so
-    the record must carry the hash of the prompt it answered and name the same PR. A record from before
-    the brief changed, or naming another PR, describes a different child and its PR is gated afresh."""
-    ns = _batch_runtime()
-    ns["pr_changed_paths"] = lambda pr_url: pytest.fail("a replayed PASS is gated through replay_gate")
-    asked = []
-    ns["replay_gate"] = lambda record, pr_url: asked.append((record["pr_head"], pr_url)) or ("c" * 40, [])
-    sha = ns["prompt_sha"](ns["child_prompt"](dict(BATCH)))
-    assert re.fullmatch(r"[0-9a-f]{16,}", sha) and sha != ns["prompt_sha"](ns["child_prompt"]({**BATCH, "brief": "b2"}))
-    same = {"id": "b", "status": "PASS", "pr_head": "c" * 40, "pr_url": "https://example/pr/1", "prompt_sha": sha}
-    ns["REPLAYED"] = {"b": same}
-    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
-    assert out["status"] == "PASS" and out["pr_head"] == "c" * 40
-    assert asked == [("c" * 40, "https://example/pr/1")]  # git is asked whether the PR still points at the record
-    assert out["prompt_sha"] == sha  # every result records the prompt it answered, for the next resume
-    # the PR gained a commit since the record (replay_gate gates the new head): a ledger change in it fails
-    ns["replay_gate"] = lambda record, pr_url: ("e" * 40, [".migration/allowed_targets.json"])
-    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
-    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and out["pr_head"] == "e" * 40
-    ns["replay_gate"] = lambda record, pr_url: None  # git could not answer: unverifiable
-    out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
-    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and "git" in out["one_line_summary"]
-    # a changed brief, another PR, a record without the binding, a replayed FAIL, or a PASS recorded
-    # before any head was gated, is gated like a new result
-    for record in ({**same, "prompt_sha": ns["prompt_sha"]("other brief")}, {**same, "pr_url": "https://example/pr/2"},
-                   {k: v for k, v in same.items() if k != "prompt_sha"}, {k: v for k, v in same.items() if k != "pr_url"},
-                   {**same, "status": "FAIL"}, {k: v for k, v in same.items() if k != "pr_head"}, "PASS"):
-        ns["REPLAYED"] = {"b": record}
-        ns["pr_changed_paths"] = lambda pr_url: ("d" * 40, [".migration/03_recon_tolerances.json"])
-        out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
-        assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and out["pr_head"] == "d" * 40
-    src = WORKFLOW.read_text()
-    assert re.search(r'REPLAYED = \{\n    b\["id"\]: b for b in', src)
-
-
-def test_a_replayed_pass_that_fails_the_gate_now_is_a_new_failure_the_breaker_counts():
-    """A replayed failure was counted by the run being resumed and is not counted again; a replayed PASS
-    whose PR no longer stands (gained a ledger edit, or cannot be verified) is a failure that run never
-    saw, so it counts, or three such PRs would never halt the wave."""
-    ns = _batch_runtime()
-    sha = ns["prompt_sha"](ns["child_prompt"](dict(BATCH)))
-    passed = {"id": "b", "status": "PASS", "pr_head": "c" * 40, "pr_url": "https://example/pr/1", "prompt_sha": sha}
-
-    def run(record, gate, report):
-        ns["REPLAYED"] = {"b": record}
-        ns["replay_gate"] = lambda record, pr_url: gate
-        ns["pr_changed_paths"] = lambda pr_url: gate
-        breaker = ns["Breaker"](3)
-
-        async def agent(prompt, **kwargs):
-            return dict(report)
-
-        ns["agent"] = agent
-        out = asyncio.run(ns["run_batch"](dict(BATCH), asyncio.Semaphore(1), breaker))
-        return out, dict(breaker.classes)
-
-    out, counted = run(passed, ("e" * 40, [".migration/allowed_targets.json"]), _pass(changed_paths=["src/a.sql"]))
-    assert out["failure_class"] == "ledger_tampered" and counted == {"ledger_tampered": 1}
-    out, counted = run(passed, None, _pass(changed_paths=["src/a.sql"]))
-    assert out["failure_class"] == "ledger_tampered" and counted == {"ledger_tampered": 1}
-    # the PR still stands: PASS, nothing counted
-    out, counted = run(passed, ("c" * 40, []), _pass(changed_paths=["src/a.sql"]))
-    assert out["status"] == "PASS" and counted == {}
-    # a PASS record may carry the optional failure_class; it was still never counted
-    out, counted = run({**passed, "failure_class": "ledger_tampered"}, ("e" * 40, [".migration/allowed_targets.json"]),
-                       _pass(changed_paths=["src/a.sql"]))
-    assert out["failure_class"] == "ledger_tampered" and counted == {"ledger_tampered": 1}
-    # a replayed FAIL is the failure the resumed run already counted, unless the gate now gives it another class
-    failed = {**passed, "status": "FAIL", "failure_class": "recon_fail"}
-    replayed = {"status": "FAIL", "recon_verdict": "FAIL", "failure_class": "recon_fail",
-                "pr_url": "https://example/pr/1", "one_line_summary": "replayed"}
-    out, counted = run(failed, ("c" * 40, []), replayed)
-    assert out["status"] == "FAIL" and counted == {}
-    out, counted = run(failed, ("e" * 40, [".migration/allowed_targets.json"]), replayed)
-    assert out["failure_class"] == "ledger_tampered" and counted == {"ledger_tampered": 1}
 
 
 @pytest.mark.parametrize("value", ["--upload-pack=touch /tmp/x", "-q", "main..x", "a b", "", 3, "^main", "m:n"])
@@ -2778,7 +2575,7 @@ def test_validate_manifest_accepts_and_checks_the_optional_resync_block():
 
 def _resync_ns():
     tree = ast.parse(WORKFLOW.read_text())
-    names = {"resync_prompt", "validate_resync", "rerun_after_resync"}
+    names = {"resync_prompt", "validate_resync"}
     selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"RESYNC_CLASS", "RESYNC_SCHEMA"}
                                                        for t in n.targets))]
@@ -2812,30 +2609,6 @@ def test_validate_resync_rejects_writes_and_objects_outside_the_listed_units():
     failed = {"status": "failed", "sequences": [], "changed_paths": [], "one_line_summary": "setval exited 1"}
     assert any("resync command failed" in p for p in validate_resync(failed))
     assert validate_resync({**ok, "sequences": []}) == []
-
-
-def test_child_prompt_carries_the_resync_report_only_to_the_children_it_reruns():
-    ns = _prompt_ns(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"},
-                                       {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "brief"}]))
-    plain = {b["id"]: ns["child_prompt"](b) for b in ns["MANIFEST"]["batches"]}
-    ns["REPLAYED"] = {"b": {"id": "b", "status": "FAIL", "failure_class": "sequence_behind_source"},
-                      "c": {"id": "c", "status": "PASS"}}
-    ns["PRIOR_RESYNC"] = {"status": "ok", "sequences": [{"object": "mig.u.s", "before": 1, "after": 9}]}
-    b, c = (ns["child_prompt"](x) for x in ns["MANIFEST"]["batches"])
-    assert b != plain["b"] and "resync" in b and "mig.u.s" in b
-    assert c == plain["c"]
-
-
-def test_rerun_after_resync_reruns_only_identity_failures_and_unreported_children():
-    rerun = _resync_ns()["rerun_after_resync"]
-    seq = {"status": "FAIL", "failure_class": "sequence_behind_source"}
-    ident = {"status": "FAIL", "failure_class": "identity_drift"}
-    other = {"status": "FAIL", "failure_class": "decimal_rounding"}
-    passed = {"status": "PASS"}
-    assert rerun(seq, True) and rerun(ident, True) and rerun(None, True)
-    assert rerun({"status": "NOT_LAUNCHED"}, True)
-    assert not rerun(other, True) and not rerun(passed, True) and not rerun({"status": "BLOCKED"}, True)
-    assert not rerun(seq, False) and not rerun(None, False)
 
 
 @pytest.mark.parametrize("value", [0, True, "10", 61])
