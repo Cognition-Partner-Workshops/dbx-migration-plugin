@@ -12,7 +12,7 @@ Playbook: Convert one fan-out batch, prove parity, and open one evidence-backed 
 
 ### Convert and deploy
 - [ ] Convert each unit with CORE + workload profile + dialect skill; record systematic gaps as SKILL FEEDBACK.
-- [ ] Implement only the decided dependency mechanisms for this batch; never touch legacy sources.
+- [ ] Implement only the decided dependency mechanisms for this batch (legacy rule: `AGENTS.md`).
 - [ ] Deploy only to the isolated namespace, idempotently, with Lakeflow Jobs owned by bundle/IaC and schedule PAUSED.
 - [ ] A platform 5xx on `databricks bundle deploy`/`bundle run` follows the bounded retry rule in `skills/target-routing/SKILL.md`.
 

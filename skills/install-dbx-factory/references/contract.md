@@ -57,7 +57,7 @@ Message style and the one-message-per-event rule are `AGENTS.md`.
 - Unit PRs and migration ledgers land on the engagement feature branch: `base_branch` is required; `main`/`master` require a recorded `trunk_base_decision`.
 - `auto_merge` is false by default and may be true only under a decision recorded at STOP A; hard `stop_mode` requires false. In hard mode, the merge owner merges PASS PRs listed under "Awaiting manual merge" in the brief without a wave-close reply gate; rejected or paused PASS PRs need a `06_decisions.md` row, while a workflow safety halt waits for a human.
 - The normal unit deliverable is one PR per unit batch.
-- Only a live, snapshot, or transactional PASS from the independent verifier is merge-eligible.
+- Merge eligibility is the recon verdict rule in `skills/data-reconciliation/SKILL.md` ("Verdict authority").
 - Detailed manifest and PR-diff enforcement remains in `skills/migration-fanout/SKILL.md`; plan/manifest construction remains in `playbooks/4-migration_plan.md`.
 
 ## Fan-out guards
@@ -67,14 +67,13 @@ Each row names the check that enforces it; the always-on rules (secrets, write s
 | If this happens | What catches it |
 |---|---|
 | A source probe runs before the write scope exists | Create `.migration/allowed_targets.json` with `catalogs` and `legacy_sources` before any source probe; authorized legacy writes carry `DBX_DECISION=D-<id>` with `legacy_write_authorized` and the object in `06_decisions.md`. |
-| A stop is skipped or an old approval is reused | Every stop is a dated row in `06_decisions.md`; the orchestrator re-reads it on resume and re-asks if the inputs changed. |
+| A stop is skipped or an old approval is reused | Every stop is a dated row in `06_decisions.md`; the orchestrator re-reads it at every launch and re-asks if the inputs changed. |
 | A child gets an incomplete brief | It reports BLOCKED, does nothing, and the brief says which item was missing. It never guesses. |
 | Two children write the same table | `workflow.py` collision check refuses to launch the wave; found afterwards, merges are held and the brief says so. |
-| The same wave is launched twice | `workflow.py` refuses if `wave-N.result.json` exists; resume uses the run_id, redo needs an explicit flag. |
-| A wave launches on a stale or unsigned preflight | `workflow.py` requires the doctor-signed `wave-N.doctor.json` for that wave. |
-| One mistake repeats across 20 children | `workflow.py` circuit breaker: 3 same-class failures and no new children launch; fix once, resume, held-back batches run. |
+| The same wave is launched twice | `workflow.py` refuses if `wave-N.result.json` exists, and a spent STOP C row never launches again; a deliberate rerun deletes the result, records a new STOP C row, refreshes the doctor, and runs `run_workflow` again (`skills/migration-fanout/SKILL.md`). |
+| A wave launches on a stale or unsigned doctor record | `workflow.py` requires the doctor-signed `wave-N.doctor.json` for that wave, at most 15 minutes old. |
+| One mistake repeats across 20 children | `workflow.py` circuit breaker: 3 same-class failures and no new children launch; the result records the halt, the fix lands once, and the held-back batches go in the next manifest. |
 | A child keeps retrying a red recon | Hard cap of 3 full `dbx-recon` runs, then it reports FAIL with a one-word failure class. |
 | Children hammer the live source | Fixture first; each child reads the real source once, inside the cap agreed at STOP A. |
-| A child grades its own homework | The verifier session (wrote none of the code) re-runs the harness; only its PASS merges. |
-| Fixture PASS gets mistaken for done | The `dbx-recon` verdict line names fixture vs live; only a live, snapshot or transactional PASS can merge. |
+| A child grades its own homework, or a fixture PASS gets mistaken for done | The verdict authority rule in `skills/data-reconciliation/SKILL.md`, enforced by `workflow.py`'s merge-authority and independent-verify guards. |
 | The source moved during the check | Live comparisons are timestamped and re-run on the source side to separate drift from a real defect. |

@@ -12,7 +12,7 @@ Playbook: Verify production readiness, obtain independent sign-off, and execute 
 2. Verify every path end to end with a fresh session: deployability, schema and governance parity, secrets, schedules, consumers, rollback, and idempotent rerun.
 3. Run an independent audit and a consumer rehearsal against the target; record failures as converted-code fixes or explicit exceptions.
 4. Regenerate `05_progress.md`, update `.migration/06_decisions.md`, and confirm no unverified path blocks cutover. Do not self-authorize the production flip.
-5. Present the evidence pack at STOP E; only the customer-held cutover principal authorizes the flip.
+5. Present the evidence pack at STOP E (who authorizes the flip: `AGENTS.md`).
 6. Execute the approved consumer repoint, smoke test, rollback watch, and decommission clock; record timestamps, owners, and evidence.
 
 ## Specifications

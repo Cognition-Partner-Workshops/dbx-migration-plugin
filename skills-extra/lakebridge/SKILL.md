@@ -5,7 +5,7 @@ description: Databricks Labs Lakebridge (analyzer, profiler, BladeBridge/Morpheu
 
 # Lakebridge
 
-Lakebridge is the Databricks Labs migration toolkit: an **analyzer** (offline scan of exported code, complexity + inventory + interdependencies), an experimental **profiler** (connects to the source system for metadata and workload metrics), three **transpilers** (BladeBridge and Morpheus deterministic; Switch LLM-based, experimental), and a **reconciler**. Position in this kit: it accelerates `!dbx_estate_inventory` and `!dbx_unit_migration`; its output always passes our own data-reconciliation harness, and the independent recon session remains the merge authority.
+Lakebridge is the Databricks Labs migration toolkit: an **analyzer** (offline scan of exported code, complexity + inventory + interdependencies), an experimental **profiler** (connects to the source system for metadata and workload metrics), three **transpilers** (BladeBridge and Morpheus deterministic; Switch LLM-based, experimental), and a **reconciler**. Position in this kit: it accelerates `!dbx_estate_inventory` and `!dbx_unit_migration`; its output always passes our own data-reconciliation harness (verdict authority: `skills/data-reconciliation/SKILL.md`).
 
 Facts below marked **[docs]** come from https://databrickslabs.github.io/lakebridge/ (read 2026-09); rows marked **SEEDED** are expectations from the dialect skills' Known Traps and have not been confirmed on an engagement. Confirm the command surface with `--help` at first use per engagement: the labs CLI evolves.
 
@@ -23,7 +23,7 @@ Network: GitHub, Maven Central, PyPI. The `factory-doctor` reports Lakebridge pr
 databricks labs lakebridge analyze --source-directory <export dir> --source-tech <tech> \
   --report-file <path>.xlsx --generate-json true
 ```
-Input is the legacy export on disk (SQL files, ETL repository XML/JSON), never a live connection: it fits the read-only rule by construction. Feed the JSON into the census and complexity ranking, cross-checked against the coverage arithmetic (the analyzer is an input, not the census; a file it cannot parse is still an asset). Run the SQL Splitter first on monolithic dump files.
+Input is the legacy export on disk (SQL files, ETL repository XML/JSON), never a live connection (`AGENTS.md`). Feed the JSON into the census and complexity ranking, cross-checked against the coverage arithmetic (the analyzer is an input, not the census; a file it cannot parse is still an asset). Run the SQL Splitter first on monolithic dump files.
 
 ## Profiler (optional, experimental) [docs]
 `configure-database-profiler` then `execute-database-profiler`; supports Synapse, Teradata, Snowflake, SQL Server, Oracle, BigQuery, Redshift. It connects to the source: only with the engagement's read-only principal named in `07_access_checklist.md`, only inside the legacy-query concurrency cap, and only if the census needs workload metrics the export cannot give (query patterns for Tier 4 op selection). Never install its collection objects on the legacy system.
@@ -93,7 +93,7 @@ Additions to the `oracle` row above for `--source-dialect oracle`; the base row 
 | Rejects / hand-convert | `CREATE SYNONYM`, `@dblink` references, `CREATE DATABASE LINK`, VPD (`DBMS_RLS`) / `DBMS_REDACT` policies, `GRANT ... TO PUBLIC` | inventory only; resolve synonyms in lineage, external links stay `INFERRED` edges, policies map through `databricks-unity-catalog` or `GAP` (traps 18, 19) |
 
 ## Reconciler [docs]
-Lakebridge ships its own reconcile module. It may run as a second opinion on a unit; it never replaces the kit's `dbx-recon` gate and never self-certifies (`AGENTS.md`). If both disagree, the kit's harness result stands and the disagreement is a finding.
+Lakebridge ships its own reconcile module. It may run as a second opinion on a unit; the verdict rule is `skills/data-reconciliation/SKILL.md`.
 
 ## Rules
 - Transpiled output is a draft: review against the source-dialect skill's conversion rules, then prove it with the data-reconciliation harness like hand-converted code.

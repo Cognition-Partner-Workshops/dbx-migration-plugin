@@ -53,7 +53,7 @@ this one in the same change. If the org's managed manifest uses `"forbiddenPlugi
 
 After installing, run the `install-dbx-factory` skill once per org (see `OVERVIEW.md`).
 
-Databricks auth: one dedicated service principal via the org blueprint (OIDC token federation preferred, OAuth M2M fallback); see `skills/target-routing/SKILL.md`.
+Databricks auth: see `skills/target-routing/SKILL.md`.
 
 ## Optional dialect skills
 
@@ -78,11 +78,11 @@ on the protected branch (`refs/remotes/origin/HEAD`, else `origin/main`/`origin/
 ```json
 {
   "catalogs": ["migration_cat"],
-  "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp"],
+  "legacy_sources": ["LEGACY_DSN", "legacy-host.example"],
   "guard_mode": "block",
   "target_hosts": ["fixture-host", "LAKEBASE_MIGRATION_DSN"],
   "bundle_targets": ["migration", "dev"],
-  "lakebase_projects": ["loan-servicing-mig"],
+  "lakebase_projects": ["example-mig"],
   "lakebase_branches": ["mig-*"],
   "run_mode": "live",
   "fixture_endpoints": ["AWS_ENDPOINT_URL"],
