@@ -43,9 +43,6 @@ TARGET_KINDS = ("databricks", "lakebase")  # the harness's --target-kind values;
 # that differs from HEAD is a contract nobody reviewed.
 LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
 CAPABILITIES = ".migration/09_capabilities.json"
-PLAYBOOKS_LOCK = ".migration/playbooks.lock.json"
-LIVE_PLAYBOOKS = ".migration/live_playbooks.json"
-LIVE_PLAYBOOKS_MAX_AGE = datetime.timedelta(minutes=15)
 HOOK_PROBE_NONCE = ".migration/.hook_probe_nonce"
 HOOK_PROBE_NONCE_TTL = 8 * 60 * 60
 # Safe live probe: if the platform loads hooks.json the guard blocks this; else `echo` prints and
@@ -449,10 +446,10 @@ _NOT_PLAYBOOKS = frozenset({"00_intake_template.md"})
 PLAYBOOKS_INDEX = "index.json"
 
 
-def _repo_playbooks(plugin_root: Path) -> dict[str, tuple[str, str]]:
-    """macro -> (repo_file, sha256 of the file bytes), from playbooks/index.json."""
+def _repo_playbooks(plugin_root: Path) -> dict[str, str]:
+    """macro -> repo file name, from playbooks/index.json."""
     playbooks = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
-    macros: dict[str, tuple[str, str]] = {}
+    macros: dict[str, str] = {}
     try:
         doc = json.loads((playbooks / PLAYBOOKS_INDEX).read_text())
         rows = doc.get("playbooks", []) if isinstance(doc, dict) else []
@@ -464,100 +461,37 @@ def _repo_playbooks(plugin_root: Path) -> dict[str, tuple[str, str]]:
         p = playbooks / str(row.get("file", ""))
         macro = str(row.get("macro", ""))
         if p.is_file() and p.name not in _NOT_PLAYBOOKS and macro.startswith("!"):
-            macros[macro] = (p.name, hashlib.sha256(p.read_bytes()).hexdigest())
+            macros[macro] = p.name
     return macros
 
 
-def _norm(s: str) -> str:
-    return s.replace("\r\n", "\n").rstrip("\n")
-
-
-def check_playbooks_in_sync(ws: Path, plugin_root: Path, role: str, live_playbooks: Path | None = None) -> Check:
-    """Org-library playbooks proven against the repo copies the wave contract was reviewed from."""
-    cid = "playbooks_in_sync"
-    lock = ws / PLAYBOOKS_LOCK
-    if not lock.is_file():
-        if role == "setup":
-            return Check(cid, "skipped", f"no {PLAYBOOKS_LOCK} yet; install-dbx-factory writes it "
-                "(warning: live playbooks unverified)", {"lock": PLAYBOOKS_LOCK})
-        return Check(cid, "warn", f"no {PLAYBOOKS_LOCK}: the playbooks installed in the org library "
-            "are unverified; run install-dbx-factory", {"lock": PLAYBOOKS_LOCK})
+def check_playbooks_installed(plugin_root: Path) -> Check:
+    """The repo playbooks the org library is synced from exist and are listed in playbooks/index.json."""
+    cid = "playbooks_installed"
+    playbooks = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
     try:
-        lock_data = json.loads(lock.read_text())
+        doc = json.loads((playbooks / PLAYBOOKS_INDEX).read_text())
+        rows = doc.get("playbooks") if isinstance(doc, dict) else None
     except (OSError, ValueError) as e:
-        return Check(cid, "warn", f"{PLAYBOOKS_LOCK} unreadable: {_redact(str(e))}", {"lock": PLAYBOOKS_LOCK})
-    if not isinstance(lock_data, dict):
-        return Check(cid, "warn", f"{PLAYBOOKS_LOCK} is not a JSON object", {"lock": PLAYBOOKS_LOCK})
+        return Check(cid, "warn", f"playbooks/{PLAYBOOKS_INDEX} unreadable: {_redact(str(e))}", {"checked": 0})
+    if not isinstance(rows, list):
+        return Check(cid, "warn", f"playbooks/{PLAYBOOKS_INDEX} has no playbooks list", {"checked": 0})
+    listed = [str(r.get("file", "")) for r in rows if isinstance(r, dict)]
+    macros = [str(r.get("macro", "")) for r in rows if isinstance(r, dict)]
     repo = _repo_playbooks(plugin_root)
-    playbooks_dir = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
-    data: dict = {"malformed": [], "stale": [], "missing": [], "unknown": [], "unlisted": [], "checked": len(repo),
-        "live": None, "duplicate": {}, "live_missing": [], "live_stale": []}
-    for macro, (_repo_file, sha) in repo.items():
-        entry = lock_data.get(macro)
-        if entry is None:
-            data["missing"].append(macro)
-        elif not isinstance(entry, dict) or not all(isinstance(entry.get(k), str) for k in ("sha256", "repo_file",
-            "installed_at")):
-            data["malformed"].append(macro)
-        elif entry["sha256"] != sha:
-            data["stale"].append(macro)
-    data["unknown"] = sorted(m for m in lock_data if m not in repo)
-    repo_files = {f for f, _sha in repo.values()}
-    data["unlisted"] = sorted(p.name for p in playbooks_dir.glob("*.md") if p.name not in _NOT_PLAYBOOKS and
-        p.name not in repo_files)
-    findings = [f"{k}: {', '.join(data[k])}" for k in ("malformed", "stale", "missing", "unknown") if data[k]]
-    if data["unlisted"]:
-        findings.append(f"not in playbooks/{PLAYBOOKS_INDEX}: {', '.join(data['unlisted'])}")
-    live = live_playbooks or ws / LIVE_PLAYBOOKS
-    age_min = None
-    if not live.is_file():
-        if role == "orchestrator" or live_playbooks is not None:
-            findings.append(f"no {live if live_playbooks else LIVE_PLAYBOOKS}: export the live library with "
-                "devin_playbook_manage right before the doctor (see 9-orchestrator)")
-    else:
-        age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromtimestamp(live.stat().st_mtime,
-            datetime.timezone.utc)
-        age_min = int(age.total_seconds() // 60)
-        if age > LIVE_PLAYBOOKS_MAX_AGE:
-            findings.append(f"stale export ({age_min} min old, max 15): re-export")
-        else:
-            try:
-                records = json.loads(live.read_text())
-            except (OSError, ValueError):
-                records = None
-            bad = (next((i for i, r in enumerate(records) if not isinstance(r, dict) or not isinstance(r.get("macro"),
-                str) or not isinstance(r.get("content"), str)), -1) if isinstance(records, list) else -2)
-            if records is None or bad != -1:
-                findings.append("live export malformed" + (f" (record {bad})" if bad >= 0 else ""))
-            else:
-                grouped: dict[str, list[dict]] = {}
-                for r in records:
-                    grouped.setdefault(r["macro"], []).append(r)
-                data["duplicate"] = {
-                    m: [r.get("playbook_id") for r in rs] for m, rs in grouped.items() if len(rs) > 1}
-                for m, ids in data["duplicate"].items():
-                    findings.append(f"duplicate: {m} ({', '.join(str(i) for i in ids)})")
-                for macro, (f, _sha) in repo.items():
-                    rs = grouped.get(macro)
-                    if not rs:
-                        data["live_missing"].append(macro)
-                    elif _norm(rs[0]["content"]) != _norm((playbooks_dir / f).read_text()):
-                        data["live_stale"].append(macro)
-                for key in ("live_stale", "live_missing"):
-                    if data[key]:
-                        findings.append(f"{key.replace('_', ' ')}: {', '.join(data[key])}")
-                data["live"] = {"checked": len(repo), "age_minutes": age_min}
+    data = {
+        "checked": len(repo),
+        "missing": sorted(f for f in listed if not (playbooks / f).is_file()),
+        "unlisted": sorted(p.name for p in playbooks.glob("*.md") if p.name not in _NOT_PLAYBOOKS and p.name not in listed),
+        "duplicate_macros": sorted({m for m in macros if macros.count(m) > 1}),
+    }
+    findings = [f"{k.replace('_', ' ')}: {', '.join(v)}" for k, v in data.items() if k != "checked" and v]
+    if not repo:
+        findings.insert(0, f"no importable playbooks in playbooks/{PLAYBOOKS_INDEX}")
     if findings:
-        detail = "; ".join(findings) + ("; duplicates: archive the extra" if data["duplicate"] else "")
-        return Check(cid, "warn", detail + " — re-run install-dbx-factory", data)
-    installed = [e["installed_at"] for e in lock_data.values() if isinstance(e, dict) and
-        isinstance(e.get("installed_at"), str)]
-    installed_at = max(installed) if installed else "unknown"
-    detail = f"{len(repo)} playbooks match the lock written at the last install-dbx-factory sync ({installed_at})"
-    if data["live"]:
-        detail += f" and the live export ({age_min} min old)"
-    return Check(cid, "ok", detail, {**data, "checked": len(repo),
-        "installed_at": installed_at if installed else None})
+        return Check(cid, "warn", "; ".join(findings) + " — fix the plugin checkout, then re-run install-dbx-factory", data)
+    return Check(cid, "ok", f"{len(repo)} playbooks listed in playbooks/{PLAYBOOKS_INDEX} and present; "
+        "install-dbx-factory syncs them to the org library", data)
 
 
 def check_official_plugin(plugin_root: Path) -> Check:
@@ -1757,7 +1691,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     params: dict[str, str] | None = None, expect_catalogs: list[str] | None = None, source_family: str | None = None,
     expect_host: str | None = None, lakebase_project: str | None = None, lakebase_parent_branch: str | None = None,
     lakebase_dsn: str | None = None, lakebase_schema: str | None = None, analytical_schema: str | None = None,
-    source_attested: str | None = None, live_playbooks: Path | None = None, target_kind: str = "databricks",
+    source_attested: str | None = None, target_kind: str = "databricks",
     secret_names: list[str] | None = None, list_secrets=None, reused: dict | None = None) -> dict:
     def _row(row_id, thunk, **binds):
         """`binds` are data keys the recorded row must carry with these exact values to stand in."""
@@ -1778,7 +1712,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         _merge("allowed_targets", [check_allowed_targets(ws, plugin_root),
             check_allowlist_matches_contract(ws, expect_catalogs)]),
         check_allowlist_committed(ws),
-        check_playbooks_in_sync(ws, plugin_root, role, live_playbooks),
+        check_playbooks_installed(plugin_root),
         _merge("hook_guard", check_hooks(plugin_root, ws, probe_result, role, reused), sec),
         check_official_plugin(plugin_root),
         _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
@@ -1912,9 +1846,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lakebase-schema", help="optional Lakebase schema to check for CREATE")
     p.add_argument("--analytical-schema", metavar="CATALOG.SCHEMA",
         help="promotion schema the principal must be able to write")
-    p.add_argument("--live-playbooks", type=Path, metavar="PATH",
-        help="JSON export of the live playbooks written right before this run "
-        "(default .migration/live_playbooks.json)")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
         help="mapping ${NAME} placeholder value, same rules as dbx-recon run --param")
     p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
@@ -1969,7 +1900,7 @@ def main(argv: list[str] | None = None) -> int:
     report = run(a.workspace.resolve(), a.plugin_root.resolve(), a.role, a.hook_probe_result, a.expect_identity,
         a.no_databricks, a.unit, a.mapping, a.source_secret, params, a.expect_catalogs, a.source_family,
         a.expect_host, a.lakebase_project, a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema,
-        a.analytical_schema, source_attested=a.source_attested, live_playbooks=a.live_playbooks,
+        a.analytical_schema, source_attested=a.source_attested,
         target_kind=a.target_kind, secret_names=a.secret, reused=reused)
     if a.reuse_record:
         report["checks"].append({**asdict(Check("doctor_record", "ok" if reused else "skipped",

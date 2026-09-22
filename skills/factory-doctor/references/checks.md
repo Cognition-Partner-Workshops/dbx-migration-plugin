@@ -19,14 +19,11 @@ to `allowed_targets.json` and is skipped without that flag.
 Verifies byte equality of `allowed_targets.json` and `03_recon_tolerances.json` with
 `git show HEAD:<path>`, naming modified, untracked, or missing files. Changes require a recorded
 decision and commit, never a working-copy edit.
-### `playbooks_in_sync`
-Verifies string `sha256`, `repo_file`, and `installed_at` for every lock macro; flags stale,
-missing, unknown, malformed, or playbooks absent from `playbooks/index.json`. Every finding is a
-wave-brief `warn` for every role — the sync problem is reported, never a blocker — except a
-missing lock at setup, which is `skipped`. Orchestrators also require fresh (<15 minutes)
-`.migration/live_playbooks.json`; absent/stale/malformed, missing, or duplicate records warn, and
-a fresh export proves live bodies equal repo files after line-ending/trailing-newline normalization
-(`live_stale`, `live_missing`, and `duplicate` identify those findings).
+### `playbooks_installed`
+Verifies the repo playbooks the org library is synced from: every file `playbooks/index.json`
+lists exists, no playbook `*.md` is unlisted, and no macro appears twice. Every finding is a
+`warn` for every role — never a blocker. The doctor never compares the org library to the repo;
+`install-dbx-factory` syncs it and reports that.
 ### `hook_guard`
 Sub-checks: `hooks_files` verifies `hooks.json` registers `hooks/dbx_guard.py` as `PreToolUse`;
 `hook_guard_functional` directly sends a probe and requires a block naming the full

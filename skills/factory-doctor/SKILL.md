@@ -8,7 +8,7 @@ description: Preflight for a DBX migration workspace. Verifies setup, hooks, con
 | `workspace` | setup files or `stop_mode` are missing | rerun `1-migration_setup` |
 | `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
 | `allowlist_committed` | allowlist or tolerances differ from the upstream ref (`origin/HEAD`, else `origin/main`/`master`, else `HEAD`) | merge the allowlist PR into the protected branch and `git fetch` |
-| `playbooks_in_sync` | lock/live playbooks are missing, stale, malformed, duplicated, or differ from repo | rerun `install-dbx-factory` |
+| `playbooks_installed` | a repo playbook listed in `playbooks/index.json` is missing, unlisted, or shares a macro | fix the plugin checkout, then rerun `install-dbx-factory` |
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
 | `recon_harness` | harness self-test/import or a required driver fails | install the harness extras |
@@ -29,7 +29,7 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--source-secret <ENV VAR NAME> [--source-family sqlserver|postgres|...] --param name=value ...] \
     [--source-attested D-<id>] [--lakebase-project NAME --lakebase-parent-branch NAME] \
     [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] [--analytical-schema CATALOG.SCHEMA] \
-    [--live-playbooks PATH] [--reuse-record PATH] [--out PATH]
+    [--reuse-record PATH] [--out PATH]
 ```
 
 Writes `.migration/09_capabilities.json` and prints one line per row. Exit 0 means `ready`.
@@ -64,7 +64,7 @@ ready when its two security controls are `ok` and no unit-mapping problem blocks
 unreadable unit mapping still blocks, and so does a required security sub-result that never ran.
 A `source_principal_read_only=fail` (a writable source principal) also blocks a child;
 `unverified` stays advisory.
-`playbooks_in_sync` findings are `warn` for every role — only a missing lock at setup is `skipped`.
+`playbooks_installed` findings are `warn` for every role; the doctor does not compare the org library to the repo — `install-dbx-factory` syncs and reports that.
 `--source-attested D-<id>` yields an `ok` row whose data carries `attested`/`decision` when the
 ledger line qualifies. Sub-results live in
 `data.sub_results`; `--no-databricks` leaves `databricks_identity=skipped` and never authorizes a
@@ -88,7 +88,7 @@ shell): <probe_command>` — run it in the lead session's exec tool, never a sid
 | `workspace` | setup files or `stop_mode` are missing | rerun `1-migration_setup` |
 | `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
 | `allowlist_committed` | allowlist or tolerances differ from the upstream ref (`origin/HEAD`, else `origin/main`/`master`, else `HEAD`) | merge the allowlist PR into the protected branch and `git fetch` |
-| `playbooks_in_sync` | lock/live playbooks are missing, stale, malformed, duplicated, or differ from repo | rerun `install-dbx-factory` |
+| `playbooks_installed` | a repo playbook listed in `playbooks/index.json` is missing, unlisted, or shares a macro | fix the plugin checkout, then rerun `install-dbx-factory` |
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
 | `recon_harness` | harness self-test/import or a required driver fails | install the harness extras |

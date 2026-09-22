@@ -1,5 +1,5 @@
 {
-  "_comment": "Playbook file -> org library title and macro, in sync order. Read by install-dbx-factory and factory-doctor (playbooks_in_sync). 00_intake_template.md is a form, not a playbook, and is not listed.",
+  "_comment": "Playbook file -> org library title and macro, in sync order. Read by install-dbx-factory and factory-doctor (playbooks_installed). 00_intake_template.md is a form, not a playbook, and is not listed.",
   "playbooks": [
     {"file": "1-migration_setup.md", "title": "[DBX v1] Migration Setup (target state + workspace + tolerances + access)", "macro": "!dbx_migration_setup"},
     {"file": "2-estate_inventory.md", "title": "[DBX v1] Estate Inventory & Coverage", "macro": "!dbx_estate_inventory"},
