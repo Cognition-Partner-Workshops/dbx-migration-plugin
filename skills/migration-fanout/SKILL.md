@@ -14,6 +14,10 @@ checks their reports, runs independent verification, and writes the result and b
    `stop_c`, and `gates_sha`.
 2. Run the signed doctor over the manifest:
    `python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo> --wave .migration/waves/wave-<N>.json --hook-probe-result blocked:<nonce>`.
+   It writes `wave-<N>.doctor.json`, signed over the manifest bytes and accepted for 15 minutes.
+   Commit it beside the manifest: it carries no secret values (manifest hash, timestamp,
+   principal name, host, readiness, `inputs_sha`, signature), and children reuse it per
+   `skills/factory-doctor/SKILL.md`, running the doctor in full when it is stale or absent.
 3. Write `~/.migration/waves/current.json`:
    `{"manifest": "wave-<N>.json", "hook_probe": "blocked:<nonce>|not-blocked|unknown", "workspace": "/abs/repo", "plugin": "<plugin>"}`.
 4. Run `run_workflow(workflow_name="migration-wave-<N>", script_path="<plugin>/skills/migration-fanout/workflow.py")`.
@@ -58,7 +62,7 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Merge authority | Requires harness evidence or an explicit human override. |
 | Acceptance gates | Requires every declared gate to pass or have a valid waiver. |
 | Resync | Runs only the declared parent-owned resync and holds affected merges on trouble. |
-| Independent verify | Rechecks passing batches from the base branch. |
+| Independent verify | Rechecks passing batches from the base branch; a `degraded: true` wave runs the harness in `--mode structural`, never merge-eligible. |
 | Verifier verdicts | Normalizes verdicts and rejects missing, extra, or contradictory results. |
 | Wave close | Proves merges against the gated PR head before closing the wave. |
 
