@@ -30,6 +30,8 @@ OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines"
     "databricks-dabs", "databricks-unity-catalog", "databricks-lakeflow-connect", "databricks-lakebase")
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
 CHILD_SECURITY_CONTROLS = ("hook_guard_functional", "databricks_identity")
+# child-advisory softening never applies to these: a writable source and a PAT session are findings in any role
+_NEVER_ADVISORY = frozenset({"source_principal_read_only", "databricks_auth_kind"})
 _RANK = {"ok": 0, "skipped": 1, "warn": 2, "unverified": 3, "fail": 4}
 DRIVERS = {
     "databricks": "databricks.sql",
@@ -1659,8 +1661,8 @@ def check_analytical_target_grants(full_name: str) -> Check:
 
 def _advisory(c: Check) -> Check:
     """In a child, non-security `fail` rows are advisory `warn` (the orchestrator gated them at launch);
-    a writable source principal is a legacy-safety finding and stays `fail`."""
-    if (c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and c.id != "source_principal_read_only"
+    a writable source principal or a PAT session stays `fail`."""
+    if (c.status == "fail" and c.id not in CHILD_SECURITY_CONTROLS and c.id not in _NEVER_ADVISORY
             and not (c.data or {}).get("units_problem")):
         return Check(c.id, "warn", "advisory in a child (the orchestrator gates it before launch): " + c.detail,
             c.data)
@@ -1677,7 +1679,7 @@ def _blocking(role: str, checks: list[Check]) -> list[str]:
             return True
         if role == "child":
             return (bool((s.data or {}).get("units_problem")) or
-                (s.id == "source_principal_read_only" and s.status == "fail"))
+                (s.id in _NEVER_ADVISORY and s.status == "fail"))
         return s.status == "fail" or (s.id == "source_principal_read_only" and s.status == "unverified")
 
     blocking = [f"{row.id}={row.status}" for row in checks if any(blocks(s) for s in _flat([row]))]

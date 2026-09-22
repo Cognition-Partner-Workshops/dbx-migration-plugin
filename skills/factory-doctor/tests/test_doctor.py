@@ -246,6 +246,22 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
     assert not report["ready"] and report["blocking"] == ["databricks_identity=warn"]
 
 
+def test_child_pat_session_is_not_softened_to_advisory(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans")
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "fail", "auth: pat"),
+        doctor.Check("databricks_identity", "ok", "authenticated as the migration service principal"),
+        doctor.Check("databricks_warehouse", "ok", "wh"),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "child", probed(ws), None, no_databricks=False, units=["loans"],
+                        source_secret="LEGACY_ODBC")
+    row = by_id(report)["databricks_identity"]
+    assert row["status"] == "fail" and "advisory" not in row["detail"]
+    assert not report["ready"] and "databricks_identity=fail" in report["blocking"]
+
+
 def test_human_identity_redacts_username_and_offers_no_waiver(monkeypatch):
     _fake_cli(monkeypatch, {"userName": "someone@example.com"},
               {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net",
