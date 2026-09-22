@@ -56,16 +56,29 @@ union its `reads` and `writes`:
 Analytical-track deltas (deploy/schedule, pipelines, governance): [references/analytical-deltas.md](references/analytical-deltas.md); load for warehouse/ETL/code units, not for Lakebase-only units.
 
 ### Auth for unattended sessions
-- Children and the orchestrator run as the engagement's **migration service principal** via
-  environment-variable OAuth M2M: `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`
-  populated from named org secrets. No interactive `databricks auth login`, no PAT, no
-  `~/.databrickscfg` with credential values. The official "never auto-select a profile" rule is
-  satisfied because there is exactly one identity and it is recorded in `.migration/00_context.md`.
-- Every session verifies identity once (`databricks current-user me`) and stops if the identity is
-  not the migration principal (an admin or a human user is a halt, not a convenience).
+
+This section is the only home for the Databricks auth rules; other files point here.
+
+- Children and the orchestrator run as the engagement's dedicated **migration service principal**,
+  configured by the org blueprint: OIDC token federation preferred (`DATABRICKS_AUTH_TYPE=env-oidc` —
+  the `databricks` binary is a wrapper that exports a fresh `DATABRICKS_OIDC_TOKEN` per call), OAuth
+  M2M fallback (`DATABRICKS_AUTH_TYPE=oauth-m2m` with `DATABRICKS_CLIENT_SECRET`). Auth arrives only
+  from env vars the blueprint sets (`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`); optional
+  `DATABRICKS_DEVIN_AUDIENCE` sets a per-tier OIDC audience. No PATs (the doctor fails a `pat`
+  session; there is no waiver), no profiles, no config files, no interactive `databricks auth login`. The
+  official "never auto-select a profile" rule is satisfied because there is exactly one identity and
+  it is recorded in `.migration/00_context.md`.
+- The federation policy that lets the workspace accept the session's OIDC token is a deployment
+  prerequisite the customer's workspace admin creates before intake; its issuer, subject and host
+  values belong to the engagement's blueprint and access checklist, never to this repo.
+- Every session verifies identity once: the doctor reads `databricks auth describe` (env-oidc or
+  oauth-m2m is `ok`; `pat` is a fail) plus `databricks current-user me`,
+  and stops if the identity is not the migration principal (an admin or a human user is a halt, not
+  a convenience). The recon harness connects with the same session identity; `DATABRICKS_HTTP_PATH`
+  (or `--target-http-path`) names the SQL warehouse.
 - Principal tiers: assessment (metadata + read-only, phase 0), migration (full rights on the
-  migration catalog, USE elsewhere, no admin roles), cutover (customer-held, STOP E only, never in
-  a child). Never request or use account-admin or workspace-admin permissions; escalate instead.
+  migration catalog, USE elsewhere, no admin roles), cutover (customer-held; `AGENTS.md`). Never
+  request or use account-admin or workspace-admin permissions; escalate instead.
 
 ### Platform 5xx on bundle deploy and run
 
@@ -73,14 +86,12 @@ A `databricks bundle deploy` or `databricks bundle run` that fails with an HTTP 
 platform-unavailable response is retried at most twice — three attempts total — with a backoff of
 30 s then 120 s. Nothing else is retried: a 4xx, a validation error, a failing job run, or a guard
 block is a finding, not a retry. After the third 5xx the session stops and reports `status=BLOCKED`
-with failure class `platform_5xx` and the last request id in `one_line_summary`. The retries never
-widen the write scope and never switch identity, and the three attempts count as one for the
-circuit breaker (rule in `skills/install-dbx-factory/references/contract.md`).
+with failure class `platform_5xx` and the last request id in `one_line_summary`. A retry repeats
+the same command as the same identity, and the three attempts count as one for the circuit breaker (rule in `skills/install-dbx-factory/references/contract.md`).
 
 ### Write scope
-- Migration work writes only to the migration catalog recorded in `.migration/00_context.md`, and a
-  child writes only to the targets in its brief (`.migration/allowed_targets.json` is the allowlist
-  the enforcement hooks check). Per-batch isolated areas: `<catalog>.<schema>__wave<N>_<unit>` or a
+- Write scope and the allowlist are `AGENTS.md`; a child writes only to the targets in its brief.
+  Per-batch isolated areas: `<catalog>.<schema>__wave<N>_<unit>` or a
   batch-scoped schema, dropped and recreated idempotently. The promotion schema is created by the
   migration principal at setup when absent, so it owns it; a pre-existing schema under another
   owner needs the grants the factory doctor names.

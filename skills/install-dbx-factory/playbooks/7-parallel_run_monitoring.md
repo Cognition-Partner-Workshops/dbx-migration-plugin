@@ -7,7 +7,7 @@ Playbook: Operate coexistence after migration waves, reconcile on schedule, and 
 4. For a conversion defect, create an isolated remediation branch and PR; event-driven automation may prepare evidence, but cannot merge or widen targets.
 5. Keep an evidence ledger of run ID, snapshot, populations, verdict, cost, finding, owner, PR, redeploy, and recheck. Stage one red-run fixture and one narrow live recheck before widening.
 6. Reconcile connector-fed or federated tables at a recorded snapshot; report CDC lag and DEGRADED paths rather than hiding them.
-7. Keep source and legacy jobs read-only; no legacy DDL/DML, duplicate resource, schedule, or consumer flip is allowed here.
+7. No duplicate resource, schedule change, or consumer flip happens here; legacy stays as `AGENTS.md` says.
 8. Pause the job on collision, repeated same-class failure, or unowned drift; notify once with the evidence and unblock condition.
 
 ## Specifications

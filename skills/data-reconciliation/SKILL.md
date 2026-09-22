@@ -8,6 +8,21 @@ description: Run the reconciliation harness that gates every Databricks migratio
 You run the harness in `harness/`. You do not write recon SQL by hand, you do not
 reimplement its checks, and you never edit its verdict.
 
+## Verdict authority
+
+This section is the only home for the merge-authority rule; other files point here.
+
+- The `dbx-recon` verdict is the merge authority. No accelerator, connector, transpiler, partner
+  tool, or child self-report certifies a unit; a second opinion that disagrees with the harness
+  is a finding, and the harness result stands.
+- The verdict that merges comes from an independent verifier session that wrote none of the
+  converted code and re-runs the harness from the protected base, not from the child's checkout.
+- Only a `live`, `snapshot`, or `transactional` PASS is merge-eligible. The verdict line names the
+  mode; a `fixture` PASS is development evidence, a `structural` run is never merge-eligible, and
+  `merge_eligible` in `result.json` is what the workflow reads.
+- The only exception is a human override row in `.migration/06_decisions.md` naming exactly the
+  affected units.
+
 ## Run it
 
 ```bash
@@ -23,7 +38,9 @@ dbx-recon run \
   --mode fixture|live|snapshot|continuous|transactional|structural \
   --source-dsn-secret <SOURCE_SECRET_NAME> \
   --target-kind databricks|lakebase \
-  --target-secret DATABRICKS_MIGRATION_SQL --target-catalog <migration catalog> \
+  [--target-http-path <warehouse path>] --target-catalog <migration catalog> \
+  # lakebase instead: --target-secret LAKEBASE_MIGRATION_DSN; databricks connects as the \
+  # session's service principal (DATABRICKS_HTTP_PATH names the warehouse; see target-routing) \
   --allowed-targets-file .migration/allowed_targets.json --target-schema <schema> \
   --snapshot-manifest .migration/snapshots/<unit_id>.json \
   --seed 0 --depth threshold|sampled|full [--param from_date=2024-01-01 ...] \
@@ -42,7 +59,7 @@ The depth is recorded in `result.json` and the summary.
 |---|---|
 | `sqlserver` (pyodbc, `[sqlserver]` extra) | live-tested: SQL Server 2022 -> Lakebase rehearsal |
 | `postgres` (psycopg, `[lakebase]` extra) | live-tested: Postgres source and Lakebase target |
-| `databricks` (`[databricks]` extra) | live-tested: Delta target and Databricks-to-Databricks source |
+| `databricks` (`[databricks]` extra) | live-tested: Delta target and Databricks-to-Databricks source. Same workspace only: the source is read as the session identity on `DATABRICKS_HOST` through `--target-http-path` (Hive-to-UC, catalog-to-catalog, federated catalogs); a source in another workspace is out of scope. |
 | `redshift`, `snowflake`, `teradata`, `oracle` | **untested**: the adapter raises `NotImplementedError("<family> source adapter is untested; see SKILL.md")` before any connection. Reconcile these through Lakehouse Federation (`--family databricks`) or land an adapter with a rehearsal first. |
 
 ```bash
@@ -55,8 +72,7 @@ which Tier 3 mode each table lands in; the plan playbook sums it per wave for th
 line. After a run, `result.json["cost"]` holds the actuals (statements, rows fetched per side,
 elapsed seconds) so the next estimate is corrected from measurement.
 
-Secrets are passed by NAME; the harness reads them from the environment. Never inline a
-connection string or token.
+Secrets are passed by NAME; the harness reads them from the environment (`AGENTS.md`).
 
 `--param name=value` (repeatable) fills `${name}` placeholders in the mapping spec's
 `root_where`/`target_where`. Values are validated before any database adapter is constructed.

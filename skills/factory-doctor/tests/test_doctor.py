@@ -1,6 +1,4 @@
-import hashlib
 import json
-import os
 import re
 import subprocess
 import time
@@ -25,11 +23,8 @@ def _git(ws: Path, *args: str) -> str:
                           check=True, capture_output=True, text=True).stdout
 
 
-def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), commit=True,
-                   with_lock=True):
-    """A setup-complete workspace, committed as the setup playbook leaves it before STOP A,
-    with the playbook lock install-dbx-factory leaves after its sync and the live-playbooks
-    export the orchestrator writes right before the doctor."""
+def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), commit=True):
+    """A setup-complete workspace, committed as the setup playbook leaves it before STOP A."""
     mig = tmp_path / ".migration"
     mig.mkdir(parents=True)
     for f in doctor.REQUIRED_FILES:
@@ -44,51 +39,11 @@ def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), c
             )
         else:
             mig.joinpath(f).write_text(f"# {f}\n")
-    if with_lock:
-        _lock(tmp_path)
-        _live(tmp_path)
     _git(tmp_path, "init", "-q")
     if commit:
         _git(tmp_path, "add", "-A")
         _git(tmp_path, "commit", "-qm", "setup")
     return tmp_path
-
-
-def _lock(ws: Path, overrides=None, drop=()):
-    """The .migration/playbooks.lock.json install-dbx-factory writes after a sync: every repo
-    playbook's sha256 plus this run's installed_at."""
-    entries = {m: {"sha256": sha, "repo_file": f, "installed_at": "2026-01-01T00:00:00Z"}
-               for m, (f, sha) in doctor._repo_playbooks(PLUGIN_ROOT).items()}
-    for macro, sha in (overrides or {}).items():
-        entries.setdefault(macro, {"repo_file": "gone.md", "installed_at": "2026-01-01T00:00:00Z"})
-        entries[macro]["sha256"] = sha
-    for macro in drop:
-        entries.pop(macro, None)
-    (ws / doctor.PLAYBOOKS_LOCK).write_text(json.dumps(entries, indent=2, sort_keys=True))
-    return entries
-
-
-def _live(ws: Path, overrides=None, drop=(), duplicate=None, age_minutes=0):
-    """The .migration/live_playbooks.json the orchestrator writes with devin_playbook_manage
-    right before the doctor: one record per repo macro with the repo file body. `overrides`
-    replaces a macro's content, `drop` removes macros, `duplicate` appends a second record
-    for that macro, `age_minutes` backdates the file mtime."""
-    playbooks_dir = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
-    records = []
-    for macro, (f, _sha) in doctor._repo_playbooks(PLUGIN_ROOT).items():
-        if macro in drop:
-            continue
-        records.append({"macro": macro, "playbook_id": f"playbook-{macro.lstrip('!')}",
-                        "content": (overrides or {}).get(macro, (playbooks_dir / f).read_text())})
-    if duplicate:
-        records.append({"macro": duplicate, "playbook_id": "playbook-extra-copy",
-                        "content": "stale body\n"})
-    live = ws / doctor.LIVE_PLAYBOOKS
-    live.write_text(json.dumps(records, indent=2))
-    if age_minutes:
-        t = time.time() - age_minutes * 60
-        os.utime(live, (t, t))
-    return records
 
 
 def by_id(report):
@@ -236,7 +191,7 @@ def test_run_core_rows_are_ten(tmp_path):
     report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
     optional = {"lakebase_branch_create", "lakebase_target_grants", "analytical_target_grants"}
     assert [c["id"] for c in report["checks"] if c["id"] not in optional] == [
-        "workspace", "allowed_targets", "allowlist_committed", "playbooks_in_sync", "hook_guard",
+        "workspace", "allowed_targets", "allowlist_committed", "playbooks_installed", "hook_guard",
         "official_databricks_plugin", "recon_harness", "recon_family_supported", "type_map_audit",
         "delete_evidence", "source_principal_read_only", "dictionary_readable",
         "named_secrets_exist", "databricks_identity",
@@ -282,7 +237,7 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
     monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
         doctor.Check("databricks_cli", "ok", "v0.2"),
-        doctor.Check("databricks_auth_kind", "warn", "pat (env)"),
+        doctor.Check("databricks_auth_kind", "warn", "pat"),
         doctor.Check("databricks_identity", "warn", "authenticated as someone@example.com (user)"),
         doctor.Check("databricks_warehouse", "warn", "none"),
     ])
@@ -291,15 +246,31 @@ def test_human_identity_is_not_ready(tmp_path, monkeypatch):
     assert not report["ready"] and report["blocking"] == ["databricks_identity=warn"]
 
 
-def test_human_identity_redacts_username_and_names_service_principal_secrets(monkeypatch):
+def test_child_pat_session_is_not_softened_to_advisory(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans")
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_cli", "ok", "v0.2"),
+        doctor.Check("databricks_auth_kind", "fail", "auth: pat"),
+        doctor.Check("databricks_identity", "ok", "authenticated as the migration service principal"),
+        doctor.Check("databricks_warehouse", "ok", "wh"),
+    ])
+    report = doctor.run(ws, PLUGIN_ROOT, "child", probed(ws), None, no_databricks=False, units=["loans"],
+                        source_secret="LEGACY_ODBC")
+    row = by_id(report)["databricks_identity"]
+    assert row["status"] == "fail" and "advisory" not in row["detail"]
+    assert not report["ready"] and "databricks_identity=fail" in report["blocking"]
+
+
+def test_human_identity_redacts_username_and_offers_no_waiver(monkeypatch):
     _fake_cli(monkeypatch, {"userName": "someone@example.com"},
-              {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
+              {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net",
+                                                "auth_type": "pat"}})
     row = by_id({"checks": [asdict(c) for c in doctor.check_databricks(None)]})["databricks_identity"]
     assert row["data"]["userName"] == "<human user (redacted)>"
     assert "someone@example.com" not in row["detail"]
-    assert "DATABRICKS_CLIENT_ID" in row["detail"]
-    assert "DATABRICKS_CLIENT_SECRET" in row["detail"]
-    assert "DATABRICKS_HOST" in row["detail"]
+    assert "service principal" in row["detail"]
+    assert "06_decisions.md" not in row["detail"]
 
 
 def test_lakebase_rows_are_absent_without_flags(tmp_path):
@@ -911,7 +882,7 @@ def test_child_names_its_batch_and_every_unit_of_it_is_checked(tmp_path, monkeyp
 
 
 def test_child_non_security_failures_are_warnings_and_do_not_block(tmp_path, monkeypatch):
-    ws = make_workspace(tmp_path, with_lock=False)
+    ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
     monkeypatch.setattr(doctor, "check_harness",
                         lambda *a, **k: doctor.Check("recon_harness", "fail", "selftest rc=1"))
@@ -924,7 +895,7 @@ def test_child_non_security_failures_are_warnings_and_do_not_block(tmp_path, mon
     report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"])
     row = by_id(report)["recon_harness"]
     assert row["status"] == "warn" and "selftest rc=1" in row["detail"]
-    assert by_id(report)["playbooks_in_sync"]["status"] == "warn"
+    assert by_id(report)["playbooks_installed"]["status"] == "ok"
     assert report["ready"] is True and report["blocking"] == []
 
 
@@ -1543,10 +1514,12 @@ def test_source_families_are_the_harness_families_and_databricks_without_cli_is_
     cli = (PLUGIN_ROOT / "skills" / "data-reconciliation" / "harness" / "recon" / "cli.py").read_text()
     families = re.search(r"^SOURCE_FAMILIES = \((.*)\)$", cli, re.MULTILINE).group(1)
     assert set(doctor.SOURCE_FAMILIES) == set(re.findall(r'"(\w+)"', families)) and "databricks" in doctor.SOURCE_FAMILIES
-    monkeypatch.setenv("SRC_DBX", "token=never-printed")
     monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
-    assert c.status == "unverified" and "databricks" in c.detail and "never-printed" not in json.dumps(asdict(c))
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
+    assert c.status == "unverified" and "databricks" in c.detail
+    # offline: never let the session-identity connect reach a real warehouse
+    monkeypatch.setitem(doctor._READ_ONLY_CONNECT, "databricks",
+                        lambda _dsn: (_ for _ in ()).throw(RuntimeError("no connector in tests")))
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, source_secret="SRC_DBX",
@@ -1769,39 +1742,23 @@ DBX_TABLES = ["mig.raw.loans", "mig.raw.payments"]
 DBX_READ_GRANTS = {"mig": ["USE_CATALOG"], "mig.raw": ["USE_SCHEMA"],
                    "mig.raw.loans": ["SELECT"], "mig.raw.payments": ["SELECT"]}
 DBX_PRINCIPAL = "2e90bc1d-e9a1-4703-8c48-ad28ebb1864d"
-DBX_SECRET = json.dumps({"server_hostname": "adb-source.example", "http_path": "/sql/1.0/warehouses/x",
-                         "access_token": "test-source-token"})
 
 
 def _dbx_source_cli(monkeypatch, *, grants, owners=None, groups=(), fail_op=None,
                     raw_get_effective=None):
-    """A databricks CLI bound to the --source-secret credential, not the session env: every call
-    must arrive with env carrying only the secret's host/token plus auth-type pat — every other
-    DATABRICKS_* variable set in the session must not reach the subprocess. `current-user me`
-    answers an applicationId in `groups`, `catalogs|schemas|tables get` the owners dict (default
-    owner@example.com, since a missing owner is now unverified), `grants get-effective` the
-    per-name grants dict (one assignment carried through a GROUP, the way inherited grants
-    arrive); `raw_get_effective` overrides the payload per securable for malformed-JSON cases.
-    Returns every command asked."""
+    """A databricks CLI answering as the session's own service principal: every call must arrive
+    with no env override (env is None) because the probe reads the source through the session
+    identity. `current-user me` answers an applicationId in `groups`, `catalogs|schemas|tables
+    get` the owners dict (default owner@example.com, since a missing owner is now unverified),
+    `grants get-effective` the per-name grants dict (one assignment carried through a GROUP, the
+    way inherited grants arrive); `raw_get_effective` overrides the payload per securable for
+    malformed-JSON cases. Returns every command asked."""
     asked = []
-    monkeypatch.setenv("SRC_DBX", DBX_SECRET)
-    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "oauth-m2m")
-    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "inherited-client-id")
-    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "inherited-secret")
-    monkeypatch.setenv("DATABRICKS_ACCOUNT_ID", "inherited-account")
-    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "inherited-profile")
-    monkeypatch.setenv("DATABRICKS_HOST", "https://wrong-workspace.example")
-    monkeypatch.setenv("DATABRICKS_TOKEN", "inherited-token")
     monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/local/bin/databricks")
 
     def fake_run(cmd, timeout=0, env=None):
         asked.append(cmd)
-        assert env is not None, cmd
-        dbx = {k for k in env if k.startswith("DATABRICKS_")}
-        assert dbx == {"DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_AUTH_TYPE"}, cmd
-        assert env["DATABRICKS_TOKEN"] == "test-source-token"
-        assert env["DATABRICKS_HOST"] == "https://adb-source.example"
-        assert env["DATABRICKS_AUTH_TYPE"] == "pat"
+        assert env is None, cmd
         op = tuple(cmd[1:3])
         if op == fail_op:
             return 1, "", "Error: default auth: cannot configure default credentials token=never-printed"
@@ -1822,24 +1779,19 @@ def _dbx_source_cli(monkeypatch, *, grants, owners=None, groups=(), fail_op=None
     return asked
 
 
-def test_databricks_source_principal_needs_and_parses_the_secret(monkeypatch):
+def test_databricks_source_principal_uses_the_session_identity(monkeypatch):
+    asked = _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
     c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
-    assert c.status == "fail" and "--source-secret" in c.detail
-    monkeypatch.delenv("SRC_DBX", raising=False)
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
-    assert c.status == "fail" and "SRC_DBX" in c.detail and "not set" in c.detail
-    monkeypatch.setenv("SRC_DBX", "token=never-printed")
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
-    assert c.status == "unverified" and "JSON" in c.detail
-    assert "never-printed" not in json.dumps(asdict(c))
+    assert c.status == "ok", c.detail
+    assert c.data["identity"] == "session" and c.data["principal"] == DBX_PRINCIPAL
+    assert asked and asked[0][1:3] == ["current-user", "me"]
 
 
 def test_databricks_source_principal_ok_reads_every_securable(monkeypatch):
     asked = _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
     assert c.status == "ok", c.detail
-    assert c.data["principal"] == DBX_PRINCIPAL and c.data["host"] == "adb-source.example"
-    assert c.data["writable"] == {} and "test-source-token" not in json.dumps(asdict(c))
+    assert c.data["principal"] == DBX_PRINCIPAL and c.data["writable"] == {}
     effective = [cmd[3:5] for cmd in asked if cmd[1:3] == ["grants", "get-effective"]]
     assert effective == [["catalog", "mig"], ["schema", "mig.raw"],
                          ["table", "mig.raw.loans"], ["table", "mig.raw.payments"]]
@@ -1848,7 +1800,7 @@ def test_databricks_source_principal_ok_reads_every_securable(monkeypatch):
 def test_databricks_source_principal_fails_on_write_privilege(monkeypatch):
     grants = dict(DBX_READ_GRANTS, **{"mig.raw.payments": ["SELECT", "MODIFY"]})
     _dbx_source_cli(monkeypatch, grants=grants)
-    c = doctor.check_source_principal(DBX_TABLES, "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
     assert c.status == "fail" and "mig.raw.payments: MODIFY" in c.detail
     assert c.data["writable"]["mig.raw.payments"] == ["MODIFY"]
 
@@ -1856,7 +1808,7 @@ def test_databricks_source_principal_fails_on_write_privilege(monkeypatch):
 def test_databricks_source_principal_fails_on_group_ownership(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, owners={"mig.raw": "data_engineers"},
                     groups=("data_engineers",))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "fail" and "mig.raw: OWNER" in c.detail
     assert c.data["writable"]["mig.raw"] == ["OWNER"]
 
@@ -1864,30 +1816,28 @@ def test_databricks_source_principal_fails_on_group_ownership(monkeypatch):
 def test_databricks_source_principal_fails_on_inherited_write_grant(monkeypatch):
     grants = dict(DBX_READ_GRANTS, **{"mig.raw": ["USE_SCHEMA", "ALL_PRIVILEGES"]})
     _dbx_source_cli(monkeypatch, grants=grants, groups=("data_engineers",))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "fail" and "mig.raw: ALL_PRIVILEGES" in c.detail
 
 
 def test_databricks_source_principal_unverified_on_cli_error(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, fail_op=("grants", "get-effective"))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "get-effective" in c.detail
-    assert "never-printed" not in json.dumps(asdict(c))
     monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "CLI" in c.detail
 
 
 def test_databricks_source_principal_unverified_when_owner_is_unknown(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, fail_op=("schemas", "get"))
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "schemas get mig.raw" in c.detail
-    assert "never-printed" not in json.dumps(asdict(c))
 
 
 def test_databricks_source_principal_unverified_on_malformed_grants_payload(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS, raw_get_effective={"mig": {}})
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "catalog mig" in c.detail
     assert "no privilege_assignments" in c.detail
 
@@ -1896,7 +1846,7 @@ def test_databricks_source_principal_empty_assignments_are_read_only(monkeypatch
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS,
                     raw_get_effective={name: {"privilege_assignments": []}
                                        for name in ("mig", "mig.raw", "mig.raw.loans")})
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "ok", c.detail
 
 
@@ -1904,14 +1854,14 @@ def test_databricks_source_principal_unverified_on_string_privileges(monkeypatch
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS,
                     raw_get_effective={"mig.raw.loans": {"privilege_assignments": [
                         {"principal": DBX_PRINCIPAL, "privileges": "SELECT"}]}})
-    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["mig.raw.loans"], "databricks", None)
     assert c.status == "unverified" and "table mig.raw.loans" in c.detail
     assert "no privilege_assignments" in c.detail
 
 
 def test_databricks_source_principal_two_part_names_are_unresolved(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
-    c = doctor.check_source_principal(["raw.loans"], "databricks", "SRC_DBX")
+    c = doctor.check_source_principal(["raw.loans"], "databricks", None)
     assert c.status == "unverified" and c.data["unresolved"] == ["raw.loans"]
 
 
@@ -2313,21 +2263,44 @@ def _fake_cli(monkeypatch, me, describe):
     monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/databricks")
 
 
-def test_auth_kind_fails_on_conflicting_pat_and_m2m_env(monkeypatch):
-    _fake_cli(monkeypatch, {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"},
-              {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
-    monkeypatch.setenv("DATABRICKS_TOKEN", "token")
-    for name in doctor.M2M_VARS:
-        monkeypatch.setenv(name, name.lower())
-    row = {c.id: c for c in doctor.check_databricks(None)}["databricks_auth_kind"]
+def _auth_kind(monkeypatch, auth_type, **env):
+    sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
+    _fake_cli(monkeypatch, sp, {"status": "success", "details": {
+        "host": "https://adb-1.azuredatabricks.net", **({"auth_type": auth_type} if auth_type else {})}})
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    return {c.id: c for c in doctor.check_databricks(None)}["databricks_auth_kind"]
+
+
+def test_auth_kind_env_oidc_is_ok(monkeypatch):
+    row = _auth_kind(monkeypatch, "env-oidc", DATABRICKS_DEVIN_AUDIENCE="databricks-prod")
+    assert row.status == "ok"
+    assert row.data["auth_kind"] == "env-oidc" and row.data["audience"] == "databricks-prod"
+
+
+def test_auth_kind_oauth_m2m_is_ok(monkeypatch):
+    row = _auth_kind(monkeypatch, "oauth-m2m")
+    assert row.status == "ok" and row.data["auth_kind"] == "oauth-m2m"
+    assert "audience" not in row.data
+
+
+def test_auth_kind_pat_fails_with_no_waiver(monkeypatch):
+    row = _auth_kind(monkeypatch, "pat")
+    assert row.status == "fail" and "06_decisions.md" not in row.detail
+    assert "service principal" in row.detail
+
+
+def test_auth_kind_fails_when_describe_reports_no_known_type(monkeypatch):
+    row = _auth_kind(monkeypatch, None)
     assert row.status == "fail"
-    assert row.data["auth_kind"] == "conflict (env)"
-    assert "DATABRICKS_TOKEN" in row.detail
+    assert "databricks auth describe" in row.detail
+    assert "env-oidc" in row.detail and "oauth-m2m" in row.detail
 
 
 def test_identity_row_records_the_verified_host_and_the_report_exposes_it(tmp_path, monkeypatch):
     sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
-    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net"}})
+    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-1.azuredatabricks.net",
+                                                                "auth_type": "oauth-m2m"}})
     checks = {c.id: c for c in doctor.check_databricks(None)}
     assert checks["databricks_identity"].status == "ok"
     assert checks["databricks_identity"].data == {"userName": sp["userName"], "service_principal": True,
@@ -2344,7 +2317,8 @@ def test_identity_row_fails_when_the_workspace_is_not_the_expected_host(tmp_path
     """The expected principal can resolve against another workspace (a child's own profile or env):
     the host is compared to --expect-host under one spelling rule, not merely required to be set."""
     sp = {"userName": "8f3c2a1e-4b6d-4c2a-9e1f-0a1b2c3d4e5f"}
-    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-2.azuredatabricks.net"}})
+    _fake_cli(monkeypatch, sp, {"status": "success", "details": {"host": "https://adb-2.azuredatabricks.net",
+                                                                "auth_type": "oauth-m2m"}})
 
     def row(host):
         return {c.id: c for c in doctor.check_databricks(sp["userName"], host)}["databricks_identity"]
@@ -2504,7 +2478,7 @@ def test_child_inherits_platform_row_from_the_signed_record(tmp_path):
     assert sub["data"]["reused_from"] == "2026-01-01T00:00:00Z"
 
 
-# ------------------------------------------------------------------ playbooks in sync
+# ------------------------------------------------------------------ playbooks installed
 
 PLAYBOOKS_DIR = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
 
@@ -2527,8 +2501,7 @@ def test_repo_playbooks_valid_index_returns_macro(tmp_path):
         "playbooks": [{"file": "1-x.md", "macro": "!x", "title": "X"}],
     }))
 
-    expected = hashlib.sha256(body.encode()).hexdigest()
-    assert doctor._repo_playbooks(tmp_path) == {"!x": ("1-x.md", expected)}
+    assert doctor._repo_playbooks(tmp_path) == {"!x": "1-x.md"}
 
 
 def test_repo_playbooks_keys_are_macros_only():
@@ -2542,168 +2515,58 @@ def test_repo_playbooks_keys_are_macros_only():
     assert all(r["title"].startswith("[DBX v1] ") for r in index)
 
 
-def test_playbooks_in_sync_ok(tmp_path):
-    ws = make_workspace(tmp_path)
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    expected = {m for m, (f, _sha) in doctor._repo_playbooks(PLUGIN_ROOT).items()}
+def test_playbooks_installed_ok():
+    c = doctor.check_playbooks_installed(PLUGIN_ROOT)
+    assert c.status == "ok" and c.data["checked"] >= 14
+    assert c.data["missing"] == c.data["unlisted"] == c.data["duplicate_macros"] == []
     on_disk = {p.name for p in PLAYBOOKS_DIR.glob("*.md")} - doctor._NOT_PLAYBOOKS
-    assert {f for f, _ in doctor._repo_playbooks(PLUGIN_ROOT).values()} == on_disk
-    sha = hashlib.sha256((PLAYBOOKS_DIR / "9-orchestrator.md").read_bytes()).hexdigest()
-    assert doctor._repo_playbooks(PLUGIN_ROOT)["!dbx_migrate_pipeline"] == ("9-orchestrator.md", sha)
-    assert c.status == "ok" and c.data["checked"] == len(expected) >= 14
-    assert c.data["installed_at"] == "2026-01-01T00:00:00Z"
-    assert "last install-dbx-factory sync (2026-01-01T00:00:00Z)" in c.detail
-    assert "and the live export (0 min old)" in c.detail
+    listed = {r["file"] for r in json.loads((PLAYBOOKS_DIR / "index.json").read_text())["playbooks"]}
+    assert on_disk <= listed
 
 
-def test_orchestrator_playbook_drift_is_a_warning_not_a_blocker(tmp_path):
-    ws = make_workspace(tmp_path, with_lock=False)
-    _lock(ws, overrides={"!dbx_migrate_pipeline": "0" * 64})
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
+def _tmp_plugin_root(tmp_path: Path, index) -> Path:
+    playbooks = tmp_path / "skills" / "install-dbx-factory" / "playbooks"
+    playbooks.mkdir(parents=True, exist_ok=True)
+    (playbooks / "index.json").write_text(json.dumps(index) if not isinstance(index, str) else index)
+    return playbooks
+
+
+def test_playbooks_installed_missing_file_is_a_warning_not_a_blocker(tmp_path):
+    playbooks = _tmp_plugin_root(tmp_path, {"playbooks": [
+        {"file": "1-x.md", "macro": "!x"}, {"file": "2-gone.md", "macro": "!gone"}]})
+    (playbooks / "1-x.md").write_text("# playbook\n")
+    c = doctor.check_playbooks_installed(tmp_path)
+    assert c.status == "warn" and c.data["missing"] == ["2-gone.md"]
+    assert "install-dbx-factory" in c.detail
+    for role in ("child", "orchestrator", "setup"):
+        assert not [b for b in doctor._blocking(role, [c]) if b.startswith("playbooks_installed")]
+
+
+def test_playbooks_installed_unlisted_and_duplicate_macro_warn(tmp_path):
+    playbooks = _tmp_plugin_root(tmp_path, {"playbooks": [
+        {"file": "1-x.md", "macro": "!x"}, {"file": "2-y.md", "macro": "!x"}]})
+    (playbooks / "1-x.md").write_text("# playbook\n")
+    (playbooks / "2-y.md").write_text("# playbook\n")
+    (playbooks / "3-extra.md").write_text("# stray\n")
+    c = doctor.check_playbooks_installed(tmp_path)
     assert c.status == "warn"
-    assert "!dbx_migrate_pipeline" in c.detail and "install-dbx-factory" in c.detail
-    assert c.data["stale"] == ["!dbx_migrate_pipeline"]
-    ws = make_workspace(tmp_path / "missing", with_lock=False)
-    _lock(ws, drop=("!dbx_migrate_oltp",))
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child")
-    assert c.status == "warn" and c.data["missing"] == ["!dbx_migrate_oltp"]
-    ws = make_workspace(tmp_path / "unknown", with_lock=False)
-    _lock(ws, overrides={"!dbx_gone": "f" * 64})
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and c.data["unknown"] == ["!dbx_gone"]
-    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
+    assert c.data["unlisted"] == ["3-extra.md"] and c.data["duplicate_macros"] == ["!x"]
+    assert "3-extra.md" in c.detail and "!x" in c.detail
 
 
-def test_playbooks_in_sync_lock_missing_and_role(tmp_path):
-    ws = make_workspace(tmp_path, with_lock=False)
-    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "setup").status == "skipped"
-    report = doctor.run(ws, PLUGIN_ROOT, "setup", "blocked", None, True)
-    assert by_id(report)["playbooks_in_sync"]["status"] == "skipped"
-    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
-    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
-                        "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--role", "setup",
-                        "--out", "-"], capture_output=True, text=True, check=False)
-    row = next(l for l in r.stdout.splitlines() if "playbooks_in_sync" in l)
-    assert row.startswith("skipped"), r.stdout
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and "install-dbx-factory" in c.detail
-    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child").status == "warn"
-    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
+def test_playbooks_installed_malformed_index_warns_not_crashes(tmp_path):
+    for content in ("{", "[]", '{"playbooks": 3}'):
+        _tmp_plugin_root(tmp_path, content)
+        assert doctor.check_playbooks_installed(tmp_path).status == "warn"
 
 
-def test_playbooks_in_sync_malformed_entry_fails_not_crashes(tmp_path):
-    ws = make_workspace(tmp_path, with_lock=False)
-    entries = _lock(ws)
-    entries["!dbx_migration_plan"]["installed_at"] = 1
-    (ws / doctor.PLAYBOOKS_LOCK).write_text(json.dumps(entries))
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and c.data["malformed"] == ["!dbx_migration_plan"]
-    assert "malformed: !dbx_migration_plan" in c.detail and "install-dbx-factory" in c.detail
-
-
-def test_playbooks_in_sync_unlisted_repo_file_is_a_finding(tmp_path, monkeypatch):
-    ws = make_workspace(tmp_path)
-    stray = PLAYBOOKS_DIR / "15-unlisted.md"
-    stray.write_text("# stray\n")
-    try:
-        c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    finally:
-        stray.unlink()
-    assert c.status == "warn" and "15-unlisted.md" in c.detail and "index.json" in c.detail
-
-
-def test_playbooks_in_sync_ok_checks_the_live_export(tmp_path):
-    ws = make_workspace(tmp_path)
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "ok" and "live export" in c.detail
-    assert c.data["live"]["checked"] >= 14 and c.data["live"]["age_minutes"] == 0
-
-
-def test_playbooks_in_sync_orchestrator_needs_the_live_export(tmp_path):
-    ws = make_workspace(tmp_path)
-    (ws / doctor.LIVE_PLAYBOOKS).unlink()
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and "live_playbooks.json" in c.detail
-    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert not [b for b in report["blocking"] if b.startswith("playbooks_in_sync")]
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child")
-    assert c.status == "ok" and c.data["live"] is None
-    assert doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "setup").status == "ok"
-
-
-def test_playbooks_in_sync_stale_live_export_fails(tmp_path):
-    ws = make_workspace(tmp_path)
-    _live(ws, age_minutes=20)
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and "stale export" in c.detail
-    ws2 = make_workspace(tmp_path / "child")
-    _live(ws2, age_minutes=20)
-    assert doctor.check_playbooks_in_sync(ws2, PLUGIN_ROOT, "child").status == "warn"
-
-
-def test_playbooks_in_sync_live_drift_fails(tmp_path):
-    ws = make_workspace(tmp_path)
-    _live(ws, overrides={"!dbx_migrate_pipeline": "# edited live\n"})
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and "!dbx_migrate_pipeline" in c.detail
-    assert c.data["live_stale"] == ["!dbx_migrate_pipeline"]
-
-
-def test_playbooks_in_sync_duplicate_macro_fails(tmp_path):
-    ws = make_workspace(tmp_path)
-    _live(ws, duplicate="!dbx_migrate_etl")
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and "!dbx_migrate_etl" in c.detail
-    assert "playbook-dbx_migrate_etl" in c.detail and "playbook-extra-copy" in c.detail
-    assert sorted(c.data["duplicate"]["!dbx_migrate_etl"]) == [
-        "playbook-dbx_migrate_etl", "playbook-extra-copy"]
-
-
-def test_playbooks_in_sync_live_missing_macro_fails(tmp_path):
-    ws = make_workspace(tmp_path)
-    _live(ws, drop=("!dbx_migrate_oltp",))
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and c.data["live_missing"] == ["!dbx_migrate_oltp"]
-
-
-def test_playbooks_in_sync_malformed_live_export_fails_not_crashes(tmp_path):
-    ws = make_workspace(tmp_path)
-    (ws / doctor.LIVE_PLAYBOOKS).write_text('{"a": 1}')
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and "malformed" in c.detail
-    (ws / doctor.LIVE_PLAYBOOKS).write_text('[{"macro": "!dbx_migrate_etl", "content": 7}]')
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "warn" and "malformed" in c.detail
-
-
-def test_playbooks_in_sync_trailing_newline_is_normalized(tmp_path):
-    ws = make_workspace(tmp_path)
-    _live(ws, overrides={"!dbx_migrate_pipeline": (
-        PLAYBOOKS_DIR / "9-orchestrator.md").read_text().rstrip("\n")})
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "orchestrator")
-    assert c.status == "ok", c.detail
-
-
-def test_playbooks_in_sync_cli_live_playbooks_flag(tmp_path):
-    ws = make_workspace(tmp_path)
-    export = tmp_path / "elsewhere" / "live.json"
-    export.parent.mkdir()
-    export.write_text((ws / doctor.LIVE_PLAYBOOKS).read_text())
-    (ws / doctor.LIVE_PLAYBOOKS).unlink()
-    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws),
-                        "--plugin-root", str(PLUGIN_ROOT), "--no-databricks",
-                        "--live-playbooks", str(export), "--out", "-"],
+def test_cli_has_no_live_playbooks_flag():
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--help"],
                        capture_output=True, text=True, check=False)
-    row = next(l for l in r.stdout.splitlines() if "playbooks_in_sync" in l)
-    assert row.startswith("ok"), r.stdout
-
-
-def test_playbooks_in_sync_explicit_live_path_must_exist(tmp_path):
-    ws = make_workspace(tmp_path)
-    c = doctor.check_playbooks_in_sync(ws, PLUGIN_ROOT, "child", tmp_path / "nowhere.json")
-    assert c.status == "warn" and "nowhere.json" in c.detail
+    assert r.returncode == 0 and "--live-playbooks" not in r.stdout
+    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--live-playbooks", "x"],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 2
 
 
 # ------------------------------------------------------------------ named_secrets_exist (WS2.6)

@@ -6,4 +6,4 @@ Playbook: Register, decide, and implement one migration dependency with evidence
 4. Route source access/load work through `data-reconciliation`; `target-routing` points to `databricks-lakeflow-connect` for connector paths.
 
 ## Pointers
-`references/contract.md` owns D1–D10 taxonomy, stops, `stop_mode`, notifications, branch/merge, and fan-out guards. No dependency authorizes legacy modification or an undeclared target.
+`references/contract.md` owns D1–D10 taxonomy, stops, `stop_mode`, notifications, branch/merge, and fan-out guards. No dependency overrides `AGENTS.md`.

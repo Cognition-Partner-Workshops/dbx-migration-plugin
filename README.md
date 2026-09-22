@@ -1,8 +1,7 @@
 # dbx-migration-factory (Devin plugin)
 
 Private, installable Devin plugin for Databricks migrations. What it is and how a migration runs:
-`OVERVIEW.md`. This file covers installation and the write-scope guard's policy file. Oracle PL/SQL is the
-core dialect skill; other dialects and the Lakebridge wrapper are optional under `skills-extra/`.
+`OVERVIEW.md`. This file covers installation, the optional dialect skills, and the write-scope guard's policy file.
 
 The repo root *is* the plugin:
 
@@ -12,7 +11,7 @@ AGENTS.md                   always-on guardrails
 hooks.json, hooks/          PreToolUse write-scope guard (fail closed, see below)
 skills/                     one directory per skill; install-dbx-factory/playbooks/ carries the playbook chain
 skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills
-skills-extra/               optional dialect skills + Lakebridge wrapper, not loaded by the core plugin (see skills-extra/README.md)
+skills-extra/               a second, optional plugin (dbx-migration-dialects); not loaded by this one
 ```
 
 ## Install (private repo is fine)
@@ -35,7 +34,7 @@ Pin a version instead of tracking the default branch:
 ```json
 {
   "requiredPlugins": [
-    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.3.2" }
+    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.4.0" }
   ]
 }
 ```
@@ -54,6 +53,19 @@ this one in the same change. If the org's managed manifest uses `"forbiddenPlugi
 
 After installing, run the `install-dbx-factory` skill once per org (see `OVERVIEW.md`).
 
+Databricks auth: see `skills/target-routing/SKILL.md`.
+
+## Optional dialect skills
+
+The core plugin ships only `oracle-plsql` as the example dialect. The other dialects live in `skills-extra/`, which
+is a separate plugin (`dbx-migration-dialects`) that the core manifest never loads; install it from
+`https://github.com/Cognition-Partner-Workshops/dbx-migration-plugin/tree/main/skills-extra` when an engagement needs one:
+
+- `teradata-bteq` — Teradata SQL, BTEQ, SPL procedures/macros, TPT/MLOAD/FASTLOAD.
+- `informatica-xml` — Informatica PowerCenter XML exports.
+- `tsql-ssis` — SQL Server T-SQL (with Sybase ASE deltas) and SSIS packages.
+- `lakebridge` — Databricks Labs Lakebridge as an accelerator (never the merge gate).
+
 ## Write-scope guard (`hooks/dbx_guard.py`)
 
 The PreToolUse hook recognises the client a shell command runs and lets only known read shapes
@@ -66,11 +78,11 @@ on the protected branch (`refs/remotes/origin/HEAD`, else `origin/main`/`origin/
 ```json
 {
   "catalogs": ["migration_cat"],
-  "legacy_sources": ["LEGACY_TD_DSN", "tdprod.corp"],
+  "legacy_sources": ["LEGACY_DSN", "legacy-host.example"],
   "guard_mode": "block",
   "target_hosts": ["fixture-host", "LAKEBASE_MIGRATION_DSN"],
   "bundle_targets": ["migration", "dev"],
-  "lakebase_projects": ["loan-servicing-mig"],
+  "lakebase_projects": ["example-mig"],
   "lakebase_branches": ["mig-*"],
   "run_mode": "live",
   "fixture_endpoints": ["AWS_ENDPOINT_URL"],

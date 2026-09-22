@@ -1,6 +1,6 @@
 ---
 name: teradata-bteq
-description: Source-dialect skill for Teradata estates (Teradata SQL, BTEQ scripts, SPL stored procedures and macros, TPT/MLOAD/FASTLOAD control files). Load it when converting Teradata objects to Databricks or reconciling a converted unit (its `canonicalization.json` feeds the harness). Target-side facts live in the official databricks skills behind `target-routing`.
+description: Source-dialect skill for Teradata estates (Teradata SQL, BTEQ scripts, SPL stored procedures and macros, TPT/MLOAD/FASTLOAD control files). Load it when converting Teradata objects to Databricks or reconciling a converted unit (its `canonicalization.json` feeds the harness); target-side facts live behind `target-routing`.
 ---
 
 # Teradata / BTEQ Dialect

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import struct
+import subprocess
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -1445,13 +1446,14 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
 
 
 class DatabricksSourceAdapter(_SqlAdapterBase):
-    """Databricks as the SOURCE (workspace-to-workspace or Hive-to-UC moves)."""
+    """Databricks as the SOURCE, same workspace as the target (Hive-to-UC, catalog-to-catalog,
+    federated catalogs): read as the session identity on DATABRICKS_HOST."""
 
     paramstyle = "pyformat"
     CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 0}
 
-    def __init__(self, dsn_secret: str):
-        super().__init__(_databricks_connect(dsn_secret))
+    def __init__(self, http_path: str | None = None):
+        super().__init__(_databricks_connect(http_path))
 
     def schema_facts(self, table: str) -> SchemaFacts:
         parts = table.replace("`", "").split(".")
@@ -1501,13 +1503,27 @@ def is_untested_source_family(family: str) -> bool:
 
 # ---- Databricks target ------------------------------------------------------------------
 
-def _databricks_connect(secret_name: str):
-    """Secret value: JSON {"server_hostname": ..., "http_path": ..., "access_token": ...}.
-    Convention: DATABRICKS_MIGRATION_SQL (the migration-catalog principal, never prod)."""
+def _databricks_bearer() -> str:
+    """Workspace access token for the session's service principal (env-oidc or oauth-m2m), via the SDK."""
+    import databricks.sdk.core as _sdk_core  # lazy: optional extra (databricks-sdk)
+    if os.environ.get("DATABRICKS_AUTH_TYPE") == "env-oidc" and not os.environ.get("DATABRICKS_OIDC_TOKEN"):
+        audience = os.environ.get("DATABRICKS_DEVIN_AUDIENCE", "databricks")
+        os.environ["DATABRICKS_OIDC_TOKEN"] = subprocess.run(["devin-oidc", "token", "--audience", audience],
+            check=True, capture_output=True, text=True).stdout.strip()
+    headers = _sdk_core.Config().authenticate()
+    return headers["Authorization"].split(" ", 1)[1]
+
+
+def _databricks_connect(http_path: str | None = None):
+    """Session identity only: DATABRICKS_HOST + DATABRICKS_CLIENT_ID with DATABRICKS_CLIENT_SECRET (oauth-m2m)
+    or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from --target-http-path or DATABRICKS_HTTP_PATH."""
     from databricks import sql  # lazy: optional extra (databricks-sql-connector)
-    cfg = json.loads(_secret(secret_name))
-    return sql.connect(server_hostname=cfg["server_hostname"], http_path=cfg["http_path"],
-                       access_token=cfg["access_token"])
+    host = _secret("DATABRICKS_HOST").removeprefix("https://").removeprefix("http://").rstrip("/")
+    http_path = http_path or _secret("DATABRICKS_HTTP_PATH")
+    if os.environ.get("DATABRICKS_CLIENT_SECRET"):
+        return sql.connect(server_hostname=host, http_path=http_path,
+            oauth_client_id=_secret("DATABRICKS_CLIENT_ID"), oauth_client_secret=_secret("DATABRICKS_CLIENT_SECRET"))
+    return sql.connect(server_hostname=host, http_path=http_path, access_token=_databricks_bearer())
 
 
 class DatabricksTargetAdapter:
@@ -1519,11 +1535,11 @@ class DatabricksTargetAdapter:
     # Unity Catalog reads share _uc_schema_facts/_uc_identity_state with the source adapter.
     CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 0}
 
-    def __init__(self, secret_name: str, catalog: str, schema: str):
+    def __init__(self, http_path: str | None, catalog: str, schema: str):
         # names are validated before a session is opened so a bad name never leaks one
         self._catalog, self._schema = catalog, schema
         self._prefix = f"{quote_ident(catalog, '`')}.{quote_ident(schema, '`')}."
-        self._conn = _databricks_connect(secret_name)
+        self._conn = _databricks_connect(http_path)
         self._sql = _SqlAdapterBase(self._conn)
         self._sql.paramstyle = "pyformat"
 

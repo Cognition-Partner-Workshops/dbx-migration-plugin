@@ -83,7 +83,7 @@ def test_write_objects_normalize_index_and_schema_targets():
     "databricks experimental aitools tools query \"SELECT * FROM prod_cat.audit.log WHERE stmt = 'DROP TABLE prod_cat.s.t' OR stmt = 'UPDATE prod_cat.s.t SET a = 1'\"",
     "sqlcmd -S legacy-prod -Q \"SELECT * FROM dbo.audit WHERE action = 'INSERT INTO loans' AND note = 'it''s an UPDATE dbo.loans SET x'\"",
     "sqlcmd -S legacy-prod -Q \"SELECT 1 -- INSERT INTO dbo.loans SELECT 1\"",
-    "dbx-recon run --unit u12 --family teradata --mode live --source-dsn-secret LEGACY_TD_DSN --target-secret DATABRICKS_MIGRATION_SQL --target-catalog mig_cat --allowed-targets-file .migration/allowed_targets.json --target-schema wave1_u12 --out .migration/recon/u12/",
+    "dbx-recon run --unit u12 --family teradata --mode live --source-dsn-secret LEGACY_TD_DSN --target-http-path /sql/1.0/warehouses/x --target-catalog mig_cat --allowed-targets-file .migration/allowed_targets.json --target-schema wave1_u12 --out .migration/recon/u12/",
     "databricks bundle validate -t migration",
     "databricks bundle deploy -t migration",
     "databricks bundle run --target migration nightly_orders",

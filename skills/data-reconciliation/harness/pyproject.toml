@@ -6,10 +6,10 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-databricks = ["databricks-sql-connector>=3.0"]
+databricks = ["databricks-sql-connector>=4.0", "databricks-sdk>=0.30"]
 sqlserver = ["pyodbc>=5.0"]
 lakebase = ["psycopg[binary]>=3.2"]
-all = ["databricks-sql-connector>=3.0", "pyodbc>=5.0", "psycopg[binary]>=3.2"]
+all = ["databricks-sql-connector>=4.0", "databricks-sdk>=0.30", "pyodbc>=5.0", "psycopg[binary]>=3.2"]
 test = ["pytest>=7.0"]
 
 [project.scripts]
