@@ -1,7 +1,7 @@
 Playbook: Independently verify one completed wave and publish its evidence for wave close.
 
 ## Procedure
-1. Use a fresh verifier session with the plan, manifest, child results, tolerances, source-volume declaration, and target allowlist; never grade your own conversion.
+1. Use a fresh verifier session with the plan, manifest, child results, tolerances, source-volume declaration, and target allowlist (verdict authority: `skills/data-reconciliation/SKILL.md`).
 2. Choose LIVE when federation or an approved live path exists; use `--mode snapshot` for a customer export or in-perimeter dual-run when it does not. Record DEGRADED and the D10 reason.
 3. Run Tier 1 row counts, Tier 2 per-column aggregates, and Tier 3 keyed row diffs at the manifest's required depth; check schema, nullability, precision, timezone, collation, and deletes.
 4. Keep all federated queries, partition copies, and legacy extracts under the recorded legacy-query concurrency cap; wide pulls use size tiers, not ad hoc scans.

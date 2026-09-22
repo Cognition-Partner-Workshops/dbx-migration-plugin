@@ -2,7 +2,7 @@
 
 A repeatable way to move a legacy data estate (a SQL warehouse, an ETL tool, a code estate, or an operational database) onto Databricks with Devin sessions working in parallel and a human deciding at five stops. Analytical workloads land in Delta under Unity Catalog and run on Databricks SQL and Lakeflow; operational workloads land in Lakebase (managed Postgres). One estate can span both tracks; they share one plan, one dependency register and one set of stops.
 
-The target is constant, so target knowledge is built once (the official `databricks` plugin, routed by `target-routing`). The source varies, so source specifics live in dialect skills. Nothing merges on trust: every converted unit must reconcile against the legacy system, and the reconciliation is re-run by a session that did not write the code. Independent units migrate many at a time.
+The target is constant, so target knowledge is built once (the official `databricks` plugin, routed by `target-routing`). The source varies, so source specifics live in dialect skills. Nothing merges on trust: the recon verdict rule is `skills/data-reconciliation/SKILL.md`. Independent units migrate many at a time.
 
 ## What the operator does
 
@@ -36,7 +36,7 @@ The questions, defaults, `stop_mode` (soft 60-second default vs hard) and what e
 
 Units at the same lineage depth with no shared-object conflict form a wave; a wave is split into unit batches, one child session each (default width 20, set at STOP C). Shared objects (D2) go first in a `wave: 0`, `width: 1` manifest; a small first wave tunes the dialect skill before full fan-out.
 
-For each wave the orchestrator: writes `.migration/waves/wave-N.json` → runs `factory-doctor` (`doctor.py --wave N`, which signs `wave-N.doctor.json`) → writes the `waves/current.json` pointer → calls `run_workflow` with `skills/migration-fanout/workflow.py`. The script holds no credentials: it checks the signed doctor file, refuses write-target collisions and duplicate launches, launches the children, trips the circuit breaker on 3 same-class failures, runs the independent verifier, and writes `wave-N.result.json` plus the ten-line wave brief. Children develop against fixtures, read the live source once inside the cap, self-grade with `dbx-recon`, cap themselves at 3 full recon re-runs, and report BLOCKED rather than guess. Only the verifier's live, snapshot or transactional PASS is merge-eligible.
+For each wave the orchestrator: writes `.migration/waves/wave-N.json` → runs `factory-doctor` (`doctor.py --wave N`, which signs `wave-N.doctor.json`) → writes the `waves/current.json` pointer → calls `run_workflow` with `skills/migration-fanout/workflow.py`. The script holds no credentials: it checks the signed doctor file, refuses write-target collisions and duplicate launches, launches the children, trips the circuit breaker on 3 same-class failures, runs the independent verifier, and writes `wave-N.result.json` plus the ten-line wave brief. Children develop against fixtures, read the live source once inside the cap, self-grade with `dbx-recon`, cap themselves at 3 full recon re-runs, and report BLOCKED rather than guess. Merge eligibility: `skills/data-reconciliation/SKILL.md`.
 
 ## What the code enforces
 
@@ -45,7 +45,7 @@ For each wave the orchestrator: writes `.migration/waves/wave-N.json` → runs `
 | Write-scope guard | `hooks/dbx_guard.py` (PreToolUse) | blocks writes outside `.migration/allowed_targets.json` — the allowlist in force is the copy committed on the protected branch, so `.migration/` is writable and scope widens only by PR — non-read statements against legacy sources, identity swaps, unreadable commands; policy table in `README.md` |
 | Preflight doctor | `skills/factory-doctor/doctor.py` | CLI and identity, harness self-test, `.migration/` integrity, committed allowlist equal to the wave contract, source principal cannot write, hook nonce probe, playbooks in sync with the org library; signs the wave's doctor file |
 | Fan-out workflow | `skills/migration-fanout/workflow.py` | doctor-file gate, collision check, duplicate-wave refusal, circuit breaker, single writer of wave results |
-| Reconciliation harness | `skills/data-reconciliation/harness` (`dbx-recon`) | tiered parity with agreed tolerances, transactional mode for Lakebase, delete evidence, verdict line names fixture vs live; the merge authority |
+| Reconciliation harness | `skills/data-reconciliation/harness` (`dbx-recon`) | tiered parity with agreed tolerances, transactional mode for Lakebase, delete evidence, verdict line names fixture vs live; holds the verdict authority rule |
 | Prose gates | `skills/test_no_estate_strings.py`, `skills/test_no_duplicated_rules.py` | no engagement-specific names; no `AGENTS.md` rule restated elsewhere |
 
-The always-on rules are `AGENTS.md`. Process rules (stops, D1-D10, notifications, branch and merge) are `references/contract.md`. Tool contracts are each skill's `SKILL.md`. A rule lives in exactly one of those; everything else points.
+The always-on safety rules are `AGENTS.md`. Process rules (stops, D1-D10, notifications, branch and merge, fan-out guards) are `references/contract.md`. Databricks auth is `skills/target-routing/SKILL.md`; the recon verdict authority is `skills/data-reconciliation/SKILL.md`. Tool contracts are each skill's `SKILL.md`. A rule lives in exactly one of those; everything else points.

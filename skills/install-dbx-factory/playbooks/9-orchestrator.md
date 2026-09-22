@@ -16,7 +16,7 @@ Read `references/contract.md` once per session for stops, `stop_mode`, D1–D10,
    - Write `$HOME/.migration/waves/current.json` as `{"manifest": "wave-<N>.json", "hook_probe": "blocked:<nonce>|not-blocked|unknown", "workspace": "/abs/repo", "plugin": "<plugin>"}` (`plugin` is the absolute plugin root) and run `run_workflow(workflow_name="migration-wave-<N>", script_path="<plugin>/skills/migration-fanout/workflow.py")`. Use its result and brief; it enforces declared targets, collision checks, breaker behavior, independent recon, close proof, and acceptance gates. If `auto_merge` is false, follow the brief's manual-merge instructions.
    - **On a halt:** fix the cause, re-run the doctor, delete `wave-<N>.result.json`, record a new STOP C row, name it in `stop_c`, and relaunch. A wave result remains authoritative until this deliberate procedure is completed.
 7. **Coexistence.** After all waves merge, run parallel-run monitoring with its paused job, live window, evidence ledger, and remediation rules.
-8. **Cutover.** Run cutover signoff and present the evidence pack for STOP E; the customer-held principal authorizes execution.
+8. **Cutover.** Run cutover signoff and present the evidence pack for STOP E (authorization: `AGENTS.md`).
 9. **Notifications.** See `references/contract.md`.
 10. **Ledger.** Never hand-edit `05_progress.md`; regenerate it with `python3 <plugin>/skills/migration-fanout/progress.py .migration --refresh-merged` at every wave close and after manual merges; keep dependency and decision ledgers current.
 
