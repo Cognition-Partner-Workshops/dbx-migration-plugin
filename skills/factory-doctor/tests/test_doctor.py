@@ -1438,7 +1438,7 @@ def test_unresolvable_object_and_untestable_families_are_unverified_never_ok(mon
     conn = FakePrivConn(absent=["raw.payments"], writable={"raw.loans": ["INSERT"]})
     c = doctor.check_source_principal(TABLES, "postgres", "LAKEBASE_SRC", connect=lambda dsn: conn)
     assert c.status == "fail" and "raw.loans: INSERT" in c.detail and c.data["unresolved"] == ["raw.payments"]
-    for family in ("teradata", "oracle", "redshift", "snowflake"):
+    for family in ("teradata", "redshift", "snowflake"):
         c = doctor.check_source_principal(TABLES, family, "LEGACY_ODBC", connect=lambda dsn: FakePrivConn())
         assert c.status == "unverified" and family in c.detail and "privilege query" in c.detail
 
@@ -1968,7 +1968,7 @@ def test_recon_family_supported_fails_for_every_family_the_harness_refuses(famil
     assert c.status == "fail"
     assert "Attestation says the principal is read-only; this row says whether we can reconcile the family" in c.detail
     assert f"dbx-recon run --family {family}" in c.detail and "DSN=" not in c.detail
-    assert c.data["live_tested"] == ["databricks", "postgres", "sqlserver"]
+    assert c.data["live_tested"] == ["databricks", "oracle", "postgres", "sqlserver"]
 
 
 def test_recon_family_supported_fails_for_an_unknown_family():
@@ -2018,7 +2018,7 @@ def test_wave_manifest_family_reaches_recon_family_supported(tmp_path):
     manifest.parent.mkdir()
     manifest.write_text(json.dumps({
         "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
-        "source": {"family": "oracle", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
+        "source": {"family": "teradata", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
     }))
     result = subprocess.run(
         [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
@@ -3089,3 +3089,87 @@ def test_allowlist_committed_other_contract_files_resolve_the_same_ref(tmp_path)
     _git(ws, "commit", "-qm", "tolerances committed on a branch")
     c = doctor.check_allowlist_committed(ws)
     assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "untracked"
+
+
+class _OracleCur:
+    """Answers doctor's oracle privilege queries by SQL substring."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._sql = ""
+
+    def execute(self, sql, params=()):
+        self._sql = sql
+        self._params = params
+        return self
+
+    def fetchall(self):
+        s = self._sql
+        if "SESSION_USER" in s:
+            return [(self._conn.session_user,)]
+        if "session_privs" in s:
+            return [(p,) for p in self._conn.session_privs]
+        if "user_tab_privs_recd" in s:
+            return list(self._conn.object_privs)
+        if "user_role_privs" in s:
+            return [(r,) for r in self._conn.roles]
+        if "all_objects" in s:
+            name, owner = self._params
+            return [(1,)] if (owner, name) in self._conn.objects else []
+        return []
+
+
+class _OracleConn:
+    def __init__(self, session_user="OW_RO", session_privs=("CREATE SESSION", "SET CONTAINER",
+                                                           "SELECT ANY TABLE"),
+                 object_privs=(("T", "SELECT"),), roles=("READER",),
+                 objects=(("OW_RO", "T"),)):
+        self.session_user, self.session_privs = session_user, session_privs
+        self.object_privs, self.roles, self.objects = object_privs, roles, objects
+        self.closed = False
+
+    def cursor(self):
+        return _OracleCur(self)
+
+    def close(self):
+        self.closed = True
+
+
+def test_oracle_source_principal_read_only_passes(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn()
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "ok", row.detail
+    assert "oracle" in row.detail and row.data["roles"] == []
+
+
+def test_oracle_source_principal_fails_on_write_system_privilege(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_privs=("CREATE SESSION", "INSERT ANY TABLE"))
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "fail" and "INSERT ANY TABLE" in row.detail
+
+
+def test_oracle_source_principal_fails_on_write_object_grant_and_role(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(object_privs=(("T", "UPDATE"),), roles=("DBA",))
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "fail"
+    assert "t: update" in row.detail and "role DBA" in row.detail
+
+
+def test_oracle_source_principal_unresolvable_table_is_unverified(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(objects=())
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "unverified" and "'t'" in row.detail
+
+
+def test_oracle_dsn_parse():
+    m = doctor._ORACLE_DSN_RE.match("oracle://u:p@host:1521/FREEPDB1")
+    assert m["user"] == "u" and m["dsn"] == "host:1521/FREEPDB1"
+    assert doctor._ORACLE_DSN_RE.match("not-a-dsn") is None
