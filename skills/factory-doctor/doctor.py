@@ -927,10 +927,16 @@ _PRIVILEGE_QUERIES = {
     # _check_oracle_source_principal, not the generic per-table engine (Oracle has no
     # HAS_PERMS-style functions; the facts are session-level).
     "oracle": {
+        # SESSION_PRIVS is every system privilege in force for the session, including the
+        # ones arriving through a role — role-derived system power is covered there.
         "session_privs": "SELECT privilege FROM session_privs",
         "object_privs": "SELECT table_name, privilege FROM user_tab_privs_recd",
+        # Object grants that reach the user through a role are not in USER_TAB_PRIVS_RECD;
+        # ROLE_TAB_PRIVS filtered by the session's effective roles covers them.
+        "session_roles": "SELECT role FROM session_roles",
+        "role_object_privs": "SELECT role, table_name, privilege FROM role_tab_privs",
         "roles": "SELECT granted_role FROM user_role_privs",
-        "exists": "SELECT 1 FROM all_objects WHERE object_name = :1 AND owner = :2 "
+        "exists": "SELECT owner FROM all_objects WHERE object_name = :1 AND owner = :2 "
             "AND object_type IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW') AND ROWNUM = 1",
         "whoami": "SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') FROM dual",
         "read_only": None}}
@@ -1041,13 +1047,22 @@ def _check_oracle_source_principal(tables: list[str], source_secret: str | None,
             for obj, priv in cur.execute(q["object_privs"]).fetchall():
                 if str(priv).upper() not in _ORA_READ_OBJECT_PRIVILEGES:
                     data["writable"].setdefault(str(obj).lower(), []).append(str(priv).lower())
+            effective_roles = {str(r).upper() for (r,) in cur.execute(q["session_roles"]).fetchall()}
+            for role, obj, priv in cur.execute(q["role_object_privs"]).fetchall():
+                if str(role).upper() in effective_roles \
+                        and str(priv).upper() not in _ORA_READ_OBJECT_PRIVILEGES:
+                    data["writable"].setdefault(str(obj).lower(), []).append(
+                        f"{str(priv).lower()} via role {str(role).lower()}")
             data["roles"] = sorted({str(r).upper() for (r,) in cur.execute(q["roles"]).fetchall()}
                                    & _ORA_WRITE_ROLES)
             for t in tables:
                 schema, _, name = t.upper().rpartition(".")
                 owner = schema or session_user
-                if cur.execute(q["exists"], (name, owner)).fetchall() == []:
+                hit = cur.execute(q["exists"], (name, owner)).fetchall()
+                if not hit:
                     data["unresolved"].append(t)
+                elif str(hit[0][0]).upper() == session_user:
+                    data["writable"].setdefault(t.lower(), []).append("owner")
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it

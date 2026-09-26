@@ -5,6 +5,7 @@ the test owns one temporary user dropped CASCADE in teardown."""
 import datetime as dt
 import decimal
 import os
+import secrets
 import uuid
 
 import pytest
@@ -31,7 +32,9 @@ def oracle_schema(monkeypatch):
     name = f"RECON_T_{uuid.uuid4().hex[:8].upper()}"
     admin = _admin_connect()
     cur = admin.cursor()
-    cur.execute(f"CREATE USER {name} IDENTIFIED BY \"{name}Pw_1\"")
+    # quoted alnum password minted per fixture; never printed
+    password = "P" + secrets.token_urlsafe(24).replace("-", "a").replace("_", "b")
+    cur.execute(f"CREATE USER {name} IDENTIFIED BY \"{password}\"")
     for grant in ("CONNECT", "RESOURCE", "UNLIMITED TABLESPACE"):
         cur.execute(f"GRANT {grant} TO {name}")
     cur.execute(f"""CREATE TABLE {name}.parent (id NUMBER(10,0) PRIMARY KEY,
@@ -49,6 +52,7 @@ def oracle_schema(monkeypatch):
                     CONSTRAINT t_dup_chk CHECK (flag > 0))""")
     cur.execute(f"ALTER TABLE {name}.t ADD CONSTRAINT t_disabled_u UNIQUE (disabled_code) DISABLE")
     cur.execute(f"CREATE INDEX lwr_code_ix ON {name}.t (LOWER(code))")
+    cur.execute(f"CREATE UNIQUE INDEX mix_u ON {name}.t (LOWER(code), p_id)")
     cur.execute(f"CREATE INDEX amt_code_ix ON {name}.t (amount, code)")
     cur.execute(f"""INSERT INTO {name}.parent (id, code, region) VALUES (1, 'a', 'eu')""")
     cur.execute(f"""INSERT INTO {name}.t (p_id, code, amount, raw_num, ratio, prob, flag,
@@ -58,7 +62,8 @@ def oracle_schema(monkeypatch):
                             TIMESTAMP '2026-09-15 13:45:30.123456',
                             TIMESTAMP '2026-09-15 13:45:30.123456 +00:00')""")
     admin.commit()
-    monkeypatch.setenv("RECON_ORACLE_USER_DSN", f"{name}/{name}Pw_1@localhost:52521/FREEPDB1")
+    monkeypatch.setenv("RECON_ORACLE_USER_DSN",
+                       f"{name}/{password}@localhost:52521/FREEPDB1")
     yield name
     # DROP USER refuses while the adapter's connection is still open, so kill first.
     for sid, serial in admin.cursor().execute(
@@ -91,6 +96,8 @@ def test_schema_facts_and_classification(oracle_schema):
     assert facts.check_count == 1
     assert ("amount", "code") in facts.indexes
     assert facts.expression_indexes                       # the LOWER(code) FBI is reported
+    # the mixed FBI reassembles whole: expression position + plain column
+    assert facts.expression_unique == {'lower("CODE"), p_id'}  # Oracle stores it quoted
     assert "id" in facts.identity_columns
     assert facts.primary_key  # PK backing index not double-counted in indexes
     assert a.whole_number_columns("t") == {"id", "p_id", "flag"}

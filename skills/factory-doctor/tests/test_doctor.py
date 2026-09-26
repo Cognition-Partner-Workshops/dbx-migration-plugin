@@ -3111,11 +3111,16 @@ class _OracleCur:
             return [(p,) for p in self._conn.session_privs]
         if "user_tab_privs_recd" in s:
             return list(self._conn.object_privs)
+        if "session_roles" in s:
+            return [(r,) for r in self._conn.session_roles]
+        if "role_tab_privs" in s:
+            return list(self._conn.role_privs)
         if "user_role_privs" in s:
             return [(r,) for r in self._conn.roles]
         if "all_objects" in s:
             name, owner = self._params
-            return [(1,)] if (owner, name) in self._conn.objects else []
+            hit = self._conn.objects.get((owner, name))
+            return [(hit,)] if hit else []
         return []
 
 
@@ -3123,9 +3128,13 @@ class _OracleConn:
     def __init__(self, session_user="OW_RO", session_privs=("CREATE SESSION", "SET CONTAINER",
                                                            "SELECT ANY TABLE"),
                  object_privs=(("T", "SELECT"),), roles=("READER",),
-                 objects=(("OW_RO", "T"),)):
+                 session_roles=("READER",), role_privs=(),
+                 objects=None):
         self.session_user, self.session_privs = session_user, session_privs
-        self.object_privs, self.roles, self.objects = object_privs, roles, objects
+        self.object_privs, self.roles = object_privs, roles
+        self.session_roles, self.role_privs = session_roles, role_privs
+        # (schema, table) -> owner; absent = unresolved
+        self.objects = objects if objects is not None else {("OW_RO", "T"): "APP_OWNER"}
         self.closed = False
 
     def cursor(self):
@@ -3163,7 +3172,7 @@ def test_oracle_source_principal_fails_on_write_object_grant_and_role(monkeypatc
 
 def test_oracle_source_principal_unresolvable_table_is_unverified(monkeypatch):
     monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
-    conn = _OracleConn(objects=())
+    conn = _OracleConn(objects={})
     row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
                                         connect=lambda dsn: conn)
     assert row.status == "unverified" and "'t'" in row.detail
@@ -3173,3 +3182,29 @@ def test_oracle_dsn_parse():
     m = doctor._ORACLE_DSN_RE.match("oracle://u:p@host:1521/FREEPDB1")
     assert m["user"] == "u" and m["dsn"] == "host:1521/FREEPDB1"
     assert doctor._ORACLE_DSN_RE.match("not-a-dsn") is None
+
+
+def test_oracle_source_principal_fails_when_session_user_owns_the_table(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(objects={("OW_RO", "T"): "OW_RO"})
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "fail" and "owner" in row.data["writable"]["t"]
+
+
+def test_oracle_source_principal_fails_on_write_via_custom_role(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_roles=("APP_RW",),
+                       role_privs=(("APP_RW", "T", "INSERT"),))
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "fail" and "insert via role app_rw" in row.data["writable"]["t"]
+
+
+def test_oracle_source_principal_ok_with_select_via_role(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_roles=("APP_RO",),
+                       role_privs=(("APP_RO", "T", "SELECT"),))
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "ok", row.detail

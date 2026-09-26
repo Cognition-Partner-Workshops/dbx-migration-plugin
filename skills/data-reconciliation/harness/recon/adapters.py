@@ -408,10 +408,16 @@ class _SqlAdapterBase:
             from .config import ConfigError
             raise ConfigError("recorded SQL ops must be read-only SELECT or WITH queries")
         cur = self._execute(sql)
-        names = [d[0] for d in cur.description or []]
+        names = self._result_names(cur.description or [])
         rows = cur.fetchall()
         self.rows_fetched += len(rows)
         return [dict(zip(names, row)) for row in rows]
+
+    def _result_names(self, description, requested: Sequence[str] | None = None) -> list[str]:
+        """Column names the result dicts carry. Engines that fold unquoted identifiers
+        (Oracle returns them UPPER CASE) override this to map back to the spelling the
+        caller requested, so keyed reads land under the mapping spec's names."""
+        return [d[0] for d in description]
 
     def row_count(self, table: str, where: str | None = None) -> int:
         w = f" WHERE {where}" if where else ""
@@ -522,7 +528,7 @@ class _SqlAdapterBase:
             w = " WHERE " + " AND ".join(clauses) if clauses else ""
             cur = self._execute(f"SELECT {cols} FROM {table}{w} ORDER BY {', '.join(key_cols)}",
                                 self._params(values))
-            names = [d[0] for d in cur.description]
+            names = self._result_names(cur.description, key_cols + columns)
             for row in cur:
                 self.rows_fetched += 1
                 yield dict(zip(names, row))
@@ -1517,44 +1523,6 @@ def _oracle_dsn_parts(secret: str) -> tuple[str, str, str]:
     return m["user"], m["password"], f"{m['host']}:{m['port']}/{m['service']}"
 
 
-class _FoldedCursor:
-    """Cursor wrapper that lowercases result column names: Oracle reports them UPPER CASE and
-    the harness names fields in the mapping spec's (lower) case."""
-
-    def __init__(self, cursor):
-        self._cur = cursor
-
-    def execute(self, sql, params=None):
-        return self._cur.execute(sql, {} if params is None else params)
-
-    @property
-    def description(self):
-        desc = self._cur.description
-        return [(d[0].lower(), *d[1:]) for d in desc] if desc else desc
-
-    def fetchone(self):
-        return self._cur.fetchone()
-
-    def fetchall(self):
-        return self._cur.fetchall()
-
-    def __getattr__(self, name):
-        return getattr(self._cur, name)
-
-
-class _FoldedConnection:
-    """Connection wrapper handing every cursor the folded-description treatment above."""
-
-    def __init__(self, conn):
-        self._conn = conn
-
-    def cursor(self):
-        return _FoldedCursor(self._conn.cursor())
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-
 class OracleSourceAdapter(_SqlAdapterBase):
     """Oracle as the source over thin-mode oracledb (no client install). Rehearsed live
     against the OtterWorks docker fixture (23ai FREE): tiers 1-6 facts and fingerprints,
@@ -1613,8 +1581,16 @@ class OracleSourceAdapter(_SqlAdapterBase):
         conn.outputtypehandler = _out_type_handler
         conn.cursor().execute("ALTER SESSION SET TIME_ZONE = '+00:00'")
         conn.cursor().execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'")
-        super().__init__(_FoldedConnection(conn))
+        super().__init__(conn)
         self._schema: str | None = None
+
+    def _result_names(self, description, requested: Sequence[str] | None = None) -> list[str]:
+        """Oracle reports unquoted result names UPPER CASE whatever the query spelled: remap
+        each to the requested column's spelling on a case-insensitive match so keyed reads
+        work for specs written in either case. Names matching nothing stay as returned."""
+        names = [str(d[0]) for d in description]
+        want = {str(r).lower(): str(r) for r in requested or []}
+        return [want.get(n.lower(), n) for n in names]
 
     def _current_schema(self) -> str:
         """The connected user's default schema, read once (session statement 1)."""
@@ -1638,13 +1614,16 @@ class OracleSourceAdapter(_SqlAdapterBase):
         owner, name = self._owner_name(table)
         rows = self._dict_rows(
             name, "all_tab_columns",
-            "SELECT column_name, data_type, data_length, data_precision, data_scale, nullable "
+            "SELECT column_name, data_type, data_length, char_length, char_used, "
+            "       data_precision, data_scale, nullable "
             "FROM all_tab_columns WHERE owner = :1 AND table_name = :2 ORDER BY column_id",
             self._params([owner, name]))
         return [{"name": col.lower(),
-                 "type": _oracle_type(dtype, precision, scale, length),
+                 "type": _oracle_type(dtype, precision, scale,
+                                      char_length if char_used == "C" else length),
                  "nullable": nullable == "Y"}
-                for col, dtype, length, precision, scale, nullable in rows]
+                for col, dtype, length, char_length, char_used, precision, scale, nullable
+                in rows]
 
     def numeric_columns(self, table: str) -> set[str]:
         owner, name = self._owner_name(table)
@@ -1749,19 +1728,34 @@ class OracleSourceAdapter(_SqlAdapterBase):
             else:
                 facts.indexes.add(tuple(cols))
 
+        # Function-based indexes are reassembled per index from ALL_IND_COLUMNS (which
+        # reports expression positions as SYS_NC…$ virtual columns) merged with
+        # ALL_IND_EXPRESSIONS by position, so a mixed or composite FBI is recorded as its
+        # whole key text ("lower(code), tenant_id") — same shape postgres emits via
+        # pg_get_indexdef — instead of a truncated single-expression fact.
         rows = self._dict_rows(
             name, "all_ind_expressions",
-            "SELECT e.column_expression, i.uniqueness FROM all_ind_expressions e "
+            "SELECT ic.index_name, ic.column_position, ic.column_name, "
+            "       e.column_expression, i.uniqueness "
+            "FROM all_ind_columns ic "
             "JOIN all_indexes i "
-            "  ON e.index_owner = i.owner AND e.index_name = i.index_name "
-            " AND e.table_owner = i.table_owner AND e.table_name = i.table_name "
+            "  ON i.owner = ic.index_owner AND i.index_name = ic.index_name "
+            " AND i.table_owner = ic.table_owner AND i.table_name = ic.table_name "
+            "LEFT JOIN all_ind_expressions e "
+            "  ON e.index_owner = ic.index_owner AND e.index_name = ic.index_name "
+            " AND e.table_owner = ic.table_owner AND e.table_name = ic.table_name "
+            " AND e.column_position = ic.column_position "
             "WHERE i.table_owner = :1 AND i.table_name = :2 "
             "  AND i.index_type LIKE 'FUNCTION-BASED%' AND i.status = 'VALID' "
-            "ORDER BY i.index_name, e.column_position",
+            "ORDER BY ic.index_name, ic.column_position",
             self._params([owner, name]))
-        for expr, uniqueness in rows:
-            text = normalize_sql_text(str(expr))
-            if uniqueness == "UNIQUE":
+        by_fbi: dict[str, dict[str, Any]] = {}
+        for idx, pos, col, expr, uniqueness in rows:
+            parts = by_fbi.setdefault(idx, {"unique": uniqueness == "UNIQUE", "parts": {}})
+            parts["parts"][int(pos)] = str(expr) if expr else str(col)
+        for parts in by_fbi.values():
+            text = normalize_sql_text(", ".join(parts["parts"][p] for p in sorted(parts["parts"])))
+            if parts["unique"]:
                 facts.expression_unique.add(text)
             else:
                 facts.expression_indexes.add(text)

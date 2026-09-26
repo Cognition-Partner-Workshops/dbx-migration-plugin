@@ -43,12 +43,14 @@ class _OracleCatalogConn:
                     return []
                 view, rows = m[1], conn.tables[m[1]]
                 if view == "all_tab_columns":
+                    # stored rows: (name, dtype, data_length, char_length, char_used,
+                    #               precision, scale, nullable)
                     if "data_scale = 0" in sql:
-                        return [(r[0],) for r in rows if r[1] == "NUMBER" and r[4] == 0]
+                        return [(r[0],) for r in rows if r[1] == "NUMBER" and r[6] == 0]
                     if "data_type IN" in sql:
                         return [(r[0],) for r in rows if r[1] in _NUMERIC]
                     if "column_name, nullable" in sql:
-                        return [(r[0], r[5]) for r in rows]
+                        return [(r[0], r[7]) for r in rows]
                 return [tuple(r) for r in rows]
         return Cur()
 
@@ -96,14 +98,14 @@ def test_oracle_dialect_strings():
 def test_numeric_and_whole_number_classification():
     conn = _OracleCatalogConn({
         "all_tab_columns": [
-            # (name, dtype, length, precision, scale, nullable)
-            ("ID", "NUMBER", 22, 38, 0, "N"),          # whole
-            ("CNT", "NUMBER", 22, 10, 0, "N"),         # whole
-            ("AMOUNT", "NUMBER", 22, 12, 2, "Y"),      # numeric, not whole
-            ("RAW_NUM", "NUMBER", 22, None, None, "Y"),  # unscaled: numeric, NOT whole
-            ("RATIO", "FLOAT", 22, 126, None, "Y"),    # numeric, not whole
-            ("PROB", "BINARY_DOUBLE", 8, None, None, "Y"),
-            ("NAME", "VARCHAR2", 100, None, None, "N"),  # neither
+            # (name, dtype, data_length, char_length, char_used, precision, scale, nullable)
+            ("ID", "NUMBER", 22, 0, "B", 38, 0, "N"),          # whole
+            ("CNT", "NUMBER", 22, 0, "B", 10, 0, "N"),         # whole
+            ("AMOUNT", "NUMBER", 22, 0, "B", 12, 2, "Y"),      # numeric, not whole
+            ("RAW_NUM", "NUMBER", 22, 0, "B", None, None, "Y"),  # unscaled: NOT whole
+            ("RATIO", "FLOAT", 22, 0, "B", 126, None, "Y"),    # numeric, not whole
+            ("PROB", "BINARY_DOUBLE", 8, 0, "B", None, None, "Y"),
+            ("NAME", "VARCHAR2", 100, 25, "C", None, None, "N"),  # neither
         ]})
     a = _OracleLike(conn)
     assert a.whole_number_columns("APP.T") == {"id", "cnt"}
@@ -125,14 +127,18 @@ def _schema_facts_conn():
             ("SYS_C001", "C", None, None, None, None, None, None, '"DUP" IS NOT NULL'),
             ("CK_T_DUP", "C", None, None, None, None, None, None, '"DUP" > 0'),
         ],
-        "all_tab_columns": [("ID", "NUMBER", 22, 10, 0, "N"), ("CODE", "VARCHAR2", 30, None,
-                              None, "Y"), ("P_ID", "NUMBER", 22, 10, 0, "Y"),
-                              ("DUP", "NUMBER", 22, 3, 0, "N")],
+        "all_tab_columns": [("ID", "NUMBER", 22, 0, "B", 10, 0, "N"),
+                              ("CODE", "VARCHAR2", 30, 30, "C", None, None, "Y"),
+                              ("P_ID", "NUMBER", 22, 0, "B", 10, 0, "Y"),
+                              ("DUP", "NUMBER", 22, 0, "B", 3, 0, "N")],
         "all_indexes": [
             ("T_CODE_U", "UNIQUE", "CODE"),
             ("T_REGION_IX", "NONUNIQUE", "REGION"),
         ],
-        "all_ind_expressions": [("LOWER(CODE)", "NONUNIQUE")],
+        # one mixed FBI (its FROM is all_ind_columns joined to all_ind_expressions):
+        # position 1 an expression (SYS_NC col), position 2 a plain column
+        "all_ind_columns": [("MIXED_U", 1, "SYS_NC00005$", "LOWER(CODE)", "UNIQUE"),
+                            ("MIXED_U", 2, "TENANT_ID", None, "UNIQUE")],
         "all_triggers": [("TRG_T", "AFTER EACH ROW", "INSERT")],
         "all_tab_privs": [("READER1", "SELECT")],
         "all_tab_identity_cols": [("ID",)],
@@ -153,7 +159,8 @@ def test_schema_facts_from_catalog_rows():
     assert facts.not_null == {"id", "dup"}    # implicit NOT NULL check not double-counted
     assert facts.checks == {'"DUP" > 0'} and facts.check_count == 1
     assert facts.indexes == {("region",)}
-    assert facts.expression_indexes == {'lower(code)'}
+    # the composite FBI is reassembled whole: expression position + plain column
+    assert facts.expression_unique == {'lower(code), tenant_id'}
     assert facts.triggers == {"trg_t": ("after", ("insert",), "row")}
     assert facts.grants == {"reader1": frozenset({"select"})}
     assert facts.grants_effective is False
@@ -174,14 +181,16 @@ def test_identity_state_from_all_sequences():
 
 def test_column_shape_orders_by_column_id():
     conn = _OracleCatalogConn({"all_tab_columns": [
-        ("ID", "NUMBER", 22, 38, 0, "N"),
-        ("NAME", "VARCHAR2", 100, None, None, "Y"),
-        ("DUE", "TIMESTAMP(6) WITH TIME ZONE", 11, None, None, "Y"),
+        ("ID", "NUMBER", 22, 0, "B", 38, 0, "N"),
+        # CHAR_USED='C' uses char_length (chars), not data_length (bytes)
+        ("NAME", "VARCHAR2", 100, 25, "C", None, None, "Y"),
+        ("DUE", "TIMESTAMP(6) WITH TIME ZONE", 11, 0, "B", None, None, "Y"),
     ]})
     a = _OracleLike(conn)
     shape = a.column_shape("APP.T")
     assert [c["name"] for c in shape] == ["id", "name", "due"]
     assert shape[0]["type"] == "number(38,0)" and shape[0]["nullable"] is False
+    assert shape[1]["type"] == "varchar2(25)"
     assert shape[2]["type"] == "timestamptz(6)"  # WITH TIME ZONE normalizes to the tz form
     sql = conn.executed[-1][0]
     assert "ORDER BY column_id" in sql
@@ -189,7 +198,7 @@ def test_column_shape_orders_by_column_id():
 
 def test_bare_table_uses_the_connected_schema_and_names_fold_upper():
     conn = _OracleCatalogConn()
-    conn.tables["all_tab_columns"] = [("ID", "NUMBER", 22, 38, 0, "N")]
+    conn.tables["all_tab_columns"] = [("ID", "NUMBER", 22, 0, "B", 38, 0, "N")]
     a = _OracleLike(conn)
     a.numeric_columns("T")
     sql, params = conn.executed[-1]
@@ -238,3 +247,54 @@ def test_connect_wires_the_typehandler_and_never_logs_the_secret(monkeypatch):
     assert handler(cur, "NAME", object(), 10, None, None) is None
     assert any("TIME_ZONE" in s for s in seen["session_sql"])
     adapter._conn.close = lambda: None  # nothing to clean up on the fake
+
+
+class _IterConn:
+    """Minimal iterable cursor returning UPPER-cased description names, as Oracle does."""
+
+    def __init__(self, rows, names):
+        self.rows, self.names, self.executed = list(rows), names, []
+
+    def cursor(self):
+        conn = self
+
+        class Cur:
+            description = [(n,) for n in conn.names]
+
+            def execute(self, sql, params=None):
+                conn.executed.append((sql, params))
+                return self
+
+            def __iter__(self):
+                return iter(conn.rows)
+
+            def fetchall(self):
+                return conn.rows
+        return Cur()
+
+    def close(self):
+        pass
+
+
+def test_fetch_keyed_remaps_upper_names_to_the_specs_spelling():
+    for spec_cols, want in ((["id", "amount"], {"id", "amount"}),
+                            (["ID", "AMOUNT"], {"ID", "AMOUNT"})):
+        conn = _IterConn([(1, 5.0), (2, 7.0)], names=["ID", "AMOUNT"])
+        a = _OracleLike(conn)
+        rows = list(a.fetch_keyed("APP.T", ["id"], spec_cols))
+        assert rows and all(set(r) == want for r in rows)
+        sql = conn.executed[-1][0]
+        assert "ORDER BY id" in sql
+
+
+def test_result_names_default_hook_is_identity():
+    a = _OracleLike(_IterConn([], []))
+    assert a._result_names([("X",), ("Y",)]) == ["X", "Y"]
+    assert a._result_names([("X",)], ["x"]) == ["x"]
+
+
+def test_run_query_names_use_the_hook_too():
+    conn = _IterConn([(7,)], names=["AMOUNT"])
+    a = _OracleLike(conn)
+    out = a.run_query("SELECT amount FROM APP.T")
+    assert out == [{"AMOUNT": 7}]
