@@ -68,12 +68,12 @@ def test_no_stale_core_paths_to_optional_skills():
     ]
 
 
-def test_required_databricks_plugin_is_pinned():
+def test_required_databricks_plugin_is_unpinned():
     manifest = json.loads((ROOT / ".devin-plugin" / "plugin.json").read_text())
     (dep,) = manifest["requiredPlugins"]
     assert dep["url"] == "https://github.com/databricks/databricks-agent-skills"
     assert dep["path"] == "plugins/databricks/claude"
-    assert len(dep.get("sha", "")) == 40
+    assert "sha" not in dep and "ref" not in dep
 
 
 def test_skills_extra_is_its_own_plugin():
