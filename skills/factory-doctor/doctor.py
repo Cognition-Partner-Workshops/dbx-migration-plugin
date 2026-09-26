@@ -37,8 +37,9 @@ DRIVERS = {
     "databricks": "databricks.sql",
     "sqlserver": "pyodbc",
     "postgres": "psycopg",
+    "oracle": "oracledb",
 }  # the adapters the harness runs
-# The families `dbx-recon run --family` accepts; only sqlserver and postgres have a privilege query.
+# The families `dbx-recon run --family` accepts; sqlserver, postgres and oracle have privilege queries.
 SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", "sqlserver", "teradata")
 TARGET_KINDS = ("databricks", "lakebase")  # the harness's --target-kind values; the type map is keyed by both
 # The committed wave contract: the guard and the harness read the working copy, so a working copy
@@ -738,6 +739,24 @@ def _psycopg_connect(dsn: str):
     return conn
 
 
+_ORACLE_DSN_RE = re.compile(
+    r"^(?:oracle://)?(?P<user>[^:/@\s]+)[:/](?P<password>[^@\s]*)@(?P<dsn>[^:/@\s]+:\d+/\S+)\s*$")
+
+
+def _oracledb_connect(dsn: str):
+    """Thin-mode oracledb connect from `oracle://user:pass@host:port/service` or
+    `user/pass@host:port/service`; the transaction is pinned read-only for the session."""
+    import oracledb
+
+    m = _ORACLE_DSN_RE.match(dsn)
+    if not m:
+        raise ValueError("oracle DSN must be oracle://user:pass@host:port/service or "
+                         "user/pass@host:port/service")
+    conn = oracledb.connect(user=m["user"], password=m["password"], dsn=m["dsn"])
+    conn.cursor().execute("SET TRANSACTION READ ONLY")
+    return conn
+
+
 def _captured_columns(column_list: str) -> list[str]:
     """`[loan_id], [borrower_id]` as sp_cdc_help_change_data_capture reports it -> names."""
     return [c.strip().strip("[]") for c in str(column_list or "").split(",") if c.strip()]
@@ -901,7 +920,26 @@ _PRIVILEGE_QUERIES = {
             "ORDER BY 1",
         "as_role": "SELECT has_table_privilege(%s, %s, 'INSERT,UPDATE,DELETE,TRUNCATE'), "
             "has_schema_privilege(%s, %s, 'CREATE')",
-        "read_only": "SELECT current_setting('transaction_read_only')"}}
+        "read_only": "SELECT current_setting('transaction_read_only')"},
+    # Oracle answers the same question from the session's own privilege dictionaries:
+    # SESSION_PRIVS is every system privilege in force, USER_TAB_PRIVS_RECD the object grants
+    # the connected user received, USER_ROLE_PRIVS its roles. Evaluated by
+    # _check_oracle_source_principal, not the generic per-table engine (Oracle has no
+    # HAS_PERMS-style functions; the facts are session-level).
+    "oracle": {
+        # SESSION_PRIVS is every system privilege in force for the session, including the
+        # ones arriving through a role — role-derived system power is covered there.
+        "session_privs": "SELECT privilege FROM session_privs",
+        "object_privs": "SELECT table_name, privilege FROM user_tab_privs_recd",
+        # Object grants that reach the user through a role are not in USER_TAB_PRIVS_RECD;
+        # ROLE_TAB_PRIVS filtered by the session's effective roles covers them.
+        "session_roles": "SELECT role FROM session_roles",
+        "role_object_privs": "SELECT role, table_name, privilege FROM role_tab_privs",
+        "roles": "SELECT granted_role FROM user_role_privs",
+        "exists": "SELECT owner FROM all_objects WHERE object_name = :1 AND owner = :2 "
+            "AND object_type IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW') AND ROWNUM = 1",
+        "whoami": "SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') FROM dual",
+        "read_only": None}}
 
 
 def _databricks_bearer() -> str:
@@ -939,7 +977,7 @@ def _databricks_sql_connect(_dsn: str):
 
 
 _READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect,
-    "databricks": _databricks_sql_connect}
+    "databricks": _databricks_sql_connect, "oracle": _oracledb_connect}
 _ADVISORY = ("driver-level read-only (SQL Server readonly=True, Postgres default_transaction_read_only) is advisory, "
     "a hint the server may ignore; only the principal's grants stop writes")
 
@@ -966,11 +1004,91 @@ def _indirect_writes(cur, q: dict, family: str, tables: list[str], resolved: lis
     return found
 
 
+# System privileges an Oracle read principal may hold; anything else in SESSION_PRIVS is a
+# write or admin path (CREATE/ALTER/DROP/INSERT/UPDATE/DELETE/EXECUTE/GRANT/UNLIMITED
+# TABLESPACE/DBA all fall outside this set).
+_ORA_READ_PRIVILEGES = frozenset({
+    "CREATE SESSION", "SET CONTAINER", "SELECT ANY TABLE", "READ ANY TABLE",
+    "SELECT ANY DICTIONARY", "SELECT ANY SEQUENCE"})
+# Object grants a read principal may hold on other users' tables.
+_ORA_READ_OBJECT_PRIVILEGES = frozenset({"SELECT", "READ"})
+# Roles that carry write or admin power regardless of what the dictionary rows show.
+_ORA_WRITE_ROLES = frozenset({"DBA", "RESOURCE", "IMP_FULL_DATABASE", "EXP_FULL_DATABASE",
+                              "DELETE_CATALOG_ROLE", "EXECUTE_CATALOG_ROLE"})
+
+
+def _check_oracle_source_principal(tables: list[str], source_secret: str | None, connect=None) -> Check:
+    """SESSION_PRIVS / USER_TAB_PRIVS_RECD / USER_ROLE_PRIVS for the connected principal: a
+    read-only one holds only CREATE SESSION / SET CONTAINER / SELECT-or-READ ANY TABLE-style
+    system privileges, SELECT-or-READ object grants, and no write role."""
+    cid = "source_principal_read_only"
+    if not source_secret:
+        return Check(cid, "fail", f"oracle source with {len(tables)} in-scope table(s); pass "
+            "--source-secret NAME (env var holding the source DSN) so the principal's write "
+            "privileges can be checked")
+    dsn = _env_dsn(cid, source_secret)
+    if isinstance(dsn, Check):
+        return dsn
+    q = _PRIVILEGE_QUERIES["oracle"]
+    data: dict = {"family": "oracle", "tables": tables, "roles": [], "writable": {},
+        "indirect": [], "unresolved": [], "stats": ""}
+    try:
+        conn = (connect or _oracledb_connect)(dsn)
+        try:
+            cur = conn.cursor()
+            session_user = str(cur.execute(q["whoami"]).fetchall()[0][0])
+            # The transaction is pinned SET TRANSACTION READ ONLY at connect, so the check
+            # itself can only read; the flag is reported like the other families.
+            data["stats"] = f"connection opened readonly=True, session_user={session_user}; {_ADVISORY}"
+            held_system = {str(p).upper() for (p,) in cur.execute(q["session_privs"]).fetchall()}
+            bad_system = sorted(held_system - _ORA_READ_PRIVILEGES)
+            if bad_system:
+                data["writable"]["session_privs"] = bad_system
+            for obj, priv in cur.execute(q["object_privs"]).fetchall():
+                if str(priv).upper() not in _ORA_READ_OBJECT_PRIVILEGES:
+                    data["writable"].setdefault(str(obj).lower(), []).append(str(priv).lower())
+            effective_roles = {str(r).upper() for (r,) in cur.execute(q["session_roles"]).fetchall()}
+            for role, obj, priv in cur.execute(q["role_object_privs"]).fetchall():
+                if str(role).upper() in effective_roles \
+                        and str(priv).upper() not in _ORA_READ_OBJECT_PRIVILEGES:
+                    data["writable"].setdefault(str(obj).lower(), []).append(
+                        f"{str(priv).lower()} via role {str(role).lower()}")
+            data["roles"] = sorted({str(r).upper() for (r,) in cur.execute(q["roles"]).fetchall()}
+                                   & _ORA_WRITE_ROLES)
+            for t in tables:
+                schema, _, name = t.upper().rpartition(".")
+                owner = schema or session_user
+                hit = cur.execute(q["exists"], (name, owner)).fetchall()
+                if not hit:
+                    data["unresolved"].append(t)
+                elif str(hit[0][0]).upper() == session_user:
+                    data["writable"].setdefault(t.lower(), []).append("owner")
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it
+        return Check(cid, "fail", f"source query failed: {_redact(str(e))}", data)
+    can_write = [f"role {r}" for r in data["roles"]]
+    can_write += [f"{t}: {', '.join(str(p) for p in ps)}" for t, ps in data["writable"].items()]
+    if can_write:
+        shown = "; ".join(can_write[:6]) + (f"; +{len(can_write) - 6} more in data" if len(can_write) > 6 else "")
+        return Check(cid, "fail", f"oracle: the source principal can write in scope ({shown}); the "
+            f"factory needs a SELECT-only principal, and {_ADVISORY}", data)
+    if data["unresolved"]:
+        return Check(cid, "unverified",
+            f"oracle: privileges could not be evaluated for {data['unresolved']} (object "
+            "not found or not visible to this principal); nothing is proven about them", data)
+    return Check(cid, "ok",
+        f"oracle: no write system privilege, no object grant beyond SELECT/READ, no write role "
+        f"on {len(tables)} in-scope table(s); {data['stats']}", data)
+
+
 def check_source_principal(tables: list[str], family: str, source_secret: str | None, connect=None) -> Check:
     """The principal behind --source-secret must not be able to write any in-scope source object."""
     cid = "source_principal_read_only"
     if family == "databricks":
         return _check_databricks_source_principal(tables)
+    if family == "oracle":
+        return _check_oracle_source_principal(tables, source_secret, connect=connect)
     q = _PRIVILEGE_QUERIES.get(family)
     if q is None:
         return Check(cid, "unverified", f"{family}: no privilege query implemented for this family, so the "

@@ -12,6 +12,7 @@ a literal connection string or token on the CLI.
 from __future__ import annotations
 
 import datetime as dt
+import decimal
 import json
 import os
 import re
@@ -407,10 +408,16 @@ class _SqlAdapterBase:
             from .config import ConfigError
             raise ConfigError("recorded SQL ops must be read-only SELECT or WITH queries")
         cur = self._execute(sql)
-        names = [d[0] for d in cur.description or []]
+        names = self._result_names(cur.description or [])
         rows = cur.fetchall()
         self.rows_fetched += len(rows)
         return [dict(zip(names, row)) for row in rows]
+
+    def _result_names(self, description, requested: Sequence[str] | None = None) -> list[str]:
+        """Column names the result dicts carry. Engines that fold unquoted identifiers
+        (Oracle returns them UPPER CASE) override this to map back to the spelling the
+        caller requested, so keyed reads land under the mapping spec's names."""
+        return [d[0] for d in description]
 
     def row_count(self, table: str, where: str | None = None) -> int:
         w = f" WHERE {where}" if where else ""
@@ -521,7 +528,7 @@ class _SqlAdapterBase:
             w = " WHERE " + " AND ".join(clauses) if clauses else ""
             cur = self._execute(f"SELECT {cols} FROM {table}{w} ORDER BY {', '.join(key_cols)}",
                                 self._params(values))
-            names = [d[0] for d in cur.description]
+            names = self._result_names(cur.description, key_cols + columns)
             for row in cur:
                 self.rows_fetched += 1
                 yield dict(zip(names, row))
@@ -833,10 +840,6 @@ class TeradataSourceAdapter(_UntestedSourceAdapter):
     family = "teradata"
 
 
-class OracleSourceAdapter(_UntestedSourceAdapter):
-    family = "oracle"
-
-
 def _key_text(value: Any) -> str | None:
     """A key component as the text the target engine casts back to the column type; datetimes as
     UTC instants with an explicit offset, matching the watermark literal contract."""
@@ -911,6 +914,18 @@ DICTIONARY_OBJECTS = {
         ("pg_roles", "SELECT 1 FROM pg_roles LIMIT 1"),
         ("pg_read_all_data", "SELECT 1 FROM pg_roles WHERE rolname = 'pg_read_all_data' LIMIT 1"),
         ("pg_write_all_data", "SELECT 1 FROM pg_roles WHERE rolname = 'pg_write_all_data' LIMIT 1"),
+    ),
+    "oracle": (
+        ("all_constraints", "SELECT 1 FROM all_constraints WHERE 1 = 0"),
+        ("all_cons_columns", "SELECT 1 FROM all_cons_columns WHERE 1 = 0"),
+        ("all_tab_columns", "SELECT 1 FROM all_tab_columns WHERE 1 = 0"),
+        ("all_indexes", "SELECT 1 FROM all_indexes WHERE 1 = 0"),
+        ("all_ind_columns", "SELECT 1 FROM all_ind_columns WHERE 1 = 0"),
+        ("all_ind_expressions", "SELECT 1 FROM all_ind_expressions WHERE 1 = 0"),
+        ("all_triggers", "SELECT 1 FROM all_triggers WHERE 1 = 0"),
+        ("all_tab_identity_cols", "SELECT 1 FROM all_tab_identity_cols WHERE 1 = 0"),
+        ("all_sequences", "SELECT 1 FROM all_sequences WHERE 1 = 0"),
+        ("all_tab_privs", "SELECT 1 FROM all_tab_privs WHERE 1 = 0"),
     ),
     "databricks": (
         ("information_schema.table_constraints",
@@ -1484,6 +1499,331 @@ class DatabricksSourceAdapter(_SqlAdapterBase):
                 f"{type(self).__name__} needs a catalog.schema.table name, got {table!r}")
         return _uc_identity_state(
             lambda sql, params: self._rows(sql, params), *parts, column)
+
+
+# ---- Oracle source ------------------------------------------------------------------------
+
+# oracle://user:pass@host:port/service and user/pass@host:port/service; the form some managers
+# emit (host:port:SID or a TNS alias) is refused rather than guessed at.
+_ORACLE_DSN_RE = re.compile(
+    r"^(?:oracle://)?(?P<user>[^:/@\s]+)[:/](?P<password>[^@\s]*)@(?P<host>[^:/@\s]+)"
+    r":(?P<port>\d+)/(?P<service>[^\s/]+)\s*$")
+
+
+def _oracle_dsn_parts(secret: str) -> tuple[str, str, str]:
+    raw = os.environ.get(secret)
+    if not raw:
+        from .config import ConfigError
+        raise ConfigError(f"source secret {secret} is not set in the environment")
+    m = _ORACLE_DSN_RE.match(raw)
+    if not m:
+        from .config import ConfigError
+        raise ConfigError(f"source secret {secret} is not an oracle DSN of the form "
+                          "oracle://user:pass@host:port/service or user/pass@host:port/service")
+    return m["user"], m["password"], f"{m['host']}:{m['port']}/{m['service']}"
+
+
+class OracleSourceAdapter(_SqlAdapterBase):
+    """Oracle as the source over thin-mode oracledb (no client install). Rehearsed live
+    against the OtterWorks docker fixture (23ai FREE): tiers 1-6 facts and fingerprints,
+    DATE kept as datetime, NUMBER fetched as exact Decimal, disabled/unvalidated
+    constraints and function-based indexes honoured. Verified DEGRADED: none from the
+    fixture rehearsal. Legacy Oracle is read-only: the snapshot is `SET TRANSACTION READ
+    ONLY`, ended by COMMIT, and no write path exists on this adapter."""
+
+    family = "oracle"
+    official = True
+    paramstyle = "named"  # oracledb binds :N
+    max_params = 1000  # Oracle's hard IN-list cap
+    snapshot_sql = "SET TRANSACTION READ ONLY"
+    snapshot_reset_sql = "COMMIT"
+    # Oracle has no cheap per-table change counter: SCN is per-transaction and flashback
+    # needs undo_retention the source may not grant, so window proof is the markers alone.
+    change_token_sql = None
+    integer_digest_sql = "CAST({col} AS NUMBER(38,0))"
+    mod_sql = "MOD({x}, {m})"
+    square_digest_sql = "CAST({r} * {r} AS NUMBER(38,0))"
+    # A datetime bound arrives as a naive UTC literal; TO_TIMESTAMP types it so Oracle
+    # compares at microsecond precision instead of DATE's one-second granularity.
+    datetime_bound_sql = "TO_TIMESTAMP({lit}, 'YYYY-MM-DD HH24:MI:SS.FF6')"
+    # Oracle has no portable timestamp-to-number cast: TIMESTAMP difference is an INTERVAL
+    # that needs day/hour/minute/second extraction, so datetime watermarks stream their
+    # ranges instead of summing (never wrong, just slower).
+    datetime_digest_sql = None
+    CATALOG_STATEMENTS = {"schema_facts": 7, "identity_state": 1, "session": 1}
+
+    _NUMERIC_TYPES = ("NUMBER", "FLOAT", "BINARY_FLOAT", "BINARY_DOUBLE")
+    _IMPLICIT_NOT_NULL_RE = re.compile(r'^"[^"]+"\s+IS\s+NOT\s+NULL$', re.IGNORECASE)
+
+    def __init__(self, dsn_secret: str):
+        import oracledb  # lazy: optional extra (oracledb)
+
+        user, password, dsn = _oracle_dsn_parts(dsn_secret)
+        conn = oracledb.connect(user=user, password=password, dsn=dsn)
+
+        def _out_type_handler(cursor, name, default_type, size, precision, scale):
+            # NUMBER/FLOAT carry exact decimal semantics: fetch as Decimal without the
+            # global oracledb.defaults.fetch_decimals flag. BINARY_FLOAT/DOUBLE stay float.
+            if default_type is oracledb.DB_TYPE_NUMBER:
+                return cursor.var(decimal.Decimal, arraysize=cursor.arraysize)
+            # Thin mode returns TIMESTAMP WITH [LOCAL] TIME ZONE as a naive datetime
+            # shifted into the session zone (set to UTC below); pin the zone so the value
+            # is aware and canon compares it as the instant it is.
+            tz_types = [t for t in (getattr(oracledb, "DB_TYPE_TIMESTAMP_TZ", None),
+                                    getattr(oracledb, "DB_TYPE_TIMESTAMP_LTZ", None))
+                        if t is not None]
+            if default_type in tz_types:
+                return cursor.var(default_type, arraysize=cursor.arraysize, outconverter=(
+                    lambda v: v if v is None or v.tzinfo is not None
+                    else v.replace(tzinfo=dt.timezone.utc)))
+            return None
+
+        conn.outputtypehandler = _out_type_handler
+        conn.cursor().execute("ALTER SESSION SET TIME_ZONE = '+00:00'")
+        conn.cursor().execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'")
+        super().__init__(conn)
+        self._schema: str | None = None
+
+    def _result_names(self, description, requested: Sequence[str] | None = None) -> list[str]:
+        """Oracle reports unquoted result names UPPER CASE whatever the query spelled: remap
+        each to the requested column's spelling on a case-insensitive match so keyed reads
+        work for specs written in either case. Names matching nothing stay as returned."""
+        names = [str(d[0]) for d in description]
+        want = {str(r).lower(): str(r) for r in requested or []}
+        return [want.get(n.lower(), n) for n in names]
+
+    def _current_schema(self) -> str:
+        """The connected user's default schema, read once (session statement 1)."""
+        if self._schema is None:
+            self._schema = str(self._rows(
+                "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")[0][0])
+        return self._schema
+
+    def _owner_name(self, table: str) -> tuple[str, str]:
+        """(owner, name) as ALL_* stores them: unquoted identifiers fold to upper case,
+        double-quoted ones keep their case."""
+        schema, name = _split_table(table, self._current_schema())
+        if '"' not in table:
+            schema, name = schema.upper(), name.upper()
+        return schema, name
+
+    # ---- catalog reads ----------------------------------------------------------
+
+    def column_shape(self, table: str) -> list[dict[str, Any]]:
+        """Observed columns in declared order (recon.fixture_shape); one catalog read."""
+        owner, name = self._owner_name(table)
+        rows = self._dict_rows(
+            name, "all_tab_columns",
+            "SELECT column_name, data_type, data_length, char_length, char_used, "
+            "       data_precision, data_scale, nullable "
+            "FROM all_tab_columns WHERE owner = :1 AND table_name = :2 ORDER BY column_id",
+            self._params([owner, name]))
+        return [{"name": col.lower(),
+                 "type": _oracle_type(dtype, precision, scale,
+                                      char_length if char_used == "C" else length),
+                 "nullable": nullable == "Y"}
+                for col, dtype, length, char_length, char_used, precision, scale, nullable
+                in rows]
+
+    def numeric_columns(self, table: str) -> set[str]:
+        owner, name = self._owner_name(table)
+        rows = self._dict_rows(
+            name, "all_tab_columns",
+            "SELECT column_name FROM all_tab_columns WHERE owner = :1 AND table_name = :2 "
+            "AND data_type IN ('NUMBER', 'FLOAT', 'BINARY_FLOAT', 'BINARY_DOUBLE')",
+            self._params([owner, name]))
+        return {col.lower() for (col,) in rows}
+
+    def whole_number_columns(self, table: str) -> set[str]:
+        """NUMBER with scale 0 only: a NUMBER declared with NULL scale is unscaled, not whole."""
+        owner, name = self._owner_name(table)
+        rows = self._dict_rows(
+            name, "all_tab_columns",
+            "SELECT column_name FROM all_tab_columns WHERE owner = :1 AND table_name = :2 "
+            "AND data_type = 'NUMBER' AND data_scale = 0",
+            self._params([owner, name]))
+        return {col.lower() for (col,) in rows}
+
+    def schema_facts(self, table: str) -> SchemaFacts:
+        owner, name = self._owner_name(table)
+        facts = SchemaFacts(table=f"{owner.lower()}.{name.lower()}")
+        constraints = self._dict_rows(
+            name, "all_constraints",
+            "SELECT c.constraint_name, c.constraint_type, cc.column_name, cc.position, "
+            "       r.owner AS r_owner, r.table_name AS r_table, rc.column_name AS r_column, "
+            "       c.delete_rule, c.search_condition_vc "
+            "FROM all_constraints c "
+            "JOIN all_cons_columns cc "
+            "  ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name "
+            " AND cc.table_name = c.table_name "
+            "LEFT JOIN all_constraints r "
+            "  ON r.owner = c.r_owner AND r.constraint_name = c.r_constraint_name "
+            "LEFT JOIN all_cons_columns rc "
+            "  ON rc.owner = r.owner AND rc.constraint_name = r.constraint_name "
+            " AND rc.table_name = r.table_name AND rc.position = cc.position "
+            "WHERE c.owner = :1 AND c.table_name = :2 "
+            "  AND c.constraint_type IN ('P', 'U', 'R', 'C') "
+            "  AND c.status = 'ENABLED' AND c.validated = 'VALIDATED' "
+            "ORDER BY c.constraint_name, cc.position",
+            self._params([owner, name]))
+        # (cname -> ordered member columns) for P/U/R; C carries no positional key.
+        cols_of: dict[str, dict[int, str]] = {}
+        ctype_of: dict[str, str] = {}
+        ref_of: dict[str, tuple[str, dict[int, str], str]] = {}  # R: rtable, rcols, delete_rule
+        for cname, ctype, col, pos, rowner, rtable, rcol, delete_rule, condition in constraints:
+            ctype_of[cname] = ctype
+            if ctype in ("P", "U"):
+                cols_of.setdefault(cname, {})[int(pos)] = col.lower()
+            elif ctype == "R":
+                cols_of.setdefault(cname, {})[int(pos)] = col.lower()
+                target, rcols, _ = ref_of.setdefault(
+                    cname, (f"{rowner}.{rtable}".lower(), {}, delete_rule))
+                if rcol:
+                    rcols[int(pos)] = rcol.lower()
+            elif condition and not self._IMPLICIT_NOT_NULL_RE.match(str(condition).strip()):
+                facts.checks.add(normalize_sql_text(str(condition)))
+        facts.check_count = len(facts.checks)
+        for cname, ctype in ctype_of.items():
+            cols = tuple(cols_of[cname][p] for p in sorted(cols_of.get(cname, {})))
+            if ctype == "P":
+                facts.primary_key = cols
+            elif ctype == "U":
+                # Oracle treats all-NULL unique keys as distinct, so unique_nulls_equal
+                # stays empty (the SQL-standard reading the base contract expects).
+                facts.unique.add(cols)
+            elif ctype == "R":
+                target, rcols, delete_rule = ref_of[cname]
+                fkey = (cols, target, tuple(rcols[p] for p in sorted(rcols)))
+                facts.foreign_keys.add(fkey)
+                # Oracle has no ON UPDATE clause; deletes map through _fk_action.
+                facts.foreign_key_actions[fkey] = ("no action", _fk_action(delete_rule))
+
+        rows = self._dict_rows(
+            name, "all_tab_columns",
+            "SELECT column_name, nullable FROM all_tab_columns "
+            "WHERE owner = :1 AND table_name = :2",
+            self._params([owner, name]))
+        facts.not_null = {col.lower() for col, nullable in rows if nullable == "N"}
+
+        rows = self._dict_rows(
+            name, "all_indexes",
+            "SELECT i.index_name, i.uniqueness, ic.column_name "
+            "FROM all_indexes i "
+            "JOIN all_ind_columns ic "
+            "  ON ic.index_owner = i.owner AND ic.index_name = i.index_name "
+            " AND ic.table_owner = i.table_owner AND ic.table_name = i.table_name "
+            "WHERE i.table_owner = :1 AND i.table_name = :2 AND i.status = 'VALID' "
+            "  AND i.index_type NOT LIKE 'FUNCTION-BASED%' "
+            "  AND NOT EXISTS (SELECT 1 FROM all_constraints c "
+            "                  WHERE c.index_owner = i.owner AND c.index_name = i.index_name "
+            "                  AND c.constraint_type = 'P') "
+            "ORDER BY i.index_name, ic.column_position",
+            self._params([owner, name]))
+        by_index: dict[tuple[str, str], list[str]] = {}
+        for idx, uniqueness, col in rows:
+            by_index.setdefault((idx, uniqueness), []).append(col.lower())
+        for (idx, uniqueness), cols in by_index.items():
+            if uniqueness == "UNIQUE":
+                facts.unique.add(tuple(cols))
+            else:
+                facts.indexes.add(tuple(cols))
+
+        # Function-based indexes are reassembled per index from ALL_IND_COLUMNS (which
+        # reports expression positions as SYS_NC…$ virtual columns) merged with
+        # ALL_IND_EXPRESSIONS by position, so a mixed or composite FBI is recorded as its
+        # whole key text ("lower(code), tenant_id") — same shape postgres emits via
+        # pg_get_indexdef — instead of a truncated single-expression fact.
+        rows = self._dict_rows(
+            name, "all_ind_expressions",
+            "SELECT ic.index_name, ic.column_position, ic.column_name, "
+            "       e.column_expression, i.uniqueness "
+            "FROM all_ind_columns ic "
+            "JOIN all_indexes i "
+            "  ON i.owner = ic.index_owner AND i.index_name = ic.index_name "
+            " AND i.table_owner = ic.table_owner AND i.table_name = ic.table_name "
+            "LEFT JOIN all_ind_expressions e "
+            "  ON e.index_owner = ic.index_owner AND e.index_name = ic.index_name "
+            " AND e.table_owner = ic.table_owner AND e.table_name = ic.table_name "
+            " AND e.column_position = ic.column_position "
+            "WHERE i.table_owner = :1 AND i.table_name = :2 "
+            "  AND i.index_type LIKE 'FUNCTION-BASED%' AND i.status = 'VALID' "
+            "ORDER BY ic.index_name, ic.column_position",
+            self._params([owner, name]))
+        by_fbi: dict[str, dict[str, Any]] = {}
+        for idx, pos, col, expr, uniqueness in rows:
+            parts = by_fbi.setdefault(idx, {"unique": uniqueness == "UNIQUE", "parts": {}})
+            parts["parts"][int(pos)] = str(expr) if expr else str(col)
+        for parts in by_fbi.values():
+            text = normalize_sql_text(", ".join(parts["parts"][p] for p in sorted(parts["parts"])))
+            if parts["unique"]:
+                facts.expression_unique.add(text)
+            else:
+                facts.expression_indexes.add(text)
+
+        rows = self._dict_rows(
+            name, "all_triggers",
+            "SELECT trigger_name, trigger_type, triggering_event FROM all_triggers "
+            "WHERE table_owner = :1 AND table_name = :2 AND status = 'ENABLED'",
+            self._params([owner, name]))
+        for tname, ttype, event in rows:
+            facts.triggers[str(tname).lower()] = _oracle_trigger_shape(str(ttype), str(event))
+
+        rows = self._dict_rows(
+            name, "all_tab_privs",
+            "SELECT grantee, privilege FROM all_tab_privs "
+            "WHERE table_schema = :1 AND table_name = :2 AND grantee <> :1",
+            self._params([owner, name]))
+        for grantee, privilege in rows:
+            key = str(grantee).lower()
+            facts.grants[key] = facts.grants.get(key, frozenset()) | {str(privilege).lower()}
+        # ALL_TAB_PRIVS shows direct grants only; privileges arriving through a role the
+        # grantee holds are invisible here.
+        facts.grants_effective = False
+
+        rows = self._dict_rows(
+            name, "all_tab_identity_cols",
+            "SELECT column_name FROM all_tab_identity_cols "
+            "WHERE owner = :1 AND table_name = :2",
+            self._params([owner, name]))
+        facts.identity_columns = {col.lower() for (col,) in rows}
+        return facts
+
+    def identity_state(self, table: str, column: str) -> IdentityState | None:
+        """LAST_NUMBER is the value the next new session's insert takes (the sequence's
+        persistent position), not the current session's cached next."""
+        owner, name = self._owner_name(table)
+        rows = self._dict_rows(
+            name, "all_tab_identity_cols",
+            "SELECT s.last_number, s.increment_by "
+            "FROM all_tab_identity_cols ic "
+            "JOIN all_sequences s "
+            "  ON s.sequence_owner = ic.owner AND s.sequence_name = ic.sequence_name "
+            "WHERE ic.owner = :1 AND ic.table_name = :2 AND ic.column_name = :3",
+            self._params([owner, name, column.upper() if '"' not in column else column]))
+        if not rows:
+            return None
+        return IdentityState(int(rows[0][0]), int(rows[0][1]))
+
+
+def _oracle_type(dtype: str, precision, scale, length) -> str:
+    """ALL_TAB_COLUMNS typing as the spec's type_map expects (recon.rerun.normalize_type):
+    number(p,s) when declared, timestamp(n)/timestamp(n) with time zone, varchar2(n)."""
+    kind = str(dtype).lower()
+    if kind == "number" and precision is not None:
+        return normalize_type(f"number({int(precision)},{int(scale or 0)})")
+    if kind == "float" and precision is not None:
+        return normalize_type(f"float({int(precision)})")
+    if kind in ("varchar2", "char", "nvarchar2", "nchar") and length is not None:
+        return normalize_type(f"{kind}({int(length)})")
+    return normalize_type(kind)
+
+
+def _oracle_trigger_shape(trigger_type: str, event: str) -> tuple[str, tuple[str, ...], str]:
+    """`AFTER EACH ROW`/`BEFORE STATEMENT`/`INSTEAD OF` -> (timing, events, granularity)."""
+    tt = trigger_type.lower()
+    timing = "instead of" if "instead of" in tt else "before" if "before" in tt else "after"
+    events = tuple(e for e in ("insert", "update", "delete") if e in event.lower())
+    return (timing, events, "row" if "each row" in tt else "statement")
 
 
 SOURCE_ADAPTERS = {
