@@ -34,7 +34,7 @@ Pin a version instead of tracking the default branch:
 ```json
 {
   "requiredPlugins": [
-    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.4.0" }
+    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.4.1" }
   ]
 }
 ```
@@ -45,10 +45,10 @@ Pin a version instead of tracking the default branch:
 devin plugins install Cognition-Partner-Workshops/dbx-migration-plugin
 ```
 
-The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
-`.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
-plugin to, or installation fails with "Conflicting version pins"; when the org bumps its pin, bump
-this one in the same change. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
+The official `databricks` plugin is installed automatically as a dependency. The entry in
+`.devin-plugin/plugin.json` carries no `"sha"`, so the org's own install of that plugin (pinned or
+not) decides the version; two different `"sha"` pins for the same plugin fail installation with
+"Conflicting version pins". If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
 `databricks/databricks-agent-skills` explicitly; transitive dependencies are not exempt.
 
 After installing, run the `install-dbx-factory` skill once per org (see `OVERVIEW.md`).
@@ -129,9 +129,3 @@ under those names.
 object written. `guard_mode: warn` never downgrades an unauthorized legacy write. Decision rows that authorize legacy writes
 are added by a human via PR; the edit tool cannot add them, and the ledger the guard reads is only the committed copy on
 the protected branch (no working-copy fallback), so an unmerged row never authorizes.
-
-The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
-`.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
-plugin to, or installation fails with "Conflicting version pins"; when the org bumps its pin, bump
-this one in the same change. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
-`databricks/databricks-agent-skills` explicitly; transitive dependencies are not exempt.
