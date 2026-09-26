@@ -455,7 +455,7 @@ def test_cli_fixture_shape_writes_the_check_and_exits_non_zero_on_a_gap(tmp_path
 
 def test_cli_fixture_shape_refuses_an_untested_family(tmp_path):
     with pytest.raises(SystemExit, match="untested"):
-        cli.main(["fixture-shape", "--family", "oracle", "--mapping", str(tmp_path / "m.json"),
+        cli.main(["fixture-shape", "--family", "redshift", "--mapping", str(tmp_path / "m.json"),
                   "--source-dsn-secret", "S", "--fixture-dsn-secret", "F",
                   "--source-statement-cap", "10", "--out", str(tmp_path)])
     assert not (tmp_path / "fixture_shape.json").exists()
