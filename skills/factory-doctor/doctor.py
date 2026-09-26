@@ -935,6 +935,9 @@ _PRIVILEGE_QUERIES = {
         # ROLE_TAB_PRIVS filtered by the session's effective roles covers them.
         "session_roles": "SELECT role FROM session_roles",
         "role_object_privs": "SELECT role, table_name, privilege FROM role_tab_privs",
+        # a grant to PUBLIC reaches every user without appearing in USER_TAB_PRIVS_RECD
+        "public_object_privs": "SELECT table_schema || '.' || table_name, privilege "
+            "FROM all_tab_privs WHERE grantee = 'PUBLIC'",
         "roles": "SELECT granted_role FROM user_role_privs",
         "exists": "SELECT owner FROM all_objects WHERE object_name = :1 AND owner = :2 "
             "AND object_type IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW') AND ROWNUM = 1",
@@ -1055,14 +1058,23 @@ def _check_oracle_source_principal(tables: list[str], source_secret: str | None,
                         f"{str(priv).lower()} via role {str(role).lower()}")
             data["roles"] = sorted({str(r).upper() for (r,) in cur.execute(q["roles"]).fetchall()}
                                    & _ORA_WRITE_ROLES)
+            resolved_names = set()
             for t in tables:
                 schema, _, name = t.upper().rpartition(".")
                 owner = schema or session_user
                 hit = cur.execute(q["exists"], (name, owner)).fetchall()
                 if not hit:
                     data["unresolved"].append(t)
-                elif str(hit[0][0]).upper() == session_user:
+                    continue
+                resolved_names.add((str(hit[0][0]), name))
+                if str(hit[0][0]).upper() == session_user:
                     data["writable"].setdefault(t.lower(), []).append("owner")
+            for obj, priv in cur.execute(q["public_object_privs"]).fetchall():
+                owner, _, name = str(obj).upper().rpartition(".")
+                if (owner, name) in resolved_names \
+                        and str(priv).upper() not in _ORA_READ_OBJECT_PRIVILEGES:
+                    data["writable"].setdefault(str(obj).lower(), []).append(
+                        f"{str(priv).lower()} via PUBLIC")
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001 - any driver failure is a finding, never a traceback with a DSN in it

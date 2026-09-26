@@ -279,17 +279,17 @@ class _IterConn:
 def test_fetch_keyed_remaps_upper_names_to_the_specs_spelling():
     for spec_cols, want in ((["id", "amount"], {"id", "amount"}),
                             (["ID", "AMOUNT"], {"ID", "AMOUNT"})):
+        key = spec_cols[0]  # key spelled like the spec -> row keys match it
         conn = _IterConn([(1, 5.0), (2, 7.0)], names=["ID", "AMOUNT"])
         a = _OracleLike(conn)
-        rows = list(a.fetch_keyed("APP.T", ["id"], spec_cols))
+        rows = list(a.fetch_keyed("APP.T", [key], spec_cols))
         assert rows and all(set(r) == want for r in rows)
-        sql = conn.executed[-1][0]
-        assert "ORDER BY id" in sql
+        assert f"ORDER BY {key}" in conn.executed[-1][0]
 
 
 def test_result_names_default_hook_is_identity():
     a = _OracleLike(_IterConn([], []))
-    assert a._result_names([("X",), ("Y",)]) == ["X", "Y"]
+    assert _SqlAdapterBase._result_names(a, [("X",), ("Y",)]) == ["X", "Y"]
     assert a._result_names([("X",)], ["x"]) == ["x"]
 
 
@@ -297,4 +297,29 @@ def test_run_query_names_use_the_hook_too():
     conn = _IterConn([(7,)], names=["AMOUNT"])
     a = _OracleLike(conn)
     out = a.run_query("SELECT amount FROM APP.T")
-    assert out == [{"AMOUNT": 7}]
+    assert out == [{"amount": 7}]  # unquoted names fold lower for target parity
+
+
+def test_first_requested_spelling_wins_on_case_collision():
+    # key "ID" and field "id" name the same column: the deduped projection keeps
+    # the key's spelling, so the row lands under "ID"
+    conn = _IterConn([(1,)], names=["ID"])
+    a = _OracleLike(conn)
+    rows = list(a.fetch_keyed("APP.T", ["ID"], ["id"]))
+    assert rows == [{"ID": 1}]
+
+
+def test_run_query_folds_unquoted_upper_names_to_lower():
+    # tier-4 parity: unquoted Oracle projections come back UPPER while the target
+    # spells them lower; quoted aliases ("Mixed") stay untouched
+    conn = _IterConn([(7, "x")], names=["AMOUNT", "Mixed"])
+    a = _OracleLike(conn)
+    out = a.run_query('SELECT amount, code AS "Mixed" FROM APP.T')
+    assert out == [{"amount": 7, "Mixed": "x"}]
+
+
+def test_schema_facts_fails_when_columns_not_visible():
+    conn = _OracleCatalogConn()  # no all_tab_columns rows for APP.T
+    a = _OracleLike(conn)
+    with pytest.raises(adapters.DictionaryError, match="not visible"):
+        a.schema_facts("APP.T")

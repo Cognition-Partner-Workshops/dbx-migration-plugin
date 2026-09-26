@@ -3115,6 +3115,8 @@ class _OracleCur:
             return [(r,) for r in self._conn.session_roles]
         if "role_tab_privs" in s:
             return list(self._conn.role_privs)
+        if "all_tab_privs" in s:
+            return list(self._conn.public_privs)
         if "user_role_privs" in s:
             return [(r,) for r in self._conn.roles]
         if "all_objects" in s:
@@ -3129,10 +3131,11 @@ class _OracleConn:
                                                            "SELECT ANY TABLE"),
                  object_privs=(("T", "SELECT"),), roles=("READER",),
                  session_roles=("READER",), role_privs=(),
-                 objects=None):
+                 public_privs=(), objects=None):
         self.session_user, self.session_privs = session_user, session_privs
         self.object_privs, self.roles = object_privs, roles
         self.session_roles, self.role_privs = session_roles, role_privs
+        self.public_privs = public_privs
         # (schema, table) -> owner; absent = unresolved
         self.objects = objects if objects is not None else {("OW_RO", "T"): "APP_OWNER"}
         self.closed = False
@@ -3205,6 +3208,22 @@ def test_oracle_source_principal_ok_with_select_via_role(monkeypatch):
     monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
     conn = _OracleConn(session_roles=("APP_RO",),
                        role_privs=(("APP_RO", "T", "SELECT"),))
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "ok", row.detail
+
+
+def test_oracle_source_principal_fails_on_public_write_grant(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(public_privs=(("APP_OWNER.T", "INSERT"),))
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
+                                        connect=lambda dsn: conn)
+    assert row.status == "fail" and "insert via PUBLIC" in row.data["writable"]["app_owner.t"]
+
+
+def test_oracle_source_principal_ok_with_public_select(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(public_privs=(("APP_OWNER.T", "SELECT"),))
     row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
                                         connect=lambda dsn: conn)
     assert row.status == "ok", row.detail

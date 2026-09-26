@@ -528,7 +528,7 @@ class _SqlAdapterBase:
             w = " WHERE " + " AND ".join(clauses) if clauses else ""
             cur = self._execute(f"SELECT {cols} FROM {table}{w} ORDER BY {', '.join(key_cols)}",
                                 self._params(values))
-            names = self._result_names(cur.description, key_cols + columns)
+            names = self._result_names(cur.description, list(dict.fromkeys(key_cols + columns)))
             for row in cur:
                 self.rows_fetched += 1
                 yield dict(zip(names, row))
@@ -1587,9 +1587,16 @@ class OracleSourceAdapter(_SqlAdapterBase):
     def _result_names(self, description, requested: Sequence[str] | None = None) -> list[str]:
         """Oracle reports unquoted result names UPPER CASE whatever the query spelled: remap
         each to the requested column's spelling on a case-insensitive match so keyed reads
-        work for specs written in either case. Names matching nothing stay as returned."""
+        work for specs written in either case. The first requested spelling wins when a key
+        and a field name the same column in different case. With nothing requested
+        (run_query), fold all-upper names to lower like other engines' unquoted output,
+        but leave mixed/lower-case names — those came from quoted aliases — untouched."""
         names = [str(d[0]) for d in description]
-        want = {str(r).lower(): str(r) for r in requested or []}
+        if not requested:
+            return [n.lower() if n.isupper() else n for n in names]
+        want: dict[str, str] = {}
+        for r in requested:
+            want.setdefault(str(r).lower(), str(r))
         return [want.get(n.lower(), n) for n in names]
 
     def _current_schema(self) -> str:
@@ -1647,6 +1654,15 @@ class OracleSourceAdapter(_SqlAdapterBase):
     def schema_facts(self, table: str) -> SchemaFacts:
         owner, name = self._owner_name(table)
         facts = SchemaFacts(table=f"{owner.lower()}.{name.lower()}")
+        # Visibility gate before any fact query: a principal that can execute the
+        # dictionary views but not see this table's rows would otherwise return a
+        # fact set that looks like "no constraints, no columns" — silently wrong.
+        if not self._rows(
+                "SELECT column_name FROM all_tab_columns WHERE owner = :1 AND table_name = :2 "
+                "AND ROWNUM = 1", self._params([owner, name])):
+            raise DictionaryError(
+                f"{table}: table metadata not visible to this principal "
+                f"(all_tab_columns has no rows for {owner}.{name})")
         constraints = self._dict_rows(
             name, "all_constraints",
             "SELECT c.constraint_name, c.constraint_type, cc.column_name, cc.position, "
