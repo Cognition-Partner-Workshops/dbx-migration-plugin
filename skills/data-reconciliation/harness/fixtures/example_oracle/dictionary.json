@@ -1,6 +1,6 @@
 {
   "family": "oracle",
-  "note": "Format fixture only: the harness has no live Oracle adapter, so this dictionary exists to show the shape (Oracle names, sequence-fed identity via identity_columns); its live reader stays untested.",
+  "note": "Format fixture: the Oracle names, sequence-fed identity via identity_columns and catalog shape a live OracleSourceAdapter read returns.",
   "unsupported": [],
   "tables": {
     "APP.LOANS": {

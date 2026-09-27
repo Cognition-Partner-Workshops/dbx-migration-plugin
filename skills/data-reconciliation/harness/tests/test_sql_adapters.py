@@ -28,11 +28,11 @@ from tests.loans import (
     _StubConn,
 )
 
-UNTESTED_FAMILIES = ("redshift", "snowflake", "teradata", "oracle")
+UNTESTED_FAMILIES = ("redshift", "snowflake", "teradata")
 
 
 _CATALOG_OBJECT_RE = re.compile(
-    r"\b(sys\.[a-z_]+|pg_[a-z_]+|information_schema\.[a-z_]+)\b(?!\()")
+    r"\b(sys\.[a-z_]+|pg_[a-z_]+|information_schema\.[a-z_]+|all_[a-z_]+)\b(?!\()")
 
 
 _STRUCTURAL_READERS = {"schema_facts", "identity_state", "_uc_schema_facts",
@@ -74,7 +74,8 @@ def test_cli_dictionary_objects_subcommand(capsys):
 
 def test_every_cli_family_is_either_live_tested_or_refused():
     assert set(SOURCE_FAMILIES) == set(SOURCE_ADAPTERS)
-    assert set(SOURCE_FAMILIES) - set(UNTESTED_FAMILIES) == {"sqlserver", "postgres", "databricks"}
+    assert set(SOURCE_FAMILIES) - set(UNTESTED_FAMILIES) == {"sqlserver", "postgres",
+                                                             "databricks", "oracle"}
 
 
 @pytest.mark.parametrize("family", UNTESTED_FAMILIES)
@@ -99,7 +100,7 @@ def test_families_reports_the_registry(capsys):
     assert cli.main(["families"]) == 0
     reg = json.loads(capsys.readouterr().out)
     assert set(reg["untested"]) == set(UNTESTED_FAMILIES)
-    assert set(reg["live_tested"]) == {"sqlserver", "postgres", "databricks"}
+    assert set(reg["live_tested"]) == {"sqlserver", "postgres", "databricks", "oracle"}
     assert all(f in SOURCE_ADAPTERS for f in reg["live_tested"] + reg["untested"])
 
 def test_type_map_audit_reports_findings_as_json(tmp_path, capsys):
