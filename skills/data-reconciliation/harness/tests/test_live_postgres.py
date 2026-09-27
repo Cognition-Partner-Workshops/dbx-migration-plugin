@@ -80,6 +80,38 @@ def test_partial_and_invalid_indexes_never_count_as_parity(schema, monkeypatch):
     assert child.foreign_key_actions == {fk: ("no action", "set null")}  # RESTRICT folds in
 
 
+def test_grants_inherited_through_a_platform_role_are_not_the_units(schema, monkeypatch):
+    """Lakebase gives every workspace admin pg_write_all_data through databricks_superuser; that
+    is the platform's grant, not one the unit made, so it must not surface as a grant_extra.
+    A membership path that does not pass through a platform role still inherits."""
+    tag = schema[-8:]
+    platform, admin, app, reader, team = (f"databricks_{tag}", f"admin_{tag}", f"app_{tag}",
+                                          f"reader_{tag}", f"team_{tag}")
+    conn = psycopg.connect(os.environ[DSN_VAR], autocommit=True)
+    try:
+        conn.execute(f"CREATE ROLE {platform} NOLOGIN")
+        conn.execute(f"GRANT pg_write_all_data TO {platform}")
+        conn.execute(f"CREATE ROLE {admin} NOLOGIN")
+        conn.execute(f"GRANT {platform} TO {admin}")
+        conn.execute(f"CREATE ROLE {app} NOLOGIN")
+        conn.execute(f"GRANT SELECT, INSERT ON {schema}.t TO {app}")
+        conn.execute(f"CREATE ROLE {team} NOLOGIN")
+        conn.execute(f"CREATE ROLE {reader} NOLOGIN")
+        conn.execute(f"GRANT SELECT ON {schema}.t TO {team}")
+        conn.execute(f"GRANT {team} TO {reader}")
+        monkeypatch.setenv("RECON_TEST_TARGET", os.environ[DSN_VAR])
+        target = LakebaseTargetAdapter("RECON_TEST_TARGET", _database(), schema)
+        grants = target.schema_facts("t").grants
+        assert grants[app] == {"select", "insert"}
+        assert grants[reader] == {"select"}                  # plain role chain still inherits
+        assert platform not in grants and admin not in grants
+    finally:
+        for role in (reader, team, app, admin, platform):
+            conn.execute(f"DROP OWNED BY {role}")
+            conn.execute(f"DROP ROLE {role}")
+        conn.close()
+
+
 def test_range_fingerprints_bind_through_psycopg(schema, monkeypatch):
     # the modular square must render as MOD(), not `%`, or psycopg reads it as a placeholder
     monkeypatch.setenv("RECON_TEST_TARGET", os.environ[DSN_VAR])

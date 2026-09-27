@@ -2150,14 +2150,18 @@ class _PostgresBase(_SqlAdapterBase):
         # PG16 grants inherit per-membership (pg_auth_members.inherit_option); older
         # versions only have the member role's rolinherit flag.
         inherit = "am.inherit_option" if self._server_version() >= 160000 else "u.rolinherit"
+        # m.platform: the membership path runs through a superuser or Lakebase platform role
+        # (databricks_*), so what the member inherits along it is the platform's grant
+        # (workspace admin -> databricks_superuser -> pg_write_all_data), not the unit's
         rows = self._dict_rows(
             table, "information_schema.table_privileges",
-            ("WITH RECURSIVE m(role, member) AS ("
-            "  SELECT r.rolname, u.rolname FROM pg_auth_members am "
+            ("WITH RECURSIVE m(role, member, platform) AS ("
+            "  SELECT r.rolname, u.rolname, false FROM pg_auth_members am "
             "  JOIN pg_roles r ON r.oid = am.roleid JOIN pg_roles u ON u.oid = am.member "
             "  WHERE {inherit} "
             "  UNION "
-            "  SELECT m.role, u.rolname FROM m "
+            "  SELECT m.role, u.rolname, m.platform OR r.rolsuper OR r.rolname LIKE 'databricks\\_%%' "
+            "  FROM m "
             "  JOIN pg_roles r ON r.rolname = m.member "
             "  JOIN pg_auth_members am ON am.roleid = r.oid JOIN pg_roles u ON u.oid = am.member "
             "  WHERE {inherit}), "
@@ -2169,11 +2173,11 @@ class _PostgresBase(_SqlAdapterBase):
             "  WHERE tp.table_schema = %s AND tp.table_name = %s), "
             "eff(grantee, priv) AS ("
             "  SELECT grantee, priv FROM direct "
-            "  UNION SELECT m.member, d.priv FROM direct d JOIN m ON m.role = d.grantee "
+            "  UNION SELECT m.member, d.priv FROM direct d JOIN m ON m.role = d.grantee AND NOT m.platform "
             "  UNION SELECT m.member, v.priv FROM m "
             "  JOIN (VALUES ('pg_read_all_data', 'SELECT'), ('pg_write_all_data', 'INSERT'), "
             "               ('pg_write_all_data', 'UPDATE'), ('pg_write_all_data', 'DELETE')) v(role, priv) "
-            "    ON v.role = m.role) "
+            "    ON v.role = m.role WHERE NOT m.platform) "
             "SELECT e.grantee, e.priv FROM eff e, rel "
             "WHERE e.grantee <> rel.owner "
             "  AND e.grantee NOT IN (SELECT member FROM m WHERE role = rel.owner) "
