@@ -2150,13 +2150,15 @@ class _PostgresBase(_SqlAdapterBase):
         # PG16 grants inherit per-membership (pg_auth_members.inherit_option); older
         # versions only have the member role's rolinherit flag.
         inherit = "am.inherit_option" if self._server_version() >= 160000 else "u.rolinherit"
-        # m.platform: the membership path runs through a superuser or Lakebase platform role
-        # (databricks_*), so what the member inherits along it is the platform's grant
-        # (workspace admin -> databricks_superuser -> pg_write_all_data), not the unit's
+        # m.platform: the membership path starts at or runs through a superuser or Lakebase
+        # platform role (databricks_*), so what the member inherits along it is the platform's
+        # grant (workspace admin -> databricks_superuser, which the event trigger grants on
+        # every table and which holds pg_write_all_data), not the unit's
         rows = self._dict_rows(
             table, "information_schema.table_privileges",
             ("WITH RECURSIVE m(role, member, platform) AS ("
-            "  SELECT r.rolname, u.rolname, false FROM pg_auth_members am "
+            "  SELECT r.rolname, u.rolname, r.rolsuper OR r.rolname LIKE 'databricks\\_%%' "
+            "  FROM pg_auth_members am "
             "  JOIN pg_roles r ON r.oid = am.roleid JOIN pg_roles u ON u.oid = am.member "
             "  WHERE {inherit} "
             "  UNION "
