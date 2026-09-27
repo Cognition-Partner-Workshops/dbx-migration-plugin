@@ -91,6 +91,9 @@ def test_grants_inherited_through_a_platform_role_are_not_the_units(schema, monk
     try:
         conn.execute(f"CREATE ROLE {platform} NOLOGIN")
         conn.execute(f"GRANT pg_write_all_data TO {platform}")
+        # the Lakebase event trigger on_create_table_or_view also grants the platform role
+        # directly on every new table; a member one hop below it inherits that, not the unit's
+        conn.execute(f"GRANT ALL ON {schema}.t TO {platform}")
         conn.execute(f"CREATE ROLE {admin} NOLOGIN")
         conn.execute(f"GRANT {platform} TO {admin}")
         conn.execute(f"CREATE ROLE {app} NOLOGIN")
