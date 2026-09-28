@@ -175,7 +175,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
                           routine_parity=routine_parity, routine_writers=routine_writers,
                           routine_analysis_missing=routine_analysis_missing,
                           routine_dependencies=routine_dependencies,
-                          rerun_proof=rerun_proof)
+                          rerun_proof=rerun_proof, rerun_posture=spec.rerun_posture)
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result

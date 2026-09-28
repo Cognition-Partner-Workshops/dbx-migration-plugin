@@ -28,8 +28,27 @@ cards and the one-line relaunch update from the shell).
    `python3 <plugin>/skills/migration-fanout/progress.py .migration`.
 
 A result file means the wave will not relaunch. To rerun deliberately, delete the result,
-obtain a new STOP C ledger row, put that row in the manifest's `stop_c`, refresh the doctor,
-and run the workflow again.
+refresh the doctor, and run the workflow again. The STOP C row is reused for a plumbing
+relaunch: same `gates_sha`, and no earlier run under that row got a batch past its own checks
+(`wave-<N>.runs.jsonl` records what each run passed and merged). A run that produced a merge
+candidate, or a changed gate list, needs a new STOP C row named in the manifest's `stop_c`.
+
+Ledger rows the workflow reads (`merge_override`, `waive`) may carry one machine cell,
+`{"kind": "merge_override", "units": ["u1", "u2"], "blocker_classes": ["rerun_policy"]}` or
+`{"kind": "waive", "gate": "g-export", "units": ["u1"]}`; when a row has one, that cell is the
+decision and the prose beside it is not parsed. `blocker_classes` scopes an override to the
+harness blocker classes it forgives; a unit with any other class stays blocked. A row without
+`blocker_classes` forgives every policy class (`rerun_policy`, `privilege_visibility`,
+`structural`, `evidence`) and never `data`: rows that differ are fixed in converted code, and
+only a row naming `data` says otherwise. A unit whose result.json records no blocker classes
+fits no override. Prose-only
+rows still work by naming the word, the gate, and every unit as whole tokens. A row with a
+malformed machine cell halts preflight. An override row written below this run's STOP C row
+applies whether or not the child reported it.
+
+A child reports gate evidence as the bare path under `.migration/recon/<unit>/`, or as
+`{"path": ..., "label": ..., "verdict": ..., "rows": ...}` to annotate it; a path with a note
+appended fails the gate with a message that says so.
 
 ## Smoke check
 
@@ -50,7 +69,8 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Manifest check | Validates shape, source names, batches, units, width, and migration contract. |
 | Signed doctor gate | Requires an HMAC-bound doctor record with 15-minute freshness, hook probe, and matching capabilities. |
 | STOP C gates_sha approval | Requires the ledger row named by `stop_c` to approve the exact gate hash. |
-| One approval one run | Locks `wave-N.runs.jsonl` and refuses a spent STOP C row. |
+| One approval one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts); reuses the STOP C row only for a plumbing relaunch (same `gates_sha` and `plan_sha`: only briefs, repo, secret names or estimates changed; nothing passed or merged under it). |
+| Repo and ledger preflight | Halts before STOP C is spent when `repo` is not `host/owner/name`, origin points elsewhere, or a ledger machine cell is malformed. |
 | Duplicate wave | Refuses any existing result, including halted or unreadable files. |
 | Manifest name / pipelines barrier | Checks tags and waits for declared sibling manifests on origin. |
 | Collision check | Rejects overlapping declared targets within and across waves. |

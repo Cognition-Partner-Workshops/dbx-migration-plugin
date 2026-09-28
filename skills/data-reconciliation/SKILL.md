@@ -20,6 +20,13 @@ This section is the only home for the merge-authority rule; other files point he
 - Only a `live`, `snapshot`, or `transactional` PASS is merge-eligible. The verdict line names the
   mode; a `fixture` PASS is development evidence, a `structural` run is never merge-eligible, and
   `merge_eligible` in `result.json` is what the workflow reads.
+- `result.json` separates what a reader acts on: `parity` (`PASS|FAIL|NOT_RUN`, the row and routine
+  tiers only), `merge_policy` (`eligible|blocked`), and `blockers`, each `merge_block_reasons` entry
+  with its class: `data` (rows or routine behaviour differ), `structural` (the catalogs differ),
+  `privilege_visibility` (the principal could not read a dictionary; nothing is known to differ),
+  `rerun_policy`, `evidence` (mode, snapshot manifest, unlisted routines, ungraded embeds, provenance).
+  The report's headline is `parity PASS, merge blocked (rerun_policy)`, never a bare FAIL when the
+  rows matched; `verdict` stays every tier's pass/fail for the workflow.
 - The only exception is a human override row in `.migration/06_decisions.md` naming exactly the
   affected units.
 
@@ -122,7 +129,12 @@ provenance warning and the run is not merge-eligible.
   or `unsupported`, and `stats.structural_diff` the per-object detail; an unsupported category
   is unchecked, not
   clean. `result.json`'s `merge_block_reasons` puts `structural_gap` first when a structural
-  tier has findings or unverifiable objects. `--source-dictionary`/`--target-dictionary`
+  tier has findings or unverifiable objects; its class is `privilege_visibility` when there are no
+  findings and every hole is a permission refusal (`DictionaryError.kind == "privilege"`, or a
+  reader that marked grants `privilege_denied`), `structural` otherwise. No harness flag lifts a
+  visibility gap: the caller cannot declare a category unreadable, so a refused read always
+  blocks with that class and is accepted, if at all, by a human `merge_override` scoped to
+  `privilege_visibility` in the decision ledger. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
 - Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --source <job file>... --prior-proof
@@ -143,9 +155,20 @@ provenance warning and the run is not merge-eligible.
   not record become notes, never findings. `run --rerun-proof <file> --rerun-source <job file>...` copies
   it into `result.json` after checking its `source_digest` against the job's files as committed now (any
   edit to the DDL, notebook or SQL makes the proof stale and refused); a
-  failed leg adds `rerun_gap` to `merge_block_reasons`, an unsupported evolved leg adds
-  `rerun_unsupported`, a `run` without `--rerun-proof` adds `rerun_missing` (every migrated unit
-  writes its tables, so no proof is a missing control), and any of them sets `merge_eligible=false`.
+  failed leg adds `rerun_gap` to `merge_block_reasons`; what else blocks depends on the unit's
+  `rerun_posture`, declared at the top level of its committed mapping spec (default `required`, recorded
+  as `rerun_posture` in `result.json`; never a run flag, so the run being graded cannot pick its gate and
+  the verifier sees the posture in the reviewed spec):
+  `required` (a job that runs again against an existing target: pipelines, scheduled loads) also
+  blocks on an unsupported evolved leg (`rerun_unsupported`) and on no proof at all
+  (`rerun_missing`); `first_run_baseline` (the unit's first migration) needs the fresh leg, which
+  records the baseline shape, and accepts exactly one unsupported evolved leg: the one that ran
+  against the fresh shape when no other prior shape was declared (`unsupported_kind: nothing_evolved`,
+  with the evolved leg's own evidence: a proof that names the kind but ran no second leg is fresh-only);
+  a leg that did not run, recorded no pre_shape, started from an undeclared shape, or started from the
+  fresh shape when `--prior-shape` declared a different one still blocks; and
+  `not_applicable` (one-shot DDL, routine packages, gold aggregates) needs no proof. No posture ever
+  lifts a failed leg or any non-rerun blocker.
 - Fixture shape (wave 0): `dbx-recon fixture-shape --family <f> --mapping <spec>
   --source-dsn-secret <NAME> --fixture-dsn-secret <NAME> --source-statement-cap <n> --out <dir>`
   compares the fixture copy with the real source per mapped table: column names, types (after
