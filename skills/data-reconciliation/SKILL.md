@@ -67,7 +67,7 @@ The depth is recorded in `result.json` and the summary.
 | `sqlserver` (pyodbc, `[sqlserver]` extra) | live-tested: SQL Server 2022 -> Lakebase rehearsal |
 | `postgres` (psycopg, `[lakebase]` extra) | live-tested: Postgres source and Lakebase target |
 | `databricks` (`[databricks]` extra) | live-tested: Delta target and Databricks-to-Databricks source. Same workspace only: the source is read as the session identity on `DATABRICKS_HOST` through `--target-http-path` (Hive-to-UC, catalog-to-catalog, federated catalogs); a source in another workspace is out of scope. |
-| `oracle` (oracledb, `[oracle]` extra) | live-tested: thin-mode rehearsal against the OtterWorks billing fixture (Oracle 23ai FREE): tiers 1–6 structural facts and fingerprints, `DATE` kept as time-of-day datetime, `NUMBER` fetched as exact `Decimal`, disabled/unvalidated constraints and function-based indexes honoured. DSN secret forms: `oracle://user:pass@host:port/service` or `user/pass@host:port/service`. |
+| `oracle` (oracledb, `[oracle]` extra) | live-tested: thin-mode rehearsal against an Oracle 23ai FREE docker fixture: tiers 1–6 structural facts and fingerprints, `DATE` kept as time-of-day datetime, `NUMBER` fetched as exact `Decimal`, disabled/unvalidated constraints and function-based indexes honoured. DSN secret forms: `oracle://user:pass@host:port/service` or `user/pass@host:port/service`. |
 | `redshift`, `snowflake`, `teradata` | **untested**: the adapter raises `NotImplementedError("<family> source adapter is untested; see SKILL.md")` before any connection. Reconcile these through Lakehouse Federation (`--family databricks`) or land an adapter with a rehearsal first. |
 
 ```bash

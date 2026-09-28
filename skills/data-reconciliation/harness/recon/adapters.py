@@ -1557,7 +1557,7 @@ def _oracle_dsn_parts(secret: str) -> tuple[str, str, str]:
 
 class OracleSourceAdapter(_SqlAdapterBase):
     """Oracle as the source over thin-mode oracledb (no client install). Rehearsed live
-    against the OtterWorks docker fixture (23ai FREE): tiers 1-6 facts and fingerprints,
+    against an Oracle 23ai FREE docker fixture: tiers 1-6 facts and fingerprints,
     DATE kept as datetime, NUMBER fetched as exact Decimal, disabled/unvalidated
     constraints and function-based indexes honoured. Verified DEGRADED: none from the
     fixture rehearsal. Legacy Oracle is read-only: the snapshot is `SET TRANSACTION READ

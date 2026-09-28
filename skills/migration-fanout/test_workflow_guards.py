@@ -36,7 +36,7 @@ def _functions():
                                       "batch_verdicts", "structured_decision", "human_decision", "override_decision", "ledger_rows",
                                       "check_repo_origin", "check_ledger"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD",
+                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
                                                          "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED", "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE",
@@ -1527,6 +1527,17 @@ def test_validate_manifest_allows_serial_wave_zero_only():
     validate_manifest(_manifest(wave=0, width=1))
     with pytest.raises(SystemExit, match="wave 0 is the serial shared-objects wave"):
         validate_manifest(_manifest(wave=0, width=2))
+
+
+def test_validate_manifest_caps_the_brief_so_estate_config_stays_in_the_manifest():
+    validate_manifest = _functions()["validate_manifest"]
+    short = _manifest()
+    short["batches"][0]["brief"] = "Units: u\nTargets: t\n" + "x" * 3900
+    validate_manifest(short)
+    long = _manifest()
+    long["batches"][0]["brief"] = "host=adb-123.azuredatabricks.net " * 400
+    with pytest.raises(SystemExit, match=r"batch b brief is 13200 chars; the cap is 4000"):
+        validate_manifest(long)
 
 
 def test_validate_manifest_requires_feature_branch_or_recorded_trunk_decision():
