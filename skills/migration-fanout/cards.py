@@ -79,16 +79,30 @@ def halt_card(wave, stop_c: str, what: str, paused: str, unblocks: str, relaunch
     ])
 
 
-def _links(urls) -> str:
+def _links(urls, limit: int = MAX_LINKS) -> str:
     urls = [u for u in urls if isinstance(u, str) and u]
-    shown = urls[:MAX_LINKS]
+    shown = urls[:limit]
     more = len(urls) - len(shown)
-    return " ".join(shown) + (f" +{more} more" if more > 0 else "") if shown else "none"
+    if not shown:
+        return f"{len(urls)} in the result" if urls else "none"
+    return " ".join(shown) + (f" +{more} more" if more > 0 else "")
 
 
-def _tally(items) -> str:
-    counts = Counter(items)
-    return ", ".join(f"{k} x{n}" for k, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+def _ids(ids, limit: int) -> str:
+    """`b-1, b-2, b-3 +17 more`: a card names a few and the result names them all."""
+    ids = [i for i in ids if isinstance(i, str)]
+    if not ids:
+        return ""
+    shown = ids[:limit]
+    more = len(ids) - len(shown)
+    return (", ".join(shown) + (f" +{more} more" if more else "")) if shown else f"{len(ids)} batches"
+
+
+def _tally(items, limit: int | None = None) -> str:
+    counts = sorted(Counter(items).items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = counts if limit is None else counts[:limit]
+    more = len(counts) - len(shown)
+    return ", ".join(f"{k} x{n}" for k, n in shown) + (f" +{more} more classes" if more else "")
 
 
 def wave_card(result: dict) -> str:
@@ -116,7 +130,7 @@ def wave_card(result: dict) -> str:
     unclassed = [b for b in blocked if not isinstance(b.get("blocker_classes"), list)]
     parts = []
     if classes:
-        parts.append(_tally(classes))
+        parts.append(None)  # the class tally, sized per render tier
     if unclassed:
         parts.append(f"{len(unclassed)} batch(es) blocked, class not reported")
     if breaker:
@@ -127,54 +141,80 @@ def wave_card(result: dict) -> str:
         parts.append("undeclared write targets")
     if result.get("unreported_write_targets"):
         parts.append("write targets not reported")
-    blockers = "Blockers: " + ("; ".join(parts) if parts else "none")
+
+    def blockers_line(classes_shown: int) -> str:
+        shown = [_tally(classes, classes_shown) if part is None else part for part in parts]
+        return "Blockers: " + ("; ".join(shown) if shown else "none")
 
     overrides = [o for o in result.get("merge_overrides", []) if isinstance(o, dict)]
     failed = [b["id"] for b in batches if b.get("status") in ("FAIL", "BLOCKED")]
     held = [b["id"] for b in batches if b.get("status") == "NOT_LAUNCHED"]
-    urls = [b.get("pr_url") for b in passed]
+    unit_verdicts = verify.get("unit_verdicts") if verify and isinstance(verify.get("unit_verdicts"), dict) else {}
+    verified = [b for b in passed if unit_verdicts.get(b.get("id")) == "PASS"]
+    unverified = [b["id"] for b in passed if unit_verdicts.get(b.get("id")) != "PASS"]
     auto_merge = result.get("auto_merge") is True
     close = result.get("close") if isinstance(result.get("close"), dict) else None
-    merged = close.get("merged_prs", []) if close else []
+    merged = [u for u in (close.get("merged_prs", []) if close else []) if isinstance(u, str)]
+    awaiting = [b.get("pr_url") for b in verified if b.get("pr_url") not in merged]
     to_start = f"wave {wave + 1}" if isinstance(wave, int) else "the next wave"
+    override_ids = ", ".join(sorted({o.get("decision_id", "?") for o in overrides}))
 
-    if closed and auto_merge:
-        decision, reply = f"none; {len(merged)} PRs merged, {to_start} may launch", None
-    elif passed and verdict == "PASS":
-        decision = f"merge {len(urls)} verified PRs, then start {to_start}"
-        if failed or held:
-            decision += f"; {', '.join(failed + held)} relaunch separately"
-        reply = f"accept wave {wave}"
-    elif passed:
-        decision, reply = f"nothing merges: verifier {verdict}; fix its findings and relaunch", "relaunch"
-    else:
-        decision, reply = f"fix {', '.join(failed + held) or 'the halt'} and relaunch", "relaunch"
-    if overrides:
-        ids = ", ".join(sorted({o.get("decision_id", "?") for o in overrides}))
-        decision += f". Override {ids} lifts merge policy only; parity stays as measured"
+    def render(ids: int, links: int, classes_shown: int) -> str:
+        rest = _ids(unverified + failed + held, ids)
+        if closed and auto_merge:
+            decision, reply = f"none; {len(merged)} PRs merged, {to_start} may launch", None
+        elif merged:
+            decision = f"{len(merged)} PRs merged; {len(awaiting)} verified await merge" if awaiting else \
+                f"{len(merged)} PRs merged; nothing else may merge"
+            decision += f"; {rest} relaunch separately" if rest else ""
+            reply = "relaunch" if rest or awaiting else None
+        elif verified:
+            decision = f"merge {len(awaiting)} verified PRs, then start {to_start}"
+            if rest:
+                decision += f"; {rest} relaunch separately"
+            reply = f"accept wave {wave}"
+        elif passed:
+            decision, reply = f"nothing merges: verifier {verdict}; fix its findings and relaunch", "relaunch"
+        else:
+            decision, reply = f"fix {rest or 'the halt'} and relaunch", "relaunch"
+        if overrides:
+            decision += f". Override {override_ids} lifts merge policy only; parity stays as measured"
 
-    not_done = []
-    if verify is None:
-        not_done.append("independent verifier (not run)")
-    elif verdict != "PASS":
-        not_done.append(f"verifier {verdict}")
-    if failed:
-        not_done.append("failed: " + ", ".join(failed))
-    if held:
-        not_done.append("held by breaker: " + ", ".join(held))
-    if close and close.get("unmerged") and auto_merge:
-        not_done.append(f"{len(close['unmerged'])} PRs not merged")
-    if result.get("resync") and (result["resync"] or {}).get("held_batches"):
-        not_done.append("resync held: " + ", ".join(result["resync"]["held_batches"]))
+        not_done = []
+        if verify is None:
+            not_done.append("independent verifier (not run)")
+        elif unverified:
+            not_done.append(f"verifier {verdict}: " + _ids(unverified, ids))
+        elif verdict != "PASS":
+            not_done.append(f"verifier {verdict}")
+        if failed:
+            not_done.append("failed: " + _ids(failed, ids))
+        if held:
+            not_done.append("held by breaker: " + _ids(held, ids))
+        if close and close.get("unmerged") and auto_merge:
+            not_done.append(f"{len(close['unmerged'])} PRs not merged")
+        if result.get("resync") and (result["resync"] or {}).get("held_batches"):
+            not_done.append("resync held: " + _ids(result["resync"]["held_batches"], ids))
 
-    return card([
-        head,
-        blockers,
-        f"Decision: {decision}",
-        "Not done: " + ("; ".join(not_done) if not_done else "nothing; wave complete"),
-        f"PRs: {_links(urls)}   Evidence: .migration/waves/wave-{wave}.result.json",
-        reply_line(reply, "halt" if reply else None),
-    ])
+        if merged:
+            prs = f"merged {_links(merged, links)}" + (f"; to merge {_links(awaiting, links)}" if awaiting else "")
+        else:
+            prs = _links(awaiting or [b.get("pr_url") for b in passed], links)
+        return card([
+            head,
+            blockers_line(classes_shown),
+            f"Decision: {decision}",
+            "Not done: " + ("; ".join(not_done) if not_done else "nothing; wave complete"),
+            f"PRs: {prs}   Evidence: .migration/waves/wave-{wave}.result.json",
+            reply_line(reply, "halt" if reply else None),
+        ])
+
+    for tier in ((3, MAX_LINKS, len(BLOCKER_CLASSES)), (1, 2, 3), (0, 1, 2), (0, 0, 1)):
+        try:
+            return render(*tier)
+        except ValueError:
+            continue
+    return render(0, 0, 1)
 
 
 def main(argv=None) -> int:

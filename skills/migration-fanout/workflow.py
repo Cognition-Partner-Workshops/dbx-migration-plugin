@@ -2021,11 +2021,13 @@ async def main():
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
         "verify": verify, "resync": resync, "close": close, "close_minutes": CLOSE_MINUTES,
     }
+    if cards is None:
+        raise SystemExit(f"{POINTER_PATH} plugin root has no skills/migration-fanout/cards.py; "
+                         "nothing was written, relaunch once the pointer names a plugin that has it")
+    card = cards.wave_card(result)
     _tmp_write(RESULT_PATH, json.dumps(result, indent=2, sort_keys=True) + "\n")
     write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close, to_merge, resync)
-    if cards is None:
-        raise SystemExit(f"{POINTER_PATH} plugin root has no skills/migration-fanout/cards.py; the wave card was not written")
-    _tmp_write(CARD_PATH, cards.wave_card(result))
+    _tmp_write(CARD_PATH, card)
     log(f"wrote {RESULT_PATH}, {BRIEF_PATH} and {CARD_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 

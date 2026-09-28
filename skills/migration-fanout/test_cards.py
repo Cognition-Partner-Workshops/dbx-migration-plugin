@@ -21,9 +21,12 @@ def _batch(bid, *, status="PASS", parity="PASS", eligible=True, classes=None, pr
     return b
 
 
-def _result(batches, *, verify="PASS", closed=False, auto_merge=False, overrides=(), breaker=None, **extra):
+def _result(batches, *, verify="PASS", closed=False, auto_merge=False, overrides=(), breaker=None,
+            unit_verdicts=None, **extra):
+    if verify and unit_verdicts is None:  # the verifier grades every passed batch; the wave verdict follows
+        unit_verdicts = {b["id"]: verify for b in batches if b.get("status") == "PASS"}
     return {"wave": 1, "closed": closed, "auto_merge": auto_merge, "breaker_tripped_on": breaker,
-            "verify": {"wave_verdict": verify, "unit_verdicts": {}, "findings": []} if verify else None,
+            "verify": {"wave_verdict": verify, "unit_verdicts": unit_verdicts, "findings": []} if verify else None,
             "merge_overrides": list(overrides), "batches": batches,
             "write_target_overlaps": [], "undeclared_write_targets": {}, "unreported_write_targets": [],
             "resync": None, "close": None, **extra}
@@ -102,7 +105,7 @@ def test_wave_card_with_a_failed_batch_and_a_tripped_breaker_asks_for_a_relaunch
 def test_wave_card_with_a_verifier_fail_merges_nothing():
     lines = _lines(cards.wave_card(_result([_batch("b-1")], verify="FAIL")))
     assert lines[2] == "Decision: nothing merges: verifier FAIL; fix its findings and relaunch"
-    assert lines[3] == "Not done: verifier FAIL"
+    assert lines[3] == "Not done: verifier FAIL: b-1"
 
 
 def test_a_closed_auto_merged_wave_needs_no_reply():
@@ -158,3 +161,51 @@ def test_the_contract_quotes_the_same_reply_phrases_the_cards_emit():
     assert packet.exists()
     playbook = (Path(__file__).parents[1] / "install-dbx-factory" / "playbooks" / "8-cutover_signoff.md").read_text()
     assert "stop_e_packet.md" in playbook
+
+
+def test_wave_card_names_the_batches_the_verifier_passed_and_what_the_close_step_merged():
+    """The close step merges per-batch verifier PASS even when the wave verdict is FAIL; the card must say so."""
+    batches = [_batch("b-1"), _batch("b-2")]
+    partial = {"b-1": "PASS", "b-2": "FAIL"}
+    lines = _lines(cards.wave_card(_result(batches, verify="FAIL", unit_verdicts=partial)))
+    assert lines[2] == "Decision: merge 1 verified PRs, then start wave 2; b-2 relaunch separately"
+    assert lines[3] == "Not done: verifier FAIL: b-2"
+    assert lines[4].startswith("PRs: https://example.test/pr/b-1   Evidence:")
+    assert lines[5] == "Reply: `accept wave 1`  (or `halt`)"
+
+    close = {"merged_prs": ["https://example.test/pr/b-1"], "unmerged": [], "changed_paths": []}
+    lines = _lines(cards.wave_card(_result(batches, verify="FAIL", unit_verdicts=partial, auto_merge=True,
+                                           close=close)))
+    assert lines[2] == "Decision: 1 PRs merged; nothing else may merge; b-2 relaunch separately"
+    assert lines[4].startswith("PRs: merged https://example.test/pr/b-1   Evidence:")
+    assert lines[5] == "Reply: `relaunch`  (or `halt`)"
+
+    close = {"merged_prs": ["https://example.test/pr/b-1"], "unmerged": [{"pr_url": "https://example.test/pr/b-2",
+                                                                          "reason": "checks red"}], "changed_paths": []}
+    lines = _lines(cards.wave_card(_result(batches, verify="PASS", auto_merge=True, close=close)))
+    assert lines[2] == "Decision: 1 PRs merged; 1 verified await merge"
+    assert "1 PRs not merged" in lines[3]
+    assert lines[4].startswith("PRs: merged https://example.test/pr/b-1; to merge https://example.test/pr/b-2   ")
+
+
+def test_wave_card_never_overflows_however_many_batches_failed_or_were_held():
+    """Rendering runs before the result is written; a card that could raise would strand the wave."""
+    batches = [_batch(f"batch-{i:02d}", status="FAIL", parity="FAIL", eligible=False, classes=["data"])
+               for i in range(3)]
+    batches += [_batch(f"batch-{i:02d}", status="NOT_LAUNCHED", parity="NOT_RUN", eligible=False)
+                for i in range(3, 20)]
+    text = cards.wave_card(_result(batches, verify=None, breaker="batch-02"))
+    lines = _lines(text)
+    assert len(lines) == 6 and sum(len(l.split()) for l in lines) <= cards.MAX_WORDS
+    assert lines[2].startswith("Decision: fix batch-00, batch-01, batch-02 +17 more and relaunch")
+    assert "held by breaker: batch-03, batch-04, batch-05 +14 more" in lines[3]
+
+    long_ids = [_batch("unit_" + "x" * 60 + f"_{i}", status="FAIL", parity="FAIL", eligible=False,
+                       classes=[f"class_{i}"]) for i in range(40)]
+    long_ids += [_batch("pass_" + "y" * 60 + f"_{i}", pr="https://example.test/" + "z" * 80 + f"/{i}")
+                 for i in range(40)]
+    verdicts = {b["id"]: ("PASS" if i % 2 else "FAIL") for i, b in enumerate(long_ids[40:])}
+    text = cards.wave_card(_result(long_ids, verify="FAIL", unit_verdicts=verdicts))
+    lines = _lines(text)
+    assert len(lines) == 6 and sum(len(l.split()) for l in lines) <= cards.MAX_WORDS
+    assert "in the result" in lines[4] or "+" in lines[4]
