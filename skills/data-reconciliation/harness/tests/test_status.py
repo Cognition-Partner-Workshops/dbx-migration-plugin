@@ -309,6 +309,20 @@ def test_cdc_lag_is_evidence_not_parity_but_a_misordered_row_is_data():
     assert data_failed(TierResult(6, "cdc_lag_ordering", True, 1, [], {})) is False
 
 
+def test_aggregates_left_ungraded_by_keys_in_flight_are_evidence_not_parity():
+    """Tier 2 does not compare an object whose in-flight keys exceed the exclusion cap; nothing was
+    found to differ, so parity holds and the feed catching up is the blocker. A mismatch beside it is data."""
+    ungraded = Finding("t", "aggregates_ungraded_in_flight", "9 source rows in flight ... exceed the 3-key exclusion cap")
+    tier2 = TierResult(2, "per_field_aggregates", False, 1, [ungraded], {})
+    r = _green(mode="transactional", tiers=[TierResult(1, "row_count", True, 1, [], {}), tier2])
+    assert r["verdict"] == "FAIL" and r["parity"] == "PASS"
+    assert r["blockers"] == [{"reason": "tier_failed", "class": "evidence"}]
+    mixed = TierResult(2, "per_field_aggregates", False, 2, [ungraded, Finding("u", "aggregate_mismatch", "sum differs")], {})
+    r = _green(mode="transactional", tiers=[TierResult(1, "row_count", True, 1, [], {}), mixed])
+    assert r["parity"] == "FAIL" and r["blockers"] == [{"reason": "tier_failed", "class": "data"}]
+    assert data_failed(TierResult(2, "per_field_aggregates", False, 1, [], {})) is True
+
+
 def test_rerun_posture_is_declared_in_the_committed_mapping_spec_never_by_the_run(tmp_path):
     """A flag would let the run being graded pick its own gate; the spec is versioned, committed and
     reviewed, and result.json cites its version."""

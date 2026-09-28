@@ -20,22 +20,18 @@ MAX_FINDINGS_IN_REPORT = 50
 STRUCTURAL_TIERS = ("structural_parity", "schema_parity")
 # tiers that grade the evidence, not the rows: a failure here is a run to repeat, not drift
 EVIDENCE_TIERS = ("consistency_window",)
-# tier 6 grades both: a row applied out of order or replayed is data; the feed's lag, an ungradable
-# watermark or unusable delete evidence says the rows are not all there yet, not that they differ
-CDC_TIER = "cdc_lag_ordering"
-CDC_EVIDENCE_CHECKS = frozenset({"cdc_lag_exceeded", "cdc_in_flight_exceeded", "cdc_watermark_incomparable",
-                                 "cdc_lag_ungraded", "delete_lag_exceeded", "delete_evidence_retention_gap",
-                                 "delete_evidence_unusable"})
+# findings in a data tier that say the rows are not all there or not gradable yet, not that they
+# differ: the feed's lag, an ungradable watermark, unusable delete evidence, aggregates left
+# ungraded because too many keys are in flight. A row applied out of order or replayed is data
+EVIDENCE_CHECKS = frozenset({"cdc_lag_exceeded", "cdc_in_flight_exceeded", "cdc_watermark_incomparable",
+                             "cdc_lag_ungraded", "delete_lag_exceeded", "delete_evidence_retention_gap",
+                             "delete_evidence_unusable", "aggregates_ungraded_in_flight"})
 
 
 def data_failed(tier: TierResult) -> bool:
-    """A failed data tier whose findings say the rows differ (every finding of a CDC tier that is
-    not the feed's evidence)."""
-    if tier.passed:
-        return False
-    if tier.name == CDC_TIER:
-        return any(f.check not in CDC_EVIDENCE_CHECKS for f in tier.findings)
-    return True
+    """A failed data tier whose findings say the rows differ; a tier that failed without a finding
+    is not explained and counts as data."""
+    return not tier.passed and (not tier.findings or any(f.check not in EVIDENCE_CHECKS for f in tier.findings))
 
 
 # Why a merge is blocked, by what a human has to do about it:
