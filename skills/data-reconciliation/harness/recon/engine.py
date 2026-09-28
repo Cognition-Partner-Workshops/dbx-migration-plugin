@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 from .adapters import StatementCounting
 from .canon import Canonicalizer
 from .config import CanonRule, ConfigError, MappingSpec, Tolerances
 from .report import build_result, write_outputs
-from .structure import tier0_structural_parity
+from .structure import CATEGORIES, tier0_structural_parity
 from .tiers import tier1_counts, tier2_aggregates, tier3_diffs, tier4_parity
 from .transactional import (
     abandon_window,
@@ -80,9 +81,9 @@ def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | No
 
 def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source, target,
                seed: int, depth: str, mode: str, ops: list[dict] | None, run_source, run_target,
-               ctx) -> list:
+               ctx, blind: frozenset[str] = frozenset()) -> list:
     if mode == "structural":
-        return [tier0_structural_parity(spec, tol, source, target, catalog_only=True)]
+        return [tier0_structural_parity(spec, tol, source, target, catalog_only=True, blind=blind)]
     tiers = [tier1_counts(spec, source, target, ctx=ctx)]
     if tiers[0].passed:
         # Tier 1 failures are load defects or mapping-spec violations; nothing else runs.
@@ -95,12 +96,12 @@ def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source,
         # keys and the lag behind a count gap instead of just the gap
         tiers.append(tier5_pk_set(spec, tol, ctx, source, target))
         tiers.append(tier6_cdc(spec, tol, ctx, source, target))
-        tiers.append(tier7_schema_parity(spec, tol, source, target))
+        tiers.append(tier7_schema_parity(spec, tol, source, target, blind=blind))
         # the window closes last so every tier above read inside it; a moved side fails the run
         tiers.insert(0, close_window(spec, tol, ctx, source, target))
     elif mode != "continuous":
         # structural parity outside a window: runs regardless of tier 1's outcome, gates nothing
-        tiers.insert(0, tier0_structural_parity(spec, tol, source, target))
+        tiers.insert(0, tier0_structural_parity(spec, tol, source, target, blind=blind))
     return tiers
 
 
@@ -131,11 +132,17 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
               routine_writers: list[str] | None = None,
               routine_analysis_missing: bool = False,
               routine_dependencies: str | None = None,
-              rerun_proof: dict | None = None) -> dict:
+              rerun_proof: dict | None = None,
+              rerun_posture: str = "required",
+              structural_blind: Iterable[str] = ()) -> dict:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     if depth not in DEPTHS:
         raise ConfigError(f"depth must be one of {DEPTHS}, got {depth!r}")
+    blind = frozenset(structural_blind)
+    if not blind <= set(CATEGORIES):
+        raise ConfigError(f"structural_blind must name categories from {CATEGORIES}, "
+                          f"got {sorted(blind - set(CATEGORIES))}")
     started = time.monotonic()
     for c in spec.objects:
         if (c.root_where is None) != (c.target_where is None):
@@ -158,7 +165,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         if mode == "transactional":
             ctx = open_window(spec, source, target, tol)
         tiers = _run_tiers(spec, tol, canon, source, target, seed, depth, mode, ops,
-                           run_source, run_target, ctx)
+                           run_source, run_target, ctx, blind)
     except BaseException as exc:
         # a marker or tier query that raises must not leave either side's window pinned; the
         # run's error is what propagates, with any release failure attached to it
@@ -175,7 +182,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
                           routine_parity=routine_parity, routine_writers=routine_writers,
                           routine_analysis_missing=routine_analysis_missing,
                           routine_dependencies=routine_dependencies,
-                          rerun_proof=rerun_proof)
+                          rerun_proof=rerun_proof, rerun_posture=rerun_posture)
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result

@@ -297,10 +297,12 @@ class DictionaryOverlay:
                 f"{self._dictionary.path} has no identity state for {table}.{column}") from None
 
 
-def tier0_structural_parity(spec, tol, source, target, catalog_only: bool = False) -> TierResult:
+def tier0_structural_parity(spec, tol, source, target, catalog_only: bool = False,
+                            blind: frozenset[str] = frozenset()) -> TierResult:
     """Structural parity outside a consistency window: the same grading as tier 7 but honest
     about holes — a catalog that cannot be read leaves categories unsupported, never clean.
-    `catalog_only` (structural mode) skips the row-backed identity bounds."""
+    `catalog_only` (structural mode) skips the row-backed identity bounds; `blind` the
+    categories declared unreadable for this principal (recorded, not warned)."""
     from .transactional import schema_parity  # lazy: transactional imports this module
     return schema_parity(0, "structural_parity", spec, tol, source, target, strict=False,
-                         catalog_only=catalog_only)
+                         catalog_only=catalog_only, blind=blind)
