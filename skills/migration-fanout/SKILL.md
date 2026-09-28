@@ -6,7 +6,8 @@ description: "Run one migration wave as a dynamic workflow: N unit-migration chi
 # migration-fanout
 
 The workflow owns one wave from launch through result writing. It launches children,
-checks their reports, runs independent verification, and writes the result and brief.
+checks their reports, runs independent verification, and writes the result, the brief, and the wave card (`cards.py`, which also renders halt
+cards and the one-line relaunch update from the shell).
 
 ## How to use it
 
@@ -22,7 +23,9 @@ checks their reports, runs independent verification, and writes the result and b
    `{"manifest": "wave-<N>.json", "hook_probe": "blocked:<nonce>|not-blocked|unknown", "workspace": "/abs/repo", "plugin": "<plugin>"}`.
 4. Run `run_workflow(workflow_name="migration-wave-<N>", script_path="<plugin>/skills/migration-fanout/workflow.py")`.
 5. Read `.migration/waves/wave-<N>.result.json` and `.migration/waves/wave-<N>.brief.md`,
-   then render progress with `python3 <plugin>/skills/migration-fanout/progress.py .migration`.
+   post `.migration/waves/wave-<N>.card.md` (the six-line wave-close card, shape in
+   `install-dbx-factory/references/contract.md`), then render progress with
+   `python3 <plugin>/skills/migration-fanout/progress.py .migration`.
 
 A result file means the wave will not relaunch. To rerun deliberately, delete the result,
 refresh the doctor, and run the workflow again. The STOP C row is reused for a plumbing
