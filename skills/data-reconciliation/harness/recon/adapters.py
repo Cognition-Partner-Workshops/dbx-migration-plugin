@@ -117,6 +117,9 @@ class SchemaFacts:
     primary_key_informational: tuple[str, ...] = ()
     foreign_keys_informational: set[tuple[tuple[str, ...], str, tuple[str, ...]]] =         field(default_factory=set)  # declared but not enforced (UC foreign keys)
     unsupported: frozenset[str] = frozenset()
+    # the subset of `unsupported` the principal was refused (a permission error on the view),
+    # as opposed to a catalog that has no such dictionary
+    privilege_denied: frozenset[str] = frozenset()
     # relations that cannot carry NOT NULL (Postgres views and materialized views:
     # pg_attribute.attnotnull is always false for them) set this False so tier 7 reports
     # nullability as unverified instead of missing
@@ -316,7 +319,44 @@ NTILE_SQL = "NTILE({n}) OVER (ORDER BY {order})"
 
 class DictionaryError(RuntimeError):
     """A catalog dictionary read failed: the reason names the view and the driver error class,
-    never str(exc) — driver messages can carry the DSN."""
+    never str(exc) — driver messages can carry the DSN. `kind` is "privilege" when the driver
+    refused the principal (it cannot see the view), "read" for any other failure."""
+
+    def __init__(self, message: str, kind: str = "read"):
+        super().__init__(message)
+        self.kind = kind
+
+
+# Driver-neutral markers of a permission refusal: Oracle ORA-00942/ORA-01031, Postgres 42501,
+# SQL Server 229/300, Unity Catalog PERMISSION_DENIED / INSUFFICIENT_PERMISSIONS.
+_PRIVILEGE_ERROR = re.compile(
+    r"ORA-0(0942|1031)|\b42501\b|permission[ _]denied|permission was denied|insufficient[ _]"
+    r"(privilege|permission)|not authorized|access denied", re.IGNORECASE)
+
+
+def dictionary_error(table: str, view: str, exc: BaseException) -> DictionaryError:
+    """The DictionaryError for a failed view read; the driver text is matched for a refusal
+    marker and then dropped."""
+    kind = "privilege" if _PRIVILEGE_ERROR.search(f"{type(exc).__name__}: {exc}") else "read"
+    return DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})", kind)
+
+
+def _read_grants(facts: SchemaFacts, read) -> None:
+    """Grants are the one category a read-only principal is routinely refused (table_privileges,
+    ALL_TAB_PRIVS, sys.database_permissions); a refusal leaves the category unsupported and
+    privilege_denied instead of failing the object's whole fact set. Any other error propagates."""
+    try:
+        rows = read()
+    except DictionaryError as exc:
+        if exc.kind != "privilege":
+            raise
+        facts.unsupported = facts.unsupported | {"grants"}
+        facts.privilege_denied = facts.privilege_denied | {"grants"}
+        return
+    grants: dict[str, set] = {}
+    for grantee, priv in rows:
+        grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
+    facts.grants = {g: frozenset(p) for g, p in grants.items()}
 
 
 class _SqlAdapterBase:
@@ -401,7 +441,7 @@ class _SqlAdapterBase:
         except (DictionaryError, NotImplementedError):
             raise
         except Exception as exc:
-            raise DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})") from exc
+            raise dictionary_error(table, view, exc) from exc
 
     def run_query(self, sql: str) -> list[dict[str, Any]]:
         if not sql.lstrip().lower().startswith(("select", "with")):
@@ -966,7 +1006,7 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         except (DictionaryError, NotImplementedError):
             raise
         except Exception as exc:
-            raise DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})") from exc
+            raise dictionary_error(table, view, exc) from exc
 
     rows = q("information_schema.table_constraints",
         f"SELECT tc.constraint_type, tc.constraint_name, kcu.column_name, "
@@ -1031,7 +1071,7 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         {"catalog": catalog, "schema": schema, "table": table})
     facts.check_count = max(facts.check_count, len(rows))
     facts.checks = {clause for (clause,) in rows}
-    rows = q("information_schema.table_privileges",
+    _read_grants(facts, lambda: q("information_schema.table_privileges",
         f"SELECT tp.grantee, tp.privilege_type FROM {catalog}.information_schema.table_privileges tp "
         f"JOIN {catalog}.information_schema.tables t "
         "  ON t.table_catalog = tp.table_catalog AND t.table_schema = tp.table_schema "
@@ -1039,11 +1079,7 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         "WHERE tp.table_catalog = %(catalog)s AND tp.table_schema = %(schema)s "
         "AND tp.table_name = %(table)s AND tp.grantee <> t.owner "
         "ORDER BY tp.grantee",
-        {"catalog": catalog, "schema": schema, "table": table})
-    grants: dict[str, set] = {}
-    for grantee, priv in rows:
-        grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
-    facts.grants = {g: frozenset(p) for g, p in grants.items()}
+        {"catalog": catalog, "schema": schema, "table": table}))
     return facts
 
 
@@ -1089,7 +1125,7 @@ def _uc_identity_state(run_query, catalog: str, schema: str, table: str,
         except (DictionaryError, NotImplementedError):
             raise
         except Exception as exc:
-            raise DictionaryError(f"{table}: {view} read failed ({type(exc).__name__})") from exc
+            raise dictionary_error(table, view, exc) from exc
 
     state = _uc_identity_columns(q("SHOW CREATE TABLE", f"SHOW CREATE TABLE {qual}")).get(column)
     if not state:
@@ -1309,7 +1345,7 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
                 events.append(str(type_desc).lower())
         for tname, (timing, events) in by_trigger.items():
             facts.triggers[tname] = (timing, tuple(sorted(set(events))), "statement")
-        rows = self._dict_rows(
+        _read_grants(facts, lambda: self._dict_rows(
             table, "sys.database_permissions",
             "WITH m(role_id, member_id) AS ("
             "  SELECT role_principal_id, member_principal_id FROM sys.database_role_members "
@@ -1361,11 +1397,7 @@ class SqlServerSourceAdapter(_SqlAdapterBase):
             "JOIN sys.database_principals dp ON dp.principal_id = e.grantee_id "
             "WHERE dp.principal_id <> (SELECT principal_id FROM sys.schemas WHERE name = ?) "
             "  AND dp.principal_id NOT IN (SELECT member_id FROM m WHERE role_id = DATABASE_PRINCIPAL_ID('db_owner')) "
-            "ORDER BY dp.name", (schema, name, schema, schema, name, schema, schema))
-        grants: dict[str, set] = {}
-        for grantee, priv in rows:
-            grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
-        facts.grants = {g: frozenset(p) for g, p in grants.items()}
+            "ORDER BY dp.name", (schema, name, schema, schema, name, schema, schema)))
         return facts
 
     def column_shape(self, table: str) -> list[dict[str, Any]]:
@@ -1784,14 +1816,11 @@ class OracleSourceAdapter(_SqlAdapterBase):
         for tname, ttype, event in rows:
             facts.triggers[str(tname).lower()] = _oracle_trigger_shape(str(ttype), str(event))
 
-        rows = self._dict_rows(
+        _read_grants(facts, lambda: self._dict_rows(
             name, "all_tab_privs",
             "SELECT grantee, privilege FROM all_tab_privs "
             "WHERE table_schema = :1 AND table_name = :2 AND grantee <> :1",
-            self._params([owner, name]))
-        for grantee, privilege in rows:
-            key = str(grantee).lower()
-            facts.grants[key] = facts.grants.get(key, frozenset()) | {str(privilege).lower()}
+            self._params([owner, name])))
         # ALL_TAB_PRIVS shows direct grants only; privileges arriving through a role the
         # grantee holds are invisible here.
         facts.grants_effective = False
@@ -2020,7 +2049,8 @@ class _PostgresBase(_SqlAdapterBase):
     watermark_literal_utc_offset = True
     binary_literal_sql = "'\\x{hex}'::bytea"
     # schema_facts' server_version_num read is cached after the first object (session).
-    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 1}
+    # schema_facts: four dictionary reads plus the grants read and its savepoint pair.
+    CATALOG_STATEMENTS = {"schema_facts": 7, "identity_state": 2, "session": 1}
 
     def _pg_column_shape(self, schema: str, name: str, physical: bool = False) -> list[dict[str, Any]]:
         kind = f"AND {_PG_PHYSICAL} " if physical else ""
@@ -2154,7 +2184,7 @@ class _PostgresBase(_SqlAdapterBase):
         # platform role (databricks_*), so what the member inherits along it is the platform's
         # grant (workspace admin -> databricks_superuser, which the event trigger grants on
         # every table and which holds pg_write_all_data), not the unit's
-        rows = self._dict_rows(
+        _read_grants(facts, lambda: self._in_savepoint(lambda: self._dict_rows(
             table, "information_schema.table_privileges",
             ("WITH RECURSIVE m(role, member, platform) AS ("
             "  SELECT r.rolname, u.rolname, r.rolsuper OR r.rolname LIKE 'databricks\\_%%' "
@@ -2185,12 +2215,22 @@ class _PostgresBase(_SqlAdapterBase):
             "  AND e.grantee NOT IN (SELECT member FROM m WHERE role = rel.owner) "
             "  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = e.grantee "
             "                  AND (r.rolsuper OR r.rolname LIKE 'databricks\\_%%')) "
-            "ORDER BY 1, 2").replace("{inherit}", inherit), (schema, name, schema, name))
-        grants: dict[str, set] = {}
-        for grantee, priv in rows:
-            grants.setdefault(str(grantee).lower(), set()).add(str(priv).lower())
-        facts.grants = {g: frozenset(p) for g, p in grants.items()}
+            "ORDER BY 1, 2").replace("{inherit}", inherit), (schema, name, schema, name))))
         return facts
+
+    def _in_savepoint(self, read):
+        """A refused statement aborts the whole Postgres transaction, so a dictionary read the
+        principal may be refused runs inside a savepoint: rolling back to it clears the abort and
+        keeps the outer transaction, and with it the pinned REPEATABLE READ window."""
+        self._execute("SAVEPOINT recon_dictionary")
+        try:
+            rows = read()
+        except Exception:
+            self._execute("ROLLBACK TO SAVEPOINT recon_dictionary")
+            self._execute("RELEASE SAVEPOINT recon_dictionary")
+            raise
+        self._execute("RELEASE SAVEPOINT recon_dictionary")
+        return rows
 
     # In-flight keys travel as one text[] per key column and are cast to the column's declared
     # type server-side, so one statement excludes any number of keys of any width: the row cap

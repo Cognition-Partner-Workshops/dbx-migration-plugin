@@ -10,11 +10,39 @@ import json
 import re
 from pathlib import Path
 
-from .rerun import rerun_gap, rerun_missing, rerun_unsupported
+from .config import RERUN_POSTURES, ConfigError
+from .rerun import rerun_first_run_baseline, rerun_gap, rerun_missing, rerun_unsupported
 from .routines import parity_missing, routine_gap
 from .tiers import TierResult
 
 MAX_FINDINGS_IN_REPORT = 50
+
+STRUCTURAL_TIERS = ("structural_parity", "schema_parity")
+# tiers that grade the evidence, not the rows: a failure here is a run to repeat, not drift
+EVIDENCE_TIERS = ("consistency_window",)
+# findings in a data tier that say the rows are not all there or not gradable yet, not that they
+# differ: the feed's lag, an ungradable watermark, unusable delete evidence, aggregates left
+# ungraded because too many keys are in flight. A row applied out of order or replayed is data
+EVIDENCE_CHECKS = frozenset({"cdc_lag_exceeded", "cdc_in_flight_exceeded", "cdc_watermark_incomparable",
+                             "cdc_lag_ungraded", "delete_lag_exceeded", "delete_evidence_retention_gap",
+                             "delete_evidence_unusable", "aggregates_ungraded_in_flight"})
+
+
+def data_failed(tier: TierResult) -> bool:
+    """A failed data tier whose findings say the rows differ; a tier that failed without a finding
+    is not explained and counts as data."""
+    return not tier.passed and (not tier.findings or any(f.check not in EVIDENCE_CHECKS for f in tier.findings))
+
+
+# Why a merge is blocked, by what a human has to do about it:
+#   data                  rows or routine behaviour differ: fix the converted code
+#   structural            the catalogs differ (a constraint, trigger, index, identity or grant)
+#   privilege_visibility  the principal could not read a dictionary: fix its grants or declare
+#                         the category blind; nothing is known to differ
+#   rerun_policy          the rerun proof is missing, failed or unsupported under the posture
+#   evidence              the run is not merge evidence (mode, snapshot manifest, unlisted
+#                         routines, ungraded embeds, provenance)
+BLOCKER_CLASSES = ("data", "structural", "privilege_visibility", "rerun_policy", "evidence")
 
 MODE_NOTES = {
     "snapshot": " (PASS scoped to the snapshot watermark)",
@@ -41,6 +69,27 @@ def _rerun_line(result: dict) -> str | None:
     return line
 
 
+def status_line(result: dict) -> str:
+    """One line a reader can act on: parity first, then the merge policy with its blocker
+    classes. `parity PASS, merge blocked (rerun_policy)` never reads as a data failure."""
+    if result.get("merge_eligible"):
+        policy = "merge eligible"
+    else:
+        classes = result.get("blocker_classes") or sorted({b["class"] for b in result.get("blockers", [])})
+        policy = "merge blocked" + (f" ({', '.join(classes)})" if classes else "")
+    return f"parity {result.get('parity', result['verdict'])}, {policy}"
+
+
+def _blocker_lines(result: dict) -> list[str]:
+    blockers = result.get("blockers") or []
+    if not blockers:
+        return []
+    by_class: dict[str, list[str]] = {}
+    for b in blockers:
+        by_class.setdefault(b["class"], []).append(b["reason"])
+    return ["- Blockers: " + "; ".join(f"{cls}: {', '.join(reasons)}" for cls, reasons in by_class.items())]
+
+
 def _authority_line(result: dict) -> str:
     """The harness is the only authority this file writes. A merge past merge_eligible=false needs a
     human_override the workflow checks against a merge_override row of .migration/06_decisions.md."""
@@ -61,7 +110,14 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  routine_writers: list[str] | None = None,
                  routine_analysis_missing: bool = False,
                  routine_dependencies: str | None = None,
-                 rerun_proof: dict | None = None) -> dict:
+                 rerun_proof: dict | None = None,
+                 rerun_posture: str = "required") -> dict:
+    """`verdict` is every tier's pass/fail and `merge_eligible` the harness's merge answer, as
+    the workflow reads them. Alongside them the result separates what a reader has to act on:
+    `parity` (did the rows and routines match), `merge_policy` (eligible/blocked) and
+    `blockers`, each block reason with the class of work it needs (BLOCKER_CLASSES)."""
+    if rerun_posture not in RERUN_POSTURES:
+        raise ConfigError(f"rerun_posture must be one of {RERUN_POSTURES}, got {rerun_posture!r}")
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -73,41 +129,68 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
             warnings.append(f"UNVERIFIED {t.name}: structure unavailable: {note}")
     warnings.extend(provenance_warnings or [])
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
-    structural = next((t for t in tiers if t.name in ("structural_parity", "schema_parity")), None)
+    structural = next((t for t in tiers if t.name in STRUCTURAL_TIERS), None)
+    data_tiers = [t for t in tiers if t.name not in STRUCTURAL_TIERS + EVIDENCE_TIERS]
     checks = (structural.stats.get("structural_checks") or {}) if structural else {}
     structural_blind = any(v == "unsupported" for c, v in checks.items() if c != "indexes")
     unlisted_writers = parity_missing(routine_parity, routine_writers)
     parity_gap = bool(unlisted_writers) or routine_analysis_missing
-    merge_eligible = (verdict == "PASS" and mode in ("live", "snapshot", "transactional")
-                      and not warnings and not structural_blind
-                      and (mode != "snapshot" or snapshot is not None)
-                      and not routine_gap(routine_parity) and not parity_gap
-                      and not rerun_missing(rerun_proof)
-                      and not rerun_gap(rerun_proof) and not rerun_unsupported(rerun_proof))
-    reasons = []
+    if not data_tiers:
+        parity = "NOT_RUN"
+    elif not any(data_failed(t) for t in data_tiers) and not routine_gap(routine_parity):
+        parity = "PASS"
+    else:
+        parity = "FAIL"
+    # a hole the principal was refused is a visibility gap, not a mismatch; a hole of any other
+    # kind (or a finding) is structural
+    structural_class = "structural"
+    if structural is not None and not structural.findings \
+            and set(structural.stats.get("hole_kinds") or []) == {"privilege"}:
+        structural_class = "privilege_visibility"
+    structural_warning = tuple(f"UNVERIFIED {t}" for t in STRUCTURAL_TIERS)
+    blockers: list[dict] = []
+
+    def block(reason: str, cls: str) -> None:
+        blockers.append({"reason": reason, "class": cls})
+
     if structural is not None and (structural.findings or structural.stats.get("unverified")
                                    or structural.stats.get("dictionary_unavailable")
                                    or structural_blind):
-        reasons.append("structural_gap")
-    if verdict == "FAIL":
-        reasons.append("tier_failed")
+        block("structural_gap", structural_class)
+    if verdict == "FAIL":  # every failed tier names its class: a structural miss does not hide a moved window
+        failed_classes = []
+        if any(data_failed(t) for t in tiers if t.name not in STRUCTURAL_TIERS + EVIDENCE_TIERS):
+            failed_classes.append("data")
+        if structural is not None and not structural.passed:
+            failed_classes.append(structural_class)
+        if any(not t.passed and (t.name in EVIDENCE_TIERS or not data_failed(t)) for t in data_tiers
+               + [t for t in tiers if t.name in EVIDENCE_TIERS]):
+            failed_classes.append("evidence")  # the window moved, or the feed is behind
+        for cls in failed_classes or ["evidence"]:
+            block("tier_failed", cls)
     if routine_gap(routine_parity):
-        reasons.append("routine_gap")
+        block("routine_gap", "data")
     if parity_gap:
-        reasons.append("routine_parity_missing")
+        block("routine_parity_missing", "evidence")
     if warnings:
-        reasons.append("warnings")
+        block("warnings", structural_class if all(w.startswith(structural_warning) for w in warnings)
+              else "evidence")
     if mode not in ("live", "snapshot", "transactional"):
-        reasons.append("mode")
+        block("mode", "evidence")
     if mode == "snapshot" and snapshot is None:
-        reasons.append("snapshot_missing")
+        block("snapshot_missing", "evidence")
     if mode != "structural":  # no row tier ran, so there is no rerun to prove
-        if rerun_missing(rerun_proof):
-            reasons.append("rerun_missing")
+        if rerun_missing(rerun_proof) and rerun_posture != "not_applicable":
+            block("rerun_missing", "rerun_policy")
         if rerun_gap(rerun_proof):
-            reasons.append("rerun_gap")
-        if rerun_unsupported(rerun_proof):
-            reasons.append("rerun_unsupported")
+            block("rerun_gap", "rerun_policy")
+        if rerun_unsupported(rerun_proof) and (
+                rerun_posture == "required"
+                or (rerun_posture == "first_run_baseline"
+                    and not rerun_first_run_baseline(rerun_proof))):
+            block("rerun_unsupported", "rerun_policy")
+    reasons = list(dict.fromkeys(b["reason"] for b in blockers))
+    merge_eligible = not blockers
     return {
         "unit": unit,
         "mode": mode,
@@ -122,10 +205,15 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "tiers": [t.as_dict() for t in tiers],
         "warnings": warnings,
         "verdict": verdict,
+        "parity": parity,
         "merge_eligible": merge_eligible,
+        "merge_policy": "eligible" if merge_eligible else "blocked",
+        "blockers": blockers,
+        "blocker_classes": sorted({b["class"] for b in blockers}),
         "merge_authority": {"kind": "harness", "decision_id": None},
         "type_map": type_map,
         "rerun_proof": rerun_proof,
+        "rerun_posture": rerun_posture,
         "merge_block_reasons": reasons,
         "routine_parity": routine_parity,
         "routine_writers": routine_writers,
@@ -162,10 +250,13 @@ def render_report(result: dict) -> str:
     lines = [
         f"# Recon report: unit `{result['unit']}`",
         "",
-        f"- **Verdict: {result['verdict']}**",
+        f"- **{status_line(result)}**",
+        f"- Verdict: {result['verdict']} (all tiers)",
+        *_blocker_lines(result),
         f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
         (f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
          "(fixture/continuous evidence never merges)"),
+        f"- Rerun posture: `{result.get('rerun_posture', 'required')}`",
         _authority_line(result),
         f"- Mapping version: `{result['mapping_version']}`",
         f"- Tolerance version: `{result['tolerance_version']}`",
@@ -217,11 +308,13 @@ def render_summary(result: dict) -> str:
     """The tier-A evidence surface: what a unit PR renders. Full detail stays in
     result.json / report.md, which the PR links."""
     lines = [
-        f"# Recon summary: `{result['unit']}` - **{result['verdict']}**",
+        f"# Recon summary: `{result['unit']}` - **{status_line(result)}**",
         "",
-        f"- Mode: `{result['mode']}`" + _mode_note(result["mode"]),
+        *_blocker_lines(result),
+        f"- Verdict: {result['verdict']} / mode `{result['mode']}`" + _mode_note(result["mode"]),
         (f"- Merge eligible: {'yes' if result['merge_eligible'] else 'no'} "
          "(fixture/continuous evidence never merges)"),
+        f"- Rerun posture: `{result.get('rerun_posture', 'required')}`",
         _authority_line(result),
         f"- Mapping `{result['mapping_version']}` / tolerances `{result['tolerance_version']}`"
         f" / seed `{result.get('seed', 0)}` / depth `{result.get('depth', 'threshold')}`"

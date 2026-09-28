@@ -13,6 +13,7 @@ from recon import cli
 from recon.config import ConfigError
 from recon.report import build_result
 from recon.rerun import (
+    rerun_first_run_baseline,
     RERUN_RECORD_KEYS,
     _check_shape,
     check_proof,
@@ -270,10 +271,44 @@ def test_evolved_is_unsupported_never_clean_when_no_prior_shape_was_exercised():
                                          "committed shape (the prior proof's shape) and run again")
     out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE))
     assert out["evolved"] == "unsupported" and "pre_shape" in out["unsupported_reason"]
-    out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE, pre_shape=NEW_SHAPE), prior=PRIOR)
-    assert out["evolved"] == "unsupported"
+    out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE, pre_shape=NEW_SHAPE))
+    assert out["evolved"] == "unsupported" and out["unsupported_kind"] == "nothing_evolved"
     assert out["unsupported_reason"] == ("evolved pre_shape equals the fresh shape: nothing evolved, "
                                          "so the run proves only what fresh proved")
+    assert out["evidence"] == {"fresh": "job-run/1", "evolved": "job-run/1"}
+    assert rerun_first_run_baseline(out) is True
+    assert rerun_first_run_baseline({**out, "evidence": {"fresh": "job-run/1"}}) is False  # the leg has to have run
+
+
+def test_a_committed_shape_equal_to_the_fresh_shape_is_a_real_evolved_leg():
+    """Once the fresh shape is the committed one, a second run from it that lands it again is the
+    idempotency proof itself, not nothing_evolved: the leg passes and names the prior it started from."""
+    out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE, pre_shape=NEW_SHAPE), prior=NEW_SHAPE)
+    assert out["evolved"] == "pass" and out["passed"] is True and "unsupported_kind" not in out
+    assert out["prior_digest"] == shape_digest(_check_shape(NEW_SHAPE, "x"))
+    assert check_proof({"unit": "u", **out}, "u", "x", DIGEST)["evolved"] == "pass"
+
+
+def test_a_declared_prior_that_is_not_the_fresh_shape_is_not_satisfied_by_a_rerun_from_the_fresh_shape():
+    """`nothing_evolved` is what a first run can honestly produce: no other shape exists. Once a prior
+    shape is declared, the leg owed is the one from it; a rerun from the fresh shape did not test the
+    migration from the prior and is graded as the wrong pre_shape, which no posture accepts."""
+    out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE, pre_shape=NEW_SHAPE), prior=PRIOR)
+    assert out["evolved"] == "unsupported" and out["unsupported_kind"] == "pre_shape_not_prior"
+    assert "not the declared prior shape" in out["unsupported_reason"] and out["findings"] == []
+    assert rerun_first_run_baseline(out) is False
+    # landing a different shape on that leg is still the failure it always was
+    out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", OLD_SHAPE, pre_shape=NEW_SHAPE), prior=PRIOR)
+    assert out["evolved"] == "fail" and "unsupported_kind" not in out
+
+
+def test_a_rerun_from_the_fresh_shape_that_lands_a_different_shape_fails_rather_than_counting_as_nothing_evolved():
+    """`nothing_evolved` is the first-run baseline the posture accepts, so it is granted only when the
+    second run landed the fresh shape again; a job that drops or changes a column on its second run
+    is the non-idempotent job the proof exists to catch."""
+    out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", OLD_SHAPE, pre_shape=NEW_SHAPE), prior=PRIOR)
+    assert out["evolved"] == "fail" and out["passed"] is False and "unsupported_kind" not in out
+    assert [(f["run"], f["check"], f["column"]) for f in out["findings"]] == [("evolved", "column_missing", "channel")]
 
 
 def test_evolved_is_unsupported_when_the_pre_shape_lacks_a_fresh_table():
@@ -367,10 +402,20 @@ def test_check_proof_rejects_contradictory_or_malformed_artifacts():
                               "detail": "d"}]},                         # unknown leg
         {k: v for k, v in ran.items() if k != "prior_digest"},       # evolved pass, no prior shape
         {**ran, "prior_digest": ""},
+        {**ran, "unsupported_kind": "nothing_evolved"},               # a kind on a leg that passed
+        # a kind that says the evolved leg ran, on a proof with no evidence that it did
+        {**good, "unsupported_kind": "nothing_evolved"},
+        {**good, "unsupported_kind": "nothing_evolved", "evidence": {"fresh": "job/1", "evolved": " "}},
+        {**good, "unsupported_kind": "pre_shape_not_prior"},
+        {**good, "unsupported_kind": "no_pre_shape"},
+        {**good, "unsupported_kind": "no_evolved_record", "evidence": {"fresh": "job/1", "evolved": "job/2"}},
     ]
     for proof in bad:
         with pytest.raises(ConfigError):
             check_proof(proof, "u", "x", DIGEST)
+    baseline = {**good, "unsupported_kind": "nothing_evolved", "evidence": {"fresh": "job/1", "evolved": "job/2"}}
+    assert check_proof(baseline, "u", "x", DIGEST) == baseline and rerun_first_run_baseline(baseline)
+    assert check_proof({**good, "unsupported_kind": "no_evolved_record"}, "u", "x", DIGEST)
     failed = {**good, "evolved": "fail", "passed": False, "evidence": {"fresh": "j/1", "evolved": "j/2"},
               "findings": [{"run": "evolved", "table": "t", "check": "job_failed", "column": None,
                             "detail": "d"}]}  # a failed job needs no prior shape to be a failure

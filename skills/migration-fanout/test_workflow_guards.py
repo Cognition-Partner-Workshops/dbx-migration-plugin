@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -32,15 +33,18 @@ def _functions():
                                       "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
                                       "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices", "check_wave_tag",
                                       "check_pipelines_published", "_is_manifest", "validate_close", "check_pipeline_updates",
-                                      "batch_verdicts"})
+                                      "batch_verdicts", "structured_decision", "human_decision", "override_decision", "ledger_rows",
+                                      "check_repo_origin", "check_ledger"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
                                                          "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED", "_SEGMENT",
-                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE"}
+                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE",
+                                                         "REPO_RE", "BARE_PATH", "LEDGER_METADATA"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
-                 "subprocess": subprocess, "sys": sys}
+                 "DECISIONS_PATH": Path("/nonexistent/.migration/06_decisions.md"),
+                 "subprocess": subprocess, "sys": sys, "urllib": urllib}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -51,14 +55,21 @@ def _batch_runtime():
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name in {"run_batch", "_run_batch"})
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
-                                                                         "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes"})
+                                                                         "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes",
+                                                                         "structured_decision", "human_decision", "ledger_override",
+                                                                         "override_scope", "scope_covers", "override_forgives",
+                                                                         "evidence_path"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
-                                                         "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS"}
+                                                         "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS",
+                                                         "BARE_PATH", "EVIDENCE_META", "UNSCOPED_OVERRIDE"}
                     for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
+        "json": json,
         "unit_eligibility": lambda head, units: {u: True for u in units},
+        "unit_blocker_classes": lambda head, units: {u: ["rerun_policy"] for u in units},
+        "record_run": lambda **fields: None,
         "evidence_in_pr": lambda head, path, units: bool(head) and any(path.startswith(f".migration/recon/{u}/") for u in units),
         "Counter": Counter,
         "hashlib": hashlib,
@@ -99,7 +110,7 @@ def test_validate_verify_contradiction():
 @pytest.mark.parametrize("value", [0, True, "3"])
 def test_validate_manifest_rejects_invalid_positive_integer(value):
     validate_manifest = _functions()["validate_manifest"]
-    manifest = {"wave": 1, "repo": "repo", "child_macro": "child",
+    manifest = {"wave": 1, "repo": "github.com/acme/target", "child_macro": "child",
                 "verify_macro": "verify", "batches": [{"id": "b", "units": ["u"],
                 "write_targets": ["t"], "brief": "brief"}], "width": value,
                 "base_branch": "migration/loan-servicing"}
@@ -191,7 +202,7 @@ def _gated(batches):
 
 
 def _manifest(**extra):
-    m = {"wave": 1, "repo": "repo", "child_macro": "child", "verify_macro": "verify",
+    m = {"wave": 1, "repo": "github.com/acme/target", "child_macro": "child", "verify_macro": "verify",
          "capabilities": _caps(host=HOST),
          "base_branch": "migration/loan-servicing",
          "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
@@ -1601,7 +1612,7 @@ def _prompt_ns(manifest):
                     isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES", "RESYNC_CLASS"}
                     for t in node.targets))]
     ns = {"json": __import__("json"), "shlex": __import__("shlex"), "re": re, "WAVE": 1, "TAG": "0",
-          "REPO": "repo", "MANIFEST": manifest,
+          "REPO": "github.com/acme/target", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
           "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
@@ -1817,10 +1828,13 @@ def test_pass_without_merge_evidence_is_downgraded(mode):
 
 # ---------------------------------------------------------------- merge authority (WS3.2)
 
-LEDGER = ("| D-6 | 2024-05-01 | user:U1 | widen tolerance for orders_dim | \n"
+LEDGER = ("| D-2 | 2024-05-01 | user:U0 | STOP C wave-0 gates_sha 0 |\n"
+          "| D-6 | 2024-05-01 | user:U1 | widen tolerance for orders_dim | \n"
           "| D-7 | 2024-05-02 | user:U1 | merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
           "| D-8 | 2024-05-02 | default-accepted | merge_override for other_unit |\n"
           "| D-70 | 2024-05-03 | user:U1 | merge_override for u2 |\n")
+# the same rows with this run's STOP C row written after them: every override belongs to an earlier run
+STALE_LEDGER = "".join(LEDGER.splitlines(True)[1:] + LEDGER.splitlines(True)[:1])
 
 
 def _ns_with_ledger(text=LEDGER):
@@ -1847,8 +1861,8 @@ _pass_nomerge = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live"
     {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "7"}},
     {**_pass_nomerge, "merge_eligible": False, "merge_authority": "D-7"},
 ])
-def test_pass_without_merge_eligible_true_needs_a_ledger_override(report):
-    out = _run_one(_ns_with_ledger(), report)
+def test_pass_without_merge_eligible_true_needs_a_ledger_override_below_stop_c(report):
+    out = _run_one(_ns_with_ledger(STALE_LEDGER), report)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
     assert "merge_override" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
     assert "merge_authority" not in out or out["merge_authority"]["kind"] != "human_override"
@@ -1946,7 +1960,7 @@ def test_override_decision_provenance_is_a_cell_of_its_own_not_a_mention_in_the_
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
     ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
-    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 | merge_override for u, u2, u3 |\n"
+    ns["decision_ledger"] = lambda: LEDGER
 
     def run(report):
         async def agent(prompt, **kwargs):
@@ -1961,7 +1975,11 @@ def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "merge_authority" not in out
     assert "recon/u2/result.json" in out["one_line_summary"] and "merge_eligible=False" in out["one_line_summary"]
     assert "recon/u3/result.json" in out["one_line_summary"] and "missing or malformed" in out["one_line_summary"]
+    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 | merge_override for u, u2, u3 |\n"
     out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
+    # the row is the ledger's decision, so a child that forgot to claim it gets the same answer
+    out = run(base)
     assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
 
 
@@ -2590,7 +2608,7 @@ def _resync_ns():
     selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"RESYNC_CLASS", "RESYNC_SCHEMA"}
                                                        for t in n.targets))]
-    ns = {"json": json, "re": re, "WAVE": 1, "REPO": "repo", "BASE_BRANCH": "migration/x",
+    ns = {"json": json, "re": re, "WAVE": 1, "REPO": "github.com/acme/target", "BASE_BRANCH": "migration/x",
           "MANIFEST": _manifest(resync={"command": "python3 load/resync_identity.py --unit u", "units": ["u"]})}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     return ns
@@ -2658,3 +2676,209 @@ def test_close_prompt_names_the_deadline_and_forbids_writes():
     prompt = ns["close_prompt"]([{"batch": "b", "pr_url": "https://example/pr/1", "pr_head": "c" * 40}], 10)
     assert "10 minutes" in prompt and "Write nothing" in prompt and "https://example/pr/1" in prompt
     assert "recon/" not in prompt
+
+
+# ---------------------------------------------------------------- structured evidence and decisions (PR 2)
+
+def test_gate_evidence_may_carry_its_annotation_beside_the_path_never_inside_it():
+    """Yesterday's relaunch: a child wrote `path (rows matched)` and the string was checked as a path."""
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(gates=[
+        {"id": "g-rows", "status": "passed",
+         "evidence": {"path": ".migration/recon/u/rows.md", "label": "row parity", "verdict": "PASS", "rows": 1204}}]))
+    assert out["status"] == "PASS", out.get("one_line_summary")
+    assert out["gates"] == [{**GATE, "status": "passed", "evidence": ".migration/recon/u/rows.md", "decision_id": None,
+                             "evidence_meta": {"label": "row parity", "verdict": "PASS", "rows": 1204}}]
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(gates=[
+        {"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/rows.md (rows matched)"}]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+    assert "bare path" in out["one_line_summary"] and "{path, label}" in out["one_line_summary"]
+
+
+@pytest.mark.parametrize("evidence", [
+    {"path": ".migration/recon/u/rows.md", "note": "x"},         # not a known annotation
+    {"path": ".migration/recon/u/rows.md", "rows": "1204"},      # rows is a count
+    {"path": ".migration/recon/u/rows.md", "rows": True},
+    {"label": "row parity"},                                      # no path
+    {"path": ["a"]},
+    {"path": ""},
+    ["path"],
+    None,
+])
+def test_evidence_objects_are_path_plus_known_annotations_only(evidence):
+    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": evidence}]))
+    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
+
+
+def test_evidence_path_reads_a_string_or_a_path_object():
+    evidence_path = _batch_runtime()["evidence_path"]
+    assert evidence_path("a/b") == "a/b"
+    assert evidence_path({"path": "a/b", "label": "L", "verdict": "PASS", "rows": 0}) == "a/b"
+    assert evidence_path({"path": "a/b", "rows": 1.5}) is None
+    assert evidence_path({"path": "a/b", "other": 1}) is None
+    assert evidence_path(3) is None
+
+
+def test_child_schema_accepts_both_evidence_forms():
+    tree = ast.parse(WORKFLOW.read_text())
+    schema = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
+    evidence = schema["properties"]["gates"]["items"]["properties"]["evidence"]
+    forms = {json.dumps(f, sort_keys=True) for f in evidence["anyOf"]}
+    assert {"type": "string"} in evidence["anyOf"]
+    obj = next(f for f in evidence["anyOf"] if f.get("type") == "object")
+    assert obj["required"] == ["path"] and set(obj["properties"]) == {"path", "label", "verdict", "rows"}
+    assert len(forms) == 2
+
+
+STRUCTURED_LEDGER = (
+    "| D-2 | 2024-05-01 | user:U0 | STOP C wave-0 gates_sha 0 |\n"
+    '| D-7 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"]} | rerun policy on a first run |\n'
+    '| D-8 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["v"]} | prose says u, the cell says v: u |\n'
+    '| D-9 | 2024-05-02 | user:U1 | {"kind": "waive", "units": ["u"]} | merge_override for u in prose only |\n'
+    '| D-10 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["rerun_policy"]} |\n'
+    '| D-11 | 2024-05-02 | default-accepted (soft, 60s) | {"kind": "merge_override", "units": ["u"]} |\n'
+    '| D-12 | 2024-05-02 | user:U1 | {"kind": "waive", "units": ["u"], "gate": "g-rows"} |\n'
+)
+
+
+def _structured_ns(ledger=STRUCTURED_LEDGER, classes=None):
+    ns = _ns_with_ledger(ledger)
+    if classes is not None:
+        ns["unit_blocker_classes"] = lambda head, units: {u: classes for u in units}
+    return ns
+
+
+def test_a_machine_cell_is_the_decision_and_prose_beside_it_is_not_consulted():
+    override_decision = _structured_ns()["override_decision"]
+    assert override_decision("D-7", ["u"], STRUCTURED_LEDGER)
+    assert not override_decision("D-7", ["u", "u2"], STRUCTURED_LEDGER)
+    assert not override_decision("D-8", ["u"], STRUCTURED_LEDGER)      # prose names u, the cell does not
+    assert not override_decision("D-9", ["u"], STRUCTURED_LEDGER)      # the cell is a waiver, prose says merge_override
+    assert not override_decision("D-11", ["u"], STRUCTURED_LEDGER)     # default-accepted is never an override
+    assert override_decision("D-12", ["u"], STRUCTURED_LEDGER, word="waive", gate="g-rows")
+    assert not override_decision("D-12", ["u"], STRUCTURED_LEDGER, word="waive", gate="g-export")
+    assert not override_decision("D-9", ["u"], STRUCTURED_LEDGER, word="waive", gate="g-rows")  # no gate in the cell
+
+
+@pytest.mark.parametrize("cell", [
+    '{"kind": "merge_override"}',                                   # no units
+    '{"kind": "merge_override", "units": "u"}',
+    '{"kind": 3, "units": ["u"]}',
+    '{"units": ["u"]}',
+    '{"kind": "merge_override", "units": ["u"], "gate": 1}',
+    '{"kind": "merge_override", "units": ["u"], "blocker_classes": "data"}',
+    '{"kind": "merge_override", "units": ["u"]',                    # not JSON but looks like a cell
+    '{"kind": "merge_override", "units": ["u"]} | {"kind": "waive", "units": ["u"]}',  # two cells
+])
+def test_a_malformed_machine_cell_is_no_decision_and_preflight_names_its_row(cell):
+    ns = _functions()
+    ledger = f"| D-7 | 2024-05-02 | user:U1 | {cell} | note |\n"
+    assert not ns["override_decision"]("D-7", ["u"], ledger)
+    with pytest.raises(SystemExit, match="D-7"):
+        ns["check_ledger"](ledger)
+    ns["check_ledger"](STRUCTURED_LEDGER)
+    ns["check_ledger"](LEDGER)
+
+
+def test_a_structured_override_row_keeps_the_pass():
+    out = _run_one(_structured_ns(), {**_pass_nomerge, "merge_eligible": False,
+                                      "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-7"}
+
+
+def test_the_ledger_override_written_below_stop_c_applies_even_when_the_child_did_not_claim_it():
+    """The human decided in the ledger; a child that forgot to report merge_authority does not cost a relaunch."""
+    for claimed in ({}, {"merge_authority": {"kind": "harness", "decision_id": None}},
+                    {"merge_authority": {"kind": "human_override", "decision_id": "D-99"}}):
+        out = _run_one(_structured_ns(), {**_pass_nomerge, "merge_eligible": False, **claimed})
+        assert out["status"] == "PASS", out.get("one_line_summary")
+        assert out["merge_authority"] == {"kind": "human_override", "decision_id": "D-7"}
+    # a row above this run's STOP C row is an earlier run's decision, claimed by the child or not
+    rows = STRUCTURED_LEDGER.splitlines()
+    ledger = "\n".join([rows[1], rows[0], *(r for r in rows[2:] if "D-10" not in r)]) + "\n"
+    for claimed in ({}, {"merge_authority": {"kind": "human_override", "decision_id": "D-7"}}):
+        out = _run_one(_structured_ns(ledger), {**_pass_nomerge, "merge_eligible": False, **claimed})
+        assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+        assert "below STOP C D-2" in out["one_line_summary"]
+
+
+def test_a_later_override_row_whose_scope_fits_is_not_hidden_by_a_narrower_one_above_it():
+    ledger = STRUCTURED_LEDGER.replace(
+        '| D-7 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"]} | rerun policy on a first run |\n', ""
+    ) + '| D-13 | 2024-05-03 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["data", "rerun_policy"]} |\n'
+    out = _run_one(_structured_ns(ledger, classes=["data"]), {**_pass_nomerge, "merge_eligible": False})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-13"}
+    out = _run_one(_structured_ns(ledger, classes=["rerun_policy"]), {**_pass_nomerge, "merge_eligible": False})
+    assert out["merge_authority"]["decision_id"] == "D-10"      # the first row that fits wins
+    out = _run_one(_structured_ns(ledger, classes=["structural"]), {**_pass_nomerge, "merge_eligible": False})
+    assert out["status"] == "FAIL" and "D-10" in out["one_line_summary"] and "structural" in out["one_line_summary"]
+
+
+def test_an_unscoped_override_forgives_every_policy_class_and_never_data():
+    scope_covers = _structured_ns()["scope_covers"]
+    assert scope_covers(None, {"u": ["rerun_policy", "privilege_visibility", "structural", "evidence"]})
+    assert not scope_covers(None, {"u": ["data"]}) and not scope_covers(None, {"u": ["rerun_policy", "data"]})
+    assert not scope_covers(None, {"u": ["rerun_policy"], "v": None})   # unrecorded: cannot be shown non-data
+    assert scope_covers(["data"], {"u": ["data"]}) and not scope_covers(["data"], {"u": ["rerun_policy"]})
+    assert scope_covers(None, {})
+
+
+def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
+    report = {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-10"}}
+    out = _run_one(_structured_ns(classes=["rerun_policy"]), report)
+    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-10"
+    # a data blocker is forgiven only by a row that names data: the unscoped D-7 does not, so the halt names it
+    out = _run_one(_structured_ns(classes=["data", "rerun_policy"]), report)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    assert "D-7" in out["one_line_summary"] and "(unscoped)" in out["one_line_summary"]
+    ledger = "\n".join(l for l in STRUCTURED_LEDGER.splitlines() if "D-7" not in l) + "\n"
+    out = _run_one(_structured_ns(ledger, classes=["data", "rerun_policy"]), report)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    assert "D-10" in out["one_line_summary"] and "data" in out["one_line_summary"]
+    named = ledger + '| D-13 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["data", "rerun_policy"]} |\n'
+    out = _run_one(_structured_ns(named, classes=["data", "rerun_policy"]), report)
+    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-13"
+    ns = _structured_ns(named)
+    ns["unit_blocker_classes"] = lambda head, units: {u: None for u in units}   # result.json records no blocker classes
+    out = _run_one(ns, report)   # even the row naming data cannot cover what was not recorded
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "unrecorded" in out["one_line_summary"]
+    out = _run_one(_structured_ns(ledger, classes=["data"]), {**_pass_nomerge, "merge_eligible": False})
+    assert out["status"] == "FAIL" and "D-10" in out["one_line_summary"]
+
+
+@pytest.mark.parametrize("origin", [
+    "https://github.com/acme/target.git\n",
+    "https://github.com/Acme/Target",
+    "git@github.com:acme/target.git",
+    "ssh://git@github.com/acme/target/",
+    "https://user@github.com/acme/target.git",
+    "ssh://git@github.com:2222/acme/target.git",   # an explicit port is not part of the repo
+    "https://github.com:443/acme/target",
+    "/tmp/mirrors/origin.git",           # a local mirror has no host to compare
+    "file:///tmp/mirrors/origin.git",
+])
+def test_check_repo_origin_accepts_origin_at_the_manifests_repo(origin):
+    _functions()["check_repo_origin"]("github.com/acme/target", origin)
+
+
+@pytest.mark.parametrize("origin", [
+    "https://github.com/acme/other.git",
+    "https://ghe.acme.com/acme/target.git",
+    "git@github.com:acme/target-fork.git",
+    "ssh://git@ghe.acme.com:2222/acme/target.git",
+])
+def test_check_repo_origin_halts_when_children_would_open_prs_elsewhere(origin):
+    with pytest.raises(SystemExit, match="manifest 'repo'"):
+        _functions()["check_repo_origin"]("github.com/acme/target", origin)
+
+
+@pytest.mark.parametrize("repo", ["target", "acme/target", "https://github.com/acme/target", "github.com/acme/target/pull"])
+def test_validate_manifest_requires_a_host_owner_name_repo(repo):
+    with pytest.raises(SystemExit, match="host/owner/name"):
+        _functions()["validate_manifest"](_manifest(repo=repo))
+
+
+def test_validate_manifest_rejects_declared_evidence_that_is_not_a_bare_path():
+    gates = [{"id": "g-p", "kind": "custom", "status": "passed", "evidence": "recon/u/result.json (checked)"}]
+    with pytest.raises(SystemExit, match="bare path"):
+        _functions()["validate_manifest"](_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "x", "gates": gates}]))
