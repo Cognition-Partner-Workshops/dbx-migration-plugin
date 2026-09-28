@@ -48,7 +48,47 @@ Each entry records the full contract, then a decision (federate / re-point / dua
 
 ## Notification contract
 
-If `00_context.md` names a notification contract, post to it at exactly these moments: each stop when its artifacts are ready for approval (one message, artifact links, what decision is needed), each wave close (exception count and the wave report), and any fan-out halt (collision or circuit breaker) with what is paused and what unblocks it. Slack posts go through the Slack integration (stops can be approved from the thread); Teams posts go to the webhook whose URL lives in the named secret. Never post per-child or per-green-PR updates. If the interaction contract opts in, add one **daily digest** at the agreed hour (a run that spans a sleep period earns it): the latest wave-close brief's headline, the status-table delta, and anything awaiting the user, in 2-4 sentences with links; it is a summary surface, never a substitute for an approval stop.
+If `00_context.md` names a notification contract, post to it at exactly these moments and no others: each stop when its artifacts are ready for approval, each wave close, any fan-out halt (preflight, collision, circuit breaker), and the one-line relaunch update below. Slack posts go through the Slack integration (stops can be approved from the thread); Teams posts go to the webhook whose URL lives in the named secret. Never post per-child or per-green-PR updates. If the interaction contract opts in, add one **daily digest** at the agreed hour (a run that spans a sleep period earns it): the latest wave card's headline, the status-table delta, and anything awaiting the user, in 2-4 sentences with links; it is a summary surface, never a substitute for an approval stop.
+
+Rules, learned from a run whose reader had to ask "is it running?" five times:
+
+- **One thread.** Every post for a run goes to the same thread; never post in one place and link it from another.
+- **One shape.** Every stop, wave close and halt is the six-line card below, under 90 words, rendered by `skills/migration-fanout/cards.py` (the workflow writes `wave-<N>.card.md` beside the brief; `cards.py halt ...` renders a halt). Attach the artifact links; do not summarize the artifact.
+- **Decision first, reply last.** Line 2 is the one thing the reader decides; line 6 quotes the one phrase that decides it, from the table below, and is accepted case- and punctuation-insensitively (a thumbs-up reaction on the card counts as that phrase). A card that needs nothing says `Reply: none needed`.
+- **Parity is never FAIL when the rows matched.** Say `parity PASS, merge policy BLOCKED (rerun_policy)`; count parity and merge eligibility separately; group blockers by class (`data`, `structural`, `privilege_visibility`, `rerun_policy`, `evidence`) and say what the reader's decision changes and what it does not ("override lifts merge policy only; parity stays as measured").
+- **A plumbing relaunch posts one line, not a card:** `wave 0 relaunch 3: report parser fix, no new decision` (`cards.py relaunch`). Silence between a halt and the next card is what generates the pings.
+- **Halts name the class**, what is paused, and the one action that unblocks; a halt the orchestrator fixes itself needs no reply.
+
+Card (six lines; A, B, C and E share it, wave close and halt swap lines 1-4 for their own):
+
+```
+STOP C  wave plan  run <tag>
+Decision: <what is being approved, in one clause>
+Why it is safe: <where writes go; production untouched>
+Evidence: <gates_sha> · <D-n rows> · <artifact links>
+Recommend: <approve | change X | halt>
+Reply: `approve STOP C`  (or `halt`)
+```
+
+```
+WAVE 1  open  parity PASS 7/7  merge-eligible 0/7  verify PASS
+Blockers: rerun_policy x7, privilege_visibility x2
+Decision: merge 7 verified PRs, then start wave 2. Override D-23 lifts merge policy only; parity stays as measured
+Not done: nothing; wave complete
+PRs: <links>   Evidence: .migration/waves/wave-1.result.json
+Reply: `accept wave 1`  (or `halt`)
+```
+
+Reply phrases (the only ones a card quotes):
+
+| Moment | Approves the recommendation | Other answers |
+|---|---|---|
+| STOP A / B / C | `approve STOP A` (B, C) | `change <field>: <value>`, `halt` |
+| Wave close | `accept wave <N>` | `override wave <N>` (writes the `merge_override` row), `pause`, `halt` |
+| Halt | none, or `relaunch` when the card asks | `halt` |
+| STOP E | `authorize cutover` | `decline cutover` |
+
+STOP E is a one-screen packet, not a card: `references/stop_e_packet.md` is its layout, and the card above is only the post that carries it.
 
 Message style and the one-message-per-event rule are `AGENTS.md`.
 

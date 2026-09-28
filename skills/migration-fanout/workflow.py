@@ -73,6 +73,13 @@ MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
+CARD_PATH = MANIFEST_PATH.with_suffix(".card.md")
+if PLUGIN:
+    sys.path.insert(0, str(PLUGIN / "skills" / "migration-fanout"))
+try:
+    import cards  # the sandbox runs a copy of this script; the pointer's plugin root names its sibling
+except ImportError:  # no plugin root: preflight halts on the missing plugin before a card is due
+    cards = None
 DOCTOR_PATH = MANIFEST_PATH.with_suffix(".doctor.json")
 DECISIONS_PATH = ROOT / ".migration" / "06_decisions.md"
 SMOKE = MANIFEST.get("smoke") is True
@@ -1407,6 +1414,11 @@ CHILD_SCHEMA = {
         "recon_verdict": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]},
         "recon_mode": {"type": "string", "description": "recon --mode of the evidence run (fixture never merges)"},
         "merge_eligible": {"type": "boolean", "description": "result.json['merge_eligible'] of the evidence run"},
+        "parity": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"],
+                   "description": "result.json['parity'] when the harness records it: the row and routine tiers alone"},
+        "blocker_classes": {"type": "array", "items": {"type": "string"},
+                            "description": "result.json['blocker_classes'] when the harness records it: why merge "
+                                           "policy is blocked, never why rows differ"},
         "merge_authority": {
             "type": "object",
             "properties": {"kind": {"type": "string", "enum": ["harness", "human_override"]},
@@ -1552,7 +1564,8 @@ def child_prompt(batch):
         "the PR changes in changed_paths (`git diff --name-only <base>...<head>`); any other .migration/ path turns "
         "PASS into FAIL ledger_tampered.\n"
         "Report: skill_feedback one line per rule you had to derive; recon_cost = result.json['cost'] of the final "
-        "merge-evidence run; one_line_summary for a human skimming 20 of these: what landed, or why not."
+        "merge-evidence run; parity and blocker_classes copied from that result.json when it has them; "
+        "one_line_summary for a human skimming 20 of these: what landed, or why not."
     )
 
 
@@ -1993,7 +2006,7 @@ async def main():
               and (close is None or not auto_merge or not close["unmerged"])
               and verify is not None and verify["wave_verdict"] == "PASS"
               and all(r["status"] == "PASS" for r in results))
-    _tmp_write(RESULT_PATH, json.dumps({
+    result = {
         "wave": WAVE, "tag": TAG, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
         "base_sha": BASE_SHA, "stop_c": MANIFEST["stop_c"],
         "hook_probe": HOOK_PROBE_RESULT, "doctor_signed_at": DOCTOR.get("signed_at"),
@@ -2007,9 +2020,13 @@ async def main():
         "waived_gates": waived_gates(results),
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
         "verify": verify, "resync": resync, "close": close, "close_minutes": CLOSE_MINUTES,
-    }, indent=2, sort_keys=True) + "\n")
+    }
+    _tmp_write(RESULT_PATH, json.dumps(result, indent=2, sort_keys=True) + "\n")
     write_brief(results, verify, surprises, undeclared, unreported, auto_merge, close, to_merge, resync)
-    log(f"wrote {RESULT_PATH} and {BRIEF_PATH}")
+    if cards is None:
+        raise SystemExit(f"{POINTER_PATH} plugin root has no skills/migration-fanout/cards.py; the wave card was not written")
+    _tmp_write(CARD_PATH, cards.wave_card(result))
+    log(f"wrote {RESULT_PATH}, {BRIEF_PATH} and {CARD_PATH}")
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 
 
