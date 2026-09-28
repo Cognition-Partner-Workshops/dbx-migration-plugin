@@ -7,7 +7,9 @@ description: "Run one migration wave as a dynamic workflow: N unit-migration chi
 
 The workflow owns one wave from launch through result writing. It launches children,
 checks their reports, runs independent verification, and writes the result, the brief, and the wave card (`cards.py`, which also renders halt
-cards and the one-line relaunch update from the shell).
+cards and the one-line relaunch update from the shell). Its pure parts live beside it: `ledger.py` (decision rows, STOP C
+approval, override scope), `manifest.py` (manifest grammar, gate shapes, write-target and predicate checks), `report.py`
+(child, verifier, close and resync report schemas and validators); the sandbox imports them from the pointer's plugin root.
 
 ## How to use it
 

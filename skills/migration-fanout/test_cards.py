@@ -258,3 +258,27 @@ def test_override_ids_are_bounded_like_every_other_enumeration():
     lines = _lines(cards.wave_card(_result(batches, overrides=overrides)))
     assert len(lines) == 6 and sum(len(l.split()) for l in lines) <= cards.MAX_WORDS
     assert "Override D-100" in lines[2] and "more lifts merge policy only" in lines[2]
+
+
+def test_a_wave_with_everything_to_say_still_fits_by_dropping_trailing_clauses():
+    """Merged, awaiting, unverified, failed, held, resync-held, overrides, breaker and every write-target
+    flag at once: the card keeps each line's first clause and marks what it dropped."""
+    every = ["data", "structural", "privilege_visibility", "rerun_policy", "evidence"]
+    batches = [_batch(f"m{i}", pr=f"https://example.test/pr/m{i}") for i in range(6)]
+    batches += [_batch(f"a{i}") for i in range(6)] + [_batch(f"u{i}") for i in range(6)]
+    batches += [_batch(f"f{i}", status="FAIL", parity="FAIL", eligible=False, classes=every) for i in range(6)]
+    batches += [_batch(f"x{i}", status="BLOCKED", eligible=False) for i in range(6)]
+    batches += [_batch(f"h{i}", status="NOT_LAUNCHED", parity="NOT_RUN") for i in range(6)]
+    batches += [_batch(f"r{i}") for i in range(6)]
+    verdicts = {b["id"]: ("FAIL" if b["id"][0] == "u" else "PASS") for b in batches}
+    result = _result(batches, verify="FAIL", unit_verdicts=verdicts, auto_merge=True, breaker="harness_error",
+                     overrides=[{"decision_id": f"D-{i}"} for i in range(6)])
+    result["close"] = {"merged_prs": [f"https://example.test/pr/m{i}" for i in range(6)], "unmerged": ["a", "b"]}
+    result["resync"] = {"held_batches": [f"r{i}" for i in range(6)] + ["q0", "q1"]}
+    result.update(write_target_overlaps=["x"], undeclared_write_targets=["y"], unreported_write_targets=["z"])
+    lines = _lines(cards.wave_card(result))
+    assert len(lines) == 6 and sum(len(l.split()) for l in lines) <= cards.MAX_WORDS
+    assert lines[1].startswith("Blockers: data x6, evidence x6, privilege_visibility x6 +2 more classes")
+    assert lines[2].startswith("Decision: 6 PRs merged; 6 verified await merge; resync held r0, r1, r2 +3 more: fix it")
+    assert any(" more in the result" in l for l in lines[1:4])
+    assert lines[5] == "Reply: `relaunch`  (or `halt`)"

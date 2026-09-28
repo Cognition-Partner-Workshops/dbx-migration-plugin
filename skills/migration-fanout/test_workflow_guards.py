@@ -17,6 +17,12 @@ import pytest
 
 
 WORKFLOW = Path(__file__).with_name("workflow.py")
+MODULES = [WORKFLOW, *(WORKFLOW.with_name(n) for n in ("ledger.py", "manifest.py", "report.py"))]
+
+
+def _tree():
+    """The workflow and the modules it imports from the plugin root, as one body."""
+    return ast.Module(body=[n for p in MODULES for n in ast.parse(p.read_text()).body], type_ignores=[])
 
 
 async def _stop_register_workflow(_meta):
@@ -24,7 +30,7 @@ async def _stop_register_workflow(_meta):
 
 
 def _functions():
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
@@ -50,7 +56,7 @@ def _functions():
 
 
 def _batch_runtime():
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name in {"run_batch", "_run_batch"})
@@ -127,6 +133,15 @@ def test_validate_manifest_rejects_invalid_max_minutes(value):
     batch_bad["batches"][0]["max_minutes"] = value
     with pytest.raises(SystemExit, match="max_minutes"):
         validate_manifest(batch_bad)
+
+
+@pytest.mark.parametrize("value", ["a b", "b-1 (held)", 7])
+def test_validate_manifest_rejects_a_batch_id_that_is_not_a_plain_word(value):
+    """A batch id is named on the six-line card and in every halt; a word, never a phrase."""
+    m = _manifest()
+    m["batches"][0]["id"] = value
+    with pytest.raises(SystemExit, match="batch ids must be a plain word"):
+        _functions()["validate_manifest"](m)
 
 
 def test_validate_manifest_accepts_a_batch_max_minutes_override():
@@ -1461,7 +1476,7 @@ def test_gate_check_runs_last_after_the_pr_gate_and_merge_authority():
 
 
 def test_child_schema_and_prompts_carry_gates():
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     schema = next(ast.literal_eval(n.value) for n in tree.body
                   if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
     gate = schema["properties"]["gates"]["items"]
@@ -1603,7 +1618,7 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
 
 
 def _prompt_ns(manifest):
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
              "sum_cost", "cost_line", "close_prompt"}
     selected = [node for node in tree.body
@@ -2004,8 +2019,7 @@ def test_override_decision_marker_does_not_stand_in_for_a_unit_of_that_name():
 
 
 def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():
-    src = WORKFLOW.read_text()
-    tree = ast.parse(src)
+    tree = _tree()
     schema = next(ast.literal_eval(n.value) for n in tree.body
                   if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
     assert "merge_eligible" in schema["required"] and schema["properties"]["merge_eligible"]["type"] == "boolean"
@@ -2087,7 +2101,7 @@ def test_breaker_counts_ledger_tampering():
 
 
 def test_child_schema_requires_changed_paths():
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     ns = {t.id: ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
           for t in node.targets if isinstance(t, ast.Name) and t.id.endswith("_SCHEMA")}
     for schema in (ns["CHILD_SCHEMA"], ns["VERIFY_SCHEMA"]):
@@ -2182,7 +2196,7 @@ def test_workflow_launches_from_the_signed_doctor_record_not_the_editable_one():
 
 
 def _launch_ns(tmp_path, fake_run=None):
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"signed_doctor_report", "wave_signature", "pr_changed_paths",
@@ -2472,7 +2486,7 @@ def test_child_prompt_passes_the_source_family_and_secret_to_the_doctor():
 
 
 def _child_schema():
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     return next(ast.literal_eval(n.value) for n in tree.body
                 if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
 
@@ -2529,7 +2543,7 @@ def test_close_prompt_and_schema_carry_the_wave_close_review_round():
                                      10, merge=False)
     assert "Do not merge anything" in review_only and "one Devin Review round" in review_only
     assert "Merge exactly these PRs" not in review_only
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     schema = next(ast.literal_eval(n.value) for n in tree.body
                   if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CLOSE_SCHEMA" for t in n.targets))
     assert schema["properties"]["review_findings"] == {"type": "array", "items": {"type": "string"}}
@@ -2581,7 +2595,7 @@ def test_verifier_prompt_and_schema_say_verdicts_are_normalised_to_batch_ids():
     ns = _prompt_ns(_manifest())
     text = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1"}])
     assert "unit_verdicts" in text and "batch id" in text and "unit id" in text and "normalis" in text
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     schema = next(ast.literal_eval(n.value) for n in tree.body
                   if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "VERIFY_SCHEMA" for t in n.targets))
     desc = schema["properties"]["unit_verdicts"]["description"]
@@ -2603,7 +2617,7 @@ def test_validate_manifest_accepts_and_checks_the_optional_resync_block():
 
 
 def _resync_ns():
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     names = {"resync_prompt", "validate_resync"}
     selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"RESYNC_CLASS", "RESYNC_SCHEMA"}
@@ -2719,7 +2733,7 @@ def test_evidence_path_reads_a_string_or_a_path_object():
 
 
 def test_child_schema_accepts_both_evidence_forms():
-    tree = ast.parse(WORKFLOW.read_text())
+    tree = _tree()
     schema = next(ast.literal_eval(n.value) for n in tree.body
                   if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
     evidence = schema["properties"]["gates"]["items"]["properties"]["evidence"]
