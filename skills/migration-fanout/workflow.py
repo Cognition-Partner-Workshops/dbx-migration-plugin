@@ -17,14 +17,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import urllib.parse
 from collections import Counter
 from pathlib import Path
 
 POINTER_REL = Path(".migration/waves/current.json")
 HOOK_PROBE = re.compile(r"blocked:[0-9a-f]{8}|not-blocked|unknown")
-TAG_RE = re.compile(r"[A-Za-z0-9_-]+")
-PIPELINE_RE = re.compile(r"[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*")
 DOCTOR_MAX_AGE = datetime.timedelta(minutes=15)
 
 
@@ -54,6 +51,24 @@ if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE
                      "orchestrator's shell; the doctor was given the same value)")
 ROOT = Path(POINTER["workspace"]).resolve() if isinstance(POINTER.get("workspace"), str) else POINTER_PATH.parents[2]
 PLUGIN = Path(POINTER["plugin"]).resolve() if isinstance(POINTER.get("plugin"), str) else None
+if PLUGIN:
+    sys.path.insert(0, str(PLUGIN / "skills" / "migration-fanout"))
+try:  # the sandbox runs a copy of this script; the pointer's plugin root names its siblings
+    import cards
+    from manifest import (BARE_PATH, MERGE_EVIDENCE_MODES, PR_URL, TAG_RE, _is_manifest, bounded_readers,
+                          check_pipeline_updates, check_repo_origin, check_wave_tag, disjoint_slices,
+                          evidence_path, mapped_target, other_wave_manifests, reader_slices, target_key,
+                          transitive_writes, valid_namespace, validate_manifest, wave_signature)
+    from ledger import (UNSCOPED_OVERRIDE, approved_plan_sha, gates_approved, ledger_override, ledger_rows,
+                        ledger_waiver, override_decision, override_forgives, override_scope, rows_after,
+                        scope_covers, structured_decision)
+    from report import (CHILD_SCHEMA, CLOSE_SCHEMA, COST_KEYS, RESYNC_SCHEMA, VERIFY_SCHEMA, _verify_sink,
+                        batch_verdicts, ledger_violations, sum_cost, validate_close, validate_resync,
+                        validate_verify)
+except ImportError:
+    raise SystemExit(f"{POINTER_PATH} names no plugin root with skills/migration-fanout/"
+                     "{cards,ledger,manifest,report}.py and skills/target-routing/pipeline_updates.py; "
+                     "nothing was written") from None
 PIPELINE_UPDATES = (PLUGIN or ROOT) / "skills" / "target-routing" / "pipeline_updates.py"
 WAVES_DIR = ROOT / ".migration" / "waves"
 MANIFEST_PATH = (WAVES_DIR / POINTER["manifest"]).resolve()
@@ -76,12 +91,6 @@ RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
 LOCK_PATH = MANIFEST_PATH.with_name(f".{MANIFEST_PATH.stem}.lock")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 CARD_PATH = MANIFEST_PATH.with_suffix(".card.md")
-if PLUGIN:
-    sys.path.insert(0, str(PLUGIN / "skills" / "migration-fanout"))
-try:
-    import cards  # the sandbox runs a copy of this script; the pointer's plugin root names its sibling
-except ImportError:  # no plugin root: preflight halts on the missing plugin before a card is due
-    cards = None
 DOCTOR_PATH = MANIFEST_PATH.with_suffix(".doctor.json")
 DECISIONS_PATH = ROOT / ".migration" / "06_decisions.md"
 SMOKE = MANIFEST.get("smoke") is True
@@ -142,69 +151,11 @@ def prompt_sha(prompt):
     return hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
 
-VERIFY_DEPTHS = ("sampled", "full")
-MERGE_EVIDENCE_MODES = ("live", "snapshot", "transactional")
-GUARD_MODES = ("block", "warn")
-STOP_MODES = ("hard", "soft")
-GATE_KINDS = ("byte_compare", "export_file", "publish_leg", "row_parity", "structural", "custom")
-GATE_STATUSES = ("pending", "passed", "failed", "waived")
-UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
-BRIEF_MAX_CHARS = 4000
-WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
-ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
-REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")  # host/owner/name
-PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
-BARE_PATH = re.compile(r"\S+")
-# a gate's evidence: the bare path, or the path with its annotation beside it, never inside it
-EVIDENCE_META = {"label": str, "verdict": str, "rows": int}
-DECISION_ID = re.compile(r"D-[0-9]+")
-HUMAN_PROVENANCE = re.compile(r"(?<![\w-])user:[\w][\w.@/-]*")
-DEFAULT_ACCEPTED = re.compile(r"default-accepted(?: ?\([^|]*\))?")
-LEDGER_METADATA = re.compile(rf"D-[0-9]+|\d{{4}}-\d{{2}}-\d{{2}}(?:[T ][\d:.]+Z?(?:[+-]\d{{2}}:?\d{{2}})?)?"
-                             rf"|{HUMAN_PROVENANCE.pattern}|{DEFAULT_ACCEPTED.pattern}")
-
-
 def decision_ledger():
     try:
         return DECISIONS_PATH.read_text()
     except OSError:
         return ""
-
-
-def ledger_rows(ledger):
-    for line in ledger.splitlines():
-        line = line.strip()
-        if "|" not in line:
-            continue
-        cells = [" ".join(c.split()) for c in line.strip("|").split("|")]
-        ids = [c for c in cells if DECISION_ID.fullmatch(c)]
-        if ids:
-            yield ids[0], cells
-
-
-def structured_decision(cells):
-    """The one machine cell a ledger row may carry: a JSON object {kind, units, gate?, blocker_classes?}.
-    None when the row is prose only; ValueError when a cell looks like one and is not."""
-    found = None
-    for c in cells:
-        if not c.startswith("{"):
-            continue
-        try:
-            obj = json.loads(c)
-        except ValueError:
-            raise ValueError(f"cell {c!r} is not JSON") from None
-        if not (isinstance(obj, dict) and isinstance(obj.get("kind"), str)
-                and isinstance(obj.get("units"), list) and all(isinstance(u, str) for u in obj["units"])
-                and isinstance(obj.get("gate", ""), str)
-                and (obj.get("blocker_classes") is None
-                     or (isinstance(obj["blocker_classes"], list)
-                         and all(isinstance(b, str) for b in obj["blocker_classes"])))):
-            raise ValueError(f"cell {c!r} must be {{kind, units: [..], gate?, blocker_classes?: [..]}}")
-        if found is not None:
-            raise ValueError("more than one machine cell")
-        found = obj
-    return found
 
 
 def check_ledger(ledger):
@@ -215,361 +166,6 @@ def check_ledger(ledger):
             structured_decision(cells)
         except ValueError as e:
             raise SystemExit(f"{DECISIONS_PATH} row {row_id}: {e}") from None
-
-
-def human_decision(decision_id, ledger):
-    """The cells of the human row D-<n> names (never a default-accepted one), or None."""
-    if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
-        return None
-    for row_id, cells in ledger_rows(ledger):
-        if (row_id == decision_id and any(HUMAN_PROVENANCE.fullmatch(c) for c in cells)
-                and not any(DEFAULT_ACCEPTED.fullmatch(c) for c in cells)):
-            return cells
-    return None
-
-
-def override_decision(decision_id, units, ledger, word="merge_override", gate=None):
-    """True when the human row D-<n> grants `word` for every unit (and the gate, for a waiver). A row
-    with a machine cell is read from that cell alone; a prose row must name the word, the gate and
-    each unit as whole tokens outside its metadata cells."""
-    cells = human_decision(decision_id, ledger)
-    if cells is None:
-        return False
-    try:
-        machine = structured_decision(cells)
-    except ValueError:
-        return False
-    if machine is not None:
-        return (machine["kind"] == word and set(units) <= set(machine["units"])
-                and (gate is None or machine.get("gate") == gate))
-
-    def token(w):
-        return rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])"
-
-    text = " | ".join(HUMAN_PROVENANCE.sub(" ", c) for c in cells if not LEDGER_METADATA.fullmatch(c))
-    need = Counter((word, *([gate] if gate else []), *units))
-    return all(len(re.findall(token(w), text)) >= n for w, n in need.items())
-
-
-def override_scope(decision_id, ledger):
-    """The blocker classes a structured override row says it covers; None when the row sets no scope."""
-    cells = human_decision(decision_id, ledger)
-    try:
-        machine = structured_decision(cells) if cells else None
-    except ValueError:
-        return None
-    return sorted(machine["blocker_classes"]) if machine and machine.get("blocker_classes") is not None else None
-
-
-def rows_after(ledger, stop_c):
-    """The ledger lines below this run's STOP C row."""
-    lines = ledger.splitlines()
-    for n, line in enumerate(lines):
-        if any(row_id == stop_c for row_id, _ in ledger_rows(line)):
-            return lines[n + 1:]
-    return []
-
-
-def ledger_waiver(gate_id, units, ledger, stop_c):
-    for line in rows_after(ledger, stop_c):
-        for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
-            if override_decision(decision_id, units, line, word="waive", gate=gate_id):
-                return decision_id
-    return None
-
-
-# what a merge_override row that sets no blocker_classes forgives: every policy class, never data.
-# Rows that differ are fixed in converted code; only a row that names "data" says otherwise
-UNSCOPED_OVERRIDE = frozenset({"structural", "privilege_visibility", "rerun_policy", "evidence"})
-
-
-def override_forgives(scope):
-    return UNSCOPED_OVERRIDE if scope is None else set(scope)
-
-
-def scope_covers(scope, classes):
-    """Whether an override's blocker-class scope covers what each unit recorded. An unrecorded class
-    list (a harness before blocker classes, or a malformed result) fits no override: it cannot show
-    the blockers are not data."""
-    return all(c is not None and set(c) <= override_forgives(scope) for c in classes.values())
-
-
-def ledger_override(units, ledger, stop_c, classes=None):
-    """The merge_override row a human wrote for these units below this run's STOP C row whose scope
-    covers the units' recorded blocker classes, whether or not the child thought to report it: the
-    decision is the ledger's, not the child's memory. The first applicable row wins; a narrower one
-    above it is not a refusal, and is returned only when no row covers the classes (so the halt names it)."""
-    named = None
-    for line in rows_after(ledger, stop_c):
-        for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
-            if override_decision(decision_id, units, line):
-                if scope_covers(override_scope(decision_id, line), classes or {}):
-                    return decision_id
-                named = named or decision_id
-    return named
-
-
-# manifest keys a plumbing relaunch may change without a new STOP C: how a child is briefed and
-# connected, and estimates. Everything else is the plan the row approved (contract: order,
-# dependencies, width, gates, write targets). Of `source`, only the secret name is plumbing:
-# the family and the params select the slice that is reconciled, which is scope
-PLAN_PLUMBING = frozenset({"brief", "repo", "secrets", "cost_estimate", "max_minutes", "stop_c", "gates_sha"})
-SOURCE_PLUMBING = frozenset({"secret"})
-
-
-def approved_plan_sha(manifest):
-    def strip(x):
-        if isinstance(x, dict):
-            return {k: strip(v) for k, v in x.items() if k not in PLAN_PLUMBING}
-        if isinstance(x, list):
-            return [strip(v) for v in x]
-        return x
-    plan = strip(manifest)
-    if isinstance(plan.get("source"), dict):
-        plan["source"] = {k: v for k, v in plan["source"].items() if k not in SOURCE_PLUMBING}
-    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def declared_gates_sha(wave, batches, degraded=False):
-    declared = {"wave": wave, "batches": {
-        b["id"]: {"units": sorted(b["units"]),
-                  "gates": [[g["id"], g["kind"], g["status"], g["evidence"], g.get("decision_id")] for g in b["gates"]]}
-        for b in batches}}
-    if degraded:
-        declared["degraded"] = True
-    return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def gates_approved(decision_id, wave, sha, ledger, stop_mode="hard"):
-    if not (isinstance(decision_id, str) and DECISION_ID.fullmatch(decision_id)
-            and isinstance(wave, int) and not isinstance(wave, bool)
-            and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
-        return False
-    approval = re.compile(rf"stop c wave-{wave} gates_sha {sha}", re.I)
-
-    def provenance(c):
-        return HUMAN_PROVENANCE.fullmatch(c) or (stop_mode == "soft" and DEFAULT_ACCEPTED.fullmatch(c))
-
-    for line in ledger.splitlines():
-        line = line.strip()
-        if not line.startswith("|"):
-            continue
-        cells = [" ".join(c.split()) for c in line.strip("|").split("|")]
-        if decision_id in cells and any(provenance(c) for c in cells) and any(approval.fullmatch(c) for c in cells):
-            return True
-    return False
-
-
-def validate_gates(b):
-    """A batch's acceptance gates, field by field, exactly as STOP C declared them."""
-    def req(cond, msg):
-        if not cond:
-            raise SystemExit(msg)
-    gates = b.get("gates")
-    req(isinstance(gates, list) and gates and all(isinstance(g, dict) for g in gates),
-        f"batch {b['id']} 'gates' must be a non-empty list of {{id, kind, status, evidence, decision_id?}} rows")
-    ids = Counter(g.get("id") for g in gates)
-    req(all(isinstance(i, str) and UNIT_ID.fullmatch(i) for i in ids),
-        f"batch {b['id']} gate 'id' must be a plain word (letters, digits, _ . -)")
-    dup = [i for i, c in ids.items() if c > 1]
-    req(not dup, f"batch {b['id']} gate ids must be unique: {dup}")
-    for g in gates:
-        req(g.get("kind") in GATE_KINDS, f"batch {b['id']} gate {g['id']} 'kind' must be one of {GATE_KINDS}")
-        req(g.get("status") in GATE_STATUSES, f"batch {b['id']} gate {g['id']} 'status' must be one of {GATE_STATUSES}")
-        req(isinstance(g.get("evidence"), str) and (g["status"] != "passed" or g["evidence"]),
-            f"batch {b['id']} gate {g['id']} 'evidence' must be a string, non-empty once passed")
-        req(not g["evidence"] or BARE_PATH.fullmatch(g["evidence"]),
-            f"batch {b['id']} gate {g['id']} 'evidence' must be a bare path (no spaces or notes)")
-        decision = g.get("decision_id")
-        req(not ((g["status"] == "waived" and decision is None)
-                 or (decision is not None and not (isinstance(decision, str) and DECISION_ID.fullmatch(decision)))),
-            f"batch {b['id']} gate {g['id']} 'decision_id' must be the D-<n> row of 06_decisions.md "
-            "(required for a waived gate)")
-
-
-def target_key(name, namespace=""):
-    """The one identity of a table however a manifest or mapping spells it: trimmed, unquoted, case-folded."""
-    def segments(s):
-        return [re.sub(r'^[`"\[]|[`"\]]$', "", p.strip()).casefold() for p in str(s).strip().split(".")] \
-            if str(s).strip() else []
-    parts, prefix = segments(name), segments(namespace)
-    if parts and all(parts) and len(parts) <= len(prefix):
-        parts = prefix[:len(prefix) + 1 - len(parts)] + parts
-    return ".".join(parts)
-
-
-def valid_namespace(value):
-    return isinstance(value, str) and all(re.fullmatch(r"[a-z_][\w$]*", s) for s in target_key(value).split("."))
-
-
-def reads_target(obj, table, namespace=""):
-    o, t = target_key(obj, namespace), target_key(table, namespace)
-    if not o:
-        return False
-    if not namespace and ("." not in o or "." not in t):
-        return o.rsplit(".", 1)[-1] == t.rsplit(".", 1)[-1]
-    return o == t
-
-
-def validate_manifest(m, doctor=None):
-    """Fail here, in one line, instead of 20 children failing on a missing field."""
-    def req(cond, msg):
-        if not cond:
-            raise SystemExit(msg)
-    def strs(v):
-        return isinstance(v, list) and all(isinstance(s, str) for s in v)
-    def pos_int(key, hi):
-        v = m.get(key)
-        return key not in m or (isinstance(v, int) and not isinstance(v, bool)
-                                and (v > 0 if hi is None else 0 < v <= hi))
-    for key in ("wave", "repo", "child_macro", "verify_macro", "batches", "base_branch"):
-        req(key in m, f"manifest is missing '{key}'")
-    req(bool(m["batches"]), "manifest has no batches")
-    req(isinstance(m["repo"], str) and REPO_RE.fullmatch(m["repo"]),
-        f"manifest 'repo' must be host/owner/name (the repo of every child's PR URL), got {m['repo']!r}")
-    req(isinstance(m["wave"], int) and not isinstance(m["wave"], bool) and m["wave"] >= 0,
-        "manifest key 'wave' must be a non-negative integer")
-    for key in ("width", "breaker_threshold"):
-        req(pos_int(key, None), f"manifest key '{key}' must be a positive integer")
-    for key, hi in (("max_minutes", 60), ("close_minutes", 60), ("doctor_max_age", 1440)):
-        req(pos_int(key, hi), f"manifest key '{key}' must be a positive integer of at most {hi} minutes")
-    req(isinstance(m.get("degraded", False), bool), "manifest key 'degraded' must be a boolean")
-    req("secrets" not in m or strs(m["secrets"]),
-        "wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
-    pipelines = m.get("pipelines")
-    req("pipelines" not in m or (isinstance(pipelines, dict) and pipelines
-        and all(isinstance(p, str) and PIPELINE_RE.fullmatch(p) for p in pipelines)
-        and all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in pipelines.values())),
-        "manifest key 'pipelines' must map each pipeline the plan split (letters, digits, '_') to a "
-        "positive wave count, the <pipeline>-<N> of its wave-<pipeline>-<N>.json manifests")
-    req(m["wave"] != 0 or m.get("width", 20) == 1,
-        "wave 0 is the serial shared-objects wave: set width to 1")
-    req(isinstance(m["base_branch"], str) and WORD.fullmatch(m["base_branch"]) and ".." not in m["base_branch"],
-        "manifest 'base_branch' must be a plain branch name (letters, digits, _ . / -)")
-    req("target_namespace" not in m or valid_namespace(m["target_namespace"]),
-        "manifest 'target_namespace' must be the dotted catalog.schema (or schema) the harness run is "
-        "given, so a bare write target or mapping object is that table and no other")
-    req(m["base_branch"] not in ("main", "master")
-        or (isinstance(m.get("trunk_base_decision"), str) and m["trunk_base_decision"].strip()),
-        "base_branch 'main' is the trunk: migration ledgers and unit PRs land on the engagement "
-        "feature branch; set base_branch to it, or record the decision in 06_decisions.md and put "
-        "its row reference in 'trunk_base_decision'")
-    ids = Counter(b.get("id") for b in m["batches"])
-    dupes = [i for i, c in ids.items() if c > 1 or not i]
-    req(not dupes, f"batch ids must be unique and non-empty: {dupes}")
-    ns = m.get("target_namespace", "") if isinstance(m.get("target_namespace", ""), str) else ""
-    owners = {}
-    for b in m["batches"]:
-        for key in ("units", "brief"):
-            req(bool(b.get(key)),
-                f"batch {b['id']} is missing '{key}' (a child with no brief cannot be launched safely)")
-        req(isinstance(b["brief"], str) and len(b["brief"]) <= BRIEF_MAX_CHARS,
-            f"batch {b['id']} brief is {len(str(b['brief']))} chars; the cap is {BRIEF_MAX_CHARS}. A brief names "
-            "the units, targets, gates and the files to read (skills/migration-fanout/references/brief_template.md); "
-            "hosts, principals, warehouses and secret names live in the manifest and 09_capabilities.json, "
-            "which every child already reads")
-        req(strs(b.get("write_targets")) and all(t.strip() for t in b["write_targets"]),
-            f"batch {b['id']} needs 'write_targets', a list of table names (empty only for a batch "
-            "whose dependency analysis writes nothing)")
-        deploy = b.get("deploy_objects", [])
-        req(strs(deploy) and all(t.strip() for t in deploy)
-            and len({target_key(t, ns) for t in deploy}) == len(deploy),
-            f"batch {b['id']} 'deploy_objects' must be a list of distinct names: the procedures, views "
-            "and jobs the batch deploys, which no routine's DML writes")
-        declared = {target_key(t, ns) for t in b["write_targets"]}
-        outside = sorted(t for t in deploy if target_key(t, ns) not in declared)
-        req(not outside, f"batch {b['id']} 'deploy_objects' {outside} are not in its write_targets; every object a "
-            "child deploys is a write target (it collides like any other)")
-        req(b.get("verify_depth", "sampled") in VERIFY_DEPTHS,
-            f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
-        req("max_minutes" not in b or (isinstance(b["max_minutes"], int) and not isinstance(b["max_minutes"], bool)
-            and 0 < b["max_minutes"] <= 60),
-            f"batch {b['id']} max_minutes must be a positive integer of at most 60 minutes")
-        req("secrets" not in b or strs(b["secrets"]),
-            "wave manifest 'secrets' (top level or per batch) must be a list of scope/key strings")
-        bad = [u for u in b["units"] if not isinstance(u, str) or not UNIT_ID.fullmatch(u)]
-        req(not bad, f"batch {b['id']} unit id(s) {bad!r} are not a plain directory name (letters, digits, "
-            "_ . -, not wave-*): the id names the only .migration/recon/<unit_id>/ its child may write")
-        for u in b["units"]:
-            owners.setdefault(u, []).append(b["id"])
-        validate_gates(b)
-    shared = {u: bs for u, bs in owners.items() if len(bs) > 1}
-    req(not shared, f"a unit id belongs to one batch (its child alone writes .migration/recon/<unit_id>/): {shared}")
-    req(isinstance(m.get("stop_c"), str) and DECISION_ID.fullmatch(m["stop_c"]),
-        "manifest 'stop_c' must be the D-<n> row of 06_decisions.md that resolved STOP C for this wave "
-        "(the row that records its gates_sha)")
-    want = declared_gates_sha(m["wave"], m["batches"], m.get("degraded") is True)
-    req(m.get("gates_sha") == want,
-        f"manifest 'gates_sha' is {m.get('gates_sha')!r} but the declared gate list hashes to {want}: "
-        "record that value at STOP C with the approved gates; a gate renamed, added, dropped, swapped "
-        "for another kind or given another status or evidence since, or the wave declared DEGRADED "
-        "since, is a plan change, not a child's call, so this run halts")
-    src = m.get("source")
-    req(src is None or (isinstance(src, dict) and isinstance(src.get("params", {}), dict)
-        and all(isinstance(v, str) and WORD.fullmatch(v) for v in (src.get("family"), *src.get("params", {}).keys()))
-        and isinstance(src.get("secret"), str) and ENV_NAME.fullmatch(src["secret"])
-        and all(isinstance(v, str) and PARAM_VALUE.fullmatch(v) for v in src.get("params", {}).values())),
-        "manifest 'source' must be {family, secret (env var NAME of the DSN), params?}: family and "
-        "param names one plain word (letters, digits, _ . / -), secret a shell variable name, param "
-        "values what dbx-recon run --param accepts; they become the doctor's command line")
-    req(m.get("verify_depth", "sampled") in VERIFY_DEPTHS, f"manifest 'verify_depth' must be one of {VERIFY_DEPTHS}")
-    req("cost_estimate" not in m or isinstance(m["cost_estimate"], dict),
-        "manifest 'cost_estimate' must be an object (output of `dbx-recon estimate`, summed over the wave)")
-    rs = m.get("resync")
-    if rs is not None:
-        req(isinstance(rs, dict) and set(rs) == {"command", "units"} and isinstance(rs["command"], str)
-            and rs["command"].strip() and isinstance(rs["units"], list) and rs["units"],
-            "manifest 'resync' must be {command: non-empty shell command, units: [unit ids declared "
-            "in this wave]} and nothing else (no SQL in the manifest); the parent-owned step runs "
-            "the command once after the children report and before the verifier")
-        ghosts = [u for u in rs["units"] if not isinstance(u, str) or u not in owners]
-        req(not ghosts, f"manifest 'resync.units' {ghosts!r} are not units of this wave's batches")
-    caps = m.get("capabilities")
-    req(isinstance(caps, dict) and isinstance(caps.get("identity"), str) and caps["identity"],
-        "manifest 'capabilities' must be an object with a non-empty 'identity' "
-        "(the migration principal's userName from 09_capabilities.json); no wave "
-        "launches without the factory-doctor contract the children compare against")
-    req(isinstance(caps.get("catalogs"), list) and caps["catalogs"]
-        and all(isinstance(c, str) and c for c in caps["catalogs"]),
-        "manifest 'capabilities.catalogs' must be the non-empty allowlist of catalog names")
-    for key, allowed in (("guard_mode", GUARD_MODES), ("stop_mode", STOP_MODES)):
-        req(caps.get(key) in allowed, f"manifest 'capabilities.{key}' must be one of {allowed}")
-    req(caps.get("ready") is True,
-        "manifest 'capabilities.ready' must be true: the factory-doctor preflight "
-        "did not pass; fix the D10 and re-run the doctor before launching a wave")
-    req(isinstance(m.get("auto_merge", False), bool), "manifest 'auto_merge' must be a boolean")
-    req(caps["stop_mode"] != "hard" or not m.get("auto_merge", False),
-        "manifest 'auto_merge' must be false under capabilities.stop_mode 'hard': "
-        "merge authority stays with a human")
-    if doctor is None:
-        return
-    req(doctor.get("ready") is True,
-        f"the factory-doctor is not ready now ({doctor.get('blocking')}): fix the D10 before a wave")
-    ident = doctor.get("identity")
-    rows = {c.get("id"): c.get("data") or {} for c in doctor.get("checks", []) if isinstance(c, dict)}
-    req(isinstance(ident, dict) and ident.get("userName") and ident.get("host"),
-        "09_capabilities.json records no verified identity and host; a wave launches only from a "
-        "doctor report that saw the migration principal")
-    recorded = {"identity": ident["userName"], "host": ident["host"],
-                "catalogs": sorted(rows.get("allowed_targets", {}).get("catalogs") or []),
-                "guard_mode": rows.get("allowed_targets", {}).get("guard_mode"),
-                "stop_mode": rows.get("workspace", {}).get("stop_mode")}
-    for key, want in recorded.items():
-        got = sorted(c.strip().strip("`").lower() for c in caps["catalogs"]) if key == "catalogs" else caps.get(key)
-        req(got == want, f"manifest 'capabilities.{key}' is {got!r} but the doctor recorded {want!r} in "
-            "09_capabilities.json; copy the doctor's values, never edit them")
-    req(doctor.get("source") == m.get("source"),
-        "manifest 'source' differs from the source the doctor was signed for; "
-        "re-run the doctor with --wave on this manifest")
-
-
-def wave_signature(body, manifest_bytes):
-    ident = body.get("identity") or {}
-    key = hashlib.sha256(manifest_bytes + str(ident.get("userName") or "").encode()
-                         + str(ident.get("host") or "").encode()).digest()
-    message = json.dumps({k: v for k, v in body.items() if k != "signature"},
-                         sort_keys=True, separators=(",", ":")).encode()
-    return hmac.new(key, message, "sha256").hexdigest()
 
 
 def signed_doctor_report(path, manifest_bytes, now=None):
@@ -653,19 +249,6 @@ def fetch_ref(ref):
     subprocess.run(git + ["fetch", "-q", "origin", f"+{ref}:{local}"], check=True, capture_output=True, timeout=300)
     return subprocess.run(git + ["rev-parse", "--verify", f"{local}^{{commit}}"],
                           check=True, capture_output=True, text=True, timeout=300).stdout.strip()
-
-
-def evidence_path(evidence):
-    """The path a reported gate's evidence names: the string itself, or the `path` of
-    {path, label?, verdict?, rows?}. None when it is neither."""
-    if isinstance(evidence, str):
-        return evidence
-    if (isinstance(evidence, dict) and isinstance(evidence.get("path"), str)
-            and set(evidence) - {"path"} <= set(EVIDENCE_META)
-            and all(isinstance(evidence[k], t) and not isinstance(evidence[k], bool)
-                    for k, t in EVIDENCE_META.items() if k in evidence)):
-        return evidence["path"]
-    return None
 
 
 def gate_outcomes(batch, reported, ledger, head):
@@ -785,50 +368,6 @@ def record_run(**fields):
         f.flush()
 
 
-def check_wave_tag(tag, manifest):
-    wave = manifest["wave"]
-    last = tag.rsplit("-", 1)[-1]
-    if not last.isdigit() or int(last) != wave:
-        raise SystemExit(f"wave-{tag}.json: the wave number in the file name must equal the manifest's 'wave' ({wave})")
-    pipeline = tag.rsplit("-", 1)[0]
-    count = manifest.get("pipelines", {}).get(pipeline) if pipeline != tag else None
-    if pipeline != tag and (not isinstance(count, int) or isinstance(count, bool) or count < int(last)):
-        raise SystemExit(f"wave-{tag}.json: wave-<pipeline>-<N>.json manifests must list every sibling pipeline in "
-                         f"'pipelines' (including {pipeline}): the planning barrier reads it")
-
-
-def _is_manifest(name):
-    return (name.startswith("wave-") and name.endswith(".json")
-            and TAG_RE.fullmatch(name[len("wave-"):-len(".json")]) is not None)
-
-
-def check_pipeline_updates(script, manifest_path):
-    if not Path(script).is_file():
-        raise SystemExit(f"{script} is missing: the pointer's `plugin` must name the plugin root so the wave can run "
-                         "skills/target-routing/pipeline_updates.py before launching")
-    try:
-        proc = subprocess.run([sys.executable, str(script), str(manifest_path)],
-                              capture_output=True, text=True, timeout=300)
-    except (OSError, subprocess.SubprocessError) as e:
-        raise SystemExit(f"pipeline_updates.py did not run ({e}); the wave does not launch unchecked")
-    try:
-        result = json.loads(proc.stdout)
-        order = result["order"]
-        assert isinstance(order, dict) and all(isinstance(v, list) for v in order.values())
-    except (ValueError, KeyError, TypeError, AssertionError):
-        result, order = {}, None
-    if proc.returncode != 0:
-        why = [f"pipeline {s.get('pipeline')!r} is shared by {', '.join(map(str, s.get('batches', [])))} without a "
-               f"pipeline_serialized decision" for s in result.get("shared", []) if s.get("serialized") is False]
-        if result.get("unchecked_batches"):
-            why.append(f"unsupported: {', '.join(map(str, result['unchecked_batches']))} declare no lakeflow_pipelines")
-        raise SystemExit(f"pipeline_updates.py exit {proc.returncode}, the wave does not launch: "
-                         + ("; ".join(why) or f"{proc.stdout.strip()} {proc.stderr.strip()}".strip()))
-    if order is None:
-        raise SystemExit(f"pipeline_updates.py printed no order: {proc.stdout.strip()[:500]}")
-    return order
-
-
 def published_manifests():
     git = ["git", "-C", str(ROOT)]
     try:
@@ -882,31 +421,6 @@ def check_pipelines_published(waves_dir, m, published=None):
                          "preflight so the collision check reads it")
 
 
-def other_wave_manifests(waves_dir, current):
-    out = {}
-    for p in sorted(waves_dir.glob("wave-*.json")):
-        if p.name == current or not _is_manifest(p.name):
-            continue
-        tail = "every wave manifest is read for cross-wave write-target collisions, so fix it, then re-run"
-        try:
-            m = json.loads(p.read_text())
-        except ValueError as e:
-            raise SystemExit(f"{p} is not valid JSON ({e}); {tail}") from None
-        batches = m.get("batches") if isinstance(m, dict) else None
-        if not isinstance(batches, list) or not all(
-                isinstance(b, dict) and isinstance(b.get("id"), str)
-                and isinstance(b.get("units"), list) and all(isinstance(u, str) for u in b["units"])
-                and isinstance(b.get("write_targets"), list) and all(isinstance(t, str) for t in b["write_targets"])
-                for b in batches):
-            raise SystemExit(f"{p} has no 'batches' list of {{id, units, write_targets}} rows; {tail}")
-        namespace = m.get("target_namespace", "")
-        if "target_namespace" in m and not valid_namespace(namespace):
-            raise SystemExit(f"{p} 'target_namespace' must be the dotted catalog.schema (or schema) its harness run "
-                             f"is given; {tail}")
-        out[p.name] = {"target_namespace": namespace, "batches": batches}
-    return out
-
-
 def unit_mapping(unit):
     """The unit's recon mapping spec, None when the child has not written it yet."""
     p = ROOT / ".migration" / "units" / unit / "mapping_spec.json"
@@ -916,181 +430,6 @@ def unit_mapping(unit):
         return json.loads(p.read_text())
     except ValueError as e:
         raise SystemExit(f"{p} is not valid JSON ({e})") from None
-
-
-_SEGMENT = r'(?:[A-Za-z_][\w$]*|\[[^\]]+\]|"(?:[^"]|"")+"|`[^`]+`)'
-PREDICATE_TOKEN = re.compile(
-    r"\s+|(?P<string>'(?:[^']|'')*')|(?P<param>\$\{\w+\})|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
-    rf"|(?P<word>{_SEGMENT}(?:\.{_SEGMENT})*)|(?P<punct><>|!=|<=|>=|[=<>(),])")
-PREDICATE_WORDS = {"and", "or", "not", "in", "between", "is", "null", "like", "true", "false"}
-
-
-def column_key(name):
-    return re.sub(r'^[`"\[]|[`"\]]$', "", str(name).strip().split(".")[-1].strip()).casefold()
-
-
-def predicate_slices(where, scope):
-    if not isinstance(where, str):
-        return None
-    scope = {column_key(c) for c in scope}
-    tokens, pos = [], 0
-    while pos < len(where):
-        m = PREDICATE_TOKEN.match(where, pos)
-        if not m:
-            return None
-        if m.lastgroup:
-            tokens.append((m.lastgroup, m.group()))
-        pos = m.end()
-
-    def keyword(i, *words):
-        return i < len(tokens) and tokens[i][0] == "word" and tokens[i][1].lower() in words
-
-    def value(kind, text):
-        if kind == "number":
-            return "n", float(text)
-        if kind == "param":
-            return "p", text[2:-1]
-        text = text[1:-1].replace("''", "'")
-        return ("p", text[2:-1]) if re.fullmatch(r"\$\{\w+\}", text) else ("s", text)
-
-    def pins(toks):
-        words = [t.lower() for k, t in toks if k == "word"]
-        columns = [i for i, (k, t) in enumerate(toks) if k == "word" and t.lower() not in PREDICATE_WORDS
-                   and not (t.lower() in ("date", "timestamp") and i + 1 < len(toks) and toks[i + 1][0] == "string")]
-        values = [(i, value(k, t)) for i, (k, t) in enumerate(toks) if k in ("string", "number", "param")]
-        ops = [t for k, t in toks if k == "punct" and t in ("=", "<", "<=", ">", ">=")]
-        wildcard = "like" in words and all(re.fullmatch(r"'[%_]*'", t) for k, t in toks if k == "string")
-        if not (len(columns) == 1 and column_key(toks[columns[0]][1]) in scope and values and (ops or any(
-                w in ("in", "like", "between") for w in words)) and not wildcard
-                and not any(w in ("is", "not") for w in words)
-                and not any(k == "punct" and t in ("<>", "!=") for k, t in toks)):
-            return None
-        col = column_key(toks[columns[0]][1])
-        if "like" in words:
-            return col, ("like",)
-        if "in" in words or ops == ["="]:
-            return col, ("eq", frozenset(v for _, v in values))
-        if "between" in words and len(values) == 2 and not ops:
-            return col, ("range", (values[0][1], True), (values[1][1], True))
-        if len(ops) == 1 and len(values) == 1:
-            op, (at, v) = ops[0], values[0]
-            if at < columns[0]:
-                op = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}[op]
-            return col, (("range", None, (v, op == "<=")) if op in ("<", "<=") else ("range", (v, op == ">="), None))
-        return col, ("like",)
-
-    def both(a, b):
-        return [{c: x.get(c, []) + y.get(c, []) for c in {*x, *y}} for x in a for y in b]
-
-    def expr(i):
-        boxes, i = term(i)
-        while keyword(i, "or"):
-            b, i = term(i + 1)
-            boxes = None if boxes is None or b is None else boxes + b
-        return boxes, i
-
-    def term(i):
-        boxes, i = factor(i)
-        while keyword(i, "and"):
-            b, i = factor(i + 1)
-            boxes = b if boxes is None else boxes if b is None else both(boxes, b)
-        return boxes, i
-
-    def factor(i):
-        if keyword(i, "not"):
-            return None, factor(i + 1)[1]
-        if i < len(tokens) and tokens[i] == ("punct", "("):
-            boxes, i = expr(i + 1)
-            if i >= len(tokens) or tokens[i] != ("punct", ")"):
-                raise ValueError
-            return boxes, i + 1
-        start, depth, between = i, 0, False
-        while (i < len(tokens)
-               and not (depth == 0 and not between
-                        and (keyword(i, "and", "or") or tokens[i] == ("punct", ")")))):
-            depth += (tokens[i] == ("punct", "(")) - (tokens[i] == ("punct", ")"))
-            if depth < 0:
-                raise ValueError
-            between = (between and not keyword(i, "and")) or keyword(i, "between")
-            i += 1
-        atom = tokens[start:i]
-        if not atom or depth:
-            raise ValueError
-        pin = pins(atom)
-        return (None if pin is None else [{pin[0]: [pin[1]]}]), i
-
-    try:
-        boxes, end = expr(0)
-    except ValueError:
-        return None
-    return boxes if end == len(tokens) else None
-
-
-def bounded_predicate(where, scope):
-    """Whether a target_where bounds the rows recon reads to the unit's own slice (predicate_slices)."""
-    return predicate_slices(where, scope) is not None
-
-
-def disjoint_slices(a, b):
-    """Whether two readers' slices can never select the same row: every box of one against every box of."""
-    def literal(v, kind):
-        return v[0] == kind and kind != "p"
-
-    def below(hi, lo):
-        return (hi is not None and lo is not None and hi[0][0] == lo[0][0] and literal(hi[0], hi[0][0])
-                and (hi[0][1] < lo[0][1] or (hi[0][1] == lo[0][1] and not (hi[1] and lo[1]))))
-    def apart(x, y):
-        if x[0] == "like" or y[0] == "like":
-            return False
-        if x[0] == "eq" and y[0] == "eq":
-            params = {v for v in x[1] | y[1] if v[0] == "p"}
-            return not (x[1] & y[1]) and (not params or params == x[1] | y[1])
-        if x[0] == "range" and y[0] == "range":
-            return below(x[2], y[1]) or below(y[2], x[1])
-        eq, rng = (x, y) if x[0] == "eq" else (y, x)
-        return all(below((v, True), rng[1]) or below(rng[2], (v, True)) for v in eq[1])
-
-    return all(any(apart(x, y) for c in set(p) & set(q) for x in p[c] for y in q[c]) for p in a for q in b)
-
-
-def bounded_readers(spec, table, namespace=""):
-    objects = spec.get("objects", spec.get("tables")) if isinstance(spec, dict) else None
-    if not isinstance(objects, list) or not all(isinstance(o, dict) for o in objects):
-        raise SystemExit("mapping spec 'objects' must be a list of object rows")
-    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
-    if not mine:
-        return None
-
-    def columns(row, inherited=None):
-        scope = row.get("scope_columns", inherited)
-        if not (isinstance(scope, list) and scope and all(isinstance(c, str) and c.strip() for c in scope)):
-            return None
-        return scope
-
-    for o in mine:
-        scope = columns(o)
-        if scope is None:
-            return "declares no scope_columns (non-empty list of the table's partition or run-date columns)"
-        if not bounded_predicate(o.get("target_where"), scope):
-            return "reads it without a target_where pinning one of its scope_columns"
-        embeds = o.get("embeds", [])
-        if not isinstance(embeds, list) or not all(isinstance(e, dict) for e in embeds):
-            return "has 'embeds' that is not a list of embed rows"
-        for e in embeds:
-            escope = columns(e, scope)
-            if escope is None or not bounded_predicate(e.get("target_where"), escope):
-                return (f"embed '{e.get('array_path')}' reads it without its own target_where pinning one of its "
-                        "scope_columns (or the object's)")
-    return ""
-
-
-def reader_slices(spec, table, namespace=""):
-    objects = spec.get("objects", spec.get("tables"))
-    mine = [o for o in objects if reads_target(o.get("object") or o.get("target_table") or "", table, namespace)]
-    if not mine:
-        return None
-    return [box for o in mine for row in (o, *o.get("embeds", []))
-            for box in predicate_slices(row.get("target_where"), row.get("scope_columns", o.get("scope_columns", [])))]
 
 
 def check_write_targets(batches, other_waves, mapping=None, namespace=""):
@@ -1174,35 +513,6 @@ def unit_dependencies(unit):
     return rows
 
 
-def transitive_writes(routines, resolve=None):
-    resolve = resolve or (lambda r, t: {target_key(t)})
-    by_name = {r["routine"].casefold(): r for r in routines}
-    seen, writes = set(), set()
-    todo = list(by_name)
-    while todo:
-        name = todo.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        r = by_name[name]
-        for t in r["writes"]:
-            writes |= resolve(r, t)
-        for callee in r["calls"]:
-            if callee.casefold() not in by_name:
-                raise SystemExit(f"routine {r['routine']} calls {callee}, which the dependency analysis does "
-                                 "not cover, so its writes are unknown")
-            todo.append(callee.casefold())
-    return writes
-
-
-def mapped_target(spec, table, namespace=""):
-    k = target_key(table)
-    objects = (spec.get("objects") or spec.get("tables") or []) if isinstance(spec, dict) else []
-    return {target_key(o.get("object") or o.get("target_table") or "", namespace)
-            for o in (objects if isinstance(objects, list) else [])
-            if isinstance(o, dict) and target_key(o.get("root_table") or o.get("source_table") or "") == k}
-
-
 def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
     analysis = unit_dependencies if analysis is None else analysis
     mapping = unit_mapping if mapping is None else mapping
@@ -1274,27 +584,6 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
             raise SystemExit(f"batch {b['id']}: analysed routine(s) {undeclared} are entry points nothing in "
                              "the batch calls, so the unit deploys them, but deploy_objects has no object of that "
                              "name left for them (one row stands for one routine). Fix the wave plan, then re-run.")
-
-
-def check_repo_origin(repo, origin_url):
-    """The manifest's repo is where the children's PR URLs must live; when origin is a remote URL it
-    has to be that repo, or every PR check fails after the child, not before it."""
-    url = origin_url.strip()
-    if "://" in url:
-        parts = urllib.parse.urlsplit(url)
-        host, path = parts.hostname, parts.path      # the port, if any, is not part of the repo
-    else:
-        m = re.fullmatch(r"(?:[^@/:]+@)?(?P<host>[^/:]+):(?P<path>[^/].*)", url)   # scp-style git@host:owner/name
-        host, path = (m["host"], m["path"]) if m else (None, "")
-    if not host:
-        return  # a local mirror or an unparsed remote: nothing to compare
-    path = path.strip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    want = repo.lower()
-    if f"{host.lower()}/{path.lower()}" != want:
-        raise SystemExit(f"manifest 'repo' is {repo!r} but origin is {origin_url.strip()!r}: children open PRs "
-                         "on origin, so the manifest must name that host/owner/name")
 
 
 def launch_checks():
@@ -1405,115 +694,6 @@ def verifier_changed_paths(wave, passed):
     return sorted(own)
 
 
-def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
-    allowed = tuple(f".migration/recon/{u}/" for u in unit_ids)
-    if wave is not None:
-        allowed += (f".migration/recon/wave-{wave}/",)
-    return [p for p in changed_paths
-            if p.startswith(".migration/") and not p.startswith(allowed)]
-
-
-def batch_verdicts(verdicts, passed):
-    if not isinstance(verdicts, dict):
-        return {}
-    owner = {u: p.get("batch") for p in passed for u in p.get("units") or []}
-    owner.update({p.get("batch"): p.get("batch") for p in passed})
-    out = {}
-    for key, verdict in verdicts.items():
-        batch = owner.get(key, key)
-        out[batch] = None if batch in out and out[batch] != verdict else verdict
-    return out
-
-
-def validate_verify(verify, passed, wave=None, observed=None) -> list[str]:
-    """The verifier's verdicts and its report branch."""
-    problems = []
-    if not isinstance(verify, dict):
-        return ["verifier output invalid: expected an object"]
-    expected = {p.get("batch") for p in passed}
-    if None in expected:
-        problems.append("verifier output invalid: passed batch is missing its id")
-        expected.discard(None)
-    verdicts = verify.get("unit_verdicts")
-    if not isinstance(verdicts, dict):
-        problems.append("verifier output invalid: unit_verdicts must be a dict")
-        verdicts = {}
-    raw, verdicts = verdicts, batch_verdicts(verdicts, passed)
-    for batch in sorted(b for b, v in verdicts.items() if v is None):
-        keys = [k for k in raw if batch_verdicts({k: raw[k]}, passed) == {batch: raw[k]}]
-        problems.append(f"verifier output invalid: conflicting verdicts for {batch}: "
-                        + ", ".join(f"{k}={raw[k]}" for k in keys))
-    missing = sorted(expected - set(verdicts))
-    extra = sorted(set(verdicts) - expected)
-    if missing:
-        problems.append("verifier output invalid: missing verdicts for " + ", ".join(missing))
-    if extra:
-        problems.append("verifier output invalid: unexpected verdicts for " + ", ".join(extra))
-    wave_verdict = verify.get("wave_verdict")
-    if wave_verdict not in ("PASS", "FAIL"):
-        problems.append("verifier output invalid: wave_verdict must be PASS or FAIL")
-    for batch in sorted(expected - set(missing)):
-        verdict = verdicts.get(batch)
-        if verdict is not None and verdict not in ("PASS", "FAIL"):
-            problems.append(f"verifier output invalid: verdict for {batch} is {verdict!r}")
-        elif wave_verdict == "PASS" and verdict != "PASS":
-            problems.append(f"verifier output invalid: wave PASS contradicts {batch}={verdict}")
-    if wave_verdict == "FAIL" and expected and all(verdicts.get(b) == "PASS" for b in expected):
-        problems.append("verifier output invalid: wave FAIL contradicts all unit verdicts PASS")
-    if not isinstance(verify.get("findings"), list):
-        problems.append("verifier output invalid: findings must be a list")
-    changed = verify.get("changed_paths")
-    if not isinstance(changed, list) or not all(isinstance(p, str) for p in changed):
-        problems.append("verifier output invalid: changed_paths must be a list of paths (git diff --name-only)")
-        changed = []
-    if wave is not None and observed is None:
-        problems.append(f"verifier output invalid: branch recon/wave-{wave} not verifiable from git (fetch or diff "
-                        "failed), ledger integrity unverified")
-    problems += [f"verifier output invalid: ledger tampered, changed {p}"
-                 for p in ledger_violations(sorted({*changed, *(observed or [])}), [], wave)]
-    return problems
-
-
-def validate_close(close, to_merge, merge=True) -> list[str]:
-    problems = []
-    if not isinstance(close, dict):
-        return ["expected an object"]
-    merged = close.get("merged_prs")
-    if not isinstance(merged, list) or not all(
-            isinstance(u, dict) and isinstance(u.get("pr_url"), str)
-            and isinstance(u.get("merge_commit_sha"), str)
-            and re.fullmatch(r"[0-9a-f]{40}", u["merge_commit_sha"])
-            and isinstance(u.get("merged_head"), str)
-            and re.fullmatch(r"[0-9a-f]{40}", u["merged_head"])
-            for u in merged):
-        problems.append("merged_prs rows must be {pr_url, merge_commit_sha, merged_head}")
-        merged = []
-    merged_urls = [u["pr_url"] for u in merged]
-    if not merge and merged:
-        problems.append("merged with auto_merge off")
-    unmerged = close.get("unmerged")
-    if not isinstance(unmerged, list) or not all(
-            isinstance(u, dict) and isinstance(u.get("pr_url"), str) and isinstance(u.get("reason"), str)
-            for u in unmerged):
-        problems.append("unmerged must be a list of {pr_url, reason} rows")
-        unmerged = []
-    want = {p.get("pr_url") for p in to_merge}
-    for url in merged_urls:
-        if url not in want:
-            problems.append(f"merged a PR outside the wave ({url})")
-    listed = Counter([*merged_urls, *(u["pr_url"] for u in unmerged)])
-    for url in sorted(want):
-        if listed.get(url, 0) != 1:
-            problems.append(f"{url} is in {listed.get(url, 0)} of merged_prs/unmerged, expected exactly one")
-    changed = close.get("changed_paths")
-    if not isinstance(changed, list) or not all(isinstance(p, str) for p in changed):
-        problems.append("changed_paths must be a list of paths (git diff --name-only)")
-        changed = []
-    for p in changed:
-        problems.append(f"wave-close step changed {p}; it writes nothing")
-    return problems
-
-
 def _applies_to(start, delta, commit):
     git = ["git", "-C", str(ROOT)]
     with tempfile.TemporaryDirectory() as d:
@@ -1606,6 +786,7 @@ def proven_merged(to_merge, reported):
             reasons[url] = f"merge proof failed ({e})"
     return proven, reasons
 
+
 WAVE = MANIFEST["wave"]
 REPO = MANIFEST["repo"]
 BATCHES = sorted(MANIFEST["batches"], key=lambda b: b["id"])
@@ -1625,6 +806,7 @@ def batch_verify_depth(batch) -> str:
 def batch_max_minutes(batch) -> int:
     return int(batch.get("max_minutes", MAX_MINUTES))
 
+
 META = {
     "name": f"migration-wave-{TAG}",
     "description": f"Wave {WAVE}: {len(BATCHES)} unit batches in parallel, then one independent verifier",
@@ -1641,107 +823,6 @@ META = {
     ],
 }
 
-CHILD_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["PASS", "FAIL", "BLOCKED"]},
-        "pr_url": {"type": "string"},
-        "branch": {"type": "string"},
-        "recon_verdict": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]},
-        "recon_mode": {"type": "string", "description": "recon --mode of the evidence run (fixture never merges)"},
-        "merge_eligible": {"type": "boolean", "description": "result.json['merge_eligible'] of the evidence run"},
-        "parity": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"],
-                   "description": "result.json['parity'] when the harness records it: the row and routine tiers alone"},
-        "blocker_classes": {"type": "array", "items": {"type": "string"},
-                            "description": "result.json['blocker_classes'] when the harness records it: why merge "
-                                           "policy is blocked, never why rows differ"},
-        "merge_authority": {
-            "type": "object",
-            "properties": {"kind": {"type": "string", "enum": ["harness", "human_override"]},
-                           "decision_id": {"type": "string"}},
-            "description": "human_override with the D-<n> row of .migration/06_decisions.md that says merge_override "
-                           "for your units; the workflow verifies the row. harness otherwise."},
-        "failure_class": {"type": "string"},
-        "write_targets": {"type": "array", "items": {"type": "string"}},
-        "changed_paths": {"type": "array", "items": {"type": "string"},
-                          "description": "every path the PR changes: git diff --name-only <base>...<head>"},
-        "skill_feedback": {"type": "array", "items": {"type": "string"},
-                           "description": "one line per rule you had to derive yourself"},
-        "gates": {
-            "type": "array",
-            "items": {"type": "object",
-                      "properties": {"id": {"type": "string"},
-                                     "status": {"type": "string", "enum": ["passed", "failed"]},
-                                     "evidence": {"anyOf": [
-                                         {"type": "string"},
-                                         {"type": "object",
-                                          "properties": {"path": {"type": "string"}, "label": {"type": "string"},
-                                                         "verdict": {"type": "string"}, "rows": {"type": "integer"}},
-                                          "required": ["path"]}]}},
-                      "required": ["id", "status", "evidence"]},
-            "description": "outcome of each gate declared in your brief, by id; passed needs the evidence: the bare "
-                           "path under .migration/recon/<unit>/, or {path, label?, verdict?, rows?} to annotate it"},
-        "recon_cost": {"type": "object",
-                       "description": "result.json['cost'] of the final live/snapshot/transactional run, one line"},
-        "one_line_summary": {"type": "string"},
-    },
-    "required": ["status", "recon_verdict", "recon_mode", "merge_eligible", "write_targets", "changed_paths",
-                 "one_line_summary"],
-}
-
-VERIFY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "wave_verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
-        "unit_verdicts": {"type": "object",
-                          "description": "PASS or FAIL per batch, keyed by batch id or by unit id (a unit key is "
-                                         "normalised to its batch id; one verdict per batch, a batch whose keys "
-                                         "disagree is rejected)"},
-        "findings": {"type": "array", "items": {"type": "string"}},
-        "report_path": {"type": "string"},
-        "changed_paths": {"type": "array", "items": {"type": "string"},
-                          "description": "every path your report branch changes: git diff --name-only <base>...<head>"},
-        "recon_cost": {"type": "object",
-                       "description": "summed result.json['cost'] over the verifier's re-runs"},
-    },
-    "required": ["wave_verdict", "unit_verdicts", "findings", "changed_paths"],
-}
-
-CLOSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "merged_prs": {"type": "array",
-                       "items": {"type": "object",
-                                 "properties": {"pr_url": {"type": "string"},
-                                                "merge_commit_sha": {"type": "string"},
-                                                "merged_head": {"type": "string"}},
-                                 "required": ["pr_url", "merge_commit_sha", "merged_head"]},
-                       "description": "from `gh pr view <url> --json state,mergeCommit,headRefOid` after "
-                                      "the merge; state must be MERGED"},
-        "unmerged": {"type": "array",
-                     "items": {"type": "object",
-                               "properties": {"pr_url": {"type": "string"}, "reason": {"type": "string"}},
-                               "required": ["pr_url", "reason"]}},
-        "changed_paths": {"type": "array", "items": {"type": "string"}},
-        "review_findings": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["merged_prs", "unmerged", "changed_paths"],
-}
-
-RESYNC_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["ok", "failed"]},
-        "sequences": {"type": "array",
-                      "items": {"type": "object",
-                                "properties": {"object": {"type": "string"}, "before": {}, "after": {}},
-                                "required": ["object", "before", "after"]}},
-        "changed_paths": {"type": "array", "items": {"type": "string"}},
-        "one_line_summary": {"type": "string"},
-    },
-    "required": ["status", "sequences", "changed_paths", "one_line_summary"],
-}
-
 
 def resync_prompt(cfg):
     return (
@@ -1753,26 +834,6 @@ def resync_prompt(cfg):
         "--porcelain` paths in changed_paths (it must be empty). For every sequence or identity column the command "
         "touched, report {object, before, after} in sequences; status failed if the command exited non-zero."
     )
-
-
-def validate_resync(out) -> list[str]:
-    if not isinstance(out, dict):
-        return ["resync output invalid: expected an object"]
-    problems = []
-    if out.get("status") not in ("ok", "failed"):
-        problems.append(f"resync output invalid: status {out.get('status')!r}")
-    elif out["status"] == "failed":
-        problems.append(f"resync command failed: {out.get('one_line_summary')}")
-    rows = out.get("sequences")
-    if (not isinstance(rows, list)
-            or not all(isinstance(r, dict) and {"object", "before", "after"} <= set(r) for r in rows)):
-        problems.append("resync output invalid: sequences must be [{object, before, after}, ...]")
-    changed = out.get("changed_paths")
-    if not isinstance(changed, list):
-        problems.append("resync output invalid: changed_paths must be a list")
-    elif changed:
-        problems.append("resync changed " + ", ".join(map(str, changed)) + " but must commit and write nothing")
-    return problems
 
 
 def child_prompt(batch):
@@ -2029,26 +1090,6 @@ async def _run_batch(batch, sem, breaker):
         return out
 
 
-COST_KEYS = ("source_statements", "target_statements", "source_rows_fetched", "target_rows_fetched")
-
-
-def sum_cost(costs) -> dict:
-    """Sum result.json['cost'] dicts; a side whose adapter did not count stays None."""
-    total: dict = {k: 0 for k in COST_KEYS} | {"elapsed_s": 0.0}
-    for c in costs:
-        if not isinstance(c, dict):
-            continue
-        for k in COST_KEYS:
-            v = c.get(k)
-            if v is None:
-                total[k] = None
-            elif total[k] is not None and isinstance(v, (int, float)) and not isinstance(v, bool):
-                total[k] += v
-        if isinstance(c.get("elapsed_s"), (int, float)):
-            total["elapsed_s"] += c["elapsed_s"]
-    return total
-
-
 def cost_line(results, verify) -> str:
     est = MANIFEST.get("cost_estimate")
     actual = sum_cost([r.get("recon_cost") for r in results]
@@ -2061,18 +1102,6 @@ def cost_line(results, verify) -> str:
             f"harness time {round(actual['elapsed_s'])}s. Verifier depth {VERIFY_DEPTH}"
             + (", overrides: " + ", ".join(f"{b['id']}={b['verify_depth']}" for b in BATCHES if "verify_depth" in b)
                if any("verify_depth" in b for b in BATCHES) else "") + ".")
-
-
-def _verify_sink(verify, problems, fail=False):
-    """Fold problems into the verify record's findings, or into a fresh FAIL one when the record is unusable."""
-    if not isinstance(verify, dict):
-        verify = {"wave_verdict": "FAIL", "unit_verdicts": {}, "findings": []}
-    if fail:
-        verify["wave_verdict"] = "FAIL"
-    if not isinstance(verify.get("findings"), list):
-        verify["findings"] = []
-    verify["findings"].extend(problems)
-    return verify
 
 
 def waived_gates(results):
@@ -2292,9 +1321,6 @@ async def main():
         "batches": [{"id": b["id"], **r} for b, r in zip(BATCHES, results)],
         "verify": verify, "resync": resync, "close": close, "close_minutes": CLOSE_MINUTES,
     }
-    if cards is None:
-        raise SystemExit(f"{POINTER_PATH} plugin root has no skills/migration-fanout/cards.py; "
-                         "nothing was written, relaunch once the pointer names a plugin that has it")
     card = cards.wave_card(result)
     record_run(event="close", merged=(close or {}).get("merged_prs", []), closed=closed)
     _tmp_write(RESULT_PATH, json.dumps(result, indent=2, sort_keys=True) + "\n")
