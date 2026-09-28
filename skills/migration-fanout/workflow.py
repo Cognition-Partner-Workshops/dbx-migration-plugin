@@ -139,6 +139,7 @@ STOP_MODES = ("hard", "soft")
 GATE_KINDS = ("byte_compare", "export_file", "publish_leg", "row_parity", "structural", "custom")
 GATE_STATUSES = ("pending", "passed", "failed", "waived")
 UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
+BRIEF_MAX_CHARS = 4000
 WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
@@ -331,6 +332,11 @@ def validate_manifest(m, doctor=None):
         for key in ("units", "brief"):
             req(bool(b.get(key)),
                 f"batch {b['id']} is missing '{key}' (a child with no brief cannot be launched safely)")
+        req(isinstance(b["brief"], str) and len(b["brief"]) <= BRIEF_MAX_CHARS,
+            f"batch {b['id']} brief is {len(str(b['brief']))} chars; the cap is {BRIEF_MAX_CHARS}. A brief names "
+            "the units, targets, gates and the files to read (skills/migration-fanout/references/brief_template.md); "
+            "hosts, principals, warehouses and secret names live in the manifest and 09_capabilities.json, "
+            "which every child already reads")
         req(strs(b.get("write_targets")) and all(t.strip() for t in b["write_targets"]),
             f"batch {b['id']} needs 'write_targets', a list of table names (empty only for a batch "
             "whose dependency analysis writes nothing)")

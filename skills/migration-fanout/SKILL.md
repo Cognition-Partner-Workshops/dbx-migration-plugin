@@ -10,8 +10,9 @@ checks their reports, runs independent verification, and writes the result and b
 
 ## How to use it
 
-1. Write and commit `wave-<N>.json`, including complete batch briefs, targets, gates,
-   `stop_c`, and `gates_sha`.
+1. Write and commit `wave-<N>.json`, including batch briefs (`references/brief_template.md`:
+   under 4000 chars, pointing at the manifest and capabilities file rather than restating them),
+   targets, gates, `stop_c`, and `gates_sha`.
 2. Run the signed doctor over the manifest:
    `python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo> --wave .migration/waves/wave-<N>.json --hook-probe-result blocked:<nonce>`.
    It writes `wave-<N>.doctor.json`, signed over the manifest bytes and accepted for 15 minutes.
