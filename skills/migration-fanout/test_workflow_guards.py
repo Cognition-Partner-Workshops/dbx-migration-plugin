@@ -135,6 +135,15 @@ def test_validate_manifest_rejects_invalid_max_minutes(value):
         validate_manifest(batch_bad)
 
 
+@pytest.mark.parametrize("value", ["a b", "b-1 (held)", 7])
+def test_validate_manifest_rejects_a_batch_id_that_is_not_a_plain_word(value):
+    """A batch id is named on the six-line card and in every halt; a word, never a phrase."""
+    m = _manifest()
+    m["batches"][0]["id"] = value
+    with pytest.raises(SystemExit, match="batch ids must be a plain word"):
+        _functions()["validate_manifest"](m)
+
+
 def test_validate_manifest_accepts_a_batch_max_minutes_override():
     m = _manifest()
     m["batches"][0]["max_minutes"] = 30

@@ -162,6 +162,8 @@ def validate_manifest(m, doctor=None):
     ids = Counter(b.get("id") for b in m["batches"])
     dupes = [i for i, c in ids.items() if c > 1 or not i]
     req(not dupes, f"batch ids must be unique and non-empty: {dupes}")
+    bad = [i for i in ids if not (isinstance(i, str) and UNIT_ID.fullmatch(i))]
+    req(not bad, f"batch ids must be a plain word (letters, digits, _ . -), like gate and unit ids: {bad}")
     ns = m.get("target_namespace", "") if isinstance(m.get("target_namespace", ""), str) else ""
     owners = {}
     for b in m["batches"]:
