@@ -29,6 +29,9 @@ STATUSES = ("pass", "fail")
 # why an evolved leg counts as unsupported; only nothing_evolved is a first run's baseline
 UNSUPPORTED_KINDS = ("no_evolved_record", "fresh_failed", "no_pre_shape", "pre_shape_missing_table",
                      "nothing_evolved", "no_prior_shape", "pre_shape_not_prior")
+# the kinds under which the evolved leg did run (and so carries evidence); the leg was graded
+# unsupported for what it started from, not for not happening
+EVOLVED_RAN_KINDS = frozenset(UNSUPPORTED_KINDS) - {"no_evolved_record", "fresh_failed"}
 PROOF_KEYS = ("unit", "fresh", "evolved", "passed", "findings", "notes", "evidence", "source_digest",
               "shape", "shape_digest")
 
@@ -246,14 +249,16 @@ def grade_rerun(fresh: dict | None, evolved: dict | None, prior: dict | None = N
         if more:
             evolved_status = "fail"
             findings += more
-        elif prior is not None and _compare("evolved", prior["tables"], expected):
+        elif prior is None:
+            kind = "nothing_evolved"
+            reason = ("evolved pre_shape equals the fresh shape: nothing evolved, so the run proves "
+                      "only what fresh proved")
+        elif _compare("evolved", prior["tables"], expected):
             kind = "pre_shape_not_prior"
             reason = ("evolved pre_shape is the fresh shape, not the declared prior shape: the run from "
                       "the prior shape was not exercised; pre-create the table in the prior shape and run again")
         else:
-            kind = "nothing_evolved"
-            reason = ("evolved pre_shape equals the fresh shape: nothing evolved, so the run proves "
-                      "only what fresh proved")
+            evolved_status = "pass"  # the committed shape is the fresh shape: the leg ran from it and landed it
     elif prior is None:
         kind = "no_prior_shape"
         reason = ("no prior shape: pass --prior-proof (the previous committed rerun_proof.json) or "
@@ -320,8 +325,10 @@ def rerun_first_run_baseline(proof: dict | None) -> bool:
     against the fresh shape, the only shape there is (`nothing_evolved`). A leg that did not run,
     recorded no pre_shape, started from a shape nothing declared or failed is not that, whatever
     the posture."""
+    evidence = proof.get("evidence") if isinstance(proof, dict) else None
     return (proof is not None and proof.get("evolved") == "unsupported"
-            and proof.get("unsupported_kind") == "nothing_evolved")
+            and proof.get("unsupported_kind") == "nothing_evolved"
+            and isinstance(evidence, dict) and bool(str(evidence.get("evolved") or "").strip()))
 
 
 def check_proof(data: object, unit: str, where: str, digest: str) -> dict:
@@ -371,8 +378,18 @@ def check_proof(data: object, unit: str, where: str, digest: str) -> dict:
             raise ConfigError(f"{where}: the {leg} leg ran ({status}) but has no evidence")
     if evolved == "unsupported" and not str(data.get("unsupported_reason") or "").strip():
         raise ConfigError(f"{where}: evolved is unsupported without an unsupported_reason")
-    if "unsupported_kind" in data and data["unsupported_kind"] not in UNSUPPORTED_KINDS:
+    kind = data.get("unsupported_kind")
+    if "unsupported_kind" in data and kind not in UNSUPPORTED_KINDS:
         raise ConfigError(f"{where}: unsupported_kind must be one of {UNSUPPORTED_KINDS}")
+    if "unsupported_kind" in data and evolved != "unsupported":
+        raise ConfigError(f"{where}: unsupported_kind {kind!r} on an evolved leg that is {evolved}")
+    evolved_evidence = bool(str(evidence.get("evolved") or "").strip())
+    if kind in EVOLVED_RAN_KINDS and not evolved_evidence:
+        raise ConfigError(f"{where}: unsupported_kind {kind!r} says the evolved leg ran, but the proof has no "
+                          "evidence for it; a leg that did not run is no_evolved_record")
+    if kind == "no_evolved_record" and evolved_evidence:
+        raise ConfigError(f"{where}: unsupported_kind 'no_evolved_record' with evolved evidence: the proof "
+                          "contradicts itself")
     if evolved == "pass" and not str(data.get("prior_digest") or "").strip():
         raise ConfigError(f"{where}: the evolved leg passed without a prior_digest naming the previous "
                           "committed shape it started from")

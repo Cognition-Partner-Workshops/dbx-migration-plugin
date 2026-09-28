@@ -163,7 +163,8 @@ provenance warning and the run is not merge-eligible.
   blocks on an unsupported evolved leg (`rerun_unsupported`) and on no proof at all
   (`rerun_missing`); `first_run_baseline` (the unit's first migration) needs the fresh leg, which
   records the baseline shape, and accepts exactly one unsupported evolved leg: the one that ran
-  against the fresh shape when no other prior shape was declared (`unsupported_kind: nothing_evolved`);
+  against the fresh shape when no other prior shape was declared (`unsupported_kind: nothing_evolved`,
+  with the evolved leg's own evidence: a proof that names the kind but ran no second leg is fresh-only);
   a leg that did not run, recorded no pre_shape, started from an undeclared shape, or started from the
   fresh shape when `--prior-shape` declared a different one still blocks; and
   `not_applicable` (one-shot DDL, routine packages, gold aggregates) needs no proof. No posture ever

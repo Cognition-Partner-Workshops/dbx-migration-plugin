@@ -29,7 +29,7 @@ from tests.loans import BORROWER_FACTS, LOANS_FACTS, TARGET_LOANS_FACTS, _facts,
 # what a first migration's proof looks like: the fresh leg landed, the evolved leg had no
 # previous committed shape to start from
 FIRST_RUN_PROOF = {"fresh": "pass", "evolved": "unsupported", "passed": True, "findings": [],
-                   "unsupported_kind": "nothing_evolved",
+                   "evidence": {"fresh": "job/1", "evolved": "job/2"}, "unsupported_kind": "nothing_evolved",
                    "unsupported_reason": "evolved pre_shape equals the fresh shape: nothing evolved"}
 FAILED_EVOLVED = {"fresh": "pass", "evolved": "fail", "passed": False,
                   "findings": [{"table": "t", "column": "c", "check": "type"}]}
@@ -64,6 +64,18 @@ def test_first_run_baseline_accepts_an_evolved_leg_with_nothing_to_evolve_from()
     assert r["rerun_proof"] is FIRST_RUN_PROOF  # the evidence is kept as recorded
 
 
+def test_first_run_baseline_needs_the_evolved_leg_to_have_run():
+    """`nothing_evolved` is a claim that the second run happened and landed the fresh shape again; a
+    proof that names the kind but carries no evolved evidence is a fresh-only proof wearing the label."""
+    for evidence in ({"fresh": "job/1"}, {"fresh": "job/1", "evolved": ""}, {}, None):
+        proof = {**FIRST_RUN_PROOF, "evidence": evidence}
+        r = _green(rerun_proof=proof, rerun_posture="first_run_baseline")
+        assert r["merge_eligible"] is False, evidence
+        assert r["blockers"] == [{"reason": "rerun_unsupported", "class": "rerun_policy"}], evidence
+    proof = {k: v for k, v in FIRST_RUN_PROOF.items() if k != "evidence"}
+    assert _green(rerun_proof=proof, rerun_posture="first_run_baseline")["merge_eligible"] is False
+
+
 def test_first_run_baseline_still_needs_a_fresh_leg_and_refuses_a_failed_one():
     assert _green(rerun_proof=None, rerun_posture="first_run_baseline")["merge_block_reasons"] == ["rerun_missing"]
     assert _green(rerun_proof=FAILED_EVOLVED, rerun_posture="first_run_baseline")["merge_block_reasons"] == ["rerun_gap"]
@@ -93,7 +105,8 @@ def test_an_unstable_window_is_an_evidence_failure_not_a_row_mismatch():
     assert r["blockers"] == [{"reason": "tier_failed", "class": "evidence"}]
     assert status_line(r) == "parity PASS, merge blocked (evidence)"
     rows_moved = [tiers[0], TierResult(1, "row_count", False, 1, [Finding("dbo.loans", "count", "1 != 2")], {})]
-    assert _green(tiers=rows_moved, mode="transactional")["blockers"] == [{"reason": "tier_failed", "class": "data"}]
+    assert _green(tiers=rows_moved, mode="transactional")["blockers"] == [
+        {"reason": "tier_failed", "class": "data"}, {"reason": "tier_failed", "class": "evidence"}]
     window_only = _green(tiers=[tiers[0]], mode="transactional")
     assert window_only["parity"] == "NOT_RUN" and window_only["blockers"][0]["class"] == "evidence"
 
@@ -121,6 +134,25 @@ def test_unknown_posture_is_a_config_error():
 
 
 # ------------------------------------------------------------------ blocker classes
+
+def test_a_moved_window_stays_a_blocker_when_the_structural_tier_also_fails():
+    """Two failed tiers, two classes: fixing the trigger does not make the window stable, so the
+    evidence blocker has to be visible beside the structural one, not hidden under it."""
+    tiers = [TierResult(0, "consistency_window", False, 1,
+                        [Finding("dbo.loans", "window_unstable", "source count moved")], {}),
+             TierResult(1, "structural_parity", False, 3, [Finding("triggers", "loans", "trg_audit", "-")], {}),
+             TierResult(2, "row_count", True, 1, [], {})]
+    r = _green(tiers=tiers, mode="transactional")
+    assert r["verdict"] == "FAIL" and r["parity"] == "PASS"
+    assert r["blockers"] == [{"reason": "structural_gap", "class": "structural"},
+                             {"reason": "tier_failed", "class": "structural"},
+                             {"reason": "tier_failed", "class": "evidence"}]
+    assert r["blocker_classes"] == ["evidence", "structural"]
+    assert r["merge_block_reasons"] == ["structural_gap", "tier_failed"]
+    rows_moved = tiers[:2] + [TierResult(2, "row_count", False, 1, [Finding("dbo.loans", "count", "1 != 2")], {})]
+    r = _green(tiers=rows_moved, mode="transactional")
+    assert r["parity"] == "FAIL" and r["blocker_classes"] == ["data", "evidence", "structural"]
+
 
 def _structural(findings=(), stats=None):
     return TierResult(0, "structural_parity", not findings, 3, list(findings), stats or {})

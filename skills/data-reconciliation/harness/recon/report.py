@@ -161,14 +161,17 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                                    or structural.stats.get("dictionary_unavailable")
                                    or structural_blind):
         block("structural_gap", structural_class)
-    if verdict == "FAIL":
-        if parity == "FAIL":
-            failed_class = "data"
-        elif structural is not None and not structural.passed:
-            failed_class = structural_class
-        else:
-            failed_class = "evidence"  # the window moved, or the feed is behind
-        block("tier_failed", failed_class)
+    if verdict == "FAIL":  # every failed tier names its class: a structural miss does not hide a moved window
+        failed_classes = []
+        if any(data_failed(t) for t in tiers if t.name not in STRUCTURAL_TIERS + EVIDENCE_TIERS):
+            failed_classes.append("data")
+        if structural is not None and not structural.passed:
+            failed_classes.append(structural_class)
+        if any(not t.passed and (t.name in EVIDENCE_TIERS or not data_failed(t)) for t in data_tiers
+               + [t for t in tiers if t.name in EVIDENCE_TIERS]):
+            failed_classes.append("evidence")  # the window moved, or the feed is behind
+        for cls in failed_classes or ["evidence"]:
+            block("tier_failed", cls)
     if routine_gap(routine_parity):
         block("routine_gap", "data")
     if parity_gap:
@@ -190,7 +193,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                 or (rerun_posture == "first_run_baseline"
                     and not rerun_first_run_baseline(rerun_proof))):
             block("rerun_unsupported", "rerun_policy")
-    reasons = [b["reason"] for b in blockers]
+    reasons = list(dict.fromkeys(b["reason"] for b in blockers))
     merge_eligible = not blockers
     return {
         "unit": unit,
