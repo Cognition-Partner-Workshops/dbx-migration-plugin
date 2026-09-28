@@ -41,8 +41,11 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
     for u, eligible in recon.items():
         d = ws / ".migration" / "recon" / u
         d.mkdir(parents=True)
+        blockers = [] if eligible else [{"reason": "rerun_unsupported", "class": "rerun_policy"}]
         (d / "result.json").write_text(eligible if isinstance(eligible, str) else json.dumps(
-            {"verdict": "PASS", "merge_eligible": eligible, "merge_authority": {"kind": "harness", "decision_id": None}}))
+            {"verdict": "PASS", "parity": "PASS", "merge_eligible": eligible, "blockers": blockers,
+             "blocker_classes": sorted({b["class"] for b in blockers}),
+             "merge_authority": {"kind": "harness", "decision_id": None}}))
     for name, text in (other_waves or {}).items():
         (waves / name).write_text(text)
     for unit, spec in (mappings or {}).items():

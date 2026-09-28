@@ -57,17 +57,18 @@ def _batch_runtime():
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
                                                                          "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes",
                                                                          "structured_decision", "human_decision", "ledger_override",
-                                                                         "override_scope", "scope_covers", "evidence_path"})
+                                                                         "override_scope", "scope_covers", "override_forgives",
+                                                                         "evidence_path"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
                                                          "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS",
-                                                         "BARE_PATH", "EVIDENCE_META"}
+                                                         "BARE_PATH", "EVIDENCE_META", "UNSCOPED_OVERRIDE"}
                     for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
         "json": json,
         "unit_eligibility": lambda head, units: {u: True for u in units},
-        "unit_blocker_classes": lambda head, units: {u: None for u in units},
+        "unit_blocker_classes": lambda head, units: {u: ["rerun_policy"] for u in units},
         "record_run": lambda **fields: None,
         "evidence_in_pr": lambda head, path, units: bool(head) and any(path.startswith(f".migration/recon/{u}/") for u in units),
         "Counter": Counter,
@@ -2802,18 +2803,33 @@ def test_a_later_override_row_whose_scope_fits_is_not_hidden_by_a_narrower_one_a
     assert out["status"] == "FAIL" and "D-10" in out["one_line_summary"] and "structural" in out["one_line_summary"]
 
 
+def test_an_unscoped_override_forgives_every_policy_class_and_never_data():
+    scope_covers = _structured_ns()["scope_covers"]
+    assert scope_covers(None, {"u": ["rerun_policy", "privilege_visibility", "structural", "evidence"]})
+    assert not scope_covers(None, {"u": ["data"]}) and not scope_covers(None, {"u": ["rerun_policy", "data"]})
+    assert not scope_covers(None, {"u": ["rerun_policy"], "v": None})   # unrecorded: cannot be shown non-data
+    assert scope_covers(["data"], {"u": ["data"]}) and not scope_covers(["data"], {"u": ["rerun_policy"]})
+    assert scope_covers(None, {})
+
+
 def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
     report = {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-10"}}
     out = _run_one(_structured_ns(classes=["rerun_policy"]), report)
     assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-10"
-    # the claim is too narrow for a data blocker, but the ledger is the authority: unscoped D-7 covers it
+    # a data blocker is forgiven only by a row that names data: the unscoped D-7 does not, so the halt names it
     out = _run_one(_structured_ns(classes=["data", "rerun_policy"]), report)
-    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-7"
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    assert "D-7" in out["one_line_summary"] and "(unscoped)" in out["one_line_summary"]
     ledger = "\n".join(l for l in STRUCTURED_LEDGER.splitlines() if "D-7" not in l) + "\n"
     out = _run_one(_structured_ns(ledger, classes=["data", "rerun_policy"]), report)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
     assert "D-10" in out["one_line_summary"] and "data" in out["one_line_summary"]
-    out = _run_one(_structured_ns(ledger, classes=None), report)   # result.json records no blocker classes: not coverable
+    named = ledger + '| D-13 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["data", "rerun_policy"]} |\n'
+    out = _run_one(_structured_ns(named, classes=["data", "rerun_policy"]), report)
+    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-13"
+    ns = _structured_ns(named)
+    ns["unit_blocker_classes"] = lambda head, units: {u: None for u in units}   # result.json records no blocker classes
+    out = _run_one(ns, report)   # even the row naming data cannot cover what was not recorded
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "unrecorded" in out["one_line_summary"]
     out = _run_one(_structured_ns(ledger, classes=["data"]), {**_pass_nomerge, "merge_eligible": False})
     assert out["status"] == "FAIL" and "D-10" in out["one_line_summary"]

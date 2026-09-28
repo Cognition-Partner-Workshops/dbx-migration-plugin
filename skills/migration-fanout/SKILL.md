@@ -34,7 +34,11 @@ Ledger rows the workflow reads (`merge_override`, `waive`) may carry one machine
 `{"kind": "merge_override", "units": ["u1", "u2"], "blocker_classes": ["rerun_policy"]}` or
 `{"kind": "waive", "gate": "g-export", "units": ["u1"]}`; when a row has one, that cell is the
 decision and the prose beside it is not parsed. `blocker_classes` scopes an override to the
-harness blocker classes it forgives; a unit with any other class stays blocked. Prose-only
+harness blocker classes it forgives; a unit with any other class stays blocked. A row without
+`blocker_classes` forgives every policy class (`rerun_policy`, `privilege_visibility`,
+`structural`, `evidence`) and never `data`: rows that differ are fixed in converted code, and
+only a row naming `data` says otherwise. A unit whose result.json records no blocker classes
+fits no override. Prose-only
 rows still work by naming the word, the gate, and every unit as whole tokens. A row with a
 malformed machine cell halts preflight. An override row written below this run's STOP C row
 applies whether or not the child reported it.

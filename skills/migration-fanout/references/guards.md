@@ -90,7 +90,9 @@ even when a child claims a clean or harmless diff.
 
 PASS requires merge-eligible harness evidence for every unit, unless a valid human
 override row names exactly the affected units. A row's machine cell, when present, is the
-decision; a `blocker_classes` scope forgives only the classes it lists. The row applies from
+decision; a `blocker_classes` scope forgives only the classes it lists, and a row with no scope
+forgives every policy class but never `data` (a data blocker needs a row that names it; a unit
+with no recorded blocker classes fits no override). The row applies from
 the ledger whether or not the child reported it, provided it sits below this run's STOP C row.
 
 ## Acceptance gates

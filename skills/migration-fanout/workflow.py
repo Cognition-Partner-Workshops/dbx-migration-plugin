@@ -270,10 +270,20 @@ def ledger_waiver(gate_id, units, ledger, stop_c):
     return None
 
 
+# what a merge_override row that sets no blocker_classes forgives: every policy class, never data.
+# Rows that differ are fixed in converted code; only a row that names "data" says otherwise
+UNSCOPED_OVERRIDE = frozenset({"structural", "privilege_visibility", "rerun_policy", "evidence"})
+
+
+def override_forgives(scope):
+    return UNSCOPED_OVERRIDE if scope is None else set(scope)
+
+
 def scope_covers(scope, classes):
-    """Whether an override's blocker-class scope (None = every class) covers what each unit recorded:
-    an unrecorded class list never fits a scoped override."""
-    return scope is None or all(c is not None and set(c) <= set(scope) for c in classes.values())
+    """Whether an override's blocker-class scope covers what each unit recorded. An unrecorded class
+    list (a harness before blocker classes, or a malformed result) fits no override: it cannot show
+    the blockers are not data."""
+    return all(c is not None and set(c) <= override_forgives(scope) for c in classes.values())
 
 
 def ledger_override(units, ledger, stop_c, classes=None):
@@ -1963,8 +1973,7 @@ async def _run_batch(batch, sem, breaker):
                 else:  # the child's claim is too narrow or absent; the ledger may still hold a row that fits
                     row = ledger_override(batch["units"], ledger, MANIFEST["stop_c"], classes) or claimed_row
                 scope = override_scope(row, below) if row else None
-                uncovered = ({} if scope_covers(scope, classes)
-                             else {u: c for u, c in classes.items() if c is None or not set(c) <= set(scope)})
+                uncovered = {u: c for u, c in classes.items() if c is None or not set(c) <= override_forgives(scope)}
                 if row and not uncovered:
                     out["merge_authority"] = {"kind": "human_override", "decision_id": row}
                 else:
@@ -1977,7 +1986,9 @@ async def _run_batch(batch, sem, breaker):
                                          for u, c in sorted(uncovered.items()))
                         downgrade("merge_authority",
                                   f"recon evidence is not merge_eligible=true for every unit ({why}); "
-                                  f"merge_override {row} covers blocker classes {scope} only, but {what}",
+                                  f"merge_override {row} covers blocker classes "
+                                  f"{scope if scope is not None else sorted(UNSCOPED_OVERRIDE) + ['(unscoped)']} "
+                                  f"only, but {what}",
                                   drop="merge_authority")
                     else:
                         downgrade("merge_authority",
