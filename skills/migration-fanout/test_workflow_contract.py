@@ -225,6 +225,7 @@ def _edit_manifest(ws, edit):
     import doctor as doctor_module
     doctor_path = manifest_path.with_suffix(".doctor.json")
     old = json.loads(doctor_path.read_text())
+    old["source"] = manifest.get("source")   # the doctor is re-run on the edited manifest
     doctor_path.write_text(json.dumps(doctor_module.sign_wave_report(
         {k: v for k, v in old.items() if k not in {"manifest_sha", "signed_at", "signature"}},
         manifest_path.read_bytes(),
@@ -403,6 +404,30 @@ def test_a_plan_change_under_the_same_stop_c_row_is_not_a_plumbing_relaunch(tmp_
         m["batches"][0]["brief"] = "the same units, told the repo host that exists"
         m["repo"] = m.get("repo")
     _edit_manifest(ws, narrow_and_rebrief)
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["relaunch"] == 2
+
+
+def test_a_source_scope_change_under_the_same_stop_c_row_is_not_a_plumbing_relaunch(tmp_path):
+    """The source secret name is plumbing; the family and the params pick the slice that is reconciled,
+    so changing them is a scope change that needs its own row."""
+    ws, cwd = _workspace(tmp_path)
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+
+    def reslice(m):
+        m["source"]["params"]["db"] = "loans_2023"
+    _edit_manifest(ws, reslice)
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "plan_sha" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    def rotate_secret(m):
+        m["source"]["params"]["db"] = "loans"
+        m["source"]["secret"] = "LEGACY_DSN_RO"
+    _edit_manifest(ws, rotate_secret)
     proc, calls = _run(cwd, tmp_path, [_pass_report()])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["relaunch"] == 2
@@ -1743,6 +1768,34 @@ def test_a_structured_override_below_stop_c_applies_without_the_child_claiming_i
                                             {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "D-3"}]
+
+
+def test_a_claimed_override_that_is_too_narrow_does_not_hide_a_ledger_row_that_fits(tmp_path):
+    """The child names D-3 (rerun_policy only) but its blockers include data; D-4 below covers both.
+    The ledger is the authority, so D-4 applies; with no fitting row the narrow claim is what the halt names."""
+    ledger = ('| D-3 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["rerun_policy"]} |\n'
+              '| D-4 | user:U1 | {"kind": "merge_override", "units": ["u"], '
+              '"blocker_classes": ["data", "rerun_policy"]} |\n')
+    blocked = json.dumps({"verdict": "PASS", "parity": "PASS", "merge_eligible": False,
+                          "blocker_classes": ["data", "rerun_policy"],
+                          "merge_authority": {"kind": "human_override", "decision_id": "D-3"}})
+    ws, cwd = _workspace(tmp_path, decisions=ledger, recon={"u": blocked})
+    pr = _push_pr(ws)
+    claim = {"kind": "human_override", "decision_id": "D-3"}
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=claim), _verify_report(),
+                                   {"error": "close step stubbed"}])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["batches"][0]["status"] == "PASS"
+    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "D-4"}]
+
+    ws, cwd = _workspace(tmp_path / "narrow", decisions=ledger.splitlines()[0] + "\n", recon={"u": blocked})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "narrow", [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
+    assert "D-3" in batch["one_line_summary"] and "data" in batch["one_line_summary"]
 
 
 def test_a_child_that_passes_is_logged_under_stop_c_before_the_wave_finishes(tmp_path):

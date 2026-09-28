@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -43,7 +44,7 @@ def _functions():
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
                  "DECISIONS_PATH": Path("/nonexistent/.migration/06_decisions.md"),
-                 "subprocess": subprocess, "sys": sys}
+                 "subprocess": subprocess, "sys": sys, "urllib": urllib}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     return namespace
 
@@ -2805,12 +2806,15 @@ def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
     report = {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-10"}}
     out = _run_one(_structured_ns(classes=["rerun_policy"]), report)
     assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-10"
+    # the claim is too narrow for a data blocker, but the ledger is the authority: unscoped D-7 covers it
     out = _run_one(_structured_ns(classes=["data", "rerun_policy"]), report)
+    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-7"
+    ledger = "\n".join(l for l in STRUCTURED_LEDGER.splitlines() if "D-7" not in l) + "\n"
+    out = _run_one(_structured_ns(ledger, classes=["data", "rerun_policy"]), report)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
     assert "D-10" in out["one_line_summary"] and "data" in out["one_line_summary"]
-    out = _run_one(_structured_ns(classes=None), report)   # result.json records no blocker classes: not coverable
+    out = _run_one(_structured_ns(ledger, classes=None), report)   # result.json records no blocker classes: not coverable
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "unrecorded" in out["one_line_summary"]
-    ledger = "\n".join(l for l in STRUCTURED_LEDGER.splitlines() if "D-7" not in l) + "\n"
     out = _run_one(_structured_ns(ledger, classes=["data"]), {**_pass_nomerge, "merge_eligible": False})
     assert out["status"] == "FAIL" and "D-10" in out["one_line_summary"]
 
@@ -2821,7 +2825,10 @@ def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
     "git@github.com:acme/target.git",
     "ssh://git@github.com/acme/target/",
     "https://user@github.com/acme/target.git",
+    "ssh://git@github.com:2222/acme/target.git",   # an explicit port is not part of the repo
+    "https://github.com:443/acme/target",
     "/tmp/mirrors/origin.git",           # a local mirror has no host to compare
+    "file:///tmp/mirrors/origin.git",
 ])
 def test_check_repo_origin_accepts_origin_at_the_manifests_repo(origin):
     _functions()["check_repo_origin"]("github.com/acme/target", origin)
@@ -2831,6 +2838,7 @@ def test_check_repo_origin_accepts_origin_at_the_manifests_repo(origin):
     "https://github.com/acme/other.git",
     "https://ghe.acme.com/acme/target.git",
     "git@github.com:acme/target-fork.git",
+    "ssh://git@ghe.acme.com:2222/acme/target.git",
 ])
 def test_check_repo_origin_halts_when_children_would_open_prs_elsewhere(origin):
     with pytest.raises(SystemExit, match="manifest 'repo'"):

@@ -62,7 +62,7 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Manifest check | Validates shape, source names, batches, units, width, and migration contract. |
 | Signed doctor gate | Requires an HMAC-bound doctor record with 15-minute freshness, hook probe, and matching capabilities. |
 | STOP C gates_sha approval | Requires the ledger row named by `stop_c` to approve the exact gate hash. |
-| One approval one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts); reuses the STOP C row only for a plumbing relaunch (same `gates_sha` and `plan_sha`: only briefs, repo, secret names, estimates or the source connection changed; nothing passed or merged under it). |
+| One approval one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts); reuses the STOP C row only for a plumbing relaunch (same `gates_sha` and `plan_sha`: only briefs, repo, secret names or estimates changed; nothing passed or merged under it). |
 | Repo and ledger preflight | Halts before STOP C is spent when `repo` is not `host/owner/name`, origin points elsewhere, or a ledger machine cell is malformed. |
 | Duplicate wave | Refuses any existing result, including halted or unreadable files. |
 | Manifest name / pipelines barrier | Checks tags and waits for declared sibling manifests on origin. |

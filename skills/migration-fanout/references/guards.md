@@ -23,8 +23,8 @@ or an approval under an incompatible stop mode halts the launch.
 A lock on `.wave-N.lock` is held for the whole run, so a second launch of a running wave
 halts instead of launching its batches twice; a run that died holds nothing. An exclusive
 lock protects the append-only runs log, which records each launch with its `gates_sha`, its
-`plan_sha` (the manifest less briefs, repo, secret names, estimates and the source
-connection) and what the run passed and merged. A STOP C identifier already in the log
+`plan_sha` (the manifest less briefs, repo, secret names and estimates; of `source`, the
+secret name is plumbing but the family and params are scope) and what the run passed and merged. A STOP C identifier already in the log
 authorizes another launch only as a plumbing relaunch: the same `gates_sha` and `plan_sha`,
 and no run under it passed or merged a batch. Anything else needs a new row.
 

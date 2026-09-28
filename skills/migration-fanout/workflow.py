@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from collections import Counter
 from pathlib import Path
 
@@ -292,8 +293,10 @@ def ledger_override(units, ledger, stop_c, classes=None):
 
 # manifest keys a plumbing relaunch may change without a new STOP C: how a child is briefed and
 # connected, and estimates. Everything else is the plan the row approved (contract: order,
-# dependencies, width, gates, write targets)
-PLAN_PLUMBING = frozenset({"brief", "repo", "secrets", "cost_estimate", "max_minutes", "source", "stop_c", "gates_sha"})
+# dependencies, width, gates, write targets). Of `source`, only the secret name is plumbing:
+# the family and the params select the slice that is reconciled, which is scope
+PLAN_PLUMBING = frozenset({"brief", "repo", "secrets", "cost_estimate", "max_minutes", "stop_c", "gates_sha"})
+SOURCE_PLUMBING = frozenset({"secret"})
 
 
 def approved_plan_sha(manifest):
@@ -303,7 +306,10 @@ def approved_plan_sha(manifest):
         if isinstance(x, list):
             return [strip(v) for v in x]
         return x
-    return hashlib.sha256(json.dumps(strip(manifest), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    plan = strip(manifest)
+    if isinstance(plan.get("source"), dict):
+        plan["source"] = {k: v for k, v in plan["source"].items() if k not in SOURCE_PLUMBING}
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def declared_gates_sha(wave, batches, degraded=False):
@@ -1250,13 +1256,20 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
 def check_repo_origin(repo, origin_url):
     """The manifest's repo is where the children's PR URLs must live; when origin is a remote URL it
     has to be that repo, or every PR check fails after the child, not before it."""
-    m = re.fullmatch(r"(?:[A-Za-z]+://(?:[^@/]+@)?|[^@/]+@)(?P<host>[^/:]+)[/:](?P<path>.+?)(?:\.git)?/?",
-                     origin_url.strip())
-    if m is None:
+    url = origin_url.strip()
+    if "://" in url:
+        parts = urllib.parse.urlsplit(url)
+        host, path = parts.hostname, parts.path      # the port, if any, is not part of the repo
+    else:
+        m = re.fullmatch(r"(?:[^@/:]+@)?(?P<host>[^/:]+):(?P<path>[^/].*)", url)   # scp-style git@host:owner/name
+        host, path = (m["host"], m["path"]) if m else (None, "")
+    if not host:
         return  # a local mirror or an unparsed remote: nothing to compare
-    host, path = m["host"].lower(), m["path"].lower()
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
     want = repo.lower()
-    if f"{host}/{path}" != want:
+    if f"{host.lower()}/{path.lower()}" != want:
         raise SystemExit(f"manifest 'repo' is {repo!r} but origin is {origin_url.strip()!r}: children open PRs "
                          "on origin, so the manifest must name that host/owner/name")
 
@@ -1943,9 +1956,12 @@ async def _run_batch(batch, sem, breaker):
                 claimed_kind = claimed.get("kind") if isinstance(claimed, dict) else None
                 below = "\n".join(rows_after(ledger, MANIFEST["stop_c"]))
                 classes = unit_blocker_classes(out["pr_head"], batch["units"])
-                row = (decision if claimed_kind == "human_override"
-                       and override_decision(decision, batch["units"], below)
-                       else ledger_override(batch["units"], ledger, MANIFEST["stop_c"], classes))
+                claimed_row = (decision if claimed_kind == "human_override"
+                               and override_decision(decision, batch["units"], below) else None)
+                if claimed_row and scope_covers(override_scope(claimed_row, below), classes):
+                    row = claimed_row
+                else:  # the child's claim is too narrow or absent; the ledger may still hold a row that fits
+                    row = ledger_override(batch["units"], ledger, MANIFEST["stop_c"], classes) or claimed_row
                 scope = override_scope(row, below) if row else None
                 uncovered = ({} if scope_covers(scope, classes)
                              else {u: c for u, c in classes.items() if c is None or not set(c) <= set(scope)})
