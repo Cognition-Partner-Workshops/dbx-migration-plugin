@@ -10,7 +10,7 @@ import json
 import re
 from pathlib import Path
 
-from .config import ConfigError
+from .config import RERUN_POSTURES, ConfigError
 from .rerun import rerun_first_run_baseline, rerun_gap, rerun_missing, rerun_unsupported
 from .routines import parity_missing, routine_gap
 from .tiers import TierResult
@@ -20,16 +20,23 @@ MAX_FINDINGS_IN_REPORT = 50
 STRUCTURAL_TIERS = ("structural_parity", "schema_parity")
 # tiers that grade the evidence, not the rows: a failure here is a run to repeat, not drift
 EVIDENCE_TIERS = ("consistency_window",)
+# tier 6 grades both: a row applied out of order or replayed is data; the feed's lag, an ungradable
+# watermark or unusable delete evidence says the rows are not all there yet, not that they differ
+CDC_TIER = "cdc_lag_ordering"
+CDC_EVIDENCE_CHECKS = frozenset({"cdc_lag_exceeded", "cdc_in_flight_exceeded", "cdc_watermark_incomparable",
+                                 "cdc_lag_ungraded", "delete_lag_exceeded", "delete_evidence_retention_gap",
+                                 "delete_evidence_unusable"})
 
-# How a unit's rerun proof is judged, declared per unit in the wave manifest and passed through
-# `dbx-recon run --rerun-posture`:
-#   required            a job that will run again against an existing target (pipelines,
-#                       scheduled loads): both legs must pass, an unsupported evolved leg blocks
-#   first_run_baseline  the unit's first migration: the fresh leg records the baseline shape and
-#                       an evolved leg that had nothing to evolve from is expected, not a gap
-#   not_applicable      one-shot DDL, routine packages, gold aggregates: no rerun semantics; a
-#                       proof, if one is supplied anyway, still blocks on a failed leg
-RERUN_POSTURES = ("required", "first_run_baseline", "not_applicable")
+
+def data_failed(tier: TierResult) -> bool:
+    """A failed data tier whose findings say the rows differ (every finding of a CDC tier that is
+    not the feed's evidence)."""
+    if tier.passed:
+        return False
+    if tier.name == CDC_TIER:
+        return any(f.check not in CDC_EVIDENCE_CHECKS for f in tier.findings)
+    return True
+
 
 # Why a merge is blocked, by what a human has to do about it:
 #   data                  rows or routine behaviour differ: fix the converted code
@@ -134,7 +141,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     parity_gap = bool(unlisted_writers) or routine_analysis_missing
     if not data_tiers:
         parity = "NOT_RUN"
-    elif all(t.passed for t in data_tiers) and not routine_gap(routine_parity):
+    elif not any(data_failed(t) for t in data_tiers) and not routine_gap(routine_parity):
         parity = "PASS"
     else:
         parity = "FAIL"
@@ -160,7 +167,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         elif structural is not None and not structural.passed:
             failed_class = structural_class
         else:
-            failed_class = "evidence"  # the consistency window moved or was lost
+            failed_class = "evidence"  # the window moved, or the feed is behind
         block("tier_failed", failed_class)
     if routine_gap(routine_parity):
         block("routine_gap", "data")

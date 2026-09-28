@@ -156,13 +156,16 @@ provenance warning and the run is not merge-eligible.
   it into `result.json` after checking its `source_digest` against the job's files as committed now (any
   edit to the DDL, notebook or SQL makes the proof stale and refused); a
   failed leg adds `rerun_gap` to `merge_block_reasons`; what else blocks depends on the unit's
-  declared `run --rerun-posture` (default `required`, recorded as `rerun_posture` in `result.json`):
+  `rerun_posture`, declared at the top level of its committed mapping spec (default `required`, recorded
+  as `rerun_posture` in `result.json`; never a run flag, so the run being graded cannot pick its gate and
+  the verifier sees the posture in the reviewed spec):
   `required` (a job that runs again against an existing target: pipelines, scheduled loads) also
   blocks on an unsupported evolved leg (`rerun_unsupported`) and on no proof at all
   (`rerun_missing`); `first_run_baseline` (the unit's first migration) needs the fresh leg, which
   records the baseline shape, and accepts exactly one unsupported evolved leg: the one that ran
-  against the fresh shape (`unsupported_kind: nothing_evolved`); a leg that did not run, recorded
-  no pre_shape or started from an undeclared shape still blocks; and
+  against the fresh shape when no other prior shape was declared (`unsupported_kind: nothing_evolved`);
+  a leg that did not run, recorded no pre_shape, started from an undeclared shape, or started from the
+  fresh shape when `--prior-shape` declared a different one still blocks; and
   `not_applicable` (one-shot DDL, routine packages, gold aggregates) needs no proof. No posture ever
   lifts a failed leg or any non-rerun blocker.
 - Fixture shape (wave 0): `dbx-recon fixture-shape --family <f> --mapping <spec>

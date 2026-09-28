@@ -13,6 +13,7 @@ from recon import cli
 from recon.config import ConfigError
 from recon.report import build_result
 from recon.rerun import (
+    rerun_first_run_baseline,
     RERUN_RECORD_KEYS,
     _check_shape,
     check_proof,
@@ -270,10 +271,24 @@ def test_evolved_is_unsupported_never_clean_when_no_prior_shape_was_exercised():
                                          "committed shape (the prior proof's shape) and run again")
     out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE))
     assert out["evolved"] == "unsupported" and "pre_shape" in out["unsupported_reason"]
+    for prior in (None, NEW_SHAPE):
+        out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE, pre_shape=NEW_SHAPE), prior=prior)
+        assert out["evolved"] == "unsupported" and out["unsupported_kind"] == "nothing_evolved"
+        assert out["unsupported_reason"] == ("evolved pre_shape equals the fresh shape: nothing evolved, "
+                                             "so the run proves only what fresh proved")
+
+
+def test_a_declared_prior_that_is_not_the_fresh_shape_is_not_satisfied_by_a_rerun_from_the_fresh_shape():
+    """`nothing_evolved` is what a first run can honestly produce: no other shape exists. Once a prior
+    shape is declared, the leg owed is the one from it; a rerun from the fresh shape did not test the
+    migration from the prior and is graded as the wrong pre_shape, which no posture accepts."""
     out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE, pre_shape=NEW_SHAPE), prior=PRIOR)
-    assert out["evolved"] == "unsupported" and out["unsupported_kind"] == "nothing_evolved"
-    assert out["unsupported_reason"] == ("evolved pre_shape equals the fresh shape: nothing evolved, "
-                                         "so the run proves only what fresh proved")
+    assert out["evolved"] == "unsupported" and out["unsupported_kind"] == "pre_shape_not_prior"
+    assert "not the declared prior shape" in out["unsupported_reason"] and out["findings"] == []
+    assert rerun_first_run_baseline(out) is False
+    # landing a different shape on that leg is still the failure it always was
+    out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", OLD_SHAPE, pre_shape=NEW_SHAPE), prior=PRIOR)
+    assert out["evolved"] == "fail" and "unsupported_kind" not in out
 
 
 def test_a_rerun_from_the_fresh_shape_that_lands_a_different_shape_fails_rather_than_counting_as_nothing_evolved():

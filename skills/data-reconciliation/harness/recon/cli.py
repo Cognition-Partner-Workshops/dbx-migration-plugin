@@ -34,7 +34,7 @@ from .config import (
 from .cost import estimate_cost
 from .engine import DEPTHS, MODES, PLANNED_MODES, run_recon
 from .fixture_shape import compare_fixture
-from .report import RERUN_POSTURES, status_line
+from .report import status_line
 from .rerun import check_proof, grade_rerun, load_prior, load_record, source_digest
 from .structure import CATEGORIES
 from .typemap import apply_type_map, load_type_map
@@ -306,11 +306,6 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--rerun-source", action="append", default=[], type=Path,
                    help="with --rerun-proof: the job's source files as committed now (the same set "
                         "rerun-proof was given); a proof of other files is stale and refused")
-    r.add_argument("--rerun-posture", choices=RERUN_POSTURES, default="required",
-                   help="the unit's declared rerun posture (wave manifest): required = both legs must "
-                        "pass; first_run_baseline = the fresh leg records the baseline and an evolved "
-                        "leg with nothing to evolve from is expected; not_applicable = no rerun "
-                        "semantics (a supplied proof still blocks on a failed leg)")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -594,8 +589,7 @@ def main(argv: list[str] | None = None) -> int:
                        source_family=args.family, depth=args.depth, type_map=type_map,
                        routine_parity=routine_parity, routine_writers=routine_writers,
                        routine_analysis_missing=routine_analysis_missing,
-                       routine_dependencies=routine_dependencies, rerun_proof=rerun_proof,
-                       rerun_posture=args.rerun_posture)
+                       routine_dependencies=routine_dependencies, rerun_proof=rerun_proof)
     print(f"dbx-recon {result['verdict']}: {status_line(result)}; unit={args.unit} mode={args.mode} "
           f"depth={result['depth']} mapping={spec.version} tolerances={tol.version} "
           f"merge_eligible={result['merge_eligible']} -> {args.out}/result.json")

@@ -3,17 +3,20 @@ privilege visibility as its own outcome. The behavioural case the estate gate ne
 first-run unit whose rows match and whose evolved rerun leg had nothing to evolve from is
 merge-eligible, and a unit whose data matched never prints as FAIL."""
 
+import dataclasses
 import json
+from pathlib import Path
 
 import pytest
 from recon import cli
 from recon.adapters import DictionaryError, SchemaFacts, _read_grants, dictionary_error
-from recon.config import ConfigError, Tolerances
+from recon.config import ConfigError, Tolerances, load_mapping_spec
 from recon.engine import run_recon
 from recon.report import (
     BLOCKER_CLASSES,
     RERUN_POSTURES,
     build_result,
+    data_failed,
     render_report,
     render_summary,
     status_line,
@@ -206,7 +209,7 @@ def test_read_grants_turns_a_refusal_into_a_denied_category_and_propagates_the_r
 
 # ------------------------------------------------------------------ end to end
 
-def _first_run(target_loans=None, **kw):
+def _first_run(target_loans=None, rerun_posture="required", **kw):
     loans, borrowers = _rows(12)
     source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
                         schema={"dbo.loans": _facts(LOANS_FACTS, grants={"app_ro": frozenset({"select"})}),
@@ -217,7 +220,8 @@ def _first_run(target_loans=None, **kw):
                                                                 grants={"app_ro": frozenset({"select"})}),
                                 "borrowers": BORROWER_FACTS},
                         sequences={("loans", "loan_id"): 13})
-    return run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target, **kw)
+    spec = dataclasses.replace(_spec(), rerun_posture=rerun_posture)
+    return run_recon("u1", "live", spec, Tolerances("t1"), [], source, target, **kw)
 
 
 def test_first_run_estate_reaches_merge_eligibility_end_to_end():
@@ -258,6 +262,37 @@ def test_a_refusal_beside_a_real_mismatch_is_structural_and_the_mismatch_is_kept
     assert any(f["check"] == "trigger_extra" for f in r["tiers"][0]["findings"])
 
 
+def test_cdc_lag_is_evidence_not_parity_but_a_misordered_row_is_data():
+    """Tier 6 fails for the feed being behind and for a row applied out of order alike; only the second
+    says the rows the target holds differ from the source."""
+    lag = TierResult(6, "cdc_lag_ordering", False, 1,
+                     [Finding("t", "cdc_lag_exceeded", "lag 90.000s > cdc_lag_max_s=60.0s (12 source rows in flight)")], {})
+    r = _green(mode="transactional", tiers=[TierResult(1, "row_count", True, 1, [], {}), lag])
+    assert r["verdict"] == "FAIL" and r["parity"] == "PASS"
+    assert r["blockers"] == [{"reason": "tier_failed", "class": "evidence"}]
+    for check in ("row_ahead_of_source", "row_behind_applied_watermark", "target_ahead_of_source"):
+        order = TierResult(6, "cdc_lag_ordering", False, 1, [lag.findings[0], Finding("t", check, "1 row")], {})
+        r = _green(mode="transactional", tiers=[TierResult(1, "row_count", True, 1, [], {}), order])
+        assert r["parity"] == "FAIL" and r["blockers"] == [{"reason": "tier_failed", "class": "data"}], check
+    assert data_failed(TierResult(6, "cdc_lag_ordering", True, 1, [], {})) is False
+
+
+def test_rerun_posture_is_declared_in_the_committed_mapping_spec_never_by_the_run(tmp_path):
+    """A flag would let the run being graded pick its own gate; the spec is versioned, committed and
+    reviewed, and result.json cites its version."""
+    spec = {"version": "m1", "objects": [{"object": "t", "root_table": "s.t",
+                                          "key": {"source": ["id"], "target": "id"}}]}
+    path = tmp_path / "mapping.json"
+    path.write_text(json.dumps(spec))
+    assert load_mapping_spec(path, {}).rerun_posture == "required"
+    path.write_text(json.dumps({**spec, "rerun_posture": "not_applicable"}))
+    assert load_mapping_spec(path, {}).rerun_posture == "not_applicable"
+    path.write_text(json.dumps({**spec, "rerun_posture": "whenever"}))
+    with pytest.raises(ConfigError, match="rerun_posture"):
+        load_mapping_spec(path, {})
+    assert "--rerun-posture" not in (Path(cli.__file__).read_text())
+
+
 def test_cli_passes_posture_through(tmp_path, monkeypatch, capsys):
     from recon import adapters
     from tests.test_tiers import GRADED_SPEC, RULES, TOL, make_graded
@@ -267,7 +302,8 @@ def test_cli_passes_posture_through(tmp_path, monkeypatch, capsys):
     source, target = make_graded()
     monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "oracle", lambda secret: source)
     monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: target)
-    monkeypatch.setattr(cli, "load_mapping_spec", lambda path, params: GRADED_SPEC)
+    specs = {"m": dataclasses.replace(GRADED_SPEC, rerun_posture="not_applicable"), "m-required": GRADED_SPEC}
+    monkeypatch.setattr(cli, "load_mapping_spec", lambda path, params: specs[str(path)])
     monkeypatch.setattr(cli, "load_tolerances", lambda path: TOL)
     monkeypatch.setattr(cli, "load_canon_rules", lambda path: RULES)
     argv = ["run", "--unit", "u", "--family", "oracle", "--mode", "live", "--depth", "full",
@@ -275,18 +311,20 @@ def test_cli_passes_posture_through(tmp_path, monkeypatch, capsys):
             "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
             "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out")]
     # no committed dependency analysis in this repo: the one blocker left is evidence, not rerun
-    assert cli.main(argv + ["--rerun-posture", "not_applicable"]) == 0
+    assert cli.main(argv) == 0
     assert "dbx-recon PASS: parity PASS, merge blocked (evidence)" in capsys.readouterr().out
     result = json.loads((tmp_path / "out" / "result.json").read_text())
     assert result["rerun_posture"] == "not_applicable"
     assert result["blockers"] == [{"reason": "routine_parity_missing", "class": "evidence"}]
     assert "structural_blind" not in result["tiers"][0]["stats"]
+    argv[argv.index("m")] = "m-required"
     assert cli.main(argv) == 0
     assert "parity PASS, merge blocked (evidence, rerun_policy)" in capsys.readouterr().out
     result = json.loads((tmp_path / "out" / "result.json").read_text())
     assert result["rerun_posture"] == "required" and "rerun_missing" in result["merge_block_reasons"]
-    with pytest.raises(SystemExit):
-        cli.main(argv + ["--structural-blind", "grants"])
+    for flag in (["--structural-blind", "grants"], ["--rerun-posture", "not_applicable"]):
+        with pytest.raises(SystemExit):
+            cli.main(argv + flag)
 
 
 def test_a_refused_grant_read_releases_its_savepoint_either_way():
