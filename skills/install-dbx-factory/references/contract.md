@@ -73,7 +73,7 @@ Reply: `approve STOP C`  (or `halt`)
 ```
 WAVE 1  open  parity PASS 7/7  merge-eligible 0/7  verify PASS
 Blockers: rerun_policy x7, privilege_visibility x2
-Decision: merge 7 verified PRs, then start wave 2. Override D-23 lifts merge policy only; parity stays as measured
+Decision: merge 7 verified PRs; wave 2 once they are recorded merged and green. Override D-23 lifts merge policy only; parity stays as measured
 Not done: nothing; wave complete
 PRs: <links>   Evidence: .migration/waves/wave-1.result.json
 Reply: `accept wave 1`  (or `halt`)

@@ -155,9 +155,13 @@ def wave_card(result: dict) -> str:
     auto_merge = result.get("auto_merge") is True
     close = result.get("close") if isinstance(result.get("close"), dict) else None
     merged = [u for u in (close.get("merged_prs", []) if close else []) if isinstance(u, str)]
-    awaiting = [b.get("pr_url") for b in verified if b.get("pr_url") not in merged]
+    resync = result.get("resync") if isinstance(result.get("resync"), dict) else None
+    resync_held = {i for i in (resync or {}).get("held_batches") or [] if isinstance(i, str)}
+    # the same merge gate the close step applies: verifier PASS, not merged yet, not held by the resync
+    awaiting = [b.get("pr_url") for b in verified if b.get("pr_url") not in merged and b.get("id") not in resync_held]
+    held_verified = [b["id"] for b in verified if b.get("id") in resync_held]
     to_start = f"wave {wave + 1}" if isinstance(wave, int) else "the next wave"
-    override_ids = ", ".join(sorted({o.get("decision_id", "?") for o in overrides}))
+    override_ids = sorted({o.get("decision_id", "?") for o in overrides})
 
     def render(ids: int, links: int, classes_shown: int) -> str:
         rest = _ids(unverified + failed + held, ids)
@@ -168,17 +172,21 @@ def wave_card(result: dict) -> str:
                 f"{len(merged)} PRs merged; nothing else may merge"
             decision += f"; {rest} relaunch separately" if rest else ""
             reply = "relaunch" if rest or awaiting else None
-        elif verified:
-            decision = f"merge {len(awaiting)} verified PRs, then start {to_start}"
+        elif awaiting:
+            decision = f"merge {len(awaiting)} verified PRs; {to_start} once they are recorded merged and green"
             if rest:
                 decision += f"; {rest} relaunch separately"
             reply = f"accept wave {wave}"
+        elif held_verified:
+            decision = f"nothing merges: resync held {_ids(held_verified, max(ids, 1))}; fix it and relaunch"
+            reply = "relaunch"
         elif passed:
             decision, reply = f"nothing merges: verifier {verdict}; fix its findings and relaunch", "relaunch"
         else:
             decision, reply = f"fix {rest or 'the halt'} and relaunch", "relaunch"
         if overrides:
-            decision += f". Override {override_ids} lifts merge policy only; parity stays as measured"
+            decision += (f". Override {_ids(override_ids, max(ids, 1))} lifts merge policy only; "
+                         "parity stays as measured")
 
         not_done = []
         if verify is None:
@@ -193,13 +201,13 @@ def wave_card(result: dict) -> str:
             not_done.append("held by breaker: " + _ids(held, ids))
         if close and close.get("unmerged") and auto_merge:
             not_done.append(f"{len(close['unmerged'])} PRs not merged")
-        if result.get("resync") and (result["resync"] or {}).get("held_batches"):
-            not_done.append("resync held: " + _ids(result["resync"]["held_batches"], ids))
+        if resync_held:
+            not_done.append("resync held: " + _ids(sorted(resync_held), ids))
 
         if merged:
             prs = f"merged {_links(merged, links)}" + (f"; to merge {_links(awaiting, links)}" if awaiting else "")
         else:
-            prs = _links(awaiting or [b.get("pr_url") for b in passed], links)
+            prs = _links(awaiting or [b.get("pr_url") for b in passed if b.get("id") not in resync_held], links)
         return card([
             head,
             blockers_line(classes_shown),

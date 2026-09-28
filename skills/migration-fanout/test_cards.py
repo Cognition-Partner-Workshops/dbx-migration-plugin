@@ -70,7 +70,7 @@ def test_wave_card_counts_parity_and_merge_policy_separately_and_groups_blockers
     assert len(lines) == 6
     assert lines[0] == "WAVE 1  open  parity PASS 3/3  merge-eligible 1/3  verify PASS"
     assert lines[1] == "Blockers: rerun_policy x2, privilege_visibility x1"
-    assert lines[2] == ("Decision: merge 3 verified PRs, then start wave 2. "
+    assert lines[2] == ("Decision: merge 3 verified PRs; wave 2 once they are recorded merged and green. "
                         "Override D-23 lifts merge policy only; parity stays as measured")
     assert lines[3] == "Not done: nothing; wave complete"
     assert lines[4].startswith("PRs: https://example.test/pr/b-1 https://example.test/pr/b-2 https://example.test/pr/b-3")
@@ -168,7 +168,7 @@ def test_wave_card_names_the_batches_the_verifier_passed_and_what_the_close_step
     batches = [_batch("b-1"), _batch("b-2")]
     partial = {"b-1": "PASS", "b-2": "FAIL"}
     lines = _lines(cards.wave_card(_result(batches, verify="FAIL", unit_verdicts=partial)))
-    assert lines[2] == "Decision: merge 1 verified PRs, then start wave 2; b-2 relaunch separately"
+    assert lines[2] == "Decision: merge 1 verified PRs; wave 2 once they are recorded merged and green; b-2 relaunch separately"
     assert lines[3] == "Not done: verifier FAIL: b-2"
     assert lines[4].startswith("PRs: https://example.test/pr/b-1   Evidence:")
     assert lines[5] == "Reply: `accept wave 1`  (or `halt`)"
@@ -209,3 +209,32 @@ def test_wave_card_never_overflows_however_many_batches_failed_or_were_held():
     lines = _lines(text)
     assert len(lines) == 6 and sum(len(l.split()) for l in lines) <= cards.MAX_WORDS
     assert "in the result" in lines[4] or "+" in lines[4]
+
+
+def test_a_verified_batch_held_by_the_resync_is_never_offered_for_merge():
+    """`to_merge` skips resync-held batches; the card must apply the same gate or it bypasses the hold."""
+    batches = [_batch("b-1"), _batch("b-2")]
+    resync = {"ran": True, "problems": ["b-1 identity resync failed"], "held_batches": ["b-1"]}
+    lines = _lines(cards.wave_card(_result(batches, resync=resync)))
+    assert lines[2] == "Decision: merge 1 verified PRs; wave 2 once they are recorded merged and green"
+    assert "resync held: b-1" in lines[3]
+    assert lines[4].startswith("PRs: https://example.test/pr/b-2   Evidence:")
+
+    lines = _lines(cards.wave_card(_result(batches, resync={**resync, "held_batches": ["b-1", "b-2"]})))
+    assert lines[2] == "Decision: nothing merges: resync held b-1, b-2; fix it and relaunch"
+    assert lines[4].startswith("PRs: none   Evidence:")
+    assert lines[5] == "Reply: `relaunch`  (or `halt`)"
+
+
+def test_a_manual_merge_wave_does_not_offer_the_next_wave_before_the_merges_are_recorded():
+    lines = _lines(cards.wave_card(_result([_batch("b-1")], closed=True, auto_merge=False)))
+    assert lines[2] == "Decision: merge 1 verified PRs; wave 2 once they are recorded merged and green"
+    assert "then start" not in lines[2]
+
+
+def test_override_ids_are_bounded_like_every_other_enumeration():
+    overrides = [{"batch": f"b-{i}", "units": [f"u{i}"], "decision_id": f"D-{100 + i}"} for i in range(100)]
+    batches = [_batch(f"b-{i}", eligible=False, classes=["rerun_policy"]) for i in range(100)]
+    lines = _lines(cards.wave_card(_result(batches, overrides=overrides)))
+    assert len(lines) == 6 and sum(len(l.split()) for l in lines) <= cards.MAX_WORDS
+    assert "Override D-100" in lines[2] and "more lifts merge policy only" in lines[2]

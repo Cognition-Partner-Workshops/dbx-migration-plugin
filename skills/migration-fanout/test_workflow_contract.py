@@ -1080,7 +1080,7 @@ def test_a_manual_wave_runs_a_review_only_close_and_the_brief_lists_the_prs(tmp_
     assert f"Awaiting manual merge: {pr}, {pr2}" in brief
     card = (ws / ".migration/waves/wave-0.card.md").read_text().splitlines()
     assert len(card) == 6 and card[0].startswith("WAVE 0  closed  recon PASS 2/2  merge-eligible 2/2  verify PASS")
-    assert card[2] == "Decision: merge 2 verified PRs, then start wave 1"
+    assert card[2] == "Decision: merge 2 verified PRs; wave 1 once they are recorded merged and green"
     assert card[4] == f"PRs: {pr} {pr2}   Evidence: .migration/waves/wave-0.result.json"
     assert card[5] == "Reply: `accept wave 0`  (or `halt`)"
 
