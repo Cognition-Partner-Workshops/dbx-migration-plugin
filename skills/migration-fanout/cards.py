@@ -165,21 +165,25 @@ def wave_card(result: dict) -> str:
 
     def render(ids: int, links: int, classes_shown: int) -> str:
         rest = _ids(unverified + failed + held, ids)
-        if closed and auto_merge:
+        # a verified batch the resync holds is not merged by anyone until the hold is fixed and the
+        # wave relaunched: it keeps the reply on `relaunch` and the next wave out of the decision
+        resync_hold = f"resync held {_ids(held_verified, max(ids, 1))}: fix it and relaunch" if held_verified else ""
+        if closed and auto_merge and not held_verified:
             decision, reply = f"none; {len(merged)} PRs merged, {to_start} may launch", None
         elif merged:
             decision = f"{len(merged)} PRs merged; {len(awaiting)} verified await merge" if awaiting else \
                 f"{len(merged)} PRs merged; nothing else may merge"
             decision += f"; {rest} relaunch separately" if rest else ""
-            reply = "relaunch" if rest or awaiting else None
+            decision += f"; {resync_hold}" if resync_hold else ""
+            reply = "relaunch" if rest or awaiting or held_verified else None
         elif awaiting:
-            decision = f"merge {len(awaiting)} verified PRs; {to_start} once they are recorded merged and green"
+            decision = f"merge {len(awaiting)} verified PRs; " + (
+                resync_hold if held_verified else f"{to_start} once they are recorded merged and green")
             if rest:
                 decision += f"; {rest} relaunch separately"
-            reply = f"accept wave {wave}"
+            reply = "relaunch" if held_verified else f"accept wave {wave}"
         elif held_verified:
-            decision = f"nothing merges: resync held {_ids(held_verified, max(ids, 1))}; fix it and relaunch"
-            reply = "relaunch"
+            decision, reply = f"nothing merges: {resync_hold}", "relaunch"
         elif passed:
             decision, reply = f"nothing merges: verifier {verdict}; fix its findings and relaunch", "relaunch"
         else:

@@ -216,13 +216,33 @@ def test_a_verified_batch_held_by_the_resync_is_never_offered_for_merge():
     batches = [_batch("b-1"), _batch("b-2")]
     resync = {"ran": True, "problems": ["b-1 identity resync failed"], "held_batches": ["b-1"]}
     lines = _lines(cards.wave_card(_result(batches, resync=resync)))
-    assert lines[2] == "Decision: merge 1 verified PRs; wave 2 once they are recorded merged and green"
+    assert lines[2] == "Decision: merge 1 verified PRs; resync held b-1: fix it and relaunch"
     assert "resync held: b-1" in lines[3]
     assert lines[4].startswith("PRs: https://example.test/pr/b-2   Evidence:")
 
     lines = _lines(cards.wave_card(_result(batches, resync={**resync, "held_batches": ["b-1", "b-2"]})))
-    assert lines[2] == "Decision: nothing merges: resync held b-1, b-2; fix it and relaunch"
+    assert lines[2] == "Decision: nothing merges: resync held b-1, b-2: fix it and relaunch"
     assert lines[4].startswith("PRs: none   Evidence:")
+    assert lines[5] == "Reply: `relaunch`  (or `halt`)"
+
+
+def test_a_resync_hold_beside_mergeable_batches_keeps_the_reply_on_relaunch():
+    """One held batch in a wave of two: the other may merge, but the wave is not accepted and the next
+    wave is not promised until the hold is fixed; the held one stays in Not done."""
+    batches = [_batch("b-1"), _batch("b-2")]
+    resync = {"ran": True, "problems": ["b-1 identity resync failed"], "held_batches": ["b-1"]}
+    lines = _lines(cards.wave_card(_result(batches, resync=resync)))
+    assert lines[2] == "Decision: merge 1 verified PRs; resync held b-1: fix it and relaunch"
+    assert "wave 2" not in lines[2] and "resync held: b-1" in lines[3]
+    assert lines[5] == "Reply: `relaunch`  (or `halt`)"
+
+    close = {"merged_prs": ["https://example.test/pr/b-2"], "unmerged": []}
+    lines = _lines(cards.wave_card(_result(batches, resync=resync, close=close)))
+    assert lines[2] == "Decision: 1 PRs merged; nothing else may merge; resync held b-1: fix it and relaunch"
+    assert lines[5] == "Reply: `relaunch`  (or `halt`)"
+
+    lines = _lines(cards.wave_card(_result(batches, resync=resync, close=close, closed=True, auto_merge=True)))
+    assert "may launch" not in lines[2] and "resync held b-1" in lines[2]
     assert lines[5] == "Reply: `relaunch`  (or `halt`)"
 
 
