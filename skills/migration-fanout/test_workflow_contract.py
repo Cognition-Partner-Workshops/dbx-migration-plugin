@@ -215,6 +215,23 @@ def _result(ws):
     return json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
 
 
+def _edit_manifest(ws, edit):
+    """Rewrite the manifest and re-sign the doctor report over it, as the doctor would after a plan edit."""
+    manifest_path = ws / ".migration/waves/wave-0.json"
+    manifest = json.loads(manifest_path.read_text())
+    edit(manifest)
+    manifest_path.write_text(json.dumps(manifest))
+    sys.path.insert(0, str(DOCTOR.parent))
+    import doctor as doctor_module
+    doctor_path = manifest_path.with_suffix(".doctor.json")
+    old = json.loads(doctor_path.read_text())
+    doctor_path.write_text(json.dumps(doctor_module.sign_wave_report(
+        {k: v for k, v in old.items() if k not in {"manifest_sha", "signed_at", "signature"}},
+        manifest_path.read_bytes(),
+        signed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))))
+    return manifest
+
+
 def _new_stop_c(ws, stop_c):
     manifest_path = ws / ".migration/waves/wave-0.json"
     manifest = json.loads(manifest_path.read_text())
@@ -362,6 +379,53 @@ def test_a_plumbing_relaunch_reuses_the_stop_c_row_while_the_gates_are_unchanged
     assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
     assert _result(ws)["relaunch"] == 2 and _spent(ws)[2]["relaunch"] == 2
     assert "Relaunch 2 under STOP C D-2" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+
+
+def test_a_plan_change_under_the_same_stop_c_row_is_not_a_plumbing_relaunch(tmp_path):
+    """STOP C approved the plan (width, units, write targets, gates), not just the gate list: a relaunch
+    with a wider or differently targeted plan under the old row halts; a brief fix does not."""
+    ws, cwd = _workspace(tmp_path)
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _spent(ws)[0]["plan_sha"]
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+
+    def widen(m):
+        m["batches"][0]["write_targets"].append("mig.t2")
+    _edit_manifest(ws, widen)
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "plan_sha" in proc.stderr and "STOP C" in proc.stderr and "write targets" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert [r.get("event") for r in _spent(ws)] == ["launch", "close"]
+
+    def narrow_and_rebrief(m):
+        m["batches"][0]["write_targets"].remove("mig.t2")
+        m["batches"][0]["brief"] = "the same units, told the repo host that exists"
+        m["repo"] = m.get("repo")
+    _edit_manifest(ws, narrow_and_rebrief)
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["relaunch"] == 2
+
+
+def test_two_runs_of_one_wave_cannot_overlap(tmp_path):
+    """A running wave has no result and no passed event yet; a second launch under the same row would
+    start the same children. The run lock says no while the first process lives."""
+    import fcntl
+    ws, cwd = _workspace(tmp_path)
+    lock = (ws / ".migration/waves/.wave-0.lock").open("a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    assert proc.returncode != 0 and "another run of wave 0" in proc.stderr and "D-2" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_a_run_that_produced_a_merge_candidate_spends_its_stop_c_row(tmp_path):

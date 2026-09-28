@@ -72,6 +72,7 @@ BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
+LOCK_PATH = MANIFEST_PATH.with_name(f".{MANIFEST_PATH.stem}.lock")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 DOCTOR_PATH = MANIFEST_PATH.with_suffix(".doctor.json")
 DECISIONS_PATH = ROOT / ".migration" / "06_decisions.md"
@@ -287,6 +288,22 @@ def ledger_override(units, ledger, stop_c, classes=None):
                     return decision_id
                 named = named or decision_id
     return named
+
+
+# manifest keys a plumbing relaunch may change without a new STOP C: how a child is briefed and
+# connected, and estimates. Everything else is the plan the row approved (contract: order,
+# dependencies, width, gates, write targets)
+PLAN_PLUMBING = frozenset({"brief", "repo", "secrets", "cost_estimate", "max_minutes", "source", "stop_c", "gates_sha"})
+
+
+def approved_plan_sha(manifest):
+    def strip(x):
+        if isinstance(x, dict):
+            return {k: strip(v) for k, v in x.items() if k not in PLAN_PLUMBING}
+        if isinstance(x, list):
+            return [strip(v) for v in x]
+        return x
+    return hashlib.sha256(json.dumps(strip(manifest), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def declared_gates_sha(wave, batches, degraded=False):
@@ -685,12 +702,26 @@ def run_log():
     return runs
 
 
+_RUN_LOCK = None
+
+
 def spend_stop_c():
     """One STOP C approval covers one run of the wave and its plumbing relaunches: a rerun under the
-    same row is allowed while the gates it approved are unchanged and no earlier run under it got a
-    batch past its own checks (nothing to merge was produced). A run that did, or a gates change, is
-    a new decision. Returns the launch number under this row (1 for the first)."""
+    same row is allowed while the plan it approved (gates, width, units, write targets: everything but
+    PLAN_PLUMBING) is unchanged and no earlier run under it got a batch past its own checks (nothing to
+    merge was produced). A run that did, or a plan change, is a new decision. One run of a wave at a
+    time: the lock is held until this process exits, so a run that died holds nothing and a run that is
+    still going cannot be launched twice. Returns the launch number under this row (1 for the first)."""
+    global _RUN_LOCK
     row = MANIFEST["stop_c"]
+    _RUN_LOCK = LOCK_PATH.open("a")
+    try:
+        fcntl.flock(_RUN_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"another run of wave {TAG} holds {LOCK_PATH}: two runs under STOP C row {row} would "
+                         "launch the same batches twice; wait for it to write its result or halt it") from None
+    if RESULT_PATH.exists():
+        raise SystemExit(f"{RESULT_PATH} was written while this run was starting: this wave already ran")
     with RUNS_PATH.open("a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         spent = [run for run in run_log() if run["stop_c"] == row]
@@ -698,15 +729,18 @@ def spend_stop_c():
         rerun = (f"{RUNS_PATH} records a run this wave already made under STOP C row {row}; a rerun is a "
                  "new run of the wave, so STOP C fires again: record its new row in the ledger and name it in "
                  "the manifest's stop_c")
-        if any(run.get("gates_sha") != MANIFEST["gates_sha"] for run in launches):
-            raise SystemExit(rerun + " (that run's gates_sha is not this manifest's, or was not recorded)")
+        if any(run.get("gates_sha") != MANIFEST["gates_sha"] or run.get("plan_sha") != PLAN_SHA for run in launches):
+            raise SystemExit(rerun + " (that run's gates_sha or plan_sha is not this manifest's, or was not "
+                             "recorded: the gates, width, units, write targets or another approved plan input "
+                             "changed; only briefs, repo, secret names, estimates and the source connection "
+                             "may change under one row)")
         produced = sorted({b for run in spent for b in (run.get("passed") or []) + (run.get("merged") or [])})
         if produced:
             raise SystemExit(rerun + f" (that run produced {', '.join(produced)}; only a run that produced "
                              "nothing to merge is a plumbing relaunch)")
         n = len(launches) + 1
         f.write(json.dumps({"stop_c": row, "event": "launch", "relaunch": n, "gates_sha": MANIFEST["gates_sha"],
-                            "manifest_sha": MANIFEST_SHA,
+                            "plan_sha": PLAN_SHA, "manifest_sha": MANIFEST_SHA,
                             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")},
                            sort_keys=True) + "\n")
         f.flush()
@@ -2011,7 +2045,7 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, 
     by_status = {st: [b["id"] for b, r in zip(BATCHES, results) if r["status"] == st]
                  for st in ("PASS", "FAIL", "BLOCKED", "NOT_LAUNCHED")}
     lines = [f"# Wave {WAVE} close", "",
-             *([f"Relaunch {RELAUNCH} under STOP C {MANIFEST['stop_c']} (gates unchanged, no new decision)."]
+             *([f"Relaunch {RELAUNCH} under STOP C {MANIFEST['stop_c']} (plan unchanged, no new decision)."]
                if RELAUNCH > 1 else []),
              f"Landed: {len(by_status['PASS'])} of {len(BATCHES)} batches passed their own recon.",
              f"Independent verify: {verify['wave_verdict'] if verify else 'NOT RUN'}.",
@@ -2219,5 +2253,6 @@ async def main():
 
 
 ORDER = launch_checks()
+PLAN_SHA = approved_plan_sha(MANIFEST)
 RELAUNCH = spend_stop_c()
 asyncio.run(main())
