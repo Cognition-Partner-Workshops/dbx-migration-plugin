@@ -133,9 +133,11 @@ provenance warning and the run is not merge-eligible.
   findings and every hole is a permission refusal (`DictionaryError.kind == "privilege"`, or a
   reader that marked grants `privilege_denied`), `structural` otherwise. A category the doctor has
   recorded this principal cannot read is declared with `run --structural-blind <category>`
-  (repeatable): it is masked like any other hole, labelled `blind` in `structural_checks` and
-  listed in `structural_blind`, and raises no warning, so a known visibility gap does not block on
-  its own; a finding in any other category still fails the tier. `--source-dictionary`/`--target-dictionary`
+  (repeatable): where a reader was in fact refused it, it is masked like any other hole, labelled
+  `blind` in `structural_checks` and raises no warning, so a known visibility gap does not block on
+  its own; where both dictionaries exposed it the declaration masks nothing (the category is
+  compared and named in `structural_blind_readable`), so `--structural-blind` can never hide drift
+  that was read. A finding in any other category still fails the tier. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
 - Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --source <job file>... --prior-proof
@@ -161,7 +163,9 @@ provenance warning and the run is not merge-eligible.
   `required` (a job that runs again against an existing target: pipelines, scheduled loads) also
   blocks on an unsupported evolved leg (`rerun_unsupported`) and on no proof at all
   (`rerun_missing`); `first_run_baseline` (the unit's first migration) needs the fresh leg, which
-  records the baseline shape, and accepts an evolved leg that had nothing to evolve from; and
+  records the baseline shape, and accepts exactly one unsupported evolved leg: the one that ran
+  against the fresh shape (`unsupported_kind: nothing_evolved`); a leg that did not run, recorded
+  no pre_shape or started from an undeclared shape still blocks; and
   `not_applicable` (one-shot DDL, routine packages, gold aggregates) needs no proof. No posture ever
   lifts a failed leg or any non-rerun blocker.
 - Fixture shape (wave 0): `dbx-recon fixture-shape --family <f> --mapping <spec>

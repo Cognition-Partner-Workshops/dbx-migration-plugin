@@ -26,6 +26,7 @@ from tests.loans import BORROWER_FACTS, LOANS_FACTS, TARGET_LOANS_FACTS, _facts,
 # what a first migration's proof looks like: the fresh leg landed, the evolved leg had no
 # previous committed shape to start from
 FIRST_RUN_PROOF = {"fresh": "pass", "evolved": "unsupported", "passed": True, "findings": [],
+                   "unsupported_kind": "nothing_evolved",
                    "unsupported_reason": "evolved pre_shape equals the fresh shape: nothing evolved"}
 FAILED_EVOLVED = {"fresh": "pass", "evolved": "fail", "passed": False,
                   "findings": [{"table": "t", "column": "c", "check": "type"}]}
@@ -63,8 +64,35 @@ def test_first_run_baseline_accepts_an_evolved_leg_with_nothing_to_evolve_from()
 def test_first_run_baseline_still_needs_a_fresh_leg_and_refuses_a_failed_one():
     assert _green(rerun_proof=None, rerun_posture="first_run_baseline")["merge_block_reasons"] == ["rerun_missing"]
     assert _green(rerun_proof=FAILED_EVOLVED, rerun_posture="first_run_baseline")["merge_block_reasons"] == ["rerun_gap"]
-    fresh_failed = {"fresh": "fail", "evolved": "unsupported", "passed": False, "findings": []}
-    assert _green(rerun_proof=fresh_failed, rerun_posture="first_run_baseline")["merge_block_reasons"] == ["rerun_gap"]
+    fresh_failed = {"fresh": "fail", "evolved": "unsupported", "passed": False, "findings": [],
+                    "unsupported_kind": "fresh_failed"}
+    assert _green(rerun_proof=fresh_failed, rerun_posture="first_run_baseline")["merge_block_reasons"] == [
+        "rerun_gap", "rerun_unsupported"]
+
+
+def test_first_run_baseline_accepts_only_the_leg_that_ran_against_the_fresh_shape():
+    for kind in ("no_evolved_record", "no_pre_shape", "pre_shape_missing_table", "no_prior_shape",
+                 "pre_shape_not_prior", None):
+        proof = {**FIRST_RUN_PROOF, "unsupported_kind": kind, "unsupported_reason": "x"}
+        if kind is None:
+            del proof["unsupported_kind"]  # a proof from a harness that did not record the kind
+        r = _green(rerun_proof=proof, rerun_posture="first_run_baseline")
+        assert r["merge_eligible"] is False, kind
+        assert r["blockers"] == [{"reason": "rerun_unsupported", "class": "rerun_policy"}], kind
+
+
+def test_an_unstable_window_is_an_evidence_failure_not_a_row_mismatch():
+    tiers = [TierResult(0, "consistency_window", False, 1,
+                        [Finding("dbo.loans", "window_unstable", "source count moved")], {}),
+             TierResult(1, "row_count", True, 1, [], {})]
+    r = _green(tiers=tiers, mode="transactional")
+    assert r["verdict"] == "FAIL" and r["parity"] == "PASS"
+    assert r["blockers"] == [{"reason": "tier_failed", "class": "evidence"}]
+    assert status_line(r) == "parity PASS, merge blocked (evidence)"
+    rows_moved = [tiers[0], TierResult(1, "row_count", False, 1, [Finding("dbo.loans", "count", "1 != 2")], {})]
+    assert _green(tiers=rows_moved, mode="transactional")["blockers"] == [{"reason": "tier_failed", "class": "data"}]
+    window_only = _green(tiers=[tiers[0]], mode="transactional")
+    assert window_only["parity"] == "NOT_RUN" and window_only["blockers"][0]["class"] == "evidence"
 
 
 def test_not_applicable_posture_needs_no_proof_but_refuses_a_failed_one():
@@ -228,6 +256,23 @@ def test_blind_masks_the_category_but_never_a_finding_elsewhere():
         _first_run(structural_blind=["comments"])
 
 
+def test_blind_never_hides_a_category_both_dictionaries_exposed():
+    # the declaration is a claim about visibility; a category that was read on both sides is
+    # compared, so a real trigger mismatch (or a grant drift) survives `--structural-blind`
+    wrong_trigger = _facts(TARGET_LOANS_FACTS, triggers={"trg_extra": ("after", ("insert",), "row")},
+                           grants={"app_ro": frozenset({"select"})})
+    r = _first_run(target_loans=wrong_trigger, rerun_proof=PROVEN_RERUN, structural_blind=["triggers", "grants"])
+    t0 = r["tiers"][0]
+    assert any(f["check"] == "trigger_extra" for f in t0["findings"])
+    assert r["merge_eligible"] is False and r["blocker_classes"] == ["structural"]
+    assert t0["stats"]["structural_checks"]["triggers"] != "blind"
+    assert t0["stats"]["structural_blind"] == ["grants", "triggers"]
+    assert t0["stats"]["structural_blind_readable"] == ["grants", "triggers"]
+    drift = _facts(TARGET_LOANS_FACTS, grants={"app_rw": frozenset({"select", "delete"})})
+    r = _first_run(target_loans=drift, rerun_proof=PROVEN_RERUN, structural_blind=["grants"])
+    assert r["merge_eligible"] is False and any("grant" in f["check"] for f in r["tiers"][0]["findings"])
+
+
 def test_cli_passes_posture_and_blind_through(tmp_path, monkeypatch, capsys):
     from recon import adapters
     from tests.test_tiers import GRADED_SPEC, RULES, TOL, make_graded
@@ -250,7 +295,10 @@ def test_cli_passes_posture_and_blind_through(tmp_path, monkeypatch, capsys):
     result = json.loads((tmp_path / "out" / "result.json").read_text())
     assert result["rerun_posture"] == "not_applicable"
     assert result["blockers"] == [{"reason": "routine_parity_missing", "class": "evidence"}]
-    assert result["tiers"][0]["stats"]["structural_checks"]["grants"] == "blind"
+    # the fixture dictionaries expose grants, so the declaration is recorded but masks nothing
+    t0 = result["tiers"][0]["stats"]
+    assert t0["structural_blind"] == ["grants"] == t0["structural_blind_readable"]
+    assert t0["structural_checks"]["grants"] != "blind"
     assert cli.main(argv) == 0
     assert "parity PASS, merge blocked (evidence, rerun_policy)" in capsys.readouterr().out
     result = json.loads((tmp_path / "out" / "result.json").read_text())

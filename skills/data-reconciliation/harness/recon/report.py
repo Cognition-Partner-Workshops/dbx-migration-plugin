@@ -11,13 +11,15 @@ import re
 from pathlib import Path
 
 from .config import ConfigError
-from .rerun import rerun_gap, rerun_missing, rerun_unsupported
+from .rerun import rerun_first_run_baseline, rerun_gap, rerun_missing, rerun_unsupported
 from .routines import parity_missing, routine_gap
 from .tiers import TierResult
 
 MAX_FINDINGS_IN_REPORT = 50
 
 STRUCTURAL_TIERS = ("structural_parity", "schema_parity")
+# tiers that grade the evidence, not the rows: a failure here is a run to repeat, not drift
+EVIDENCE_TIERS = ("consistency_window",)
 
 # How a unit's rerun proof is judged, declared per unit in the wave manifest and passed through
 # `dbx-recon run --rerun-posture`:
@@ -125,7 +127,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     warnings.extend(provenance_warnings or [])
     verdict = "PASS" if all(t.passed for t in tiers) else "FAIL"
     structural = next((t for t in tiers if t.name in STRUCTURAL_TIERS), None)
-    data_tiers = [t for t in tiers if t.name not in STRUCTURAL_TIERS]
+    data_tiers = [t for t in tiers if t.name not in STRUCTURAL_TIERS + EVIDENCE_TIERS]
     checks = (structural.stats.get("structural_checks") or {}) if structural else {}
     structural_blind = any(v == "unsupported" for c, v in checks.items() if c != "indexes")
     unlisted_writers = parity_missing(routine_parity, routine_writers)
@@ -153,7 +155,13 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                                    or structural_blind):
         block("structural_gap", structural_class)
     if verdict == "FAIL":
-        block("tier_failed", "data" if parity == "FAIL" else structural_class)
+        if parity == "FAIL":
+            failed_class = "data"
+        elif structural is not None and not structural.passed:
+            failed_class = structural_class
+        else:
+            failed_class = "evidence"  # the consistency window moved or was lost
+        block("tier_failed", failed_class)
     if routine_gap(routine_parity):
         block("routine_gap", "data")
     if parity_gap:
@@ -170,7 +178,10 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
             block("rerun_missing", "rerun_policy")
         if rerun_gap(rerun_proof):
             block("rerun_gap", "rerun_policy")
-        if rerun_unsupported(rerun_proof) and rerun_posture == "required":
+        if rerun_unsupported(rerun_proof) and (
+                rerun_posture == "required"
+                or (rerun_posture == "first_run_baseline"
+                    and not rerun_first_run_baseline(rerun_proof))):
             block("rerun_unsupported", "rerun_policy")
     reasons = [b["reason"] for b in blockers]
     merge_eligible = not blockers

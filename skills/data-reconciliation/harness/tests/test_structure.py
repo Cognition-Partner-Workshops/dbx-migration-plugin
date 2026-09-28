@@ -309,8 +309,8 @@ def test_structural_estimate_counts_each_adapters_catalog_reads():
     assert est["source_rows_fetched"] == 0 and est["target_rows_fetched"] == 0
     pg = estimate_cost(spec, Tolerances("t1"), mode="structural",
                        family="postgres", target_kind="lakebase")
-    assert pg["source_statements"]["tier0"] == 5 * n + 2 * n_id + 1
-    assert pg["target_statements"]["tier0"] == 5 * n + 2 * n_id + 1
+    assert pg["source_statements"]["tier0"] == 7 * n + 2 * n_id + 1
+    assert pg["target_statements"]["tier0"] == 7 * n + 2 * n_id + 1
     with pytest.raises(ValueError, match="--family"):
         estimate_cost(spec, Tolerances("t1"), mode="structural")
     assert estimate_cost(spec, Tolerances("t1"), mode="structural",
@@ -335,6 +335,7 @@ def test_catalog_statements_match_what_the_adapters_issue():
             return []
 
         inst._rows = stub
+        inst._execute = lambda sql, params=(): calls.append(sql)  # savepoint statements: sent
         inst.schema_facts("dbo.loans")
         inst.schema_facts("dbo.loans")
         inst.identity_state("dbo.loans", "loan_id")

@@ -2049,7 +2049,8 @@ class _PostgresBase(_SqlAdapterBase):
     watermark_literal_utc_offset = True
     binary_literal_sql = "'\\x{hex}'::bytea"
     # schema_facts' server_version_num read is cached after the first object (session).
-    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 1}
+    # schema_facts: four dictionary reads plus the grants read and its savepoint pair.
+    CATALOG_STATEMENTS = {"schema_facts": 7, "identity_state": 2, "session": 1}
 
     def _pg_column_shape(self, schema: str, name: str, physical: bool = False) -> list[dict[str, Any]]:
         kind = f"AND {_PG_PHYSICAL} " if physical else ""
@@ -2183,7 +2184,7 @@ class _PostgresBase(_SqlAdapterBase):
         # platform role (databricks_*), so what the member inherits along it is the platform's
         # grant (workspace admin -> databricks_superuser, which the event trigger grants on
         # every table and which holds pg_write_all_data), not the unit's
-        _read_grants(facts, lambda: self._dict_rows(
+        _read_grants(facts, lambda: self._in_savepoint(lambda: self._dict_rows(
             table, "information_schema.table_privileges",
             ("WITH RECURSIVE m(role, member, platform) AS ("
             "  SELECT r.rolname, u.rolname, r.rolsuper OR r.rolname LIKE 'databricks\\_%%' "
@@ -2214,8 +2215,21 @@ class _PostgresBase(_SqlAdapterBase):
             "  AND e.grantee NOT IN (SELECT member FROM m WHERE role = rel.owner) "
             "  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = e.grantee "
             "                  AND (r.rolsuper OR r.rolname LIKE 'databricks\\_%%')) "
-            "ORDER BY 1, 2").replace("{inherit}", inherit), (schema, name, schema, name)))
+            "ORDER BY 1, 2").replace("{inherit}", inherit), (schema, name, schema, name))))
         return facts
+
+    def _in_savepoint(self, read):
+        """A refused statement aborts the whole Postgres transaction, so a dictionary read the
+        principal may be refused runs inside a savepoint: rolling back to it clears the abort and
+        keeps the outer transaction, and with it the pinned REPEATABLE READ window."""
+        self._execute("SAVEPOINT recon_dictionary")
+        try:
+            rows = read()
+        except Exception:
+            self._execute("ROLLBACK TO SAVEPOINT recon_dictionary")
+            raise
+        self._execute("RELEASE SAVEPOINT recon_dictionary")
+        return rows
 
     # In-flight keys travel as one text[] per key column and are cast to the column's declared
     # type server-side, so one statement excludes any number of keys of any width: the row cap
