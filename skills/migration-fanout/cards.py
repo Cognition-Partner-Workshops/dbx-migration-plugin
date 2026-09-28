@@ -169,15 +169,16 @@ def wave_card(result: dict) -> str:
     to_start = f"wave {wave + 1}" if isinstance(wave, int) else "the next wave"
     rest = _ids(unverified + failed + held)
     # a verified batch the resync holds is not merged by anyone until the hold is fixed and the
-    # wave relaunched: it keeps the reply on `relaunch` and the next wave out of the decision
+    # wave relaunched: it keeps the reply on `relaunch` and the next wave out of the decision, and
+    # rides in the first Decision clause so truncation cannot drop it
     resync_hold = f"resync held {_ids(held_verified)}: fix it and relaunch" if held_verified else ""
     if closed and auto_merge and not held_verified:
         decision, reply = [f"none; {len(merged)} PRs merged, {to_start} may launch"], None
     elif merged:
-        decision = [f"{len(merged)} PRs merged; {len(awaiting)} verified await merge" if awaiting
-                    else f"{len(merged)} PRs merged; nothing else may merge"]
+        decision = [f"{len(merged)} PRs merged; " + (f"{len(awaiting)} verified await merge" if awaiting
+                                                     else "nothing else may merge")
+                    + (f"; {resync_hold}" if resync_hold else "")]
         decision += [f"{rest} relaunch separately"] if rest else []
-        decision += [resync_hold] if resync_hold else []
         reply = "relaunch" if rest or awaiting or held_verified else None
     elif awaiting:
         decision = [f"merge {len(awaiting)} verified PRs; " + (

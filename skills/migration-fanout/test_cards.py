@@ -279,6 +279,6 @@ def test_a_wave_with_everything_to_say_still_fits_by_dropping_trailing_clauses()
     lines = _lines(cards.wave_card(result))
     assert len(lines) == 6 and sum(len(l.split()) for l in lines) <= cards.MAX_WORDS
     assert lines[1].startswith("Blockers: data x6, evidence x6, privilege_visibility x6 +2 more classes")
-    assert lines[2].startswith("Decision: 6 PRs merged; 6 verified await merge")
+    assert lines[2].startswith("Decision: 6 PRs merged; 6 verified await merge; resync held r0, r1, r2 +3 more: fix it")
     assert any(" more in the result" in l for l in lines[1:4])
     assert lines[5] == "Reply: `relaunch`  (or `halt`)"
