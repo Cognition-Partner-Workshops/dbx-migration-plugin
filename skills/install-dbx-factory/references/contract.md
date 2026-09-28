@@ -70,7 +70,7 @@ Each row names the check that enforces it; the always-on rules (secrets, write s
 | A stop is skipped or an old approval is reused | Every stop is a dated row in `06_decisions.md`; the orchestrator re-reads it at every launch and re-asks if the inputs changed. |
 | A child gets an incomplete brief | It reports BLOCKED, does nothing, and the brief says which item was missing. It never guesses. |
 | Two children write the same table | `workflow.py` collision check refuses to launch the wave; found afterwards, merges are held and the brief says so. |
-| The same wave is launched twice | `workflow.py` refuses if `wave-N.result.json` exists, and a spent STOP C row never launches again; a deliberate rerun deletes the result, records a new STOP C row, refreshes the doctor, and runs `run_workflow` again (`skills/migration-fanout/SKILL.md`). |
+| The same wave is launched twice | `workflow.py` refuses if `wave-N.result.json` exists, and a spent STOP C row relaunches only as a plumbing rerun (same `gates_sha`, nothing passed or merged under it); a deliberate rerun deletes the result, refreshes the doctor, records a new STOP C row when the gates changed or a batch passed, and runs `run_workflow` again (`skills/migration-fanout/SKILL.md`). |
 | A wave launches on a stale or unsigned doctor record | `workflow.py` requires the doctor-signed `wave-N.doctor.json` for that wave, at most 15 minutes old. |
 | One mistake repeats across 20 children | `workflow.py` circuit breaker: 3 same-class failures and no new children launch; the result records the halt, the fix lands once, and the held-back batches go in the next manifest. |
 | A child keeps retrying a red recon | Hard cap of 3 full `dbx-recon` runs, then it reports FAIL with a one-word failure class. |

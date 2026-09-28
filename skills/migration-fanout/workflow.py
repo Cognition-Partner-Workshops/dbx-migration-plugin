@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from collections import Counter
 from pathlib import Path
 
@@ -72,6 +73,7 @@ BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
+LOCK_PATH = MANIFEST_PATH.with_name(f".{MANIFEST_PATH.stem}.lock")
 BRIEF_PATH = MANIFEST_PATH.with_suffix(".brief.md")
 DOCTOR_PATH = MANIFEST_PATH.with_suffix(".doctor.json")
 DECISIONS_PATH = ROOT / ".migration" / "06_decisions.md"
@@ -117,8 +119,9 @@ if RESULT_PATH.exists():
         closed = "unreadable"
     raise SystemExit(
         f"{RESULT_PATH} exists: this wave already ran (closed={closed} when readable). "
-        "To redo it on purpose delete that file, record the new STOP C row in 06_decisions.md "
-        "and name it in the manifest's stop_c, then run again"
+        "To redo it on purpose delete that file and run again: the STOP C row is reused while its gates "
+        "are unchanged and the earlier run produced nothing to merge; otherwise record the new STOP C row "
+        "in 06_decisions.md and name it in the manifest's stop_c"
     )
 
 if SMOKE:
@@ -142,7 +145,11 @@ UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
 WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")  # host/owner/name
 PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
+BARE_PATH = re.compile(r"\S+")
+# a gate's evidence: the bare path, or the path with its annotation beside it, never inside it
+EVIDENCE_META = {"label": str, "verdict": str, "rows": int}
 DECISION_ID = re.compile(r"D-[0-9]+")
 HUMAN_PROVENANCE = re.compile(r"(?<![\w-])user:[\w][\w.@/-]*")
 DEFAULT_ACCEPTED = re.compile(r"default-accepted(?: ?\([^|]*\))?")
@@ -168,21 +175,82 @@ def ledger_rows(ledger):
             yield ids[0], cells
 
 
-def override_decision(decision_id, units, ledger, word="merge_override"):
+def structured_decision(cells):
+    """The one machine cell a ledger row may carry: a JSON object {kind, units, gate?, blocker_classes?}.
+    None when the row is prose only; ValueError when a cell looks like one and is not."""
+    found = None
+    for c in cells:
+        if not c.startswith("{"):
+            continue
+        try:
+            obj = json.loads(c)
+        except ValueError:
+            raise ValueError(f"cell {c!r} is not JSON") from None
+        if not (isinstance(obj, dict) and isinstance(obj.get("kind"), str)
+                and isinstance(obj.get("units"), list) and all(isinstance(u, str) for u in obj["units"])
+                and isinstance(obj.get("gate", ""), str)
+                and (obj.get("blocker_classes") is None
+                     or (isinstance(obj["blocker_classes"], list)
+                         and all(isinstance(b, str) for b in obj["blocker_classes"])))):
+            raise ValueError(f"cell {c!r} must be {{kind, units: [..], gate?, blocker_classes?: [..]}}")
+        if found is not None:
+            raise ValueError("more than one machine cell")
+        found = obj
+    return found
+
+
+def check_ledger(ledger):
+    """Every machine cell in the ledger parses, or the run halts naming the row: a decision the workflow
+    cannot read is not one it may guess at."""
+    for row_id, cells in ledger_rows(ledger):
+        try:
+            structured_decision(cells)
+        except ValueError as e:
+            raise SystemExit(f"{DECISIONS_PATH} row {row_id}: {e}") from None
+
+
+def human_decision(decision_id, ledger):
+    """The cells of the human row D-<n> names (never a default-accepted one), or None."""
     if not isinstance(decision_id, str) or not DECISION_ID.fullmatch(decision_id):
+        return None
+    for row_id, cells in ledger_rows(ledger):
+        if (row_id == decision_id and any(HUMAN_PROVENANCE.fullmatch(c) for c in cells)
+                and not any(DEFAULT_ACCEPTED.fullmatch(c) for c in cells)):
+            return cells
+    return None
+
+
+def override_decision(decision_id, units, ledger, word="merge_override", gate=None):
+    """True when the human row D-<n> grants `word` for every unit (and the gate, for a waiver). A row
+    with a machine cell is read from that cell alone; a prose row must name the word, the gate and
+    each unit as whole tokens outside its metadata cells."""
+    cells = human_decision(decision_id, ledger)
+    if cells is None:
         return False
+    try:
+        machine = structured_decision(cells)
+    except ValueError:
+        return False
+    if machine is not None:
+        return (machine["kind"] == word and set(units) <= set(machine["units"])
+                and (gate is None or machine.get("gate") == gate))
 
     def token(w):
         return rf"(?<![A-Za-z0-9_.-]){re.escape(w)}(?![A-Za-z0-9_.-])"
 
-    for row_id, cells in ledger_rows(ledger):
-        if (row_id == decision_id and any(HUMAN_PROVENANCE.fullmatch(c) for c in cells)
-                and not any(DEFAULT_ACCEPTED.fullmatch(c) for c in cells)):
-            text = " | ".join(HUMAN_PROVENANCE.sub(" ", c) for c in cells if not LEDGER_METADATA.fullmatch(c))
-            need = Counter((word, *units))
-            if all(len(re.findall(token(w), text)) >= n for w, n in need.items()):
-                return True
-    return False
+    text = " | ".join(HUMAN_PROVENANCE.sub(" ", c) for c in cells if not LEDGER_METADATA.fullmatch(c))
+    need = Counter((word, *([gate] if gate else []), *units))
+    return all(len(re.findall(token(w), text)) >= n for w, n in need.items())
+
+
+def override_scope(decision_id, ledger):
+    """The blocker classes a structured override row says it covers; None when the row sets no scope."""
+    cells = human_decision(decision_id, ledger)
+    try:
+        machine = structured_decision(cells) if cells else None
+    except ValueError:
+        return None
+    return sorted(machine["blocker_classes"]) if machine and machine.get("blocker_classes") is not None else None
 
 
 def rows_after(ledger, stop_c):
@@ -197,9 +265,61 @@ def rows_after(ledger, stop_c):
 def ledger_waiver(gate_id, units, ledger, stop_c):
     for line in rows_after(ledger, stop_c):
         for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
-            if override_decision(decision_id, [gate_id, *units], line, word="waive"):
+            if override_decision(decision_id, units, line, word="waive", gate=gate_id):
                 return decision_id
     return None
+
+
+# what a merge_override row that sets no blocker_classes forgives: every policy class, never data.
+# Rows that differ are fixed in converted code; only a row that names "data" says otherwise
+UNSCOPED_OVERRIDE = frozenset({"structural", "privilege_visibility", "rerun_policy", "evidence"})
+
+
+def override_forgives(scope):
+    return UNSCOPED_OVERRIDE if scope is None else set(scope)
+
+
+def scope_covers(scope, classes):
+    """Whether an override's blocker-class scope covers what each unit recorded. An unrecorded class
+    list (a harness before blocker classes, or a malformed result) fits no override: it cannot show
+    the blockers are not data."""
+    return all(c is not None and set(c) <= override_forgives(scope) for c in classes.values())
+
+
+def ledger_override(units, ledger, stop_c, classes=None):
+    """The merge_override row a human wrote for these units below this run's STOP C row whose scope
+    covers the units' recorded blocker classes, whether or not the child thought to report it: the
+    decision is the ledger's, not the child's memory. The first applicable row wins; a narrower one
+    above it is not a refusal, and is returned only when no row covers the classes (so the halt names it)."""
+    named = None
+    for line in rows_after(ledger, stop_c):
+        for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
+            if override_decision(decision_id, units, line):
+                if scope_covers(override_scope(decision_id, line), classes or {}):
+                    return decision_id
+                named = named or decision_id
+    return named
+
+
+# manifest keys a plumbing relaunch may change without a new STOP C: how a child is briefed and
+# connected, and estimates. Everything else is the plan the row approved (contract: order,
+# dependencies, width, gates, write targets). Of `source`, only the secret name is plumbing:
+# the family and the params select the slice that is reconciled, which is scope
+PLAN_PLUMBING = frozenset({"brief", "repo", "secrets", "cost_estimate", "max_minutes", "stop_c", "gates_sha"})
+SOURCE_PLUMBING = frozenset({"secret"})
+
+
+def approved_plan_sha(manifest):
+    def strip(x):
+        if isinstance(x, dict):
+            return {k: strip(v) for k, v in x.items() if k not in PLAN_PLUMBING}
+        if isinstance(x, list):
+            return [strip(v) for v in x]
+        return x
+    plan = strip(manifest)
+    if isinstance(plan.get("source"), dict):
+        plan["source"] = {k: v for k, v in plan["source"].items() if k not in SOURCE_PLUMBING}
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def declared_gates_sha(wave, batches, degraded=False):
@@ -250,6 +370,8 @@ def validate_gates(b):
         req(g.get("status") in GATE_STATUSES, f"batch {b['id']} gate {g['id']} 'status' must be one of {GATE_STATUSES}")
         req(isinstance(g.get("evidence"), str) and (g["status"] != "passed" or g["evidence"]),
             f"batch {b['id']} gate {g['id']} 'evidence' must be a string, non-empty once passed")
+        req(not g["evidence"] or BARE_PATH.fullmatch(g["evidence"]),
+            f"batch {b['id']} gate {g['id']} 'evidence' must be a bare path (no spaces or notes)")
         decision = g.get("decision_id")
         req(not ((g["status"] == "waived" and decision is None)
                  or (decision is not None and not (isinstance(decision, str) and DECISION_ID.fullmatch(decision)))),
@@ -295,6 +417,8 @@ def validate_manifest(m, doctor=None):
     for key in ("wave", "repo", "child_macro", "verify_macro", "batches", "base_branch"):
         req(key in m, f"manifest is missing '{key}'")
     req(bool(m["batches"]), "manifest has no batches")
+    req(isinstance(m["repo"], str) and REPO_RE.fullmatch(m["repo"]),
+        f"manifest 'repo' must be host/owner/name (the repo of every child's PR URL), got {m['repo']!r}")
     req(isinstance(m["wave"], int) and not isinstance(m["wave"], bool) and m["wave"] >= 0,
         "manifest key 'wave' must be a non-negative integer")
     for key in ("width", "breaker_threshold"):
@@ -518,6 +642,19 @@ def fetch_ref(ref):
                           check=True, capture_output=True, text=True, timeout=300).stdout.strip()
 
 
+def evidence_path(evidence):
+    """The path a reported gate's evidence names: the string itself, or the `path` of
+    {path, label?, verdict?, rows?}. None when it is neither."""
+    if isinstance(evidence, str):
+        return evidence
+    if (isinstance(evidence, dict) and isinstance(evidence.get("path"), str)
+            and set(evidence) - {"path"} <= set(EVIDENCE_META)
+            and all(isinstance(evidence[k], t) and not isinstance(evidence[k], bool)
+                    for k, t in EVIDENCE_META.items() if k in evidence)):
+        return evidence["path"]
+    return None
+
+
 def gate_outcomes(batch, reported, ledger, head):
     declared = {g["id"]: {**g, "decision_id": g.get("decision_id")} for g in batch.get("gates", [])}
     unmet = []
@@ -529,19 +666,24 @@ def gate_outcomes(batch, reported, ledger, head):
     seen = Counter(r.get("id") for r in reported)
     for r in reported:
         gid, g = r.get("id"), declared.get(r.get("id"))
+        path = evidence_path(r.get("evidence"))
         if g is None:
             unmet.append(f"gate {gid!r} reported but not declared for {batch['id']}")
         elif (seen[gid] > 1 or set(r) - {"id", "status", "evidence"} or r.get("status") not in ("passed", "failed")
-              or not isinstance(r.get("evidence"), str) or (r["status"] == "passed" and not r["evidence"])):
-            unmet.append(f"gate {gid} report must be one {{id, status: passed|failed, evidence}} row, evidence "
-                         "non-empty when passed")
+              or path is None or (r["status"] == "passed" and not path)):
+            unmet.append(f"gate {gid} report must be one {{id, status: passed|failed, evidence}} row; evidence is "
+                         "the bare path or {path, label?, verdict?, rows?}, non-empty when passed")
         elif g["status"] == "waived":
             unmet.append(f"gate {gid} is waived in the plan; a child cannot change it")
-        elif r["status"] == "passed" and not evidence_in_pr(head, r["evidence"], batch["units"]):
-            unmet.append(f"gate {gid} evidence {r['evidence']!r} is not a file under .migration/recon/<unit>/ of "
+        elif r["status"] == "passed" and not BARE_PATH.fullmatch(path):
+            unmet.append(f"gate {gid} evidence {path!r} is not a bare path: report {{path, label}} to annotate it")
+        elif r["status"] == "passed" and not evidence_in_pr(head, path, batch["units"]):
+            unmet.append(f"gate {gid} evidence {path!r} is not a file under .migration/recon/<unit>/ of "
                          f"{', '.join(batch['units'])} at the gated PR head")
         else:
-            g.update(status=r["status"], evidence=r["evidence"])
+            g.update(status=r["status"], evidence=path)
+            if isinstance(r["evidence"], dict) and len(r["evidence"]) > 1:
+                g["evidence_meta"] = {k: v for k, v in r["evidence"].items() if k != "path"}
     for g in declared.values():
         if g["status"] != "waived" and (not seen[g["id"]] or g["status"] == "failed"):
             waiver = ledger_waiver(g["id"], batch["units"], ledger, MANIFEST["stop_c"])
@@ -551,7 +693,7 @@ def gate_outcomes(batch, reported, ledger, head):
         if g["status"] != "waived" and not seen[g["id"]]:
             unmet.append(f"gate {g['id']} ({g['kind']}) has no child result; the plan's {g['status']} is not proof")
         elif g["status"] == "waived":
-            if not override_decision(g["decision_id"], [g["id"], *batch["units"]], ledger, word="waive"):
+            if not override_decision(g["decision_id"], batch["units"], ledger, word="waive", gate=g["id"]):
                 unmet.append(f"gate {g['id']} waived by {g['decision_id']} but no such row naming the gate and "
                              f"{', '.join(batch['units'])} is in .migration/06_decisions.md")
         elif g["status"] != "passed":
@@ -576,17 +718,57 @@ def run_log():
     return runs
 
 
+_RUN_LOCK = None
+
+
 def spend_stop_c():
-    """One STOP C approval launches one run under the log lock, or halts if already spent."""
+    """One STOP C approval covers one run of the wave and its plumbing relaunches: a rerun under the
+    same row is allowed while the plan it approved (gates, width, units, write targets: everything but
+    PLAN_PLUMBING) is unchanged and no earlier run under it got a batch past its own checks (nothing to
+    merge was produced). A run that did, or a plan change, is a new decision. One run of a wave at a
+    time: the lock is held until this process exits, so a run that died holds nothing and a run that is
+    still going cannot be launched twice. Returns the launch number under this row (1 for the first)."""
+    global _RUN_LOCK
+    row = MANIFEST["stop_c"]
+    _RUN_LOCK = LOCK_PATH.open("a")
+    try:
+        fcntl.flock(_RUN_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"another run of wave {TAG} holds {LOCK_PATH}: two runs under STOP C row {row} would "
+                         "launch the same batches twice; wait for it to write its result or halt it") from None
+    if RESULT_PATH.exists():
+        raise SystemExit(f"{RESULT_PATH} was written while this run was starting: this wave already ran")
     with RUNS_PATH.open("a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        if MANIFEST["stop_c"] in {run["stop_c"] for run in run_log()}:
-            raise SystemExit(
-                f"{RUNS_PATH} records a run this wave already made under STOP C row "
-                f"{MANIFEST['stop_c']}; a rerun is a new run of the wave, so STOP C fires again: "
-                "record its new row in the ledger and name it in the manifest's stop_c"
-            )
-        f.write(json.dumps({"stop_c": MANIFEST["stop_c"]}, sort_keys=True) + "\n")
+        spent = [run for run in run_log() if run["stop_c"] == row]
+        launches = [run for run in spent if run.get("event", "launch") == "launch"]
+        rerun = (f"{RUNS_PATH} records a run this wave already made under STOP C row {row}; a rerun is a "
+                 "new run of the wave, so STOP C fires again: record its new row in the ledger and name it in "
+                 "the manifest's stop_c")
+        if any(run.get("gates_sha") != MANIFEST["gates_sha"] or run.get("plan_sha") != PLAN_SHA for run in launches):
+            raise SystemExit(rerun + " (that run's gates_sha or plan_sha is not this manifest's, or was not "
+                             "recorded: the gates, width, units, write targets or another approved plan input "
+                             "changed; only briefs, repo, secret names, estimates and the source connection "
+                             "may change under one row)")
+        produced = sorted({b for run in spent for b in (run.get("passed") or []) + (run.get("merged") or [])})
+        if produced:
+            raise SystemExit(rerun + f" (that run produced {', '.join(produced)}; only a run that produced "
+                             "nothing to merge is a plumbing relaunch)")
+        n = len(launches) + 1
+        f.write(json.dumps({"stop_c": row, "event": "launch", "relaunch": n, "gates_sha": MANIFEST["gates_sha"],
+                            "plan_sha": PLAN_SHA, "manifest_sha": MANIFEST_SHA,
+                            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")},
+                           sort_keys=True) + "\n")
+        f.flush()
+    return n
+
+
+def record_run(**fields):
+    """Append what this run produced, so the next launch under the same STOP C row can tell a plumbing
+    relaunch from a replay."""
+    with RUNS_PATH.open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps({"stop_c": MANIFEST["stop_c"], **fields}, sort_keys=True) + "\n")
         f.flush()
 
 
@@ -1081,8 +1263,36 @@ def check_dependencies(batches, analysis=None, mapping=None, namespace=""):
                              "name left for them (one row stands for one routine). Fix the wave plan, then re-run.")
 
 
+def check_repo_origin(repo, origin_url):
+    """The manifest's repo is where the children's PR URLs must live; when origin is a remote URL it
+    has to be that repo, or every PR check fails after the child, not before it."""
+    url = origin_url.strip()
+    if "://" in url:
+        parts = urllib.parse.urlsplit(url)
+        host, path = parts.hostname, parts.path      # the port, if any, is not part of the repo
+    else:
+        m = re.fullmatch(r"(?:[^@/:]+@)?(?P<host>[^/:]+):(?P<path>[^/].*)", url)   # scp-style git@host:owner/name
+        host, path = (m["host"], m["path"]) if m else (None, "")
+    if not host:
+        return  # a local mirror or an unparsed remote: nothing to compare
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    want = repo.lower()
+    if f"{host.lower()}/{path.lower()}" != want:
+        raise SystemExit(f"manifest 'repo' is {repo!r} but origin is {origin_url.strip()!r}: children open PRs "
+                         "on origin, so the manifest must name that host/owner/name")
+
+
 def launch_checks():
     """The launch-time checks; returns the pipeline order."""
+    check_ledger(decision_ledger())
+    try:
+        origin = subprocess.run(["git", "-C", str(ROOT), "remote", "get-url", "origin"], check=True,
+                                capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        raise SystemExit(f"{ROOT} has no git remote 'origin'; children push PRs to it") from None
+    check_repo_origin(MANIFEST["repo"], origin)
     check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                         other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),
@@ -1137,6 +1347,26 @@ def unit_eligibility(head, units):
             got = None
         return got if isinstance(got, bool) else None
     return {u: eligible(u) for u in units}
+
+
+def unit_blocker_classes(head, units):
+    """The blocker classes result.json records per unit at the PR head: `blocker_classes`, else the
+    `class` of each `blockers` entry; None when the file or both fields are missing (a harness that
+    predates blocker classes cannot be matched against a scoped override)."""
+    def classes(u):
+        try:
+            result = json.loads(subprocess.run(
+                ["git", "-C", str(ROOT), "show", f"{head}:.migration/recon/{u}/result.json"],
+                check=True, capture_output=True, text=True, timeout=300).stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        got = result.get("blocker_classes")
+        if got is None and isinstance(result.get("blockers"), list):
+            got = [b.get("class") for b in result["blockers"] if isinstance(b, dict)]
+        return sorted(set(got)) if isinstance(got, list) and all(isinstance(c, str) for c in got) else None
+    return {u: classes(u) for u in units}
 
 
 def pr_changed_paths(pr_url):
@@ -1424,9 +1654,15 @@ CHILD_SCHEMA = {
             "items": {"type": "object",
                       "properties": {"id": {"type": "string"},
                                      "status": {"type": "string", "enum": ["passed", "failed"]},
-                                     "evidence": {"type": "string"}},
+                                     "evidence": {"anyOf": [
+                                         {"type": "string"},
+                                         {"type": "object",
+                                          "properties": {"path": {"type": "string"}, "label": {"type": "string"},
+                                                         "verdict": {"type": "string"}, "rows": {"type": "integer"}},
+                                          "required": ["path"]}]}},
                       "required": ["id", "status", "evidence"]},
-            "description": "outcome of each gate declared in your brief, by id; passed needs the evidence path"},
+            "description": "outcome of each gate declared in your brief, by id; passed needs the evidence: the bare "
+                           "path under .migration/recon/<unit>/, or {path, label?, verdict?, rows?} to annotate it"},
         "recon_cost": {"type": "object",
                        "description": "result.json['cost'] of the final live/snapshot/transactional run, one line"},
         "one_line_summary": {"type": "string"},
@@ -1534,7 +1770,8 @@ def child_prompt(batch):
         + "\n" + capability_block(batch["units"])
         + f"Time budget: {batch_max_minutes(batch)} minutes; at the budget report status=BLOCKED with what "
         "landed and what blocked.\n"
-        f"Gates STOP C declared (report each by id in gates as passed with its evidence path or failed; an "
+        f"Gates STOP C declared (report each by id in gates as passed with its evidence, the bare path or "
+        "{path, label, verdict, rows}, never a path with a note appended, or failed; an "
         "unreported gate fails the unit; a waived gate is the ledger's and is not listed; never rename or "
         f"re-kind one): {json.dumps(gates, sort_keys=True)}\n"
         + "Recon: run the harness fixture-first, then the merge-evidence run; at most 3 full runs, never change a "
@@ -1722,26 +1959,51 @@ async def _run_batch(batch, sem, breaker):
             decision = claimed.get("decision_id") if isinstance(claimed, dict) else None
             evidence = unit_eligibility(out["pr_head"], batch["units"])
             ineligible = sorted(u for u, e in evidence.items() if e is not True)
+            ledger = decision_ledger()
             if out.get("merge_eligible") is True and not ineligible:
                 out["merge_authority"] = {"kind": "harness", "decision_id": None}
-            elif (isinstance(claimed, dict) and claimed.get("kind") == "human_override"
-                  and override_decision(decision, batch["units"], decision_ledger())):
-                out["merge_authority"] = {"kind": "human_override", "decision_id": decision}
             else:
-                why = "; ".join(
-                    f".migration/recon/{u}/result.json at the PR head "
-                    + ("is missing or malformed" if evidence[u] is None else f"has merge_eligible={evidence[u]!r}")
-                    for u in ineligible) or f"the child reported merge_eligible={out.get('merge_eligible')!r}"
-                downgrade("merge_authority",
-                          f"recon evidence is not merge_eligible=true for every unit ({why}) "
-                          f"and no merge_override row {decision or 'D-<n>'} naming {', '.join(batch['units'])} is in "
-                          ".migration/06_decisions.md",
-                          drop="merge_authority")
+                claimed_kind = claimed.get("kind") if isinstance(claimed, dict) else None
+                below = "\n".join(rows_after(ledger, MANIFEST["stop_c"]))
+                classes = unit_blocker_classes(out["pr_head"], batch["units"])
+                claimed_row = (decision if claimed_kind == "human_override"
+                               and override_decision(decision, batch["units"], below) else None)
+                if claimed_row and scope_covers(override_scope(claimed_row, below), classes):
+                    row = claimed_row
+                else:  # the child's claim is too narrow or absent; the ledger may still hold a row that fits
+                    row = ledger_override(batch["units"], ledger, MANIFEST["stop_c"], classes) or claimed_row
+                scope = override_scope(row, below) if row else None
+                uncovered = {u: c for u, c in classes.items() if c is None or not set(c) <= override_forgives(scope)}
+                if row and not uncovered:
+                    out["merge_authority"] = {"kind": "human_override", "decision_id": row}
+                else:
+                    why = "; ".join(
+                        f".migration/recon/{u}/result.json at the PR head "
+                        + ("is missing or malformed" if evidence[u] is None else f"has merge_eligible={evidence[u]!r}")
+                        for u in ineligible) or f"the child reported merge_eligible={out.get('merge_eligible')!r}"
+                    if uncovered:
+                        what = "; ".join(f"{u} has blockers {c if c is not None else 'unrecorded'}"
+                                         for u, c in sorted(uncovered.items()))
+                        downgrade("merge_authority",
+                                  f"recon evidence is not merge_eligible=true for every unit ({why}); "
+                                  f"merge_override {row} covers blocker classes "
+                                  f"{scope if scope is not None else sorted(UNSCOPED_OVERRIDE) + ['(unscoped)']} "
+                                  f"only, but {what}",
+                                  drop="merge_authority")
+                    else:
+                        downgrade("merge_authority",
+                                  f"recon evidence is not merge_eligible=true for every unit ({why}) "
+                                  f"and no merge_override row {decision or 'D-<n>'} naming "
+                                  f"{', '.join(batch['units'])} is below STOP C {MANIFEST['stop_c']} in "
+                                  ".migration/06_decisions.md",
+                                  drop="merge_authority")
         if out["status"] == "PASS":
             out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger(), out["pr_head"])
             if unmet:
                 downgrade("gates", "; ".join(unmet))
-        if out["status"] != "PASS":
+        if out["status"] == "PASS":
+            record_run(event="child", passed=[batch["id"]])
+        else:
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
             f"{out['one_line_summary']}")
@@ -1810,6 +2072,8 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, 
     by_status = {st: [b["id"] for b, r in zip(BATCHES, results) if r["status"] == st]
                  for st in ("PASS", "FAIL", "BLOCKED", "NOT_LAUNCHED")}
     lines = [f"# Wave {WAVE} close", "",
+             *([f"Relaunch {RELAUNCH} under STOP C {MANIFEST['stop_c']} (plan unchanged, no new decision)."]
+               if RELAUNCH > 1 else []),
              f"Landed: {len(by_status['PASS'])} of {len(BATCHES)} batches passed their own recon.",
              f"Independent verify: {verify['wave_verdict'] if verify else 'NOT RUN'}.",
              f"Failed: {', '.join(by_status['FAIL']) or 'none'}. Blocked: {', '.join(by_status['BLOCKED']) or 'none'}. "
@@ -1872,9 +2136,10 @@ def write_brief(results, verify, surprises, undeclared, unreported, auto_merge, 
 
 async def main():
     await register_workflow(META)
-    order = launch_checks()
+    order = ORDER
     log(f"wave {WAVE}: {len(BATCHES)} batches, width {WIDTH}, breaker at {BREAKER}"
-        + (f", serialized {order}" if order else ""))
+        + (f", serialized {order}" if order else "")
+        + (f", relaunch {RELAUNCH} under STOP C {MANIFEST['stop_c']}" if RELAUNCH > 1 else ""))
 
     sem = asyncio.Semaphore(WIDTH)
     breaker = Breaker(BREAKER)
@@ -1993,9 +2258,10 @@ async def main():
               and (close is None or not auto_merge or not close["unmerged"])
               and verify is not None and verify["wave_verdict"] == "PASS"
               and all(r["status"] == "PASS" for r in results))
+    record_run(event="close", merged=(close or {}).get("merged_prs", []), closed=closed)
     _tmp_write(RESULT_PATH, json.dumps({
         "wave": WAVE, "tag": TAG, "manifest_sha": MANIFEST_SHA, "width": WIDTH,
-        "base_sha": BASE_SHA, "stop_c": MANIFEST["stop_c"],
+        "base_sha": BASE_SHA, "stop_c": MANIFEST["stop_c"], "relaunch": RELAUNCH,
         "hook_probe": HOOK_PROBE_RESULT, "doctor_signed_at": DOCTOR.get("signed_at"),
         "breaker_tripped_on": breaker.tripped_on, "auto_merge": auto_merge,
         "closed": closed,
@@ -2013,5 +2279,7 @@ async def main():
     log(f"wave {WAVE} verdict: {verify['wave_verdict'] if verify else 'NO PASSING BATCHES'}")
 
 
-spend_stop_c()
+ORDER = launch_checks()
+PLAN_SHA = approved_plan_sha(MANIFEST)
+RELAUNCH = spend_stop_c()
 asyncio.run(main())
