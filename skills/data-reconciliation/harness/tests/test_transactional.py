@@ -763,7 +763,7 @@ def test_a_target_that_cannot_exclude_keys_leaves_aggregates_ungraded_not_green(
                          schema={"loans": TARGET_LOANS_FACTS, "borrowers": BORROWER_FACTS},
                          sequences={("loans", "loan_id"): 13})
     result = _run(source, target, tol=Tolerances("t1", cdc_lag_max_s=5))
-    assert result["verdict"] == "FAIL"
+    assert result["verdict"] == "FAIL" and result["parity"] == "PASS"
     assert _codes(result, "per_field_aggregates") == ["aggregates_ungraded_in_flight"]
 
 

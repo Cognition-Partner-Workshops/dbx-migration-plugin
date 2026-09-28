@@ -223,12 +223,24 @@ class ObjectMapping:
             object.__setattr__(self, "key_target", [self.key_target])
 
 
+# How a unit's rerun proof is judged, declared in its committed mapping spec (`rerun_posture`),
+# never chosen by the run that is graded:
+#   required            a job that will run again against an existing target (pipelines,
+#                       scheduled loads): both legs must pass, an unsupported evolved leg blocks
+#   first_run_baseline  the unit's first migration: the fresh leg records the baseline shape and
+#                       an evolved leg that had nothing to evolve from is expected, not a gap
+#   not_applicable      one-shot DDL, routine packages, gold aggregates: no rerun semantics; a
+#                       proof, if one is supplied anyway, still blocks on a failed leg
+RERUN_POSTURES = ("required", "first_run_baseline", "not_applicable")
+
+
 @dataclass(frozen=True)
 class MappingSpec:
     version: str
     objects: list[ObjectMapping]
     # source principal -> target principal for the grant comparison; identity when absent
     principal_map: dict[str, str] = field(default_factory=dict)
+    rerun_posture: str = "required"
 
 
 @dataclass(frozen=True)
@@ -436,8 +448,12 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
     if not isinstance(principal_map, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in principal_map.items()):
         raise ConfigError(f"{path}: principal_map must be a string -> string object")
+    posture = data.get("rerun_posture", "required")
+    if posture not in RERUN_POSTURES:
+        raise ConfigError(f"{path}: rerun_posture must be one of {RERUN_POSTURES}, got {posture!r}")
     return MappingSpec(version=version, objects=objects,
-                       principal_map={k.lower(): v.lower() for k, v in principal_map.items()})
+                       principal_map={k.lower(): v.lower() for k, v in principal_map.items()},
+                       rerun_posture=posture)
 
 
 def _flag(data: dict, key: str, path: Path) -> bool:
