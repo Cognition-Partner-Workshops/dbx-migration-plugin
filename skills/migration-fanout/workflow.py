@@ -268,14 +268,25 @@ def ledger_waiver(gate_id, units, ledger, stop_c):
     return None
 
 
-def ledger_override(units, ledger, stop_c):
-    """The merge_override row a human wrote for these units below this run's STOP C row, whether or
-    not the child thought to report it: the decision is the ledger's, not the child's memory."""
+def scope_covers(scope, classes):
+    """Whether an override's blocker-class scope (None = every class) covers what each unit recorded:
+    an unrecorded class list never fits a scoped override."""
+    return scope is None or all(c is not None and set(c) <= set(scope) for c in classes.values())
+
+
+def ledger_override(units, ledger, stop_c, classes=None):
+    """The merge_override row a human wrote for these units below this run's STOP C row whose scope
+    covers the units' recorded blocker classes, whether or not the child thought to report it: the
+    decision is the ledger's, not the child's memory. The first applicable row wins; a narrower one
+    above it is not a refusal, and is returned only when no row covers the classes (so the halt names it)."""
+    named = None
     for line in rows_after(ledger, stop_c):
         for decision_id in dict.fromkeys(DECISION_ID.findall(line)):
             if override_decision(decision_id, units, line):
-                return decision_id
-    return None
+                if scope_covers(override_scope(decision_id, line), classes or {}):
+                    return decision_id
+                named = named or decision_id
+    return named
 
 
 def declared_gates_sha(wave, batches, degraded=False):
@@ -1282,15 +1293,22 @@ def unit_eligibility(head, units):
 
 
 def unit_blocker_classes(head, units):
-    """result.json['blocker_classes'] per unit at the PR head; None when the file or the field is not there."""
+    """The blocker classes result.json records per unit at the PR head: `blocker_classes`, else the
+    `class` of each `blockers` entry; None when the file or both fields are missing (a harness that
+    predates blocker classes cannot be matched against a scoped override)."""
     def classes(u):
         try:
-            got = json.loads(subprocess.run(
+            result = json.loads(subprocess.run(
                 ["git", "-C", str(ROOT), "show", f"{head}:.migration/recon/{u}/result.json"],
-                check=True, capture_output=True, text=True, timeout=300).stdout).get("blocker_classes")
-        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
-            got = None
-        return sorted(got) if isinstance(got, list) and all(isinstance(c, str) for c in got) else None
+                check=True, capture_output=True, text=True, timeout=300).stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        got = result.get("blocker_classes")
+        if got is None and isinstance(result.get("blockers"), list):
+            got = [b.get("class") for b in result["blockers"] if isinstance(b, dict)]
+        return sorted(set(got)) if isinstance(got, list) and all(isinstance(c, str) for c in got) else None
     return {u: classes(u) for u in units}
 
 
@@ -1889,14 +1907,14 @@ async def _run_batch(batch, sem, breaker):
                 out["merge_authority"] = {"kind": "harness", "decision_id": None}
             else:
                 claimed_kind = claimed.get("kind") if isinstance(claimed, dict) else None
+                below = "\n".join(rows_after(ledger, MANIFEST["stop_c"]))
+                classes = unit_blocker_classes(out["pr_head"], batch["units"])
                 row = (decision if claimed_kind == "human_override"
-                       and override_decision(decision, batch["units"], ledger)
-                       else ledger_override(batch["units"], ledger, MANIFEST["stop_c"]))
-                scope = override_scope(row, ledger) if row else None
-                uncovered = {}
-                if scope is not None:
-                    classes = unit_blocker_classes(out["pr_head"], batch["units"])
-                    uncovered = {u: c for u, c in classes.items() if c is None or not set(c) <= set(scope)}
+                       and override_decision(decision, batch["units"], below)
+                       else ledger_override(batch["units"], ledger, MANIFEST["stop_c"], classes))
+                scope = override_scope(row, below) if row else None
+                uncovered = ({} if scope_covers(scope, classes)
+                             else {u: c for u, c in classes.items() if c is None or not set(c) <= set(scope)})
                 if row and not uncovered:
                     out["merge_authority"] = {"kind": "human_override", "decision_id": row}
                 else:
@@ -1915,13 +1933,16 @@ async def _run_batch(batch, sem, breaker):
                         downgrade("merge_authority",
                                   f"recon evidence is not merge_eligible=true for every unit ({why}) "
                                   f"and no merge_override row {decision or 'D-<n>'} naming "
-                                  f"{', '.join(batch['units'])} is in .migration/06_decisions.md",
+                                  f"{', '.join(batch['units'])} is below STOP C {MANIFEST['stop_c']} in "
+                                  ".migration/06_decisions.md",
                                   drop="merge_authority")
         if out["status"] == "PASS":
             out["gates"], unmet = gate_outcomes(batch, out.get("gates"), decision_ledger(), out["pr_head"])
             if unmet:
                 downgrade("gates", "; ".join(unmet))
-        if out["status"] != "PASS":
+        if out["status"] == "PASS":
+            record_run(event="child", passed=[batch["id"]])
+        else:
             breaker.record(out.get("failure_class") or "unclassified")
         log(f"done   {batch['id']}: {out['status']} / recon {out['recon_verdict']}: "
             f"{out['one_line_summary']}")
@@ -2108,7 +2129,6 @@ async def main():
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
                "gates": r.get("gates", [])}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
-    record_run(event="children", passed=[p["batch"] for p in passed])
     verify = None
     if passed:
         log(f"verify: {len(passed)} batches to an independent session")

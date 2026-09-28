@@ -352,15 +352,15 @@ def test_a_plumbing_relaunch_reuses_the_stop_c_row_while_the_gates_are_unchanged
     ws, cwd = _workspace(tmp_path)
     proc, calls = _run(cwd, tmp_path, [_pass_report()])   # no PR: downgraded, nothing passed
     assert proc.returncode == 0, proc.stderr
-    assert [(r["stop_c"], r.get("event")) for r in _spent(ws)] == [("D-2", "launch"), ("D-2", "children"), ("D-2", "close")]
+    assert [(r["stop_c"], r.get("event")) for r in _spent(ws)] == [("D-2", "launch"), ("D-2", "close")]
     assert _spent(ws)[0]["gates_sha"] == json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
-    assert _spent(ws)[1]["passed"] == [] and _spent(ws)[2]["merged"] == []
+    assert _spent(ws)[1]["merged"] == []
     assert _result(ws)["relaunch"] == 1
     (ws / ".migration/waves/wave-0.result.json").unlink()
     proc, calls = _run(cwd, tmp_path, [_pass_report()])
     assert proc.returncode == 0, proc.stderr
     assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
-    assert _result(ws)["relaunch"] == 2 and _spent(ws)[3]["relaunch"] == 2
+    assert _result(ws)["relaunch"] == 2 and _spent(ws)[2]["relaunch"] == 2
     assert "Relaunch 2 under STOP C D-2" in (ws / ".migration/waves/wave-0.brief.md").read_text()
 
 
@@ -1669,3 +1669,27 @@ def test_a_structured_override_below_stop_c_applies_without_the_child_claiming_i
     batch = _result(ws)["batches"][0]
     assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
     assert "D-3" in batch["one_line_summary"] and "data" in batch["one_line_summary"]
+
+    # a harness that records blockers as {reason, class} rows only is read the same way
+    by_rows = blocked.replace('"blocker_classes": ["rerun_policy"]',
+                              '"blockers": [{"reason": "rerun_unsupported", "class": "rerun_policy"}]')
+    ws, cwd = _workspace(tmp_path / "rows", decisions=ledger, recon={"u": by_rows})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "rows", [_pass_report(pr, merge_eligible=False), _verify_report(),
+                                            {"error": "close step stubbed"}])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "D-3"}]
+
+
+def test_a_child_that_passes_is_logged_under_stop_c_before_the_wave_finishes(tmp_path):
+    """The pass is appended when the child clears its checks, not at wave end, so a run that dies between
+    the two cannot be relaunched under the same row as if nothing had been produced."""
+    ws, cwd = _workspace(tmp_path)
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), {"error": "verifier died"}])
+    events = _spent(ws)
+    assert [(r.get("event"), r.get("passed")) for r in events][:2] == [("launch", None), ("child", ["b-1"])]
+    (ws / ".migration/waves/wave-0.result.json").unlink(missing_ok=True)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr)])
+    assert proc.returncode != 0 and "b-1" in proc.stderr and "STOP C" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]

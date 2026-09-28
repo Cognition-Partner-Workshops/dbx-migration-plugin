@@ -56,7 +56,7 @@ def _batch_runtime():
                 or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
                                                                          "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes",
                                                                          "structured_decision", "human_decision", "ledger_override",
-                                                                         "override_scope", "evidence_path"})
+                                                                         "override_scope", "scope_covers", "evidence_path"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
                                                          "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS",
@@ -67,6 +67,7 @@ def _batch_runtime():
         "json": json,
         "unit_eligibility": lambda head, units: {u: True for u in units},
         "unit_blocker_classes": lambda head, units: {u: None for u in units},
+        "record_run": lambda **fields: None,
         "evidence_in_pr": lambda head, path, units: bool(head) and any(path.startswith(f".migration/recon/{u}/") for u in units),
         "Counter": Counter,
         "hashlib": hashlib,
@@ -1814,10 +1815,13 @@ def test_pass_without_merge_evidence_is_downgraded(mode):
 
 # ---------------------------------------------------------------- merge authority (WS3.2)
 
-LEDGER = ("| D-6 | 2024-05-01 | user:U1 | widen tolerance for orders_dim | \n"
+LEDGER = ("| D-2 | 2024-05-01 | user:U0 | STOP C wave-0 gates_sha 0 |\n"
+          "| D-6 | 2024-05-01 | user:U1 | widen tolerance for orders_dim | \n"
           "| D-7 | 2024-05-02 | user:U1 | merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
           "| D-8 | 2024-05-02 | default-accepted | merge_override for other_unit |\n"
           "| D-70 | 2024-05-03 | user:U1 | merge_override for u2 |\n")
+# the same rows with this run's STOP C row written after them: every override belongs to an earlier run
+STALE_LEDGER = "".join(LEDGER.splitlines(True)[1:] + LEDGER.splitlines(True)[:1])
 
 
 def _ns_with_ledger(text=LEDGER):
@@ -1844,8 +1848,8 @@ _pass_nomerge = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live"
     {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "7"}},
     {**_pass_nomerge, "merge_eligible": False, "merge_authority": "D-7"},
 ])
-def test_pass_without_merge_eligible_true_needs_a_ledger_override(report):
-    out = _run_one(_ns_with_ledger(), report)
+def test_pass_without_merge_eligible_true_needs_a_ledger_override_below_stop_c(report):
+    out = _run_one(_ns_with_ledger(STALE_LEDGER), report)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
     assert "merge_override" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
     assert "merge_authority" not in out or out["merge_authority"]["kind"] != "human_override"
@@ -1943,7 +1947,7 @@ def test_override_decision_provenance_is_a_cell_of_its_own_not_a_mention_in_the_
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
     ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
-    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 | merge_override for u, u2, u3 |\n"
+    ns["decision_ledger"] = lambda: LEDGER
 
     def run(report):
         async def agent(prompt, **kwargs):
@@ -1958,7 +1962,11 @@ def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "merge_authority" not in out
     assert "recon/u2/result.json" in out["one_line_summary"] and "merge_eligible=False" in out["one_line_summary"]
     assert "recon/u3/result.json" in out["one_line_summary"] and "missing or malformed" in out["one_line_summary"]
+    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 | merge_override for u, u2, u3 |\n"
     out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
+    # the row is the ledger's decision, so a child that forgot to claim it gets the same answer
+    out = run(base)
     assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
 
 
@@ -2772,11 +2780,25 @@ def test_the_ledger_override_written_below_stop_c_applies_even_when_the_child_di
         out = _run_one(_structured_ns(), {**_pass_nomerge, "merge_eligible": False, **claimed})
         assert out["status"] == "PASS", out.get("one_line_summary")
         assert out["merge_authority"] == {"kind": "human_override", "decision_id": "D-7"}
-    # a row above this run's STOP C row is an earlier run's decision
+    # a row above this run's STOP C row is an earlier run's decision, claimed by the child or not
     rows = STRUCTURED_LEDGER.splitlines()
     ledger = "\n".join([rows[1], rows[0], *(r for r in rows[2:] if "D-10" not in r)]) + "\n"
-    out = _run_one(_structured_ns(ledger), {**_pass_nomerge, "merge_eligible": False})
-    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    for claimed in ({}, {"merge_authority": {"kind": "human_override", "decision_id": "D-7"}}):
+        out = _run_one(_structured_ns(ledger), {**_pass_nomerge, "merge_eligible": False, **claimed})
+        assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+        assert "below STOP C D-2" in out["one_line_summary"]
+
+
+def test_a_later_override_row_whose_scope_fits_is_not_hidden_by_a_narrower_one_above_it():
+    ledger = STRUCTURED_LEDGER.replace(
+        '| D-7 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"]} | rerun policy on a first run |\n', ""
+    ) + '| D-13 | 2024-05-03 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["data", "rerun_policy"]} |\n'
+    out = _run_one(_structured_ns(ledger, classes=["data"]), {**_pass_nomerge, "merge_eligible": False})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-13"}
+    out = _run_one(_structured_ns(ledger, classes=["rerun_policy"]), {**_pass_nomerge, "merge_eligible": False})
+    assert out["merge_authority"]["decision_id"] == "D-10"      # the first row that fits wins
+    out = _run_one(_structured_ns(ledger, classes=["structural"]), {**_pass_nomerge, "merge_eligible": False})
+    assert out["status"] == "FAIL" and "D-10" in out["one_line_summary"] and "structural" in out["one_line_summary"]
 
 
 def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
