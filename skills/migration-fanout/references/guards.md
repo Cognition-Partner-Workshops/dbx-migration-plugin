@@ -20,8 +20,15 @@ or an approval under an incompatible stop mode halts the launch.
 
 ## One approval one run
 
-An exclusive lock protects the append-only runs log. A STOP C identifier already present
-in that log cannot authorize another execution.
+An exclusive lock protects the append-only runs log, which records each launch with its
+`gates_sha` and what the run passed and merged. A STOP C identifier already in the log
+authorizes another launch only as a plumbing relaunch: the same `gates_sha`, and no run
+under it passed or merged a batch. Anything else needs a new row.
+
+## Repo and ledger preflight
+
+Before the row is spent: `repo` is `host/owner/name` and matches a remote origin URL; every
+machine cell in the ledger parses as `{kind, units, gate?, blocker_classes?}`.
 
 ## Duplicate wave
 
@@ -79,7 +86,9 @@ even when a child claims a clean or harmless diff.
 ## Merge authority
 
 PASS requires merge-eligible harness evidence for every unit, unless a valid human
-override row names exactly the affected units.
+override row names exactly the affected units. A row's machine cell, when present, is the
+decision; a `blocker_classes` scope forgives only the classes it lists. The row applies from
+the ledger whether or not the child reported it, provided it sits below this run's STOP C row.
 
 ## Acceptance gates
 
