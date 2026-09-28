@@ -271,9 +271,18 @@ def test_evolved_is_unsupported_never_clean_when_no_prior_shape_was_exercised():
     out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE))
     assert out["evolved"] == "unsupported" and "pre_shape" in out["unsupported_reason"]
     out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", NEW_SHAPE, pre_shape=NEW_SHAPE), prior=PRIOR)
-    assert out["evolved"] == "unsupported"
+    assert out["evolved"] == "unsupported" and out["unsupported_kind"] == "nothing_evolved"
     assert out["unsupported_reason"] == ("evolved pre_shape equals the fresh shape: nothing evolved, "
                                          "so the run proves only what fresh proved")
+
+
+def test_a_rerun_from_the_fresh_shape_that_lands_a_different_shape_fails_rather_than_counting_as_nothing_evolved():
+    """`nothing_evolved` is the first-run baseline the posture accepts, so it is granted only when the
+    second run landed the fresh shape again; a job that drops or changes a column on its second run
+    is the non-idempotent job the proof exists to catch."""
+    out = _grade(_record("fresh", NEW_SHAPE), _record("evolved", OLD_SHAPE, pre_shape=NEW_SHAPE), prior=PRIOR)
+    assert out["evolved"] == "fail" and out["passed"] is False and "unsupported_kind" not in out
+    assert [(f["run"], f["check"], f["column"]) for f in out["findings"]] == [("evolved", "column_missing", "channel")]
 
 
 def test_evolved_is_unsupported_when_the_pre_shape_lacks_a_fresh_table():

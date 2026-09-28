@@ -311,11 +311,6 @@ def main(argv: list[str] | None = None) -> int:
                         "pass; first_run_baseline = the fresh leg records the baseline and an evolved "
                         "leg with nothing to evolve from is expected; not_applicable = no rerun "
                         "semantics (a supplied proof still blocks on a failed leg)")
-    r.add_argument("--structural-blind", action="append", default=[], choices=CATEGORIES,
-                   metavar="CATEGORY",
-                   help="a structural category the doctor recorded this principal cannot read "
-                        f"(one of {', '.join(CATEGORIES)}; repeatable): masked and recorded as "
-                        "`blind`, never graded and never an unverified warning")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -600,7 +595,7 @@ def main(argv: list[str] | None = None) -> int:
                        routine_parity=routine_parity, routine_writers=routine_writers,
                        routine_analysis_missing=routine_analysis_missing,
                        routine_dependencies=routine_dependencies, rerun_proof=rerun_proof,
-                       rerun_posture=args.rerun_posture, structural_blind=args.structural_blind)
+                       rerun_posture=args.rerun_posture)
     print(f"dbx-recon {result['verdict']}: {status_line(result)}; unit={args.unit} mode={args.mode} "
           f"depth={result['depth']} mapping={spec.version} tolerances={tol.version} "
           f"merge_eligible={result['merge_eligible']} -> {args.out}/result.json")

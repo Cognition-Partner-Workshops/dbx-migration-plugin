@@ -1340,8 +1340,7 @@ def _covered(leading: tuple, facts: SchemaFacts) -> bool:
 
 
 def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, source, target,
-                  strict: bool, catalog_only: bool = False,
-                  blind: frozenset[str] = frozenset()) -> TierResult:
+                  strict: bool, catalog_only: bool = False) -> TierResult:
     """Constraints are compared both ways: a source constraint the target lacks lets bad data in,
     a target constraint the source lacks rejects writes the legacy application makes today.
     Indexes stay one-directional (an extra target index changes cost, not acceptance). Triggers
@@ -1349,18 +1348,14 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
     (tier 7) records an unreadable catalog as `unverified`; tier 0 records it as
     `dictionary_unavailable` with every category unsupported for that object — a hole the
     report turns into a structural_gap warning, so an unread dictionary blocks merge.
-    `catalog_only` (structural mode) skips the row-backed identity bounds. `blind` names the
-    categories the doctor recorded the principal cannot read: where a reader was in fact refused
-    one, it is masked like any other hole but recorded as `blind`, not as an unverified warning,
-    so a declared visibility gap does not read as a structural mismatch; where both dictionaries
-    exposed it, the declaration changes nothing (`structural_blind_readable`) and the category is
-    compared. Every other hole records its kind in `stats.hole_kinds` ("privilege" when a reader
-    was refused, "read" otherwise)."""
+    `catalog_only` (structural mode) skips the row-backed identity bounds. Every hole records its
+    kind in `stats.hole_kinds` ("privilege" when a reader was refused, "read" otherwise), so the
+    report can class a refused read as a visibility gap rather than a mismatch; nothing the caller
+    passes can mask one."""
     findings, checks = [], 0
     stats: dict[str, Any] = {}
     obj_uns: dict[str, set] = {}  # categories a live read failed for this object
     hole_kinds: set[str] = set()
-    blind_seen: set[str] = set()  # declared-blind categories some reader was refused
 
     def hole(note: str, kind: str = "read", key: str = "unverified") -> None:
         hole_kinds.add(kind)
@@ -1405,11 +1400,7 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
         # categories a reader marked unsupported (or this object's read failed on) are holes
         # in the evidence, not emptiness: masked before comparing so they can never grade on
         # nothing, and recorded below
-        # a declared-blind category is honoured only where a reader was in fact refused it;
-        # one both dictionaries exposed is compared like any other
-        refused = blind & (s_raw.privilege_denied | t_raw.privilege_denied)
-        blind_seen |= refused
-        uns = s_raw.unsupported | t_raw.unsupported | obj_uns.get(c.object, set()) | refused
+        uns = s_raw.unsupported | t_raw.unsupported | obj_uns.get(c.object, set())
         if uns:
             s, t, t_lower = (mask_unsupported(f_, uns) for f_ in (s, t, t_lower))
         pk = _map_cols(s.primary_key, colmap)
@@ -1717,11 +1708,8 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
             id_findings, id_extra = compare_identity_columns(c.object, s, t_lower, colmap)
             findings += id_findings + id_extra
         # a category the target reader marks unsupported is a hole in the evidence, not a pass;
-        # indexes are the exception (an access path, not acceptance), recorded without a warning,
-        # and a declared-blind category is recorded once below, not per object
+        # indexes are the exception (an access path, not acceptance), recorded without a warning
         for cat in CATEGORIES:
-            if cat in refused:
-                continue
             n = _category_content(s_raw, cat)
             if cat in (t_raw.unsupported | obj_uns.get(c.object, set())):
                 if cat == "indexes":
@@ -1746,15 +1734,9 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
     checks_map = structural_checks(list(facts.values()))
     for cat in {c for cats in obj_uns.values() for c in cats}:
         checks_map[cat] = "unsupported"
-    for cat in blind_seen:
-        checks_map[cat] = "blind"
     if not strict and any(c.object not in facts for c in spec.objects):
         checks_map = {cat: "unsupported" for cat in CATEGORIES}
     stats["structural_checks"] = checks_map
-    if blind:
-        stats["structural_blind"] = sorted(blind)
-        if blind - blind_seen:
-            stats["structural_blind_readable"] = sorted(blind - blind_seen)
     stats["structural_diff"] = diff_by_object(findings)
     stats["dictionary"] = {"source": getattr(source, "dictionary_label", "live"),
                            "target": getattr(target, "dictionary_label", "live")}
@@ -1767,11 +1749,10 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
     return TierResult(tier, name, not findings, checks, findings, stats)
 
 
-def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target,
-                        blind: frozenset[str] = frozenset()) -> TierResult:
+def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> TierResult:
     """Tier 7 of the transactional track: structural parity graded strictly — an unreadable
     catalog is unverified evidence, which blocks merge there."""
-    return schema_parity(7, "schema_parity", spec, tol, source, target, strict=True, blind=blind)
+    return schema_parity(7, "schema_parity", spec, tol, source, target, strict=True)
 
 
 def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any, Any]:

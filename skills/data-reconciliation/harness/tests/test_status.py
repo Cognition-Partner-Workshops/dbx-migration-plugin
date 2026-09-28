@@ -229,7 +229,10 @@ def test_first_run_estate_reaches_merge_eligibility_end_to_end():
     assert eligible["merge_authority"] == {"kind": "harness", "decision_id": None}
 
 
-def test_denied_grants_are_a_visibility_blocker_until_declared_blind():
+def test_denied_grants_are_a_visibility_blocker_no_caller_can_lift():
+    """A refused dictionary read is classed `privilege_visibility`, never `structural` or `data`, and
+    it blocks merge on its own: the harness takes no declaration that would mask it, so the only way
+    past it is a human merge_override scoped to that class in the ledger."""
     denied = _facts(TARGET_LOANS_FACTS, unsupported=frozenset({"grants"}), privilege_denied=frozenset({"grants"}))
     r = _first_run(target_loans=denied, rerun_proof=PROVEN_RERUN)
     t0 = r["tiers"][0]
@@ -238,42 +241,24 @@ def test_denied_grants_are_a_visibility_blocker_until_declared_blind():
     assert r["parity"] == "PASS" and r["merge_eligible"] is False
     assert r["blocker_classes"] == ["privilege_visibility"]
     assert any("cannot expose grants" in w for w in r["warnings"])
+    assert status_line(r) == "parity PASS, merge blocked (privilege_visibility)"
+    with pytest.raises(TypeError):
+        _first_run(target_loans=denied, rerun_proof=PROVEN_RERUN, structural_blind=["grants"])
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--unit", "u", "--family", "oracle", "--mode", "live", "--mapping", "m",
+                  "--tolerances", "t", "--canonicalization", "c", "--structural-blind", "grants"])
 
-    r = _first_run(target_loans=denied, rerun_proof=PROVEN_RERUN, structural_blind=["grants"])
-    t0 = r["tiers"][0]
-    assert t0["stats"]["structural_checks"]["grants"] == "blind" and t0["stats"]["structural_blind"] == ["grants"]
-    assert "hole_kinds" not in t0["stats"] and r["warnings"] == []
-    assert r["merge_eligible"] is True and r["blockers"] == []
 
-
-def test_blind_masks_the_category_but_never_a_finding_elsewhere():
-    wrong_trigger = _facts(TARGET_LOANS_FACTS, triggers={"trg_extra": ("after", ("insert",), "row")})
-    r = _first_run(target_loans=wrong_trigger, rerun_proof=PROVEN_RERUN, structural_blind=["grants"])
+def test_a_refusal_beside_a_real_mismatch_is_structural_and_the_mismatch_is_kept():
+    wrong_trigger = _facts(TARGET_LOANS_FACTS, triggers={"trg_extra": ("after", ("insert",), "row")},
+                           unsupported=frozenset({"grants"}), privilege_denied=frozenset({"grants"}))
+    r = _first_run(target_loans=wrong_trigger, rerun_proof=PROVEN_RERUN)
     assert r["verdict"] == "FAIL" and r["parity"] == "PASS"
     assert r["blocker_classes"] == ["structural"]
     assert any(f["check"] == "trigger_extra" for f in r["tiers"][0]["findings"])
-    with pytest.raises(ConfigError, match="structural_blind"):
-        _first_run(structural_blind=["comments"])
 
 
-def test_blind_never_hides_a_category_both_dictionaries_exposed():
-    # the declaration is a claim about visibility; a category that was read on both sides is
-    # compared, so a real trigger mismatch (or a grant drift) survives `--structural-blind`
-    wrong_trigger = _facts(TARGET_LOANS_FACTS, triggers={"trg_extra": ("after", ("insert",), "row")},
-                           grants={"app_ro": frozenset({"select"})})
-    r = _first_run(target_loans=wrong_trigger, rerun_proof=PROVEN_RERUN, structural_blind=["triggers", "grants"])
-    t0 = r["tiers"][0]
-    assert any(f["check"] == "trigger_extra" for f in t0["findings"])
-    assert r["merge_eligible"] is False and r["blocker_classes"] == ["structural"]
-    assert t0["stats"]["structural_checks"]["triggers"] != "blind"
-    assert t0["stats"]["structural_blind"] == ["grants", "triggers"]
-    assert t0["stats"]["structural_blind_readable"] == ["grants", "triggers"]
-    drift = _facts(TARGET_LOANS_FACTS, grants={"app_rw": frozenset({"select", "delete"})})
-    r = _first_run(target_loans=drift, rerun_proof=PROVEN_RERUN, structural_blind=["grants"])
-    assert r["merge_eligible"] is False and any("grant" in f["check"] for f in r["tiers"][0]["findings"])
-
-
-def test_cli_passes_posture_and_blind_through(tmp_path, monkeypatch, capsys):
+def test_cli_passes_posture_through(tmp_path, monkeypatch, capsys):
     from recon import adapters
     from tests.test_tiers import GRADED_SPEC, RULES, TOL, make_graded
     monkeypatch.chdir(tmp_path)
@@ -290,18 +275,30 @@ def test_cli_passes_posture_and_blind_through(tmp_path, monkeypatch, capsys):
             "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
             "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out")]
     # no committed dependency analysis in this repo: the one blocker left is evidence, not rerun
-    assert cli.main(argv + ["--rerun-posture", "not_applicable", "--structural-blind", "grants"]) == 0
+    assert cli.main(argv + ["--rerun-posture", "not_applicable"]) == 0
     assert "dbx-recon PASS: parity PASS, merge blocked (evidence)" in capsys.readouterr().out
     result = json.loads((tmp_path / "out" / "result.json").read_text())
     assert result["rerun_posture"] == "not_applicable"
     assert result["blockers"] == [{"reason": "routine_parity_missing", "class": "evidence"}]
-    # the fixture dictionaries expose grants, so the declaration is recorded but masks nothing
-    t0 = result["tiers"][0]["stats"]
-    assert t0["structural_blind"] == ["grants"] == t0["structural_blind_readable"]
-    assert t0["structural_checks"]["grants"] != "blind"
+    assert "structural_blind" not in result["tiers"][0]["stats"]
     assert cli.main(argv) == 0
     assert "parity PASS, merge blocked (evidence, rerun_policy)" in capsys.readouterr().out
     result = json.loads((tmp_path / "out" / "result.json").read_text())
     assert result["rerun_posture"] == "required" and "rerun_missing" in result["merge_block_reasons"]
     with pytest.raises(SystemExit):
-        cli.main(argv + ["--structural-blind", "comments"])
+        cli.main(argv + ["--structural-blind", "grants"])
+
+
+def test_a_refused_grant_read_releases_its_savepoint_either_way():
+    """ROLLBACK TO leaves the savepoint defined; without RELEASE one accumulates per refused table
+    until the transaction ends, so both paths release it."""
+    from recon.adapters import LakebaseTargetAdapter
+    inst = LakebaseTargetAdapter.__new__(LakebaseTargetAdapter)
+    calls = []
+    inst._execute = lambda sql, params=(): calls.append(sql)
+    assert inst._in_savepoint(lambda: [1]) == [1]
+    with pytest.raises(DictionaryError):
+        inst._in_savepoint(lambda: (_ for _ in ()).throw(DictionaryError("refused", "privilege")))
+    assert calls == ["SAVEPOINT recon_dictionary", "RELEASE SAVEPOINT recon_dictionary",
+                     "SAVEPOINT recon_dictionary", "ROLLBACK TO SAVEPOINT recon_dictionary",
+                     "RELEASE SAVEPOINT recon_dictionary"]

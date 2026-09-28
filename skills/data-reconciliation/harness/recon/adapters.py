@@ -2227,6 +2227,7 @@ class _PostgresBase(_SqlAdapterBase):
             rows = read()
         except Exception:
             self._execute("ROLLBACK TO SAVEPOINT recon_dictionary")
+            self._execute("RELEASE SAVEPOINT recon_dictionary")
             raise
         self._execute("RELEASE SAVEPOINT recon_dictionary")
         return rows

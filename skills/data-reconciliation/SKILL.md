@@ -131,13 +131,10 @@ provenance warning and the run is not merge-eligible.
   clean. `result.json`'s `merge_block_reasons` puts `structural_gap` first when a structural
   tier has findings or unverifiable objects; its class is `privilege_visibility` when there are no
   findings and every hole is a permission refusal (`DictionaryError.kind == "privilege"`, or a
-  reader that marked grants `privilege_denied`), `structural` otherwise. A category the doctor has
-  recorded this principal cannot read is declared with `run --structural-blind <category>`
-  (repeatable): where a reader was in fact refused it, it is masked like any other hole, labelled
-  `blind` in `structural_checks` and raises no warning, so a known visibility gap does not block on
-  its own; where both dictionaries exposed it the declaration masks nothing (the category is
-  compared and named in `structural_blind_readable`), so `--structural-blind` can never hide drift
-  that was read. A finding in any other category still fails the tier. `--source-dictionary`/`--target-dictionary`
+  reader that marked grants `privilege_denied`), `structural` otherwise. No harness flag lifts a
+  visibility gap: the caller cannot declare a category unreadable, so a refused read always
+  blocks with that class and is accepted, if at all, by a human `merge_override` scoped to
+  `privilege_visibility` in the decision ledger. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
 - Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --source <job file>... --prior-proof

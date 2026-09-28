@@ -240,9 +240,15 @@ def grade_rerun(fresh: dict | None, evolved: dict | None, prior: dict | None = N
         reason = (f"evolved pre_shape has no {missing}: the table did not exist before the run, "
                   "so that leg was a fresh run")
     elif not _compare("evolved", expected, evolved["pre_shape"]["tables"]):
-        kind = "nothing_evolved"
-        reason = ("evolved pre_shape equals the fresh shape: nothing evolved, so the run proves "
-                  "only what fresh proved")
+        # started from the fresh shape: nothing to evolve, but the run still has to land it again
+        more = _compare("evolved", expected, evolved["shape"]["tables"])
+        if more:
+            evolved_status = "fail"
+            findings += more
+        else:
+            kind = "nothing_evolved"
+            reason = ("evolved pre_shape equals the fresh shape: nothing evolved, so the run proves "
+                      "only what fresh proved")
     elif prior is None:
         kind = "no_prior_shape"
         reason = ("no prior shape: pass --prior-proof (the previous committed rerun_proof.json) or "
