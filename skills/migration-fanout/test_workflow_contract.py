@@ -24,7 +24,7 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
                pipelines=None, auto_merge=None, close_minutes=None, other_batch=None,
                lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1,
                manifest_extra=None, plan_step="run-wave-0", child_skill="unit-migration",
-               verify_skill="wave-verify", drop_keys=()):
+               verify_skill="wave-verify", drop_keys=(), authorizations=None):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -130,6 +130,15 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
             record["signature"] = ("0" if record["signature"][0] != "0" else "1") + record["signature"][1:]
         if tamper != "missing":
             manifest_path.with_suffix(".doctor.json").write_text(json.dumps(record))
+    if authorizations is None:
+        authorizations = [{"id": g["decision_id"], "kind": "gate_waived", "objects": list(b["units"]), "by": "user:t"}
+                          for b in manifest["batches"] for g in b.get("gates", [])
+                          if g.get("status") == "waived" and isinstance(g.get("decision_id"), str)]
+        authorizations += [{"id": e["decision"], "kind": "merge_override", "objects": list(e["units"]), "by": "user:t"}
+                           for e in manifest.get("merge_overrides", [])]
+    if authorizations:
+        (ws / ".migration" / "authorizations.json").write_text(
+            json.dumps({"version": 1, "authorizations": authorizations}))
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
     subprocess.run(["git", "-C", str(ws), "init", "-q"], check=True)
@@ -253,6 +262,51 @@ def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_ma
     proc, _ = _run(cwd, tmp_path / "unwaived", [_pass_report(pr)])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["batches"][0]["failure_class"] == "gates"
+
+
+WAIVED = {"id": "g-export", "kind": "export_file", "status": "waived", "evidence": "", "decision_id": "waive-export"}
+OVERRIDE = {"merge_overrides": [{"decision": "mo-u", "units": ["u"]}]}
+
+
+@pytest.mark.parametrize("sub,kwargs", [
+    ("no-file", dict(gates=[GATE, WAIVED], authorizations=[])),
+    ("wrong-kind", dict(gates=[GATE, WAIVED], authorizations=[
+        {"id": "waive-export", "kind": "merge_override", "objects": ["u"], "by": "user:t"}])),
+    ("not-a-user", dict(gates=[GATE, WAIVED], authorizations=[
+        {"id": "waive-export", "kind": "gate_waived", "objects": ["u"], "by": "devin:w"}])),
+    ("other-units", dict(gates=[GATE, WAIVED], authorizations=[
+        {"id": "waive-export", "kind": "gate_waived", "objects": ["v"], "by": "user:t"}])),
+    ("override-no-file", dict(manifest_extra=OVERRIDE, recon={"u": False}, authorizations=[])),
+    ("override-other-units", dict(manifest_extra=OVERRIDE, recon={"u": False}, authorizations=[
+        {"id": "mo-u", "kind": "merge_override", "objects": ["v"], "by": "user:t"}])),
+])
+def test_a_waiver_or_override_without_a_committed_authorization_halts_before_launch(tmp_path, sub, kwargs):
+    ws, cwd = _workspace(tmp_path / sub, **kwargs)
+    proc, calls = _run(cwd, tmp_path / sub, [_pass_report()])
+    assert proc.returncode != 0
+    assert "committed authorization file" in proc.stderr or "whose objects do not name" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_an_authorization_in_the_working_copy_alone_waives_nothing(tmp_path):
+    ws, cwd = _workspace(tmp_path, gates=[GATE, WAIVED], authorizations=[])
+    (ws / ".migration" / "authorizations.json").write_text(json.dumps({"version": 1, "authorizations": [
+        {"id": "waive-export", "kind": "gate_waived", "objects": ["u"], "by": "user:t"}]}))
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "committed authorization file" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_a_malformed_committed_authorization_file_halts_a_manifest_that_cites_it(tmp_path):
+    ws, cwd = _workspace(tmp_path / "cites", gates=[GATE, WAIVED], authorizations=[])
+    (ws / ".migration" / "authorizations.json").write_text("{not json")
+    subprocess.run(["git", "-C", str(ws), "add", ".migration/authorizations.json"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "bad"], check=True)
+    subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:migration/x"], check=True)
+    proc, calls = _run(cwd, tmp_path / "cites", [_pass_report()])
+    assert proc.returncode != 0 and "authorizations.json" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def test_a_waived_gate_with_no_decision_id_in_the_manifest_halts_before_launch(tmp_path):
@@ -622,6 +676,23 @@ def test_a_plan_step_whose_close_step_was_sent_prs_to_merge_cannot_rerun_its_bat
     assert proc.returncode != 0 and "merged" in proc.stderr and "new plan step" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
     assert len(runs.read_text().splitlines()) == 2
+
+
+def test_a_review_only_close_that_merged_a_pr_anyway_bars_a_rerun_of_the_plan_step(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pr = _unproven_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _merged(ws, pr)])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["close"]["merged_prs"] == [pr] and result["closed"] is False
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    assert [json.loads(l).get("merged") for l in runs.read_text().splitlines()] == [None, [pr]]
+
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    _resign(ws, max_minutes=46)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr)])
+    assert proc.returncode != 0 and "merged" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def _merged(ws, pr, **extra):

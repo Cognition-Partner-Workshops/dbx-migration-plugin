@@ -56,7 +56,8 @@ if PLUGIN:
     sys.path.insert(0, str(PLUGIN / "skills" / "migration-fanout"))
 try:  # the sandbox runs a copy of this script; the pointer's plugin root names its siblings
     import cards
-    from decisions import UNSCOPED_OVERRIDE, merge_override_for, override_forgives, plan_sha
+    from decisions import (UNSCOPED_OVERRIDE, merge_override_for, override_forgives, plan_authorizations, plan_sha,
+                           unauthorized_decisions)
     from manifest import (BARE_PATH, MERGE_EVIDENCE_MODES, PR_URL, TAG_RE, _is_manifest, bounded_readers,
                           check_doctor_contract, check_pipeline_updates, check_repo_origin, check_wave_tag,
                           disjoint_slices, evidence_path, mapped_target, other_wave_manifests, reader_slices,
@@ -207,6 +208,20 @@ def wave_base():
         return _base_tip()
     except (OSError, subprocess.SubprocessError) as e:
         raise SystemExit(f"cannot resolve origin/{BASE_BRANCH} in {ROOT} ({e}); the protected-files gate needs the base commit")
+
+
+def committed_authorizations():
+    """The authorization entries on the base tip, the copy the guard reads; never the working copy."""
+    try:
+        r = subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE_SHA}:.migration/authorizations.json"],
+                           capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SystemExit(f"cannot read .migration/authorizations.json on origin/{BASE_BRANCH} ({e})") from None
+    try:
+        return plan_authorizations(r.stdout if r.returncode == 0 else None)
+    except ValueError as e:
+        raise SystemExit(f"origin/{BASE_BRANCH}:.migration/authorizations.json {e}; the manifest's waived gates and "
+                         "merge_overrides cannot be resolved against it") from None
 
 
 def evidence_in_pr(head, path, units):
@@ -361,8 +376,9 @@ def _append_run(f, record):
 
 def record_merged(merged_prs):
     """The run log remembers which PRs this plan step's close step was dispatched to merge, written
-    before it runs: whatever it then reports or proves, a rerun of the step (the result deleted, the
-    plumbing edited) cannot launch those batches again."""
+    before it runs (and, for a review-only close, whichever PRs it merged anyway): whatever the close
+    reports or proves, a rerun of the step (the result deleted, the plumbing edited) cannot launch
+    those batches again."""
     if merged_prs:
         with RUNS_PATH.open("a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
@@ -610,6 +626,11 @@ check_wave_tag(TAG, MANIFEST)
 BASE_SHA = wave_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES, MANIFEST_SHA)
 check_doctor_contract(MANIFEST, DOCTOR)
+UNAUTHORIZED = unauthorized_decisions(MANIFEST, committed_authorizations)
+if UNAUTHORIZED:
+    raise SystemExit("; ".join(UNAUTHORIZED) + ". A waiver or override is a plan decision the human selected, mirrored to "
+                     f".migration/authorizations.json on origin/{BASE_BRANCH} by reviewed PR (kind gate_waived or "
+                     "merge_override, by user:<id>, objects naming the units); a slug the manifest names alone waives nothing")
 
 
 def _git_paths(*args):
@@ -1269,6 +1290,8 @@ async def main():
                                      if isinstance(f, str)]}
         if close_problems:
             close["invalid"] = raw
+        if not auto_merge:
+            record_merged(close["merged_prs"])
     if close_problems:
         verify = _verify_sink(verify, [f"wave close invalid: {p}" for p in close_problems])
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported

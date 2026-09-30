@@ -51,8 +51,11 @@ classes it forgives; a unit with any other class stays blocked. An entry without
 forgives every policy class (`rerun_policy`, `privilege_visibility`, `structural`, `evidence`)
 and never `data`: rows that differ are fixed in converted code, and only an entry naming `data`
 says otherwise. A unit whose result.json records no blocker classes fits no override. A waived
-gate carries the `decision_id` of the plan decision that waived it; nothing is looked up at run
-time.
+gate carries the `decision_id` of the plan decision that waived it. Each `decision_id` and each
+`merge_overrides` `decision` must be an entry of `.migration/authorizations.json` as committed on
+the base branch (`kind: gate_waived` / `merge_override`, `by: user:<id>`, `objects` naming the
+units it covers): the human's plan selection reaches the repo by reviewed PR, and a slug the
+manifest names alone halts the wave before launch.
 
 A child reports gate evidence as the bare path under `.migration/recon/<unit>/`, or as
 `{"path": ..., "label": ..., "verdict": ..., "rows": ...}` to annotate it; a path with a note
@@ -98,8 +101,8 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Single result writer | Keeps the result, card and run log out of child writes. |
 | Child report | Validates schema, status, recon evidence, and changed paths. |
 | Protected files gate | Reclassifies unauthorized `.migration/` changes as `protected_files_tampered`. |
-| Merge authority | Requires harness evidence or the one committed `merge_overrides` entry covering the batch. |
-| Acceptance gates | Requires every declared gate to pass; a waived gate carries its plan `decision_id` in the manifest. |
+| Merge authority | Requires harness evidence or the one committed `merge_overrides` entry covering the batch, its decision a committed `merge_override` authorization naming the units. |
+| Acceptance gates | Requires every declared gate to pass; a waived gate carries its plan `decision_id`, a committed `gate_waived` authorization naming the units. |
 | Resync | Runs only the declared parent-owned resync and holds affected merges on trouble. |
 | Independent verify | Rechecks passing batches from the base branch; a `degraded: true` wave runs the harness in `--mode structural`, never merge-eligible. |
 | Verifier verdicts | Normalizes verdicts and rejects missing, extra, or contradictory results. |

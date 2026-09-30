@@ -21,6 +21,48 @@ def scope_covers(scope, classes):
     return all(c is not None and set(c) <= override_forgives(scope) for c in classes.values())
 
 
+# the committed authorization file's entry kinds a manifest may cite: a plan decision the human
+# selected is mirrored there by reviewed PR, with `objects` naming the units it covers
+AUTHORIZED_KINDS = frozenset({"gate_waived", "merge_override"})
+
+
+def plan_authorizations(text):
+    """The committed `.migration/authorizations.json` entries by id; no file is no entries. Raises
+    ValueError when the file is not {"version": 1, "authorizations": [{id, kind, objects, by}, ...]}."""
+    if text is None:
+        return {}
+    doc = json.loads(text)
+    entries = doc.get("authorizations") if isinstance(doc, dict) else None
+    if not (isinstance(entries, list) and all(isinstance(e, dict) and isinstance(e.get("id"), str) for e in entries)):
+        raise ValueError("is not {version, authorizations: [{id, kind, objects, by}]}")
+    return {e["id"]: e for e in entries}
+
+
+def unauthorized_decisions(manifest, entries):
+    """What the manifest waives or overrides without a committed authorization: each waived gate's
+    `decision_id` and each merge_overrides entry's `decision` must be an entry of that kind, by a
+    user, whose objects name every unit it covers. `entries` may be a callable, read only when
+    the manifest cites a decision."""
+    cited = [(g.get("decision_id"), "gate_waived", b["units"], f"batch {b['id']} gate {g['id']}")
+             for b in manifest.get("batches", []) for g in b.get("gates", []) if g.get("status") == "waived"]
+    cited += [(e.get("decision"), "merge_override", e.get("units") or [],
+               f"merge_overrides entry for {', '.join(e.get('units') or [])}")
+              for e in manifest.get("merge_overrides") or [] if isinstance(e, dict)]
+    if not cited:
+        return []
+    entries = entries() if callable(entries) else entries
+    problems = []
+    for decision, kind, units, what in cited:
+        e = entries.get(decision)
+        objects = e.get("objects") if isinstance(e, dict) else None
+        if not (isinstance(e, dict) and e.get("kind") == kind and str(e.get("by", "")).startswith("user:")
+                and isinstance(objects, list) and all(isinstance(o, str) for o in objects)):
+            problems.append(f"{what} cites {decision!r}, not a `{kind}` entry by a user in the committed authorization file")
+        elif not set(units) <= set(objects):
+            problems.append(f"{what} cites {decision!r}, whose objects do not name {sorted(set(units) - set(objects))}")
+    return problems
+
+
 def merge_override_for(units, entries):
     """The single merge_overrides entry covering every unit of a batch, else None: two entries that
     both cover it, or none, clear nothing."""

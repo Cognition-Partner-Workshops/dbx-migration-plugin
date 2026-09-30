@@ -21,11 +21,16 @@ from authoritative evidence, not from worker claims.
   the same manifest bytes; merge overrides come from the committed manifest's
   `merge_overrides` entries (`{decision, units}`; a batch is cleared only when exactly one
   entry covers all its units and the child claims that entry's decision); a waived gate stands
-  on its manifest `decision_id`; `result.json` carries `brief` lines instead of a brief file;
+  on its manifest `decision_id`; each override decision and waiver `decision_id` must be a
+  committed `merge_override` / `gate_waived` entry of `.migration/authorizations.json` on the
+  base branch whose `objects` name the units, else the wave halts before launch; a close step
+  dispatched to merge (or a review-only close that merged anyway) is recorded in the run log so
+  the plan step never reruns its batches; `result.json` carries `brief` lines instead of a brief file;
   `ledger_tampered` is now `protected_files_tampered`; all decision ids are lowercase slugs.
 - `skills/factory-doctor/doctor.py` — `REQUIRED_FILES` is now `allowed_targets.json` +
   `03_recon_tolerances.json`; new `authorizations_file` check (ok when absent; fails on
-  malformed JSON or entries missing `id`/`kind`/`objects`/`by`; warns when the working copy
+  malformed JSON, entries missing `id`/`kind`/`objects`/`by` or a kind other than
+  `legacy_write_authorized`/`gate_waived`/`merge_override`; warns when the working copy
   differs from the committed one, which is the copy the guard reads).
 - `skills/target-routing/pipeline_updates.py` — `serialized_pipelines` maps a pipeline to a
   plan decision slug and is shape-validated only (no runtime decision lookup); the
@@ -91,10 +96,11 @@ with (`status ok`, the id in `data.decision`); it is recorded, not machine-verif
    the non-child roles the doctor actually signs for.
 2. The run-log dedup key is the manifest sha: identical bytes launch once; changed bytes with a
    fresh signature launch a new run.
-3. A waived gate needs its `decision_id` in the committed manifest; there is no runtime waiver
-   lookup.
-4. `merge_overrides` are manifest entries; a batch clears only when exactly one entry covers
-   all of its units and the child claims that entry's decision.
+3. A waived gate needs its `decision_id` in the committed manifest and a committed `gate_waived`
+   authorization naming the units; there is no other runtime waiver lookup.
+4. `merge_overrides` are manifest entries backed by a committed `merge_override` authorization;
+   a batch clears only when exactly one entry covers all of its units and the child claims that
+   entry's decision.
 5. `orchestrator` survives only as the doctor's `--role` CLI value; the banned-terms test
    exempts `skills/factory-doctor/` for that one word.
 6. Teradata "macro"/"macros" mentions in `skills-extra/` (and the README dialect list) are the

@@ -79,6 +79,12 @@ ADD_LWA = '{"id": "D-8", "kind": "legacy_write_authorized", "objects": ["dbo.ord
         "old_string": ']\n}', "new_string": ', ' + ADD_LWA + ']\n}',
     }, "block"),
     ("edit", ".migration/authorizations.json", {
+        "old_string": '"kind": "tolerance_change"', "new_string": '"kind": "gate_waived"',
+    }, "block"),
+    ("edit", ".migration/authorizations.json", {
+        "old_string": '"kind": "tolerance_change"', "new_string": '"kind": "merge_override"',
+    }, "block"),
+    ("edit", ".migration/authorizations.json", {
         "old_string": '"tolerance_change"', "new_string": '"Legacy_Write_Authorized"',
     }, "block"),
     ("write", ".migration/authorizations.json", {

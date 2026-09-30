@@ -94,10 +94,18 @@ child reports that entry's decision. A `blocker_classes` scope forgives only the
 lists; an entry with no scope forgives every policy class but never `data` (a data blocker
 needs an entry that names it; a unit with no recorded blocker classes fits no override).
 
+## Plan decisions
+
+A waived gate's `decision_id` and a `merge_overrides` entry's `decision` name a plan decision
+the human selected; before launch each must be an entry of `.migration/authorizations.json` on
+origin/`base_branch` with that `id`, `kind: gate_waived` or `merge_override`, `by: user:<id>` and
+`objects` naming every unit it covers. The working copy never counts, and a session cannot add
+those kinds (the guard blocks the edit): the authorization arrives by reviewed PR.
+
 ## Acceptance gates
 
-Every declared gate needs a valid passed outcome with evidence. A waived gate carries the
-plan `decision_id` in the committed manifest; there is no runtime waiver lookup.
+Every declared gate needs a valid passed outcome with evidence. A waived gate stands on its
+committed `gate_waived` authorization; there is no other runtime waiver lookup.
 
 ## Resync
 

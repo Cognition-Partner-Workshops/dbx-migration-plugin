@@ -118,9 +118,9 @@ for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row the
 
 **File-edit tools.** `hooks.json` has a second PreToolUse matcher, `^(edit|write|MultiEdit)$`, over the event's
 `tool_name`; the guard reads `tool_input.file_path` and its new content. Writes under `.migration/` are the
-session's working copy and pass, except that a session can never add a `legacy_write_authorized` entry to
-`.migration/authorizations.json` (any edit or write whose added text carries that kind blocks); authorizations enter
-only through a reviewed PR. Edits to the Databricks credential store and to the running guard's plugin tree block. This
+session's working copy and pass, except that a session can never add a `legacy_write_authorized`, `gate_waived` or
+`merge_override` entry to `.migration/authorizations.json` (any edit or write whose added text carries one of those
+kinds blocks); authorizations enter only through a reviewed PR. Edits to the Databricks credential store and to the running guard's plugin tree block. This
 covers only file-edit tools the platform routes through PreToolUse under those names.
 
 **Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
@@ -130,4 +130,6 @@ matching an entry in the committed `.migration/authorizations.json` with that `i
 substitution such as `$(TABLE)` never matches, and a statement whose object the guard cannot tell blocks). `guard_mode:
 warn` never downgrades an unauthorized legacy write. The file the guard reads is only the committed copy on the protected
 branch (`origin/HEAD`, else `origin/main`/`origin/master`, else local `HEAD`; never the working copy), so an unmerged entry
-never authorizes.
+never authorizes. The fan-out workflow resolves a wave manifest's waived-gate `decision_id`s and `merge_overrides`
+decisions the same way, against `gate_waived` / `merge_override` entries whose `objects` name the units, on the wave's
+base branch.

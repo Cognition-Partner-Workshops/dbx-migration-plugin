@@ -121,6 +121,7 @@ _WRITE_OBJECT = re.compile(
     r"(?:GRANT|REVOKE)\b.*?\bON\s+ALL\s+\w+\s+IN\s+SCHEMA|GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)")
 _WRITE_OBJECT_NEXT = re.compile(r"\s*,\s*([\w.$\"\[\]`]+)")
 _AUTHORIZED = "authorized: decision "
+_AUTHORIZED_KINDS = ("legacy_write_authorized", "gate_waived", "merge_override")
 _LEGACY_TAIL = " (legacy is read-only in every phase)"
 
 class _Legacy(str):
@@ -1471,8 +1472,9 @@ def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd
     kind, violations = _touch(file_path, cwd or "", root), []
     if kind == "inside" and Path(file_path).name == "authorizations.json":
         added = new[len(old):] if new.startswith(old) else new
-        if "legacy_write_authorized" in added.lower():
-            violations.append("a `legacy_write_authorized` entry enters the authorization file only through a "
+        kinds = [k for k in _AUTHORIZED_KINDS if k in added.lower()]
+        if kinds:
+            violations.append(f"a `{kinds[0]}` entry enters the authorization file only through a "
                               "reviewed PR, never from a session")
     elif kind == "identity":
         violations.append(f"file-edit tool `{tool}` writes `{file_path}`, the Databricks CLI's credential store; the session runs as the "

@@ -32,12 +32,15 @@ doctor signs `wave-<N>.doctor.json` over them.
 2. Each batch: `id`, `units`, `write_targets` (from the dependency analysis's transitive
    writes, each taken to the target its `mapping_spec.json` names — the workflow refuses a
    differing list), `deploy_objects`, `brief`, `gates` (`{id, kind, status, evidence}` rows;
-   `waived` rows carry `decision_id` of the plan decision that waived them), optional
+   `waived` rows carry `decision_id` of the plan decision that waived them, which must be a
+   committed `gate_waived` entry of `.migration/authorizations.json` naming the units), optional
    `max_minutes`, `secrets`, `verify_depth`, `lakeflow_pipelines`.
 3. `merge_overrides`: when a unit cannot reach `merge_eligible` on evidence alone, one manifest
    entry per covered unit set — `{decision: <plan decision slug>, units: [...]}` — citing the
-   plan decision that authorizes the merge. The child clears a batch only when exactly one
-   entry covers all its units and it claims that entry's decision.
+   plan decision that authorizes the merge; the workflow launches only when that decision is a
+   committed `merge_override` entry of `.migration/authorizations.json` whose `objects` name the
+   units (the human mirrors a selected waiver or override there by PR). The child clears a batch
+   only when exactly one entry covers all its units and it claims that entry's decision.
 4. Pipelines: each batch lists the pipelines it updates as `lakeflow_pipelines` (`[]` when
    none). Two batches sharing one pipeline is a launch halt unless the wave is serial
    (`width` 1) or `serialized_pipelines` maps the pipeline to the plan decision slug that

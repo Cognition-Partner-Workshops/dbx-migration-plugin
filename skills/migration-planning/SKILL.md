@@ -73,7 +73,8 @@ Nothing you write launches until the human approves `plan.yaml` in the Plan view
 Decisions the human must weigh before approval: cutover authorization, any tolerance change,
 scope widening, anything that touches the legacy source (including every
 `legacy_write_authorized` entry — mirrored by a human PR to `.migration/authorizations.json`),
-a merge override, a gate waiver, and `auto_merge`.
+a merge override and a gate waiver (mirrored the same way, as a `merge_override` / `gate_waived`
+entry whose `objects` name the units; the wave halts before launch without it), and `auto_merge`.
 
 ## Cold-start ticket contents per step type
 

@@ -197,7 +197,7 @@ def check_workspace(ws: Path) -> Check:
 
 _ENTRY_AUTHOR = re.compile(r"user:[\w][\w.@/-]*")
 _ENTRY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-_AUTH_KINDS = {"legacy_write_authorized"}
+_AUTH_KINDS = {"legacy_write_authorized", "gate_waived", "merge_override"}
 
 
 def check_authorizations(ws: Path) -> Check:
@@ -205,7 +205,7 @@ def check_authorizations(ws: Path) -> Check:
     cid = "authorizations_file"
     p = ws / AUTHORIZATIONS_REL
     if not p.is_file():
-        return Check(cid, "ok", f"no {AUTHORIZATIONS_REL} (no legacy writes are authorized)")
+        return Check(cid, "ok", f"no {AUTHORIZATIONS_REL} (no legacy write, gate waiver or merge override is authorized)")
     try:
         doc = json.loads(p.read_text())
     except (OSError, ValueError) as e:
