@@ -30,7 +30,7 @@ go in a PROPOSED-unused set.
 5. Prove `N = pipelines + shared + PROPOSED-unused + confirmed exclusions`; cross-check every
    available external count and mark completeness UNVERIFIABLE when no check exists.
 6. Build the shared-object ownership map. Append governance rows (grantee, privilege, role,
-   service account, masking policy, cited query) to the dependency register; credentials never
+   service account, masking policy, cited query) to the dependency table; credentials never
    enter the inventory.
 7. Register every D3–D9 crossing with a complete contract; unresolved fields stay explicit
    blockers on the plan.
@@ -43,5 +43,5 @@ go in a PROPOSED-unused set.
   governance section.
 - The exact coverage arithmetic (`N = pipelines + shared + PROPOSED-unused + confirmed
   exclusions`) and which counts are UNVERIFIABLE.
-- The dependency register entries for every crossing, with complete contracts.
+- The dependency table: every crossing with a complete contract.
 - The parallelism profile: per-pipeline width, serial floor, D10-constrained concurrency.

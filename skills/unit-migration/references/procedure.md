@@ -43,12 +43,15 @@ Convert one batch of units, prove parity, and open one evidence-backed PR. The w
 - Idempotency is the rerun proof (`dbx-recon rerun-proof`, fixture
   `harness/fixtures/example_rerun/`): fresh target plus a target pre-created in the table's
   previous committed shape (`--prior-proof`, the last committed `rerun_proof.json`); pass
-  `--rerun-proof` with `--rerun-source` to `run`.
+  `--rerun-proof` with `--rerun-source` to `run`. What the proof must show is the unit's
+  `rerun_posture` in the committed `mapping_spec.json`, never a run flag you choose.
 - On FAIL, capture evidence, fix converted code only, rerun, and stop after 3 full runs.
 - Never change a tolerance or `03_recon_tolerances.json`.
-- A structural gap (missing constraint, trigger, index, identity, or grant; `structural_gap` in
-  `merge_block_reasons`) fails like a row-tier failure; `unsupported` in `structural_checks`
-  is unchecked, not clean.
+- Read `result.json` as `parity` plus `merge_policy`: every `merge_block_reasons` entry has a
+  class. `data` means fix converted code; `structural` (a missing constraint, trigger, index,
+  identity, or grant), `privilege_visibility`, `rerun_policy` and `evidence` (mode, provenance,
+  rows not gradable yet such as `aggregates_ungraded_in_flight`) block merge with parity as
+  measured and are reported by class. `unsupported` in `structural_checks` is unchecked, not clean.
 - Keep the source principal read-only, use one warehouse window, and report connector/live
   budget and recon cost in the evidence.
 
