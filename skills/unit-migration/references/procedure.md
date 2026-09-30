@@ -47,11 +47,12 @@ Convert one batch of units, prove parity, and open one evidence-backed PR. The w
   `rerun_posture` in the committed `mapping_spec.json`, never a run flag you choose.
 - On FAIL, capture evidence, fix converted code only, rerun, and stop after 3 full runs.
 - Never change a tolerance or `03_recon_tolerances.json`.
-- Read `result.json` as `parity` plus `merge_policy`: every `merge_block_reasons` entry has a
-  class. `data` means fix converted code; `structural` (a missing constraint, trigger, index,
-  identity, or grant), `privilege_visibility`, `rerun_policy` and `evidence` (mode, provenance,
-  rows not gradable yet such as `aggregates_ungraded_in_flight`) block merge with parity as
-  measured and are reported by class. `unsupported` in `structural_checks` is unchecked, not clean.
+- Read `result.json` as `parity` plus `merge_policy`: each `blockers` entry has a `reason` and a
+  `class` (the classes also in `blocker_classes`; `merge_block_reasons` is the reasons alone).
+  `data` means fix converted code; `structural` (a missing constraint, trigger, index, identity,
+  or grant), `privilege_visibility`, `rerun_policy` and `evidence` (mode, provenance, rows not
+  gradable yet such as `aggregates_ungraded_in_flight`) block merge with parity as measured and
+  are reported by class. `unsupported` in `structural_checks` is unchecked, not clean.
 - Keep the source principal read-only, use one warehouse window, and report connector/live
   budget and recon cost in the evidence.
 

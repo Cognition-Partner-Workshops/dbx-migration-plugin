@@ -21,8 +21,8 @@ This section is the only home for the merge-authority rule; other files point he
   mode; a `fixture` PASS is development evidence, a `structural` run is never merge-eligible, and
   `merge_eligible` in `result.json` is what the workflow reads.
 - `result.json` separates what a reader acts on: `parity` (`PASS|FAIL|NOT_RUN`, the row and routine
-  tiers only), `merge_policy` (`eligible|blocked`), and `blockers`, each `merge_block_reasons` entry
-  with its class: `data` (rows or routine behaviour differ), `structural` (the catalogs differ),
+  tiers only), `merge_policy` (`eligible|blocked`), and `blockers`, each a `reason` with its `class`
+  (`blocker_classes` lists the classes, `merge_block_reasons` the reasons): `data` (rows or routine behaviour differ), `structural` (the catalogs differ),
   `privilege_visibility` (the principal could not read a dictionary; nothing is known to differ),
   `rerun_policy`, `evidence` (mode, snapshot manifest, unlisted routines, ungraded embeds, provenance).
   The report's headline is `parity PASS, merge blocked (rerun_policy)`, never a bare FAIL when the

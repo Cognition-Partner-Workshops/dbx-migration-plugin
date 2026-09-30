@@ -1,8 +1,9 @@
 # Cutover packet: one screen
 
 The signer reads this on a phone between meetings. Everything they must weigh fits on one screen,
-in this order; everything else is a link. The `cutover` ticket renders it from the evidence pack;
-the six-line card (`skills/migration-fanout/cards.py`) is the post that carries it.
+in this order; everything else is a link. The `cutover` ticket renders it from the evidence pack
+and posts it verbatim as the ticket's authorization request; it is the whole message (no wave
+card wraps it), and the closing `Reply:` line is the only reply that authorizes.
 
 ```
 CUTOVER  <pipeline>  run <tag>
