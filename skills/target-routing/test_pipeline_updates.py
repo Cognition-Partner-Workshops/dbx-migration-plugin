@@ -18,7 +18,7 @@ def _batch(bid, pipelines):
 
 
 def test_distinct_pipelines_pass():
-    r = check_manifest(_manifest([_batch("b1", ["mig.orders"]), _batch("b2", ["mig.ledger"])]))
+    r = check_manifest(_manifest([_batch("b1", ["mig.orders"]), _batch("b2", ["mig.acct"])]))
     assert r["status"] == "pass"
     assert r["shared"] == [] and r["unchecked_batches"] == []
 
@@ -37,53 +37,36 @@ def test_a_serial_wave_may_share_a_pipeline():
     assert r["order"] == {"b2": ["b1"]}
 
 
-LEDGER = ("| D-31 | 2026-02-01 | user:U1 | pipeline_serialized p: b1 then b2 | one update at a time |\n"
-          "| D-32 | 2026-02-01 | user:U1 | pipeline_serialized q: b3 then b4 |\n"
-          "| D-33 | 2026-02-01 | user:U1 | merge_override for b9_u |\n")
-
-
 def test_a_recorded_serialization_decision_orders_the_batches_that_share_the_pipeline():
     m = _manifest([_batch("b1", ["p"]), _batch("b2", ["p"]), _batch("b3", ["q"]), _batch("b4", ["q"])],
-                  serialized_pipelines={"p": "D-31"})
-    r = check_manifest(m, LEDGER)
+                  serialized_pipelines={"p": "ser-p"})
+    r = check_manifest(m)
     assert r["status"] == "halt"
     assert [s["pipeline"] for s in r["shared"]] == ["p", "q"]
-    assert r["shared"][0]["serialized"] == "D-31" and r["shared"][1]["serialized"] is False
-    r = check_manifest(_manifest(m["batches"], serialized_pipelines={"p": "D-31", "Q": "D-32"}), LEDGER)
+    assert r["shared"][0]["serialized"] == "ser-p" and r["shared"][1]["serialized"] is False
+    r = check_manifest(_manifest(m["batches"], serialized_pipelines={"p": "ser-p", "Q": "ser-q"}))
     assert r["status"] == "pass"
     assert r["order"] == {"b2": ["b1"], "b4": ["b3"]}
 
 
 def test_serialization_order_follows_the_manifest_and_chains_every_batch_of_the_pipeline():
     m = _manifest([_batch("b3", ["p", "q"]), _batch("b1", ["p"]), _batch("b2", ["p", "q"])],
-                  serialized_pipelines={"p": "D-31", "q": "D-32"})
-    r = check_manifest(m, LEDGER.replace("b3 then b4", "b3 then b2"))
+                  serialized_pipelines={"p": "ser-p", "q": "ser-q"})
+    r = check_manifest(m)
     assert r["status"] == "pass"
     assert r["order"] == {"b1": ["b3"], "b2": ["b1", "b3"]}
 
 
-@pytest.mark.parametrize("bad", [{"p": ""}, {"p": "yes"}, {"p": 31}, ["p"], {"p": "D31"}, {"p": "decided"}])
-def test_a_serialization_entry_must_name_a_decision_row(bad):
+@pytest.mark.parametrize("bad", [{"p": ""}, {"p": "Yes"}, {"p": 31}, ["p"], {"p": "D-31"},
+                                 {"p": "has space"}])
+def test_a_serialization_entry_must_name_a_plan_decision_slug(bad):
     m = _manifest([_batch("b1", ["p"]), _batch("b2", ["p"])], serialized_pipelines=bad)
     with pytest.raises(SystemExit, match="serialized_pipelines"):
-        check_manifest(m, LEDGER)
-
-
-@pytest.mark.parametrize("ledger", [
-    "",
-    LEDGER.replace("D-31", "D-30"),
-    LEDGER.replace("pipeline_serialized p", "serialized p"),
-    LEDGER.replace("pipeline_serialized p:", "pipeline_serialized pp:"),
-    "D-31 pipeline_serialized p\n",
-])
-def test_the_decision_row_must_exist_and_be_tagged_pipeline_serialized_for_that_pipeline(ledger):
-    m = _manifest([_batch("b1", ["p"]), _batch("b2", ["p"])], serialized_pipelines={"p": "D-31"})
-    with pytest.raises(SystemExit, match="D-31"):
-        check_manifest(m, ledger)
+        check_manifest(m)
 
 
 def test_a_serialization_entry_for_a_pipeline_no_two_batches_share_is_ignored():
-    r = check_manifest(_manifest([_batch("b1", ["p"])], serialized_pipelines={"p": "D-31"}), LEDGER)
+    r = check_manifest(_manifest([_batch("b1", ["p"])], serialized_pipelines={"p": "ser-p"}))
     assert r["status"] == "pass" and r["order"] == {}
 
 
@@ -129,21 +112,6 @@ def test_cli_writes_the_result_and_exit_codes(tmp_path, capsys):
     man.write_text(json.dumps(_manifest([_batch("b1", ["p"]), _batch("b2", ["q"])])))
     assert main([str(man), "--out", str(out)]) == 0
     assert json.loads(out.read_text())["wave"] == 2
-
-
-def test_cli_reads_the_decision_ledger_beside_the_waves_directory_or_where_told(tmp_path):
-    waves = tmp_path / ".migration" / "waves"
-    waves.mkdir(parents=True)
-    man = waves / "wave-2.json"
-    man.write_text(json.dumps(_manifest([_batch("b1", ["p"]), _batch("b2", ["p"])], serialized_pipelines={"p": "D-31"})))
-    with pytest.raises(SystemExit, match="D-31"):
-        main([str(man)])
-    (tmp_path / ".migration" / "06_decisions.md").write_text(LEDGER)
-    assert main([str(man)]) == 0
-    other = tmp_path / "elsewhere.md"
-    other.write_text("")
-    with pytest.raises(SystemExit, match="D-31"):
-        main([str(man), "--decisions", str(other)])
 
 
 def test_script_is_standard_library_only_and_runs_as_a_file(tmp_path):

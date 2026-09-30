@@ -12,7 +12,7 @@ Source: skill-authored (fixture schema `DIM_ACCOUNT`, `FACT_TRANSACTION`, `ETL_L
   (`NOT EXISTS` on `TRANSACTION_ID`); an account interrupted mid-triple stays `CLOSED` and is finished by the re-run.
   The `INOUT` budget is never taken from the in-memory counter (which only caps the loop): each account writes an
   `ARCHIVE_RUN_LEDGER (RUN_ID, ACCOUNT_KEY)` row (DDL ships in the converted file) just before its status `UPDATE`,
-  and both exits derive `p_accounts_done` as `count(ledger rows of v_run_id whose account is ARCHIVED)`: an account
+  and both exits derive `p_accounts_done` as `count(ARCHIVE_RUN_LEDGER rows of v_run_id whose account is ARCHIVED)`: an account
   interrupted between the two is not charged (the re-run does), other writers' archives are never charged, and
   `ETL_BATCH_ID` keeps its load lineage as on the source. `v_run_id` is `uuid()` (random, docs.databricks.com
   `functions/uuid`), never clock-derived, so two callers cannot share an id.

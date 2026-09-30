@@ -1,6 +1,6 @@
 """Pre-run cost estimate for one unit's recon: statements per side per tier and rows that will
 cross the wire, from the mapping spec, the tolerances, the depth, and (optionally) known source
-row counts. The plan playbook sums these per wave for the STOP C cost line; the actuals land in
+row counts. The wave-plan worker sums these per wave for the plan's cost estimate; the actuals land in
 result.json["cost"] after the run so the estimate can be corrected next wave.
 
 No connections are opened here. Warehouse cost is proportional to statements x scanned rows on

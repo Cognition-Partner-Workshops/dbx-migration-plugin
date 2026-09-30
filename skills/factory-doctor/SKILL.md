@@ -5,16 +5,16 @@ description: Preflight for a DBX migration workspace. Verifies setup, hooks, con
 
 # factory-doctor
 
-| `workspace` | setup files or `stop_mode` are missing | rerun `1-migration_setup` |
+| `workspace` | required `.migration/` contract files are missing | rerun the intake step |
+| `authorizations_file` | `authorizations.json` is malformed or the working copy differs from the committed one | fix the file or land the authorization PR |
 | `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
 | `allowlist_committed` | allowlist or tolerances differ from the upstream ref (`origin/HEAD`, else `origin/main`/`master`, else `HEAD`) | merge the allowlist PR into the protected branch and `git fetch` |
-| `playbooks_installed` | a repo playbook listed in `playbooks/index.json` is missing, unlisted, or shares a macro | fix the plugin checkout, then rerun `install-dbx-factory` |
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
 | `recon_harness` | harness self-test/import or a required driver fails | install the harness extras |
 | `type_map_audit` | a unit mapping declares a `target_type` the source family's `type_map.<family>.<target_kind>` forbids | fix the declared type or add the required `evidence` token |
 | `delete_evidence` | mapped CDC evidence is absent, incomplete, or unreadable | provide source CDC evidence; never enable it here |
-| `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a user-attested decision |
+| `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a plan decision attesting the source |
 | `databricks_identity` | CLI/auth/host/identity is missing, human, or mismatched | use the expected OAuth M2M principal and host |
 | `lakebase_branch_create` | optional branch probe cannot create/delete a one-hour child | fix Lakebase project/parent permissions |
 | `lakebase_target_grants` | optional DSN role lacks database/schema `CREATE` | grant target create permission |
@@ -27,15 +27,18 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--expect-identity <migration SP userName>] [--expect-host <workspace URL>] [--expect-catalogs a,b] \
     [--hook-probe-result blocked:<nonce>|not-blocked] [--unit <unit_id> ...] [--mapping <mapping_spec.json> ...] \
     [--source-secret <ENV VAR NAME> [--source-family sqlserver|postgres|...] --param name=value ...] \
-    [--source-attested D-<id>] [--lakebase-project NAME --lakebase-parent-branch NAME] \
+    [--source-attested <id>] [--lakebase-project NAME --lakebase-parent-branch NAME] \
     [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] [--analytical-schema CATALOG.SCHEMA] \
     [--reuse-record PATH] [--out PATH]
 ```
 
-Writes `.migration/09_capabilities.json` and prints one line per row. Exit 0 means `ready`.
+`--role orchestrator` is kept as the CLI value for the wave ticket's worker (the session that proves
+the platform hook once per wave and signs `wave-N.doctor.json`); `--role setup` is the intake /
+wave-plan worker before mappings exist; `--role child` is a batch worker. Writes
+`.migration/09_capabilities.json` and prints one line per row. Exit 0 means `ready`.
 
-A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the orchestrator's signed
-record, committed beside the wave manifest). When the record is an orchestrator's, `ready`, signed
+A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the wave worker's signed
+record, committed beside the wave manifest). When the record is the wave worker's, `ready`, signed
 for the same manifest bytes, fresher than the manifest's `doctor_max_age` minutes (default 15),
 signed for the `--expect-identity`/`--expect-host` principal, and its `inputs_sha` equals this
 checkout's (sha256 over `.migration/units/**` and `.migration/*.json` except `09_capabilities.json`,
@@ -55,20 +58,22 @@ it refuses `--wave`, `--no-databricks`, a non-child role, and a missing `--expec
 `ready` requires no `fail`, the security rows `hook_guard` and `databricks_identity` to have every
 security sub-result at `ok`, and `source_principal_read_only` not `unverified` once mappings exist.
 
-The orchestrator proves the platform once per wave: `hook_platform_loaded` is live-probed only by
-`--role orchestrator` and signed into `wave-N.doctor.json`. A child proves the guard script and its
-identity (`hook_guard_functional`, `databricks_identity`) and inherits `hook_platform_loaded`
-through `--reuse-record`, which is the normal child path. In a child report every non-security
-`fail` is softened to an advisory `warn` (the orchestrator gated it before launch), so a child is
-ready when its two security controls are `ok` and no unit-mapping problem blocks it; a missing or
-unreadable unit mapping still blocks, and so does a required security sub-result that never ran.
-A `source_principal_read_only=fail` (a writable source principal) also blocks a child;
-`unverified` stays advisory.
-`playbooks_installed` findings are `warn` for every role; the doctor does not compare the org library to the repo — `install-dbx-factory` syncs and reports that.
-`--source-attested D-<id>` yields an `ok` row whose data carries `attested`/`decision` when the
-ledger line qualifies. Sub-results live in
+The wave ticket's worker proves the platform once per wave: `hook_platform_loaded` is live-probed
+only by `--role orchestrator` and signed into `wave-N.doctor.json`. A child proves the guard script
+and its identity (`hook_guard_functional`, `databricks_identity`) and inherits
+`hook_platform_loaded` through `--reuse-record`, which is the normal child path. In a child report
+every non-security `fail` is softened to an advisory `warn` (the wave worker gated it before
+launch), so a child is ready when its two security controls are `ok` and no unit-mapping problem
+blocks it; a missing or unreadable unit mapping still blocks, and so does a required security
+sub-result that never ran. A `source_principal_read_only=fail` (a writable source principal) also
+blocks a child; `unverified` stays advisory.
+`authorizations_file` is `ok` when the file is absent; `warn` when the working copy differs from
+the committed one (authorizations change only by PR); `fail` on malformed JSON or an entry without
+a slug `id`, `kind: legacy_write_authorized`, a non-empty `objects` list, and `by: user:...`.
+`--source-attested <id>` yields an `ok` row whose data carries `attested`/`decision`: the plan
+decision is human-owned, so the doctor records it rather than verifying it. Sub-results live in
 `data.sub_results`; `--no-databricks` leaves `databricks_identity=skipped` and never authorizes a
-wave. The report identity, host, catalogs, guard mode, and stop mode are the workflow capability
+wave. The report identity, host, catalogs, and guard mode are the wave manifest's capability
 contract.
 
 ## The hook probe
@@ -76,7 +81,7 @@ contract.
 1. Run the exact `probe_command` in the `hook_guard` row, from the workspace.
 2. A guard refusal naming `__dbx_guard_probe__<nonce>` proves hooks are live.
 3. Re-run with `--hook-probe-result blocked:<nonce>`; the nonce is in the `hook_guard` row.
-4. If the echo prints, re-run with `not-blocked`, register a D10, and do not launch children.
+4. If the echo prints, re-run with `not-blocked`, record a plan blocker, and do not launch children.
 
 One nonce per report serves both the functional row and the probe command, so `blocked:<nonce>`
 can only come from a session that saw the live block. While `hook_platform_loaded` is `unverified`,
@@ -85,18 +90,18 @@ shell): <probe_command>` — run it in the lead session's exec tool, never a sid
 
 | row | fails when | fix |
 |---|---|---|
-| `workspace` | setup files or `stop_mode` are missing | rerun `1-migration_setup` |
+| `workspace` | required `.migration/` contract files are missing | rerun the intake step |
+| `authorizations_file` | `authorizations.json` is malformed or the working copy differs from the committed one | fix the file or land the authorization PR |
 | `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
 | `allowlist_committed` | allowlist or tolerances differ from the upstream ref (`origin/HEAD`, else `origin/main`/`master`, else `HEAD`) | merge the allowlist PR into the protected branch and `git fetch` |
-| `playbooks_installed` | a repo playbook listed in `playbooks/index.json` is missing, unlisted, or shares a macro | fix the plugin checkout, then rerun `install-dbx-factory` |
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
 | `recon_harness` | harness self-test/import or a required driver fails | install the harness extras |
 | `recon_family_supported` | the harness refuses the declared source family (asked of the same harness `recon_harness` ran) | reconcile through a family the harness supports |
 | `delete_evidence` | mapped CDC evidence is absent, incomplete, or unreadable | provide source CDC evidence; never enable it here |
-| `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a user-attested decision |
+| `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a plan decision attesting the source |
 | `dictionary_readable` | the source principal cannot read a catalog view the structural tier needs, or hides declared triggers | fix the principal's catalog visibility |
-| `named_secrets_exist` | a Databricks secret name (`scope/key`) the manifest or a brief references is missing or its scope is unreadable | create the named secret before STOP C; a missing name is a STOP C blocker, not a per-unit discovery |
+| `named_secrets_exist` | a Databricks secret name (`scope/key`) the manifest or a ticket references is missing or its scope is unreadable | create the named secret before the wave launches; a missing name blocks the wave, it is not a per-unit discovery |
 | `databricks_identity` | CLI/auth/host/identity is missing, human, or mismatched | use the expected OAuth M2M principal and host |
 | `lakebase_branch_create` | optional branch probe cannot create/delete a one-hour child | fix Lakebase project/parent permissions |
 | `lakebase_target_grants` | optional DSN role lacks database/schema `CREATE` | grant target create permission |

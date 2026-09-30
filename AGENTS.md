@@ -1,10 +1,12 @@
 # DBX Migration Factory: guardrails
 
-These rules apply to every session in an org where this plugin is installed, whether or not a migration playbook is active.
+These rules apply to every session in an org where this plugin is installed, whether the session is a manager, a wave worker, or a one-off.
 
-- Never modify legacy source code, legacy tables, or legacy job definitions. The legacy system is read-only in every phase; reconciliation failures are fixed in converted code only.
-- Reference credentials by secret name only. Never print, commit, or paste secret values into artifacts, PRs, chat, or logs.
-- Migration work writes only to the designated migration catalog or target area recorded in `.migration/00_context.md` and allowlisted in `.migration/allowed_targets.json`. Never create grants on, or write to, customer production catalogs. The plugin's PreToolUse hook (`hooks/dbx_guard.py`) hard-blocks commands that write outside the allowlist or through a legacy-only client; a block is a finding to report, never something to route around (no alternate client, identity, or catalog). The allowlist in force is the copy on the protected branch; sessions change it by PR.
-- Never change reconciliation tolerances, scope, or dependency decisions mid-run without a human reply recorded in `.migration/06_decisions.md` (a soft stop's default-accepted row establishes the initial values; changing them later always needs a human).
-- Cutover actions (repointing production consumers) require the customer-held cutover principal and an explicit, current STOP E authorization. Fan-out child sessions never perform cutover actions.
-- Messages to humans (Slack/Teams/web) read like a sharp colleague, not a bot: 2-4 short sentences, lead with the one decision or fact, state the recommended answer and the exact reply that approves it, link the artifact instead of summarizing it. No preambles, no bullet-walls, no emoji, no restating what the artifact already shows. One message per event, and the only events are the blocking stops, wave closes, and emergency halts recorded in the notification contract; never ping per-task or per-child.
+- Never modify legacy source code, legacy tables, or legacy job definitions; the legacy system is read-only in every phase and reconciliation failures are fixed in converted code only.
+- Reference credentials by secret name only, and never print, commit, or paste secret values into artifacts, PRs, chat, or logs.
+- Migration work writes only to the catalogs allowlisted in `.migration/allowed_targets.json`; the copy in force is the committed one on the protected branch, so a session widens its own scope only through a reviewed PR.
+- A legacy write runs only under a `legacy_write_authorized` entry in the committed `.migration/authorizations.json` naming every object it touches, cited as `DBX_DECISION=<id>`; sessions never author the authorization file.
+- Cutover actions that repoint production consumers require the customer-held cutover principal and an explicit, current human authorization; wave worker sessions never perform cutover actions.
+- The plugin's PreToolUse hook (`hooks/dbx_guard.py`) hard-blocks writes outside that allowlist and reads `.migration/` contracts from committed state; a block is a finding to report, never something to route around.
+- Messages to humans read like a sharp colleague, not a bot: two to four short sentences, lead with the one decision or fact, link the artifact instead of summarizing it, and post once per event rather than per task or per child.
+- `plan.yaml` approvals come from the human in the Plan view; Devin writes `decisions`, `gates`, `blockers` and `depends_on` but never writes `approved`.

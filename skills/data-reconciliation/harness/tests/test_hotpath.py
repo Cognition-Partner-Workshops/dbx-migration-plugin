@@ -139,7 +139,7 @@ def test_one_source_field_mapped_to_numeric_and_nonnumeric_targets_keeps_both_su
     assert s_all["code"]["sum"] == 55 and s_all["code"]["count"] == 10   # batched metrics kept
     assert t_all["code_n"]["sum"] == 56 and t_all["code"].get("sum") is None
     assert len(t_conn.statements) == 1                                    # code_n batched, code never summed
-    est = estimate_cost(spec, TOL)  # the STOP C estimate plans per physical column like the run
+    est = estimate_cost(spec, TOL)  # the wave-plan estimate plans per physical column like the run
     assert est["source_statements"]["tier2"] == len(s_conn.statements) == 2
     assert est["target_statements"]["tier2"] == len(t_conn.statements) == 1
     result = _tier2(spec, source, target)

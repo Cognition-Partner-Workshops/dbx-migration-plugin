@@ -111,8 +111,8 @@ _PY_ENV = re.compile(r"(?:environ\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]|getenv\s*
 _PY_DSN = re.compile(r"""['"][^'"]*(?:://|jdbc:|Server=|host=|Database=|Initial Catalog=)[^'"]*['"]""", re.IGNORECASE)
 _PY_WRITE = re.compile(r"""['"](?:[wax]\+?|\+?>>?|\+<)['"]|\.write\w*\(|json\.dump\(|os\.(?:remove|unlink|rename|replace|chmod|rmdir|makedirs|mkdir)\(|"""
                        r"""shutil\.|\.(?:unlink|rename|rmdir|mkdir|touch|chmod)\(|\bunlink\b|\bwriteFile\w*\(""")
-_DECISION_ROW = re.compile(r"(?m)^\s*(?:\|\s*|#{1,6}\s*)?(D-[A-Za-z0-9][\w.-]*)\b")
-_DECISION_ID = re.compile(r"D-[A-Za-z0-9][\w.-]*")
+_DECISION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_AUTHORIZATIONS_REL = ".migration/authorizations.json"
 _WRITE_OBJECT = re.compile(
     r"(?is)^\s*(?:DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|UPDATE(?:\s+TOP\s*\([^)]*\)(?:\s+PERCENT)?|\s+STATISTICS|\s+(?:ONLY|LOW_PRIORITY|IGNORE))*|TRUNCATE(?:\s+TABLE)?|"
     r"(?:CREATE|ALTER|DROP)(?:\s+\w+)*?\s+INDEX(?:\s+IF\s+(?:NOT\s+)?EXISTS)?\s+[\w.$\"\[\]`]+\s+ON(?:\s+ONLY)?|"
@@ -284,8 +284,8 @@ class Verdict:
         if not real:
             return cls("approve", "dbx-migration-factory guard: " + "; ".join(notes) if notes else "", violations)
         reason = ("dbx-migration-factory guard: " + "; ".join(violations) + ". Fix the command or, if the target is legitimate, add "
-                  "it to .migration/allowed_targets.json by a PR to the protected branch carrying a `D-<id>` row in "
-                  f"06_decisions.md (allowlist in force: {cfg.policy_ref}); never work around the guard.")
+                  "it to .migration/allowed_targets.json by a PR to the protected branch "
+                  f"(allowlist in force: {cfg.policy_ref}); never work around the guard.")
         if cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
             return cls("approve", "WARN (guard_mode=warn): " + reason, violations)
         return cls("block", reason, violations)
@@ -484,7 +484,7 @@ def _lakebase(verb: str, project: str | None, branch: str | None, cfg: GuardConf
                 f"{cfg.lakebase_projects} (empty = every Lakebase write blocks)"]
     if branch == "production":
         return [f"`databricks postgres {verb}` on the `production` branch of Lakebase project {project or '?'}; migration sessions "
-                "write only per-batch branches (production is repointed at STOP E)"]
+                "write only per-batch branches (production is repointed at cutover)"]
     if branch is not None and cfg.lakebase_branches and not any(fnmatch.fnmatchcase(branch, p) for p in cfg.lakebase_branches):
         return [f"`databricks postgres {verb}` on branch {branch!r} of Lakebase project {project or '?'}; allowed lakebase_branches "
                 f"{cfg.lakebase_branches}"]
@@ -741,19 +741,32 @@ def _write_objects(statements: list[str]) -> list[list[str]]:
         objects.append(names)
     return objects
 
+_ENTRY_AUTHOR = re.compile(r"user:[\w][\w.@/-]*")
+
+
 def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None, str | None]:
     """(decision id, why it does not authorize these statements; None when it does)."""
     did = next((a.split("=", 1)[1] for a in reversed(seg.assigns) if a.startswith("DBX_DECISION=")), None)
     if not did:
-        return None, "no `DBX_DECISION=D-<id>` prefix on the command"
-    ledger, ref = _committed(root, ".migration/06_decisions.md") if _DECISION_ID.fullmatch(did) else ("", None)
-    if ledger is None:
-        return did, "no committed .migration/06_decisions.md on the protected branch (or HEAD); a session cannot author its own authorization"
-    row = next((ln for ln in ledger.splitlines() if (m := _DECISION_ROW.search(ln)) and m.group(1).lower() == did.lower()), None)
-    if row is None:
-        return did, f"`{did}` is not a row in {ref or 'working copy'}:.migration/06_decisions.md"
-    if "legacy_write_authorized" not in row.lower():
-        return did, f"row `{did}` does not contain `legacy_write_authorized`"
+        return None, "no `DBX_DECISION=<id>` prefix on the command"
+    text, ref = _committed(root, _AUTHORIZATIONS_REL) if _DECISION_ID.fullmatch(did) else (None, None)
+    if text is None:
+        return did, "no committed .migration/authorizations.json on the protected branch (or HEAD); " \
+                    "a session cannot author its own authorization"
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return did, f"{ref or 'working copy'}:{_AUTHORIZATIONS_REL} is not valid JSON; " \
+                    "a session cannot author its own authorization"
+    entries = doc.get("authorizations") if isinstance(doc, dict) else None
+    entry = next((e for e in entries or [] if isinstance(e, dict) and str(e.get("id")) == did), None)
+    if entry is None:
+        return did, f"`{did}` is not an entry in {ref or 'working copy'}:{_AUTHORIZATIONS_REL}"
+    if entry.get("kind") != "legacy_write_authorized":
+        return did, f"entry `{did}` does not have kind `legacy_write_authorized`"
+    if not (isinstance(entry.get("by"), str) and _ENTRY_AUTHOR.fullmatch(entry["by"])):
+        return did, f"entry `{did}` has no `user:...` author"
+    allowed = {re.sub(r'["`\[\]]', "", str(o)).lower() for o in (entry.get("objects") or [])}
     objects = _write_objects(statements)
     for names, statement in zip(objects, statements):
         if not names:
@@ -761,8 +774,8 @@ def _decision(seg: _Seg, statements: list[str], root: Path) -> tuple[str | None,
         for obj in names:
             if obj.startswith("$") or obj.endswith("$") or re.search(r"[$:&@]\{?\(", statement):
                 return did, f"`{obj}` is a run-time substitution; the decision must name the literal object"
-            if not re.search(rf"(?<![\w.]){re.escape(obj)}(?![\w.])", re.sub(r'["`\[\]]', "", row), re.IGNORECASE):
-                return did, f"row `{did}` does not name `{obj}`"
+            if re.sub(r'["`\[\]]', "", obj).lower() not in allowed:
+                return did, f"entry `{did}` does not name `{obj}`"
     return did, None
 
 def _host(value: str) -> str:
@@ -878,9 +891,9 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         if missing is None:
             objects = [obj for names in _write_objects(non_reads) for obj in names]
             violations.append(f"{_AUTHORIZED}{did} authorizes the legacy write of {', '.join(objects)} "
-                              "(legacy_write_authorized row in .migration/06_decisions.md)")
+                              "(legacy_write_authorized entry in .migration/authorizations.json)")
         else:
-            violations.append(_Legacy(f"{violation}; a committed `legacy_write_authorized` row would allow it, but {missing}{tail}"))
+            violations.append(_Legacy(f"{violation}; a committed `legacy_write_authorized` entry would allow it, but {missing}{tail}"))
     elif unresolved:
         violations.append(f"non-read statement through `{base}` to a connection built at run time ({sorted(set(unresolved))[:4]} is not a "
                           f"literal and not a name in target_hosts / legacy_sources): `{bad[0]}`; spell the host and database out so the guard "
@@ -921,7 +934,7 @@ def _catalog_violations(sql: str, cfg: GuardConfig, default: str | None, who: st
                 grant and (who != "Databricks SQL client" or not re.search(r"\bON\s+TABLE\b", stmt, re.IGNORECASE)) or
                 re.match(_PERMISSION.format(c="|".join((*cats, _METASTORE))), stmt, re.IGNORECASE | re.DOTALL))):
             violations.append(f"catalog / metastore lifecycle or permission change `{head}`; the allowlist authorizes object writes "
-                              "inside a catalog, never grants or the containers themselves (those happen at STOP E)")
+                              "inside a catalog, never grants or the containers themselves (those happen at cutover)")
         elif cat is not None or use_cat is not None:
             c, how = (cat, f"to catalog(s) {[cat]}") if cat is not None else (use_cat, f"under USE CATALOG {use_cat!r}")
             if c not in allowed:
@@ -956,7 +969,7 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
     if kind:
         t = m.group(1) if (m := _BUNDLE_TARGET.search(" " + " ".join(argv))) else ""
         bad = ("has no literal -t/--target" if not t else "is not a literal" if _expands(t) or not re.fullmatch(r"[\w.-]+", t) else
-               "is a forbidden target (forbidden_bundle_targets); production deploys happen only at STOP E"
+               "is a forbidden target (forbidden_bundle_targets); production deploys happen only at cutover"
                if t.lower() in cfg.forbidden_bundle_targets else "is not in the list (exact, case-sensitive)" if t not in cfg.bundle_targets else "")
         return [f"`{kind}` target {t!r} {bad}; allowed bundle_targets {cfg.bundle_targets} (empty = every deploy blocks)"] if bad else []
     if (group, verb) == ("sql", "execute") or path[:4] == ["experimental", "aitools", "tools", "query"] or (
@@ -977,7 +990,7 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         return [f"`databricks {key}` prints the session's bearer token (credential exposure); `auth describe` shows the identity without it"]
     if key in _LIFECYCLE:
         return [(f"`databricks {key}` on {' '.join(args) or '<securable>'!r}: the allowlist authorizes object writes inside a "
-                 "catalog / Lakebase-project lifecycle or permissions (those happen at STOP E)")]
+                 "catalog / Lakebase-project lifecycle or permissions (those happen at cutover)")]
     if key in _CLI_CATALOG_ARG:
         name = (args + ["", ""])[_CLI_CATALOG_ARG[key]]
         if not name or _norm(name.split(".")[0]) not in cfg.catalogs:
@@ -1442,8 +1455,8 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 
 def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd: str) -> Verdict:
-    """File-edit tools: `.migration/` is writable (the allowlist in force is upstream), but 06_decisions.md still accepts only an
-    appended `D-<id>` row; the credential store and the guard tree never take an edit."""
+    """File-edit tools: `.migration/` is writable (the allowlist in force is upstream), but a `legacy_write_authorized`
+    entry never enters authorizations.json from a session; the credential store and the guard tree never take an edit."""
     file_path = tool_input.get("file_path")
     if not isinstance(file_path, str) or not file_path:
         return Verdict.of([], cfg)
@@ -1456,12 +1469,11 @@ def evaluate_edit(tool: str, tool_input: dict, cfg: GuardConfig, root: Path, cwd
         except OSError:
             old = ""
     kind, violations = _touch(file_path, cwd or "", root), []
-    if kind == "inside" and Path(file_path).name == "06_decisions.md":
+    if kind == "inside" and Path(file_path).name == "authorizations.json":
         added = new[len(old):] if new.startswith(old) else new
         if "legacy_write_authorized" in added.lower():
-            violations.append("a `legacy_write_authorized` row enters the ledger only through a reviewed PR, never from a session")
-        elif not (tool != "MultiEdit" and new.startswith(old) and added and _DECISION_ROW.search(added)):
-            violations.append("06_decisions.md is append-only: the edit must keep the existing text and only add `D-<id>` rows")
+            violations.append("a `legacy_write_authorized` entry enters the authorization file only through a "
+                              "reviewed PR, never from a session")
     elif kind == "identity":
         violations.append(f"file-edit tool `{tool}` writes `{file_path}`, the Databricks CLI's credential store; the session runs as the "
                           "doctor-verified migration principal only")

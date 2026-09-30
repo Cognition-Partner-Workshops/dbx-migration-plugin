@@ -7,7 +7,7 @@ description: Source-dialect skill for Informatica PowerCenter estates (repositor
 
 ## 1. When to use / routing
 
-Use for PowerCenter 9.x/10.x repository XML exports (`POWERMART` documents): `MAPPING`, `SESSION`, `WORKFLOW`/`WORKLET`, `MAPPLET`, `.par` parameter files, pre/post-session commands and SQL. IICS assets (JSON/zip project exports, taskflows, mapping tasks) have a different format and asset model: do not route them here; record them as a front-door finding (`install-dbx-factory/playbooks/10-front_door_etl.md`) until an IICS skill exists. One unit = a mapping plus the sessions that run it plus their workflow task instances, keyed `<folder>.<mapping>`; reusable transformations and mapplets used by two or more mappings are shared objects (wave 0, convert once). Session-level `Sql Query` / `Lookup Sql Override` / `Source Filter` / `Pre SQL` / `Post SQL` overrides replace the mapping's SQL silently: always convert the session's effective SQL, transpiled with the connection's dialect skill (`teradata-bteq`, `oracle-plsql`).
+Use for PowerCenter 9.x/10.x repository XML exports (`POWERMART` documents): `MAPPING`, `SESSION`, `WORKFLOW`/`WORKLET`, `MAPPLET`, `.par` parameter files, pre/post-session commands and SQL. IICS assets (JSON/zip project exports, taskflows, mapping tasks) have a different format and asset model: do not route them here; record them as a front-door finding for the intake ticket until an IICS skill exists. One unit = a mapping plus the sessions that run it plus their workflow task instances, keyed `<folder>.<mapping>`; reusable transformations and mapplets used by two or more mappings are shared objects (wave 0, convert once). Session-level `Sql Query` / `Lookup Sql Override` / `Source Filter` / `Pre SQL` / `Post SQL` overrides replace the mapping's SQL silently: always convert the session's effective SQL, transpiled with the connection's dialect skill (`teradata-bteq`, `oracle-plsql`).
 
 Everything Databricks-side goes through `skills/target-routing/SKILL.md` to the official skills; this file cites, never restates:
 
@@ -40,14 +40,14 @@ Parse the `POWERMART` export namespace-free with the DTD disabled (`powrmart.dtd
 |---|---|---|---|
 | `decimal(p,s)`, `Enable high precision = YES` | `DECIMAL(p,s)` (p <= 38) | `NUMERIC` | s <= 10: `decimal_round` (places 10); s > 10: `identity`, raw compare (trap 3) |
 | `decimal(p,s)`, `Enable high precision = NO` (default) | `DECIMAL(p,s)`; legacy computed in double (15 digits) | `NUMERIC` | `decimal_round`; last-digit drift expected (trap 3) |
-| `decimal` p > 38, Oracle `NUMBER` without scale | `DECIMAL(38,s)` or `DOUBLE` per STOP A | `NUMERIC` / `DOUBLE PRECISION` | Tier 2 sum drift is the signature |
+| `decimal` p > 38, Oracle `NUMBER` without scale | `DECIMAL(38,s)` or `DOUBLE` per the intake decision | `NUMERIC` / `DOUBLE PRECISION` | Tier 2 sum drift is the signature |
 | `integer`, `small integer`, `bigint` | `INT`, `SMALLINT`, `BIGINT` | `INTEGER`, `SMALLINT`, `BIGINT` | double->integer port assignment rounds (row 14) |
 | `double`, `real` | `DOUBLE`, `FLOAT` | `DOUBLE PRECISION`, `REAL` | compare with `numeric_abs_tol`, not `decimal_round` |
 | `string(n)` from `VARCHAR` | `STRING` | `TEXT` | width dropped; `empty_string_is_null` where an engine folds `''` to NULL (Oracle targets) |
 | `string(n)` from `CHAR(n)` / fixed-width with `STRIPTRAILINGBLANKS="NO"` | `STRING` | `TEXT` | `rstrip_spaces`; `IS_SPACES`/`LENGTH` see the padding (trap 4) |
 | `nstring`, `ntext`, `text` | `STRING` | `TEXT` | codepage `Latin1`/`MS1252` -> UTF-8 on read (trap 18); `text` excluded from Tier 3, hash-compare |
 | `binary` | `BINARY` | `BYTEA` | `uuid_normalize` only for 16-byte GUIDs |
-| `date/time` (29,9) from `TIMESTAMP(6)`, Oracle `DATE` | `TIMESTAMP_NTZ` (zone-less legacy); `TIMESTAMP` only if STOP A says UTC | `TIMESTAMP [WITHOUT TIME ZONE]` | pass-through: `identity` at us; `datetime_utc_truncate_ms` only on `SYSDATE`/`SESSSTARTTIME`-fed and Pre-85 columns (traps 7, 8); into a `DATE` target: `CAST(ts AS DATE)` only after confirming the legacy truncated |
+| `date/time` (29,9) from `TIMESTAMP(6)`, Oracle `DATE` | `TIMESTAMP_NTZ` (zone-less legacy); `TIMESTAMP` only if the intake decision says UTC | `TIMESTAMP [WITHOUT TIME ZONE]` | pass-through: `identity` at us; `datetime_utc_truncate_ms` only on `SYSDATE`/`SESSSTARTTIME`-fed and Pre-85 columns (traps 7, 8); into a `DATE` target: `CAST(ts AS DATE)` only after confirming the legacy truncated |
 | `timestamp with time zone` | `TIMESTAMP` (UTC) | `TIMESTAMP WITH TIME ZONE` | compare in UTC with `identity`: zone normalisation keeps the fraction, so a us mismatch must still fail; `datetime_utc_truncate_ms` only if the column is also clock-fed (trap 7) |
 | Flat-file `PICTURETEXT="9(09)V99"` (implied decimals) | `DECIMAL(11,2)` via `CAST(substr AS DECIMAL(11,0)) / 100` | `NUMERIC` | Tier 2 sum 100x off if missed (trap 21) |
 | Flat-file `9(05)` Julian `YYDDD`, `X(n)` codes | `STRING` + derived `DATE` | `TEXT`, `DATE` | pivot year lives in converted code (trap 22) |
@@ -158,7 +158,7 @@ Databricks expressions are SQL, usable verbatim via `F.expr(...)` or in DBSQL. K
 | 2 | Implicit port conversions | round / 0-on-failure | error or NULL | Tier 3 off-by-one, Tier 2 null rate | explicit `try_cast`/`round` per port; gap `zero_null_equiv` |
 | 3 | `Enable high precision = NO` | double arithmetic | exact `DECIMAL` | Tier 3 last digit, Tier 2 sum drift | `decimal_round half_up` (places 10) on ports with s <= 10 or computed in double; s > 10 ports `identity` (per-field `places` is a harness gap); never widen without a decision |
 | 4 | CHAR padding, `IS_SPACES`, `LENGTH` | padded | unbounded `STRING` | Tier 3 strings, Tier 2 distinct | `rstrip_spaces`; test on the untrimmed value |
-| 5 | `''` vs NULL (`NULL_CHARACTER`, Oracle targets) | engine-specific | distinct | Tier 2 null rate | `empty_string_is_null` (STOP A); `nullif(x, '')` at Oracle boundaries |
+| 5 | `''` vs NULL (`NULL_CHARACTER`, Oracle targets) | engine-specific | distinct | Tier 2 null rate | `empty_string_is_null` (intake decision); `nullif(x, '')` at Oracle boundaries |
 | 6 | `TO_DATE` format on transposed data | day <= 12 transposes, else row error | same, or NULL | Tier 3 dates, Tier 2 null rate | reproduce like-for-like, file the defect; rejects -> quarantine |
 | 7 | Timezone | zone-less local time | UTC `TIMESTAMP` | Tier 3 constant offset | `TIMESTAMP_NTZ`; gap `timestamp_offset_shift` |
 | 8 | Datetime precision | ns clock reads (`SYSDATE`, `SYSTIMESTAMP('NS')`), Pre-85 seconds | us | Tier 3 sub-ms on those columns only | `datetime_utc_truncate_ms` bound to them; `TIMESTAMP(6)` pass-through stays `identity` so a us mismatch still fails |

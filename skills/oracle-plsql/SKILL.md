@@ -1,6 +1,6 @@
 ---
 name: oracle-plsql
-description: Source-dialect skill for Oracle SQL and PL/SQL estates (packages, procedures, functions, triggers, sequences, materialized views, DBMS_SCHEDULER jobs, SQL*Plus scripts). Load it when converting Oracle units to Databricks SQL / Lakeflow (analytical track) or to Lakebase Postgres (`!dbx_migrate_oltp` OLTP track), or when reconciling Oracle against Databricks.
+description: Source-dialect skill for Oracle SQL and PL/SQL estates (packages, procedures, functions, triggers, sequences, materialized views, DBMS_SCHEDULER jobs, SQL*Plus scripts). Load it when converting Oracle units to Databricks SQL / Lakeflow (analytical track) or to Lakebase Postgres (OLTP track), or when reconciling Oracle against Databricks.
 ---
 
 # Oracle SQL / PL-SQL Dialect
@@ -8,7 +8,7 @@ description: Source-dialect skill for Oracle SQL and PL/SQL estates (packages, p
 ## When to use / routing
 
 Source-side half only: what Oracle does, where each construct lands, and which recon tier catches a wrong conversion.
-Tracks: **A** is analytical Delta/DBSQL (MVs -> Pipelines, jobs -> Jobs); **L** is Lakebase Postgres via `!dbx_migrate_oltp` (tables, constraints, sequences, and triggers must behave identically).
+Tracks: **A** is analytical Delta/DBSQL (MVs -> Pipelines, jobs -> Jobs); **L** is Lakebase Postgres on the OLTP track (tables, constraints, sequences, and triggers must behave identically).
 Procedural logic routes DBSQL SQL scripting first, Lakeflow Jobs control flow second, PySpark last.
 Databricks-side facts come from the official skills via `skills/target-routing/SKILL.md`, never restated here. Citations: `[dbsql:<file>#<section>]` = `databricks-dbsql/references/<file>`, likewise `[jobs:]`, `[pipelines:]`, `[lakebase:]`, `[uc:]`; `[docs:<path>]` = `docs.databricks.com/aws/en/sql/language-manual/<path>`; `[pg17:<page>]` = `postgresql.org/docs/17/<page>` (Lakebase product facts only from `[lakebase:]`).
 Lakebridge (`--source-dialect oracle`, optional: `skills-extra/lakebridge/SKILL.md`) handles static SQL; anything with `BEGIN`, `DECLARE`, `CREATE OR REPLACE (PACKAGE|PROCEDURE|FUNCTION|TRIGGER)` or `DBMS_` comes straight here.

@@ -172,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--canonicalization", action="append", type=Path, default=[])
     t.add_argument("--param", action="append", default=[])
     e = sub.add_parser("estimate", help="statements/rows a run would cost (no connections); "
-                                        "summed per wave for the STOP C cost line")
+                                        "summed per wave for the plan's cost estimate")
     e.add_argument("--mapping", required=True, type=Path)
     e.add_argument("--tolerances", required=True, type=Path)
     e.add_argument("--depth", choices=DEPTHS, default="threshold")

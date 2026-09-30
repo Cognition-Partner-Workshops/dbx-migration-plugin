@@ -252,7 +252,7 @@ class Tolerances:
     # A side with no pinned snapshot and no engine change token proves stillness only by
     # (count, max watermark) markers, which miss updates below the max and balanced
     # insert+delete pairs. False (default): such a run is not merge-eligible. True records the
-    # STOP A decision to accept marker-only evidence (Sybase ASE, logins without VIEW SERVER STATE).
+    # intake decision to accept marker-only evidence (Sybase ASE, logins without VIEW SERVER STATE).
     accept_marker_only_window: bool = False
     # Tier 7 fails a target that enforces a NOT NULL, unique, foreign-key or CHECK constraint the
     # source does not: such a target rejects writes the legacy application makes today. True

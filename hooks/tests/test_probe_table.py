@@ -121,7 +121,7 @@ PROBES = [
     ("mv workspace .migration", "mv .migration .m", "approve"),
     ("switch guard_mode to warn", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json > x && mv x .migration/allowed_targets.json", "approve"),
     ("edit tolerances", "sed -i 's/0.001/0.5/' .migration/units/u/tolerances.json", "approve"),
-    ("edit decisions ledger", "echo '| tol change | accepted |' >> .migration/06_decisions.md", "approve"),
+    ("edit authorization file", "echo 'x' >> .migration/authorizations.json", "approve"),
     ("edit capabilities manifest", "python3 -c \"import json;json.dump({'ready':True},open('.migration/09_capabilities.json','w'))\"", "approve"),
     ("run from outside workspace (cd out first)", "cd /tmp && databricks sql execute -e 'INSERT INTO prod.s.t VALUES (1)'", "block"),
     ("run with absolute path outside ws", "databricks sql execute -e 'INSERT INTO prod.s.t VALUES (1)' --profile x", "block"),
@@ -168,7 +168,17 @@ FILES2 = {
     "fix.sh": "cat /etc/hosts\n",
     "q.sql": "SELECT 1;\n",
     "capture_baseline.py": "import boto3\ns3 = boto3.client(\"s3\")\nprint(s3.list_buckets())\n",
-    ".migration/06_decisions.md": "# Decisions\n\n| id | date | decision |\n|---|---|---|\n| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n| D-8 | 2026-01-02 | accept tolerance change for dbo.orders |\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n| D-10 | 2026-01-04 | legacy_write_authorized: supplemental logging on dbo.orders_archive |\n| D-11 | 2026-01-05 | legacy_write_authorized: approved modifiers TOP and STATISTICS |\n| D-12 | 2026-01-06 | legacy_write_authorized: approved DROP TABLE on dbo.orders and dbo.customers |\n| D-13 | 2026-01-07 | legacy_write_authorized: approved CDC index on \"dbo\".\"customers\" |\n| D-14 | 2026-01-08 | legacy_write_authorized: read grant on schema billing |\n| D-15 | 2026-01-09 | legacy_write_authorized: approved VIEW maintenance on dbo.customers |\n",
+    ".migration/authorizations.json": json.dumps({"version": 1, "authorizations": [
+        {"id": "D-7", "kind": "legacy_write_authorized", "objects": ["dbo.orders"], "by": "user:t", "at": "2026-01-01"},
+        {"id": "D-8", "kind": "tolerance_change", "objects": ["dbo.orders"], "by": "user:t", "at": "2026-01-02"},
+        {"id": "D-9", "kind": "legacy_write_authorized", "objects": ["dbo.customers"], "by": "user:t", "at": "2026-01-03"},
+        {"id": "D-10", "kind": "legacy_write_authorized", "objects": ["dbo.orders_archive"], "by": "user:t", "at": "2026-01-04"},
+        {"id": "D-11", "kind": "legacy_write_authorized", "objects": ["TOP", "STATISTICS"], "by": "user:t", "at": "2026-01-05"},
+        {"id": "D-12", "kind": "legacy_write_authorized", "objects": ["dbo.orders", "dbo.customers"], "by": "user:t", "at": "2026-01-06"},
+        {"id": "D-13", "kind": "legacy_write_authorized", "objects": ["dbo.customers"], "by": "user:t", "at": "2026-01-07"},
+        {"id": "D-14", "kind": "legacy_write_authorized", "objects": ["billing"], "by": "user:t", "at": "2026-01-08"},
+        {"id": "D-15", "kind": "legacy_write_authorized", "objects": ["dbo.customers"], "by": "user:t", "at": "2026-01-09"},
+    ]}),
     "d.patch": "--- a/.migration/allowed_targets.json\n+++ b/.migration/allowed_targets.json\n",
     "ok.patch": "--- a/notes.md\n+++ b/notes.md\n",
 }
@@ -497,12 +507,12 @@ PROBES2 = [
     ("git checkout -- .migration", "git checkout -- .migration/03_recon_tolerances.json", "approve"),
     ("git checkout -- .", "git checkout -- .", "approve"),
     ("git -C ws checkout -- .migration", "git -C {ws} checkout -- .migration/03_recon_tolerances.json", "approve"),      # round 4
-    ("git -C ws/src checkout -- ../.migration", "git -C {ws}/src checkout -- ../.migration/06_decisions.md", "approve"),  # round 4
+    ("git -C ws/src checkout -- ../.migration", "git -C {ws}/src checkout -- ../.migration/authorizations.json", "approve"),  # round 4
     ("git -C ws checkout -- .", "git -C {ws} checkout -- .", "approve"),                                                  # round 4
     ("git -C ws reset --hard", "git -C {ws} reset --hard", "approve"),                                                    # round 4
     ("git -C ws clean -fdx", "git -C {ws} clean -fdx", "approve"),                                                        # round 4
     ("git -C ws log (approve)", "git -C {ws} log --oneline", "approve"),                                                # round 4
-    ("git -C ws add .migration (approve)", "git -C {ws} add .migration/06_decisions.md", "approve"),                    # round 4
+    ("git -C ws add .migration (approve)", "git -C {ws} add .migration/authorizations.json", "approve"),                    # round 4
     ("git checkout branch (approve)", "git checkout -b feature/x", "approve"),
     ("git stash", "git stash", "approve"),                                                                            # the working copy carries no policy
     ("git reset --hard", "git reset --hard HEAD~1", "approve"),
@@ -512,11 +522,11 @@ PROBES2 = [
     ("git commit -am (approve)", "git commit -am 'recon evidence'", "approve"),
     ("git commit -m mentioning rm .migration (approve)", "git commit -m \"rm .migration\"", "approve"),
     ("git add .migration/recon (approve)", "git add .migration/recon/u1/evidence.json", "approve"),
-    ("git add .migration decision ledger (approve)", "git add .migration/06_decisions.md", "approve"),
+    ("git add .migration authorization file (approve)", "git add .migration/authorizations.json", "approve"),
     ("git diff .migration (approve)", "git diff -- .migration/allowed_targets.json", "approve"),
     ("git log .migration (approve)", "git log --oneline -- .migration", "approve"),
     ("grep -r . .migration (approve)", "grep -r . .migration", "approve"),
-    ("cat .migration/06_decisions.md (approve)", "cat .migration/06_decisions.md", "approve"),
+    ("cat .migration/authorizations.json (approve)", "cat .migration/authorizations.json", "approve"),
     ("mkdir -p .migration/recon/u1 (approve)", "mkdir -p .migration/recon/u1", "approve"),
     ("echo into .migration/recon/u1/log (approve)", "echo x > .migration/recon/u1/log", "approve"),
     ("ls -la .migration (approve)", "ls -la .migration", "approve"),
@@ -530,7 +540,7 @@ PROBES2 = [
     ("python -c shutil.rmtree('.')", "python3 -c \"import shutil; shutil.rmtree('.')\"", "approve"),
     ("python -c write via variable path", "python3 -c \"p='.migration/'+'allowed_targets.json'; open(p,'w')\"", "approve"),
     ("python -c read .migration (approve)", "python3 -c \"print(open('.migration/allowed_targets.json').read())\"", "approve"),
-    ("python script file (unreadable, approve)", "python3 edit_ledger.py", "approve"),
+    ("python script file (unreadable, approve)", "python3 edit_auth.py", "approve"),
     ("node -e fs.writeFileSync", "node -e \"require('fs').writeFileSync('.migration/allowed_targets.json','{}')\"", "approve"),
     ("ruby -e File.write", "ruby -e \"File.write('.migration/allowed_targets.json','{}')\"", "approve"),
     ("jq edit redirect", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json > .migration/allowed_targets.json", "approve"),
@@ -546,12 +556,12 @@ PROBES2 = [
     ("wget -O .migration", "wget https://x/a.json -O .migration/allowed_targets.json", "approve"),
     ("--output=.migration", "some-tool --output=.migration/allowed_targets.json", "approve"),
     ("mkdir .migration/waves", "mkdir .migration/waves", "approve"),
-    ("touch .migration/06_decisions.md", "touch .migration/06_decisions.md", "approve"),
+    ("touch .migration/authorizations.json", "touch .migration/authorizations.json", "approve"),
     ("chattr", "chattr -i .migration/allowed_targets.json", "approve"),
     ("setfacl", "setfacl -m u:x:rw .migration/allowed_targets.json", "approve"),
     ("chmod -R on ws", "chmod -R 777 .", "approve"),
     ("unknown program with .migration operand", "frobnicate .migration/allowed_targets.json", "approve"),
-    ("unknown program, .migration only in prose (approve)", "frobnicate 'see .migration/06_decisions.md for context'", "approve"),
+    ("unknown program, .migration only in prose (approve)", "frobnicate 'see .migration/authorizations.json for context'", "approve"),
     # --- wrappers / opacity
     ("bash -c literal legacy write", "bash -c 'sqlcmd -S sqlserver-demo -Q \"DROP TABLE t\"'", "block"),
     ("sh -c with var", "sh -c \"$CMD\"", "block"),
@@ -671,9 +681,9 @@ PROBES2 = [
     ("R3 for loop mv over .migration units", "for f in .migration/units/*/tolerances.json; do mv \"$f\" \"$f.bak\"; done", "approve"),
     ("R3 for loop rm over .migration units", "for f in .migration/units/*/tolerances.json; do rm \"$f\"; done", "approve"),
     ("R3 for loop tee into .migration units", "for f in .migration/units/*/tolerances.json; do echo x | tee \"$f\"; done", "approve"),
-    ("R3 for loop rm over .migration ledger glob", "for f in .migration/0*.md; do rm \"$f\"; done", "approve"),
+    ("R3 for loop rm over .migration glob", "for f in .migration/0*.md; do rm \"$f\"; done", "approve"),
     ("R3 for loop over non-migration paths writes", "for f in build/*.json; do rm \"$f\"; done", "approve"),
-    ("R5 loop var reassigned to a ledger path (approve)", "for f in a b; do f=.migration/06_decisions.md; echo x > \"$f\"; done", "approve"),
+    ("R5 loop var reassigned to a .migration path (approve)", "for f in a b; do f=.migration/authorizations.json; echo x > \"$f\"; done", "approve"),
     ("R3 for loop over build output paths writes", "for d in build out; do echo x > \"$d/x.json\"; done", "approve"),
     ("R3 while loop body write into .migration", "while true; do rm .migration/units/x; done", "approve"),
     ("R3 if-then body write into .migration", "if true; then rm .migration/units/x; fi", "approve"),
@@ -714,8 +724,8 @@ PROBES2 = [
     ("R4 decision runtime substitution quoted", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE \"$(TABLE)\" SET x=1'", "block"),
     ("R4 decision runtime substitution braced", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -v TABLE=dbo.orders -Q 'UPDATE ${TABLE} SET x=1'", "block"),
     ("R4 decision literal object remains authorized", "DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'UPDATE dbo.orders SET x=1'", "approve"),
-    ("R5 bracketed object matches plain ledger row", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'ALTER TABLE [dbo].[orders] ADD x INT'", "approve"),
-    ("R5 quoted ledger row matches plain object", "DBX_DECISION=D-13 sqlcmd -S sqlserver-demo -Q 'ALTER TABLE dbo.customers ADD x INT'", "approve"),
+    ("R5 bracketed object matches plain entry", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'ALTER TABLE [dbo].[orders] ADD x INT'", "approve"),
+    ("R5 quoted object matches plain entry", "DBX_DECISION=D-13 sqlcmd -S sqlserver-demo -Q 'ALTER TABLE dbo.customers ADD x INT'", "approve"),
     ("R5 bracketed object boundary still blocks", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'ALTER TABLE [dbo].[orders_archive] ADD x INT'", "block"),
     ("R5 create index authorizes the table", "DBX_DECISION=D-7 sqlcmd -S sqlserver-demo -Q 'CREATE INDEX ix_orders ON dbo.orders (id)'", "approve"),
     ("R5 create index name does not authorize table", "DBX_DECISION=D-13 sqlcmd -S sqlserver-demo -Q 'CREATE INDEX ix_orders ON dbo.orders (id)'", "block"),
@@ -736,7 +746,7 @@ WARN_PROBES = [
 
 
 def _commit_ws(ws: Path) -> None:
-    """The allowlist and ledger in force are the committed copies; every probe workspace is a repo."""
+    """The allowlist and authorization file in force are the committed copies; every probe workspace is a repo."""
     subprocess.run(["git", "init", "-q", str(ws)], check=True)
     subprocess.run(["git", "-C", str(ws), "-c", "user.email=t@example.com", "-c", "user.name=t", "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(ws), "-c", "user.email=t@example.com", "-c", "user.name=t",
@@ -917,7 +927,7 @@ def test_fixture_shell_depth_limit_is_fail_closed(tmp_path: Path, label: str, de
 
 @pytest.mark.parametrize("command,expected,needle", [
     ("DBX_DECISION=D-7 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", True, "D-7"),
-    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "DBX_DECISION=D-<id>"),
+    ("sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "DBX_DECISION=<id>"),
     ("DBX_DECISION=D-99 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "D-99"),
     ("DBX_DECISION=D-8 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "legacy_write_authorized"),
     ("DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.orders ADD cdc_ts DATETIME2'", False, "dbo.orders"),
@@ -1227,8 +1237,8 @@ def test_running_guard_tree_is_tamper_proof(label: str, command: str, expected: 
     ("cwd=ws: relative hooks/ is not the running guard (approve)", "ws", "sed -i 's/a/b/' hooks/dbx_guard.py", "approve"),
     ("cwd=ws: relative hooks.json is not the running guard (approve)", "ws", "echo '{{}}' > hooks.json", "approve"),
     ("cwd=ws: ruff --fix hooks/ is not the running guard (approve)", "ws", "ruff check --fix hooks/", "approve"),
-    ("cwd=ws: .migration write (approve)", "ws", "echo x > .migration/06_decisions.md", "approve"),
-    ("cwd=ws/src: ../.migration write (approve)", "src", "echo x > ../.migration/06_decisions.md", "approve"),
+    ("cwd=ws: .migration write (approve)", "ws", "echo x > .migration/authorizations.json", "approve"),
+    ("cwd=ws/src: ../.migration write (approve)", "src", "echo x > ../.migration/authorizations.json", "approve"),
     # round 5
     ("cwd=plugin: git pull", "plugin", "git pull", "block"),
     ("cwd=plugin: git checkout <branch>", "plugin", "git checkout main", "block"),
@@ -1326,15 +1336,15 @@ _COMMENT_GAP = "\n-- a long comment " + "x" * 80 + "\n"
 PROBES3 = [
     # F1: a `.migration/` path assigned to a shell variable, then written through it
     ("F1 var path redirect", 'P=.migration/allowed_targets.json; printf \'{}\' > "$P"', "approve"),
-    ("F1 var path braces redirect", 'P=.migration/06_decisions.md; echo x >> "${P}"', "approve"),
-    ("F1 export var path tee", 'export OUT=.migration/06_decisions.md && echo x | tee $OUT', "approve"),
-    ("F1 var dir + file", 'D=.migration; echo x > $D/06_decisions.md', "approve"),
+    ("F1 var path braces redirect", 'P=.migration/authorizations.json; echo x >> "${P}"', "approve"),
+    ("F1 export var path tee", 'export OUT=.migration/authorizations.json && echo x | tee $OUT', "approve"),
+    ("F1 var dir + file", 'D=.migration; echo x > $D/authorizations.json', "approve"),
     ("F1 var path rm", 'F=".migration/allowed_targets.json"; rm -f "$F"', "approve"),
     ("F1 var path sed -i", 'F=.migration/allowed_targets.json; sed -i "s/a/b/" "$F"', "approve"),
     ("F1 var path cp dest", 'T=.migration/allowed_targets.json; cp /tmp/x "$T"', "approve"),
     ("F1 chained var", 'D=.migration; F=$D/allowed_targets.json; echo x > $F', "approve"),
     ("F1 var abs ws path", 'W={ws}; echo x > $W/.migration/allowed_targets.json', "approve"),
-    ("F1 var path read (approve)", 'F=.migration/06_decisions.md; cat "$F"', "approve"),
+    ("F1 var path read (approve)", 'F=.migration/authorizations.json; cat "$F"', "approve"),
     ("F1 var path recon write (approve)", 'F=.migration/recon/u1/log; echo x > "$F"', "approve"),
     ("F1 var other path write (approve)", 'F=notes.md; echo x > "$F"', "approve"),
     ("F1 unresolved var redirect (approve: a redirect only creates/appends, cf. `> $OUT` in test_dbx_guard)", 'echo x > "$OUT"', "approve"),

@@ -1,35 +1,36 @@
 ## Placement
-Setup runs the doctor after committing the allowlist, tolerances, and hook probe. Plan reruns it
-with `--expect-catalogs` before each wave; the manifest copies identity, host, catalogs, guard mode,
-and stop mode, which `workflow.py` compares before launch. Children and the verifier use expected
-identity and host; a child blocks only on its security controls (`hook_guard_functional`,
+Intake runs the doctor after committing the allowlist, tolerances, and hook probe. The wave-plan
+worker reruns it with `--expect-catalogs` before each wave; the manifest copies identity, host,
+catalogs, and guard mode, which `workflow.py` compares before launch. Children and the verifier use
+expected identity and host; a child blocks only on its security controls (`hook_guard_functional`,
 `databricks_identity`) not being `ok` or a unit-mapping problem — every other `fail` is reported as
 an advisory `warn`. A child also blocks when a required security sub-result is missing or a unit
 mapping is unreadable, and on `source_principal_read_only=fail` (a writable source principal);
 `unverified` stays advisory in a child.
 
 ### `workspace`
-Sub-checks: `workspace` verifies every required `.migration` setup file from `1-migration_setup` and requires a `## Glossary` section in `00_context.md` or legacy `02_glossary.md`;
-`stop_mode` verifies `hard|soft` in `00_context.md` or `01_conventions.md`.
+Verifies every required `.migration` contract file exists: `allowed_targets.json` and
+`03_recon_tolerances.json`.
+### `authorizations_file`
+`ok` when `.migration/authorizations.json` is absent. When present it must be
+`{"version": 1, "authorizations": [...]}` where every entry has a slug `id`, `kind` in
+`{"legacy_write_authorized"}`, a non-empty `objects` list, and `by` matching `user:...` — anything
+else is `fail`. When the working copy differs from `git show HEAD:.migration/authorizations.json`
+the row is `warn`: authorizations change only by PR.
 ### `allowed_targets`
 Sub-checks: `allowed_targets` parses and passes `hooks/dbx_guard.py` (warn for `guard_mode: warn`
 or empty `legacy_sources`); `allowlist_matches_contract` compares normalized `--expect-catalogs`
 to `allowed_targets.json` and is skipped without that flag.
 ### `allowlist_committed`
 Verifies byte equality of `allowed_targets.json` and `03_recon_tolerances.json` with
-`git show HEAD:<path>`, naming modified, untracked, or missing files. Changes require a recorded
-decision and commit, never a working-copy edit.
-### `playbooks_installed`
-Verifies the repo playbooks the org library is synced from: every file `playbooks/index.json`
-lists exists, no playbook `*.md` is unlisted, and no macro appears twice. Every finding is a
-`warn` for every role — never a blocker. The doctor never compares the org library to the repo;
-`install-dbx-factory` syncs it and reports that.
+`git show HEAD:<path>`, naming modified, untracked, or missing files. Changes require a reviewed
+PR and commit, never a working-copy edit.
 ### `hook_guard`
 Sub-checks: `hooks_files` verifies `hooks.json` registers `hooks/dbx_guard.py` as `PreToolUse`;
 `hook_guard_functional` directly sends a probe and requires a block naming the full
 `__dbx_guard_probe__<nonce>`; `hook_platform_loaded` is `unverified` until the session blocks the
 pending nonce, or fails when the echo runs. One nonce per report serves the functional row and the
-probe command, which are in `data`. The platform row is orchestrator-only: the orchestrator's live
+probe command, which are in `data`. The platform row is the wave ticket worker's only: its live
 probe proves the platform once per wave and is signed into `wave-N.doctor.json`; a child never runs
 the live probe and inherits the signed sub-result through `--reuse-record` (a `warn` row when no
 record is reused). While the row is `unverified`, the run's last stdout line is
@@ -44,8 +45,8 @@ adapters' Databricks SQL, `pyodbc`, and `psycopg` drivers, warning when the
 ### `delete_evidence`
 Checks every resolved mapping: CDC is enabled, the capture is visible and captures every mapped
 source key column, and a bounded read-only `fn_cdc_get_all_changes_<capture>` probe works. Children
-name units; orchestrators cover every mapping; setup skips before mappings exist. The doctor never
-runs `sp_cdc_enable_*`; source-side changes are customer decisions.
+name units; the wave ticket's worker covers every mapping; setup skips before mappings exist. The
+doctor never runs `sp_cdc_enable_*`; source-side changes are customer decisions.
 ### `source_principal_read_only`
 Verifies the source principal cannot write mapped objects. SQL Server checks server roles
 `sysadmin/securityadmin/serveradmin/dbcreator/bulkadmin`, database roles
@@ -59,9 +60,9 @@ on every source procedure, and CDC. Postgres checks `rolsuper/rolcreaterole/rolc
 read through the session's own service principal (see target-routing: env-oidc or oauth-m2m, no
 PAT), then `grants get-effective` on each catalog/schema/table; ownership or anything beyond `SELECT`,
 `USE_CATALOG`, `USE_SCHEMA`, `BROWSE`, and `READ_VOLUME` fails, owner-less/malformed assignments
-are `unverified`. Unsupported/uninferred families are `unverified`; `--source-attested D-<id>`
-yields `ok` with `attested`/`decision` in `data` only for families without a query and a
-human-provenance decision line. Rows name
+are `unverified`. Unsupported/uninferred families are `unverified`; `--source-attested <id>`
+yields `ok` with `attested`/`decision` in `data` for families without a query — the plan decision
+is human-owned, so the doctor records it rather than verifying it. Rows name
 objects/privileges, never credentials; `readonly=True`/`default_transaction_read_only` are hints.
 ### `recon_family_supported`
 
@@ -77,16 +78,16 @@ The `--source-secret` principal can read the catalog views the recon structural 
 ### `named_secrets_exist`
 
 Reads the secret names a wave references: the manifest's `secrets` list and each batch's `secrets` list,
-plus `{{secrets/scope/key}}` and `dbutils.secrets.get(scope, key)` references in batch briefs. For each scope
+plus `{{secrets/scope/key}}` and `dbutils.secrets.get(scope, key)` references in batch tickets. For each scope
 it runs `databricks secrets list-secrets <scope> --output json` and compares names only — secret values are
-never read. `fail` when a referenced name is not in its scope's list (a STOP C blocker: create it before
-launch) or the scope cannot be listed; `fail` also on a name that is not `scope/key`. `skipped` when nothing
+never read. `fail` when a referenced name is not in its scope's list (create it before the wave
+launches) or the scope cannot be listed; `fail` also on a name that is not `scope/key`. `skipped` when nothing
 references a secret, and under `--no-databricks` like every CLI check.
 
 ### `databricks_identity`
 `databricks auth describe` must report the session's service-principal auth: `env-oidc` or
-`oauth-m2m` is `ok`, `pat` is a `warn` that attributes work to a human and bypasses the service
-principal (waivable in `06_decisions.md`), anything else `fail`; `current-user me` then classifies
+`oauth-m2m` is `ok`, `pat` is a `fail` that attributes work to a human and bypasses the service
+principal (a plan decision cannot waive it), anything else `fail`; `current-user me` then classifies
 the identity — a service principal on the manifest's host is `ok`, a human is a `warn` pointing at
 the org blueprint (see target-routing), a wrong identity or host is `fail`.
 ### `type_map_audit`

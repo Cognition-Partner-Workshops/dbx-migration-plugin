@@ -43,11 +43,11 @@ def _rerun_line(result: dict) -> str | None:
 
 def _authority_line(result: dict) -> str:
     """The harness is the only authority this file writes. A merge past merge_eligible=false needs a
-    human_override the workflow checks against a merge_override row of .migration/06_decisions.md."""
+    human_override the workflow checks against a merge_overrides entry of the committed wave manifest."""
     authority = result.get("merge_authority") or {"kind": "harness", "decision_id": None}
     return (f"- Merge authority: `{authority['kind']}`"
             + (f" ({authority['decision_id']})" if authority.get("decision_id") else "")
-            + " (human_override needs a merge_override row in .migration/06_decisions.md naming the unit)")
+            + " (human_override needs a merge_overrides entry in the committed wave manifest naming the unit)")
 
 
 def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: str,

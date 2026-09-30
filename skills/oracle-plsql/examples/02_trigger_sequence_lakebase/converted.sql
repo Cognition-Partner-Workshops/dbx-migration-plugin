@@ -1,4 +1,4 @@
--- Lakebase / PostgreSQL 17 (OLTP track, !dbx_migrate_oltp). Cites: [lakebase:SKILL.md], [pg17:sql-createsequence],
+-- Lakebase / PostgreSQL 17 (OLTP track). Cites: [lakebase:SKILL.md], [pg17:sql-createsequence],
 -- [pg17:sql-createtrigger], [pg17:plpgsql-trigger], [pg17:sql-createprocedure], [pg17:plpgsql-transactions].
 -- Analytical (Delta) track has no triggers: the same logic is folded into each writer (example 01).
 
@@ -7,7 +7,7 @@ CREATE SEQUENCE poladm.audit_seq  START WITH 1       INCREMENT BY 1 CACHE 1000 N
 -- Cutover: ALTER SEQUENCE ... RESTART WITH <DBA_SEQUENCES.LAST_NUMBER + CACHE>; never lower.
 
 -- PRAGMA AUTONOMOUS_TRANSACTION has no Postgres equivalent: the logger runs inside the caller's transaction, so
--- a caller ROLLBACK also drops the audit row (record in 06_decisions.md). No COMMIT: transaction control is only
+-- a caller ROLLBACK also drops the audit row (recorded in the plan's decisions). No COMMIT: transaction control is only
 -- legal in a top-level CALL chain and would commit the caller's work.
 CREATE OR REPLACE PROCEDURE poladm.prc_log_event(
   p_policy_id   bigint,

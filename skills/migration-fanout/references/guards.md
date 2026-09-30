@@ -1,7 +1,7 @@
 # Migration fan-out guards
 
 These notes expand the one-line guard summary in the skill. The workflow remains the
-only writer of wave results and workflow ledger records.
+only writer of the wave result and the run log.
 
 ## Manifest check
 
@@ -13,15 +13,11 @@ briefs, targets, gates, width, branch, and capabilities are checked before child
 The doctor record is bound to the exact manifest bytes and identity/host, has a recent
 signature, records the hook probe, and must be ready with capabilities matching the plan.
 
-## STOP C gates_sha approval
+## Plan step + run log
 
-The named ledger row must identify this wave and exact gates hash; a changed declaration
-or an approval under an incompatible stop mode halts the launch.
-
-## One approval one run
-
-An exclusive lock protects the append-only runs log. A STOP C identifier already present
-in that log cannot authorize another execution.
+The manifest names the plan step id of the wave's "Run wave N" ticket. An exclusive lock
+protects the append-only run log; each run records `{plan_step, manifest_sha, started}`
+and a manifest whose sha is already present cannot launch again.
 
 ## Duplicate wave
 
@@ -61,30 +57,31 @@ Child prompts and runtime calls carry the manifest's batch or wave time budget.
 Repeated failures of the same class trip the breaker and prevent remaining batches from
 launching; the result identifies the triggering batch.
 
-## Single ledger writer
+## Single result writer
 
-Children may write only their declared migration evidence. Result, brief, run log, and
-workflow-owned ledger artifacts are written by the parent workflow.
+Children may write only their declared migration evidence. Result and run log are
+written by the parent workflow; the result's `brief` lines go on the ticket.
 
 ## Child report
 
 Each child report is schema-validated, must identify status and recon evidence, and must
 list changed paths and write targets for later gates.
 
-## Ledger gate
+## Protected files gate
 
-Git-observed changes to protected migration files are reclassified as ledger tampering,
-even when a child claims a clean or harmless diff.
+Git-observed changes to protected `.migration/` files are reclassified as
+`protected_files_tampered`, even when a child claims a clean or harmless diff.
 
 ## Merge authority
 
-PASS requires merge-eligible harness evidence for every unit, unless a valid human
-override row names exactly the affected units.
+PASS requires merge-eligible harness evidence for every unit, unless a
+`merge_overrides` entry in the committed manifest covers exactly the batch's units and
+the child reports that entry's decision id.
 
 ## Acceptance gates
 
-Every declared gate needs a valid passed outcome with evidence, or a ledger waiver
-whose decision row names the gate and units.
+Every declared gate needs a valid passed outcome with evidence. A waived gate carries
+the plan decision id in the committed manifest; there is no runtime waiver.
 
 ## Resync
 
@@ -93,8 +90,8 @@ unexpected, or non-empty-change resync holds affected batches from merge.
 
 ## Independent verify
 
-The verifier reruns reconciliation from the launch base and protected ledgers, not from
-an untrusted child checkout, and supplies the verdict used for close.
+The verifier reruns reconciliation from the launch base and the protected contract
+files, not from an untrusted child checkout, and supplies the verdict used for close.
 
 ## Verifier verdicts
 
