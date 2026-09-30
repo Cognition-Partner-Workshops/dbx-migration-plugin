@@ -1,6 +1,6 @@
 ---
 name: tsql-ssis
-description: Source-dialect skill for SQL Server T-SQL estates (with Sybase ASE deltas) and SSIS packages. Load it when converting T-SQL procedures, views, triggers, SQL Agent jobs, isql runners or .dtsx packages to Databricks SQL, Lakeflow Jobs and Lakeflow Spark Declarative Pipelines, or reconciling a T-SQL-sourced unit (analytical track and the Lakebase OLTP front door).
+description: Source-dialect skill for SQL Server T-SQL estates (with Sybase ASE deltas) and SSIS packages. Load it when converting T-SQL procedures, views, triggers, SQL Agent jobs, isql runners or .dtsx packages to Databricks SQL, Lakeflow Jobs and Lakeflow Spark Declarative Pipelines, or reconciling a T-SQL-sourced unit (analytical track and the Lakebase OLTP track).
 ---
 
 # T-SQL + SSIS Dialect (v1)

@@ -46,7 +46,7 @@ databricks labs lakebridge transpile --input-source <unit dir> --output-folder <
 | `snowflake` | — | DBSQL | SparkSQL | none yet |
 | `synapse` | DBSQL | DBSQL | SparkSQL | none yet |
 | `netezza` | DBSQL | — | SparkSQL | none yet |
-| `postgresql`, `mysql` | — | — | SparkSQL | OLTP front door sources; Switch only |
+| `postgresql`, `mysql` | — | — | SparkSQL | OLTP-track sources; Switch only |
 | `ssis` | SparkSQL (experimental) | — | SDP | `tsql-ssis` |
 | `datastage` | SparkSQL, PySpark | — | SDP | none yet |
 | Informatica | not listed as a transpile source | | | `informatica-xml` (hand conversion; analyzer may still inventory the XML export, confirm `--source-tech`) |
