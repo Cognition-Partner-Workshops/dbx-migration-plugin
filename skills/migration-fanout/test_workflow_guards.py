@@ -17,7 +17,7 @@ import pytest
 
 
 WORKFLOW = Path(__file__).with_name("workflow.py")
-MODULES = [WORKFLOW, *(WORKFLOW.with_name(n) for n in ("ledger.py", "manifest.py", "report.py"))]
+MODULES = [WORKFLOW, *(WORKFLOW.with_name(n) for n in ("decisions.py", "manifest.py", "report.py"))]
 
 
 def _tree():
@@ -33,25 +33,27 @@ def _functions():
     tree = _tree()
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
-                    and node.name in {"validate_manifest", "validate_verify", "ledger_violations", "declared_gates_sha",
-                                      "validate_gates", "gates_approved", "check_write_targets", "other_wave_manifests",
+                    and node.name in {"validate_manifest", "validate_verify", "protected_files_violations",
+                                      "validate_gates", "check_write_targets", "other_wave_manifests",
                                       "unit_mapping", "bounded_readers", "target_key", "valid_namespace", "reads_target", "bounded_predicate",
                                       "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
                                       "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices", "check_wave_tag",
                                       "check_pipelines_published", "_is_manifest", "validate_close", "check_pipeline_updates",
-                                      "batch_verdicts", "structured_decision", "human_decision", "override_decision", "ledger_rows",
-                                      "check_repo_origin", "check_ledger"})
+                                      "batch_verdicts", "merge_override_for", "skill_text", "check_repo_origin",
+                                      "check_doctor_contract", "scope_covers", "override_forgives", "skill_file"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "STOP_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
+                    isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
-                                                         "DECISION_ID", "HUMAN_PROVENANCE", "DEFAULT_ACCEPTED", "_SEGMENT",
+                                                         "DECISION_ID", "SKILL_NAME", "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE",
-                                                         "REPO_RE", "BARE_PATH", "LEDGER_METADATA"}
+                                                         "REPO_RE", "BARE_PATH"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
-                 "DECISIONS_PATH": Path("/nonexistent/.migration/06_decisions.md"),
-                 "subprocess": subprocess, "sys": sys, "urllib": urllib}
+                 "subprocess": subprocess, "sys": sys, "urllib": urllib, "PLUGIN": WORKFLOW.parents[2],
+                 "MANIFEST": {"merge_overrides": []}}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
+    validate = namespace["validate_manifest"]
+    namespace["validate_manifest"] = lambda m, plugin=WORKFLOW.parents[2]: validate(m, plugin)
     return namespace
 
 
@@ -60,28 +62,23 @@ def _batch_runtime():
     selected = [node for node in tree.body
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name in {"run_batch", "_run_batch"})
-                or (isinstance(node, ast.FunctionDef) and node.name in {"ledger_violations", "prompt_sha", "override_decision", "ledger_rows",
-                                                                         "gate_outcomes", "ledger_waiver", "rows_after", "batch_max_minutes",
-                                                                         "structured_decision", "human_decision", "ledger_override",
-                                                                         "override_scope", "scope_covers", "override_forgives",
-                                                                         "evidence_path"})
+                or (isinstance(node, ast.FunctionDef) and node.name in {"protected_files_violations", "prompt_sha",
+                                                                         "merge_override_for", "gate_outcomes", "batch_max_minutes",
+                                                                         "scope_covers", "override_forgives", "evidence_path", "skill_file"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "HUMAN_PROVENANCE", "LEDGER_METADATA",
-                                                         "DEFAULT_ACCEPTED", "_SEGMENT", "PREDICATE_TOKEN", "PREDICATE_WORDS",
-                                                         "BARE_PATH", "EVIDENCE_META", "UNSCOPED_OVERRIDE"}
+                    isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "SKILL_NAME", "_SEGMENT",
+                                                         "PREDICATE_TOKEN", "PREDICATE_WORDS", "BARE_PATH", "EVIDENCE_META",
+                                                         "UNSCOPED_OVERRIDE"}
                     for t in node.targets))]
     namespace = {
         "asyncio": asyncio,
         "json": json,
-        "unit_eligibility": lambda head, units: {u: True for u in units},
-        "unit_blocker_classes": lambda head, units: {u: ["rerun_policy"] for u in units},
-        "record_run": lambda **fields: None,
+        "unit_recon": lambda head, units: {u: (True, ["rerun_policy"]) for u in units},
         "evidence_in_pr": lambda head, path, units: bool(head) and any(path.startswith(f".migration/recon/{u}/") for u in units),
         "Counter": Counter,
         "hashlib": hashlib,
         "re": re,
-        "decision_ledger": lambda: "",
-        "MANIFEST": {"stop_c": "D-2"},
+        "MANIFEST": {"merge_overrides": [{"decision": "mo-u", "units": ["u"]}]},
         "MAX_MINUTES": 45,
         "CHILD_SCHEMA": {},
         "REPO": ".",
@@ -116,8 +113,9 @@ def test_validate_verify_contradiction():
 @pytest.mark.parametrize("value", [0, True, "3"])
 def test_validate_manifest_rejects_invalid_positive_integer(value):
     validate_manifest = _functions()["validate_manifest"]
-    manifest = {"wave": 1, "repo": "github.com/acme/target", "child_macro": "child",
-                "verify_macro": "verify", "batches": [{"id": "b", "units": ["u"],
+    manifest = {"wave": 1, "repo": "github.com/acme/target", "child_skill": "unit-migration",
+                "verify_skill": "wave-verify", "plan_step": "run-wave-1",
+                "batches": [{"id": "b", "units": ["u"],
                 "write_targets": ["t"], "brief": "brief"}], "width": value,
                 "base_branch": "migration/loan-servicing"}
     with pytest.raises(SystemExit, match="width"):
@@ -200,7 +198,7 @@ def test_validate_manifest_accepts_list_of_string_secrets():
     _functions()["validate_manifest"](m)
 
 
-CAPS = {"identity": "sp-1", "catalogs": ["mig"], "ready": True, "guard_mode": "block", "stop_mode": "soft"}
+CAPS = {"identity": "sp-1", "catalogs": ["mig"], "ready": True, "guard_mode": "block"}
 HOST = "https://adb-1.azuredatabricks.net"
 
 
@@ -212,19 +210,18 @@ GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": "
 
 
 def _gated(batches):
-    """Every manifest declares its gates at STOP C; tests about other fields get one pending gate each."""
+    """Every manifest declares its gates in the plan; tests about other fields get one pending gate each."""
     return [{**b, "gates": b.get("gates", [dict(GATE)])} for b in batches]
 
 
 def _manifest(**extra):
-    m = {"wave": 1, "repo": "github.com/acme/target", "child_macro": "child", "verify_macro": "verify",
+    m = {"wave": 1, "repo": "github.com/acme/target", "child_skill": "unit-migration", "verify_skill": "wave-verify",
+         "plan_step": "run-wave-1",
          "capabilities": _caps(host=HOST),
          "base_branch": "migration/loan-servicing",
          "batches": [{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "brief"}]}
     m.update(extra)
     m["batches"] = _gated(m["batches"])
-    m.setdefault("stop_c", "D-2")
-    m.setdefault("gates_sha", _functions()["declared_gates_sha"](m["wave"], m["batches"], m.get("degraded") is True))
     return m
 
 
@@ -303,26 +300,26 @@ def test_preflight_halts_until_every_declared_sibling_pipeline_has_published_a_m
     branch yet is invisible to it; the manifest names the pipelines the plan split, and launch waits until each
     has a manifest on origin and the disk matches origin."""
     check = _functions()["check_pipelines_published"]
-    pipelines = {"orders": 1, "payments": 1, "ledger": 1}
+    pipelines = {"orders": 1, "payments": 1, "wire": 1}
     orders = json.dumps({"batches": [B1], "pipelines": pipelines})
     (tmp_path / "wave-orders-1.json").write_text(orders)
     manifest = {"pipelines": pipelines}
     published = {"wave-orders-1.json": orders}
-    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json, wave-payments-1\.json.*integration branch"):
+    with pytest.raises(SystemExit, match=r"wave-payments-1\.json, wave-wire-1\.json.*integration branch"):
         check(tmp_path, manifest, published)
     payments = json.dumps({"batches": [B2], "pipelines": pipelines})
     (tmp_path / "wave-payments-1.json").write_text(payments)
     published["wave-payments-1.json"] = payments
-    published["wave-ledger-2.json"] = json.dumps({"batches": [], "pipelines": pipelines})   # past the count
-    with pytest.raises(SystemExit, match=r"wave-ledger-1\.json"):
+    published["wave-wire-2.json"] = json.dumps({"batches": [], "pipelines": pipelines})   # past the count
+    with pytest.raises(SystemExit, match=r"wave-wire-1\.json"):
         check(tmp_path, manifest, published)
-    published["wave-ledger-1.json"] = json.dumps({"batches": [], "pipelines": pipelines})
-    (tmp_path / "wave-ledger-1.json").write_text(published["wave-ledger-1.json"])
-    with pytest.raises(SystemExit, match=r"wave-ledger-2\.json.*plans disagree"):
+    published["wave-wire-1.json"] = json.dumps({"batches": [], "pipelines": pipelines})
+    (tmp_path / "wave-wire-1.json").write_text(published["wave-wire-1.json"])
+    with pytest.raises(SystemExit, match=r"wave-wire-2\.json.*plans disagree"):
         check(tmp_path, manifest, published)
-    del published["wave-ledger-2.json"]
+    del published["wave-wire-2.json"]
     published["wave-payments-1.json"] = json.dumps(
-        {"batches": [B2], "pipelines": {"orders": 1, "payments": 1, "ledger": 2}})
+        {"batches": [B2], "pipelines": {"orders": 1, "payments": 1, "wire": 2}})
     with pytest.raises(SystemExit, match="plans disagree"):
         check(tmp_path, manifest, published)
     for junk in ("[]", "not json"):
@@ -386,7 +383,7 @@ def test_check_wave_tag_requires_a_tagged_manifest_to_list_its_pipelines():
     with pytest.raises(SystemExit, match=r"wave-<pipeline>-<N>\.json.*pipelines"):
         check("orders-1", {"wave": 1})
     with pytest.raises(SystemExit, match="orders"):
-        check("orders-1", {"wave": 1, "pipelines": {"payments": 1, "ledger": 1}})
+        check("orders-1", {"wave": 1, "pipelines": {"payments": 1, "wire": 1}})
     with pytest.raises(SystemExit, match="orders"):
         check("orders-3", {"wave": 3, "pipelines": {"orders": 2}})
 
@@ -728,7 +725,7 @@ def test_other_wave_manifests_reads_every_wave_but_the_current_and_fails_closed(
     (tmp_path / "wave-1.json").write_text(json.dumps({"target_namespace": "cat.mig", "batches": [B2]}))
     (tmp_path / "wave-1.result.json").write_text("{")
     (tmp_path / "wave-1.doctor.json").write_text("{")
-    (tmp_path / "wave-2.brief.md").write_text("x")
+    (tmp_path / "wave-2.runs.jsonl").write_text("{}")
     assert read(tmp_path, "wave-0.json") == {"wave-1.json": {"target_namespace": "cat.mig", "batches": [B2]}}
     assert read(tmp_path, "wave-1.json") == {"wave-0.json": {"target_namespace": "", "batches": [B1]}}
     (tmp_path / "wave-1.json").write_text(json.dumps({"target_namespace": "cat.", "batches": [B2]}))
@@ -772,10 +769,10 @@ def _routine(name, reads=(), writes=(), calls=()):
     return {"routine": name, "reads": list(reads), "writes": list(writes), "calls": list(calls)}
 
 
-CLOSE = _routine("app.close_period", reads=["src.ledger"], writes=["mig.ledger"], calls=["app.log_run"])
+CLOSE = _routine("app.close_period", reads=["src.lg"], writes=["mig.lg"], calls=["app.log_run"])
 LOG = _routine("app.log_run", writes=["mig.run_log"])
 LOOP = _routine("app.retry", calls=["app.close_period"])
-TARGETS = ["mig.ledger", "mig.run_log", "mig.close_period"]
+TARGETS = ["mig.lg", "mig.run_log", "mig.close_period"]
 DEPLOYS = {"deploy_objects": ["mig.close_period"]}
 
 
@@ -785,7 +782,7 @@ def _deps(**by_unit):
 
 def test_transitive_writes_follows_calls_and_tolerates_cycles():
     writes = _functions()["transitive_writes"]
-    assert writes([CLOSE, LOG, LOOP]) == {"mig.ledger", "mig.run_log"}
+    assert writes([CLOSE, LOG, LOOP]) == {"mig.lg", "mig.run_log"}
     assert writes([LOG]) == {"mig.run_log"}
     assert writes([_routine("app.read_only", reads=["src.x"])]) == set()
 
@@ -803,7 +800,7 @@ def test_transitive_writes_halts_on_a_callee_the_analysis_does_not_cover():
 
 def test_check_dependencies_passes_when_declared_targets_equal_transitive_writes():
     check = _functions()["check_dependencies"]
-    b = {"id": "b", "units": ["u"], "write_targets": ["MIG.ledger", "mig.run_log", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    b = {"id": "b", "units": ["u"], "write_targets": ["MIG.lg", "mig.run_log", "mig.close_period"], **DEPLOYS, "brief": "b"}
     check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
     retry = {**b, "units": ["u", "v"], "write_targets": b["write_targets"] + ["mig.retry"],
              "deploy_objects": ["mig.close_period", "mig.retry"]}
@@ -823,12 +820,12 @@ def test_every_root_of_the_call_graph_is_a_declared_deploy_object():
     check([{**b, "write_targets": TARGETS + ["mig.log_run"], "deploy_objects": ["mig.close_period", "mig.log_run"]}],
           _deps(u=[CLOSE, LOG]), namespace="mig")
     with pytest.raises(SystemExit, match=r"b-8.*app\.close_period.*deploy_objects"):
-        check([{**b, "write_targets": ["mig.ledger", "mig.run_log", "mig.other"], "deploy_objects": ["mig.other"]}],
+        check([{**b, "write_targets": ["mig.lg", "mig.run_log", "mig.other"], "deploy_objects": ["mig.other"]}],
               _deps(u=[CLOSE, LOG]), namespace="mig")
     with pytest.raises(SystemExit, match=r"b-8.*app\.retry.*deploy_objects"):
         check([{**b, "units": ["u", "v"]}], _deps(u=[CLOSE, LOG], v=[LOOP]), namespace="mig")
     with pytest.raises(SystemExit, match=r"b-8.*app\.close_period.*deploy_objects"):
-        check([{**b, "write_targets": ["mig.ledger", "mig.run_log"], "deploy_objects": []}], _deps(u=[CLOSE, LOG]), namespace="mig")
+        check([{**b, "write_targets": ["mig.lg", "mig.run_log"], "deploy_objects": []}], _deps(u=[CLOSE, LOG]), namespace="mig")
     with pytest.raises(SystemExit, match=r"b-8.*app\.read_only.*deploy_objects"):
         check([{**b, "write_targets": [], "deploy_objects": []}], _deps(u=[READ_ONLY]), namespace="mig")
 
@@ -915,14 +912,14 @@ def test_check_dependencies_skips_a_batch_with_no_analysis_at_all():
 
 def test_check_dependencies_names_missing_and_extra_tables():
     check = _functions()["check_dependencies"]
-    b = {"id": "b-7", "units": ["u"], "write_targets": ["mig.ledger", "mig.stale", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    b = {"id": "b-7", "units": ["u"], "write_targets": ["mig.lg", "mig.stale", "mig.close_period"], **DEPLOYS, "brief": "b"}
     with pytest.raises(SystemExit) as e:
         check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
     msg = str(e.value)
     assert "b-7" in msg
     assert re.search(r"missing.*mig\.run_log", msg)
     assert re.search(r"extra.*mig\.stale", msg)
-    assert "mig.ledger" not in msg.split("missing", 1)[1].split("extra", 1)[0]
+    assert "mig.lg" not in msg.split("missing", 1)[1].split("extra", 1)[0]
 
 
 def test_check_dependencies_halts_when_the_analysis_writes_nothing_the_batch_declared():
@@ -959,7 +956,7 @@ def test_check_dependencies_with_an_unanalysed_unit_checks_only_missing_tables()
     b = {"id": "b-4", "units": ["u", "v"], "write_targets": TARGETS + ["mig.v_only"], **DEPLOYS, "brief": "b"}
     check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
     with pytest.raises(SystemExit, match=r"b-4.*missing.*mig\.run_log") as e:
-        check([{**b, "write_targets": ["mig.ledger", "mig.close_period", "mig.v_only"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+        check([{**b, "write_targets": ["mig.lg", "mig.close_period", "mig.v_only"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
     assert "mig.v_only" not in str(e.value)
     with pytest.raises(SystemExit, match=r"b-4.*extra.*mig\.v_only"):
         check([{**b, "deploy_objects": ["mig.close_period", "mig.read_only"], "write_targets": b["write_targets"] + ["mig.read_only"]}],
@@ -968,7 +965,7 @@ def test_check_dependencies_with_an_unanalysed_unit_checks_only_missing_tables()
 
 def test_check_dependencies_compares_targets_as_one_case_insensitive_identity():
     check = _functions()["check_dependencies"]
-    b = {"id": "b", "units": ["u"], "write_targets": ["`MIG`.`Ledger`", " mig.RUN_LOG ", "mig.close_period"], **DEPLOYS, "brief": "b"}
+    b = {"id": "b", "units": ["u"], "write_targets": ["`MIG`.`Lg`", " mig.RUN_LOG ", "mig.close_period"], **DEPLOYS, "brief": "b"}
     check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
     assert _functions()["transitive_writes"]([_routine("a", writes=['"MIG"."T"', "mig.t"])]) == {"mig.t"}
 
@@ -981,7 +978,7 @@ def _maps(**by_unit):
     return lambda unit: by_unit.get(unit)
 
 
-SRC_CLOSE = _routine("app.close_period", reads=["app.period"], writes=["APP.LEDGER"], calls=["app.log_run"])
+SRC_CLOSE = _routine("app.close_period", reads=["app.period"], writes=["APP.LG"], calls=["app.log_run"])
 SRC_LOG = _routine("app.log_run", writes=["app.run_log"])
 
 
@@ -990,31 +987,31 @@ def test_check_dependencies_resolves_source_writes_through_the_units_mapping_spe
     A written source table is the target its mapping object (root_table -> object) gives it, and the
     manifest's bare names are the manifest's target_namespace, so a renamed target compares as itself."""
     check = _functions()["check_dependencies"]
-    spec = _spec(("app.ledger", "finance.ledger"), ("APP.RUN_LOG", "run_log"))
-    b = {"id": "b", "units": ["u"], "write_targets": ["mig.finance.ledger", "MIG.app.run_log", "close_period"],
+    spec = _spec(("app.lg", "finance.lg"), ("APP.RUN_LOG", "run_log"))
+    b = {"id": "b", "units": ["u"], "write_targets": ["mig.finance.lg", "MIG.app.run_log", "close_period"],
          "deploy_objects": ["close_period"], "brief": "b"}
     check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=spec), "mig.app")
-    with pytest.raises(SystemExit, match=r"b.*missing.*mig\.finance\.ledger.*extra.*mig\.app\.ledger"):
-        check([{**b, "write_targets": ["app.ledger", "run_log", "close_period"]}], _deps(u=[SRC_CLOSE, SRC_LOG]),
+    with pytest.raises(SystemExit, match=r"b.*missing.*mig\.finance\.lg.*extra.*mig\.app\.lg"):
+        check([{**b, "write_targets": ["app.lg", "run_log", "close_period"]}], _deps(u=[SRC_CLOSE, SRC_LOG]),
               _maps(u=spec), "mig.app")
 
 
 def test_check_dependencies_resolves_a_callees_writes_through_the_callees_own_unit():
     check = _functions()["check_dependencies"]
-    b = {"id": "b", "units": ["u", "v"], "write_targets": ["mig.app.ledger", "mig.audit.run_log", "close_period"],
+    b = {"id": "b", "units": ["u", "v"], "write_targets": ["mig.app.lg", "mig.audit.run_log", "close_period"],
          "deploy_objects": ["close_period"], "brief": "b"}
     check([b], _deps(u=[SRC_CLOSE], v=[SRC_LOG]),
-          _maps(u=_spec(("app.ledger", "ledger")), v=_spec(("app.run_log", "audit.run_log"))), "mig.app")
+          _maps(u=_spec(("app.lg", "lg")), v=_spec(("app.run_log", "audit.run_log"))), "mig.app")
     with pytest.raises(SystemExit, match=r"missing.*mig\.app\.run_log"):
         check([b], _deps(u=[SRC_CLOSE], v=[SRC_LOG]),
-              _maps(u=_spec(("app.ledger", "ledger")), v=_spec(("app.run_log", "run_log"))), "mig.app")
+              _maps(u=_spec(("app.lg", "lg")), v=_spec(("app.run_log", "run_log"))), "mig.app")
 
 
 def test_check_dependencies_halts_when_a_mapped_unit_writes_a_source_table_its_mapping_does_not_name():
     check = _functions()["check_dependencies"]
     b = {"id": "b-2", "units": ["u"], "write_targets": TARGETS, **DEPLOYS, "brief": "b"}
     with pytest.raises(SystemExit, match=r"b-2.*u.*app\.run_log.*mapping_spec"):
-        check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=_spec(("app.ledger", "ledger"))), "mig")
+        check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(u=_spec(("app.lg", "lg"))), "mig")
 
 
 def test_mapped_target_reads_the_legacy_tables_mapping_like_the_harness():
@@ -1049,7 +1046,7 @@ def test_a_source_table_split_over_several_mapping_objects_writes_every_one_of_t
 
 def test_check_dependencies_without_a_mapping_spec_keeps_the_source_name():
     check = _functions()["check_dependencies"]
-    b = {"id": "b", "units": ["u"], "write_targets": ["app.ledger", "app.run_log", "close_period"],
+    b = {"id": "b", "units": ["u"], "write_targets": ["app.lg", "app.run_log", "close_period"],
          "deploy_objects": ["close_period"], "brief": "b"}
     check([b], _deps(u=[SRC_CLOSE, SRC_LOG]), _maps(), "mig")
 
@@ -1059,13 +1056,13 @@ def test_deploy_objects_are_declared_targets_outside_the_table_comparison():
     routine's DML writes it; the batch lists it in deploy_objects so the graph comparison leaves it alone.
     A deploy object that is also a written table halts (one outside write_targets fails the manifest check)."""
     check = _functions()["check_dependencies"]
-    b = {"id": "b-5", "units": ["u"], "write_targets": ["mig.ledger", "mig.run_log", "MIG.close_period"],
+    b = {"id": "b-5", "units": ["u"], "write_targets": ["mig.lg", "mig.run_log", "MIG.close_period"],
          "deploy_objects": ["mig.close_period"], "brief": "b"}
     check([b], _deps(u=[CLOSE, LOG]), namespace="mig")
     with pytest.raises(SystemExit, match=r"b-5.*extra.*mig\.close_period"):
         check([{**b, "deploy_objects": []}], _deps(u=[CLOSE, LOG]), namespace="mig")
-    with pytest.raises(SystemExit, match=r"b-5.*deploy_objects.*mig\.ledger.*writes"):
-        check([{**b, "deploy_objects": ["mig.close_period", "mig.ledger"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
+    with pytest.raises(SystemExit, match=r"b-5.*deploy_objects.*mig\.lg.*writes"):
+        check([{**b, "deploy_objects": ["mig.close_period", "mig.lg"]}], _deps(u=[CLOSE, LOG]), namespace="mig")
 
 
 @pytest.mark.parametrize("value", ["x", [1], [""], ["mig.p", "MIG.P"]])
@@ -1089,7 +1086,7 @@ def test_manifest_deploy_objects_outside_write_targets_halt():
 def test_check_dependencies_halts_on_an_uncovered_callee_naming_the_unit():
     check = _functions()["check_dependencies"]
     with pytest.raises(SystemExit, match=r"u.*app\.close_period.*app\.log_run"):
-        check([{"id": "b", "units": ["u"], "write_targets": ["mig.ledger"], "brief": "b"}], _deps(u=[CLOSE]))
+        check([{"id": "b", "units": ["u"], "write_targets": ["mig.lg"], "brief": "b"}], _deps(u=[CLOSE]))
 
 
 @pytest.mark.parametrize("body", ["{", "[]", "{}", '{"routines": {}}', '{"routines": ["x"]}',
@@ -1161,8 +1158,8 @@ def test_example_fixture_is_a_valid_analysis_whose_writes_the_check_accepts(tmp_
     ([{**GATE, "evidence": None}], "evidence"),
     ([{**GATE, "status": "passed", "evidence": ""}], "evidence"),
     ([{**GATE, "status": "waived"}], "decision_id"),
-    ([{**GATE, "status": "waived", "decision_id": "7"}], "decision_id"),
-    ([{**GATE, "decision_id": "seven"}], "decision_id"),
+    ([{**GATE, "status": "waived", "decision_id": "D-7"}], "decision_id"),
+    ([{**GATE, "decision_id": "not a slug!"}], "decision_id"),
 ])
 def test_validate_manifest_rejects_missing_or_malformed_gates(gates, message):
     validate_manifest = _functions()["validate_manifest"]
@@ -1181,123 +1178,8 @@ def test_validate_manifest_accepts_every_gate_kind_and_status():
     gates = [{"id": f"g-{k}", "kind": k, "status": "pending", "evidence": ""} for k in kinds]
     gates += [{"id": "g-p", "kind": "custom", "status": "passed", "evidence": "recon/u/result.json"},
               {"id": "g-f", "kind": "custom", "status": "failed", "evidence": ""},
-              {"id": "g-w", "kind": "custom", "status": "waived", "evidence": "", "decision_id": "D-12"}]
+              {"id": "g-w", "kind": "custom", "status": "waived", "evidence": "", "decision_id": "waive-g-w"}]
     validate_manifest(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "x", "gates": gates}]))
-
-
-def test_gates_sha_is_approved_only_by_the_named_human_stop_c_row_for_this_wave():
-    """The approval is one parsed table row: the manifest names its D-<n>; that row has a cell that is the
-    decision id, a cell that is a human's provenance, and a cell reading exactly `STOP C wave-<N> gates_sha <sha>`
-    for this wave. Tokens scattered through prose, another wave's row, or another D-<n> do not approve."""
-    gates_approved = _functions()["gates_approved"]
-    sha = "a" * 64
-    row = f"| D-3 | 2024-05-01 | user:evt-9 | STOP C wave-2 gates_sha {sha} | plan v3 approved |\n"
-    assert gates_approved("D-3", 2, sha, "| D-1 | user:evt-1 | STOP A |\n" + row)
-    assert gates_approved("D-3", 2, sha, f"|D-3|user:evt-9|  stop c   wave-2   GATES_SHA {sha}  |\n")
-    assert gates_approved("D-3", 2, sha, f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha} |\n".rstrip("|\n") + "\n")
-    for ledger in ("",
-                   f"| D-3 | default-accepted (soft, 60s) | STOP C wave-2 gates_sha {sha} |\n",  # not a human's row
-                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {'b' * 64} |\n",               # another gate list
-                   f"| D-3 | user:evt-9 | STOP C wave-2 {sha} |\n",                              # the value without its name
-                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha}0 |\n",                   # not the exact value
-                   f"| user:evt-9 | STOP C wave-2 gates_sha {sha} |\n",                          # no decision id
-                   f"| D-4 | user:evt-9 | STOP C wave-2 gates_sha {sha} |\n",                    # not the row the manifest names
-                   f"| D-3 | user: | STOP C wave-2 gates_sha {sha} |\n",                         # user: without an id
-                   f"| D-3 | user:evt-9 | wave-2 gates_sha {sha} |\n",                           # not a STOP C row
-                   f"| D-3 | user:evt-9 | STOP CD wave-2 gates_sha {sha} |\n",
-                   f"| D-3 | user:evt-9 | STOP C gates_sha {sha} |\n",                           # no wave
-                   f"| D-3 | user:evt-9 | STOP C wave-3 gates_sha {sha} |\n",                    # another wave's approval
-                   f"| D-3 | user:evt-9 | STOP C wave-2 gates_sha {sha} approved |\n",           # prose in the approval cell
-                   f"| D-3 | user:evt-9 STOP C wave-2 gates_sha {sha} |\n",                      # provenance and approval in one cell
-                   f"D-3 user:evt-9 STOP C wave-2 gates_sha {sha}\n",                            # not a table row
-                   f"| D-3 | STOP C wave-2 gates_sha {sha} |\n| user:evt-9 |\n",                 # cells on two rows
-                   f"| D-3 | see D-3 | STOP C wave-2 gates_sha {sha} |\n",                       # no provenance cell
-                   f"| D-3 | D-3 user:evt-9 | STOP C wave-2 gates_sha {sha} |\n"):                # provenance cell is not just the provenance
-        assert not gates_approved("D-3", 2, sha, ledger), ledger
-    assert not gates_approved(None, 2, sha, row)
-    assert not gates_approved("D3", 2, sha, row)
-    assert not gates_approved("D-3", "2", sha, row)
-    assert not gates_approved("D-3", 2, None, row)
-    assert not gates_approved("D-3", 2, sha[:-1], row.replace(sha, sha[:-1]))
-
-
-def test_a_default_accepted_stop_c_row_approves_the_gates_only_under_soft_stop_mode():
-    """STOP C is resolved per stop_mode: soft lets the orchestrator's default-accepted row stand, hard needs
-    a human's. The cell is still just the provenance, in the row the manifest names, for this wave."""
-    gates_approved = _functions()["gates_approved"]
-    sha = "a" * 64
-    soft = f"| D-3 | 2024-05-01 | default-accepted (soft, 60s) | STOP C wave-2 gates_sha {sha} |\n"
-    human = soft.replace("default-accepted (soft, 60s)", "user:evt-9")
-    assert gates_approved("D-3", 2, sha, soft, stop_mode="soft")
-    assert gates_approved("D-3", 2, sha, soft.replace(" (soft, 60s)", ""), stop_mode="soft")
-    assert gates_approved("D-3", 2, sha, human, stop_mode="soft")
-    assert not gates_approved("D-3", 2, sha, soft, stop_mode="hard")
-    assert not gates_approved("D-3", 2, sha, soft)
-    assert not gates_approved("D-3", 2, sha, soft, stop_mode="open")
-    for ledger in (soft.replace("wave-2", "wave-3"),
-                   soft.replace("D-3", "D-4"),
-                   soft.replace("default-accepted (soft, 60s)", "bot:default-accepted"),
-                   soft.replace("default-accepted (soft, 60s)", "default-accepted by D-3"),
-                   soft.replace("default-accepted (soft, 60s)", "not default-accepted")):
-        assert not gates_approved("D-3", 2, sha, ledger, stop_mode="soft"), ledger
-
-
-def test_declared_gate_list_is_hashed_into_the_manifest():
-    ns = _functions()
-    validate_manifest, sha = ns["validate_manifest"], ns["declared_gates_sha"]
-    m = _manifest()
-    good = m["gates_sha"]
-    assert re.fullmatch(r"[0-9a-f]{64}", good)
-    validate_manifest(m)
-    for missing in ({k: v for k, v in m.items() if k != "gates_sha"}, {**m, "gates_sha": ""}, {**m, "gates_sha": good[:-1] + "0"}):
-        with pytest.raises(SystemExit, match="gates_sha") as e:
-            validate_manifest(missing)
-        assert good in str(e.value) and "STOP C" in str(e.value)
-    # the manifest names the STOP C row that approved it
-    for bad in ({k: v for k, v in m.items() if k != "stop_c"}, {**m, "stop_c": ""}, {**m, "stop_c": "7"}, {**m, "stop_c": ["D-2"]}):
-        with pytest.raises(SystemExit, match="stop_c"):
-            validate_manifest(bad)
-    # STOP C approved the whole row: a status or evidence edited in the manifest afterwards (a pending gate
-    # marked passed by hand) is a plan change, not an outcome; outcomes arrive in the children's reports
-    for edited in ([{**b, "gates": [{**g, "status": "passed", "evidence": "x"} for g in b["gates"]]} for b in m["batches"]],
-                   [{**b, "gates": [{**g, "evidence": "note.txt"} for g in b["gates"]]} for b in m["batches"]],
-                   [{**b, "gates": [{**g, "decision_id": "D-9"} for g in b["gates"]]} for b in m["batches"]]):
-        assert sha(m["wave"], edited) != good
-        with pytest.raises(SystemExit, match="gates_sha"):
-            validate_manifest({**m, "batches": edited})
-    # a gate swapped for another kind, renamed, dropped or added is a halt; so is a unit swapped under the gates
-    for changed in ([{**b, "gates": [{**g, "kind": "custom"} for g in b["gates"]]} for b in m["batches"]],
-                    [{**b, "units": ["other_unit"]} for b in m["batches"]],
-                    [{**b, "units": b["units"] + ["extra_unit"]} for b in m["batches"]],
-                    [{**b, "gates": [{**g, "id": "g-other"} for g in b["gates"]]} for b in m["batches"]],
-                    [{**b, "gates": b["gates"] + [{**GATE, "id": "g-extra"}]} for b in m["batches"]]):
-        assert sha(m["wave"], changed) != good
-        with pytest.raises(SystemExit, match="gates_sha"):
-            validate_manifest({**m, "batches": changed})
-    # a wave declared DEGRADED verifies at the structural tier only: that scope is part of what STOP C
-    # approved, so flipping it after the row is a plan change
-    assert sha(m["wave"], m["batches"], True) != good
-    assert sha(m["wave"], m["batches"], False) == good
-    with pytest.raises(SystemExit, match="gates_sha"):
-        validate_manifest({**m, "degraded": True})
-    validate_manifest({**m, "degraded": True, "gates_sha": sha(m["wave"], m["batches"], True)})
-    # the same declaration for another wave is another approval
-    assert sha(m["wave"] + 1, m["batches"]) != good
-    with pytest.raises(SystemExit, match="gates_sha"):
-        validate_manifest({**m, "wave": m["wave"] + 1})
-    # an absent decision_id and an explicit null hash alike; the hash is over sorted batches and gate order,
-    # so re-ordering is not a change
-    assert sha(1, [{**b, "gates": [{**g, "decision_id": None} for g in b["gates"]]} for b in m["batches"]]) == good
-    assert sha(1, list(reversed(_manifest(batches=[
-        {"id": "a", "units": ["u"], "write_targets": ["t"], "brief": "x"},
-        {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"]))) == sha(1, _manifest(batches=[
-        {"id": "a", "units": ["u"], "write_targets": ["t"], "brief": "x"},
-        {"id": "c", "units": ["v"], "write_targets": ["t2"], "brief": "x"}])["batches"])
-
-
-GATES_LEDGER = ("| D-12 | user:U1 | waive g-w for u, export leg retired with the legacy feed |\n"
-                "| D-13 | user:U1 | waive g-other for u |\n"
-                f"| D-2 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n")
 
 
 def _gate_batch(*gates):
@@ -1309,9 +1191,8 @@ def _gate_report(**extra):
             "pr_url": "https://example/pr/1", "branch": "f", "changed_paths": ["src/a.sql"], "one_line_summary": "ok", **extra}
 
 
-def _run_gates(batch, report, ledger=GATES_LEDGER):
+def _run_gates(batch, report):
     ns = _batch_runtime()
-    ns["decision_ledger"] = lambda: ledger
 
     async def agent(prompt, **kwargs):
         return dict(report)
@@ -1340,7 +1221,7 @@ def test_child_reported_gate_pass_with_evidence_in_the_pr_closes_the_gate():
     [{"id": "g-rows", "status": "passed", "evidence": "recon/u/rows.md"}],         # not under .migration/recon/<unit>/
     [{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/other_unit/rows.md"}],  # another unit's evidence
     [{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}],
-    [{"id": "g-rows", "status": "waived", "evidence": "", "decision_id": "D-12"}],  # only the ledger waives
+    [{"id": "g-rows", "status": "waived", "evidence": "", "decision_id": "x"}],  # only the plan waives
     [{"id": "g-rows", "kind": "custom", "status": "passed", "evidence": "x"}],      # kind is not the child's to set
     [{"id": "g-other", "status": "passed", "evidence": "x"}],                     # undeclared gate
     [{"id": "g-rows", "status": "passed", "evidence": "x"}, {"id": "g-rows", "status": "passed", "evidence": "x"}],
@@ -1353,8 +1234,8 @@ def test_child_cannot_pass_a_gate_without_evidence_waive_it_or_rename_it(reporte
     assert out["status"] == "FAIL" and out["failure_class"] == "gates"
 
 
-def test_a_ledger_waived_gate_needs_nothing_from_the_child_and_cannot_be_flipped_by_it():
-    batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
+def test_a_plan_waived_gate_needs_nothing_from_the_child_and_cannot_be_flipped_by_it():
+    batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "waive-g-w"})
     out = _run_gates(batch, _gate_report())
     assert out["status"] == "PASS"
     assert [g["status"] for g in out["gates"]] == ["waived"]
@@ -1363,12 +1244,12 @@ def test_a_ledger_waived_gate_needs_nothing_from_the_child_and_cannot_be_flipped
 
 
 def test_a_plan_passed_gate_is_a_declaration_the_child_still_has_to_prove():
-    """passed in the manifest says what STOP C expects, not what happened: without the child's result and its
+    """passed in the manifest says what the plan expects, not what happened: without the child's result and its
     evidence at the PR head the gate is unmet, and the child's evidence is what gets recorded."""
-    batch = _gate_batch({**GATE, "status": "passed", "evidence": "stop-c/rows.md"})
+    batch = _gate_batch({**GATE, "status": "passed", "evidence": "plan/rows.md"})
     out = _run_gates(batch, _gate_report())
     assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "g-rows" in out["one_line_summary"]
-    out = _run_gates(batch, _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": "stop-c/rows.md"}]))
+    out = _run_gates(batch, _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": "plan/rows.md"}]))
     assert out["status"] == "FAIL" and out["failure_class"] == "gates"
     out = _run_gates(batch, _gate_report(gates=[{"id": "g-rows", "status": "passed", "evidence": ".migration/recon/u/rows.md"}]))
     assert out["status"] == "PASS"
@@ -1376,63 +1257,6 @@ def test_a_plan_passed_gate_is_a_declaration_the_child_still_has_to_prove():
     ns = _prompt_ns(_manifest())
     child = ns["child_prompt"]({**ns["MANIFEST"]["batches"][0], "gates": batch["gates"]})
     assert "g-rows" in child
-
-
-@pytest.mark.parametrize("ledger", [
-    "",
-    "| D-12 | user: waive g-w for other_unit |\n",                 # names another unit
-    "| D-12 | user: waive g-other for u |\n",                      # names another gate
-    "| D-120 | user: waive g-w for u |\n",                         # D-12 is not a prefix match
-])
-def test_waived_gate_whose_decision_is_not_in_the_ledger_fails_closed(ledger):
-    batch = _gate_batch({**GATE, "id": "g-w", "kind": "export_file", "status": "waived", "decision_id": "D-12"})
-    out = _run_gates(batch, _gate_report(), ledger)
-    assert out["status"] == "FAIL" and out["failure_class"] == "gates" and "D-12" in out["one_line_summary"]
-
-
-def test_a_human_waiver_recorded_after_stop_c_closes_a_declared_gate_the_child_did_not_pass():
-    """The declaration is frozen by gates_sha, so a waiver decided after STOP C lives in the ledger alone: a
-    human's D-<n> row that says waive and names the gate and every unit stands in for the child's result."""
-    ledger = GATES_LEDGER + "| D-14 | user:U2 | waive g-rows for u, parity proven on the wave-1 rerun |\n"
-    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), ledger)
-    assert out["status"] == "PASS", out.get("one_line_summary")
-    assert out["gates"] == [{**GATE, "status": "waived", "decision_id": "D-14"}]
-    out = _run_gates(_gate_batch(dict(GATE)),
-                     _gate_report(gates=[{"id": "g-rows", "status": "failed", "evidence": "3 rows differ"}]), ledger)
-    assert out["status"] == "PASS", out.get("one_line_summary")
-    assert out["gates"] == [{**GATE, "status": "waived", "evidence": "3 rows differ", "decision_id": "D-14"}]  # what was waived over stays visible
-
-
-def test_a_waiver_written_before_this_stop_c_row_does_not_carry_into_the_run_it_approved():
-    """A wave rerun fires STOP C again and the manifest names the new row; a waiver a human wrote for the
-    earlier run sits above that row and is that run's, so it does not waive the gate here. Only rows
-    strictly after the manifest's stop_c row are post-STOP C waivers; no stop_c row, no waiver."""
-    ledger_waiver = _batch_runtime()["ledger_waiver"]
-    old = "| D-14 | user:U2 | waive g-rows for u |\n"
-    stop_c = f"| D-20 | user:U0 | STOP C wave-0 gates_sha {'0' * 64} |\n"
-    new = "| D-21 | user:U2 | waive g-rows for u |\n"
-    assert ledger_waiver("g-rows", ["u"], old + stop_c + new, "D-20") == "D-21"
-    assert ledger_waiver("g-rows", ["u"], old + stop_c, "D-20") is None
-    assert ledger_waiver("g-rows", ["u"], old + new, "D-20") is None
-    assert ledger_waiver("g-rows", ["u"], old + "| D-19 | user:U0 | STOP C, see D-20 for the hash |\n" + new, "D-20") is None
-    assert ledger_waiver("g-rows", ["u"], "| D-20 | user:U2 | STOP C wave-0 gates_sha x; waive g-rows for u |\n", "D-20") is None
-    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), old + GATES_LEDGER)
-    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
-    assert out["gates"] == [{**GATE, "decision_id": None}]
-    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), GATES_LEDGER + new.replace("D-21", "D-14"))
-    assert out["status"] == "PASS", out.get("one_line_summary")
-
-
-@pytest.mark.parametrize("row", [
-    "| D-14 | default-accepted | waive g-rows for u |\n",   # the orchestrator's row, not a human's
-    "| D-14 | user:U2 | waive g-rows for other_unit |\n",
-    "| D-14 | user:U2 | waive g-other for u |\n",
-    "| D-14 | user:U2 | g-rows for u |\n",
-])
-def test_a_ledger_row_that_does_not_waive_this_gate_for_every_unit_leaves_it_unmet(row):
-    out = _run_gates(_gate_batch(dict(GATE)), _gate_report(), GATES_LEDGER + row)
-    assert out["status"] == "FAIL" and out["failure_class"] == "gates"
-    assert out["gates"] == [{**GATE, "decision_id": None}]
 
 
 def test_evidence_in_pr_is_a_file_of_the_units_recon_dir_at_the_gated_head(tmp_path):
@@ -1503,8 +1327,6 @@ def test_child_schema_and_prompts_carry_gates():
     _caps(ready=1),
     {k: v for k, v in CAPS.items() if k != "guard_mode"},
     _caps(guard_mode="off"),
-    {k: v for k, v in CAPS.items() if k != "stop_mode"},
-    _caps(stop_mode="medium"),
 ])
 def test_validate_manifest_rejects_bad_capability_contract(caps):
     validate_manifest = _functions()["validate_manifest"]
@@ -1520,21 +1342,17 @@ def test_validate_manifest_rejects_missing_capabilities():
         validate_manifest(m)
 
 
-@pytest.mark.parametrize("manifest", [
-    _manifest(capabilities=_caps(stop_mode="hard"), auto_merge=True),
-    _manifest(auto_merge="false"),
-])
-def test_validate_manifest_hard_stop_mode_forbids_auto_merge(manifest):
+def test_validate_manifest_rejects_non_bool_auto_merge():
     validate_manifest = _functions()["validate_manifest"]
     with pytest.raises(SystemExit, match="auto_merge"):
-        validate_manifest(manifest)
+        validate_manifest(_manifest(auto_merge="false"))
 
 
 def test_validate_manifest_accepts_capability_contract():
     validate_manifest = _functions()["validate_manifest"]
     validate_manifest(_manifest())
     validate_manifest(_manifest(auto_merge=True))
-    validate_manifest(_manifest(capabilities=_caps(stop_mode="hard", guard_mode="warn"), auto_merge=False))
+    validate_manifest(_manifest(capabilities=_caps(guard_mode="warn"), auto_merge=False))
 
 
 def test_validate_manifest_allows_serial_wave_zero_only():
@@ -1563,7 +1381,7 @@ def test_validate_manifest_requires_feature_branch_or_recorded_trunk_decision():
         validate_manifest(missing)
     with pytest.raises(SystemExit, match="base_branch 'main' is the trunk"):
         validate_manifest(_manifest(base_branch="main"))
-    validate_manifest(_manifest(base_branch="main", trunk_base_decision="D-2026-001"))
+    validate_manifest(_manifest(base_branch="main", trunk_base_decision="trunk-2026-001"))
 
 
 def test_child_prompt_embeds_capability_contract():
@@ -1571,7 +1389,7 @@ def test_child_prompt_embeds_capability_contract():
     text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
     assert "--expect-identity sp-1" in text
     assert '"catalogs": ["mig"]' in text
-    assert '"guard_mode": "block"' in text and '"stop_mode": "soft"' in text
+    assert '"guard_mode": "block"' in text
     assert "BLOCKED" in text
 
 
@@ -1620,13 +1438,14 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
 def _prompt_ns(manifest):
     tree = _tree()
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
-             "sum_cost", "cost_line", "close_prompt"}
+             "sum_cost", "cost_line", "close_prompt", "skill_text", "skill_file"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES", "RESYNC_CLASS"}
                     for t in node.targets))]
     ns = {"json": __import__("json"), "shlex": __import__("shlex"), "re": re, "WAVE": 1, "TAG": "0",
+          "PLUGIN": WORKFLOW.parents[2],
           "REPO": "github.com/acme/target", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
           "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
@@ -1697,10 +1516,9 @@ def test_cost_line_compares_estimate_with_summed_actuals():
 PIPELINE_UPDATES = WORKFLOW.parents[1] / "target-routing" / "pipeline_updates.py"
 
 
-def _pipeline_wave(tmp_path, batches, ledger="", **manifest):
+def _pipeline_wave(tmp_path, batches, **manifest):
     waves = tmp_path / ".migration" / "waves"
     waves.mkdir(parents=True)
-    (tmp_path / ".migration" / "06_decisions.md").write_text(ledger)
     path = waves / "wave-1.json"
     path.write_text(json.dumps({"wave": 1, "width": 4, "batches": batches, **manifest}))
     return path
@@ -1710,9 +1528,8 @@ def test_check_pipeline_updates_runs_the_script_on_the_manifest_and_returns_its_
     """The workflow can import nothing, so the pipeline check is the plugin's script run as a subprocess on
     the manifest; a clean run hands back `order` (later batch -> the earlier batches it waits for)."""
     check = _functions()["check_pipeline_updates"]
-    ledger = "| D-7 | 2026-02-01 | user:U1 | pipeline_serialized p: b1 then b2 |\n"
     path = _pipeline_wave(tmp_path, [{"id": "b1", "lakeflow_pipelines": ["p"]}, {"id": "b2", "lakeflow_pipelines": ["p"]}],
-                          ledger, serialized_pipelines={"p": "D-7"})
+                         serialized_pipelines={"p": "ser-p"})
     assert check(PIPELINE_UPDATES, path) == {"b2": ["b1"]}
     assert check(PIPELINE_UPDATES, _pipeline_wave(tmp_path / "solo", [{"id": "b1", "lakeflow_pipelines": ["p"]}])) == {}
 
@@ -1843,139 +1660,111 @@ def test_pass_without_merge_evidence_is_downgraded(mode):
 
 # ---------------------------------------------------------------- merge authority (WS3.2)
 
-LEDGER = ("| D-2 | 2024-05-01 | user:U0 | STOP C wave-0 gates_sha 0 |\n"
-          "| D-6 | 2024-05-01 | user:U1 | widen tolerance for orders_dim | \n"
-          "| D-7 | 2024-05-02 | user:U1 | merge_override for u, its snapshot watermark mismatch is a known feed gap |\n"
-          "| D-8 | 2024-05-02 | default-accepted | merge_override for other_unit |\n"
-          "| D-70 | 2024-05-03 | user:U1 | merge_override for u2 |\n")
-# the same rows with this run's STOP C row written after them: every override belongs to an earlier run
-STALE_LEDGER = "".join(LEDGER.splitlines(True)[1:] + LEDGER.splitlines(True)[:1])
-
-
-def _ns_with_ledger(text=LEDGER):
-    ns = _batch_runtime()
-    ns["decision_ledger"] = lambda: text
-    return ns
-
-
 _pass_nomerge = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live", "pr_url": "https://example/pr/1",
                  "branch": "f", "changed_paths": ["src/a.sql"],
                  "one_line_summary": "ok"}
 
 
+def _ns_with_overrides(entries):
+    ns = _batch_runtime()
+    ns["MANIFEST"] = {"merge_overrides": entries}
+    return ns
+
+
 @pytest.mark.parametrize("report", [
     _pass_nomerge,
-    {**_pass_nomerge, "merge_eligible": False},
     {**_pass_nomerge, "merge_eligible": "true"},
     {**_pass_nomerge, "merge_eligible": 1},
-    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "harness", "decision_id": "D-7"}},
+    {**_pass_nomerge, "merge_eligible": False},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "harness", "decision_id": "mo-u"}},
     {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override"}},
-    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-6"}},
-    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-8"}},
-    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}},
-    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "7"}},
-    {**_pass_nomerge, "merge_eligible": False, "merge_authority": "D-7"},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "other-d"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "mo-z"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "7 mo"}},
+    {**_pass_nomerge, "merge_eligible": False, "merge_authority": "mo-u"},
 ])
-def test_pass_without_merge_eligible_true_needs_a_ledger_override_below_stop_c(report):
-    out = _run_one(_ns_with_ledger(STALE_LEDGER), report)
+def test_pass_without_merge_eligible_true_needs_the_manifests_override(report):
+    out = _run_one(_batch_runtime(), report)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
-    assert "merge_override" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
+    assert "merge_overrides" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
     assert "merge_authority" not in out or out["merge_authority"]["kind"] != "human_override"
 
 
-def test_human_override_recorded_in_the_ledger_for_the_unit_keeps_the_pass():
-    out = _run_one(_ns_with_ledger(), {**_pass_nomerge, "merge_eligible": False,
-                                       "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+def test_manifest_override_entry_for_the_batches_units_keeps_the_pass():
+    out = _run_one(_batch_runtime(), {**_pass_nomerge, "merge_eligible": False,
+                                      "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}})
     assert out["status"] == "PASS" and "failure_class" not in out
-    assert out["merge_authority"] == {"kind": "human_override", "decision_id": "D-7"}
+    assert out["merge_authority"] == {"kind": "human_override", "decision_id": "mo-u"}
 
 
 def test_override_does_not_bypass_the_merge_evidence_mode_gate():
-    out = _run_one(_ns_with_ledger(), {**_pass_nomerge, "recon_mode": "fixture", "merge_eligible": False,
-                                       "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+    out = _run_one(_batch_runtime(), {**_pass_nomerge, "recon_mode": "fixture", "merge_eligible": False,
+                                      "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}})
     assert out["status"] == "FAIL" and out["failure_class"] == "non_merge_evidence"
 
 
-def test_override_with_no_ledger_file_fails_closed():
-    out = _run_one(_ns_with_ledger(""), {**_pass_nomerge, "merge_eligible": False,
-                                         "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
+def test_override_claim_with_no_manifest_entry_fails_closed():
+    ns = _ns_with_overrides([])
+    out = _run_one(ns, {**_pass_nomerge, "merge_eligible": False,
+                        "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}})
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
 
 
-def test_override_decision_row_must_name_every_unit_and_say_merge_override():
-    override_decision = _batch_runtime()["override_decision"]
-    assert override_decision("D-7", ["u"], LEDGER)
-    assert not override_decision("D-7", ["u", "u2"], LEDGER)
-    assert not override_decision("D-7", ["u"], LEDGER.replace("merge_override", "merge override"))
-    assert not override_decision("D-70", ["u"], LEDGER)      # D-70 names u2, not u
-    assert not override_decision("D-7", ["u2"], LEDGER)      # D-7 is not a prefix match for D-70
-    assert override_decision("D-70", ["u2"], LEDGER)
-    assert not override_decision("D-7", ["orders"], "D-7 merge_override for orders_dim")
-    assert not override_decision(None, ["u"], LEDGER) and not override_decision("D-", ["u"], LEDGER)
+def test_merge_override_for_is_the_single_entry_covering_every_unit():
+    merge_override_for = _batch_runtime()["merge_override_for"]
+    assert merge_override_for(["u"], [{"decision": "mo-u", "units": ["u"]}]) == {"decision": "mo-u", "units": ["u"]}
+    # an entry may name more units than the batch asks for; the claim still cites its decision
+    assert merge_override_for(["u"], [{"decision": "mo-all", "units": ["u", "v"]}]) == {"decision": "mo-all", "units": ["u", "v"]}
+    # two entries both covering the batch's units: no single authority, claim must fail closed
+    assert merge_override_for(["u"], [{"decision": "a", "units": ["u"]}, {"decision": "b", "units": ["u"]}]) is None
+    # an entry covering only some of the batch's units clears nothing
+    assert merge_override_for(["u", "v"], [{"decision": "a", "units": ["u"]}]) is None
+    # no merge_overrides key, a non-list value, or malformed rows clear nothing either
+    assert merge_override_for(["u"], None) is None
+    for bad in ("x", [{"decision": "a"}], [{"units": ["u"]}], ["a"]):
+        assert merge_override_for(["u"], bad) is None
 
 
-def test_override_decision_row_names_units_in_its_text_not_in_its_metadata():
-    override_decision = _batch_runtime()["override_decision"]
-    row = "| D-7 | 2024-05-02 | user:U1 | merge_override for u |\n"
-    assert override_decision("D-7", ["u"], row)
-    assert not override_decision("D-7", ["U1"], row)                 # the provenance id is not a unit
-    assert not override_decision("D-7", ["2024-05-02"], row)         # nor the date
-    assert not override_decision("D-7", ["u", "U1"], row)
-    assert override_decision("D-7", ["u", "v"], "| D-7 | user:U1 | merge_override for u and v (feed gap) |")
-    # column order is the ledger author's: units before the marker count too
-    assert override_decision("D-7", ["orders"], "| D-7 | units: orders | user:U1 | merge_override for an accepted feed gap |")
-    assert override_decision("D-7", ["u", "v"], "| 2024-05-02T10:00:00Z | D-7 | u, v | user:U1 | merge_override |")
-    # but never a unit that is only the row's id, date or author
-    assert not override_decision("D-7", ["D-7"], "| D-7 | user:U1 | merge_override for u |")
-    assert not override_decision("D-7", ["2024-05-02"], "| D-7 | 2024-05-02 | user:U1 | merge_override for u |")
-    assert not override_decision("D-7", ["U1"], "| D-7 | user:U1 | merge_override for u |")
-    assert not override_decision("D-7", ["u"], "| D-7 | user:u | merge_override for v |")
+def test_an_unscoped_override_forgives_every_policy_class_and_never_data():
+    scope_covers = _batch_runtime()["scope_covers"]
+    assert scope_covers(None, {"u": ["rerun_policy", "privilege_visibility", "structural", "evidence"]})
+    assert not scope_covers(None, {"u": ["data"]}) and not scope_covers(None, {"u": ["rerun_policy", "data"]})
+    assert not scope_covers(None, {"u": ["rerun_policy"], "v": None})   # unrecorded: cannot be shown non-data
+    assert scope_covers(["data"], {"u": ["data"]}) and not scope_covers(["data"], {"u": ["rerun_policy"]})
+    assert scope_covers(None, {})
 
 
-def test_override_decision_is_the_row_whose_id_cell_is_the_decision_not_a_row_that_mentions_it():
-    """A decision id authorizes only through its own row: one that cites it in prose (supersedes D-7,
-    see D-7) is another decision, and D-7 must be looked up as a row of its own."""
-    override_decision = _batch_runtime()["override_decision"]
-    assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u, supersedes D-7 |")
-    assert not override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for u | D-7 |")
-    assert not override_decision("D-7", ["u"], "D-7 user:U1 merge_override for u")   # prose, not a table row
-    assert override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u")   # edge pipes are optional
-    assert override_decision("D-7", ["u"], "D-7 | user:U1 | merge_override for u |")
-    assert override_decision("D-7", ["u"], "| D-9 | user:U1 | merge_override for v |\n| D-7 | user:U1 | merge_override for u |")
+def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
+    def ns_with(entries, classes):
+        ns = _ns_with_overrides(entries)
+        ns["unit_recon"] = lambda head, units: {u: (False, classes) for u in units}
+        return ns
 
-
-def test_override_decision_counts_a_unit_named_like_metadata_when_the_row_names_it_in_its_text():
-    """Ids, dates and provenance are excluded by cell, not by shape: a unit called D-7, 2024-05-02 or
-    default-accepted is named like any other when it appears in the row's text."""
-    override_decision = _batch_runtime()["override_decision"]
-    assert override_decision("D-9", ["D-7"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for D-7 |")
-    assert override_decision("D-9", ["2024-05-02"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for 2024-05-02 |")
-    assert override_decision("D-9", ["default-accepted"], "| D-9 | user:evt-1 | merge_override for default-accepted |")
-    assert not override_decision("D-9", ["D-7"], "| D-9 | D-7 | user:evt-1 | merge_override for u |")   # a cell that is only an id
-    assert not override_decision("D-9", ["2026-09-16"], "| D-9 | 2026-09-16 | user:evt-1 | merge_override for u |")
-    assert not override_decision("D-9", ["evt-1"], "| D-9 | user:evt-1 | merge_override for u |")
-
-
-def test_override_decision_provenance_is_a_cell_of_its_own_not_a_mention_in_the_text():
-    """Human provenance is the row's provenance cell, exactly `user:<id>`, as the STOP C row's is: a row whose
-    text mentions a user (default-accepted rows citing who asked, prose quoting an event id) is not a
-    human's decision, and a row with a default-accepted cell is the orchestrator's whatever else it says."""
-    override_decision = _batch_runtime()["override_decision"]
-    assert not override_decision("D-7", ["u"], "| D-7 | 2024-05-02 | user:U1 merge_override for u |")
-    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted | merge_override for u, as user:U1 asked |")
-    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted (soft) | user:U1 | merge_override for u |")
-    assert not override_decision("D-7", ["u"], "| D-7 | D-7 user:U1 | merge_override for u |")
-    assert not override_decision("D-7", ["u"], "| D-7 | user:U1 said so | merge_override for u |")
-    assert override_decision("D-7", ["u"], "| D-7 | user:U1 | merge_override for u |")
-    assert override_decision("D-7", ["u"], "| D-7 |  user:U1  | merge_override for u |")
-    assert override_decision("D-7", ["u"], "| D-7 | user:U1 | waive for u |", word="waive")
-    assert not override_decision("D-7", ["u"], "| D-7 | default-accepted | user:U1 waive for u |", word="waive")
+    unscoped = [{"decision": "mo-u", "units": ["u"]}]
+    scoped = [{"decision": "mo-u", "units": ["u"], "blocker_classes": ["rerun_policy"]}]
+    named = [{"decision": "mo-u", "units": ["u"], "blocker_classes": ["data", "rerun_policy"]}]
+    report = {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}}
+    out = _run_one(ns_with(scoped, ["rerun_policy"]), report)
+    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "mo-u"
+    # a data blocker is forgiven only by an entry that names data: the unscoped entry does not, so the halt names it
+    out = _run_one(ns_with(unscoped, ["data", "rerun_policy"]), report)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    assert "mo-u" in out["one_line_summary"] and "(unscoped)" in out["one_line_summary"]
+    out = _run_one(ns_with(scoped, ["data", "rerun_policy"]), report)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    assert "mo-u" in out["one_line_summary"] and "data" in out["one_line_summary"]
+    out = _run_one(ns_with(named, ["data", "rerun_policy"]), report)
+    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "mo-u"
+    out = _run_one(ns_with(named, None), report)   # even the entry naming data cannot cover what was not recorded
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "unrecorded" in out["one_line_summary"]
+    out = _run_one(ns_with(named, ["data"]), {**_pass_nomerge, "merge_eligible": False})   # the entry must be claimed
+    assert out["status"] == "FAIL" and "mo-u" in out["one_line_summary"]
 
 
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
-    ns["unit_eligibility"] = lambda head, units: {"u": True, "u2": False, "u3": None}
-    ns["decision_ledger"] = lambda: LEDGER
+    ns["MANIFEST"] = {"merge_overrides": [{"decision": "mo-all", "units": ["u", "u2", "u3"]}]}
+    ns["unit_recon"] = lambda head, units: {"u": (True, []), "u2": (False, ["rerun_policy"]), "u3": (None, ["rerun_policy"])}
 
     def run(report):
         async def agent(prompt, **kwargs):
@@ -1990,32 +1779,12 @@ def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "merge_authority" not in out
     assert "recon/u2/result.json" in out["one_line_summary"] and "merge_eligible=False" in out["one_line_summary"]
     assert "recon/u3/result.json" in out["one_line_summary"] and "missing or malformed" in out["one_line_summary"]
-    ns["decision_ledger"] = lambda: LEDGER + "| D-9 | user:U1 | merge_override for u, u2, u3 |\n"
-    out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "D-9"}})
-    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
-    # the row is the ledger's decision, so a child that forgot to claim it gets the same answer
-    out = run(base)
-    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-9"}
-
-
-def test_override_decision_row_needs_human_provenance():
-    override_decision = _batch_runtime()["override_decision"]
-    assert not override_decision("D-8", ["other_unit"], LEDGER)          # default-accepted is not a human
-    assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "bot:"))
-    assert not override_decision("D-7", ["u"], LEDGER.replace("user:", "user"))
-    assert not override_decision("D-7", ["u"], LEDGER.replace("user:U1", "user:"))      # user: with no event id
-    assert override_decision("D-7", ["u"], LEDGER.replace("user:U1 | merge", "user:a.b@x.io | merge"))
-
-
-def test_override_decision_marker_does_not_stand_in_for_a_unit_of_that_name():
-    """A unit may be called merge_override (UNIT_ID allows it); the row's one authority marker is not then
-    also the mention of that unit. The row has to name it a second time."""
-    override_decision = _batch_runtime()["override_decision"]
-    row = "| D-9 | 2024-05-03 | user:U2 | merge_override for an accepted feed gap |\n"
-    assert not override_decision("D-9", ["merge_override"], row)
-    assert not override_decision("D-9", ["merge_override", "u"], row.replace("gap", "gap in u"))
-    assert override_decision("D-9", ["merge_override"], row.replace("gap", "gap in merge_override"))
-    assert override_decision("D-9", ["merge_override", "u"], row.replace("gap", "gap in merge_override and u"))
+    out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "mo-all"}})
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "mo-all"}
+    # an entry covering only part of the batch clears nothing
+    ns["MANIFEST"] = {"merge_overrides": [{"decision": "mo-part", "units": ["u", "u2"]}]}
+    out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "mo-part"}})
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
 
 
 def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():
@@ -2026,11 +1795,11 @@ def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():
     assert schema["properties"]["merge_authority"]["properties"]["kind"]["enum"] == ["harness", "human_override"]
     ns = _prompt_ns(_manifest())
     child = ns["child_prompt"](_manifest()["batches"][0])
-    assert "merge_eligible" in child and "merge_override" in child and "06_decisions.md" in child
+    assert "merge_eligible" in child and "merge_overrides" in child
     passed = [{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1",
-               "merge_authority": {"kind": "human_override", "decision_id": "D-7"}}]
+               "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}}]
     verify = ns["verify_prompt"](passed)
-    assert "human_override" in verify and "D-7" in verify
+    assert "human_override" in verify and "mo-u" in verify
 
 
 def test_prompts_name_every_merge_evidence_mode():
@@ -2042,10 +1811,11 @@ def test_prompts_name_every_merge_evidence_mode():
     assert "Fixture evidence is never PASS" in child
 
 
-# ---------------------------------------------------------------- ledger gate (changed_paths)
+# ---------------------------------------------------------------- protected-files gate (changed_paths)
 
-LEDGER_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targets.json",
-                ".migration/06_decisions.md", ".migration/09_capabilities.json", ".migration/units/u/mapping_spec.json"]
+PROTECTED_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targets.json",
+                   ".migration/authorizations.json", ".migration/09_capabilities.json",
+                   ".migration/units/u/mapping_spec.json", ".migration/waves/wave-0.json"]
 
 
 def _pass(**extra):
@@ -2058,31 +1828,31 @@ def test_clean_diff_stays_pass_and_recon_evidence_for_its_own_units_is_allowed()
     ns = _batch_runtime()
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql", ".migration/recon/u/result.json"]))
     assert out["status"] == "PASS" and "failure_class" not in out
-    assert ns["ledger_violations"](["a.py", ".migration/recon/u/x", ".migration/recon/u/deep/y"], ["u"]) == []
+    assert ns["protected_files_violations"](["a.py", ".migration/recon/u/x", ".migration/recon/u/deep/y"], ["u"]) == []
 
 
-@pytest.mark.parametrize("path", LEDGER_FILES + [".migration/recon/other_unit/result.json", ".migration/recon/wave-1/report.md"])
-def test_diff_touching_the_ledger_is_downgraded_to_ledger_tampered(path):
+@pytest.mark.parametrize("path", PROTECTED_FILES + [".migration/recon/other_unit/result.json", ".migration/recon/wave-1/report.md"])
+def test_diff_touching_a_protected_file_is_downgraded_to_protected_files_tampered(path):
     out = _run_one(_batch_runtime(), _pass(changed_paths=["src/loans.sql", path]))
-    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered"
+    assert out["status"] == "FAIL" and out["failure_class"] == "protected_files_tampered"
     assert path in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
 
 
 @pytest.mark.parametrize("report", [_pass(), _pass(changed_paths="src/x.sql"), _pass(changed_paths=[".migration/x", 3])])
 def test_pass_without_a_usable_changed_paths_is_not_pass(report):
     out = _run_one(_batch_runtime(), report)
-    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered"
+    assert out["status"] == "FAIL" and out["failure_class"] == "protected_files_tampered"
     assert "changed_paths" in out["one_line_summary"]
 
 
-def test_a_failed_child_that_touched_the_ledger_is_still_reclassified():
+def test_a_failed_child_that_touched_a_protected_file_is_still_reclassified():
     out = _run_one(_batch_runtime(), {"status": "FAIL", "recon_verdict": "FAIL", "recon_mode": "live",
                                       "failure_class": "decimal_rounding", "one_line_summary": "off by one",
                                       "changed_paths": [".migration/03_recon_tolerances.json"]})
-    assert out["failure_class"] == "ledger_tampered"
+    assert out["failure_class"] == "protected_files_tampered"
 
 
-def test_breaker_counts_ledger_tampering():
+def test_breaker_counts_protected_file_tampering():
     ns = _batch_runtime()
 
     async def agent(prompt, **kwargs):
@@ -2097,7 +1867,7 @@ def test_breaker_counts_ledger_tampering():
                                   asyncio.Semaphore(1), breaker)
         return breaker
 
-    assert asyncio.run(exercise()).tripped_on == "ledger_tampered"
+    assert asyncio.run(exercise()).tripped_on == "protected_files_tampered"
 
 
 def test_child_schema_requires_changed_paths():
@@ -2114,12 +1884,12 @@ def test_prompts_demand_changed_paths_and_base_branch_policy_files():
     ns = _prompt_ns(_manifest())
     child = ns["child_prompt"](_manifest()["batches"][0])
     assert "git diff --name-only" in child and "changed_paths" in child
-    assert ".migration/recon/<unit_id>/" in child and "ledger_tampered" in child
+    assert ".migration/recon/<unit_id>/" in child and "protected_files_tampered" in child
     verify = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1"}])
     assert "git diff --name-only" in verify and "changed_paths" in verify
     assert "03_recon_tolerances.json" in verify and "allowed_targets.json" in verify
     assert "base branch" in verify and "not the PR" in verify
-    assert ".migration/recon/<unit_id>/" in verify and "ledger_tampered" in verify
+    assert ".migration/recon/<unit_id>/" in verify and "protected_files_tampered" in verify
 
 
 def test_validate_verify_requires_changed_paths_inside_the_wave_report_dir():
@@ -2130,9 +1900,9 @@ def test_validate_verify_requires_changed_paths_inside_the_wave_report_dir():
     assert validate_verify(ok, passed, wave=2, observed=[]) == []
     problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-2/report.md",
                                                         ".migration/03_recon_tolerances.json"]}, passed, 2, [])
-    assert problems == ["verifier output invalid: ledger tampered, changed .migration/03_recon_tolerances.json"]
+    assert problems == ["verifier output invalid: protected files tampered, changed .migration/03_recon_tolerances.json"]
     problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-3/report.md"]}, passed, 2, [])
-    assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/wave-3/report.md"]
+    assert problems == ["verifier output invalid: protected files tampered, changed .migration/recon/wave-3/report.md"]
     problems = validate_verify({k: v for k, v in ok.items() if k != "changed_paths"}, passed, 2, [])
     assert problems == ["verifier output invalid: changed_paths must be a list of paths (git diff --name-only)"]
 
@@ -2145,14 +1915,14 @@ def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_repo
     assert validate_verify(ok, passed, wave=2, observed=[".migration/recon/wave-2/report.md"]) == []
     tampered = validate_verify(ok, passed, wave=2,
                                observed=[".migration/recon/wave-2/report.md", ".migration/allowed_targets.json"])
-    assert tampered == ["verifier output invalid: ledger tampered, changed .migration/allowed_targets.json"]
+    assert tampered == ["verifier output invalid: protected files tampered, changed .migration/allowed_targets.json"]
     unverifiable = validate_verify(ok, passed, wave=2, observed=None)
     assert len(unverifiable) == 1 and "recon/wave-2" in unverifiable[0] and "git" in unverifiable[0]
     # `observed` is what the verifier itself changed (verifier_changed_paths): a passed unit's evidence in
     # it means the verifier rewrote it, which is not the verifier's to do
     problems = validate_verify(ok, passed, wave=2,
                                observed=[".migration/recon/wave-2/report.md", ".migration/recon/u/result.json"])
-    assert problems == ["verifier output invalid: ledger tampered, changed .migration/recon/u/result.json"]
+    assert problems == ["verifier output invalid: protected files tampered, changed .migration/recon/u/result.json"]
     src = WORKFLOW.read_text()
     assert 'validate_verify(verify, passed, TAG, verifier_changed_paths(TAG, passed))' in src
 
@@ -2162,11 +1932,11 @@ def test_validate_verify_reads_the_report_branch_from_git_not_only_the_self_repo
 DOCTOR = {"schema": "dbx-migration-factory/capabilities/1", "ready": True,
           "identity": {"userName": "sp-1", "service_principal": True, "host": "https://adb-1.azuredatabricks.net"},
           "checks": [{"id": "allowed_targets", "status": "ok", "data": {"catalogs": ["mig"], "guard_mode": "block"}},
-                     {"id": "workspace", "status": "ok", "data": {"stop_mode": "soft"}}]}
+                     {"id": "workspace", "status": "ok", "data": {}}]}
 
 
 def test_validate_manifest_compares_the_contract_with_the_doctor_record():
-    validate_manifest = _functions()["validate_manifest"]
+    validate_manifest = _functions()["check_doctor_contract"]
     validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), DOCTOR)
     # the doctor records guard-normalized catalog names; a manifest spelling the guard accepts is the same contract
     validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"], catalogs=["`MIG` "])), DOCTOR)
@@ -2174,8 +1944,7 @@ def test_validate_manifest_compares_the_contract_with_the_doctor_record():
                          (_caps(host="https://adb-2.azuredatabricks.net"), "host"),
                          (_caps(host=DOCTOR["identity"]["host"], identity="sp-2"), "identity"),
                          (_caps(host=DOCTOR["identity"]["host"], catalogs=["mig", "prod"]), "catalogs"),
-                         (_caps(host=DOCTOR["identity"]["host"], guard_mode="warn"), "guard_mode"),
-                         (_caps(host=DOCTOR["identity"]["host"], stop_mode="hard"), "stop_mode")):
+                         (_caps(host=DOCTOR["identity"]["host"], guard_mode="warn"), "guard_mode")):
         with pytest.raises(SystemExit, match=f"capabilities.*{needle}.*09_capabilities.json"):
             validate_manifest(_manifest(capabilities=caps, auto_merge=False), DOCTOR)
     with pytest.raises(SystemExit, match="ready"):
@@ -2190,8 +1959,9 @@ def test_validate_manifest_compares_the_contract_with_the_doctor_record():
 def test_workflow_launches_from_the_signed_doctor_record_not_the_editable_one():
     src = WORKFLOW.read_text()
     assert "RECORDED" not in src
-    assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)" in src
-    assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES)\nvalidate_manifest(MANIFEST, DOCTOR)" in src
+    assert "DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES, MANIFEST_SHA)" in src
+    assert ("DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES, MANIFEST_SHA)\n"
+            "check_doctor_contract(MANIFEST, DOCTOR)") in src
     assert "fresh_doctor_report" not in src and "DOCTOR_PY" not in src
 
 
@@ -2230,7 +2000,7 @@ def test_signed_doctor_report_gate(tmp_path):
     path = tmp_path / "wave-1.doctor.json"
     path.write_text(json.dumps(signed))
     ns = _launch_ns(tmp_path)
-    assert ns["signed_doctor_report"](path, manifest_bytes,
+    assert ns["signed_doctor_report"](path, manifest_bytes, doctor.manifest_sha(manifest_bytes),
                                       now=datetime.datetime(2026, 1, 1, 0, 1, tzinfo=datetime.timezone.utc)) == signed
     cases = [
         (None, manifest_bytes, "no doctor record"),
@@ -2248,7 +2018,7 @@ def test_signed_doctor_report_gate(tmp_path):
         else:
             path.write_text(json.dumps(value))
         with pytest.raises(SystemExit, match=match):
-            ns["signed_doctor_report"](path, mb,
+            ns["signed_doctor_report"](path, mb, doctor.manifest_sha(mb),
                                        now=datetime.datetime(2026, 1, 1, 0, 1, tzinfo=datetime.timezone.utc))
     assert ns["wave_signature"](signed, manifest_bytes) == doctor.wave_signature(signed, manifest_bytes)
 
@@ -2285,7 +2055,7 @@ def test_pr_changed_paths_comes_from_the_pr_head_ref_of_this_repo(tmp_path):
     assert calls[2][3:] == ["fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]
     assert calls[3][3:] == ["rev-parse", "--verify", "origin/main^{commit}"]
     assert calls[4][3:] == ["merge-base", "--is-ancestor", "c" * 40, "t" * 40]
-    # --no-renames: a ledger file moved under an allowed recon/ path must still surface its old path.
+    # --no-renames: a protected file moved under an allowed recon/ path must still surface its old path.
     # An unmerged head diffs from its own fork point on the base (three-dot against the fresh tip)
     assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "t" * 40 + "..." + "c" * 40]
     assert len(calls) == 6
@@ -2322,7 +2092,7 @@ def test_every_fetch_the_gate_makes_lands_in_this_workflows_own_ref(tmp_path):
     assert "FETCH_HEAD" not in WORKFLOW.read_text()
 
 
-def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_merge(tmp_path):
+def test_the_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_merge(tmp_path):
     calls = []
 
     def fake_run(cmd, **kw):
@@ -2340,7 +2110,7 @@ def test_the_ledger_base_is_snapshotted_once_at_launch_before_any_wave_pr_can_me
     with pytest.raises(SystemExit, match="main"):
         _launch_ns(tmp_path, failing)["wave_base"]()
     src = WORKFLOW.read_text()
-    assert re.search(r"validate_manifest\(MANIFEST\)\ncheck_wave_tag\(TAG, MANIFEST\)\nBASE_SHA = wave_base\(\)\n"
+    assert re.search(r"validate_manifest\(MANIFEST, PLUGIN\)\ncheck_wave_tag\(TAG, MANIFEST\)\nBASE_SHA = wave_base\(\)\n"
                       r"DOCTOR = signed_doctor_report", src)
     assert 'BASE_SHA_PATH' not in src and '"base_sha": BASE_SHA' in src
 
@@ -2393,12 +2163,12 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
     assert _launch_ns(tmp_path, failing)["verifier_changed_paths"](2, passed) is None
 
 
-def test_git_observed_ledger_changes_beat_a_clean_self_report():
+def test_git_observed_protected_file_changes_beat_a_clean_self_report():
     ns = _batch_runtime()
     seen = []
     ns["pr_changed_paths"] = lambda pr_url: seen.append(pr_url) or ("c" * 40, ["src/loans.sql", ".migration/03_recon_tolerances.json"])
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
-    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered"
+    assert out["status"] == "FAIL" and out["failure_class"] == "protected_files_tampered"
     assert ".migration/03_recon_tolerances.json" in out["one_line_summary"]
     assert seen == ["https://example/pr/1"]  # the PR, not the branch the child names
     assert out["pr_head"] == "c" * 40  # the gated head, for the verifier's tree to be held to
@@ -2407,7 +2177,7 @@ def test_git_observed_ledger_changes_beat_a_clean_self_report():
     assert out["status"] == "PASS" and out["pr_head"] == "c" * 40
     ns["pr_changed_paths"] = lambda pr_url: None
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
-    assert out["status"] == "FAIL" and out["failure_class"] == "ledger_tampered" and "git" in out["one_line_summary"]
+    assert out["status"] == "FAIL" and out["failure_class"] == "protected_files_tampered" and "git" in out["one_line_summary"]
 
 
 @pytest.mark.parametrize("value", ["--upload-pack=touch /tmp/x", "-q", "main..x", "a b", "", 3, "^main", "m:n"])
@@ -2447,7 +2217,7 @@ def test_validate_manifest_rejects_unit_ids_that_are_not_a_plain_recon_dir_name(
                                     {"family": "sqlserver", "secret": "1LEGACY"},
                                     {"family": "sqlserver", "secret": "X", "params": {"db": "loans && rm -rf ."}},
                                     {"family": "sqlserver", "secret": "X", "params": {"db=x --unit": "y"}},
-                                    {"family": "sqlserver", "secret": "X", "params": {"db": "--role orchestrator"}},
+                                    {"family": "sqlserver", "secret": "X", "params": {"db": "--role admin"}},
                                     {"family": "sqlserver", "secret": "X", "params": {"as_of": "2026-09-08 18:43:52 x"}},
                                     {"family": "sqlserver", "secret": "X", "params": {"as_of": "2026-09-08  18:43"}},
                                     {"family": "sqlserver", "secret": "X", "params": {"db": "a'b"}},
@@ -2528,7 +2298,7 @@ def test_child_prompt_is_s2_shaped_and_under_900_words():
         "merge authority",                                                 # harness decides
         "exactly one PR", "first line",                                    # one PR, PASS/FAIL line 1
         "Do not merge",                                                    # no merge
-        ".migration/recon/<unit_id>/",                                     # ledger rule
+        ".migration/recon/<unit_id>/",                                     # protected-files rule
         "one_line_summary",                                                # structured output
     )]
     assert order == sorted(order), order
@@ -2567,8 +2337,8 @@ def test_validate_verify_normalises_unit_keys_to_batch_ids_for_any_batch_size():
     assert _verify({"w2-b03": "PASS", "orders": "PASS", "lines": "PASS", "fees": "PASS"}, passed) == []
     missing = _verify({"orders": "PASS"}, passed)
     assert missing == ["verifier output invalid: missing verdicts for w2-b04"]
-    extra = _verify({"orders": "PASS", "fees": "PASS", "ledger": "PASS"}, passed)
-    assert extra == ["verifier output invalid: unexpected verdicts for ledger"]
+    extra = _verify({"orders": "PASS", "fees": "PASS", "lg": "PASS"}, passed)
+    assert extra == ["verifier output invalid: unexpected verdicts for lg"]
 
 
 def test_validate_verify_fails_only_a_real_collision_after_normalisation():
@@ -2742,122 +2512,6 @@ def test_child_schema_accepts_both_evidence_forms():
     obj = next(f for f in evidence["anyOf"] if f.get("type") == "object")
     assert obj["required"] == ["path"] and set(obj["properties"]) == {"path", "label", "verdict", "rows"}
     assert len(forms) == 2
-
-
-STRUCTURED_LEDGER = (
-    "| D-2 | 2024-05-01 | user:U0 | STOP C wave-0 gates_sha 0 |\n"
-    '| D-7 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"]} | rerun policy on a first run |\n'
-    '| D-8 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["v"]} | prose says u, the cell says v: u |\n'
-    '| D-9 | 2024-05-02 | user:U1 | {"kind": "waive", "units": ["u"]} | merge_override for u in prose only |\n'
-    '| D-10 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["rerun_policy"]} |\n'
-    '| D-11 | 2024-05-02 | default-accepted (soft, 60s) | {"kind": "merge_override", "units": ["u"]} |\n'
-    '| D-12 | 2024-05-02 | user:U1 | {"kind": "waive", "units": ["u"], "gate": "g-rows"} |\n'
-)
-
-
-def _structured_ns(ledger=STRUCTURED_LEDGER, classes=None):
-    ns = _ns_with_ledger(ledger)
-    if classes is not None:
-        ns["unit_blocker_classes"] = lambda head, units: {u: classes for u in units}
-    return ns
-
-
-def test_a_machine_cell_is_the_decision_and_prose_beside_it_is_not_consulted():
-    override_decision = _structured_ns()["override_decision"]
-    assert override_decision("D-7", ["u"], STRUCTURED_LEDGER)
-    assert not override_decision("D-7", ["u", "u2"], STRUCTURED_LEDGER)
-    assert not override_decision("D-8", ["u"], STRUCTURED_LEDGER)      # prose names u, the cell does not
-    assert not override_decision("D-9", ["u"], STRUCTURED_LEDGER)      # the cell is a waiver, prose says merge_override
-    assert not override_decision("D-11", ["u"], STRUCTURED_LEDGER)     # default-accepted is never an override
-    assert override_decision("D-12", ["u"], STRUCTURED_LEDGER, word="waive", gate="g-rows")
-    assert not override_decision("D-12", ["u"], STRUCTURED_LEDGER, word="waive", gate="g-export")
-    assert not override_decision("D-9", ["u"], STRUCTURED_LEDGER, word="waive", gate="g-rows")  # no gate in the cell
-
-
-@pytest.mark.parametrize("cell", [
-    '{"kind": "merge_override"}',                                   # no units
-    '{"kind": "merge_override", "units": "u"}',
-    '{"kind": 3, "units": ["u"]}',
-    '{"units": ["u"]}',
-    '{"kind": "merge_override", "units": ["u"], "gate": 1}',
-    '{"kind": "merge_override", "units": ["u"], "blocker_classes": "data"}',
-    '{"kind": "merge_override", "units": ["u"]',                    # not JSON but looks like a cell
-    '{"kind": "merge_override", "units": ["u"]} | {"kind": "waive", "units": ["u"]}',  # two cells
-])
-def test_a_malformed_machine_cell_is_no_decision_and_preflight_names_its_row(cell):
-    ns = _functions()
-    ledger = f"| D-7 | 2024-05-02 | user:U1 | {cell} | note |\n"
-    assert not ns["override_decision"]("D-7", ["u"], ledger)
-    with pytest.raises(SystemExit, match="D-7"):
-        ns["check_ledger"](ledger)
-    ns["check_ledger"](STRUCTURED_LEDGER)
-    ns["check_ledger"](LEDGER)
-
-
-def test_a_structured_override_row_keeps_the_pass():
-    out = _run_one(_structured_ns(), {**_pass_nomerge, "merge_eligible": False,
-                                      "merge_authority": {"kind": "human_override", "decision_id": "D-7"}})
-    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-7"}
-
-
-def test_the_ledger_override_written_below_stop_c_applies_even_when_the_child_did_not_claim_it():
-    """The human decided in the ledger; a child that forgot to report merge_authority does not cost a relaunch."""
-    for claimed in ({}, {"merge_authority": {"kind": "harness", "decision_id": None}},
-                    {"merge_authority": {"kind": "human_override", "decision_id": "D-99"}}):
-        out = _run_one(_structured_ns(), {**_pass_nomerge, "merge_eligible": False, **claimed})
-        assert out["status"] == "PASS", out.get("one_line_summary")
-        assert out["merge_authority"] == {"kind": "human_override", "decision_id": "D-7"}
-    # a row above this run's STOP C row is an earlier run's decision, claimed by the child or not
-    rows = STRUCTURED_LEDGER.splitlines()
-    ledger = "\n".join([rows[1], rows[0], *(r for r in rows[2:] if "D-10" not in r)]) + "\n"
-    for claimed in ({}, {"merge_authority": {"kind": "human_override", "decision_id": "D-7"}}):
-        out = _run_one(_structured_ns(ledger), {**_pass_nomerge, "merge_eligible": False, **claimed})
-        assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
-        assert "below STOP C D-2" in out["one_line_summary"]
-
-
-def test_a_later_override_row_whose_scope_fits_is_not_hidden_by_a_narrower_one_above_it():
-    ledger = STRUCTURED_LEDGER.replace(
-        '| D-7 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"]} | rerun policy on a first run |\n', ""
-    ) + '| D-13 | 2024-05-03 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["data", "rerun_policy"]} |\n'
-    out = _run_one(_structured_ns(ledger, classes=["data"]), {**_pass_nomerge, "merge_eligible": False})
-    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "D-13"}
-    out = _run_one(_structured_ns(ledger, classes=["rerun_policy"]), {**_pass_nomerge, "merge_eligible": False})
-    assert out["merge_authority"]["decision_id"] == "D-10"      # the first row that fits wins
-    out = _run_one(_structured_ns(ledger, classes=["structural"]), {**_pass_nomerge, "merge_eligible": False})
-    assert out["status"] == "FAIL" and "D-10" in out["one_line_summary"] and "structural" in out["one_line_summary"]
-
-
-def test_an_unscoped_override_forgives_every_policy_class_and_never_data():
-    scope_covers = _structured_ns()["scope_covers"]
-    assert scope_covers(None, {"u": ["rerun_policy", "privilege_visibility", "structural", "evidence"]})
-    assert not scope_covers(None, {"u": ["data"]}) and not scope_covers(None, {"u": ["rerun_policy", "data"]})
-    assert not scope_covers(None, {"u": ["rerun_policy"], "v": None})   # unrecorded: cannot be shown non-data
-    assert scope_covers(["data"], {"u": ["data"]}) and not scope_covers(["data"], {"u": ["rerun_policy"]})
-    assert scope_covers(None, {})
-
-
-def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
-    report = {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "D-10"}}
-    out = _run_one(_structured_ns(classes=["rerun_policy"]), report)
-    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-10"
-    # a data blocker is forgiven only by a row that names data: the unscoped D-7 does not, so the halt names it
-    out = _run_one(_structured_ns(classes=["data", "rerun_policy"]), report)
-    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
-    assert "D-7" in out["one_line_summary"] and "(unscoped)" in out["one_line_summary"]
-    ledger = "\n".join(l for l in STRUCTURED_LEDGER.splitlines() if "D-7" not in l) + "\n"
-    out = _run_one(_structured_ns(ledger, classes=["data", "rerun_policy"]), report)
-    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
-    assert "D-10" in out["one_line_summary"] and "data" in out["one_line_summary"]
-    named = ledger + '| D-13 | 2024-05-02 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["data", "rerun_policy"]} |\n'
-    out = _run_one(_structured_ns(named, classes=["data", "rerun_policy"]), report)
-    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "D-13"
-    ns = _structured_ns(named)
-    ns["unit_blocker_classes"] = lambda head, units: {u: None for u in units}   # result.json records no blocker classes
-    out = _run_one(ns, report)   # even the row naming data cannot cover what was not recorded
-    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "unrecorded" in out["one_line_summary"]
-    out = _run_one(_structured_ns(ledger, classes=["data"]), {**_pass_nomerge, "merge_eligible": False})
-    assert out["status"] == "FAIL" and "D-10" in out["one_line_summary"]
 
 
 @pytest.mark.parametrize("origin", [

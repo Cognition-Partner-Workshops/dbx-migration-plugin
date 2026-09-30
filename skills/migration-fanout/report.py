@@ -5,7 +5,9 @@ import re
 from collections import Counter
 
 
-def ledger_violations(changed_paths, unit_ids, wave=None) -> list[str]:
+def protected_files_violations(changed_paths, unit_ids, wave=None) -> list[str]:
+    """The .migration/ paths a PR or verifier branch changed outside the recon directories it owns: the
+    manifests, results, plan and every other protected file are the workflow's and the manager's alone."""
     allowed = tuple(f".migration/recon/{u}/" for u in unit_ids)
     if wave is not None:
         allowed += (f".migration/recon/wave-{wave}/",)
@@ -68,9 +70,9 @@ def validate_verify(verify, passed, wave=None, observed=None) -> list[str]:
         changed = []
     if wave is not None and observed is None:
         problems.append(f"verifier output invalid: branch recon/wave-{wave} not verifiable from git (fetch or diff "
-                        "failed), ledger integrity unverified")
-    problems += [f"verifier output invalid: ledger tampered, changed {p}"
-                 for p in ledger_violations(sorted({*changed, *(observed or [])}), [], wave)]
+                        "failed), protected files unverified")
+    problems += [f"verifier output invalid: protected files tampered, changed {p}"
+                 for p in protected_files_violations(sorted({*changed, *(observed or [])}), [], wave)]
     return problems
 
 
@@ -132,8 +134,8 @@ CHILD_SCHEMA = {
             "type": "object",
             "properties": {"kind": {"type": "string", "enum": ["harness", "human_override"]},
                            "decision_id": {"type": "string"}},
-            "description": "human_override with the D-<n> row of .migration/06_decisions.md that says merge_override "
-                           "for your units; the workflow verifies the row. harness otherwise."},
+            "description": "human_override with the decision slug of the committed manifest's merge_overrides "
+                           "entry covering your units; the workflow checks the entry. harness otherwise."},
         "failure_class": {"type": "string"},
         "write_targets": {"type": "array", "items": {"type": "string"}},
         "changed_paths": {"type": "array", "items": {"type": "string"},
