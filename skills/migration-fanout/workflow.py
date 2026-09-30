@@ -41,7 +41,8 @@ except ValueError as e:
 if isinstance(POINTER, dict) and ("mode" in POINTER or "run_id" in POINTER):
     raise SystemExit(
         f"{POINTER_PATH} no longer takes mode or run_id; a rerun is a new ticket: delete wave-<N>.result.json, "
-        "update the manifest, re-sign it with the doctor and re-dispatch the ticket for its plan step"
+        "edit the manifest's plumbing, re-sign it with the doctor and re-dispatch the ticket for its plan step; "
+        "a changed plan is a new plan step"
     )
 if not isinstance(POINTER, dict) or not isinstance(POINTER.get("manifest"), str):
     raise SystemExit(f"{POINTER_PATH} must be {{manifest: 'wave-N.json', hook_probe, workspace, plugin}}")
@@ -132,8 +133,8 @@ if RESULT_PATH.exists():
         closed = "unreadable"
     raise SystemExit(
         f"{RESULT_PATH} exists: this wave already ran (closed={closed} when readable). "
-        "A rerun is a new ticket: delete that file, update the manifest (the run log refuses the same bytes), "
-        "re-sign it with the doctor and re-dispatch the ticket for its plan step"
+        "A rerun is a new ticket: delete that file, edit the manifest's plumbing (the run log refuses the same "
+        "bytes and a changed plan), re-sign it with the doctor and re-dispatch the ticket for its plan step"
     )
 
 if SMOKE:
@@ -290,9 +291,8 @@ def run_log():
                 if not line.strip():
                     continue
                 run = json.loads(line)
-                if not (isinstance(run, dict) and isinstance(run.get("plan_step"), str)
-                        and isinstance(run.get("manifest_sha"), str) and isinstance(run.get("started"), str)):
-                    raise ValueError(f"line {n} is not a {{plan_step, manifest_sha, started}} record")
+                if not (isinstance(run, dict) and all(isinstance(run.get(k), str) for k in RUN_RECORD)):
+                    raise ValueError(f"line {n} is not a {{{', '.join(RUN_RECORD)}}} record")
                 runs.append(run)
         except (OSError, ValueError) as e:
             raise SystemExit(f"{RUNS_PATH} cannot say which plan steps this wave's runs recorded ({e}); "
@@ -300,15 +300,19 @@ def run_log():
     return runs
 
 
+RUN_RECORD = ("plan_step", "plan_sha", "manifest_sha", "started")
 _RUN_LOCK = None
 
 
 def record_run():
-    """One run of a wave at a time, one run per manifest. The wave lock is held until this process
-    exits, so a run that died holds nothing and a running wave cannot be launched twice, whatever its
-    manifest bytes; the result is rechecked under it. The run log is read and appended under its own
-    lock: the same bytes, concurrent or later, halt on the first record; changed bytes are a new
-    manifest (the doctor signed them) and launch a new run."""
+    """One run of a wave at a time, one run per manifest, one plan per plan step. The wave lock is
+    held until this process exits, so a run that died holds nothing and a running wave cannot be
+    launched twice, whatever its manifest bytes; the result is rechecked under it. The run log is read
+    and appended under its own lock: the same bytes, concurrent or later, halt on the first record;
+    a plumbing edit (brief, repo, secret name, estimates) is a new manifest the doctor signed and
+    launches a new run; a manifest whose plan differs from what this plan step already ran (units,
+    write targets, gates, width, source scope, overrides) halts: scope changes through a plan
+    decision the human selects, which is a new plan step, never a rerun of this one."""
     global _RUN_LOCK
     _RUN_LOCK = LOCK_PATH.open("a")
     try:
@@ -320,13 +324,22 @@ def record_run():
         raise SystemExit(f"{RESULT_PATH} was written while this run was starting: this wave already ran")
     with RUNS_PATH.open("a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        if MANIFEST_SHA in {run["manifest_sha"] for run in run_log()}:
+        runs = run_log()
+        step, plan = MANIFEST["plan_step"], plan_sha(MANIFEST)
+        if MANIFEST_SHA in {run["manifest_sha"] for run in runs}:
             raise SystemExit(
-                f"{RUNS_PATH} records a run of this wave's manifest already (plan step {MANIFEST['plan_step']}); "
-                f"a rerun is a new ticket: delete wave-{TAG}.result.json, update the manifest, re-sign it with the "
-                "doctor and re-dispatch the ticket for its plan step"
+                f"{RUNS_PATH} records a run of this wave's manifest already (plan step {step}); "
+                f"a rerun is a new ticket: delete wave-{TAG}.result.json, edit the manifest's plumbing, re-sign it "
+                "with the doctor and re-dispatch the ticket for its plan step"
             )
-        f.write(json.dumps({"plan_step": MANIFEST["plan_step"], "manifest_sha": MANIFEST_SHA,
+        if any(run["plan_step"] == step and run["plan_sha"] != plan for run in runs):
+            raise SystemExit(
+                f"{RUNS_PATH} records a run of plan step {step} over a different plan: this manifest changes the "
+                "units, write targets, gates, width, source scope or overrides that step ran, not just its plumbing. "
+                "A plan change is a plan decision the human selects, so it runs as a new plan step of the approved "
+                "plan, never as a rerun of this one"
+            )
+        f.write(json.dumps({"plan_step": step, "plan_sha": plan, "manifest_sha": MANIFEST_SHA,
                             "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")},
                            sort_keys=True) + "\n")
         f.flush()

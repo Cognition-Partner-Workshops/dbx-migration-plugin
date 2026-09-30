@@ -271,15 +271,15 @@ def test_a_manifest_launches_one_run_of_its_wave(tmp_path):
     runs = ws / ".migration/waves/wave-0.runs.jsonl"
     logged = [json.loads(l) for l in runs.read_text().splitlines()]
     assert [l["plan_step"] for l in logged] == ["run-wave-0"]
-    assert all(set(l) == {"plan_step", "manifest_sha", "started"} for l in logged)
+    assert all(set(l) == {"plan_step", "plan_sha", "manifest_sha", "started"} for l in logged)
     assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
     # the same manifest bytes launch once: a rerun of the ticket halts on the run log
     (ws / ".migration/waves/wave-0.result.json").unlink()
     proc, calls = _run(cwd, tmp_path / "log", [_pass_report()])
     assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "run-wave-0" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
-    # a rerun is a new manifest: changed bytes re-signed by the doctor launch again
-    _resign(ws, rerun=True)
+    # a rerun is a new manifest: a plumbing edit re-signed by the doctor launches again
+    _resign(ws, max_minutes=46)
     proc, calls = _run(cwd, tmp_path / "log", [_pass_report()])
     assert proc.returncode == 0, proc.stderr
     assert len([json.loads(l) for l in runs.read_text().splitlines()]) == 2
@@ -1151,7 +1151,7 @@ def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
     assert result["closed"] is False and result["batches"][0]["status"] == "PASS"
 
     (ws / ".migration/waves/wave-0.result.json").unlink()
-    _resign(ws, rerun="moved-head")
+    _resign(ws, max_minutes=46)
     subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "b"], check=True)
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
                     "HEAD:migration/x"], check=True)
@@ -1497,7 +1497,7 @@ def test_a_moved_pr_head_is_not_proven_even_with_a_record(tmp_path):
                     "HEAD:migration/x"], check=True)
     mc = _merge_commit(ws, _PR_HEADS[pr])
     (ws / ".migration/waves/wave-0.result.json").unlink()
-    _resign(ws, rerun="moved-head")
+    _resign(ws, max_minutes=46)
     close = _close_report(merged_prs=[_merge_row(pr, mc)])
     close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
                          f"{mc}:refs/heads/migration/x"]]
@@ -1674,9 +1674,13 @@ def test_a_manifest_already_in_the_run_log_does_not_launch_again_before_its_resu
     """A run still going (or one that died) has a log record and no result; a second launch of the same
     bytes would start the same children twice, so the log record alone halts it."""
     ws, cwd = _workspace(tmp_path)
-    sha = hashlib.sha256((ws / ".migration/waves/wave-0.json").read_bytes()).hexdigest()[:12]
+    manifest_bytes = (ws / ".migration/waves/wave-0.json").read_bytes()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from decisions import plan_sha
     (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps(
-        {"plan_step": "run-wave-0", "manifest_sha": sha, "started": "2026-01-05T00:00:00+00:00"}) + "\n")
+        {"plan_step": "run-wave-0", "plan_sha": plan_sha(json.loads(manifest_bytes)),
+         "manifest_sha": hashlib.sha256(manifest_bytes).hexdigest()[:12],
+         "started": "2026-01-05T00:00:00+00:00"}) + "\n")
     proc, calls = _run(cwd, tmp_path, [_pass_report()])
     assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "run-wave-0" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
@@ -1699,6 +1703,24 @@ def test_the_result_records_a_plan_sha_that_ignores_plumbing_but_not_the_source_
     assert _result(ws)["plan_sha"] == first
     (ws / ".migration/waves/wave-0.result.json").unlink()
     _resign(ws, source={**manifest["source"], "params": {"db": "cards"}})
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "different plan" in proc.stderr and "run-wave-0" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+    logged = [json.loads(l) for l in (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()]
+    assert len(logged) == 2 and {l["plan_sha"] for l in logged} == {first}
+    # the changed scope runs as the plan step the human approved for it
+    _resign(ws, plan_step="run-wave-0-cards")
     proc, _ = _run(cwd, tmp_path, [_pass_report()])
     assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["plan_sha"] != first
+    assert _result(ws)["plan_sha"] != first and _result(ws)["plan_step"] == "run-wave-0-cards"
+
+
+def test_a_plan_step_that_ran_without_a_recorded_plan_sha_does_not_rerun_over_a_new_manifest(tmp_path):
+    """A run record that cannot say what plan it ran cannot show the plan is unchanged."""
+    ws, cwd = _workspace(tmp_path)
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps(
+        {"plan_step": "run-wave-0", "manifest_sha": "0" * 12, "started": "2026-01-05T00:00:00+00:00"}) + "\n")
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "plan_sha" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
