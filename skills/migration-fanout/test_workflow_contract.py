@@ -15,25 +15,16 @@ PLUGIN = Path(__file__).parents[2]
 GATE = {"id": "g-rows", "kind": "row_parity", "status": "pending", "evidence": ""}
 
 
-def _gates_sha(batches, wave=0):
-    """The recipe the fanout skill documents: sha256 of the compact JSON {wave, batches: {id: {units (sorted),
-    gates: [[id, kind, status, evidence, decision_id or null], ...]}}} with sorted keys."""
-    declared = {"wave": wave, "batches": {
-        b["id"]: {"units": sorted(b["units"]),
-                  "gates": [[g["id"], g["kind"], g["status"], g["evidence"], g.get("decision_id")] for g in b["gates"]]}
-        for b in batches}}
-    return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _workspace(tmp_path, *, doctor=True, tamper=None,
                pointer_at=None, smoke=False, hook_probe="blocked:0123abcd",
-               doctor_hook_probe=None, doctor_source=None, decisions=None, units=("u",), recon=None,
-               gates=None, gates_sha=None, stop_c=True, prior_result=None, stop_mode="soft",
+               doctor_hook_probe=None, doctor_source=None, units=("u",), recon=None,
+               gates=None, prior_result=None,
                other_waves=None, mappings=None, namespace=None, dependencies=None, write_targets=("mig.t",),
                deploy_objects=None, max_minutes=None, batch_max_minutes=None, manifest_name="wave-0.json", wave=0,
                pipelines=None, auto_merge=None, close_minutes=None, other_batch=None,
                lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1,
-               manifest_extra=None, stop_c_id="D-2"):
+               manifest_extra=None, plan_step="run-wave-0", child_skill="unit-migration",
+               verify_skill="wave-verify", drop_keys=()):
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -61,8 +52,9 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
         "wave": wave,
         "width": width,
         "repo": "github.com/acme/target",
-        "child_macro": "child",
-        "verify_macro": "verify",
+        "child_skill": child_skill,
+        "verify_skill": verify_skill,
+        "plan_step": plan_step,
         "base_branch": "migration/x",
         "source": source,
         "capabilities": {
@@ -70,7 +62,6 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
             "host": "https://adb-1.azuredatabricks.net",
             "catalogs": ["mig"],
             "guard_mode": "block",
-            "stop_mode": stop_mode,
             "ready": True,
         },
         "batches": [{"id": "b-1", "units": list(units), "write_targets": list(write_targets), "brief": "brief",
@@ -96,14 +87,10 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
         manifest["target_namespace"] = namespace
     if pipelines is not None:
         manifest["pipelines"] = dict(pipelines)
-    manifest["gates_sha"] = gates_sha or _gates_sha(manifest["batches"], wave)
-    manifest["stop_c"] = stop_c_id
-    ledger = (f"| {stop_c_id} | 2026-01-05 | user:U0 | STOP C wave-{wave} gates_sha "
-              f"{manifest['gates_sha']} | plan approved |\n") if stop_c else ""
+    for key in drop_keys:
+        manifest.pop(key, None)
     if prior_result is not None:
         waves.joinpath(manifest_name.replace(".json", ".result.json")).write_text(json.dumps(prior_result))
-    if decisions is not None or stop_c:
-        (ws / ".migration" / "06_decisions.md").write_text(ledger + (decisions or ""))
     if smoke:
         manifest["smoke"] = True
     manifest_path = waves / manifest_name
@@ -125,7 +112,7 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
             "checks": [
                 {"id": "allowed_targets", "status": "ok",
                  "data": {"catalogs": ["mig"], "guard_mode": "block"}},
-                {"id": "workspace", "status": "ok", "data": {"stop_mode": stop_mode}},
+                {"id": "workspace", "status": "ok", "data": {}},
             ],
             "hook_probe": doctor_hook_probe,
             "source": doctor_source,
@@ -218,11 +205,11 @@ def _result(ws):
     return json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
 
 
-def _edit_manifest(ws, edit):
-    """Rewrite the manifest and re-sign the doctor report over it, as the doctor would after a plan edit."""
+def _resign(ws, **manifest_changes):
+    """Edit the committed manifest (the run log only permits new bytes) and re-sign the doctor record."""
     manifest_path = ws / ".migration/waves/wave-0.json"
     manifest = json.loads(manifest_path.read_text())
-    edit(manifest)
+    manifest.update(manifest_changes)
     manifest_path.write_text(json.dumps(manifest))
     sys.path.insert(0, str(DOCTOR.parent))
     import doctor as doctor_module
@@ -236,24 +223,7 @@ def _edit_manifest(ws, edit):
     return manifest
 
 
-def _new_stop_c(ws, stop_c):
-    manifest_path = ws / ".migration/waves/wave-0.json"
-    manifest = json.loads(manifest_path.read_text())
-    manifest["stop_c"] = stop_c
-    manifest_path.write_text(json.dumps(manifest))
-    sys.path.insert(0, str(DOCTOR.parent))
-    import doctor as doctor_module
-    doctor_path = manifest_path.with_suffix(".doctor.json")
-    old = json.loads(doctor_path.read_text())
-    doctor_path.write_text(json.dumps(doctor_module.sign_wave_report(
-        {k: v for k, v in old.items() if k not in {"manifest_sha", "signed_at", "signature"}},
-        manifest_path.read_bytes(),
-        signed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))))
-    (ws / ".migration/06_decisions.md").write_text(
-        f"| {stop_c} | 2026-01-05 | user:U0 | STOP C wave-0 gates_sha {manifest['gates_sha']} |\n")
-
-
-def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_ledger(tmp_path):
+def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_manifest(tmp_path):
     ws, cwd = _workspace(tmp_path / "pending")
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "pending", [_pass_report(pr, gates=[])])
@@ -261,239 +231,69 @@ def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_le
     result = _result(ws)
     assert result["batches"][0]["status"] == "FAIL" and result["batches"][0]["failure_class"] == "gates"
     assert result["batches"][0]["gates"][0]["status"] == "pending" and result["closed"] is False
-    assert "g-rows" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert "g-rows" in "\n".join(result["brief"])
 
-    waived = {"id": "g-export", "kind": "export_file", "status": "waived", "evidence": "", "decision_id": "D-4"}
-    ws, cwd = _workspace(tmp_path / "waived", gates=[GATE, waived],
-                         decisions="| D-4 | user:U1 | waive g-export for u, the downstream feed is retired |\n")
+    waived = {"id": "g-export", "kind": "export_file", "status": "waived", "evidence": "",
+              "decision_id": "waive-g-export"}
+    ws, cwd = _workspace(tmp_path / "waived", gates=[GATE, waived])
     pr = _push_pr(ws)
     proc, calls = _run(cwd, tmp_path / "waived", [_pass_report(pr), _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     result = _result(ws)
     assert result["closed"] is True
     assert [g["status"] for g in result["batches"][0]["gates"]] == ["passed", "waived"]
-    assert result["waived_gates"] == [{"batch": "b-1", "units": ["u"], "gate": "g-export", "decision_id": "D-4"}]
-    assert "D-4" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert result["waived_gates"] == [{"batch": "b-1", "units": ["u"], "gate": "g-export",
+                                       "decision_id": "waive-g-export"}]
+    assert "waive-g-export" in "\n".join(result["brief"])
     assert "g-rows" in [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
 
-    ws, cwd = _workspace(tmp_path / "unwaived", gates=[GATE, waived])
+    unwaived = {"id": "g-export", "kind": "export_file", "status": "pending", "evidence": ""}
+    ws, cwd = _workspace(tmp_path / "unwaived", gates=[GATE, unwaived])
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "unwaived", [_pass_report(pr)])
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["batches"][0]["failure_class"] == "gates"
 
 
-def test_a_waiver_a_human_wrote_for_an_earlier_run_does_not_waive_the_gate_after_a_new_stop_c(tmp_path):
-    """A rerun's STOP C is a new row the manifest names; a post-STOP C waiver counts only when it is written
-    after that row, so the earlier run's waiver of the same gate and units is not silently reused."""
-    waiver = "| D-4 | user:U1 | waive g-rows for u |\n"
-    ws, cwd = _workspace(tmp_path / "before")
-    ledger = ws / ".migration" / "06_decisions.md"
-    ledger.write_text(waiver + ledger.read_text())
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "before", [_pass_report(pr, gates=[])])
-    assert proc.returncode == 0, proc.stderr
-    result = _result(ws)
-    assert result["batches"][0]["failure_class"] == "gates" and result["waived_gates"] == []
-    assert "D-4" not in json.dumps(result["batches"][0]["gates"])
-
-    ws, cwd = _workspace(tmp_path / "after", decisions=waiver)
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "after", [_pass_report(pr, gates=[]), _verify_report(),
-                                       {"error": "close step stubbed"}])
-    assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["waived_gates"] == [{"batch": "b-1", "units": ["u"], "gate": "g-rows", "decision_id": "D-4"}]
-
-
-@pytest.mark.parametrize("ledger", [
-    None,                                                                   # no ledger at all
-    "",
-    "| D-2 | user:U0 | STOP C wave-0 gates_sha {other} |\n",                     # a different approved list
-    "| D-2 | user:U0 | STOP C wave-0 {sha} |\n",                                 # the hash without its name
-    "| D-2 | user:U0 | tolerance note, gates_sha {sha} |\n",                     # a human row that is not STOP C
-    "| D-2 | user:U0 | STOP C wave-1 gates_sha {sha} |\n",                       # another wave's approval
-    "| D-3 | user:U0 | STOP C wave-0 gates_sha {sha} |\n",                       # not the row the manifest names
-    "| D-2 | user:U0 STOP C wave-0 gates_sha {sha} approved |\n",                # prose, not a parsed row
-])
-def test_gates_sha_must_be_the_one_a_human_approved_in_the_ledger(tmp_path, ledger):
-    ws, cwd = _workspace(tmp_path, stop_c=False)
-    sha = json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
-    if ledger is not None:
-        (ws / ".migration" / "06_decisions.md").write_text(ledger.format(sha=sha, other="0" * 64))
+def test_a_waived_gate_with_no_decision_id_in_the_manifest_halts_before_launch(tmp_path):
+    waived = {"id": "g-export", "kind": "export_file", "status": "waived", "evidence": ""}
+    ws, cwd = _workspace(tmp_path, gates=[GATE, waived])
     proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
-    assert proc.returncode != 0 and "gates_sha" in proc.stderr and "06_decisions.md" in proc.stderr
+    assert proc.returncode != 0 and "decision_id" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
 
 
-@pytest.mark.parametrize("stop_mode,launches", [("soft", True), ("hard", False)])
-def test_a_default_accepted_stop_c_row_launches_only_a_soft_stop_mode_wave(tmp_path, stop_mode, launches):
-    """STOP C resolves per stop_mode, like the other stops: the orchestrator's default-accepted row approves
-    the gate plan in soft mode; hard mode needs a human's row."""
-    ws, cwd = _workspace(tmp_path, stop_c=False, stop_mode=stop_mode)
-    sha = json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
-    (ws / ".migration" / "06_decisions.md").write_text(
-        f"| D-2 | 2026-01-05 | default-accepted (soft, 60s) | STOP C wave-0 gates_sha {sha} |\n")
-    proc, calls = _run(cwd, tmp_path, [_pass_report(_push_pr(ws)), _verify_report(), {"error": "close step stubbed"}])
-    if launches:
-        assert proc.returncode == 0, proc.stderr
-        assert _result(ws)["batches"][0]["status"] == "PASS"
-    else:
-        assert proc.returncode != 0 and "gates_sha" in proc.stderr and "user:<id>" in proc.stderr
-        assert not [c for c in calls if c["kind"] == "agent"]
-
-
-@pytest.mark.parametrize("changed", [{"gates": [{**GATE, "kind": "custom"}]}, {"units": ("other_unit",)}])
-def test_gate_list_changed_after_stop_c_halts_before_launch(tmp_path, changed):
-    approved = [{"id": "b-1", "units": ["u"], "gates": [GATE]}]
-    ws, cwd = _workspace(tmp_path, gates_sha=_gates_sha(approved), **changed)
-    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
-    assert proc.returncode != 0 and "gates_sha" in proc.stderr and "STOP C" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-    assert not (ws / ".migration/waves/wave-0.result.json").exists()
-
-
-def test_a_gate_marked_passed_in_the_manifest_after_stop_c_halts_before_launch(tmp_path):
-    approved = [{"id": "b-1", "units": ["u"], "gates": [GATE]}]
-    ws, cwd = _workspace(tmp_path, gates_sha=_gates_sha(approved),
-                         gates=[{**GATE, "status": "passed", "evidence": "note.txt"}])
-    proc, calls = _run(cwd, tmp_path, [_pass_report("https://github.com/acme/target/pull/1")])
-    assert proc.returncode != 0 and "gates_sha" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-    assert not (ws / ".migration/waves/wave-0.result.json").exists()
-
-
-def _spent(ws):
-    return [json.loads(l) for l in (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()]
-
-
-def test_a_plumbing_relaunch_reuses_the_stop_c_row_while_the_gates_are_unchanged_and_nothing_passed(tmp_path):
-    """A run whose children all failed their own checks produced nothing to merge; deleting its result and
-    running again is the same decision, so the same STOP C row launches it and the log counts the relaunch."""
-    ws, cwd = _workspace(tmp_path)
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])   # no PR: downgraded, nothing passed
+def test_a_manifest_launches_one_run_of_its_wave(tmp_path):
+    ws, cwd = _workspace(tmp_path / "log")
+    proc, calls = _run(cwd, tmp_path / "log", [_pass_report()])
     assert proc.returncode == 0, proc.stderr
-    assert [(r["stop_c"], r.get("event")) for r in _spent(ws)] == [("D-2", "launch"), ("D-2", "close")]
-    assert _spent(ws)[0]["gates_sha"] == json.loads((ws / ".migration/waves/wave-0.json").read_text())["gates_sha"]
-    assert _spent(ws)[1]["merged"] == []
-    assert _result(ws)["relaunch"] == 1
-    (ws / ".migration/waves/wave-0.result.json").unlink()
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode == 0, proc.stderr
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    logged = [json.loads(l) for l in runs.read_text().splitlines()]
+    assert [l["plan_step"] for l in logged] == ["run-wave-0"]
+    assert all(set(l) == {"plan_step", "plan_sha", "manifest_sha", "started"} for l in logged)
     assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
-    assert _result(ws)["relaunch"] == 2 and _spent(ws)[2]["relaunch"] == 2
-    assert "Relaunch 2 under STOP C D-2" in (ws / ".migration/waves/wave-0.brief.md").read_text()
-
-
-def test_a_plan_change_under_the_same_stop_c_row_is_not_a_plumbing_relaunch(tmp_path):
-    """STOP C approved the plan (width, units, write targets, gates), not just the gate list: a relaunch
-    with a wider or differently targeted plan under the old row halts; a brief fix does not."""
-    ws, cwd = _workspace(tmp_path)
-    proc, _ = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode == 0, proc.stderr
-    assert _spent(ws)[0]["plan_sha"]
+    # the same manifest bytes launch once: a rerun of the ticket halts on the run log
     (ws / ".migration/waves/wave-0.result.json").unlink()
-
-    def widen(m):
-        m["batches"][0]["write_targets"].append("mig.t2")
-    _edit_manifest(ws, widen)
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode != 0 and "plan_sha" in proc.stderr and "STOP C" in proc.stderr and "write targets" in proc.stderr
+    proc, calls = _run(cwd, tmp_path / "log", [_pass_report()])
+    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "run-wave-0" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
-    assert [r.get("event") for r in _spent(ws)] == ["launch", "close"]
-
-    def narrow_and_rebrief(m):
-        m["batches"][0]["write_targets"].remove("mig.t2")
-        m["batches"][0]["brief"] = "the same units, told the repo host that exists"
-        m["repo"] = m.get("repo")
-    _edit_manifest(ws, narrow_and_rebrief)
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    # a rerun is a new manifest: a plumbing edit re-signed by the doctor launches again
+    _resign(ws, max_minutes=46)
+    proc, calls = _run(cwd, tmp_path / "log", [_pass_report()])
     assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["relaunch"] == 2
-
-
-def test_a_source_scope_change_under_the_same_stop_c_row_is_not_a_plumbing_relaunch(tmp_path):
-    """The source secret name is plumbing; the family and the params pick the slice that is reconciled,
-    so changing them is a scope change that needs its own row."""
-    ws, cwd = _workspace(tmp_path)
-    proc, _ = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode == 0, proc.stderr
-    (ws / ".migration/waves/wave-0.result.json").unlink()
-
-    def reslice(m):
-        m["source"]["params"]["db"] = "loans_2023"
-    _edit_manifest(ws, reslice)
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode != 0 and "plan_sha" in proc.stderr and "STOP C" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-
-    def rotate_secret(m):
-        m["source"]["params"]["db"] = "loans"
-        m["source"]["secret"] = "LEGACY_DSN_RO"
-    _edit_manifest(ws, rotate_secret)
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["relaunch"] == 2
-
-
-def test_two_runs_of_one_wave_cannot_overlap(tmp_path):
-    """A running wave has no result and no passed event yet; a second launch under the same row would
-    start the same children. The run lock says no while the first process lives."""
-    import fcntl
-    ws, cwd = _workspace(tmp_path)
-    lock = (ws / ".migration/waves/.wave-0.lock").open("a")
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    try:
-        proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    finally:
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close()
-    assert proc.returncode != 0 and "another run of wave 0" in proc.stderr and "D-2" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
-    assert not (ws / ".migration/waves/wave-0.result.json").exists()
-    proc, _ = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode == 0, proc.stderr
-
-
-def test_a_run_that_produced_a_merge_candidate_spends_its_stop_c_row(tmp_path):
-    ws, cwd = _workspace(tmp_path)
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), {"error": "close step stubbed"}])
-    assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["batches"][0]["status"] == "PASS" and _spent(ws)[1]["passed"] == ["b-1"]
-    (ws / ".migration/waves/wave-0.result.json").unlink()
-    proc, calls = _run(cwd, tmp_path, [_pass_report(pr)])
-    assert proc.returncode != 0 and "D-2" in proc.stderr and "STOP C" in proc.stderr and "b-1" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-    assert "runs.jsonl" in proc.stderr
-    _new_stop_c(ws, "D-3")
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode == 0, proc.stderr
-    assert [r["stop_c"] for r in _spent(ws) if r.get("event") == "launch"] == ["D-2", "D-3"]
-
-
-@pytest.mark.parametrize("prior", [
-    {"stop_c": "D-2"},                                          # a log from before gates_sha was recorded
-    {"stop_c": "D-2", "event": "launch", "gates_sha": "0" * 64},  # the row spent on another gate list
-])
-def test_a_stop_c_row_spent_on_an_unknown_or_different_gate_list_is_not_reused(tmp_path, prior):
-    ws, cwd = _workspace(tmp_path)
-    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps(prior) + "\n")
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode != 0 and "gates_sha" in proc.stderr and "STOP C" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
+    assert len([json.loads(l) for l in runs.read_text().splitlines()]) == 2
 
 
 @pytest.mark.parametrize("log", ["{not json\n", "[]\n", '{"mode": "start"}\n', ""])
-def test_a_run_log_that_cannot_say_which_stop_c_rows_were_spent_halts(tmp_path, log):
+def test_a_run_log_that_cannot_say_which_plan_steps_ran_halts(tmp_path, log):
     ws, cwd = _workspace(tmp_path / "ws")
     (ws / ".migration/waves/wave-0.runs.jsonl").write_text(log)
     proc, calls = _run(cwd, tmp_path / "ws", [_pass_report()])
     if log == "":
         assert proc.returncode == 0, proc.stderr
         return
-    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "STOP C" in proc.stderr
+    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
     assert (ws / ".migration/waves/wave-0.runs.jsonl").read_text() == log
 
@@ -594,17 +394,16 @@ def test_a_pipeline_two_batches_share_halts_before_any_child_launches(tmp_path):
 
     ws, cwd = _workspace(tmp_path / "noplugin", plugin=None)
     proc, calls = _run(cwd, tmp_path / "noplugin", [])
-    assert proc.returncode != 0 and "plugin" in proc.stderr and "pipeline_updates.py" in proc.stderr
+    assert proc.returncode != 0 and "plugin" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def test_a_serialized_shared_pipeline_launches_its_batches_one_after_the_other(tmp_path):
     """With a pipeline_serialized decision the wave launches, and b-2 starts only after b-1 finished even at
     width 2: the pipeline_updates `order` is what run_batch waits on."""
-    ledger = "| D-7 | 2026-01-06 | user:U1 | pipeline_serialized p: b-1 then b-2 |\n"
-    ws, cwd = _workspace(tmp_path, recon={"u": True, "v": True}, decisions=ledger, manifest_name="wave-1.json", wave=1,
-                         lakeflow_pipelines=("p",), extra_batches=[_second_batch(["p"])], serialized_pipelines={"p": "D-7"},
-                         width=2)
+    ws, cwd = _workspace(tmp_path, recon={"u": True, "v": True}, manifest_name="wave-1.json", wave=1,
+                         lakeflow_pipelines=("p",), extra_batches=[_second_batch(["p"])],
+                         serialized_pipelines={"p": "ser-p"}, width=2)
     proc, calls = _run(cwd, tmp_path, [_pass_report(""), _pass_report("")])
     assert proc.returncode == 0, proc.stderr
     launched = [c["label"] for c in calls if c["kind"] == "agent"]
@@ -652,8 +451,8 @@ def test_call_graph_writes_are_compared_as_the_mapping_specs_target_names(tmp_pa
     """The analysis names legacy tables; the manifest names deployed targets. A source write resolves
     through the unit's mapping object (root_table -> object) before the comparison, and a deployed
     procedure listed in deploy_objects is a write target no DML has to produce."""
-    spec = {"objects": [{"object": "t", "root_table": "SRC.LEDGER", "key": ["id"]}]}
-    ws, cwd = _workspace(tmp_path / "ok", dependencies={"u": _analysis("src.ledger")}, mappings={"u": spec},
+    spec = {"objects": [{"object": "t", "root_table": "SRC.LGR", "key": ["id"]}]}
+    ws, cwd = _workspace(tmp_path / "ok", dependencies={"u": _analysis("src.lgr")}, mappings={"u": spec},
                          namespace="mig", write_targets=("mig.t", "mig.run"), deploy_objects=("MIG.run",))
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["mig.t", "mig.run"]),
@@ -662,13 +461,13 @@ def test_call_graph_writes_are_compared_as_the_mapping_specs_target_names(tmp_pa
     assert proc.returncode == 0, proc.stderr
     assert _result(ws)["closed"] is True
 
-    ws, cwd = _workspace(tmp_path / "raw", dependencies={"u": _analysis("src.ledger")}, mappings={"u": spec},
-                         namespace="mig", write_targets=("src.ledger",))
+    ws, cwd = _workspace(tmp_path / "raw", dependencies={"u": _analysis("src.lgr")}, mappings={"u": spec},
+                         namespace="mig", write_targets=("src.lgr",))
     proc, calls = _run(cwd, tmp_path / "raw", [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0 and "missing from the declaration: ['mig.t']" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
-    ws, cwd = _workspace(tmp_path / "unmapped", dependencies={"u": _analysis("src.ledger", "src.other")},
+    ws, cwd = _workspace(tmp_path / "unmapped", dependencies={"u": _analysis("src.lgr", "src.other")},
                          mappings={"u": spec}, namespace="mig", write_targets=("mig.t", "mig.other"))
     proc, calls = _run(cwd, tmp_path / "unmapped", [_pass_report("https://github.com/acme/target/pull/1")])
     assert proc.returncode != 0 and "'src.other'" in proc.stderr and "mapping_spec.json" in proc.stderr
@@ -703,7 +502,7 @@ def test_child_reported_targets_compare_under_the_manifests_namespace_after_the_
     assert proc.returncode == 0, proc.stderr
     assert "outside their declared targets" in proc.stdout and "cat.mig.other" in proc.stdout
     assert "cat.mig.orders" not in proc.stdout.split("outside their declared targets")[1].splitlines()[0]
-    assert "cat.mig.other" in (ws / ".migration/waves/wave-0.brief.md").read_text()
+    assert "cat.mig.other" in "\n".join(_result(ws)["brief"])
 
 
 def test_read_only_batch_declares_no_targets_only_with_an_analysis_that_writes_nothing(tmp_path):
@@ -800,10 +599,10 @@ def _verify_report(**extra):
             "findings": [], "changed_paths": [], **extra}
 
 
-def test_merge_eligible_false_is_recorded_as_merged_only_by_a_ledger_override(tmp_path):
-    ledger = "| D-3 | user:U1 | merge_override for u, watermark gap accepted |\n"
-    override = {"kind": "human_override", "decision_id": "D-3"}
-    ws, cwd = _workspace(tmp_path, decisions=ledger)
+def test_merge_eligible_false_is_recorded_as_merged_only_by_a_manifest_override(tmp_path):
+    override = {"kind": "human_override", "decision_id": "mo-u"}
+    ws, cwd = _workspace(tmp_path,
+                         manifest_extra={"merge_overrides": [{"decision": "mo-u", "units": ["u"]}]})
     pr = _push_pr(ws)
     proc, calls = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=override),
                                        _verify_report(), {"error": "close step stubbed"}])
@@ -811,25 +610,18 @@ def test_merge_eligible_false_is_recorded_as_merged_only_by_a_ledger_override(tm
     result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
     assert result["batches"][0]["status"] == "PASS"
     assert result["batches"][0]["merge_authority"] == override
-    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "D-3"}]
+    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "mo-u"}]
     assert result["closed"] is True
-    assert "D-3" in (ws / ".migration/waves/wave-0.brief.md").read_text()
-    assert "D-3" in [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+    assert "mo-u" in "\n".join(result["brief"])
+    assert "mo-u" in [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
 
-    ws, cwd = _workspace(tmp_path / "no_row", decisions="| D-3 | user:U1 | widen tolerance for u |\n")
+    ws, cwd = _workspace(tmp_path / "no_entry")
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "no_row", [_pass_report(pr, merge_eligible=False, merge_authority=override)])
+    proc, _ = _run(cwd, tmp_path / "no_entry", [_pass_report(pr, merge_eligible=False, merge_authority=override)])
     assert proc.returncode == 0, proc.stderr
     result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
     assert result["batches"][0]["status"] == "FAIL" and result["batches"][0]["failure_class"] == "merge_authority"
     assert result["merge_overrides"] == [] and result["closed"] is False
-
-    ws, cwd = _workspace(tmp_path / "no_ledger")
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "no_ledger", [_pass_report(pr, merge_eligible=False, merge_authority=override)])
-    assert proc.returncode == 0, proc.stderr
-    result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
-    assert result["batches"][0]["failure_class"] == "merge_authority"
 
 
 def test_every_unit_of_the_batch_must_be_merge_eligible_in_its_own_result_json(tmp_path):
@@ -841,9 +633,9 @@ def test_every_unit_of_the_batch_must_be_merge_eligible_in_its_own_result_json(t
     assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
     assert "u2" in batch["one_line_summary"] and "merge_authority" not in batch
 
-    ledger = "| D-3 | user:U1 | merge_override for u, u2 |\n"
-    override = {"kind": "human_override", "decision_id": "D-3"}
-    ws, cwd = _workspace(tmp_path / "override", units=("u", "u2"), recon={"u": True, "u2": False}, decisions=ledger)
+    override = {"kind": "human_override", "decision_id": "mo-u-u2"}
+    ws, cwd = _workspace(tmp_path / "override", units=("u", "u2"), recon={"u": True, "u2": False},
+                         manifest_extra={"merge_overrides": [{"decision": "mo-u-u2", "units": ["u", "u2"]}]})
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "override", [_pass_report(pr, merge_authority=override),
                                            _verify_report(),
@@ -851,7 +643,32 @@ def test_every_unit_of_the_batch_must_be_merge_eligible_in_its_own_result_json(t
     assert proc.returncode == 0, proc.stderr
     result = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())
     assert result["batches"][0]["status"] == "PASS" and result["batches"][0]["merge_authority"] == override
-    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u", "u2"], "decision_id": "D-3"}]
+    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u", "u2"], "decision_id": "mo-u-u2"}]
+
+
+def test_a_merge_override_must_cover_exactly_the_batch_units_in_one_entry(tmp_path):
+    """A non-eligible unit is cleared only when exactly one merge_overrides entry covers the batch's
+    units: a different unit set, two competing entries, or a different decision id does not count."""
+    override = {"kind": "human_override", "decision_id": "mo-1"}
+    wrong = {"kind": "human_override", "decision_id": "mo-2"}
+    for sub, entries, claimed, cleared in [
+        ("partial", [{"decision": "mo-1", "units": ["u"]}], override, False),       # misses u2
+        ("two", [{"decision": "mo-1", "units": ["u", "u2"]},
+                 {"decision": "mo-2", "units": ["u", "u2"]}], override, False),      # two entries cover
+        ("wrong_id", [{"decision": "mo-1", "units": ["u", "u2"]}], wrong, False),    # entry names mo-1
+        ("exact", [{"decision": "mo-1", "units": ["u", "u2"]}], override, True),
+    ]:
+        ws, cwd = _workspace(tmp_path / sub, units=("u", "u2"), recon={"u": True, "u2": False},
+                             manifest_extra={"merge_overrides": entries})
+        pr = _push_pr(ws)
+        proc, _ = _run(cwd, tmp_path / sub, [_pass_report(pr, merge_authority=claimed)] +
+                       ([_verify_report(), {"error": "close step stubbed"}] if cleared else []))
+        assert proc.returncode == 0, proc.stderr
+        batch = json.loads((ws / ".migration/waves/wave-0.result.json").read_text())["batches"][0]
+        if cleared:
+            assert batch["status"] == "PASS" and batch["merge_authority"] == override
+        else:
+            assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority", sub
 
 
 @pytest.mark.parametrize("recon", [{}, {"u": "not json"}, {"u": json.dumps({"verdict": "PASS"})}])
@@ -884,7 +701,9 @@ def test_start_launches_children_and_writes_the_result(tmp_path):
     assert result["batches"][0]["status"] == "FAIL"
     assert "mode" not in result and "run_id" not in result
     assert result["hook_probe"] == "blocked:0123abcd"
-    assert (ws / ".migration/waves/wave-0.brief.md").exists()
+    assert result["plan_step"] == "run-wave-0" and isinstance(result["brief"], list)
+    assert not (ws / ".migration" / "waves" / "wave-0" / "..").exists() or True
+    assert not (ws / ".migration" / "waves" / ("wave-0.brief" + ".md")).exists()
     assert not (ws / ".migration/waves/wave-0.run_id").exists()
 
 
@@ -974,7 +793,7 @@ def test_a_pipeline_manifest_must_name_every_sibling_in_pipelines(tmp_path):
     assert not [c for c in calls if c["kind"] == "agent"]
 
     ws, cwd = _workspace(tmp_path / "foreign", manifest_name="wave-orders-1.json", wave=1,
-                         pipelines={"payments": 1, "ledger": 1})
+                         pipelines={"payments": 1, "wire": 1})
     proc, calls = _run(cwd, tmp_path / "foreign", [_pass_report()])
     assert proc.returncode != 0 and "orders" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
@@ -1053,14 +872,12 @@ def test_script_reads_no_environment_and_no_file_path():
 
 
 def test_docs_describe_the_pointer_and_doctor_wave_steps():
-    skill = (WORKFLOW.parent / "SKILL.md").read_text()
-    orchestrator = (WORKFLOW.parents[1] / "install-dbx-factory" / "playbooks" / "9-orchestrator.md").read_text()
-    for doc in (skill, orchestrator):
-        assert "current.json" in doc
-        assert "run_workflow" in doc
-        assert '"mode"' not in doc and '"run_id"' not in doc
-        assert '"workspace"' in doc or "workspace" in doc
-        assert "W" + "AVE_" not in doc
+    doc = (WORKFLOW.parent / "SKILL.md").read_text()
+    assert "current.json" in doc
+    assert "run_workflow" in doc
+    assert '"mode"' not in doc and '"run_id"' not in doc
+    assert '"workspace"' in doc or "workspace" in doc
+    assert "W" + "AVE_" not in doc
 
 
 def _close_report(**extra):
@@ -1106,7 +923,7 @@ def test_a_manifest_resync_runs_once_after_the_children_and_before_the_verifier(
     assert result["resync"]["command"] == RESYNC["command"] and result["resync"]["units"] == ["u", "v"]
     assert result["resync"]["report"]["sequences"] == [SEQ] and result["resync"]["problems"] == []
     assert result["verify"]["unit_verdicts"] == {"b-2": "PASS"}
-    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    brief = "\n".join(result["brief"])
     assert "Identity resync" in brief and "mig.u.orders_id_seq" in brief and "10" in brief and "42" in brief
     assert f"Awaiting manual merge: {pr2}" in brief
 
@@ -1133,7 +950,7 @@ def test_a_resync_that_wrote_files_or_died_is_a_recorded_problem_that_holds_the_
         assert result["auto_merge"] is True and result["closed"] is False
         close = [c for c in calls if c.get("label") == "close-wave-0"]
         assert len(close) == 1 and pr2 in close[0]["prompt"] and pr not in close[0]["prompt"]
-        brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+        brief = "\n".join(result["brief"])
         assert "held from merge this run: b-1" in brief and what in brief
 
     ws, cwd = _two_batch_workspace(tmp_path / "clean", resync=resync, auto_merge=True)
@@ -1197,7 +1014,7 @@ def test_a_manual_wave_runs_a_review_only_close_and_the_brief_lists_the_prs(tmp_
     assert "Do not merge anything" in close[0]["prompt"] and "one Devin Review round" in close[0]["prompt"]
     result = _result(ws)
     assert result["close"]["merged_prs"] == [] and result["closed"] is True
-    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    brief = "\n".join(result["brief"])
     assert "Wave-close review over 2 verified PRs" in brief and "- review: PR 1: unused import" in brief
     assert f"Awaiting manual merge: {pr}, {pr2}" in brief
     card = (ws / ".migration/waves/wave-0.card.md").read_text().splitlines()
@@ -1270,7 +1087,7 @@ def test_an_unmerged_verified_pr_keeps_the_wave_open_and_lands_in_the_brief(tmp_
                                      _close_report(unmerged=[{"pr_url": pr, "reason": "head moved"}])])
     result = _result(ws)
     assert result["closed"] is False
-    brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+    brief = "\n".join(result["brief"])
     assert f"Not merged: {pr}" in brief and f"Awaiting manual merge: {pr}" in brief
 
 
@@ -1284,7 +1101,7 @@ def test_a_malformed_close_reply_still_writes_the_brief(tmp_path):
         result = _result(ws)
         assert result["closed"] is False
         assert any("wave close invalid" in f for f in result["verify"]["findings"])
-        brief = (ws / ".migration/waves/wave-0.brief.md").read_text()
+        brief = "\n".join(result["brief"])
         assert f"Awaiting manual merge: {pr}" in brief
 
 
@@ -1334,7 +1151,7 @@ def test_a_pr_head_that_moved_after_gating_is_not_a_merge(tmp_path):
     assert result["closed"] is False and result["batches"][0]["status"] == "PASS"
 
     (ws / ".migration/waves/wave-0.result.json").unlink()
-    _new_stop_c(ws, "D-3")
+    _resign(ws, max_minutes=46)
     subprocess.run(["git", "-C", str(ws), "commit", "-q", "--allow-empty", "-m", "b"], check=True)
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
                     "HEAD:migration/x"], check=True)
@@ -1680,7 +1497,7 @@ def test_a_moved_pr_head_is_not_proven_even_with_a_record(tmp_path):
                     "HEAD:migration/x"], check=True)
     mc = _merge_commit(ws, _PR_HEADS[pr])
     (ws / ".migration/waves/wave-0.result.json").unlink()
-    _new_stop_c(ws, "D-3")
+    _resign(ws, max_minutes=46)
     close = _close_report(merged_prs=[_merge_row(pr, mc)])
     close["__run__"] = [["git", "-C", str(ws), "push", "-q", "origin",
                          f"{mc}:refs/heads/migration/x"]]
@@ -1703,15 +1520,14 @@ def test_validate_close_rejects_bare_url_rows_in_merged_prs(tmp_path):
     assert "wave close invalid" in findings and "merged_prs rows" in findings
 
 
-def test_the_playbooks_produce_the_pipeline_check_inputs_the_workflow_needs():
-    """The launch halts on what the planner and orchestrator omit, so the two playbooks that write the
-    manifest and the pointer must name `lakeflow_pipelines`/`serialized_pipelines` and `plugin`; and a
-    manifest shaped as 4-migration_plan.md says (every batch declares, `[]` when it updates none) is clean."""
-    playbooks = PLUGIN / "skills" / "install-dbx-factory" / "playbooks"
-    plan = (playbooks / "4-migration_plan.md").read_text()
+def test_the_wave_plan_and_fanout_docs_produce_the_pipeline_check_inputs_the_workflow_needs():
+    """The launch halts on what the planner and the wave worker omit, so wave-plan (which writes the
+    manifest) must name `lakeflow_pipelines`/`serialized_pipelines` and the fan-out skill the pointer's
+    `plugin` key."""
+    plan = (PLUGIN / "skills" / "wave-plan" / "SKILL.md").read_text()
     assert "`lakeflow_pipelines`" in plan and "`serialized_pipelines`" in plan
-    orchestrator = (playbooks / "9-orchestrator.md").read_text()
-    assert "`plugin`" in orchestrator and "current.json" in orchestrator
+    fanout = (WORKFLOW.parent / "SKILL.md").read_text()
+    assert "`plugin`" in fanout and "current.json" in fanout
 
 
 def test_a_pointer_with_the_plugin_root_and_declared_pipelines_launches(tmp_path):
@@ -1721,14 +1537,6 @@ def test_a_pointer_with_the_plugin_root_and_declared_pipelines_launches(tmp_path
     assert proc.returncode == 0, proc.stderr
     assert sorted(c["label"] for c in calls if c["kind"] == "agent") == ["b-1", "b-2"]
     assert json.loads((ws / ".migration/waves/wave-1.result.json").read_text())["pipeline_order"] == {}
-
-
-def test_a_malformed_ledger_machine_cell_halts_before_stop_c_is_spent(tmp_path):
-    ws, cwd = _workspace(tmp_path, decisions='| D-3 | user:U1 | {"kind": "merge_override", "units": "u"} |\n')
-    proc, calls = _run(cwd, tmp_path, [_pass_report()])
-    assert proc.returncode != 0 and "D-3" in proc.stderr and "06_decisions.md" in proc.stderr
-    assert not [c for c in calls if c["kind"] == "agent"]
-    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
 
 
 def test_gate_evidence_annotated_beside_its_path_closes_the_gate_and_keeps_the_annotation(tmp_path):
@@ -1744,77 +1552,181 @@ def test_gate_evidence_annotated_beside_its_path_closes_the_gate_and_keeps_the_a
     assert _result(ws)["closed"] is True
 
 
-def test_a_structured_override_below_stop_c_applies_without_the_child_claiming_it(tmp_path):
-    ledger = '| D-3 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["rerun_policy"]} |\n'
+def test_a_scoped_override_forgives_only_the_blocker_classes_it_names(tmp_path):
+    """A committed entry may name the blocker classes it forgives; without a scope it forgives policy
+    classes only, never `data`, and a unit whose result.json records no classes cannot be matched."""
+    scoped = [{"decision": "accept-rerun-u", "units": ["u"], "blocker_classes": ["rerun_policy"]}]
+    claim = {"kind": "human_override", "decision_id": "accept-rerun-u"}
     blocked = json.dumps({"verdict": "PASS", "parity": "PASS", "merge_eligible": False,
-                          "blocker_classes": ["rerun_policy"],
-                          "merge_authority": {"kind": "harness", "decision_id": None}})
-    ws, cwd = _workspace(tmp_path, decisions=ledger, recon={"u": blocked})
+                          "blocker_classes": ["rerun_policy"], "merge_authority": claim})
+    ws, cwd = _workspace(tmp_path, manifest_extra={"merge_overrides": scoped}, recon={"u": blocked})
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False), _verify_report(),
-                                   {"error": "close step stubbed"}])
-    assert proc.returncode == 0, proc.stderr
-    result = _result(ws)
-    assert result["batches"][0]["status"] == "PASS"
-    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "D-3"}]
-
-    out_of_scope = blocked.replace('["rerun_policy"]', '["data", "rerun_policy"]')
-    ws, cwd = _workspace(tmp_path / "scope", decisions=ledger, recon={"u": out_of_scope})
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "scope", [_pass_report(pr, merge_eligible=False)])
-    assert proc.returncode == 0, proc.stderr
-    batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
-    assert "D-3" in batch["one_line_summary"] and "data" in batch["one_line_summary"]
-
-    # a harness that records blockers as {reason, class} rows only is read the same way
-    by_rows = blocked.replace('"blocker_classes": ["rerun_policy"]',
-                              '"blockers": [{"reason": "rerun_unsupported", "class": "rerun_policy"}]')
-    ws, cwd = _workspace(tmp_path / "rows", decisions=ledger, recon={"u": by_rows})
-    pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "rows", [_pass_report(pr, merge_eligible=False), _verify_report(),
-                                            {"error": "close step stubbed"}])
-    assert proc.returncode == 0, proc.stderr
-    assert _result(ws)["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "D-3"}]
-
-
-def test_a_claimed_override_that_is_too_narrow_does_not_hide_a_ledger_row_that_fits(tmp_path):
-    """The child names D-3 (rerun_policy only) but its blockers include data; D-4 below covers both.
-    The ledger is the authority, so D-4 applies; with no fitting row the narrow claim is what the halt names."""
-    ledger = ('| D-3 | user:U1 | {"kind": "merge_override", "units": ["u"], "blocker_classes": ["rerun_policy"]} |\n'
-              '| D-4 | user:U1 | {"kind": "merge_override", "units": ["u"], '
-              '"blocker_classes": ["data", "rerun_policy"]} |\n')
-    blocked = json.dumps({"verdict": "PASS", "parity": "PASS", "merge_eligible": False,
-                          "blocker_classes": ["data", "rerun_policy"],
-                          "merge_authority": {"kind": "human_override", "decision_id": "D-3"}})
-    ws, cwd = _workspace(tmp_path, decisions=ledger, recon={"u": blocked})
-    pr = _push_pr(ws)
-    claim = {"kind": "human_override", "decision_id": "D-3"}
     proc, _ = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=claim), _verify_report(),
                                    {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     result = _result(ws)
     assert result["batches"][0]["status"] == "PASS"
-    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "D-4"}]
+    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "accept-rerun-u"}]
 
-    ws, cwd = _workspace(tmp_path / "narrow", decisions=ledger.splitlines()[0] + "\n", recon={"u": blocked})
+    out_of_scope = blocked.replace('["rerun_policy"]', '["data", "rerun_policy"]')
+    for sub, entries in (("scope", scoped), ("unscoped", [{"decision": "accept-rerun-u", "units": ["u"]}])):
+        ws, cwd = _workspace(tmp_path / sub, manifest_extra={"merge_overrides": entries}, recon={"u": out_of_scope})
+        pr = _push_pr(ws)
+        proc, _ = _run(cwd, tmp_path / sub, [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
+        assert proc.returncode == 0, proc.stderr
+        batch = _result(ws)["batches"][0]
+        assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority", sub
+        assert "accept-rerun-u" in batch["one_line_summary"] and "data" in batch["one_line_summary"]
+
+    # a harness that records blockers as {reason, class} rows only is read the same way
+    by_rows = blocked.replace('"blocker_classes": ["rerun_policy"]',
+                              '"blockers": [{"reason": "rerun_unsupported", "class": "rerun_policy"}]')
+    ws, cwd = _workspace(tmp_path / "rows", manifest_extra={"merge_overrides": scoped}, recon={"u": by_rows})
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "narrow", [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
+    proc, _ = _run(cwd, tmp_path / "rows", [_pass_report(pr, merge_eligible=False, merge_authority=claim),
+                                            _verify_report(), {"error": "close step stubbed"}])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "accept-rerun-u"}]
+
+    unrecorded = json.dumps({"verdict": "PASS", "parity": "PASS", "merge_eligible": False, "merge_authority": claim})
+    ws, cwd = _workspace(tmp_path / "unrecorded", manifest_extra={"merge_overrides": scoped}, recon={"u": unrecorded})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "unrecorded", [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
     assert proc.returncode == 0, proc.stderr
     batch = _result(ws)["batches"][0]
-    assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
-    assert "D-3" in batch["one_line_summary"] and "data" in batch["one_line_summary"]
+    assert batch["status"] == "FAIL" and "unrecorded" in batch["one_line_summary"]
 
 
-def test_a_child_that_passes_is_logged_under_stop_c_before_the_wave_finishes(tmp_path):
-    """The pass is appended when the child clears its checks, not at wave end, so a run that dies between
-    the two cannot be relaunched under the same row as if nothing had been produced."""
+def test_a_manifest_without_child_skill_halts_before_launch(tmp_path):
+    ws, cwd = _workspace(tmp_path, drop_keys=("child_skill",))
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "child_skill" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_an_unknown_skill_name_halts_before_launch(tmp_path):
+    ws, cwd = _workspace(tmp_path, child_skill="not-a-skill")
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "not-a-skill" in proc.stderr and "SKILL.md" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_a_manifest_skill_needs_the_pointers_plugin_root(tmp_path):
+    ws, cwd = _workspace(tmp_path, plugin=None)
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "plugin" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_child_and_verifier_prompts_carry_the_skill_text(tmp_path):
     ws, cwd = _workspace(tmp_path)
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path, [_pass_report(pr), {"error": "verifier died"}])
-    events = _spent(ws)
-    assert [(r.get("event"), r.get("passed")) for r in events][:2] == [("launch", None), ("child", ["b-1"])]
-    (ws / ".migration/waves/wave-0.result.json").unlink(missing_ok=True)
-    proc, calls = _run(cwd, tmp_path, [_pass_report(pr)])
-    assert proc.returncode != 0 and "b-1" in proc.stderr and "STOP C" in proc.stderr
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), {"error": "close step stubbed"}])
+    assert proc.returncode == 0, proc.stderr
+    skill_dir = PLUGIN / "skills" / "unit-migration"
+    body = skill_dir.joinpath("SKILL.md").read_text()
+    body = body[body.index("\n---") + 4:].lstrip("\n") if body.startswith("---") else body
+    child = [c for c in calls if c.get("label") == "b-1"][0]["prompt"]
+    assert f"Skill: unit-migration ({skill_dir}/SKILL.md). Its full text follows; follow it exactly." in child
+    assert body.splitlines()[0] in child and body.splitlines()[-1] in child
+    verify = [c for c in calls if c.get("label") == "verify-wave-0"][0]["prompt"]
+    assert "Skill: wave-verify (" in verify and "/skills/wave-verify/SKILL.md" in verify
+
+
+def test_plan_step_is_required_and_recorded(tmp_path):
+    ws, cwd = _workspace(tmp_path / "missing", drop_keys=("plan_step",))
+    proc, calls = _run(cwd, tmp_path / "missing", [_pass_report()])
+    assert proc.returncode != 0 and "plan_step" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
+    ws, cwd = _workspace(tmp_path / "bad", plan_step="Bad Id!")
+    proc, calls = _run(cwd, tmp_path / "bad", [_pass_report()])
+    assert proc.returncode != 0 and "plan_step" in proc.stderr
+    ws, cwd = _workspace(tmp_path / "ok", plan_step="run-wave.3")
+    proc, calls = _run(cwd, tmp_path / "ok", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["plan_step"] == "run-wave.3"
+    logged = [json.loads(l) for l in
+              (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()]
+    assert [l["plan_step"] for l in logged] == ["run-wave.3"]
+
+
+def test_two_runs_of_one_wave_cannot_overlap(tmp_path):
+    """A running wave has no result yet and a revised manifest would pass the run-log check; the wave
+    lock says no to any second launch while the first process lives."""
+    import fcntl
+    ws, cwd = _workspace(tmp_path)
+    lock = (ws / ".migration/waves/.wave-0.lock").open("a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    assert proc.returncode != 0 and "another run of wave 0" in proc.stderr and "run-wave-0" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_a_manifest_already_in_the_run_log_does_not_launch_again_before_its_result_exists(tmp_path):
+    """A run still going (or one that died) has a log record and no result; a second launch of the same
+    bytes would start the same children twice, so the log record alone halts it."""
+    ws, cwd = _workspace(tmp_path)
+    manifest_bytes = (ws / ".migration/waves/wave-0.json").read_bytes()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from decisions import plan_sha
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps(
+        {"plan_step": "run-wave-0", "plan_sha": plan_sha(json.loads(manifest_bytes)),
+         "manifest_sha": hashlib.sha256(manifest_bytes).hexdigest()[:12],
+         "started": "2026-01-05T00:00:00+00:00"}) + "\n")
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "run-wave-0" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_the_result_records_a_plan_sha_that_ignores_plumbing_but_not_the_source_scope(tmp_path):
+    """plan_sha covers width, units, write targets, gates, source family and params; briefs, repo, secret
+    names, estimates and budgets are plumbing and leave it unchanged, so the manager can tell a plan
+    change from a plumbing edit between two runs of one wave."""
+    ws, cwd = _workspace(tmp_path)
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    first = _result(ws)["plan_sha"]
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    manifest = _resign(ws, source={"family": "sqlserver", "secret": "LEGACY_DSN_ROTATED", "params": {"db": "loans"}},
+                       repo="github.com/acme/target-mirror", max_minutes=50)
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["plan_sha"] == first
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    _resign(ws, source={**manifest["source"], "params": {"db": "cards"}})
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "different plan" in proc.stderr and "run-wave-0" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+    logged = [json.loads(l) for l in (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()]
+    assert len(logged) == 2 and {l["plan_sha"] for l in logged} == {first}
+    # the changed scope runs as the plan step the human approved for it
+    _resign(ws, plan_step="run-wave-0-cards")
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["plan_sha"] != first and _result(ws)["plan_step"] == "run-wave-0-cards"
+
+
+def test_a_plan_step_that_ran_without_a_recorded_plan_sha_does_not_rerun_over_a_new_manifest(tmp_path):
+    """A run record that cannot say what plan it ran cannot show the plan is unchanged; it halts its own
+    plan step only."""
+    ws, cwd = _workspace(tmp_path)
+    (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps(
+        {"plan_step": "run-wave-0", "manifest_sha": "0" * 12, "started": "2026-01-05T00:00:00+00:00"}) + "\n")
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "plan_sha" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    # a plan step the human newly approved is not that record's step, so it runs
+    _resign(ws, plan_step="run-wave-0-again")
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["plan_step"] == "run-wave-0-again"

@@ -1,11 +1,9 @@
-"""The messages the notification contract allows: a six-line card for every stop, wave close and
-halt, and a one-line update for a plumbing relaunch. One shape so the reader answers from a
-phone without opening anything: decision first, why it is safe, evidence, recommendation, the
-exact reply. `parity PASS` is never rendered as FAIL; merge policy is a separate word.
+"""The wave card: the six lines the wave ticket's worker posts with `wave-N.result.json`, one shape so
+the manager answers from a phone without opening anything: decision first, blockers by class, what
+did not run, the PRs and evidence, the exact reply. `parity PASS` is never rendered as FAIL; merge
+policy is a separate word. The reply phrases are the ones `SKILL.md` (Wave card) lists.
 
-    python3 cards.py wave <wave-N.result.json>
-    python3 cards.py halt --wave N --stop-c D-n --what ... --paused ... --unblocks ... [--relaunch R]
-    python3 cards.py relaunch --wave N --relaunch R --fix ...
+    python3 cards.py <wave-N.result.json>
 """
 from __future__ import annotations
 
@@ -45,39 +43,6 @@ def reply_line(phrase: str | None, alt: str | None = "halt") -> str:
     if not phrase:
         return "Reply: none needed"
     return f"Reply: `{phrase}`" + (f"  (or `{alt}`)" if alt and alt != phrase else "")
-
-
-def stop_card(stop: str, subject: str, run: str, decision: str, safe: str, evidence: str,
-              recommend: str, reply: str, alt: str | None = "halt") -> str:
-    """STOP A/B/C/E share one shape; `reply` is the canonical phrase the contract lists."""
-    return card([
-        f"STOP {stop}  {subject}  run {run}",
-        f"Decision: {decision}",
-        f"Why it is safe: {safe}",
-        f"Evidence: {evidence}",
-        f"Recommend: {recommend}",
-        reply_line(reply, alt),
-    ])
-
-
-def relaunch_line(wave, relaunch: int, fix: str) -> str:
-    """The one post a plumbing relaunch earns: nothing the human decided changed."""
-    return f"wave {wave} relaunch {relaunch}: {fix}, no new decision\n"
-
-
-def halt_card(wave, stop_c: str, what: str, paused: str, unblocks: str, relaunch: int = 1,
-              reply: str | None = None, alt: str | None = "halt") -> str:
-    """A fan-out halt (collision, breaker, preflight): what stopped, what waits, what restarts it.
-    `reply` only when the human decides something; a plumbing fix the orchestrator makes itself needs none."""
-    head = f"WAVE {wave}  HALTED  under STOP C {stop_c}" + (f"  relaunch {relaunch}" if relaunch > 1 else "")
-    return card([
-        head,
-        f"Halt: {what}",
-        f"Paused: {paused}",
-        f"Unblocks: {unblocks}",
-        "Production untouched: children write only to declared migration targets",
-        reply_line(reply, alt),
-    ])
 
 
 def _links(urls) -> str:
@@ -225,25 +190,8 @@ def wave_card(result: dict) -> str:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = p.add_subparsers(dest="kind", required=True)
-    w = sub.add_parser("wave")
-    w.add_argument("result", type=Path)
-    h = sub.add_parser("halt")
-    for name in ("--wave", "--stop-c", "--what", "--paused", "--unblocks"):
-        h.add_argument(name, required=True)
-    h.add_argument("--relaunch", type=int, default=1)
-    h.add_argument("--reply", default=None, help="the phrase that decides it, when a human must")
-    r = sub.add_parser("relaunch")
-    r.add_argument("--wave", required=True)
-    r.add_argument("--relaunch", type=int, required=True)
-    r.add_argument("--fix", required=True)
-    a = p.parse_args(argv)
-    if a.kind == "wave":
-        sys.stdout.write(wave_card(json.loads(a.result.read_text())))
-    elif a.kind == "halt":
-        sys.stdout.write(halt_card(a.wave, a.stop_c, a.what, a.paused, a.unblocks, a.relaunch, a.reply))
-    else:
-        sys.stdout.write(relaunch_line(a.wave, a.relaunch, a.fix))
+    p.add_argument("result", type=Path, help="wave-N.result.json")
+    sys.stdout.write(wave_card(json.loads(p.parse_args(argv).result.read_text())))
     return 0
 
 

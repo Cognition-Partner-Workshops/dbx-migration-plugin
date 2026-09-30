@@ -1,4 +1,4 @@
-"""Cards are the only shape a stop, wave close or halt is posted in: six lines, under 90 words, decision
+"""The wave card is the only shape a wave close or halt is posted in: six lines, under 90 words, decision
 first, one quoted reply, and never a FAIL for rows that matched."""
 import json
 import subprocess
@@ -37,11 +37,12 @@ def _lines(text):
 
 
 def test_a_card_is_six_lines_under_ninety_words():
-    text = cards.stop_card("C", "wave plan", "r1", "approve 3 waves", "writes only to mig_*", "D-12", "approve",
-                           "approve STOP C")
+    text = cards.card(["WAVE 1  open", "Blockers: none", "Decision: merge 3 verified PRs", "Not done: nothing",
+                       "PRs: https://example.test/pr/b-1", cards.reply_line("accept wave 1")])
     lines = _lines(text)
-    assert len(lines) == 6 and lines[0].startswith("STOP C") and lines[1].startswith("Decision:")
-    assert lines[-1] == "Reply: `approve STOP C`  (or `halt`)"
+    assert len(lines) == 6 and lines[0].startswith("WAVE 1") and lines[2].startswith("Decision:")
+    assert lines[-1] == "Reply: `accept wave 1`  (or `halt`)"
+    assert cards.reply_line(None) == "Reply: none needed"
     assert sum(len(l.split()) for l in lines) <= cards.MAX_WORDS
     with pytest.raises(ValueError, match="6 non-empty lines"):
         cards.card(["a", "b", "c", "d", "e"])
@@ -125,42 +126,19 @@ def test_links_are_capped_so_a_wide_wave_still_fits_the_card():
     assert sum(len(l.split()) for l in _lines(text)) <= cards.MAX_WORDS
 
 
-def test_halt_card_and_relaunch_line():
-    text = cards.halt_card(0, "D-2", "ledger cell D-7 is not JSON", "wave 0, nothing launched",
-                           "fix the cell and relaunch under the same STOP C", relaunch=3)
-    lines = _lines(text)
-    assert lines[0] == "WAVE 0  HALTED  under STOP C D-2  relaunch 3"
-    assert lines[1:4] == ["Halt: ledger cell D-7 is not JSON", "Paused: wave 0, nothing launched",
-                          "Unblocks: fix the cell and relaunch under the same STOP C"]
-    assert lines[5] == "Reply: none needed"
-    assert cards.halt_card(0, "D-2", "x", "y", "z", reply="halt").endswith("Reply: `halt`\n")
-    assert cards.relaunch_line(0, 3, "report parser fix") == "wave 0 relaunch 3: report parser fix, no new decision\n"
-
-
-def test_cli_renders_each_kind(tmp_path):
+def test_cli_renders_the_wave_card(tmp_path):
     result = tmp_path / "wave-1.result.json"
     result.write_text(json.dumps(_result([_batch("b-1")])))
-    out = subprocess.run([sys.executable, str(CARDS), "wave", str(result)], check=True, capture_output=True, text=True)
+    out = subprocess.run([sys.executable, str(CARDS), str(result)], check=True, capture_output=True, text=True)
     assert out.stdout == cards.wave_card(json.loads(result.read_text()))
-    out = subprocess.run([sys.executable, str(CARDS), "halt", "--wave", "0", "--stop-c", "D-2", "--what", "w",
-                          "--paused", "p", "--unblocks", "u", "--relaunch", "2"], check=True,
-                         capture_output=True, text=True)
-    assert out.stdout.startswith("WAVE 0  HALTED  under STOP C D-2  relaunch 2\n")
-    out = subprocess.run([sys.executable, str(CARDS), "relaunch", "--wave", "0", "--relaunch", "2", "--fix", "f"],
-                         check=True, capture_output=True, text=True)
-    assert out.stdout == "wave 0 relaunch 2: f, no new decision\n"
 
 
-def test_the_contract_quotes_the_same_reply_phrases_the_cards_emit():
-    contract = (Path(__file__).parents[1] / "install-dbx-factory" / "references" / "contract.md").read_text()
-    for phrase in ("`approve STOP C`", "`accept wave <N>`", "`override wave <N>`", "`relaunch`", "`halt`",
-                   "`authorize cutover`", "`decline cutover`", "Reply: none needed"):
-        assert phrase in contract, phrase
-    assert "wave-<N>.card.md" in contract and "cards.py relaunch" in contract
-    packet = Path(__file__).parents[1] / "install-dbx-factory" / "references" / "stop_e_packet.md"
-    assert packet.exists()
-    playbook = (Path(__file__).parents[1] / "install-dbx-factory" / "playbooks" / "8-cutover_signoff.md").read_text()
-    assert "stop_e_packet.md" in playbook
+def test_the_fanout_skill_quotes_the_same_reply_phrases_the_cards_emit():
+    """The reply phrases have one owner: the fan-out skill's Wave card section, which the manager reads."""
+    skill = Path(__file__).with_name("SKILL.md").read_text()
+    for phrase in ("`accept wave <N>`", "`relaunch`", "`halt`", "Reply: none needed"):
+        assert phrase in skill, phrase
+    assert "wave-<N>.card.md" in skill and "cards.py" in skill
 
 
 def test_wave_card_names_the_batches_the_verifier_passed_and_what_the_close_step_merged():

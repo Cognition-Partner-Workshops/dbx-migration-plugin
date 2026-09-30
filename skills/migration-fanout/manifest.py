@@ -10,13 +10,20 @@ import sys
 import urllib.parse
 from collections import Counter
 from pathlib import Path
-from ledger import DECISION_ID, declared_gates_sha
 
 
 TAG_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 PIPELINE_RE = re.compile(r"[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*")
+
+
+# a plan decision id: the lowercase slug of a plan.yaml decision
+DECISION_ID = re.compile(r"[a-z0-9][a-z0-9_.-]*")
+
+
+# a skill name: skills/<name>/SKILL.md under the plugin root
+SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
 VERIFY_DEPTHS = ("sampled", "full")
@@ -26,9 +33,6 @@ MERGE_EVIDENCE_MODES = ("live", "snapshot", "transactional")
 
 
 GUARD_MODES = ("block", "warn")
-
-
-STOP_MODES = ("hard", "soft")
 
 
 GATE_KINDS = ("byte_compare", "export_file", "publish_leg", "row_parity", "structural", "custom")
@@ -66,7 +70,7 @@ EVIDENCE_META = {"label": str, "verdict": str, "rows": int}
 
 
 def validate_gates(b):
-    """A batch's acceptance gates, field by field, exactly as STOP C declared them."""
+    """A batch's acceptance gates, field by field, exactly as the plan declared them."""
     def req(cond, msg):
         if not cond:
             raise SystemExit(msg)
@@ -88,8 +92,8 @@ def validate_gates(b):
         decision = g.get("decision_id")
         req(not ((g["status"] == "waived" and decision is None)
                  or (decision is not None and not (isinstance(decision, str) and DECISION_ID.fullmatch(decision)))),
-            f"batch {b['id']} gate {g['id']} 'decision_id' must be the D-<n> row of 06_decisions.md "
-            "(required for a waived gate)")
+            f"batch {b['id']} gate {g['id']} 'decision_id' must be the lowercase slug of the plan decision "
+            "that set it (required for a waived gate)")
 
 
 def target_key(name, namespace=""):
@@ -116,7 +120,11 @@ def reads_target(obj, table, namespace=""):
     return o == t
 
 
-def validate_manifest(m, doctor=None):
+def skill_file(plugin, name):
+    return plugin / "skills" / name / "SKILL.md"
+
+
+def validate_manifest(m, plugin=None):
     """Fail here, in one line, instead of 20 children failing on a missing field."""
     def req(cond, msg):
         if not cond:
@@ -127,9 +135,20 @@ def validate_manifest(m, doctor=None):
         v = m.get(key)
         return key not in m or (isinstance(v, int) and not isinstance(v, bool)
                                 and (v > 0 if hi is None else 0 < v <= hi))
-    for key in ("wave", "repo", "child_macro", "verify_macro", "batches", "base_branch"):
+    for key in ("wave", "repo", "child_skill", "verify_skill", "batches", "base_branch", "plan_step"):
         req(key in m, f"manifest is missing '{key}'")
     req(bool(m["batches"]), "manifest has no batches")
+    req(isinstance(m["plan_step"], str) and DECISION_ID.fullmatch(m["plan_step"]),
+        f"manifest 'plan_step' must be the lowercase slug of the plan step this wave ticket runs, got "
+        f"{m['plan_step']!r}")
+    for key in ("child_skill", "verify_skill"):
+        req(isinstance(m[key], str) and SKILL_NAME.fullmatch(m[key]),
+            f"manifest '{key}' must be a skill name (lowercase letters, digits, -): the skills/<name>/SKILL.md "
+            f"the prompt embeds, got {m[key]!r}")
+        req(plugin is not None, f"manifest '{key}' needs the pointer's `plugin` root to resolve "
+            f"skills/{m[key]}/SKILL.md")
+        req(skill_file(plugin, m[key]).is_file(),
+            f"manifest '{key}' names no skill of the plugin: {skill_file(plugin, m[key])} does not exist")
     req(isinstance(m["repo"], str) and REPO_RE.fullmatch(m["repo"]),
         f"manifest 'repo' must be host/owner/name (the repo of every child's PR URL), got {m['repo']!r}")
     req(isinstance(m["wave"], int) and not isinstance(m["wave"], bool) and m["wave"] >= 0,
@@ -156,9 +175,9 @@ def validate_manifest(m, doctor=None):
         "given, so a bare write target or mapping object is that table and no other")
     req(m["base_branch"] not in ("main", "master")
         or (isinstance(m.get("trunk_base_decision"), str) and m["trunk_base_decision"].strip()),
-        "base_branch 'main' is the trunk: migration ledgers and unit PRs land on the engagement "
-        "feature branch; set base_branch to it, or record the decision in 06_decisions.md and put "
-        "its row reference in 'trunk_base_decision'")
+        "base_branch 'main' is the trunk: wave results and unit PRs land on the engagement "
+        "feature branch; set base_branch to it, or record the plan decision and put its slug in "
+        "'trunk_base_decision'")
     ids = Counter(b.get("id") for b in m["batches"])
     dupes = [i for i, c in ids.items() if c > 1 or not i]
     req(not dupes, f"batch ids must be unique and non-empty: {dupes}")
@@ -202,15 +221,17 @@ def validate_manifest(m, doctor=None):
         validate_gates(b)
     shared = {u: bs for u, bs in owners.items() if len(bs) > 1}
     req(not shared, f"a unit id belongs to one batch (its child alone writes .migration/recon/<unit_id>/): {shared}")
-    req(isinstance(m.get("stop_c"), str) and DECISION_ID.fullmatch(m["stop_c"]),
-        "manifest 'stop_c' must be the D-<n> row of 06_decisions.md that resolved STOP C for this wave "
-        "(the row that records its gates_sha)")
-    want = declared_gates_sha(m["wave"], m["batches"], m.get("degraded") is True)
-    req(m.get("gates_sha") == want,
-        f"manifest 'gates_sha' is {m.get('gates_sha')!r} but the declared gate list hashes to {want}: "
-        "record that value at STOP C with the approved gates; a gate renamed, added, dropped, swapped "
-        "for another kind or given another status or evidence since, or the wave declared DEGRADED "
-        "since, is a plan change, not a child's call, so this run halts")
+    overrides = m.get("merge_overrides", [])
+    req(isinstance(overrides, list) and all(
+            isinstance(e, dict) and {"decision", "units"} <= set(e) <= {"decision", "units", "blocker_classes"}
+            and isinstance(e["decision"], str) and DECISION_ID.fullmatch(e["decision"])
+            and strs(e["units"]) and e["units"] and ("blocker_classes" not in e or strs(e["blocker_classes"]))
+            for e in overrides),
+        "manifest 'merge_overrides' must be a list of {decision: <plan decision slug>, units: [unit ids], "
+        "blocker_classes?: [classes it forgives]} entries: the plan decisions that let a batch merge on a PASS "
+        "verdict while a unit's result.json says merge_eligible=false")
+    ghosts = sorted({u for e in overrides for u in e["units"] if u not in owners})
+    req(not ghosts, f"manifest 'merge_overrides' units {ghosts!r} are not units of this wave's batches")
     src = m.get("source")
     req(src is None or (isinstance(src, dict) and isinstance(src.get("params", {}), dict)
         and all(isinstance(v, str) and WORD.fullmatch(v) for v in (src.get("family"), *src.get("params", {}).keys()))
@@ -239,17 +260,20 @@ def validate_manifest(m, doctor=None):
     req(isinstance(caps.get("catalogs"), list) and caps["catalogs"]
         and all(isinstance(c, str) and c for c in caps["catalogs"]),
         "manifest 'capabilities.catalogs' must be the non-empty allowlist of catalog names")
-    for key, allowed in (("guard_mode", GUARD_MODES), ("stop_mode", STOP_MODES)):
-        req(caps.get(key) in allowed, f"manifest 'capabilities.{key}' must be one of {allowed}")
+    req(caps.get("guard_mode") in GUARD_MODES, f"manifest 'capabilities.guard_mode' must be one of {GUARD_MODES}")
     req(caps.get("ready") is True,
         "manifest 'capabilities.ready' must be true: the factory-doctor preflight "
         "did not pass; fix the D10 and re-run the doctor before launching a wave")
     req(isinstance(m.get("auto_merge", False), bool), "manifest 'auto_merge' must be a boolean")
-    req(caps["stop_mode"] != "hard" or not m.get("auto_merge", False),
-        "manifest 'auto_merge' must be false under capabilities.stop_mode 'hard': "
-        "merge authority stays with a human")
-    if doctor is None:
-        return
+
+
+def check_doctor_contract(m, doctor):
+    """The manifest's capabilities are the doctor's, copied: a wave launches only from a signed
+    preflight that saw the same identity, host, catalogs, guard mode and source."""
+    def req(cond, msg):
+        if not cond:
+            raise SystemExit(msg)
+    caps = m["capabilities"]
     req(doctor.get("ready") is True,
         f"the factory-doctor is not ready now ({doctor.get('blocking')}): fix the D10 before a wave")
     ident = doctor.get("identity")
@@ -259,8 +283,7 @@ def validate_manifest(m, doctor=None):
         "doctor report that saw the migration principal")
     recorded = {"identity": ident["userName"], "host": ident["host"],
                 "catalogs": sorted(rows.get("allowed_targets", {}).get("catalogs") or []),
-                "guard_mode": rows.get("allowed_targets", {}).get("guard_mode"),
-                "stop_mode": rows.get("workspace", {}).get("stop_mode")}
+                "guard_mode": rows.get("allowed_targets", {}).get("guard_mode")}
     for key, want in recorded.items():
         got = sorted(c.strip().strip("`").lower() for c in caps["catalogs"]) if key == "catalogs" else caps.get(key)
         req(got == want, f"manifest 'capabilities.{key}' is {got!r} but the doctor recorded {want!r} in "
