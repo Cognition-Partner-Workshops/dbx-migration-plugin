@@ -39,7 +39,9 @@ re-dispatch the ticket for the same plan step: `wave-<N>.runs.jsonl` records
 a plumbing edit (brief, repo, secret name, estimates) launches again only with a fresh doctor
 signature over the new bytes, and a manifest whose `plan_sha` differs from what that plan step
 already ran (units, write targets, gates, width, source scope, overrides) halts: a scope change is
-a plan decision the human selects, a new plan step, never a rerun of the old one.
+a plan decision the human selects, a new plan step, never a rerun of the old one. A close that
+merged PRs appends `{..., merged: [pr_url]}` for the step, and the step never launches again:
+its remaining batches are a new manifest under a new plan step.
 
 `merge_overrides` entries are `{"decision": "<slug>", "units": ["u1", "u2"], "blocker_classes":
 ["rerun_policy"]}`. An entry clears a batch only when it is the single entry covering every unit
@@ -82,7 +84,7 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 |---|---|
 | Manifest check | Validates shape, plan step, skills, source names, batches, units, width, and migration contract. |
 | Signed doctor gate | Requires an HMAC-bound doctor record with 15-minute freshness, hook probe, and matching capabilities. |
-| One manifest one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts), refuses a manifest whose sha is already in `wave-N.runs.jsonl`, and refuses a manifest whose `plan_sha` differs from the one its plan step already ran. |
+| One manifest one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts), refuses a manifest whose sha is already in `wave-N.runs.jsonl`, refuses a manifest whose `plan_sha` differs from the one its plan step already ran, and refuses a plan step whose earlier run merged PRs. |
 | Repo preflight | Halts before anything launches when `repo` is not `host/owner/name` or origin points elsewhere. |
 | Duplicate wave | Refuses any existing result, including halted or unreadable files. |
 | Manifest name / pipelines barrier | Checks tags and waits for declared sibling manifests on origin. |

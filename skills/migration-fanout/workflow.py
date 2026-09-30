@@ -291,8 +291,9 @@ def run_log():
                 if not line.strip():
                     continue
                 run = json.loads(line)
-                if not (isinstance(run, dict) and all(isinstance(run.get(k), str) for k in RUN_RECORD)
-                        and isinstance(run.get("plan_sha", ""), str)):
+                if not (isinstance(run, dict) and isinstance(run.get("manifest_sha"), str)
+                        and isinstance(run.get("plan_sha", ""), str)
+                        and ("plan_step" not in run or all(isinstance(run.get(k), str) for k in RUN_RECORD))):
                     raise ValueError(f"line {n} is not a {{{', '.join(RUN_RECORD)}}} record")
                 runs.append(run)
         except (OSError, ValueError) as e:
@@ -314,7 +315,8 @@ def record_run():
     launches a new run; a manifest whose plan differs from what this plan step already ran (units,
     write targets, gates, width, source scope, overrides) halts: scope changes through a plan
     decision the human selects, which is a new plan step, never a rerun of this one. A record
-    without a plan_sha cannot show its plan unchanged, so it halts its own plan step only."""
+    without a plan_sha cannot show its plan unchanged, so it halts its own plan step only; a
+    pre-plan record (no plan_step) halts only its own manifest bytes."""
     global _RUN_LOCK
     _RUN_LOCK = LOCK_PATH.open("a")
     try:
@@ -334,7 +336,13 @@ def record_run():
                 f"a rerun is a new ticket: delete wave-{TAG}.result.json, edit the manifest's plumbing, re-sign it "
                 "with the doctor and re-dispatch the ticket for its plan step"
             )
-        if any(run["plan_step"] == step and run.get("plan_sha") != plan for run in runs):
+        if any(run.get("plan_step") == step and run.get("merged") for run in runs):
+            raise SystemExit(
+                f"{RUNS_PATH} records PRs merged by an earlier run of plan step {step}: a rerun would launch its "
+                "merged batches again (duplicate target writes and PRs). The remaining batches are a new wave "
+                "manifest under a new plan step the human selects, never a rerun of this one"
+            )
+        if any(run.get("plan_step") == step and run.get("plan_sha") != plan for run in runs):
             raise SystemExit(
                 f"{RUNS_PATH} records a run of plan step {step} over a different plan (or one without a plan_sha): "
                 "this manifest changes the units, write targets, gates, width, source scope or overrides that step "
@@ -342,10 +350,23 @@ def record_run():
                 "A plan change is a plan decision the human selects, so it runs as a new plan step of the approved "
                 "plan, never as a rerun of this one"
             )
-        f.write(json.dumps({"plan_step": step, "plan_sha": plan, "manifest_sha": MANIFEST_SHA,
-                            "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")},
-                           sort_keys=True) + "\n")
-        f.flush()
+        _append_run(f, {"plan_step": step, "plan_sha": plan, "manifest_sha": MANIFEST_SHA})
+
+
+def _append_run(f, record):
+    f.write(json.dumps({**record, "started": datetime.datetime.now(datetime.timezone.utc)
+                        .isoformat(timespec="seconds")}, sort_keys=True) + "\n")
+    f.flush()
+
+
+def record_merged(merged_prs):
+    """The run log remembers what a run of this plan step merged, so a rerun of the step (the result
+    deleted, the plumbing edited) cannot launch those batches again."""
+    if merged_prs:
+        with RUNS_PATH.open("a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            _append_run(f, {"plan_step": MANIFEST["plan_step"], "plan_sha": plan_sha(MANIFEST),
+                            "manifest_sha": MANIFEST_SHA, "merged": list(merged_prs)})
 
 
 def published_manifests():
@@ -1245,6 +1266,7 @@ async def main():
                                      if isinstance(f, str)]}
         if close_problems:
             close["invalid"] = raw
+        record_merged(close["merged_prs"])
     if close_problems:
         verify = _verify_sink(verify, [f"wave close invalid: {p}" for p in close_problems])
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported

@@ -20,8 +20,10 @@ signature, records the hook probe, and must be ready with capabilities matching 
 A lock on `.wave-N.lock` is held for the whole run, so a second launch of a running wave
 halts instead of launching its batches twice; a run that died holds nothing. An exclusive
 lock protects the append-only run log, which records each launch as
-`{plan_step, manifest_sha, started}`. A manifest whose sha is already in the log cannot launch
-again; changed bytes are a new manifest and need a doctor signature over them. The `plan_sha`
+`{plan_step, plan_sha, manifest_sha, started}` and each close that merged PRs with `merged`.
+A manifest whose sha is already in the log cannot launch again; changed bytes are a new manifest
+and need a doctor signature over them; a plan step that merged PRs cannot launch again, and one
+whose `plan_sha` differs from what it ran halts (a scope change is a new plan step). The `plan_sha`
 in the result is the manifest less briefs, repo, secret names and estimates (of `source`, the
 secret name is plumbing but the family and params are scope), so a reader can tell a plumbing
 edit from a changed plan.

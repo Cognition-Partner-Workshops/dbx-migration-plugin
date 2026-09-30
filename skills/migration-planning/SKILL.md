@@ -29,7 +29,11 @@ Nothing you write launches until the human approves `plan.yaml` in the Plan view
    all unit mappings; refresh `09_capabilities.json`. A `fail` row, an unverified hook state, or
    an uncommitted allowlist/tolerance is a plan blocker (`kind: repo`/`secret`/`mcp` on the step
    that needs it) — a red `named_secrets_exist` row means the secret must be created before the
-   wave launches, never left for a worker to discover.
+   wave launches, never left for a worker to discover. On a cold start with no `.migration/`
+   workspace yet, the doctor's missing `allowed_targets.json` / `03_recon_tolerances.json` rows
+   are the `workspace-setup` step's deliverables, not blockers: write the plan with that step
+   first in `foundation` and record as blockers only the access and lead-time gaps the doctor's
+   other rows show.
 2. Fill `plan.yaml`: `title`, `summary`, phases, steps with `depends_on` between step ids,
    `decisions` with `options` for every dependency crossing (template catalog:
    `references/decisions.md`), `gates` for the checks a wave or the engagement must pass, and

@@ -285,6 +285,24 @@ def test_a_manifest_launches_one_run_of_its_wave(tmp_path):
     assert len([json.loads(l) for l in runs.read_text().splitlines()]) == 2
 
 
+def test_a_pre_plan_run_record_halts_only_its_own_manifest_bytes(tmp_path):
+    ws, cwd = _workspace(tmp_path / "old")
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    old = {"event": "launch", "relaunch": 0, "plan_sha": "p" * 64, "manifest_sha": "m" * 12,
+           "started": "2026-01-01T00:00:00+00:00"}
+    runs.write_text(json.dumps(old) + "\n")
+    proc, calls = _run(cwd, tmp_path / "old", [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
+    logged = [json.loads(l) for l in runs.read_text().splitlines()]
+    assert logged[0] == old and logged[1]["plan_step"] == "run-wave-0"
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    runs.write_text(json.dumps({**old, "manifest_sha": logged[1]["manifest_sha"]}) + "\n")
+    proc, calls = _run(cwd, tmp_path / "old", [_pass_report()])
+    assert proc.returncode != 0 and "runs.jsonl" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
 @pytest.mark.parametrize("log", ["{not json\n", "[]\n", '{"mode": "start"}\n', ""])
 def test_a_run_log_that_cannot_say_which_plan_steps_ran_halts(tmp_path, log):
     ws, cwd = _workspace(tmp_path / "ws")
@@ -583,6 +601,24 @@ def _merge_commit(ws, head, second_parent=None):
 
 def _merge_row(url, mc, head=None):
     return {"pr_url": url, "merge_commit_sha": mc, "merged_head": head or _PR_HEADS[url]}
+
+
+def test_a_plan_step_that_merged_prs_cannot_rerun_its_batches(tmp_path):
+    ws, cwd = _workspace(tmp_path, auto_merge=True)
+    pr = _unproven_pr(ws)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _merged(ws, pr)])
+    assert proc.returncode == 0, proc.stderr
+    runs = ws / ".migration/waves/wave-0.runs.jsonl"
+    logged = [json.loads(l) for l in runs.read_text().splitlines()]
+    assert [l.get("merged") for l in logged] == [None, [pr]]
+    assert {l["plan_step"] for l in logged} == {"run-wave-0"}
+    # the result deleted and the plumbing edited, the step still cannot launch its merged batches again
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    _resign(ws, max_minutes=46)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr)])
+    assert proc.returncode != 0 and "merged" in proc.stderr and "new plan step" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert len(runs.read_text().splitlines()) == 2
 
 
 def _merged(ws, pr, **extra):

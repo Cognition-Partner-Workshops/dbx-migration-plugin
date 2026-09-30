@@ -25,8 +25,8 @@ from authoritative evidence, not from worker claims.
   `ledger_tampered` is now `protected_files_tampered`; all decision ids are lowercase slugs.
 - `skills/factory-doctor/doctor.py` — `REQUIRED_FILES` is now `allowed_targets.json` +
   `03_recon_tolerances.json`; new `authorizations_file` check (ok when absent; fails on
-  malformed JSON, entries missing `id`/`kind`/`objects`/`by`, or a working copy that differs
-  from the committed one).
+  malformed JSON or entries missing `id`/`kind`/`objects`/`by`; warns when the working copy
+  differs from the committed one, which is the copy the guard reads).
 - `skills/target-routing/pipeline_updates.py` — `serialized_pipelines` maps a pipeline to a
   plan decision slug and is shape-validated only (no runtime decision lookup); the
   `--decisions` flag is gone.
