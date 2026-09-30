@@ -1650,6 +1650,26 @@ def test_plan_step_is_required_and_recorded(tmp_path):
     assert [l["plan_step"] for l in logged] == ["run-wave.3"]
 
 
+def test_two_runs_of_one_wave_cannot_overlap(tmp_path):
+    """A running wave has no result yet and a revised manifest would pass the run-log check; the wave
+    lock says no to any second launch while the first process lives."""
+    import fcntl
+    ws, cwd = _workspace(tmp_path)
+    lock = (ws / ".migration/waves/.wave-0.lock").open("a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        proc, calls = _run(cwd, tmp_path, [_pass_report()])
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    assert proc.returncode != 0 and "another run of wave 0" in proc.stderr and "run-wave-0" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+    assert not (ws / ".migration/waves/wave-0.runs.jsonl").exists()
+    assert not (ws / ".migration/waves/wave-0.result.json").exists()
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_a_manifest_already_in_the_run_log_does_not_launch_again_before_its_result_exists(tmp_path):
     """A run still going (or one that died) has a log record and no result; a second launch of the same
     bytes would start the same children twice, so the log record alone halts it."""

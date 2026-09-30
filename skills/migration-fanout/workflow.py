@@ -87,6 +87,7 @@ BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
+LOCK_PATH = MANIFEST_PATH.with_name(f".{MANIFEST_PATH.stem}.lock")
 CARD_PATH = MANIFEST_PATH.with_suffix(".card.md")
 DOCTOR_PATH = MANIFEST_PATH.with_suffix(".doctor.json")
 SMOKE = MANIFEST.get("smoke") is True
@@ -299,10 +300,24 @@ def run_log():
     return runs
 
 
+_RUN_LOCK = None
+
+
 def record_run():
-    """One manifest launches one run: the log is read and appended under its lock, so a second run of
-    the same bytes, concurrent or later, halts on the first's record. Changed bytes are a new manifest
-    (the doctor signed them) and launch a new run."""
+    """One run of a wave at a time, one run per manifest. The wave lock is held until this process
+    exits, so a run that died holds nothing and a running wave cannot be launched twice, whatever its
+    manifest bytes; the result is rechecked under it. The run log is read and appended under its own
+    lock: the same bytes, concurrent or later, halt on the first record; changed bytes are a new
+    manifest (the doctor signed them) and launch a new run."""
+    global _RUN_LOCK
+    _RUN_LOCK = LOCK_PATH.open("a")
+    try:
+        fcntl.flock(_RUN_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"another run of wave {TAG} holds {LOCK_PATH} (plan step {MANIFEST['plan_step']}): two runs "
+                         "would launch the same batches twice; wait for it to write its result or halt it") from None
+    if RESULT_PATH.exists():
+        raise SystemExit(f"{RESULT_PATH} was written while this run was starting: this wave already ran")
     with RUNS_PATH.open("a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         if MANIFEST_SHA in {run["manifest_sha"] for run in run_log()}:
