@@ -1,0 +1,12 @@
+# https://docs.devin.ai/onboard-devin/environment-yaml
+# One-time setup (e.g., install system tools, global CLIs).
+initialize: |
+  /usr/bin/python3 -m pip install --user "pytest>=7.0"
+# Install project dependencies (runs during builds, surfaced to agent at session start).
+maintenance: |
+  /usr/bin/python3 -m pip install --user "pytest>=7.0"
+knowledge:
+  - name: test
+    contents: |
+      /usr/bin/python3 -m pytest skills/factory-doctor/tests skills/migration-fanout/test_workflow_guards.py -q
+      No pre-commit config, lint, or build step in this repo.
