@@ -2288,6 +2288,7 @@ def test_child_prompt_is_s2_shaped_and_under_900_words():
                             "brief": brief, "gates": [GATE]}])
     text = _prompt_ns(m)["child_prompt"](m["batches"][0])
     assert len(text.split()) < 900, len(text.split())
+    text = text[text.index("BRIEF:"):]                                     # the quoted skill body precedes it
     order = [text.index(s) for s in (
         '"loans"', "mig.loans",                                            # units and write targets
         "mapping_spec.json",                                               # converted files and mapping specs
