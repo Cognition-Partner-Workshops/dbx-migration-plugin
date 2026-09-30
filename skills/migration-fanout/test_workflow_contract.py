@@ -1717,10 +1717,16 @@ def test_the_result_records_a_plan_sha_that_ignores_plumbing_but_not_the_source_
 
 
 def test_a_plan_step_that_ran_without_a_recorded_plan_sha_does_not_rerun_over_a_new_manifest(tmp_path):
-    """A run record that cannot say what plan it ran cannot show the plan is unchanged."""
+    """A run record that cannot say what plan it ran cannot show the plan is unchanged; it halts its own
+    plan step only."""
     ws, cwd = _workspace(tmp_path)
     (ws / ".migration/waves/wave-0.runs.jsonl").write_text(json.dumps(
         {"plan_step": "run-wave-0", "manifest_sha": "0" * 12, "started": "2026-01-05T00:00:00+00:00"}) + "\n")
     proc, calls = _run(cwd, tmp_path, [_pass_report()])
     assert proc.returncode != 0 and "runs.jsonl" in proc.stderr and "plan_sha" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
+    # a plan step the human newly approved is not that record's step, so it runs
+    _resign(ws, plan_step="run-wave-0-again")
+    proc, _ = _run(cwd, tmp_path, [_pass_report()])
+    assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["plan_step"] == "run-wave-0-again"

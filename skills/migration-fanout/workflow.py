@@ -291,7 +291,8 @@ def run_log():
                 if not line.strip():
                     continue
                 run = json.loads(line)
-                if not (isinstance(run, dict) and all(isinstance(run.get(k), str) for k in RUN_RECORD)):
+                if not (isinstance(run, dict) and all(isinstance(run.get(k), str) for k in RUN_RECORD)
+                        and isinstance(run.get("plan_sha", ""), str)):
                     raise ValueError(f"line {n} is not a {{{', '.join(RUN_RECORD)}}} record")
                 runs.append(run)
         except (OSError, ValueError) as e:
@@ -300,7 +301,7 @@ def run_log():
     return runs
 
 
-RUN_RECORD = ("plan_step", "plan_sha", "manifest_sha", "started")
+RUN_RECORD = ("plan_step", "manifest_sha", "started")
 _RUN_LOCK = None
 
 
@@ -312,7 +313,8 @@ def record_run():
     a plumbing edit (brief, repo, secret name, estimates) is a new manifest the doctor signed and
     launches a new run; a manifest whose plan differs from what this plan step already ran (units,
     write targets, gates, width, source scope, overrides) halts: scope changes through a plan
-    decision the human selects, which is a new plan step, never a rerun of this one."""
+    decision the human selects, which is a new plan step, never a rerun of this one. A record
+    without a plan_sha cannot show its plan unchanged, so it halts its own plan step only."""
     global _RUN_LOCK
     _RUN_LOCK = LOCK_PATH.open("a")
     try:
@@ -332,10 +334,11 @@ def record_run():
                 f"a rerun is a new ticket: delete wave-{TAG}.result.json, edit the manifest's plumbing, re-sign it "
                 "with the doctor and re-dispatch the ticket for its plan step"
             )
-        if any(run["plan_step"] == step and run["plan_sha"] != plan for run in runs):
+        if any(run["plan_step"] == step and run.get("plan_sha") != plan for run in runs):
             raise SystemExit(
-                f"{RUNS_PATH} records a run of plan step {step} over a different plan: this manifest changes the "
-                "units, write targets, gates, width, source scope or overrides that step ran, not just its plumbing. "
+                f"{RUNS_PATH} records a run of plan step {step} over a different plan (or one without a plan_sha): "
+                "this manifest changes the units, write targets, gates, width, source scope or overrides that step "
+                "ran, not just its plumbing. "
                 "A plan change is a plan decision the human selects, so it runs as a new plan step of the approved "
                 "plan, never as a rerun of this one"
             )
