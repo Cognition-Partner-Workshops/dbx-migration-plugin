@@ -603,11 +603,14 @@ def _merge_row(url, mc, head=None):
     return {"pr_url": url, "merge_commit_sha": mc, "merged_head": head or _PR_HEADS[url]}
 
 
-def test_a_plan_step_that_merged_prs_cannot_rerun_its_batches(tmp_path):
+@pytest.mark.parametrize("proven", [True, False])
+def test_a_plan_step_whose_close_step_was_sent_prs_to_merge_cannot_rerun_its_batches(tmp_path, proven):
     ws, cwd = _workspace(tmp_path, auto_merge=True)
     pr = _unproven_pr(ws)
-    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _merged(ws, pr)])
+    close = _merged(ws, pr) if proven else _close_report(merged_prs=[_merge_row(pr, "f" * 40)])
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
     assert proc.returncode == 0, proc.stderr
+    assert _result(ws)["close"]["merged_prs"] == ([pr] if proven else [])
     runs = ws / ".migration/waves/wave-0.runs.jsonl"
     logged = [json.loads(l) for l in runs.read_text().splitlines()]
     assert [l.get("merged") for l in logged] == [None, [pr]]

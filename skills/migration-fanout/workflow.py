@@ -360,8 +360,9 @@ def _append_run(f, record):
 
 
 def record_merged(merged_prs):
-    """The run log remembers what a run of this plan step merged, so a rerun of the step (the result
-    deleted, the plumbing edited) cannot launch those batches again."""
+    """The run log remembers which PRs this plan step's close step was dispatched to merge, written
+    before it runs: whatever it then reports or proves, a rerun of the step (the result deleted, the
+    plumbing edited) cannot launch those batches again."""
     if merged_prs:
         with RUNS_PATH.open("a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
@@ -1230,6 +1231,8 @@ async def main():
                                         and p["batch"] not in held)]
     close = None
     if to_merge:
+        if auto_merge:
+            record_merged([p["pr_url"] for p in to_merge])
         try:
             close = await asyncio.wait_for(
                 agent(close_prompt(to_merge, CLOSE_MINUTES, merge=auto_merge), phase="close", schema=CLOSE_SCHEMA,
@@ -1266,7 +1269,6 @@ async def main():
                                      if isinstance(f, str)]}
         if close_problems:
             close["invalid"] = raw
-        record_merged(close["merged_prs"])
     if close_problems:
         verify = _verify_sink(verify, [f"wave close invalid: {p}" for p in close_problems])
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported
