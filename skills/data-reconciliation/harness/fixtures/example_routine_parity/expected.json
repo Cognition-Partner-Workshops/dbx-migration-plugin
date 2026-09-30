@@ -3,15 +3,15 @@
     {
       "routine": "app_pkg.close_period",
       "status": "proven",
-      "evidence": "recon/ledger/close_period.run.json"
+      "evidence": "recon/acct/close_period.run.json"
     },
     {
       "routine": "app_pkg.archive_entries",
       "status": "failed",
-      "evidence": "recon/ledger/archive_entries.run.json",
+      "evidence": "recon/acct/archive_entries.run.json",
       "findings": [
         {
-          "table": "app.ledger_entry",
+          "table": "app.acct_entry",
           "check": "rows_differ",
           "detail": "golden 0 rows, observed 1 rows; 0 only in golden, 1 only in observed"
         }

@@ -5,7 +5,7 @@ description: Databricks Labs Lakebridge (analyzer, profiler, BladeBridge/Morpheu
 
 # Lakebridge
 
-Lakebridge is the Databricks Labs migration toolkit: an **analyzer** (offline scan of exported code, complexity + inventory + interdependencies), an experimental **profiler** (connects to the source system for metadata and workload metrics), three **transpilers** (BladeBridge and Morpheus deterministic; Switch LLM-based, experimental), and a **reconciler**. Position in this kit: it accelerates `!dbx_estate_inventory` and `!dbx_unit_migration`; its output always passes our own data-reconciliation harness (verdict authority: `skills/data-reconciliation/SKILL.md`).
+Lakebridge is the Databricks Labs migration toolkit: an **analyzer** (offline scan of exported code, complexity + inventory + interdependencies), an experimental **profiler** (connects to the source system for metadata and workload metrics), three **transpilers** (BladeBridge and Morpheus deterministic; Switch LLM-based, experimental), and a **reconciler**. Position in this kit: it accelerates the `estate-inventory` and `unit-migration` skills; its output always passes our own data-reconciliation harness (verdict authority: `skills/data-reconciliation/SKILL.md`).
 
 Facts below marked **[docs]** come from https://databrickslabs.github.io/lakebridge/ (read 2026-09); rows marked **SEEDED** are expectations from the dialect skills' Known Traps and have not been confirmed on an engagement. Confirm the command surface with `--help` at first use per engagement: the labs CLI evolves.
 
@@ -26,7 +26,7 @@ databricks labs lakebridge analyze --source-directory <export dir> --source-tech
 Input is the legacy export on disk (SQL files, ETL repository XML/JSON), never a live connection (`AGENTS.md`). Feed the JSON into the census and complexity ranking, cross-checked against the coverage arithmetic (the analyzer is an input, not the census; a file it cannot parse is still an asset). Run the SQL Splitter first on monolithic dump files.
 
 ## Profiler (optional, experimental) [docs]
-`configure-database-profiler` then `execute-database-profiler`; supports Synapse, Teradata, Snowflake, SQL Server, Oracle, BigQuery, Redshift. It connects to the source: only with the engagement's read-only principal named in `07_access_checklist.md`, only inside the legacy-query concurrency cap, and only if the census needs workload metrics the export cannot give (query patterns for Tier 4 op selection). Never install its collection objects on the legacy system.
+`configure-database-profiler` then `execute-database-profiler`; supports Synapse, Teradata, Snowflake, SQL Server, Oracle, BigQuery, Redshift. It connects to the source: only with the engagement's read-only principal the intake ticket recorded, only inside the legacy-query concurrency cap, and only if the census needs workload metrics the export cannot give (query patterns for Tier 4 op selection). Never install its collection objects on the legacy system.
 
 ## Transpiler (unit conversion) [docs]
 ```

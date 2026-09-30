@@ -21,7 +21,7 @@
     "rule": "empty_string_is_null",
     "applies_to": "string,varchar->STRING",
     "params": {"policy": "SET_AT_STOP_A"},
-    "why": "Flat-file NULL_CHARACTER, Oracle targets folding '' to NULL (fixture ORA_MDM_HUB_PROD), REG_EXTRACT no-match ('' in Spark, NULL in Informatica) and two-argument IIF returning ''. Whether '' and NULL compare equal is the STOP A policy."
+    "why": "Flat-file NULL_CHARACTER, Oracle targets folding '' to NULL (fixture ORA_MDM_HUB_PROD), REG_EXTRACT no-match ('' in Spark, NULL in Informatica) and two-argument IIF returning ''. Whether '' and NULL compare equal is the intake policy."
   },
   {
     "rule": "null_missing_equiv",

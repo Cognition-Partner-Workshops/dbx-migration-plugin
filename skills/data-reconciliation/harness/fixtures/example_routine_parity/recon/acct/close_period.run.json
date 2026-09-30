@@ -2,11 +2,11 @@
   "note": "One committed run of the converted routine on the dedicated exec branch against the fixture snapshot; rows read back after the run.",
   "routine": "app_pkg.close_period",
   "target_family": "lakebase",
-  "target_branch": "mig-ledger-exec",
-  "snapshot": "fixture:fixtures/ledger-2024q1.sql",
-  "evidence": "recon/ledger/close_period.run.json",
+  "target_branch": "mig-acct-exec",
+  "snapshot": "fixture:fixtures/acct-2024q1.sql",
+  "evidence": "recon/acct/close_period.run.json",
   "golden": {
-    "app.ledger_balance": [
+    "app.acct_balance": [
       {
         "period_id": 1,
         "balance": "1250.00",
@@ -27,7 +27,7 @@
     ]
   },
   "observed": {
-    "app.ledger_balance": [
+    "app.acct_balance": [
       {
         "period_id": 1,
         "balance": "1250.00",

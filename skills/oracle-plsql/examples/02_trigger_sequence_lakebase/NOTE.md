@@ -1,6 +1,6 @@
 # 02 — Sequences + `:NEW`/`:OLD` trigger + autonomous logger -> Lakebase (OLTP parity)
 
-**Track**: OLTP `!dbx_migrate_oltp` -> Lakebase (PostgreSQL 17). On the analytical track there are no triggers or
+**Track**: OLTP -> Lakebase (PostgreSQL 17). On the analytical track there are no triggers or
 sequences: `policy_id` becomes an identity column and the trigger body is folded into each writer (examples 01, 03).
 
 | Oracle | Converted | SKILL.md |
@@ -17,7 +17,7 @@ sequences: `policy_id` becomes an identity column and the trigger body is folded
 **Recon**: Tier 3 on `poladm.policy` keyed by `policy_no` (`row_version`, `active_policy_flag`, `policy_no`
 normalisation, `cover_note_ref` `''`/NULL are all trigger outputs; `policy_id` excluded, uniqueness-checked instead).
 Tier 1/2 on `policy_audit_log` per `event_cd`: the expected delta is exactly the count of rolled-back business
-transactions in the replay window, pre-declared in `06_decisions.md`. Tier 4: the SOAP layer expects `ALB-` prefixes.
+transactions in the replay window, pre-declared in the plan's decisions. Tier 4: the SOAP layer expects `ALB-` prefixes.
 
 **Canonicalization**: `datetime_utc_truncate_ms` (`created_dt`, `updated_dt`), `decimal_round` (`old_premium`,
 `new_premium`), `empty_string_is_null` (`cover_note_ref`).
