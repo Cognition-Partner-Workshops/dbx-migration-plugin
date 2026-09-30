@@ -35,7 +35,11 @@ def plan_authorizations(text):
     entries = doc.get("authorizations") if isinstance(doc, dict) else None
     if not (isinstance(entries, list) and all(isinstance(e, dict) and isinstance(e.get("id"), str) for e in entries)):
         raise ValueError("is not {version, authorizations: [{id, kind, objects, by}]}")
-    return {e["id"]: e for e in entries}
+    ids = [e["id"] for e in entries]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise ValueError(f"repeats authorization ids {dupes!r}; which entry a decision cites must not depend on order")
+    return dict(zip(ids, entries))
 
 
 def unauthorized_decisions(manifest, entries):

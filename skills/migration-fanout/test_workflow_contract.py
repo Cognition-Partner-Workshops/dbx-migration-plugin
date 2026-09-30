@@ -298,9 +298,15 @@ def test_an_authorization_in_the_working_copy_alone_waives_nothing(tmp_path):
     assert not [c for c in calls if c["kind"] == "agent"]
 
 
-def test_a_malformed_committed_authorization_file_halts_a_manifest_that_cites_it(tmp_path):
+@pytest.mark.parametrize("text", [
+    "{not json",
+    json.dumps({"version": 1, "authorizations": [
+        {"id": "waive-export", "kind": "gate_waived", "objects": ["v"], "by": "user:t"},
+        {"id": "waive-export", "kind": "gate_waived", "objects": ["u"], "by": "user:t"}]}),
+])
+def test_a_malformed_committed_authorization_file_halts_a_manifest_that_cites_it(tmp_path, text):
     ws, cwd = _workspace(tmp_path / "cites", gates=[GATE, WAIVED], authorizations=[])
-    (ws / ".migration" / "authorizations.json").write_text("{not json")
+    (ws / ".migration" / "authorizations.json").write_text(text)
     subprocess.run(["git", "-C", str(ws), "add", ".migration/authorizations.json"], check=True)
     subprocess.run(["git", "-C", str(ws), "commit", "-qm", "bad"], check=True)
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:migration/x"], check=True)
@@ -678,13 +684,16 @@ def test_a_plan_step_whose_close_step_was_sent_prs_to_merge_cannot_rerun_its_bat
     assert len(runs.read_text().splitlines()) == 2
 
 
-def test_a_review_only_close_that_merged_a_pr_anyway_bars_a_rerun_of_the_plan_step(tmp_path):
+@pytest.mark.parametrize("proven", [True, False])
+def test_a_review_only_close_sent_prs_bars_a_rerun_of_the_plan_step_whatever_it_proves(tmp_path, proven):
+    """A review-only close may squash-merge anyway and leave no merge proof; the step never reruns."""
     ws, cwd = _workspace(tmp_path)
     pr = _unproven_pr(ws)
-    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), _merged(ws, pr)])
+    close = _merged(ws, pr) if proven else _close_report(unmerged=[{"pr_url": pr, "reason": "review only"}])
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr), _verify_report(), close])
     assert proc.returncode == 0, proc.stderr
     result = _result(ws)
-    assert result["close"]["merged_prs"] == [pr] and result["closed"] is False
+    assert result["close"]["merged_prs"] == ([pr] if proven else [])
     runs = ws / ".migration/waves/wave-0.runs.jsonl"
     assert [json.loads(l).get("merged") for l in runs.read_text().splitlines()] == [None, [pr]]
 

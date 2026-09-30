@@ -87,6 +87,7 @@ MANIFEST_BYTES = MANIFEST_PATH.read_bytes()
 MANIFEST = json.loads(MANIFEST_BYTES)
 BASE_BRANCH = MANIFEST.get("base_branch", "")
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()[:12]
+AUTHORIZATIONS_REL = ".migration/authorizations.json"
 RESULT_PATH = MANIFEST_PATH.with_suffix(".result.json")
 RUNS_PATH = MANIFEST_PATH.with_suffix(".runs.jsonl")
 LOCK_PATH = MANIFEST_PATH.with_name(f".{MANIFEST_PATH.stem}.lock")
@@ -211,14 +212,18 @@ def wave_base():
 
 
 def committed_authorizations():
-    """The authorization entries on the base tip, the copy the guard reads; never the working copy."""
+    """The authorization entries on the base tip, the copy the guard reads; never the working copy. A
+    file the tree lacks is no entries; a git failure is a halt, never an absent file."""
+    git = ["git", "-C", str(ROOT)]
     try:
-        r = subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE_SHA}:.migration/authorizations.json"],
-                           capture_output=True, text=True, timeout=300)
+        present = subprocess.run(git + ["ls-tree", "--name-only", BASE_SHA, "--", AUTHORIZATIONS_REL],
+                                 check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+        text = subprocess.run(git + ["show", f"{BASE_SHA}:{AUTHORIZATIONS_REL}"], check=True,
+                              capture_output=True, text=True, timeout=300).stdout if present else None
     except (OSError, subprocess.SubprocessError) as e:
-        raise SystemExit(f"cannot read .migration/authorizations.json on origin/{BASE_BRANCH} ({e})") from None
+        raise SystemExit(f"cannot read {AUTHORIZATIONS_REL} on origin/{BASE_BRANCH} ({e})") from None
     try:
-        return plan_authorizations(r.stdout if r.returncode == 0 else None)
+        return plan_authorizations(text)
     except ValueError as e:
         raise SystemExit(f"origin/{BASE_BRANCH}:.migration/authorizations.json {e}; the manifest's waived gates and "
                          "merge_overrides cannot be resolved against it") from None
@@ -375,10 +380,10 @@ def _append_run(f, record):
 
 
 def record_merged(merged_prs):
-    """The run log remembers which PRs this plan step's close step was dispatched to merge, written
-    before it runs (and, for a review-only close, whichever PRs it merged anyway): whatever the close
-    reports or proves, a rerun of the step (the result deleted, the plumbing edited) cannot launch
-    those batches again."""
+    """The run log remembers which PRs this plan step's close step was sent, written before it runs
+    and whether or not it may merge: whatever the close then reports, proves, or merges without proof
+    (a squash a review-only close was told not to make), a rerun of the step (the result deleted, the
+    plumbing edited) cannot launch those batches again."""
     if merged_prs:
         with RUNS_PATH.open("a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
@@ -1252,8 +1257,7 @@ async def main():
                                         and p["batch"] not in held)]
     close = None
     if to_merge:
-        if auto_merge:
-            record_merged([p["pr_url"] for p in to_merge])
+        record_merged([p["pr_url"] for p in to_merge])
         try:
             close = await asyncio.wait_for(
                 agent(close_prompt(to_merge, CLOSE_MINUTES, merge=auto_merge), phase="close", schema=CLOSE_SCHEMA,
@@ -1290,8 +1294,6 @@ async def main():
                                      if isinstance(f, str)]}
         if close_problems:
             close["invalid"] = raw
-        if not auto_merge:
-            record_merged(close["merged_prs"])
     if close_problems:
         verify = _verify_sink(verify, [f"wave close invalid: {p}" for p in close_problems])
     closed = (breaker.tripped_on is None and not surprises and not undeclared and not unreported

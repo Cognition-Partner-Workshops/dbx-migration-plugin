@@ -23,9 +23,9 @@ from authoritative evidence, not from worker claims.
   entry covers all its units and the child claims that entry's decision); a waived gate stands
   on its manifest `decision_id`; each override decision and waiver `decision_id` must be a
   committed `merge_override` / `gate_waived` entry of `.migration/authorizations.json` on the
-  base branch whose `objects` name the units, else the wave halts before launch; a close step
-  dispatched to merge (or a review-only close that merged anyway) is recorded in the run log so
-  the plan step never reruns its batches; `result.json` carries `brief` lines instead of a brief file;
+  base branch whose `objects` name the units (a repeated id or an unreadable committed file halts
+  too), else the wave halts before launch; the PRs a close step is sent, review-only or merging,
+  are recorded in the run log before it runs so the plan step never reruns its batches; `result.json` carries `brief` lines instead of a brief file;
   `ledger_tampered` is now `protected_files_tampered`; all decision ids are lowercase slugs.
 - `skills/factory-doctor/doctor.py` — `REQUIRED_FILES` is now `allowed_targets.json` +
   `03_recon_tolerances.json`; new `authorizations_file` check (ok when absent; fails on

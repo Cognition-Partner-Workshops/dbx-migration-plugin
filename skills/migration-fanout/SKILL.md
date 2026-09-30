@@ -40,9 +40,9 @@ a plumbing edit (brief, repo, secret name, estimates) launches again only with a
 signature over the new bytes, and a manifest whose `plan_sha` differs from what that plan step
 already ran (units, write targets, gates, width, source scope, overrides) halts: a scope change is
 a plan decision the human selects, a new plan step, never a rerun of the old one. Dispatching a
-close step to merge PRs first appends `{..., merged: [pr_url]}` for the step, and the step never
-launches again whatever that close reports: its remaining batches are a new manifest under a new
-plan step.
+close step, review-only or merging, first appends `{..., merged: [pr_url]}` for the step with the
+PRs it is sent, and the step never launches again whatever that close reports, proves, or merges
+without proof: its remaining batches are a new manifest under a new plan step.
 
 `merge_overrides` entries are `{"decision": "<slug>", "units": ["u1", "u2"], "blocker_classes":
 ["rerun_policy"]}`. An entry clears a batch only when it is the single entry covering every unit
