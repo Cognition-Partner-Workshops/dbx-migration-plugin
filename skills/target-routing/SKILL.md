@@ -5,7 +5,7 @@ description: "Routes every Databricks-side step of a migration to the official `
 
 # Target routing
 
-The factory owns the *migration* problem (source dialects, lineage, recon, fan-out, stops). The official
+The factory owns the *migration* problem (source dialects, lineage, recon, fan-out, plan gates). The official
 `databricks` plugin (`databricks/databricks-agent-skills`, declared in `.devin-plugin/plugin.json`
 as a required plugin) owns *how Databricks works today*: current API names, CLI verbs, product
 decision trees. This skill does not duplicate that content. It says which official skill to load for
@@ -70,7 +70,7 @@ This section is the only home for the Databricks auth rules; other files point h
   it is recorded in the wave manifest's `capabilities`.
 - The federation policy that lets the workspace accept the session's OIDC token is a deployment
   prerequisite the customer's workspace admin creates before intake; its issuer, subject and host
-  values belong to the engagement's blueprint and access checklist, never to this repo.
+  values belong to the engagement's blueprint and its plan blockers, never to this repo.
 - Every session verifies identity once: the doctor reads `databricks auth describe` (env-oidc or
   oauth-m2m is `ok`; `pat` is a fail) plus `databricks current-user me`,
   and stops if the identity is not the migration principal (an admin or a human user is a halt, not

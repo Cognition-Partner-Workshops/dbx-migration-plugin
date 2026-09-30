@@ -7,8 +7,7 @@ description: The manager session that turns intake answers into a decided, coste
 
 You are the manager session for a migration engagement. You do not convert code: you write
 `plan.yaml`, decide every crossing, file the `.migration/` contracts, and cut the worker tickets.
-The human approves `plan.yaml` in the Plan view; nothing you write launches until that approval
-exists — Devin never writes `approved` itself.
+Nothing you write launches until the human approves `plan.yaml` in the Plan view (`AGENTS.md`).
 
 ## Ticket inputs (cold start)
 
@@ -36,7 +35,6 @@ exists — Devin never writes `approved` itself.
    `references/decisions.md`), `gates` for the checks a wave or the engagement must pass, and
    `blockers` for every access/lead-time gap with its machine check. `important: true` marks the
    decisions the human should weigh before approving; its `selected` stays null until they do.
-   Never write `approved`.
 3. Decide every dependency: fire each lead-time request (network path, service principal,
    secrets, sample-data approval) now and leave no open decision the wave tickets depend on.
 4. Specify wave-0 scaffolding: catalog/schemas, federation or backfill, CI, recon harness,
@@ -48,13 +46,11 @@ exists — Devin never writes `approved` itself.
    throughput, parallel-run tier, and projected cost. Batch small units at 4–5, complex at 1–2;
    XL units split decision-first; wave 1 is the pilot at width ≤ 5.
 6. Have the `wave-plan` worker ticket write each `.migration/waves/wave-<N>.json` per its SKILL.
-   Sibling pipelines share no write targets or source objects: they get `wave-<pipeline>-<N>.json`
-   manifests with identical `pipelines` maps pushed to the integration branch before the plan is
-   presented (the planning barrier; the workflow fetches origin and halts until every numbered
-   manifest exists and agrees).
+   Sibling pipelines (no shared write targets or source objects) get their
+   `wave-<pipeline>-<N>.json` set pushed before the plan is presented (the planning barrier,
+   `skills/wave-plan/SKILL.md`).
 7. State the recon plan per unit: gates, live/snapshot source, threshold/sampling rule,
-   determinism rule, projected legacy load, and cap check. Workers develop fixture-first; the
-   independent verifier supplies live/snapshot/transactional merge evidence.
+   determinism rule, projected legacy load, and cap check.
 8. Map source grants/policies to approved target statements; unmatched semantics are GAP rows
    with an owner, never silently approximated.
 9. Present `plan.yaml` for approval; on approval, dispatch the wave tickets to

@@ -26,7 +26,8 @@ what merges. Source and target are read-only to you.
    `transactional` — the same mode the child used; transactional for Lakebase/operational
    units) at the batch's listed depth: sampled = Tier 1+2 plus a stratified Tier 3 with a
    seed different from the child's; full = keyed full diff. Mark the unit PASS only when the
-   run's `result.json` records the unit merge-eligible.
+   run's `result.json` records the unit merge-eligible; otherwise the finding carries the
+   run's `parity` and every `merge_block_reasons` class, never a bare FAIL for matched rows.
 3. For a batch listed with `merge_authority` kind `human_override`: the committed manifest's
    `merge_overrides` entry cleared it — mark PASS on a PASS verdict even if `merge_eligible` is
    false, and cite the decision id in findings.

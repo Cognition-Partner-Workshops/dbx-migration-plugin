@@ -8,8 +8,7 @@ description: Manager-facing intake checklist — what the human's request and at
 You are the manager session scoping a migration engagement. This skill is a checklist of what
 you must find out and where in `plan.yaml` it lands — not a form to send the human, not a setup
 ticket. You do not write `.migration/` files yourself; a `workspace-setup` worker ticket does
-that after the human approves the plan. Nothing is imported from an org library anywhere — the
-plugin arrives through the plugin system and every contract lives in the plan or a ticket.
+that after the human approves the plan.
 
 ## What the request and its attachments should contain
 
@@ -29,7 +28,7 @@ plugin arrives through the plugin system and every contract lives in the plan or
 - Timeline: hard dates, freeze windows, and lead-time items the customer must start now.
 - Who holds the cutover principal and how cutover authorization will be recorded.
 
-## Old intake field -> where it lands in the plan
+## Intake answer -> where it lands in the plan
 
 | Intake answer | Lands in |
 |---|---|
@@ -50,8 +49,7 @@ plugin arrives through the plugin system and every contract lives in the plan or
 ## Blueprint proposal (relayed to the human)
 
 When the org has no blueprint yet, propose: install the Databricks CLI, `uv`, and the source
-drivers the estate needs; add `.hook_probe_nonce` to `.gitignore`. The plugin itself arrives
-via the plugin system — do not ask for any import, submodule, or library copy step.
+drivers the estate needs; add `.hook_probe_nonce` to `.gitignore`.
 
 ## Estate-type routing -> `references/estate-types.md`
 
@@ -64,7 +62,5 @@ lists which `skills-extra/` dialect skills apply per type.
 
 ## Explicitly out of scope
 
-- The manager writes `plan.yaml` — never `allowed_targets.json`, tolerances, capabilities, or
-  authorizations; those are the `workspace-setup` ticket's, entered on the protected branch.
-- Legacy write authorizations are human PRs into `.migration/authorizations.json`; intake only
-  names the objects the plan's `legacy_write_authorized` decision will cover.
+Legacy write authorizations are human PRs into `.migration/authorizations.json`; intake only
+names the objects the plan's `legacy_write_authorized` decision will cover.

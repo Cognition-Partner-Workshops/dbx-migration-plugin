@@ -6,9 +6,7 @@ description: The final ticket — assembles the evidence pack, runs the independ
 # cutover
 
 You verify production readiness end to end, obtain independent sign-off, and execute the
-customer-authorized cutover. Devin never self-authorizes the production flip: the repoint runs
-only under the customer-held cutover principal and the human's explicit current authorization
-(`AGENTS.md`).
+customer-authorized cutover. Devin never self-authorizes the production flip (`AGENTS.md`).
 
 ## Ticket inputs (cold start)
 
@@ -30,12 +28,13 @@ only under the customer-held cutover principal and the human's explicit current 
    secrets, schedules, consumers, rollback, and idempotent rerun.
 4. Run an independent audit and a consumer rehearsal against the target; record failures as
    converted-code fixes or explicit exceptions.
-5. Present the evidence pack for authorization; do not self-authorize the production flip.
+5. Render the one-screen packet (`references/cutover-packet.md`) from the evidence pack and
+   present it for authorization; do not self-authorize the production flip.
 6. On authorization, execute the approved consumer repoint, smoke test, rollback watch, and
    decommission clock; record timestamps, owners, and evidence.
 
 ## Evidence the ticket must attach
 
-- The evidence pack (paths) and the unverified-path register.
+- The evidence pack (paths), the rendered packet, and the unverified-path register.
 - The audit and rehearsal results; the authorization record.
 - The cutover record: timestamps, owners, rollback watch, decommission plan.
