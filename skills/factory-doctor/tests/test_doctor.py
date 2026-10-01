@@ -23,8 +23,8 @@ def _git(ws: Path, *args: str) -> str:
                           check=True, capture_output=True, text=True).stdout
 
 
-def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), commit=True):
-    """A setup-complete workspace, committed as the setup playbook leaves it before STOP A."""
+def make_workspace(tmp_path: Path, *, allowed=None, omit=(), commit=True):
+    """An intake-complete workspace: the contract files the wave worker's ticket requires, committed."""
     mig = tmp_path / ".migration"
     mig.mkdir(parents=True)
     for f in doctor.REQUIRED_FILES:
@@ -33,12 +33,8 @@ def make_workspace(tmp_path: Path, *, allowed=None, stop_mode="hard", omit=(), c
         if f == "allowed_targets.json":
             mig.joinpath(f).write_text(json.dumps(allowed if allowed is not None else
                                                   {"catalogs": ["mig_cat"], "legacy_sources": ["LEGACY_DSN"]}))
-        elif f == "00_context.md":
-            mig.joinpath(f).write_text(
-                f"# context\n\nstop_mode: {stop_mode}\n\n## Glossary\n- term: meaning\n"
-            )
         else:
-            mig.joinpath(f).write_text(f"# {f}\n")
+            mig.joinpath(f).write_text("{}\n")
     _git(tmp_path, "init", "-q")
     if commit:
         _git(tmp_path, "add", "-A")
@@ -79,7 +75,6 @@ def test_offline_run_passes_every_local_check_but_is_never_ready(tmp_path):
     # an unverified identity can never certify a wave, however the check was skipped
     assert not report["ready"] and report["blocking"] == ["databricks_identity=skipped"]
     assert c["workspace"]["status"] == "ok"
-    assert c["workspace"]["data"]["stop_mode"] == "hard"
     assert sub_by_id(report, "allowed_targets")["allowed_targets"]["status"] == "ok"
     assert c["allowed_targets"]["data"]["catalogs"] == ["mig_cat"]
     assert c["hook_guard"]["status"] == "ok"
@@ -191,7 +186,7 @@ def test_run_core_rows_are_ten(tmp_path):
     report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
     optional = {"lakebase_branch_create", "lakebase_target_grants", "analytical_target_grants"}
     assert [c["id"] for c in report["checks"] if c["id"] not in optional] == [
-        "workspace", "allowed_targets", "allowlist_committed", "playbooks_installed", "hook_guard",
+        "workspace", "authorizations_file", "allowed_targets", "allowlist_committed", "hook_guard",
         "official_databricks_plugin", "recon_harness", "recon_family_supported", "type_map_audit",
         "delete_evidence", "source_principal_read_only", "dictionary_readable",
         "named_secrets_exist", "databricks_identity",
@@ -217,11 +212,6 @@ def test_merged_row_status_rules():
     merged = doctor._merge("row", [ok, warn])
     assert [s["id"] for s in merged.data["sub_results"]] == ["ok", "warn"]
     assert merged.data["ok"] == 1 and merged.data["warn"] == 3
-
-
-def test_stop_mode_datum_on_workspace_row(tmp_path):
-    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
-    assert by_id(report)["workspace"]["data"]["stop_mode"] in ("soft", "hard")
 
 
 def test_cli_rejects_a_bare_blocked_claim(tmp_path):
@@ -270,7 +260,7 @@ def test_human_identity_redacts_username_and_offers_no_waiver(monkeypatch):
     assert row["data"]["userName"] == "<human user (redacted)>"
     assert "someone@example.com" not in row["detail"]
     assert "service principal" in row["detail"]
-    assert "06_decisions.md" not in row["detail"]
+    assert "authorizations.json" not in row["detail"]
 
 
 def test_lakebase_rows_are_absent_without_flags(tmp_path):
@@ -576,51 +566,12 @@ def test_not_blocked_probe_fails(tmp_path):
 
 
 def test_generated_and_folded_files_are_not_required(tmp_path):
-    ws = make_workspace(tmp_path, omit=("02_glossary.md", "05_progress.md"))
-    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert c["workspace"]["status"] == "ok"
-    (ws / ".migration" / "00_context.md").write_text("# no mode here\n\n## Glossary\n- term: meaning\n")
-    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert sub_by_id({"checks": [c["workspace"]]}, "workspace")["stop_mode"]["status"] == "fail"
-
-
-def test_workspace_requires_glossary_section(tmp_path):
-    ws = make_workspace(tmp_path, omit=("02_glossary.md",))
-    (ws / ".migration" / "00_context.md").write_text("stop_mode: hard\n")
-    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert c["workspace"]["status"] == "fail"
-    assert "Glossary" in c["workspace"]["detail"]
-
-    (ws / ".migration" / "00_context.md").write_text(
-        "stop_mode: hard\n\n## Glossary\n- term: meaning\n"
-    )
-    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert c["workspace"]["status"] == "ok"
-
-
-def test_workspace_accepts_legacy_glossary_file(tmp_path):
     ws = make_workspace(tmp_path)
-    (ws / ".migration" / "02_glossary.md").write_text("# legacy glossary\n")
-    (ws / ".migration" / "00_context.md").write_text("stop_mode: hard\n")
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
     assert c["workspace"]["status"] == "ok"
-
-
-def test_workspace_rejects_glossary_directory(tmp_path):
-    ws = make_workspace(tmp_path, omit=("02_glossary.md",))
-    (ws / ".migration" / "02_glossary.md").mkdir()
-    (ws / ".migration" / "00_context.md").write_text("stop_mode: hard\n")
+    (ws / ".migration" / "extra.md").write_text("# extra\n")
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert c["workspace"]["status"] == "fail"
-    assert "Glossary" in c["workspace"]["detail"]
-
-
-def test_workspace_rejects_context_directory(tmp_path):
-    ws = make_workspace(tmp_path, omit=("00_context.md",))
-    (ws / ".migration" / "00_context.md").mkdir()
-    c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
-    assert c["workspace"]["status"] == "fail"
-    assert "00_context.md" in c["workspace"]["detail"]
+    assert c["workspace"]["status"] == "ok"
 
 
 def test_setup_outputs_tolerances_json_is_required(tmp_path):
@@ -745,7 +696,7 @@ def _mapping(tmp_path: Path, *, evidence=True, key=("Id",), root_where=None) -> 
 
 
 def _unit_mapping(ws: Path, unit: str, **kw) -> Path:
-    """The unit's mapping where the plan playbook writes it: .migration/units/<id>/mapping_spec.json."""
+    """The unit's mapping where the wave-plan ticket writes it: .migration/units/<id>/mapping_spec.json."""
     p = _mapping(ws / ".migration" / "units" / unit, **kw)
     return p.rename(p.with_name("mapping_spec.json"))
 
@@ -895,7 +846,7 @@ def test_child_non_security_failures_are_warnings_and_do_not_block(tmp_path, mon
     report = doctor.run(ws, PLUGIN_ROOT, "child", "unknown", None, False, units=["loans"])
     row = by_id(report)["recon_harness"]
     assert row["status"] == "warn" and "selftest rc=1" in row["detail"]
-    assert by_id(report)["playbooks_installed"]["status"] == "ok"
+    assert by_id(report)["authorizations_file"]["status"] == "ok"
     assert report["ready"] is True and report["blocking"] == []
 
 
@@ -1865,64 +1816,24 @@ def test_databricks_source_principal_two_part_names_are_unresolved(monkeypatch):
     assert c.status == "unverified" and c.data["unresolved"] == ["raw.loans"]
 
 
-def _attest(ws, line):
-    p = ws / ".migration" / "06_decisions.md"
-    p.write_text(p.read_text() + line)
-
-
 def test_source_attested_reports_attested_and_does_not_block(tmp_path):
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
-    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal | user:msg-41\n")
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                         source_family="teradata", source_attested="D-7")
     row = by_id(report)["source_principal_read_only"]
     assert row["status"] == "ok" and row["data"]["attested"] == "D-7"
-    assert row["data"]["decision"] == "D-7" and row["data"]["provenance"] == "user:msg-41"
+    assert row["data"]["decision"] == "D-7"
+    assert "plan decision D-7" in row["detail"] and "not machine-checkable" in row["detail"]
     assert not [b for b in report["blocking"] if b.startswith("source_principal_read_only")]
     assert report["blocking"] == ["hook_guard=unverified", "recon_family_supported=fail",
                                   "databricks_identity=skipped"]
-
-
-def test_source_attested_fails_without_a_matching_ledger_line(tmp_path):
-    ws = make_workspace(tmp_path)
-    _unit_mapping(ws, "loans", evidence=False)
-    _attest(ws, "D-99 | source_principal_read_only: grants confirmed SELECT-only by hand\n")
-    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
-                        source_family="teradata", source_attested="D-99")
-    row = by_id(report)["source_principal_read_only"]
-    assert row["status"] == "fail" and "D-99" in row["detail"]
-    assert "source_principal_read_only=fail" in report["blocking"]
-    # a decision id is a whole token: D-9 does not match the D-99 line, nor D-990 a D-99 one
-    _attest(ws, "D-990 | source_principal_read_only attested: static export\n")
-    for wrong in ("D-9", "D-99"):
-        report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
-                            source_family="teradata", source_attested=wrong)
-        assert by_id(report)["source_principal_read_only"]["status"] == "fail", wrong
-
-
-@pytest.mark.parametrize("line", [
-    "D-8 | source_principal_read_only attested: static export | default-accepted (soft, 60s, no reply)\n",
-    "D-8 | source_principal_read_only attested: static export\n",
-    "D-8 | source_principal_read_only attested: static export | user:\n",
-    "D-8 | source_principal_read_only attested: static export | reviewer:alice\n",
-])
-def test_source_attested_requires_user_provenance(tmp_path, line):
-    ws = make_workspace(tmp_path)
-    _unit_mapping(ws, "loans", evidence=False)
-    _attest(ws, line)
-    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
-                        source_family="teradata", source_attested="D-8")
-    row = by_id(report)["source_principal_read_only"]
-    assert row["status"] == "fail" and "user:" in row["detail"] and "D-8" in row["detail"]
-    assert "source_principal_read_only=fail" in report["blocking"]
 
 
 def test_source_attested_is_rejected_for_families_with_a_privilege_query(tmp_path, monkeypatch):
     monkeypatch.setattr(doctor, "check_source_principal", lambda *a, **k: pytest.fail("must not connect"))
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
-    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal | user:msg-41\n")
     for family in ("postgres", "databricks"):
         report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                             source_family=family, source_attested="D-7")
@@ -2003,7 +1914,6 @@ def test_recon_family_supported_fails_on_a_malformed_registry_instead_of_raising
 def test_recon_family_supported_is_its_own_row_beside_an_attested_principal(tmp_path):
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
-    _attest(ws, "D-7 | source_principal_read_only attested: source is a static export, no principal | user:msg-41\n")
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                         source_family="teradata", source_attested="D-7")
     rows = by_id(report)
@@ -2159,7 +2069,7 @@ def test_type_map_audit_asks_the_installed_harness_first(tmp_path, monkeypatch):
 
 
 
-# ------------------------------------------------------------------ ledger integrity rows (A2c)
+# ------------------------------------------------------------------ contract integrity rows (A2c)
 
 def test_allowlist_committed_is_ok_only_when_both_contract_files_equal_head(tmp_path):
     ws = make_workspace(tmp_path)
@@ -2181,6 +2091,58 @@ def test_allowlist_committed_is_ok_only_when_both_contract_files_equal_head(tmp_
     assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "untracked"
     (ws / ".migration" / "03_recon_tolerances.json").unlink()
     assert doctor.check_allowlist_committed(ws).data[".migration/03_recon_tolerances.json"] == "missing"
+
+
+def test_authorizations_absent_is_ok(tmp_path):
+    ws = make_workspace(tmp_path)
+    c = doctor.check_authorizations(ws)
+    assert c.status == "ok" and "no .migration/authorizations.json" in c.detail
+
+
+def _auth_doc(entries):
+    return json.dumps({"version": 1, "authorizations": entries})
+
+
+def test_authorizations_valid_entries_ok(tmp_path):
+    ws = make_workspace(tmp_path)
+    (ws / ".migration" / "authorizations.json").write_text(_auth_doc([
+        {"id": "D-7", "kind": "legacy_write_authorized", "objects": ["dbo.orders"],
+         "by": "user:t", "at": "2026-01-01"}]))
+    c = doctor.check_authorizations(ws)
+    assert c.status == "ok" and c.data["entries"] == 1
+
+
+@pytest.mark.parametrize("entry", [
+    {"id": "D-7", "kind": "tolerance_change", "objects": ["dbo.orders"], "by": "user:t"},
+    {"id": "D-7", "kind": "legacy_write_authorized", "objects": [], "by": "user:t"},
+    {"id": "D-7", "kind": "legacy_write_authorized", "objects": ["dbo.orders"]},
+    {"id": "D-7", "kind": "legacy_write_authorized", "objects": ["dbo.orders"], "by": "svc-bot"},
+    {"id": "bad id!", "kind": "legacy_write_authorized", "objects": ["dbo.orders"], "by": "user:t"},
+])
+def test_authorizations_malformed_entry_fails(tmp_path, entry):
+    ws = make_workspace(tmp_path)
+    (ws / ".migration" / "authorizations.json").write_text(_auth_doc([entry]))
+    c = doctor.check_authorizations(ws)
+    assert c.status == "fail" and "malformed entry 0" in c.detail
+
+
+def test_authorizations_malformed_json_fails(tmp_path):
+    ws = make_workspace(tmp_path)
+    (ws / ".migration" / "authorizations.json").write_text("{ not json")
+    assert doctor.check_authorizations(ws).status == "fail"
+
+
+def test_authorizations_uncommitted_diff_warns(tmp_path):
+    ws = make_workspace(tmp_path)
+    auth = ws / ".migration" / "authorizations.json"
+    auth.write_text(_auth_doc([{"id": "D-7", "kind": "legacy_write_authorized",
+                                "objects": ["dbo.orders"], "by": "user:t", "at": "x"}]))
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "authorization")
+    auth.write_text(_auth_doc([{"id": "D-8", "kind": "legacy_write_authorized",
+                                "objects": ["dbo.orders"], "by": "user:t", "at": "x"}]))
+    c = doctor.check_authorizations(ws)
+    assert c.status == "warn" and "authorizations change only by PR" in c.detail
 
 
 def test_allowlist_committed_compares_bytes_not_git_status(tmp_path):
@@ -2286,7 +2248,7 @@ def test_auth_kind_oauth_m2m_is_ok(monkeypatch):
 
 def test_auth_kind_pat_fails_with_no_waiver(monkeypatch):
     row = _auth_kind(monkeypatch, "pat")
-    assert row.status == "fail" and "06_decisions.md" not in row.detail
+    assert row.status == "fail" and "authorizations.json" not in row.detail
     assert "service principal" in row.detail
 
 
@@ -2478,155 +2440,6 @@ def test_child_inherits_platform_row_from_the_signed_record(tmp_path):
     assert sub["data"]["reused_from"] == "2026-01-01T00:00:00Z"
 
 
-# ------------------------------------------------------------------ playbooks installed
-
-PLAYBOOKS_DIR = PLUGIN_ROOT / "skills" / "install-dbx-factory" / "playbooks"
-
-
-def test_repo_playbooks_malformed_index_returns_empty(tmp_path):
-    playbooks = tmp_path / "skills" / "install-dbx-factory" / "playbooks"
-    playbooks.mkdir(parents=True)
-    (playbooks / "1-x.md").write_text("# playbook\n")
-    for content in ("[]", '{"playbooks": 3}', '{"playbooks": [null]}', "{"):
-        (playbooks / "index.json").write_text(content)
-        assert doctor._repo_playbooks(tmp_path) == {}
-
-
-def test_repo_playbooks_valid_index_returns_macro(tmp_path):
-    playbooks = tmp_path / "skills" / "install-dbx-factory" / "playbooks"
-    playbooks.mkdir(parents=True)
-    body = "# playbook\n"
-    (playbooks / "1-x.md").write_text(body)
-    (playbooks / "index.json").write_text(json.dumps({
-        "playbooks": [{"file": "1-x.md", "macro": "!x", "title": "X"}],
-    }))
-
-    assert doctor._repo_playbooks(tmp_path) == {"!x": "1-x.md"}
-
-
-def test_repo_playbooks_keys_are_macros_only():
-    repo = doctor._repo_playbooks(PLUGIN_ROOT)
-    assert all(m.startswith("!") for m in repo)
-    assert "00_intake_template.md" not in repo and "index.json" not in repo
-    assert "!dbx_migrate_pipeline" in repo
-    assert len(repo) >= 14
-    index = json.loads((PLAYBOOKS_DIR / "index.json").read_text())["playbooks"]
-    assert [r["macro"] for r in index] == list(repo)
-    assert all(r["title"].startswith("[DBX v1] ") for r in index)
-
-
-def test_playbooks_installed_ok():
-    c = doctor.check_playbooks_installed(PLUGIN_ROOT)
-    assert c.status == "ok" and c.data["checked"] >= 14
-    assert c.data["missing"] == c.data["unlisted"] == c.data["duplicate_macros"] == []
-    on_disk = {p.name for p in PLAYBOOKS_DIR.glob("*.md")} - doctor._NOT_PLAYBOOKS
-    listed = {r["file"] for r in json.loads((PLAYBOOKS_DIR / "index.json").read_text())["playbooks"]}
-    assert on_disk <= listed
-
-
-def _tmp_plugin_root(tmp_path: Path, index) -> Path:
-    playbooks = tmp_path / "skills" / "install-dbx-factory" / "playbooks"
-    playbooks.mkdir(parents=True, exist_ok=True)
-    (playbooks / "index.json").write_text(json.dumps(index) if not isinstance(index, str) else index)
-    return playbooks
-
-
-def test_playbooks_installed_missing_file_is_a_warning_not_a_blocker(tmp_path):
-    playbooks = _tmp_plugin_root(tmp_path, {"playbooks": [
-        {"file": "1-x.md", "macro": "!x"}, {"file": "2-gone.md", "macro": "!gone"}]})
-    (playbooks / "1-x.md").write_text("# playbook\n")
-    c = doctor.check_playbooks_installed(tmp_path)
-    assert c.status == "warn" and c.data["missing"] == ["2-gone.md"]
-    assert "install-dbx-factory" in c.detail
-    for role in ("child", "orchestrator", "setup"):
-        assert not [b for b in doctor._blocking(role, [c]) if b.startswith("playbooks_installed")]
-
-
-def test_playbooks_installed_unlisted_and_duplicate_macro_warn(tmp_path):
-    playbooks = _tmp_plugin_root(tmp_path, {"playbooks": [
-        {"file": "1-x.md", "macro": "!x"}, {"file": "2-y.md", "macro": "!x"}]})
-    (playbooks / "1-x.md").write_text("# playbook\n")
-    (playbooks / "2-y.md").write_text("# playbook\n")
-    (playbooks / "3-extra.md").write_text("# stray\n")
-    c = doctor.check_playbooks_installed(tmp_path)
-    assert c.status == "warn"
-    assert c.data["unlisted"] == ["3-extra.md"] and c.data["duplicate_macros"] == ["!x"]
-    assert "3-extra.md" in c.detail and "!x" in c.detail
-
-
-def test_playbooks_installed_malformed_index_warns_not_crashes(tmp_path):
-    for content in ("{", "[]", '{"playbooks": 3}'):
-        _tmp_plugin_root(tmp_path, content)
-        assert doctor.check_playbooks_installed(tmp_path).status == "warn"
-
-
-def test_cli_has_no_live_playbooks_flag():
-    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--help"],
-                       capture_output=True, text=True, check=False)
-    assert r.returncode == 0 and "--live-playbooks" not in r.stdout
-    r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--live-playbooks", "x"],
-                       capture_output=True, text=True, check=False)
-    assert r.returncode == 2
-
-
-# ------------------------------------------------------------------ named_secrets_exist (WS2.6)
-
-def test_manifest_secret_names_collects_lists_and_brief_references():
-    manifest = {
-        "secrets": ["app/db-host"],
-        "batches": [
-            {"id": "b-1", "secrets": ["app/db-user"],
-             "brief": "read {{secrets/app/db-password}} then dbutils.secrets.get(scope=\"app\", key=\"db-token\")"},
-            {"id": "b-2",
-             "brief": "also secrets/warehouse/token and secrets.get(\"app\", \"db-host\")"},
-        ],
-    }
-    assert doctor.manifest_secret_names(manifest) == [
-        "app/db-host", "app/db-password", "app/db-token", "app/db-user", "warehouse/token"]
-
-
-def test_manifest_secret_names_parses_secrets_get_in_any_argument_order():
-    manifest = {"batches": [{"id": "b", "brief": (
-        'a = dbutils.secrets.get(key="password", scope="payments")\n'
-        'b = secrets.get("s", key="k")\n'
-        "c = dbutils.secrets.get(scope='app', key='db-token')\n"
-        'd = secrets.get("only")\n')}]}
-    assert doctor.manifest_secret_names(manifest) == ["app/db-token", "payments/password", "s/k"]
-
-
-@pytest.mark.parametrize("bad", ["a/b", 7, None, ["ok/k", 3]])
-def test_manifest_secret_names_rejects_a_non_list_of_strings(bad):
-    with pytest.raises(SystemExit, match="must be a list of scope/key strings"):
-        doctor.manifest_secret_names({"secrets": bad, "batches": []})
-    with pytest.raises(SystemExit, match="must be a list of scope/key strings"):
-        doctor.manifest_secret_names({"batches": [{"id": "b", "secrets": bad}]})
-
-
-def test_wave_manifest_with_bad_secrets_shape_exits_cleanly(tmp_path):
-    ws = make_workspace(tmp_path)
-    manifest = ws / ".migration" / "waves" / "wave-1.json"
-    manifest.parent.mkdir()
-    manifest.write_text(json.dumps({
-        "capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
-        "source": {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}},
-        "secrets": "app/db-user",
-    }))
-    result = subprocess.run(
-        [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
-         "--hook-probe-result", probed(ws), "--wave", str(manifest)],
-        capture_output=True, text=True, check=False,
-    )
-    assert result.returncode == 1
-    assert "must be a list of scope/key strings" in result.stderr
-    assert "Traceback" not in result.stderr
-    assert not manifest.with_suffix(".doctor.json").exists()
-
-
-def test_manifest_secret_names_ignores_other_text():
-    manifest = {"batches": [{"id": "b-1", "brief": "no secrets here, just secrets talk"}]}
-    assert doctor.manifest_secret_names(manifest) == []
-
-
 def test_check_named_secrets_skipped_without_names():
     c = doctor.check_named_secrets([])
     assert c.status == "skipped" and "no Databricks secret names" in c.detail
@@ -2638,7 +2451,7 @@ def test_check_named_secrets_fails_on_missing_key():
     c = doctor.check_named_secrets(["app/db-user", "app/db-password"],
                                    lambda scope: list(values.get(scope, {})))
     assert c.status == "fail"
-    assert "STOP C" in c.detail and "app/db-password" in c.detail
+    assert "before the wave launches" in c.detail and "app/db-password" in c.detail
     assert c.data["missing"] == ["app/db-password"]
     assert c.data["checked"] == ["app/db-user", "app/db-password"]
     assert "s3cr3t-value" not in json.dumps(asdict(c))

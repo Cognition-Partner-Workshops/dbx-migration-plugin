@@ -1,62 +1,79 @@
 ---
 name: migration-fanout
-description: "Run one migration wave as a dynamic workflow: N unit-migration children in parallel, then one independent verifier, with write-target collision checks, a circuit breaker, and a ten-line wave brief. Use from the orchestrator for every wave with more than one batch. Never hand-manage child sessions when this exists."
+description: "Run one migration wave as a dynamic workflow: N unit-migration children in parallel, then one independent verifier, with write-target collision checks, a circuit breaker, and the wave card. Use from the wave ticket's worker for every wave with more than one batch. Never hand-manage child sessions when this exists."
 ---
 
 # migration-fanout
 
-The workflow owns one wave from launch through result writing. It launches children,
-checks their reports, runs independent verification, and writes the result, the brief, and the wave card (`cards.py`, which also renders halt
-cards and the one-line relaunch update from the shell). Its pure parts live beside it: `ledger.py` (decision rows, STOP C
-approval, override scope), `manifest.py` (manifest grammar, gate shapes, write-target and predicate checks), `report.py`
-(child, verifier, close and resync report schemas and validators); the sandbox imports them from the pointer's plugin root.
+The workflow owns one wave from launch through result writing. It launches children, checks
+their reports, runs independent verification, and writes the result and the wave card
+(`cards.py`). Its pure parts live beside it: `decisions.py` (plan hash, `merge_overrides`
+selection and scope), `manifest.py` (manifest grammar, skill paths, gate shapes, write-target and
+predicate checks), `report.py` (child, verifier, close and resync report schemas, protected-file
+checks); the sandbox imports them from the pointer's plugin root.
 
 ## How to use it
 
-1. Write and commit `wave-<N>.json`, including batch briefs (`references/brief_template.md`:
-   under 4000 chars, pointing at the manifest and capabilities file rather than restating them),
-   targets, gates, `stop_c`, and `gates_sha`.
-2. Run the signed doctor over the manifest:
-   `python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo> --wave .migration/waves/wave-<N>.json --hook-probe-result blocked:<nonce>`.
-   It writes `wave-<N>.doctor.json`, signed over the manifest bytes and accepted for 15 minutes.
-   Commit it beside the manifest: it carries no secret values (manifest hash, timestamp,
-   principal name, host, readiness, `inputs_sha`, signature), and children reuse it per
-   `skills/factory-doctor/SKILL.md`, running the doctor in full when it is stale or absent.
-3. Write `~/.migration/waves/current.json`:
+1. The "Run wave N" ticket's worker reads the committed `wave-<N>.json` the wave-plan ticket
+   wrote: `plan_step` (this ticket's plan step id), `child_skill` / `verify_skill` (skill names
+   under `<plugin>/skills/`, embedded verbatim in the child and verifier prompts), batch briefs
+   (`references/brief_template.md`: under 4000 chars, pointing at the manifest and capabilities
+   file rather than restating them), targets, gates, and the `merge_overrides` / gate
+   `decision_id`s the human selected in the plan.
+2. Refresh the signed doctor record when it is older than `doctor_max_age`:
+   `python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo> --wave .migration/waves/wave-<N>.json --hook-probe-result blocked:<nonce>`
+   writes `wave-<N>.doctor.json`, signed over the manifest bytes. Commit it beside the manifest:
+   it carries no secret values (manifest hash, timestamp, principal name, host, readiness,
+   `inputs_sha`, signature), and children reuse it per `skills/factory-doctor/SKILL.md`, running
+   the doctor in full when it is stale or absent.
+3. Write `~/.migration/waves/current.json`; its `plugin` key names the plugin root the skills and
+   `pipeline_updates.py` resolve from:
    `{"manifest": "wave-<N>.json", "hook_probe": "blocked:<nonce>|not-blocked|unknown", "workspace": "/abs/repo", "plugin": "<plugin>"}`.
 4. Run `run_workflow(workflow_name="migration-wave-<N>", script_path="<plugin>/skills/migration-fanout/workflow.py")`.
-5. Read `.migration/waves/wave-<N>.result.json` and `.migration/waves/wave-<N>.brief.md`,
-   post `.migration/waves/wave-<N>.card.md` (the six-line wave-close card, shape in
-   `install-dbx-factory/references/contract.md`), then render progress with
-   `python3 <plugin>/skills/migration-fanout/progress.py .migration`.
+5. Post `.migration/waves/wave-<N>.card.md` on the ticket with the result's `brief` lines and a link
+   to `wave-<N>.result.json`; the manager ticks the gate.
 
-A result file means the wave will not relaunch. To rerun deliberately, delete the result,
-refresh the doctor, and run the workflow again. The STOP C row is reused for a plumbing
-relaunch: same `gates_sha`, and no earlier run under that row got a batch past its own checks
-(`wave-<N>.runs.jsonl` records what each run passed and merged). A run that produced a merge
-candidate, or a changed gate list, needs a new STOP C row named in the manifest's `stop_c`.
+A result file means the wave will not relaunch. To rerun deliberately, delete the result and
+re-dispatch the ticket for the same plan step: `wave-<N>.runs.jsonl` records
+`{plan_step, plan_sha, manifest_sha, started}` per launch, so the same manifest bytes launch once,
+a plumbing edit (brief, repo, secret name, estimates) launches again only with a fresh doctor
+signature over the new bytes, and a manifest whose `plan_sha` differs from what that plan step
+already ran (units, write targets, gates, width, source scope, overrides) halts: a scope change is
+a plan decision the human selects, a new plan step, never a rerun of the old one. Dispatching a
+close step, review-only or merging, first appends `{..., merged: [pr_url]}` for the step with the
+PRs it is sent, and the step never launches again whatever that close reports, proves, or merges
+without proof: its remaining batches are a new manifest under a new plan step.
 
-Ledger rows the workflow reads (`merge_override`, `waive`) may carry one machine cell,
-`{"kind": "merge_override", "units": ["u1", "u2"], "blocker_classes": ["rerun_policy"]}` or
-`{"kind": "waive", "gate": "g-export", "units": ["u1"]}`; when a row has one, that cell is the
-decision and the prose beside it is not parsed. `blocker_classes` scopes an override to the
-harness blocker classes it forgives; a unit with any other class stays blocked. A row without
-`blocker_classes` forgives every policy class (`rerun_policy`, `privilege_visibility`,
-`structural`, `evidence`) and never `data`: rows that differ are fixed in converted code, and
-only a row naming `data` says otherwise. A unit whose result.json records no blocker classes
-fits no override. Prose-only
-rows still work by naming the word, the gate, and every unit as whole tokens. A row with a
-malformed machine cell halts preflight. An override row written below this run's STOP C row
-applies whether or not the child reported it.
+`merge_overrides` entries are `{"decision": "<slug>", "units": ["u1", "u2"], "blocker_classes":
+["rerun_policy"]}`. An entry clears a batch only when it is the single entry covering every unit
+of the batch and the child claims its decision. `blocker_classes` scopes it to the harness blocker
+classes it forgives; a unit with any other class stays blocked. An entry without `blocker_classes`
+forgives every policy class (`rerun_policy`, `privilege_visibility`, `structural`, `evidence`)
+and never `data`: rows that differ are fixed in converted code, and only an entry naming `data`
+says otherwise. A unit whose result.json records no blocker classes fits no override. A waived
+gate carries the `decision_id` of the plan decision that waived it. Each `decision_id` and each
+`merge_overrides` `decision` must be an entry of `.migration/authorizations.json` as committed on
+the base branch (`kind: gate_waived` / `merge_override`, `by: user:<id>`, `objects` naming the
+units it covers): the human's plan selection reaches the repo by reviewed PR, and a slug the
+manifest names alone halts the wave before launch.
 
 A child reports gate evidence as the bare path under `.migration/recon/<unit>/`, or as
 `{"path": ..., "label": ..., "verdict": ..., "rows": ...}` to annotate it; a path with a note
 appended fails the gate with a message that says so.
 
+## Wave card
+
+`cards.py <wave-N.result.json>` renders the six lines the worker posts (`wave-<N>.card.md`):
+head, blockers by class, decision, not done, PRs and evidence, reply. `parity PASS` is never
+rendered as FAIL; merge policy is a separate word. The last line quotes the one reply the
+manager gives: `accept wave <N>` when verified PRs await a manual merge, `relaunch` when a
+batch failed, was held or the verifier failed, `Reply: none needed` when everything merged;
+`halt` is always the alternative.
+
 ## Smoke check
 
 The credential-free smoke manifest exercises pointer discovery, registration, and result
-writing without a doctor, ledger approval, git origin, or child launch:
+writing without a doctor, git origin, or child launch:
 
 ```sh
 mkdir -p /tmp/fanout-smoke/.migration/waves && printf '{"smoke": true, "wave": 0, "width": 1, "batches": []}' > /tmp/fanout-smoke/.migration/waves/wave-0.json && mkdir -p ~/.migration/waves && printf '{"manifest": "wave-0.json", "hook_probe": "unknown", "workspace": "/tmp/fanout-smoke", "plugin": "<plugin>"}' > ~/.migration/waves/current.json
@@ -69,11 +86,10 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 
 | Guard | Summary |
 |---|---|
-| Manifest check | Validates shape, source names, batches, units, width, and migration contract. |
+| Manifest check | Validates shape, plan step, skills, source names, batches, units, width, and migration contract. |
 | Signed doctor gate | Requires an HMAC-bound doctor record with 15-minute freshness, hook probe, and matching capabilities. |
-| STOP C gates_sha approval | Requires the ledger row named by `stop_c` to approve the exact gate hash. |
-| One approval one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts); reuses the STOP C row only for a plumbing relaunch (same `gates_sha` and `plan_sha`: only briefs, repo, secret names or estimates changed; nothing passed or merged under it). |
-| Repo and ledger preflight | Halts before STOP C is spent when `repo` is not `host/owner/name`, origin points elsewhere, or a ledger machine cell is malformed. |
+| One manifest one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts), refuses a manifest whose sha is already in `wave-N.runs.jsonl`, refuses a manifest whose `plan_sha` differs from the one its plan step already ran, and refuses a plan step whose earlier run sent PRs to merge. |
+| Repo preflight | Halts before anything launches when `repo` is not `host/owner/name` or origin points elsewhere. |
 | Duplicate wave | Refuses any existing result, including halted or unreadable files. |
 | Manifest name / pipelines barrier | Checks tags and waits for declared sibling manifests on origin. |
 | Collision check | Rejects overlapping declared targets within and across waves. |
@@ -82,11 +98,11 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Width | Limits concurrent child launches to the manifest width. |
 | Time budget | Passes each child its declared execution budget. |
 | Circuit breaker | Stops launching after the configured repeated failure threshold. |
-| Single ledger writer | Keeps workflow-owned ledger artifacts out of child writes. |
+| Single result writer | Keeps the result, card and run log out of child writes. |
 | Child report | Validates schema, status, recon evidence, and changed paths. |
-| Ledger gate | Reclassifies unauthorized migration-ledger changes. |
-| Merge authority | Requires harness evidence or an explicit human override. |
-| Acceptance gates | Requires every declared gate to pass or have a valid waiver. |
+| Protected files gate | Reclassifies unauthorized `.migration/` changes as `protected_files_tampered`. |
+| Merge authority | Requires harness evidence or the one committed `merge_overrides` entry covering the batch, its decision a committed `merge_override` authorization naming the units. |
+| Acceptance gates | Requires every declared gate to pass; a waived gate carries its plan `decision_id`, a committed `gate_waived` authorization naming the units. |
 | Resync | Runs only the declared parent-owned resync and holds affected merges on trouble. |
 | Independent verify | Rechecks passing batches from the base branch; a `degraded: true` wave runs the harness in `--mode structural`, never merge-eligible. |
 | Verifier verdicts | Normalizes verdicts and rejects missing, extra, or contradictory results. |

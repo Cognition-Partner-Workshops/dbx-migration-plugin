@@ -1,6 +1,6 @@
 ---
 name: tsql-ssis
-description: Source-dialect skill for SQL Server T-SQL estates (with Sybase ASE deltas) and SSIS packages. Load it when converting T-SQL procedures, views, triggers, SQL Agent jobs, isql runners or .dtsx packages to Databricks SQL, Lakeflow Jobs and Lakeflow Spark Declarative Pipelines, or reconciling a T-SQL-sourced unit (analytical track and the Lakebase OLTP front door).
+description: Source-dialect skill for SQL Server T-SQL estates (with Sybase ASE deltas) and SSIS packages. Load it when converting T-SQL procedures, views, triggers, SQL Agent jobs, isql runners or .dtsx packages to Databricks SQL, Lakeflow Jobs and Lakeflow Spark Declarative Pipelines, or reconciling a T-SQL-sourced unit (analytical track and the Lakebase OLTP track).
 ---
 
 # T-SQL + SSIS Dialect (v1)
@@ -17,7 +17,7 @@ Everything Databricks-side is a pointer through `skills/target-routing/SKILL.md`
 | Task graphs (`depends_on`, `run_if`, If/else, `for_each_task`, `sql_task`, job parameters, retries) | `databricks-jobs` (`SKILL.md`, `references/task-types.md`, `notifications-monitoring.md`, `triggers-schedules.md`); docs `/jobs/parameter-use`, `/jobs/dynamic-value-references`, `/jobs/conditional-tasks` |
 | Data flows as streaming tables / materialized views / expectations / Auto CDC | `databricks-pipelines` |
 | `BEGIN ATOMIC`, transaction requirements, optimistic concurrency | docs `/transactions/`, `/transactions/transaction-modes` |
-| Lakebase Postgres column types (`!dbx_migrate_oltp`) | `databricks-lakebase` `references/synced-tables.md` "Type mapping" |
+| Lakebase Postgres column types (OLTP track) | `databricks-lakebase` `references/synced-tables.md` "Type mapping" |
 | Grants, RLS, system tables | `databricks-unity-catalog` |
 | Name resolution (column beats parameter/variable) | docs `sql-ref-name-resolution` |
 

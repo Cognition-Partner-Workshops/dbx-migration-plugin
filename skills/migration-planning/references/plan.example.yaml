@@ -1,0 +1,100 @@
+version: 1
+title: Migrate the loans warehouse to Databricks
+summary: Like-for-like migration of the loans reporting pipeline, one pilot wave, then full waves.
+phases:
+  - id: foundation
+    title: Foundation
+    decisions:
+      - id: feed-mode
+        description: How the upstream ERP feed reaches the target during coexistence.
+        options:
+          - id: federate
+            label: Lakehouse Federation, read-only
+          - id: connect
+            label: Lakeflow Connect managed connector
+        selected: federate
+        important: false
+    steps:
+      - id: scaffold-wave-0
+        title: Wave 0 scaffolding
+        decisions:
+          - id: tol-window
+            description: Accept marker-only consistency windows for the ASE source.
+            options:
+              - id: accept
+                label: Accept marker-only evidence
+              - id: reject
+                label: Require pinned snapshots
+            selected: null
+            important: true
+        gates:
+          - id: doctor-green
+            description: factory-doctor signs wave-0 ready with the expected identity and catalogs.
+          - id: fixture-shape
+            description: dbx-recon fixture-shape passes for every wave-0 table.
+        blockers:
+          - id: b-net
+            description: Private link from the workspace to the legacy subnet is not open
+              (customer-side work; no machine check).
+          - id: target-repo
+            description: The connected target repository is reachable.
+            check:
+              kind: repo
+              repo: acme/dbx-target
+          - id: b-secret
+            description: LEGACY_DSN secret missing in the migration scope.
+            check:
+              kind: secret
+              secret: migration/LEGACY_DSN
+      - id: access-requests
+        title: Fired access and lead-time requests
+        depends_on: [scaffold-wave-0]
+  - id: waves
+    title: Migration waves
+    steps:
+      - id: run-wave-1
+        title: Pilot wave (width 5)
+        depends_on: [access-requests]
+        gates:
+          - id: recon-pass
+            description: Every unit's merge-evidence recon run is PASS.
+          - id: prs-merged
+            description: All verified batch PRs merged to the base branch.
+      - id: run-wave-2
+        title: Full fan-out wave
+        depends_on: [run-wave-1]
+        blockers:
+          - id: b-mcp
+            description: The Databricks MCP server must be connected for the workers.
+            check:
+              kind: mcp
+              server: databricks
+  - id: coexistence
+    title: Coexistence
+    steps:
+      - id: parallel-run
+        title: Scheduled recon during parallel run
+        depends_on: [run-wave-2]
+        gates:
+          - id: green-cycles
+            description: The agreed number of consecutive green recon cycles.
+  - id: cutover
+    title: Cutover
+    steps:
+      - id: repoint
+        title: Consumer repoint and sign-off
+        depends_on: [parallel-run]
+        decisions:
+          - id: cutover-auth
+            description: Authorize the production consumer repoint under the customer-held
+              cutover principal.
+            options:
+              - id: authorize
+                label: Proceed with the rehearsed repoint
+              - id: hold
+                label: Hold cutover; keep parallel run
+            selected: null
+            important: true
+        gates:
+          - id: authorized
+            description: The customer-held cutover principal authorized the repoint.

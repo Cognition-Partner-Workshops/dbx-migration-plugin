@@ -1,5 +1,6 @@
 """Section C tests for the guard rewrite."""
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -247,12 +248,10 @@ def test_keep_list_remains_blocked(command, needle):
 
 def test_decision_authorizes_the_pinned_legacy_write(tmp_path: Path):
     (tmp_path / ".migration").mkdir()
-    (tmp_path / ".migration" / "06_decisions.md").write_text(
-        "# Decisions\n\n"
-        "| id | date | decision |\n|---|---|---|\n"
-        "| D-7 | 2026-01-01 | legacy_write_authorized: customer DBA approved the CDC "
-        "prerequisite `ALTER TABLE dbo.orders ADD cdc_ts DATETIME2` on dbo.orders |\n"
-    )
+    (tmp_path / ".migration" / "authorizations.json").write_text(json.dumps(
+        {"version": 1, "authorizations": [
+            {"id": "D-7", "kind": "legacy_write_authorized", "objects": ["dbo.orders"],
+             "by": "user:t", "at": "2026-01-01"}]}))
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "-c", "user.email=t@example.com", "-c", "user.name=t",
                     "add", "-A"], check=True)

@@ -4,10 +4,10 @@
       "routine": "app_pkg.close_period",
       "reads": [
         "app.period",
-        "app.ledger_entry"
+        "app.acct_entry"
       ],
       "writes": [
-        "app.ledger_balance"
+        "app.acct_balance"
       ],
       "calls": [
         "app_pkg.write_run_log"
@@ -16,11 +16,11 @@
     {
       "routine": "app_pkg.archive_entries",
       "reads": [
-        "app.ledger_entry"
+        "app.acct_entry"
       ],
       "writes": [
-        "app.ledger_entry_hist",
-        "app.ledger_entry"
+        "app.acct_entry_hist",
+        "app.acct_entry"
       ],
       "calls": [
         "app_pkg.write_run_log"

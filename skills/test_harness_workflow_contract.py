@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "skills" / "data-reconciliation" / "harness"
 FANOUT = ROOT / "skills" / "migration-fanout"
-WORKFLOW = "".join((FANOUT / n).read_text() for n in ("workflow.py", "ledger.py", "manifest.py", "report.py"))
+WORKFLOW = "".join((FANOUT / n).read_text() for n in ("workflow.py", "decisions.py", "manifest.py", "report.py"))
 
 sys.path.insert(0, str(HARNESS))
 from recon.report import build_result  # noqa: E402

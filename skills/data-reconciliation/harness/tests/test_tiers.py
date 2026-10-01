@@ -535,7 +535,7 @@ def test_result_names_the_harness_as_merge_authority():
     for mode in ("live", "fixture"):
         result = build_result("u", mode, "m", "t", [TierResult(1, "x", True, 1, [])])
         assert result["merge_authority"] == {"kind": "harness", "decision_id": None}
-        assert "human_override" in render_report(result) and "06_decisions.md" in render_summary(result)
+        assert "human_override" in render_report(result) and "merge_overrides" in render_summary(result)
 
 
 def test_unversioned_inputs_rejected(tmp_path: Path):

@@ -52,15 +52,15 @@ def test_platform_5xx_retry_rule_lives_in_target_routing():
         assert needle in text, needle
 
 
-@pytest.mark.parametrize("path", ["skills/install-dbx-factory/playbooks/5-unit_migration.md",
-                                  "skills/install-dbx-factory/playbooks/12-front_door_code.md"])
-def test_deploy_playbooks_point_at_the_5xx_retry_rule(path):
+@pytest.mark.parametrize("path", ["skills/unit-migration/SKILL.md",
+                                  "skills/intake/references/estate-types.md"])
+def test_worker_skills_point_at_the_5xx_retry_rule(path):
     text = (ROOT / path).read_text(encoding="utf-8")
     assert "target-routing/SKILL.md" in text
 
 
 def test_the_signed_doctor_record_is_committed_beside_the_manifest():
-    """Children reuse the orchestrator's wave-<N>.doctor.json only if it reaches their checkout: the
+    """Children reuse the wave worker's wave-<N>.doctor.json only if it reaches their checkout: the
     fan-out skill says to commit it (it carries no secret values) and the doctor skill says what the
     child checks before trusting it."""
     fanout = (ROOT / "skills/migration-fanout/SKILL.md").read_text(encoding="utf-8")

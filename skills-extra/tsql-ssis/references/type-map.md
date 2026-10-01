@@ -1,6 +1,6 @@
 ## Type map
 
-`Delta` is the analytical track, `Lakebase PG` the OLTP front door. `canon` = harness rule in `canonicalization.json`; `GAP` = not in the harness (PR body).
+`Delta` is the analytical track, `Lakebase PG` the OLTP track. `canon` = harness rule in `canonicalization.json`; `GAP` = not in the harness (PR body).
 
 | Source | Delta | Lakebase PG | Loss / canon |
 |---|---|---|---|

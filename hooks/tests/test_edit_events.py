@@ -16,12 +16,17 @@ ALLOWLIST = {
 }
 
 
+AUTHORIZATIONS = json.dumps({"version": 1, "authorizations": [
+    {"id": "D-7", "kind": "tolerance_change", "objects": ["dbo.orders"], "by": "user:t", "at": "2026-01-01"},
+]})
+
+
 def _make_ws(tmp_path: Path) -> Path:
     ws = tmp_path / "edit_ws"
     (ws / ".migration" / "recon" / "u1").mkdir(parents=True)
     (ws / ".migration" / "waves").mkdir()
     (ws / ".migration").joinpath("allowed_targets.json").write_text(json.dumps(ALLOWLIST))
-    (ws / ".migration" / "06_decisions.md").write_text("# Decisions\n")
+    (ws / ".migration" / "authorizations.json").write_text(AUTHORIZATIONS)
     (ws / "src").mkdir()
     (ws / "src" / "etl.py").write_text("print('ok')\n")
     return ws
@@ -33,7 +38,7 @@ def _make_nested_ws(tmp_path: Path) -> Path:
     (sub / ".migration" / "recon" / "u1").mkdir(parents=True)
     (sub / ".migration" / "waves").mkdir()
     (sub / ".migration" / "allowed_targets.json").write_text(json.dumps(ALLOWLIST))
-    (sub / ".migration" / "06_decisions.md").write_text("# Decisions\n")
+    (sub / ".migration" / "authorizations.json").write_text(AUTHORIZATIONS)
     return ws
 
 
@@ -50,32 +55,43 @@ def decide(tool: str, tool_input: dict, ws: Path, env: dict[str, str] | None = N
     return "block" if result.returncode == 2 else "approve"
 
 
+ADD_LWA = '{"id": "D-8", "kind": "legacy_write_authorized", "objects": ["dbo.orders"], "by": "user:t", "at": "x"}'
+
+
 @pytest.mark.parametrize("tool,path,tool_input,expected", [
     ("write", ".migration/allowed_targets.json", {"content": "{}"}, "approve"),
-    ("edit", ".migration/00_context.md", {"old_string": "a", "new_string": "b"}, "approve"),
-    ("MultiEdit", ".migration/05_progress.md", {"edits": [{"old_string": "a", "new_string": "b"}]}, "approve"),
+    ("edit", ".migration/units/u1/mapping_spec.json", {"old_string": "a", "new_string": "b"}, "approve"),
+    ("MultiEdit", ".migration/waves/wave-1.json", {"edits": [{"old_string": "a", "new_string": "b"}]}, "approve"),
     ("write", ".migration/recon/u1/result.json", {"content": "{}"}, "approve"),
     ("write", ".migration/waves/wave-1.json", {"content": "{}"}, "approve"),
     ("edit", "src/etl.py", {"old_string": "ok", "new_string": "better"}, "approve"),
-    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\n| D-7 | 2026-01-01 | accept tolerances |\n"}, "approve"),
-    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\n| D-7 | 2026-01-01 | legacy_write_authorized: drop dbo.orders |\n"}, "block"),
-    ("write", ".migration/06_decisions.md", {"content": "# Decisions\n| D-7 | 2026-01-01 | legacy_write_authorized: drop dbo.orders |\n"}, "block"),
-    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\n| D-7 | 2026-01-01 | Legacy_Write_Authorized: drop dbo.orders |\n"}, "block"),
-    ("edit", ".migration/06_decisions.md", {"old_string": "# Decisions\n", "new_string": "# Decisions\nmore prose\n"}, "block"),
-    ("edit", ".migration/06_decisions.md", {"old_string": "| D-7 | old | decision |\n", "new_string": "| D-7 | new | changed |\n"}, "block"),
-    ("edit", ".migration/06_decisions.md", {
-        "old_string": "| D-7 | 2026-01-01 | legacy_write_authorized: dbo.orders |\n",
-        "new_string": "| D-7 | 2026-01-01 | approved dbo.orders |\n| D-13 | 2026-01-02 | legacy_write_authorized: dbo.customers |\n",
-    }, "block"),
-    ("edit", ".migration/06_decisions.md", {
-        "old_string": "# Decisions\n",
-        "new_string": "# Ledger\n| D-7 | x | y |\n",
-    }, "block"),
-    ("write", ".migration/06_decisions.md", {
-        "content": "# Decisions\n| D-7 | 2026-01-01 | accept tolerances |\n",
+    # benign edits to the authorization file pass like any other .migration/ file
+    ("write", ".migration/authorizations.json", {"content": "{}"}, "approve"),
+    ("edit", ".migration/authorizations.json", {"old_string": "D-7", "new_string": "D-9"}, "approve"),
+    ("write", ".migration/authorizations.json", {
+        "content": '{"version": 1, "authorizations": [{"id": "D-8", "kind": "tolerance_change", "objects": ["dbo.orders"], "by": "user:t", "at": "x"}]}',
     }, "approve"),
-    ("MultiEdit", ".migration/06_decisions.md", {
-        "edits": [{"old_string": "# Decisions\n", "new_string": "# Decisions\n| D-7 | 2026-01-01 | accept tolerances |\n"}],
+    # a legacy_write_authorized entry enters only through a reviewed PR, never from a session
+    ("edit", ".migration/authorizations.json", {
+        "old_string": '"kind": "tolerance_change"', "new_string": '"kind": "legacy_write_authorized"',
+    }, "block"),
+    ("edit", ".migration/authorizations.json", {
+        "old_string": ']\n}', "new_string": ', ' + ADD_LWA + ']\n}',
+    }, "block"),
+    ("edit", ".migration/authorizations.json", {
+        "old_string": '"kind": "tolerance_change"', "new_string": '"kind": "gate_waived"',
+    }, "block"),
+    ("edit", ".migration/authorizations.json", {
+        "old_string": '"kind": "tolerance_change"', "new_string": '"kind": "merge_override"',
+    }, "block"),
+    ("edit", ".migration/authorizations.json", {
+        "old_string": '"tolerance_change"', "new_string": '"Legacy_Write_Authorized"',
+    }, "block"),
+    ("write", ".migration/authorizations.json", {
+        "content": '{"version": 1, "authorizations": [' + ADD_LWA + ']}',
+    }, "block"),
+    ("MultiEdit", ".migration/authorizations.json", {
+        "edits": [{"old_string": '"tolerance_change"', "new_string": '"legacy_write_authorized"'}],
     }, "block"),
 ])
 def test_edit_event(tool, path, tool_input, expected, tmp_path):
@@ -101,12 +117,12 @@ def test_edit_outside_workspace_passes(tmp_path):
 
 def test_nested_workspace_edit_falls_back_to_file_config(tmp_path):
     ws = _make_nested_ws(tmp_path)
-    decisions = ws / "sub" / ".migration" / "06_decisions.md"
+    auth = ws / "sub" / ".migration" / "authorizations.json"
     allowlist = ws / "sub" / ".migration" / "allowed_targets.json"
     added = run_hook("edit", {
-        "file_path": str(decisions),
-        "old_string": "# Decisions\n",
-        "new_string": "# Decisions\n| D-8 | 2026-01-01 | accept tolerances |\n",
+        "file_path": str(auth),
+        "old_string": '"version": 1',
+        "new_string": '"version": 2',
     }, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
     edited = run_hook("write", {"file_path": str(allowlist), "content": "{}"}, ws, {"CLAUDE_PROJECT_DIR": str(ws)})
     assert added.returncode == 0

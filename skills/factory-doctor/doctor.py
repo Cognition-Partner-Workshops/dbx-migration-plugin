@@ -24,8 +24,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-REQUIRED_FILES = ("00_context.md", "01_conventions.md", "03_recon_tolerances.md", "03_recon_tolerances.json",
-    "04_dependency_register.md", "06_decisions.md", "07_access_checklist.md", "allowed_targets.json")
+REQUIRED_FILES = ("allowed_targets.json", "03_recon_tolerances.json")
 OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines", "databricks-jobs",
     "databricks-dabs", "databricks-unity-catalog", "databricks-lakeflow-connect", "databricks-lakebase")
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
@@ -44,7 +43,8 @@ SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", 
 TARGET_KINDS = ("databricks", "lakebase")  # the harness's --target-kind values; the type map is keyed by both
 # The committed wave contract: the guard and the harness read the working copy, so a working copy
 # that differs from HEAD is a contract nobody reviewed.
-LEDGER_CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
+CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
+AUTHORIZATIONS_REL = ".migration/authorizations.json"
 CAPABILITIES = ".migration/09_capabilities.json"
 HOOK_PROBE_NONCE = ".migration/.hook_probe_nonce"
 HOOK_PROBE_NONCE_TTL = 8 * 60 * 60
@@ -188,31 +188,49 @@ def _redact(text: str) -> str:
 def check_workspace(ws: Path) -> Check:
     mig = ws / ".migration"
     if not mig.is_dir():
-        return Check("workspace", "fail", f"{mig} missing; run 1-migration_setup first")
+        return Check("workspace", "fail", f"{mig} missing; the intake step creates it")
     missing = [f for f in REQUIRED_FILES if not (mig / f).is_file()]
     if missing:
         return Check("workspace", "fail", f".migration/ incomplete: missing {missing}", {"missing": missing})
-    context = (mig / "00_context.md").read_text(errors="replace")
-    if not re.search(r"(?m)^##\s+Glossary\b", context) and not (mig / "02_glossary.md").is_file():
-        return Check("workspace", "fail",
-            "00_context.md has no '## Glossary' section (02_glossary.md was folded into it)", {"missing": [
-            "00_context.md#Glossary"]})
     return Check("workspace", "ok", f".migration/ has all {len(REQUIRED_FILES)} required files")
 
 
-def check_stop_mode(ws: Path) -> Check:
-    text = ""
-    for name in ("00_context.md", "01_conventions.md"):
-        p = ws / ".migration" / name
-        if p.is_file():
-            text += p.read_text(errors="replace")
-    for line in text.splitlines():
-        low = line.lower()
-        if "stop_mode" in low:
-            for mode in ("hard", "soft"):
-                if mode in low.split("stop_mode", 1)[1]:
-                    return Check("stop_mode", "ok", f"stop_mode: {mode}", {"stop_mode": mode})
-    return Check("stop_mode", "fail", "stop_mode (hard|soft) not recorded in 00_context.md / 01_conventions.md")
+_ENTRY_AUTHOR = re.compile(r"user:[\w][\w.@/-]*")
+_ENTRY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_AUTH_KINDS = {"legacy_write_authorized", "gate_waived", "merge_override"}
+
+
+def check_authorizations(ws: Path) -> Check:
+    """.migration/authorizations.json shape, and warn when the working copy is not the committed one."""
+    cid = "authorizations_file"
+    p = ws / AUTHORIZATIONS_REL
+    if not p.is_file():
+        return Check(cid, "ok", f"no {AUTHORIZATIONS_REL} (no legacy write, gate waiver or merge override is authorized)")
+    try:
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError) as e:
+        return Check(cid, "fail", f"{AUTHORIZATIONS_REL} is not valid JSON: {_redact(str(e))}")
+    if not isinstance(doc, dict) or doc.get("version") != 1 or not isinstance(doc.get("authorizations"), list):
+        return Check(cid, "fail", f"{AUTHORIZATIONS_REL} must be "
+            '{"version": 1, "authorizations": [...]}')
+    bad = []
+    for i, e in enumerate(doc["authorizations"]):
+        if (not isinstance(e, dict) or not _ENTRY_ID.fullmatch(str(e.get("id") or "")) or
+                e.get("kind") not in _AUTH_KINDS or
+                not (isinstance(e.get("objects"), list) and e["objects"]) or
+                not _ENTRY_AUTHOR.fullmatch(str(e.get("by") or ""))):
+            bad.append(f"entry {i}")
+    if bad:
+        return Check(cid, "fail", f"{AUTHORIZATIONS_REL}: malformed {', '.join(bad)} — each entry needs "
+            "a slug id, kind in " + str(sorted(_AUTH_KINDS)) + ", a non-empty objects list and a "
+            "`by` matching `user:...`", {"malformed": bad})
+    data = {"entries": len(doc["authorizations"])}
+    committed, ref = _committed(ws, AUTHORIZATIONS_REL)
+    if committed is not None and p.read_bytes() != committed:
+        return Check(cid, "warn", f"the working copy differs from {ref}:{AUTHORIZATIONS_REL}: "
+            "authorizations change only by PR", data)
+    return Check(cid, "ok", f"{len(doc['authorizations'])} authorization entries in "
+        f"{AUTHORIZATIONS_REL}", data)
 
 
 def check_allowed_targets(ws: Path, plugin_root: Path) -> Check:
@@ -400,9 +418,9 @@ def check_allowlist_committed(ws: Path) -> Check:
         return Check("allowlist_committed", "fail",
             f"git cannot read the repository under {ws}: {_redact(r.stderr.decode(errors='replace').strip())}; "
             "the workspace must be the committed repository the wave is planned from")
-    _, ref = _committed(ws, LEDGER_CONTRACT_FILES[0])   # the whole contract is pinned to the one ref the allowlist is on
+    _, ref = _committed(ws, CONTRACT_FILES[0])   # the whole contract is pinned to the one ref the allowlist is on
     states: dict[str, str] = {}
-    for rel in LEDGER_CONTRACT_FILES:
+    for rel in CONTRACT_FILES:
         committed, _ = _committed(ws, rel, (ref,) if ref else ())
         if not (ws / rel).is_file():
             states[rel] = "missing"
@@ -442,59 +460,6 @@ def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None
             f"allowlist catalogs {cats} differ from the contract's {expected}; "
             "a catalog is added by a PR to the protected branch carrying a `D-<id>` row, then a new doctor run", data)
     return Check("allowlist_matches_contract", "ok", f"allowlist catalogs match the contract: {cats}", data)
-
-
-# Files in the playbooks dir that are not importable playbooks (the pre-kickoff intake form).
-_NOT_PLAYBOOKS = frozenset({"00_intake_template.md"})
-PLAYBOOKS_INDEX = "index.json"
-
-
-def _repo_playbooks(plugin_root: Path) -> dict[str, str]:
-    """macro -> repo file name, from playbooks/index.json."""
-    playbooks = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
-    macros: dict[str, str] = {}
-    try:
-        doc = json.loads((playbooks / PLAYBOOKS_INDEX).read_text())
-        rows = doc.get("playbooks", []) if isinstance(doc, dict) else []
-    except (OSError, ValueError):
-        rows = []
-    for row in rows if isinstance(rows, list) else ():
-        if not isinstance(row, dict):
-            continue
-        p = playbooks / str(row.get("file", ""))
-        macro = str(row.get("macro", ""))
-        if p.is_file() and p.name not in _NOT_PLAYBOOKS and macro.startswith("!"):
-            macros[macro] = p.name
-    return macros
-
-
-def check_playbooks_installed(plugin_root: Path) -> Check:
-    """The repo playbooks the org library is synced from exist and are listed in playbooks/index.json."""
-    cid = "playbooks_installed"
-    playbooks = plugin_root / "skills" / "install-dbx-factory" / "playbooks"
-    try:
-        doc = json.loads((playbooks / PLAYBOOKS_INDEX).read_text())
-        rows = doc.get("playbooks") if isinstance(doc, dict) else None
-    except (OSError, ValueError) as e:
-        return Check(cid, "warn", f"playbooks/{PLAYBOOKS_INDEX} unreadable: {_redact(str(e))}", {"checked": 0})
-    if not isinstance(rows, list):
-        return Check(cid, "warn", f"playbooks/{PLAYBOOKS_INDEX} has no playbooks list", {"checked": 0})
-    listed = [str(r.get("file", "")) for r in rows if isinstance(r, dict)]
-    macros = [str(r.get("macro", "")) for r in rows if isinstance(r, dict)]
-    repo = _repo_playbooks(plugin_root)
-    data = {
-        "checked": len(repo),
-        "missing": sorted(f for f in listed if not (playbooks / f).is_file()),
-        "unlisted": sorted(p.name for p in playbooks.glob("*.md") if p.name not in _NOT_PLAYBOOKS and p.name not in listed),
-        "duplicate_macros": sorted({m for m in macros if macros.count(m) > 1}),
-    }
-    findings = [f"{k.replace('_', ' ')}: {', '.join(v)}" for k, v in data.items() if k != "checked" and v]
-    if not repo:
-        findings.insert(0, f"no importable playbooks in playbooks/{PLAYBOOKS_INDEX}")
-    if findings:
-        return Check(cid, "warn", "; ".join(findings) + " — fix the plugin checkout, then re-run install-dbx-factory", data)
-    return Check(cid, "ok", f"{len(repo)} playbooks listed in playbooks/{PLAYBOOKS_INDEX} and present; "
-        "install-dbx-factory syncs them to the org library", data)
 
 
 def check_official_plugin(plugin_root: Path) -> Check:
@@ -1104,8 +1069,8 @@ def check_source_principal(tables: list[str], family: str, source_secret: str | 
     q = _PRIVILEGE_QUERIES.get(family)
     if q is None:
         return Check(cid, "unverified", f"{family}: no privilege query implemented for this family, so the "
-            "source principal's write privileges are unknown; confirm SELECT-only grants by hand and "
-            "record the decision in .migration/06_decisions.md, then pass --source-attested D-<id>", {
+            "source principal's write privileges are unknown; confirm SELECT-only grants by hand, "
+            "record it as a plan decision, then pass --source-attested <id>", {
             "family": family, "tables": tables})
     if not source_secret:
         return Check(cid, "fail", f"{family} source with {len(tables)} in-scope table(s); pass --source-secret NAME "
@@ -1221,34 +1186,17 @@ def _check_databricks_source_principal(tables: list[str]) -> Check:
         f"{len(tables)} in-scope table(s), their schemas and catalogs; no ownership", data)
 
 
-_USER_PROVENANCE = re.compile(r"(?<![\w-])user:[\w][\w.@/-]*")
-
-
 def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
-    """--source-attested D-<id>: a ledger decision standing in for a privilege query the family lacks."""
+    """--source-attested <id>: a plan decision standing in for a privilege query the family lacks.
+    The decision is human-owned; the doctor records it without verifying it."""
     cid = "source_principal_read_only"
     if family == "databricks" or family in _PRIVILEGE_QUERIES:
         return Check(cid, "fail", f"{family}: --source-attested {decision} rejected, this family has a "
             "privilege query: run the query instead (drop --source-attested)", {"family": family,
             "decision": decision})
-    ledger = ws / ".migration" / "06_decisions.md"
-    if not ledger.is_file():
-        return Check(cid, "fail", f"{family}: ledger .migration/06_decisions.md not found", {"decision": decision})
-    named = re.compile(rf"(?<![\w-]){re.escape(decision)}(?![\w-])")
-    for line in ledger.read_text().splitlines():
-        if named.search(line) and "source_principal_read_only" in line and "attested" in line:
-            who = _USER_PROVENANCE.search(line)
-            if not who:
-                return Check(cid, "fail", f"{family}: decision {decision} attests source_principal_read_only "
-                    "without user:<id> provenance; a default-accepted row cannot attest the source "
-                    "is read-only, a human has to reply", {"decision": decision})
-            return Check(cid, "ok", f"{family}: source principal read-only attested by decision "
-                f"{decision} ({who.group(0)}) in .migration/06_decisions.md (no principal to query)", {
-                "decision": decision, "attested": decision, "family": family, "tables": tables,
-                "provenance": who.group(0)})
-    return Check(cid, "fail", f"{family}: decision {decision} is not in .migration/06_decisions.md with "
-        "'source_principal_read_only', 'attested' and user:<id> provenance in its line; record the "
-        "attestation in the ledger first", {"decision": decision})
+    return Check(cid, "ok", f"{family}: source principal attested by plan decision {decision} "
+        "(human-owned; not machine-checkable)", {"decision": decision, "attested": decision,
+        "family": family, "tables": tables})
 
 
 def _load_mapping(path: Path, params: dict[str, str] | None, plugin_root: Path):
@@ -1500,7 +1448,7 @@ def check_named_secrets(names: list[str], list_secrets=None) -> Check:
     parts = [n.split("/", 1) for n in names]
     data["missing"] = [n for n, (scope, key) in zip(names, parts) if keys[scope] is None or key not in keys[scope]]
     if data["missing"]:
-        detail = ("missing named secrets (STOP C blocker: create them before launch; values are never "
+        detail = ("missing named secrets (create them before the wave launches; values are never "
             "read): " + ", ".join(data["missing"]))
         if data["unreadable_scopes"]:
             scope_msgs = "; ".join(f"scope {s} not readable via `databricks secrets list-secrets`"
@@ -1552,7 +1500,7 @@ def check_databricks(expect_identity: str | None, expect_host: str | None = None
     detail = f"authenticated as {display_name} ({'service principal' if is_sp else 'user'}) on {host}"
     if expect_identity and str(name).lower() != expect_identity.lower():
         expected_display = "<human user (redacted)>" if "@" in expect_identity else expect_identity
-        status, detail = "fail", detail + f"; expected {expected_display} (recorded in 07_access_checklist.md)"
+        status, detail = "fail", detail + f"; expected {expected_display} (the wave contract records it)"
     elif not host:
         status = "fail"
         detail += ("; workspace host not resolved by `databricks auth describe`, so the wave manifest "
@@ -1840,11 +1788,11 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     units, mappings = units or [], mappings or []
     sec = security_controls(role)
     checks: list[Check] = [
-        _merge("workspace", [check_workspace(ws), check_stop_mode(ws)]),
+        check_workspace(ws),
+        check_authorizations(ws),
         _merge("allowed_targets", [check_allowed_targets(ws, plugin_root),
             check_allowlist_matches_contract(ws, expect_catalogs)]),
         check_allowlist_committed(ws),
-        check_playbooks_installed(plugin_root),
         _merge("hook_guard", check_hooks(plugin_root, ws, probe_result, role, reused), sec),
         check_official_plugin(plugin_root),
         _merge("recon_harness", [check_harness(plugin_root), check_drivers()]),
@@ -1968,8 +1916,8 @@ def main(argv: list[str] | None = None) -> int:
         help="source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
     p.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks",
         help="recon target the type_map is audited against")
-    p.add_argument("--source-attested", metavar="D-<id>",
-        help="ledger decision id attesting the source has no principal to query; rejected for families "
+    p.add_argument("--source-attested", metavar="<id>",
+        help="plan decision id attesting the source has no principal to query; rejected for families "
         "with a privilege query")
     p.add_argument("--lakebase-project", help="Lakebase project id for the branch-create preflight")
     p.add_argument("--lakebase-parent-branch", help="Lakebase parent branch for the branch-create preflight")

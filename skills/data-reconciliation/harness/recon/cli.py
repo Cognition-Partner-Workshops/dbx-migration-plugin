@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--canonicalization", action="append", type=Path, default=[])
     t.add_argument("--param", action="append", default=[])
     e = sub.add_parser("estimate", help="statements/rows a run would cost (no connections); "
-                                        "summed per wave for the STOP C cost line")
+                                        "summed per wave for the plan's cost estimate")
     e.add_argument("--mapping", required=True, type=Path)
     e.add_argument("--tolerances", required=True, type=Path)
     e.add_argument("--depth", choices=DEPTHS, default="threshold")
@@ -257,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--mapping", required=True, type=Path,
                    help="mapping spec JSON: source table -> target table, keys, fields")
     r.add_argument("--tolerances", required=True, type=Path,
-                   help=".migration/03_tolerances.json, versioned")
+                   help=".migration/03_recon_tolerances.json, versioned")
     r.add_argument("--canonicalization", required=True, type=Path,
                    help="the source-dialect skill's recon_canonicalization rules, as JSON")
     r.add_argument("--mode", required=True, choices=MODES + PLANNED_MODES)
@@ -437,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
             f"--mode transactional is not implemented for --target-kind {args.target_kind}: it "
             "grades two live sides and only the operational target (--target-kind lakebase) is "
             "one. Analytical-track units reconcile with --mode snapshot or live at a stated "
-            "consistency point. See 14-front_door_oltp.")
+            "consistency point (skills/intake/references/estate-types.md, OLTP).")
 
     params = parse_params(args.param) if args.cmd != "shape" else {}
     if args.cmd == "estimate":

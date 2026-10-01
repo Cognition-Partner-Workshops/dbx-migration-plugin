@@ -9,7 +9,7 @@ The repo root *is* the plugin:
 .devin-plugin/plugin.json   manifest (name, version, requiredPlugins -> official databricks plugin)
 AGENTS.md                   always-on guardrails
 hooks.json, hooks/          PreToolUse write-scope guard (fail closed, see below)
-skills/                     one directory per skill; install-dbx-factory/playbooks/ carries the playbook chain
+skills/                     one directory per skill (manager and worker skills; see OVERVIEW.md)
 skills/_dialect-skill-template.md  spec + acceptance criteria for new source-dialect skills
 skills-extra/               a second, optional plugin (dbx-migration-dialects); not loaded by this one
 ```
@@ -34,7 +34,7 @@ Pin a version instead of tracking the default branch:
 ```json
 {
   "requiredPlugins": [
-    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.4.8" }
+    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.5.0" }
   ]
 }
 ```
@@ -45,13 +45,11 @@ Pin a version instead of tracking the default branch:
 devin plugins install Cognition-Partner-Workshops/dbx-migration-plugin
 ```
 
-The official `databricks` plugin is installed automatically as a dependency. The entry in
-`.devin-plugin/plugin.json` carries no `"sha"`, so the org's own install of that plugin (pinned or
-not) decides the version; two different `"sha"` pins for the same plugin fail installation with
-"Conflicting version pins". If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
+The official `databricks` plugin is installed automatically as a dependency, pinned by `"sha"` in
+`.devin-plugin/plugin.json`. The pin must equal the sha the org's managed manifest pins the same
+plugin to, or installation fails with "Conflicting version pins"; when the org bumps its pin, bump
+this one in the same change. If the org's managed manifest uses `"forbiddenPlugins": ["*"]`, list
 `databricks/databricks-agent-skills` explicitly; transitive dependencies are not exempt.
-
-After installing, run the `install-dbx-factory` skill once per org (see `OVERVIEW.md`).
 
 Databricks auth: see `skills/target-routing/SKILL.md`.
 
@@ -61,7 +59,7 @@ The core plugin ships only `oracle-plsql` as the example dialect. The other dial
 is a separate plugin (`dbx-migration-dialects`) that the core manifest never loads; install it from
 `https://github.com/Cognition-Partner-Workshops/dbx-migration-plugin/tree/main/skills-extra` when an engagement needs one:
 
-- `teradata-bteq` — Teradata SQL, BTEQ, SPL procedures/macros, TPT/MLOAD/FASTLOAD.
+- `teradata-bteq` — Teradata SQL, BTEQ, SPL stored procedures, TPT/MLOAD/FASTLOAD.
 - `informatica-xml` — Informatica PowerCenter XML exports.
 - `tsql-ssis` — SQL Server T-SQL (with Sybase ASE deltas) and SSIS packages.
 - `lakebridge` — Databricks Labs Lakebridge as an accelerator (never the merge gate).
@@ -120,12 +118,18 @@ for them. `hooks/tests/test_probe_table.py` is the red-team table: add a row the
 
 **File-edit tools.** `hooks.json` has a second PreToolUse matcher, `^(edit|write|MultiEdit)$`, over the event's
 `tool_name`; the guard reads `tool_input.file_path` and its new content. Writes under `.migration/` are the
-session's working copy and pass; `06_decisions.md` stays append-only for `D-<id>` rows and never accepts a
-`legacy_write_authorized` row from a session. This covers only file-edit tools the platform routes through PreToolUse
-under those names.
+session's working copy and pass, except that a session can never add a `legacy_write_authorized`, `gate_waived` or
+`merge_override` entry to `.migration/authorizations.json` (any edit or write whose added text carries one of those
+kinds blocks); authorizations enter only through a reviewed PR. Edits to the Databricks credential store and to the running guard's plugin tree block. This
+covers only file-edit tools the platform routes through PreToolUse under those names.
 
 **Authorized legacy writes.** A non-read statement naming a `legacy_sources` entry needs a
-`DBX_DECISION=D-<id>` prefix matching a `legacy_write_authorized` row in `.migration/06_decisions.md` that names every
-object written. `guard_mode: warn` never downgrades an unauthorized legacy write. Decision rows that authorize legacy writes
-are added by a human via PR; the edit tool cannot add them, and the ledger the guard reads is only the committed copy on
-the protected branch (no working-copy fallback), so an unmerged row never authorizes.
+`DBX_DECISION=<id>` prefix (an assignment in front of the command; a flag, or the token inside the SQL, is not a prefix)
+matching an entry in the committed `.migration/authorizations.json` with that `id`, `kind: legacy_write_authorized`, a
+`by: user:...` author, and an `objects` list naming every object the statements write as a literal (a run-time
+substitution such as `$(TABLE)` never matches, and a statement whose object the guard cannot tell blocks). `guard_mode:
+warn` never downgrades an unauthorized legacy write. The file the guard reads is only the committed copy on the protected
+branch (`origin/HEAD`, else `origin/main`/`origin/master`, else local `HEAD`; never the working copy), so an unmerged entry
+never authorizes. The fan-out workflow resolves a wave manifest's waived-gate `decision_id`s and `merge_overrides`
+decisions the same way, against `gate_waived` / `merge_override` entries whose `objects` name the units, on the wave's
+base branch.

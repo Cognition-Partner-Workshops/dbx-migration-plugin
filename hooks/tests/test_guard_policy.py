@@ -348,7 +348,7 @@ def test_identity_variables_without_a_client_in_the_segment_are_not_the_guards_b
 # branch, so a session-side write can never widen its own scope.
 
 @pytest.mark.parametrize("cmd", [
-    "echo x > .migration/allowed_targets.json", "echo x >> .migration/06_decisions.md", "sed -i 's/a/b/' .migration/x.json",
+    "echo x > .migration/allowed_targets.json", "echo x >> .migration/authorizations.json", "sed -i 's/a/b/' .migration/x.json",
     "tee .migration/x.json < y", "cp y .migration/x.json", "mv .migration .m", "rm -rf .migration", "rmdir .migration/units",
     "truncate -s 0 .migration/x", "chmod 000 .migration/allowed_targets.json", "jq . y > .migration/x.json",
     "git checkout -- .migration/allowed_targets.json", "python3 -c \"open('.migration/x','w')\"",
@@ -429,7 +429,8 @@ def git_workspace(tmp_path: Path) -> Path:
     _git(ws, "config", "user.name", "t")
     (ws / ".migration").mkdir()
     (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "legacy_sources": ["tdprod.corp"]}))
-    (ws / ".migration" / "06_decisions.md").write_text("# Decisions\n")
+    (ws / ".migration" / "authorizations.json").write_text(
+        json.dumps({"version": 1, "authorizations": []}))
     _git(ws, "add", "-A")
     _git(ws, "commit", "-qm", "setup")
     _git(ws, "remote", "add", "origin", str(origin))
@@ -480,43 +481,75 @@ def test_edit_tool_writes_in_a_git_workspace(git_workspace: Path):
     def verdict(tool: str, tool_input: dict) -> g.Verdict:
         return g.evaluate_edit(tool, tool_input, cfg, ws, str(ws))
     assert verdict("write", {"file_path": str(ws / ".migration" / "allowed_targets.json"), "content": "{}"}).decision == "approve"
-    assert verdict("write", {"file_path": str(ws / ".migration" / "00_context.md"), "content": "# ctx\n"}).decision == "approve"
-    blocked = verdict("edit", {"file_path": str(ws / ".migration" / "06_decisions.md"),
-                               "old_string": "# Decisions\n", "new_string": "# Decisions\nmore prose\n"})
-    assert blocked.decision == "block" and "append-only" in blocked.reason
-    blocked = verdict("edit", {"file_path": str(ws / ".migration" / "06_decisions.md"), "old_string": "# Decisions\n",
-                               "new_string": "# Decisions\n| D-7 | 2026-01-01 | legacy_write_authorized: drop dbo.orders |\n"})
-    assert blocked.decision == "block"
-    assert verdict("edit", {"file_path": str(ws / ".migration" / "06_decisions.md"), "old_string": "# Decisions\n",
-                            "new_string": "# Decisions\n| D-7 | 2026-01-01 | accept tolerances |\n"}).decision == "approve"
+    assert verdict("write", {"file_path": str(ws / ".migration" / "notes.md"), "content": "# ctx\n"}).decision == "approve"
+    ok = verdict("edit", {"file_path": str(ws / ".migration" / "authorizations.json"),
+                          "old_string": '"version": 1', "new_string": '"version": 2'})
+    assert ok.decision == "approve"
+    blocked = verdict("edit", {"file_path": str(ws / ".migration" / "authorizations.json"),
+                               "old_string": '"authorizations": []',
+                               "new_string": '"authorizations": [{"id": "D-7", "kind": "legacy_write_authorized", '
+                                             '"objects": ["dbo.orders"], "by": "user:t", "at": "x"}]'})
+    assert blocked.decision == "block" and "authorization file" in blocked.reason
 
 
-def test_decision_row_must_be_committed(git_workspace: Path):
+def test_authorization_entry_must_be_committed(git_workspace: Path):
     ws = git_workspace
     cfg = g.load_config(ws)
     cmd = "DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.customers ADD cdc_ts DATETIME2'"
-    ledger = ws / ".migration" / "06_decisions.md"
-    ledger.write_text(ledger.read_text() +
-        "| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n")
+    auth = ws / ".migration" / "authorizations.json"
+    auth.write_text(json.dumps({"version": 1, "authorizations": [
+        {"id": "D-9", "kind": "legacy_write_authorized", "objects": ["dbo.customers"],
+         "by": "user:t", "at": "2026-01-03"}]}))
     v = g.evaluate(cmd, g.load_config(ws), root=ws, cwd=str(ws))
-    assert v.decision == "block" and "is not a row in refs/remotes/origin/HEAD:.migration/06_decisions.md" in v.reason
-    _git(ws, "add", ".migration/06_decisions.md")
-    _git(ws, "commit", "-qm", "decision")
+    assert v.decision == "block" and "is not an entry in refs/remotes/origin/HEAD:.migration/authorizations.json" in v.reason
+    _git(ws, "add", ".migration/authorizations.json")
+    _git(ws, "commit", "-qm", "authorization")
     _git(ws, "push", "-q", "origin", "main")
     cfg = g.load_config(ws)
     assert g.evaluate(cmd, cfg, root=ws, cwd=str(ws)).decision == "approve"
 
 
-def test_uncommitted_ledger_never_authorizes(git_workspace: Path):
+def test_malformed_authorization_file_refuses(git_workspace: Path):
     ws = git_workspace
-    _git(ws, "rm", "-q", "--cached", ".migration/06_decisions.md")
-    _git(ws, "commit", "-qm", "drop the committed ledger")
+    auth = ws / ".migration" / "authorizations.json"
+    auth.write_text("{ not json")
+    _git(ws, "add", ".migration/authorizations.json")
+    _git(ws, "commit", "-qm", "break it")
     _git(ws, "push", "-q", "origin", "main")
-    (ws / ".migration" / "06_decisions.md").write_text(
-        "# Decisions\n| D-9 | 2026-01-03 | legacy_write_authorized: supplemental logging on dbo.customers |\n")
     v = g.evaluate("DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.customers ADD cdc_ts DATETIME2'",
                    g.load_config(ws), root=ws, cwd=str(ws))
-    assert v.decision == "block" and "no committed .migration/06_decisions.md" in v.reason
+    assert v.decision == "block" and "not valid JSON" in v.reason
+
+
+def test_entry_without_kind_or_author_refuses(git_workspace: Path):
+    ws = git_workspace
+    auth = ws / ".migration" / "authorizations.json"
+    auth.write_text(json.dumps({"version": 1, "authorizations": [
+        {"id": "D-9", "kind": "tolerance_change", "objects": ["dbo.customers"], "by": "user:t"},
+        {"id": "D-10", "kind": "legacy_write_authorized", "objects": ["dbo.customers"], "by": "svc-bot"}]}))
+    _git(ws, "add", ".migration/authorizations.json")
+    _git(ws, "commit", "-qm", "entries")
+    _git(ws, "push", "-q", "origin", "main")
+    cfg = g.load_config(ws)
+    v = g.evaluate("DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.customers ADD cdc_ts DATETIME2'",
+                   cfg, root=ws, cwd=str(ws))
+    assert v.decision == "block" and "legacy_write_authorized" in v.reason
+    v = g.evaluate("DBX_DECISION=D-10 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.customers ADD cdc_ts DATETIME2'",
+                   cfg, root=ws, cwd=str(ws))
+    assert v.decision == "block" and "user:..." in v.reason
+
+
+def test_uncommitted_authorization_never_authorizes(git_workspace: Path):
+    ws = git_workspace
+    _git(ws, "rm", "-q", "--cached", ".migration/authorizations.json")
+    _git(ws, "commit", "-qm", "drop the committed authorization file")
+    _git(ws, "push", "-q", "origin", "main")
+    (ws / ".migration" / "authorizations.json").write_text(json.dumps({"version": 1, "authorizations": [
+        {"id": "D-9", "kind": "legacy_write_authorized", "objects": ["dbo.customers"],
+         "by": "user:t", "at": "2026-01-03"}]}))
+    v = g.evaluate("DBX_DECISION=D-9 sqlcmd -S tdprod.corp -Q 'ALTER TABLE dbo.customers ADD cdc_ts DATETIME2'",
+                   g.load_config(ws), root=ws, cwd=str(ws))
+    assert v.decision == "block" and "no committed .migration/authorizations.json" in v.reason
 
 
 def test_policy_survives_migration_dir_deletion(git_workspace: Path):

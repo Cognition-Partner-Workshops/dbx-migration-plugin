@@ -29,21 +29,21 @@ FLAT = MappingSpec(version="m", objects=[ObjectMapping(
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "example_routine_parity"
 
 DEPS = {"routines": [
-    {"routine": "app_pkg.close_period", "reads": ["app.period"], "writes": ["app.ledger_balance"],
+    {"routine": "app_pkg.close_period", "reads": ["app.period"], "writes": ["app.acct_balance"],
      "calls": ["app_pkg.write_run_log"]},
     {"routine": "app_pkg.write_run_log", "reads": [], "writes": ["app.run_log"], "calls": []},
     {"routine": "app_pkg.period_status", "reads": ["app.period"], "writes": [], "calls": []}]}
 
-# close_period writes ledger_balance itself and run_log through the routine it calls
-GOLDEN = {"app.ledger_balance": [{"period_id": 1, "balance": "10.00"},
+# close_period writes acct_balance itself and run_log through the routine it calls
+GOLDEN = {"app.acct_balance": [{"period_id": 1, "balance": "10.00"},
                                  {"period_id": 2, "balance": "-3.50"}],
           "app.run_log": [{"run_id": 7, "routine": "close_period"}]}
-EVIDENCE = "pr-42/recon/ledger/close_period.run.json"
-SNAPSHOT = "fixture:fixtures/ledger-2024q1"
-COMMITTED = {EVIDENCE, SNAPSHOT[len("fixture:"):], "fixtures/ledger/2024q1.v2"}.__contains__
+EVIDENCE = "pr-42/recon/acct/close_period.run.json"
+SNAPSHOT = "fixture:fixtures/acct-2024q1"
+COMMITTED = {EVIDENCE, SNAPSHOT[len("fixture:"):], "fixtures/acct/2024q1.v2"}.__contains__
 
 
-def _run(routine="app_pkg.close_period", family="lakebase", branch="mig-ledger-exec",
+def _run(routine="app_pkg.close_period", family="lakebase", branch="mig-acct-exec",
          observed=None, evidence=EVIDENCE, record=EVIDENCE, **extra):
     return {"routine": routine, "target_family": family, "target_branch": branch,
             "snapshot": SNAPSHOT, "golden": GOLDEN,
@@ -75,12 +75,12 @@ def test_writers_include_what_the_callees_write_transitively():
         {"routine": "app_pkg.loop_a", "writes": ["app.a"], "calls": ["app_pkg.loop_b"]},
         {"routine": "app_pkg.loop_b", "writes": [], "calls": ["app_pkg.loop_a", "app_pkg.period_status"]}]}
     assert writers(deps) == {
-        "app_pkg.close_period": ["app.ledger_balance", "app.run_log"],
+        "app_pkg.close_period": ["app.acct_balance", "app.run_log"],
         "app_pkg.write_run_log": ["app.run_log"],
-        "app_pkg.month_end": ["app.ledger_balance", "app.run_log"],
+        "app_pkg.month_end": ["app.acct_balance", "app.run_log"],
         "app_pkg.loop_a": ["app.a"],
         "app_pkg.loop_b": ["app.a"]}
-    out = grade_routines(DEPS, [_run(observed={"app.ledger_balance": GOLDEN["app.ledger_balance"]})])
+    out = grade_routines(DEPS, [_run(observed={"app.acct_balance": GOLDEN["app.acct_balance"]})])
     assert out["routine_parity"][0]["status"] == "failed"
     assert out["routine_parity"][0]["findings"] == [
         {"table": "app.run_log", "check": "table_unobserved",
@@ -124,7 +124,7 @@ def test_proven_needs_the_evidence_and_the_fixture_snapshot_committed():
     assert row["reason"] == f"evidence {EVIDENCE} is not a committed file"
     row = grade_routines(DEPS, [_run()], committed=lambda p: p == EVIDENCE)["routine_parity"][0]
     assert row["status"] == "unproven"
-    assert row["reason"] == "fixture snapshot fixtures/ledger-2024q1 is not a committed file"
+    assert row["reason"] == "fixture snapshot fixtures/acct-2024q1 is not a committed file"
     row = grade_routines(DEPS, [_run(observed={})], committed=lambda p: False)["routine_parity"][0]
     assert row["status"] == "unproven"  # provenance before rows: an uncommitted run is not a failed one
     assert grade_routines(DEPS, [_run()])["routine_parity"][0]["status"] == "proven"
@@ -220,20 +220,20 @@ def test_read_only_routines_are_out_of_scope():
 
 
 def test_rows_compare_as_sets_after_canonical_json_order():
-    shuffled = {"app.ledger_balance": [{"balance": "-3.50", "period_id": 2},
+    shuffled = {"app.acct_balance": [{"balance": "-3.50", "period_id": 2},
                                        {"balance": "10.00", "period_id": 1}],
                "app.run_log": GOLDEN["app.run_log"]}
     assert grade_routines(DEPS, [_run(observed=shuffled)])["routine_parity"][0]["status"] == "proven"
 
 
 def test_differing_rows_fail_and_name_the_table_and_counts():
-    observed = {"app.ledger_balance": [{"period_id": 1, "balance": "10.00"},
+    observed = {"app.acct_balance": [{"period_id": 1, "balance": "10.00"},
                                        {"period_id": 2, "balance": "-3.5"}],
                "app.run_log": GOLDEN["app.run_log"]}
     out = grade_routines(DEPS, [_run(observed=observed)])
     row = out["routine_parity"][0]
     assert row["status"] == "failed" and out["failed"] == ["app_pkg.close_period"]
-    assert row["findings"] == [{"table": "app.ledger_balance", "check": "rows_differ",
+    assert row["findings"] == [{"table": "app.acct_balance", "check": "rows_differ",
                                 "detail": "golden 2 rows, observed 2 rows; 1 only in golden, "
                                           "1 only in observed"}]
 
@@ -241,7 +241,7 @@ def test_differing_rows_fail_and_name_the_table_and_counts():
 def test_a_written_table_absent_from_the_golden_or_observed_set_fails():
     out = grade_routines(DEPS, [_run(observed={})])
     assert out["routine_parity"][0]["findings"] == [
-        {"table": "app.ledger_balance", "check": "table_unobserved",
+        {"table": "app.acct_balance", "check": "table_unobserved",
          "detail": "written by the routine but not in the observed set"},
         {"table": "app.run_log", "check": "table_unobserved",
          "detail": "written by the routine but not in the observed set"}]
@@ -252,12 +252,12 @@ def test_a_written_table_absent_from_the_golden_or_observed_set_fails():
 
 
 def test_a_run_outside_a_dedicated_exec_branch_is_unproven_not_proven():
-    for family, branch in (("lakebase", "main"), ("lakebase", "mig-ledger"),
-                           ("databricks", "prod.ledger"), ("databricks", "mig.ledger")):
+    for family, branch in (("lakebase", "main"), ("lakebase", "mig-acct"),
+                           ("databricks", "prod.acct"), ("databricks", "mig.acct")):
         row = grade_routines(DEPS, [_run(family=family, branch=branch)])["routine_parity"][0]
         assert row["status"] == "unproven", (family, branch)
         assert "dedicated" in row["reason"]
-    ok = grade_routines(DEPS, [_run(family="databricks", branch="mig.ledger_exec")])
+    ok = grade_routines(DEPS, [_run(family="databricks", branch="mig.acct_exec")])
     assert ok["routine_parity"][0]["status"] == "proven"
 
 
@@ -278,25 +278,25 @@ def test_a_run_without_evidence_or_snapshot_is_unproven():
 def test_a_snapshot_that_is_not_a_fixture_leaves_the_routine_unproven():
     """Only a run against a committed fixture snapshot proves a routine; a production or ad hoc
     snapshot is not evidence, however non-empty the string is."""
-    for bad in ("production-2026-09-16", "prod", "fixture:", "fixture: ", "Fixture:ledger", "/tmp/snap", 7):
+    for bad in ("production-2026-09-16", "prod", "fixture:", "fixture: ", "Fixture:acct", "/tmp/snap", 7):
         run = _run()
         run["snapshot"] = bad
         row = grade_routines(DEPS, [run])["routine_parity"][0]
         assert row["status"] == "unproven" and "fixture:" in row["reason"], bad
-    for ok in (SNAPSHOT, "fixture:fixtures/ledger/2024q1.v2"):
+    for ok in (SNAPSHOT, "fixture:fixtures/acct/2024q1.v2"):
         run = _run()
         run["snapshot"] = ok
         assert grade_routines(DEPS, [run])["routine_parity"][0]["status"] == "proven", ok
 
 
 def test_table_names_in_golden_and_observed_compare_case_insensitively():
-    upper = {"APP.Ledger_Balance": GOLDEN["app.ledger_balance"], "app.run_log": GOLDEN["app.run_log"]}
+    upper = {"APP.Acct_Balance": GOLDEN["app.acct_balance"], "app.run_log": GOLDEN["app.run_log"]}
     out = grade_routines(DEPS, [_run(golden=upper, observed=upper)])
     assert out["routine_parity"][0]["status"] == "proven"
     out = grade_routines(DEPS, [_run(golden=upper)])
     assert out["routine_parity"][0]["status"] == "proven"
-    both = {**GOLDEN, "APP.LEDGER_BALANCE": []}
-    with pytest.raises(ConfigError, match="app.ledger_balance.*twice"):
+    both = {**GOLDEN, "APP.ACCT_BALANCE": []}
+    with pytest.raises(ConfigError, match="app.acct_balance.*twice"):
         grade_routines(DEPS, [_run(observed=both)])
 
 
@@ -510,7 +510,7 @@ def test_check_parity_regrades_every_claim_from_its_committed_run_record(tmp_pat
     with pytest.raises(ConfigError, match="close_period.*claims proven.*grades failed"):
         check_parity(claim, "p", DEPS, git_committed(repo), repo)
     claim[0] = {**claim[0], "status": "failed",
-                "findings": [{"table": "app.ledger_balance", "check": "rows_differ", "detail": "made up"}]}
+                "findings": [{"table": "app.acct_balance", "check": "rows_differ", "detail": "made up"}]}
     rows = check_parity(claim, "p", DEPS, git_committed(repo), repo)
     assert rows[0]["status"] == "failed"
     assert [(f["table"], f["check"]) for f in rows[0]["findings"]] == [("app.run_log", "rows_differ")]
@@ -690,9 +690,9 @@ def test_cli_run_downgrades_proven_rows_whose_evidence_is_not_in_the_committed_t
 
 # the example is laid out like a unit's repository: each run record sits at the path its
 # `evidence` names, next to the fixture snapshot it ran against
-FIXTURE_RUNS = "recon/ledger"
+FIXTURE_RUNS = "recon/acct"
 FIXTURE_ARTIFACTS = (f"{FIXTURE_RUNS}/close_period.run.json", f"{FIXTURE_RUNS}/archive_entries.run.json",
-                     "fixtures/ledger-2024q1.sql")
+                     "fixtures/acct-2024q1.sql")
 
 
 def test_example_fixture_has_one_of_each_status():
@@ -757,12 +757,12 @@ def test_cli_routine_parity_checks_artifacts_against_the_repo_it_runs_in(tmp_pat
 def test_cli_routine_parity_is_clean_only_when_every_writer_is_proven(tmp_path):
     repo = _committed_repo(tmp_path / "repo", SNAPSHOT[len("fixture:"):])
     (tmp_path / "deps.json").write_text(json.dumps(DEPS))
-    runs = repo / "pr-42" / "recon" / "ledger"
+    runs = repo / "pr-42" / "recon" / "acct"
     runs.mkdir(parents=True)
 
     def commit(name, run):
         (runs / name).write_text(json.dumps(run))
-        _git(repo, "add", f"pr-42/recon/ledger/{name}")
+        _git(repo, "add", f"pr-42/recon/acct/{name}")
         _git(repo, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", name)
 
     commit("close_period.run.json", _run())
@@ -771,9 +771,9 @@ def test_cli_routine_parity_is_clean_only_when_every_writer_is_proven(tmp_path):
     assert cli.main(args) == 2  # unproven: not a failure, not clean
     commit("write_run_log.run.json", _run(
         "app_pkg.write_run_log", observed={"app.run_log": []}, golden={"app.run_log": []},
-        evidence="pr-42/recon/ledger/write_run_log.run.json"))
+        evidence="pr-42/recon/acct/write_run_log.run.json"))
     assert cli.main(args) == 0
     (runs / "write_run_log.run.json").write_text(json.dumps(_run(
         "app_pkg.write_run_log", observed={"app.run_log": [{"run_id": 1}]}, golden={"app.run_log": []},
-        evidence="pr-42/recon/ledger/write_run_log.run.json")))
+        evidence="pr-42/recon/acct/write_run_log.run.json")))
     assert cli.main(args) == 2  # edited after the commit: not the committed run any more

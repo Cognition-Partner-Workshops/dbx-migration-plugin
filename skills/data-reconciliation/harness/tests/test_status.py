@@ -268,7 +268,7 @@ def test_first_run_estate_reaches_merge_eligibility_end_to_end():
 def test_denied_grants_are_a_visibility_blocker_no_caller_can_lift():
     """A refused dictionary read is classed `privilege_visibility`, never `structural` or `data`, and
     it blocks merge on its own: the harness takes no declaration that would mask it, so the only way
-    past it is a human merge_override scoped to that class in the ledger."""
+    past it is a manifest merge_overrides entry whose plan decision names that class."""
     denied = _facts(TARGET_LOANS_FACTS, unsupported=frozenset({"grants"}), privilege_denied=frozenset({"grants"}))
     r = _first_run(target_loans=denied, rerun_proof=PROVEN_RERUN)
     t0 = r["tiers"][0]

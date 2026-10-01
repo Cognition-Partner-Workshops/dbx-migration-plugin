@@ -68,12 +68,12 @@ def test_no_stale_core_paths_to_optional_skills():
     ]
 
 
-def test_required_databricks_plugin_is_unpinned():
+def test_required_databricks_plugin_is_pinned():
     manifest = json.loads((ROOT / ".devin-plugin" / "plugin.json").read_text())
     (dep,) = manifest["requiredPlugins"]
     assert dep["url"] == "https://github.com/databricks/databricks-agent-skills"
     assert dep["path"] == "plugins/databricks/claude"
-    assert "sha" not in dep and "ref" not in dep
+    assert len(dep.get("sha", "")) == 40
 
 
 def test_skills_extra_is_its_own_plugin():
@@ -95,9 +95,8 @@ def test_source_access_folded_into_recon():
     assert "### Live mode prerequisites (Lakehouse Federation)" in recon
     assert "### Load posture (materialize)" in recon
     forbidden = ("lakehouse-federation", "backfill-planner")
-    allowed = ROOT / "skills" / "install-dbx-factory" / "playbooks" / "0-README.md"
     for path in ROOT.glob("**/*.md"):
-        if path == allowed or ".git" in path.parts:
+        if ".git" in path.parts:
             continue
         text = path.read_text()
         assert not any(term in text for term in forbidden), path
