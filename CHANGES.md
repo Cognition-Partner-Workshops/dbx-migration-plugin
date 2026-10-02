@@ -10,12 +10,15 @@ built from arguments, and failed closed, so no session could sign `.migration/09
 
 - `hooks/dbx_guard.py`: `_runs_plugin_doctor` exempts a Python segment from the script scan only
   when the script's **real path** is this plugin's own `skills/factory-doctor/doctor.py` (resolved
-  under the running guard's tree, through symlinks and `cd`). A `doctor.py` anywhere else, a copy
-  of the plugin tree, `-m`/`-c`/heredoc forms, and shell-expanded paths are still scanned. Every
-  other layer (allowlist writes, legacy-only clients, identity swaps, `.migration/` integrity,
-  the doctor's own sentinel probe) is unchanged.
+  under the running guard's tree, through symlinks and `cd`) and the interpreter runs it plainly:
+  a `doctor.py` anywhere else, a copy of the plugin tree, interpreter options (`-m`, `-c`, `-X`,
+  `-W`, ...), heredocs, shell-expanded paths, and any `PYTHON*` variable set on the segment
+  (`PYTHONPATH=... python3`, `env PYTHONPATH=...`, an earlier `export PYTHONPATH=...`) are still
+  scanned. Every other layer (allowlist writes, legacy-only clients, identity swaps, `.migration/`
+  integrity, the doctor's own sentinel probe) is unchanged.
 - `hooks/tests/test_guard_policy.py`: subprocess tests for the allowed doctor command, the blocked
-  look-alikes outside the plugin root, and a still-blocked write to `redshift_src` alongside it.
+  look-alikes outside the plugin root, the steered-interpreter forms, and a still-blocked write to
+  `redshift_src` alongside it.
 
 # 0.5.0 — board rework ("Devin for Migrations")
 

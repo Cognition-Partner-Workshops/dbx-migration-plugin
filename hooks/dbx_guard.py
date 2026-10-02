@@ -1089,12 +1089,17 @@ def _python_texts(seg: _Seg, root: Path) -> tuple[str, str | None]:
 
 def _runs_plugin_doctor(seg: _Seg, root: Path) -> bool:
     """`python3 <plugin>/skills/factory-doctor/doctor.py ...`: the script the guard would read is this plugin's own doctor, by real path
-    inside the running guard's tree (a `doctor.py` anywhere else, or a copy of the tree, is just a program)."""
+    inside the running guard's tree (a `doctor.py` anywhere else, or a copy of the tree, is just a program). The interpreter must run
+    it plainly: no interpreter options, heredoc, or `PYTHON*` variable set on the segment (prefix, `env`, or an earlier `export`),
+    since any of those can load code the doctor never imports."""
     argv = seg.argv
-    if seg.at is None or "-m" in argv or _flag_values(argv, ("-c",)) or seg.heredocs:
+    if seg.at is None or len(argv) < 2 or argv[1].startswith("-") or seg.heredocs:
         return False
-    script = next((w for w in argv[1:] if w.endswith(".py")), None)
-    if script is None or _expands(script) or _expands(script, subst=True):
+    names = [a.split("=", 1)[0] for a in seg.assigns] + list(seg.env)
+    if any(n.startswith("PYTHON") for n in names):
+        return False
+    script = argv[1]
+    if not script.endswith(".py") or _expands(script) or _expands(script, subst=True):
         return False
     base = root if not seg.at else Path(seg.at) if seg.at.startswith("/") else root / seg.at
     return os.path.realpath(base / os.path.expanduser(script)) == str(_DOCTOR)

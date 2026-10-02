@@ -469,6 +469,33 @@ def test_doctor_exemption_does_not_widen_other_rules(doctor_ws: Path):
     assert g._runs_plugin_doctor(g._segments(f"python3 $PLUGIN/skills/factory-doctor/doctor.py", root=doctor_ws)[0], doctor_ws) is False
 
 
+@pytest.mark.parametrize("form", [
+    "PYTHONPATH={evil} python3 {doctor} {args}",
+    "export PYTHONPATH={evil}; python3 {doctor} {args}",
+    "export PYTHONPATH={evil}\npython3 {doctor} {args}",
+    "env PYTHONPATH={evil} python3 {doctor} {args}",
+    "env -u PYTHONSAFEPATH python3 {doctor} {args}",
+    "PYTHONHOME={evil} python3 {doctor} {args}",
+    "PYTHONSTARTUP={evil}/sitecustomize.py python3 {doctor} {args}",
+    "declare -x PYTHONUSERBASE={evil}; python3 {doctor} {args}",
+    "p={evil}\nPYTHONPATH=$p python3 {doctor} {args}",
+    "python3 -X importtime {doctor} {args}",
+    "python3 -W ignore {doctor} {args}",
+    "python3 -I {doctor} {args}",
+])
+def test_doctor_exemption_refused_when_interpreter_is_steered(doctor_ws: Path, form: str):
+    evil = doctor_ws / "evil"
+    evil.mkdir()
+    cmd = form.format(evil=evil, doctor=DOCTOR, args=f"--workspace {doctor_ws} {DOCTOR_ARGS}")
+    for seg in g._segments(cmd, root=doctor_ws):
+        if seg.argv0 == "python3":
+            assert g._runs_plugin_doctor(seg, doctor_ws) is False, cmd
+    r = _hook(cmd, doctor_ws)
+    assert r.returncode == 2 and "built at run time" in r.stdout, (cmd, r.stdout)
+    r = _hook(f"python3 {DOCTOR} --workspace {doctor_ws} {DOCTOR_ARGS}", doctor_ws)
+    assert r.returncode == 0, r.stdout
+
+
 # ---------------------------------------------------------------- the allowlist in force is the committed copy
 
 def _git(ws: Path, *args: str) -> None:
