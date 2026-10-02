@@ -1091,9 +1091,12 @@ def _runs_plugin_doctor(seg: _Seg, root: Path) -> bool:
     """`python3 <plugin>/skills/factory-doctor/doctor.py ...`: the script the guard would read is this plugin's own doctor, by real path
     inside the running guard's tree (a `doctor.py` anywhere else, or a copy of the tree, is just a program). The interpreter must run
     it plainly: no interpreter options, heredoc, or `PYTHON*` variable set on the segment (prefix, `env`, or an earlier `export`),
-    since any of those can load code the doctor never imports."""
+    since any of those can load code the doctor never imports; and the doctor must inspect this plugin, not a `--plugin-root` of the
+    caller's choosing (it imports `<plugin-root>/hooks/dbx_guard.py` and runs that tree's harness)."""
     argv = seg.argv
     if seg.at is None or len(argv) < 2 or argv[1].startswith("-") or seg.heredocs:
+        return False
+    if any(w == "--plugin-root" or w.startswith("--plugin-root=") for w in argv[2:]):
         return False
     names = [a.split("=", 1)[0] for a in seg.assigns] + list(seg.env)
     if any(n.startswith("PYTHON") for n in names):

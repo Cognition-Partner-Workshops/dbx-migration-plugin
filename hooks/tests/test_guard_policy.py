@@ -482,6 +482,8 @@ def test_doctor_exemption_does_not_widen_other_rules(doctor_ws: Path):
     "python3 -X importtime {doctor} {args}",
     "python3 -W ignore {doctor} {args}",
     "python3 -I {doctor} {args}",
+    "python3 {doctor} --plugin-root {evil} {args}",
+    "python3 {doctor} {args} --plugin-root={evil}",
 ])
 def test_doctor_exemption_refused_when_interpreter_is_steered(doctor_ws: Path, form: str):
     evil = doctor_ws / "evil"
