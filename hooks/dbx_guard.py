@@ -210,6 +210,7 @@ _IN_PLACE = {"sed": (re.compile(r"-[nEersuz]*i.*"), re.compile(r"--in-place.*"))
 _IDENTITY_FILE = re.compile(r"(?:^|/)(?:\.databrickscfg|\.databricks(?:/.*)?|\.config/databricks(?:/.*)?)$")
 _GUARD_TREE = Path(os.path.realpath(__file__)).parent.parent
 _GUARD_FILE = Path(__file__).name
+_DOCTOR = _GUARD_TREE / "skills" / "factory-doctor" / "doctor.py"
 _PATH_LITERAL = re.compile(r"['\"]((?:[~./$]|/)[^'\"\n]{0,300})['\"]")
 _GUARD_LITERAL = re.compile(r"['\"]((?:[^'\"\n/]*/)*(?:hooks(?:/[^'\"\n]*)?|hooks\.json|" + re.escape(_GUARD_FILE) + r"))['\"]")
 _OUTPUT_FLAGS = ("-o", "-O", "--output", "--out", "--out-file", "--output-file", "--outfile", "--file")
@@ -1086,6 +1087,26 @@ def _python_texts(seg: _Seg, root: Path) -> tuple[str, str | None]:
             texts.append(body)
     return "\n".join(texts), unreadable
 
+def _runs_plugin_doctor(seg: _Seg, root: Path) -> bool:
+    """`python3 <plugin>/skills/factory-doctor/doctor.py ...`: the script the guard would read is this plugin's own doctor, by real path
+    inside the running guard's tree (a `doctor.py` anywhere else, or a copy of the tree, is just a program). The interpreter must run
+    it plainly: no interpreter options, heredoc, or `PYTHON*` variable set on the segment (prefix, `env`, or an earlier `export`),
+    since any of those can load code the doctor never imports; and the doctor must inspect this plugin, not a `--plugin-root` of the
+    caller's choosing (it imports `<plugin-root>/hooks/dbx_guard.py` and runs that tree's harness)."""
+    argv = seg.argv
+    if seg.at is None or len(argv) < 2 or argv[1].startswith("-") or seg.heredocs:
+        return False
+    if any(w == "--plugin-root" or w.startswith("--plugin-root=") for w in argv[2:]):
+        return False
+    names = [a.split("=", 1)[0] for a in seg.assigns] + list(seg.env)
+    if any(n.startswith("PYTHON") for n in names):
+        return False
+    script = argv[1]
+    if not script.endswith(".py") or _expands(script) or _expands(script, subst=True):
+        return False
+    base = root if not seg.at else Path(seg.at) if seg.at.startswith("/") else root / seg.at
+    return os.path.realpath(base / os.path.expanduser(script)) == str(_DOCTOR)
+
 def _strip_python_comments(text: str) -> str:
     lines = text.splitlines(keepends=True)
     try:
@@ -1451,7 +1472,7 @@ def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str 
             violations += _check_rest(seg)
         elif base in _LEGACY_ONLY or base in _GENERIC:
             violations += _check_sql_client(seg, cfg, root)
-        elif _PYTHON.fullmatch(base):
+        elif _PYTHON.fullmatch(base) and not _runs_plugin_doctor(seg, root):
             violations += _check_python(seg, cfg, root)
     return Verdict.of(list(dict.fromkeys(violations)), cfg)
 

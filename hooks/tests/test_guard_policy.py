@@ -413,6 +413,91 @@ def test_doctor_probe_command_blocks_via_subprocess(tmp_path: Path):
     assert r.returncode == 2 and "block" in r.stdout
 
 
+DOCTOR = HOOKS.parent / "skills" / "factory-doctor" / "doctor.py"
+DOCTOR_ARGS = "--role setup --expect-identity sp-123 --expect-host $DATABRICKS_HOST --expect-catalogs mig_cat"
+
+
+def _hook(command: str, ws: Path) -> subprocess.CompletedProcess:
+    event = {"tool_name": "exec", "tool_input": {"command": command}}
+    return subprocess.run([sys.executable, str(HOOKS / "dbx_guard.py")], input=json.dumps(event), text=True, check=False,
+                          capture_output=True, cwd=ws, env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(ws)})
+
+
+@pytest.fixture
+def doctor_ws(tmp_path: Path) -> Path:
+    ws = tmp_path / "ws"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps(
+        {"catalogs": ["mig_cat"], "legacy_sources": ["redshift_src", "legacy-wg"], "target_hosts": ["DATABRICKS_HOST"]}))
+    return ws
+
+
+def test_plugin_doctor_command_is_allowed_via_subprocess(doctor_ws: Path):
+    r = _hook(f"python3 {DOCTOR} --workspace {doctor_ws} {DOCTOR_ARGS}", doctor_ws)
+    assert r.returncode == 0, r.stdout
+    link = doctor_ws / "plug"
+    link.symlink_to(HOOKS.parent)
+    r = _hook(f"python3 {link}/skills/factory-doctor/doctor.py --workspace {doctor_ws} {DOCTOR_ARGS}", doctor_ws)
+    assert r.returncode == 0, r.stdout
+    r = _hook(f"cd {doctor_ws} && python3 plug/skills/factory-doctor/doctor.py {DOCTOR_ARGS}", doctor_ws)
+    assert r.returncode == 0, r.stdout
+
+
+def test_doctor_lookalike_outside_plugin_root_still_blocks(doctor_ws: Path):
+    for rel in ("tools/doctor.py", "skills/factory-doctor/doctor.py"):
+        copy = doctor_ws / rel
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(DOCTOR, copy)
+        r = _hook(f"python3 {copy} --workspace {doctor_ws} {DOCTOR_ARGS}", doctor_ws)
+        assert r.returncode == 2 and "built at run time" in r.stdout, (rel, r.stdout)
+    tree = doctor_ws / "plugin-copy"
+    shutil.copytree(HOOKS.parent / "skills" / "factory-doctor", tree / "skills" / "factory-doctor")
+    r = _hook(f"python3 {tree}/skills/factory-doctor/doctor.py --workspace {doctor_ws} {DOCTOR_ARGS}", doctor_ws)
+    assert r.returncode == 2 and "built at run time" in r.stdout, r.stdout
+
+
+def test_doctor_exemption_does_not_widen_other_rules(doctor_ws: Path):
+    r = _hook("databricks experimental aitools tools query \"CREATE TABLE redshift_src.core._probe AS SELECT 1\"", doctor_ws)
+    assert r.returncode == 2 and "redshift_src" in r.stdout and "outside allowlist" in r.stdout, r.stdout
+    r = _hook(f"python3 {DOCTOR} --workspace {doctor_ws} {DOCTOR_ARGS} && "
+              "databricks experimental aitools tools query \"DROP TABLE redshift_src.core.orders\"", doctor_ws)
+    assert r.returncode == 2 and "redshift_src" in r.stdout, r.stdout
+    r = _hook(f"ssh legacy-wg 'python3 {DOCTOR} --workspace {doctor_ws} {DOCTOR_ARGS}'", doctor_ws)
+    assert r.returncode == 2, r.stdout
+    r = _hook(f"python3 -c \"import databricks.sql as s; s.connect(server_hostname=h).cursor().execute(q)\" {DOCTOR}", doctor_ws)
+    assert r.returncode == 2 and "built at run time" in r.stdout, r.stdout
+    assert g._runs_plugin_doctor(g._segments(f"python3 $PLUGIN/skills/factory-doctor/doctor.py", root=doctor_ws)[0], doctor_ws) is False
+
+
+@pytest.mark.parametrize("form", [
+    "PYTHONPATH={evil} python3 {doctor} {args}",
+    "export PYTHONPATH={evil}; python3 {doctor} {args}",
+    "export PYTHONPATH={evil}\npython3 {doctor} {args}",
+    "env PYTHONPATH={evil} python3 {doctor} {args}",
+    "env -u PYTHONSAFEPATH python3 {doctor} {args}",
+    "PYTHONHOME={evil} python3 {doctor} {args}",
+    "PYTHONSTARTUP={evil}/sitecustomize.py python3 {doctor} {args}",
+    "declare -x PYTHONUSERBASE={evil}; python3 {doctor} {args}",
+    "p={evil}\nPYTHONPATH=$p python3 {doctor} {args}",
+    "python3 -X importtime {doctor} {args}",
+    "python3 -W ignore {doctor} {args}",
+    "python3 -I {doctor} {args}",
+    "python3 {doctor} --plugin-root {evil} {args}",
+    "python3 {doctor} {args} --plugin-root={evil}",
+])
+def test_doctor_exemption_refused_when_interpreter_is_steered(doctor_ws: Path, form: str):
+    evil = doctor_ws / "evil"
+    evil.mkdir()
+    cmd = form.format(evil=evil, doctor=DOCTOR, args=f"--workspace {doctor_ws} {DOCTOR_ARGS}")
+    for seg in g._segments(cmd, root=doctor_ws):
+        if seg.argv0 == "python3":
+            assert g._runs_plugin_doctor(seg, doctor_ws) is False, cmd
+    r = _hook(cmd, doctor_ws)
+    assert r.returncode == 2 and "built at run time" in r.stdout, (cmd, r.stdout)
+    r = _hook(f"python3 {DOCTOR} --workspace {doctor_ws} {DOCTOR_ARGS}", doctor_ws)
+    assert r.returncode == 0, r.stdout
+
+
 # ---------------------------------------------------------------- the allowlist in force is the committed copy
 
 def _git(ws: Path, *args: str) -> None:
