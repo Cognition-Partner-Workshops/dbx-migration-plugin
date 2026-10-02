@@ -1,3 +1,22 @@
+# 0.5.1 — guard: the plugin's own factory-doctor is not a scanned script
+
+`hooks/dbx_guard.py` 0.5.0 refused the documented
+`python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo> --role setup ...` command
+("Python statement or connection is built at run time; the guard cannot resolve a non-read
+statement"): the cheap Python scan read the doctor's source, saw its `databricks.sql` probes
+built from arguments, and failed closed, so no session could sign `.migration/09_capabilities.json`.
+
+## Changed
+
+- `hooks/dbx_guard.py`: `_runs_plugin_doctor` exempts a Python segment from the script scan only
+  when the script's **real path** is this plugin's own `skills/factory-doctor/doctor.py` (resolved
+  under the running guard's tree, through symlinks and `cd`). A `doctor.py` anywhere else, a copy
+  of the plugin tree, `-m`/`-c`/heredoc forms, and shell-expanded paths are still scanned. Every
+  other layer (allowlist writes, legacy-only clients, identity swaps, `.migration/` integrity,
+  the doctor's own sentinel probe) is unchanged.
+- `hooks/tests/test_guard_policy.py`: subprocess tests for the allowed doctor command, the blocked
+  look-alikes outside the plugin root, and a still-blocked write to `redshift_src` alongside it.
+
 # 0.5.0 — board rework ("Devin for Migrations")
 
 The playbook/macro/stops model is replaced by the board flow: a human files a request, the
