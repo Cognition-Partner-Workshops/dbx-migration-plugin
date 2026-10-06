@@ -1056,6 +1056,56 @@ def test_main_hosted_cd_outside_any_workspace_is_noop(tmp_path: Path):
     assert r.returncode == 0
 
 
+@pytest.mark.parametrize("shape,command,expect_block", [
+    ("direct-cwd-ws", None, True),
+    ("hosted-workdir", None, True),
+    ("hosted-event-cwd", None, True),
+    ("hosted-cd-into-ws", None, True),
+    ("hosted-lead-no-workdir", None, True),
+    ("fresh-child-no-workdir", None, True),
+    ("hosted-lead-no-workdir", "echo hello", False),
+])
+def test_doctor_probe_blocks_in_every_session_shell_shape(tmp_path: Path, shape: str, command: str | None,
+                                                          expect_block: bool):
+    """The doctor's probe must block in every shell shape a run sees: the direct workspace check,
+    the hosted shells that carry the workspace via workdir/event cwd/a `cd`, and the ones that carry
+    no resolvable workspace at all (a lead exec without workdir, a fresh child) — only a non-probe
+    command may still pass through there."""
+    sys.path.insert(0, str(HOOKS.parent / "skills" / "factory-doctor"))
+    import doctor
+    nonce = "4f90dd1b"
+    probe = doctor.HOOK_PROBE_COMMAND.format(nonce=nonce)
+    token = f"__dbx_guard_probe__{nonce}"
+    home = tmp_path / "home"
+    child_home = tmp_path / "child-home"
+    child_home.mkdir()
+    ws = home / "repos" / "otterworks"
+    (ws / ".migration").mkdir(parents=True)
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["ow_tp"], "guard_mode": "block"}))
+    event = {"tool_name": "exec", "tool_input": {"command": command or probe}}
+    if shape == "direct-cwd-ws":
+        run_cwd = str(ws)
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "CLAUDE_PROJECT_DIR": str(ws)}
+    else:
+        run_cwd = "/"
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(child_home if shape == "fresh-child-no-workdir" else home),
+               "CLAUDE_PROJECT_DIR": "/", "DEVIN_PROJECT_DIR": "/"}
+        if shape == "hosted-workdir":
+            event["tool_input"]["workdir"] = str(ws)
+        elif shape == "hosted-event-cwd":
+            event["cwd"] = str(ws)
+        elif shape == "hosted-cd-into-ws":
+            event["tool_input"]["command"] = f"cd {ws} && {command or probe}"
+    r = subprocess.run([sys.executable, str(HOOKS / "dbx_guard.py")], input=json.dumps(event), text=True,
+                       capture_output=True, cwd=run_cwd, env=env)
+    if expect_block:
+        assert r.returncode == 2, r.stderr
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        assert token in out["reason"] and token in r.stderr
+    else:
+        assert r.returncode == 0 and r.stdout.strip() == ""
+
+
 def test_main_blocks_when_allowlist_is_broken(tmp_path: Path):
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text("{not json")
