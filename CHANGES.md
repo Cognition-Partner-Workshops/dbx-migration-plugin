@@ -1,5 +1,31 @@
 # 0.6.0 — .migration/ holds machine files only
 
+0.5.0 moved the human-readable ledger onto the board but several skills still asked for prose
+artifacts with no stated home, so workers recreated numbered files under `.migration/`
+(`04_target_state.md`, `05_access_probes.md`, `10_access_requests.md`, inventories). `.migration/`
+now holds only files a tool reads; everything a human reads lives in `plan.yaml` or on the ticket.
+
+## Changed
+
+- Renamed `.migration/03_recon_tolerances.json` to `recon_tolerances.json` and
+  `.migration/09_capabilities.json` to `capabilities.json`. The doctor still reads the legacy
+  names until 0.7.0 and its `workspace` check warns with the rename; both names present fails.
+  The doctor writes `capabilities.json`.
+- `factory-doctor`: `MIGRATION_LAYOUT` lists the allowed top-level `.migration/` entries; the new
+  `workspace_layout` check warns (never fails) on anything else.
+- Target state is one `target-<surface>` decision per surface in `plan.yaml`, proposed by
+  `workspace-setup`; wave manifests may carry it as `target_state`, validated by `manifest.py`.
+- `workspace-setup` probe table, `estate-inventory` inventory and `pipeline-analysis` analysis are
+  ticket attachments, never `.migration/` files; fired access requests are `plan.yaml` blockers,
+  with no separate register.
+- README lists every `.migration/` machine file with its writer and readers;
+  `skills/test_migration_layout.py` fails when shipped text names any other `.migration/` path.
+
+## Calls
+
+- Existing workspaces: rename the two files in one PR (`git mv`), and move any prose under
+  `.migration/` onto the ticket or into `plan.yaml`.
+
 # 0.5.1 — guard: the plugin's own factory-doctor is not a scanned script
 
 `hooks/dbx_guard.py` 0.5.0 refused the documented
