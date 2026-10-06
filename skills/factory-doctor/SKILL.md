@@ -1,6 +1,6 @@
 ---
 name: factory-doctor
-description: Preflight for a DBX migration workspace. Verifies setup, hooks, contracts, identity, harness, source access, and optional target grants, then writes .migration/09_capabilities.json.
+description: Preflight for a DBX migration workspace. Verifies setup, hooks, contracts, identity, harness, source access, and optional target grants, then writes .migration/capabilities.json.
 ---
 
 # factory-doctor
@@ -35,13 +35,13 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
 `--role orchestrator` is kept as the CLI value for the wave ticket's worker (the session that proves
 the platform hook once per wave and signs `wave-N.doctor.json`); `--role setup` is the intake /
 wave-plan worker before mappings exist; `--role child` is a batch worker. Writes
-`.migration/09_capabilities.json` and prints one line per row. Exit 0 means `ready`.
+`.migration/capabilities.json` and prints one line per row. Exit 0 means `ready`.
 
 A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the wave worker's signed
 record, committed beside the wave manifest). When the record is the wave worker's, `ready`, signed
 for the same manifest bytes, fresher than the manifest's `doctor_max_age` minutes (default 15),
 signed for the `--expect-identity`/`--expect-host` principal, and its `inputs_sha` equals this
-checkout's (sha256 over `.migration/units/**` and `.migration/*.json` except `09_capabilities.json`,
+checkout's (sha256 over `.migration/units/**` and top-level contract files except `capabilities.json`,
 by relative path), the rows marked `reusable` (`type_map_audit`, `delete_evidence`,
 `dictionary_readable`) are taken from it — every other row, and the whole run when the record fails
 any check, is computed fresh; `type_map_audit` is reused only when its recorded `data.target_kind`
@@ -91,6 +91,7 @@ shell): <probe_command>` — run it in the lead session's exec tool, never a sid
 | row | fails when | fix |
 |---|---|---|
 | `workspace` | required `.migration/` contract files are missing | rerun the intake step |
+| `workspace_layout` | a top-level `.migration/` entry is not a machine-file layout entry or legacy alias | move prose to the plan step's ticket or `plan.yaml` decisions/blockers |
 | `authorizations_file` | `authorizations.json` is malformed or the working copy differs from the committed one | fix the file or land the authorization PR |
 | `allowed_targets` | allowlist is invalid or differs from `--expect-catalogs` | fix the recorded contract |
 | `allowlist_committed` | allowlist or tolerances differ from the upstream ref (`origin/HEAD`, else `origin/main`/`master`, else `HEAD`) | merge the allowlist PR into the protected branch and `git fetch` |
@@ -108,3 +109,8 @@ shell): <probe_command>` — run it in the lead session's exec tool, never a sid
 | `analytical_target_grants` | optional promotion schema lacks required UC privileges | grant `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, `MODIFY`, `SELECT` |
 
 Long form: `references/checks.md`.
+
+The `workspace` check reads the legacy tolerance alias with a `warn` until 0.7.0 when the
+canonical tolerance file is absent; both names together fail as ambiguous.
+`workspace_layout` warns for unexpected top-level entries but never blocks readiness. Human-readable
+material belongs on the plan step's ticket or in `plan.yaml` decisions/blockers, not in `.migration/`.

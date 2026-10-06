@@ -25,7 +25,8 @@ doctor signs `wave-<N>.doctor.json` over them.
    lowercase slug), `width`, `breaker_threshold`, `auto_merge`, `base_branch` (the engagement
    feature branch; `main`/`master` need `trunk_base_decision`), `source` family/secret/params,
    `capabilities` (identity, host, catalogs, `ready`, `guard_mode` — matching
-   `09_capabilities.json`), `verify_depth`, `max_minutes`, `cost_estimate`, `degraded` when the
+   `capabilities.json`), `target_state` copied from the selected `target-*` decisions in
+   `plan.yaml`, `verify_depth`, `max_minutes`, `cost_estimate`, `degraded` when the
    wave is export-only, `target_namespace` when the harness runs under a fixed catalog.schema,
    `resync` when identity/sequence drift needs a parent-owned reseed, and `secrets` for
    scope/key names a brief references.

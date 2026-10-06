@@ -53,7 +53,7 @@ def sub_by_id(report, row_id):
 def probed(ws):
     """What a session does before the live probe: one doctor run (report written) issues the nonce the probe echoes."""
     first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
-    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
+    (ws / ".migration" / "capabilities.json").write_text(json.dumps(first))
     return "blocked:" + sub_by_id(first, "hook_guard")["hook_platform_loaded"]["data"]["probe_nonce"]
 
 
@@ -101,7 +101,7 @@ def test_unknown_probe_is_unverified_and_carries_command(tmp_path):
 def test_platform_probe_reuses_a_pending_nonce_until_accepted(tmp_path):
     ws = make_workspace(tmp_path)
     first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
-    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
+    (ws / ".migration" / "capabilities.json").write_text(json.dumps(first))
     nonce = by_id(first)["hook_guard"]["data"]["probe_nonce"]
     saved_nonce, issued_at = (ws / doctor.HOOK_PROBE_NONCE).read_text().strip().split()
     assert saved_nonce == nonce and issued_at.isdigit()
@@ -134,7 +134,7 @@ def test_one_nonce_serves_functional_and_platform_probe(tmp_path):
 
 def test_failed_hook_report_without_probe_nonce_does_not_crash(tmp_path):
     ws = make_workspace(tmp_path)
-    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps({
+    (ws / ".migration" / "capabilities.json").write_text(json.dumps({
         "checks": [{"id": "hook_guard", "status": "fail", "data": {}}],
     }))
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
@@ -164,7 +164,7 @@ def test_expired_report_nonce_is_not_accepted(tmp_path):
         "checks": [{"id": "hook_guard", "status": "unverified",
                     "data": {"probe_nonce": old_nonce}}],
     }
-    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(old_report))
+    (ws / ".migration" / "capabilities.json").write_text(json.dumps(old_report))
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{old_nonce}", None, True)
     row = sub_by_id(report, "hook_guard")["hook_platform_loaded"]
     assert row["status"] == "unverified"
@@ -172,6 +172,17 @@ def test_expired_report_nonce_is_not_accepted(tmp_path):
 
 
 def test_issued_nonce_reads_hook_guard_row(tmp_path):
+    ws = make_workspace(tmp_path)
+    nonce = "deadbeef"
+    (ws / ".migration" / "capabilities.json").write_text(json.dumps({
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "checks": [{"id": "hook_guard", "status": "unverified",
+                    "data": {"probe_nonce": nonce}}],
+    }))
+    assert doctor._issued_nonce(ws) == nonce
+
+
+def test_issued_nonce_falls_back_to_legacy_capabilities_path(tmp_path):
     ws = make_workspace(tmp_path)
     nonce = "deadbeef"
     (ws / ".migration" / "09_capabilities.json").write_text(json.dumps({
@@ -182,11 +193,11 @@ def test_issued_nonce_reads_hook_guard_row(tmp_path):
     assert doctor._issued_nonce(ws) == nonce
 
 
-def test_run_core_rows_are_ten(tmp_path):
+def test_run_core_rows_include_workspace_layout(tmp_path):
     report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True)
     optional = {"lakebase_branch_create", "lakebase_target_grants", "analytical_target_grants"}
     assert [c["id"] for c in report["checks"] if c["id"] not in optional] == [
-        "workspace", "authorizations_file", "allowed_targets", "allowlist_committed", "hook_guard",
+        "workspace", "workspace_layout", "authorizations_file", "allowed_targets", "allowlist_committed", "hook_guard",
         "official_databricks_plugin", "recon_harness", "recon_family_supported", "type_map_audit",
         "delete_evidence", "source_principal_read_only", "dictionary_readable",
         "named_secrets_exist", "databricks_identity",
@@ -220,7 +231,7 @@ def test_cli_rejects_a_bare_blocked_claim(tmp_path):
                         str(PLUGIN_ROOT), "--no-databricks", "--hook-probe-result", "blocked"],
                        capture_output=True, text=True)
     assert r.returncode == 2 and "blocked:<nonce>" in r.stderr
-    assert not (ws / ".migration" / "09_capabilities.json").exists()
+    assert not (ws / ".migration" / "capabilities.json").exists()
 
 
 def test_human_identity_is_not_ready(tmp_path, monkeypatch):
@@ -572,13 +583,76 @@ def test_generated_and_folded_files_are_not_required(tmp_path):
     (ws / ".migration" / "extra.md").write_text("# extra\n")
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
     assert c["workspace"]["status"] == "ok"
+    assert c["workspace_layout"]["status"] == "warn"
+    assert "extra.md" in c["workspace_layout"]["detail"]
+
+
+def test_workspace_layout_clean_directory_is_ok(tmp_path):
+    ws = make_workspace(tmp_path)
+    assert doctor.check_workspace_layout(ws).status == "ok"
+
+
+def test_workspace_layout_warning_does_not_block_readiness():
+    security = [doctor.Check(row_id, "ok", "ok") for row_id in doctor.SECURITY_CONTROLS]
+    checks = [*security, doctor.Check("workspace_layout", "warn", "unexpected.md")]
+    assert doctor._blocking("orchestrator", checks) == []
+
+
+def test_workspace_reads_legacy_tolerance_with_warning_and_allowlist_resolution(tmp_path):
+    ws = make_workspace(tmp_path)
+    canonical = ws / ".migration" / "recon_tolerances.json"
+    legacy = ws / ".migration" / "03_recon_tolerances.json"
+    canonical.rename(legacy)
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "legacy tolerance")
+
+    workspace = doctor.check_workspace(ws)
+    assert workspace.status == "warn"
+    assert "rename .migration/03_recon_tolerances.json to recon_tolerances.json" in workspace.detail
+    assert "the legacy name is read until 0.7.0" in workspace.detail
+    assert workspace.data["resolved"]["recon_tolerances.json"] == ".migration/03_recon_tolerances.json"
+    committed = doctor.check_allowlist_committed(ws)
+    assert committed.status == "ok" and ".migration/03_recon_tolerances.json" in committed.data
+
+
+def test_workspace_fails_when_canonical_and_legacy_tolerance_both_exist(tmp_path):
+    ws = make_workspace(tmp_path)
+    legacy = ws / ".migration" / "03_recon_tolerances.json"
+    legacy.write_text((ws / ".migration" / "recon_tolerances.json").read_text())
+    workspace = doctor.check_workspace(ws)
+    assert workspace.status == "fail"
+    assert workspace.data["ambiguous"] == ["recon_tolerances.json"]
+
+
+def test_issued_nonce_prefers_canonical_capabilities_when_both_names_exist(tmp_path):
+    ws = make_workspace(tmp_path)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    (ws / ".migration" / "capabilities.json").write_text(json.dumps({
+        "generated_at": now,
+        "checks": [{"id": "hook_guard", "status": "unverified",
+                    "data": {"probe_nonce": "12345678"}}],
+    }))
+    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps({
+        "generated_at": now,
+        "checks": [{"id": "hook_guard", "status": "unverified",
+                    "data": {"probe_nonce": "deadbeef"}}],
+    }))
+    assert doctor._issued_nonce(ws) == "12345678"
+
+
+def test_workspace_accepts_canonical_tolerance_only(tmp_path):
+    ws = make_workspace(tmp_path)
+    workspace = doctor.check_workspace(ws)
+    assert workspace.status == "ok"
+    assert doctor.resolve_migration_file(ws, "recon_tolerances.json") == (
+        ws / ".migration" / "recon_tolerances.json", False, False)
 
 
 def test_setup_outputs_tolerances_json_is_required(tmp_path):
-    ws = make_workspace(tmp_path, omit=("03_recon_tolerances.json",))
+    ws = make_workspace(tmp_path, omit=("recon_tolerances.json",))
     c = by_id(doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True))
     assert c["workspace"]["status"] == "fail"
-    assert c["workspace"]["data"]["missing"] == ["03_recon_tolerances.json"]
+    assert c["workspace"]["data"]["missing"] == ["recon_tolerances.json"]
 
 
 @pytest.mark.parametrize("who, expected", [
@@ -613,11 +687,12 @@ def test_cli_writes_capabilities_json_and_exit_codes(tmp_path):
             "--no-databricks"]
     r = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert r.returncode == 1, r.stdout + r.stderr
-    cap = json.loads((ws / ".migration" / "09_capabilities.json").read_text())
+    cap = json.loads((ws / ".migration" / "capabilities.json").read_text())
+    assert not (ws / ".migration" / "09_capabilities.json").exists()
     nonce = by_id(cap)["hook_guard"]["data"]["probe_nonce"]
     r = subprocess.run([*argv, "--hook-probe-result", f"blocked:{nonce}"], capture_output=True, text=True, check=False)
     assert r.returncode == 1, r.stdout + r.stderr  # offline: identity unverified, so not ready
-    cap = json.loads((ws / ".migration" / "09_capabilities.json").read_text())
+    cap = json.loads((ws / ".migration" / "capabilities.json").read_text())
     assert cap["schema"] == "dbx-migration-factory/capabilities/1" and cap["ready"] is False
     assert cap["blocking"] == ["databricks_identity=skipped"] and cap["identity"] is None
     assert "ready=False" in r.stdout and "databricks_identity=skipped" in r.stdout
@@ -2076,7 +2151,7 @@ def test_allowlist_committed_is_ok_only_when_both_contract_files_equal_head(tmp_
     c = doctor.check_allowlist_committed(ws)
     assert c.status == "ok" and "byte-equal to HEAD" in c.detail
     assert c.data == {".migration/allowed_targets.json": "clean",
-                      ".migration/03_recon_tolerances.json": "clean"}
+                      ".migration/recon_tolerances.json": "clean"}
     (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat", "prod"]}))
     c = doctor.check_allowlist_committed(ws)
     assert c.status == "fail" and c.data[".migration/allowed_targets.json"] == "modified"
@@ -2085,12 +2160,12 @@ def test_allowlist_committed_is_ok_only_when_both_contract_files_equal_head(tmp_
     assert doctor.check_allowlist_committed(ws).status == "fail"
     _git(ws, "commit", "-qm", "decision")
     assert doctor.check_allowlist_committed(ws).status == "ok"
-    _git(ws, "rm", "-q", "--cached", ".migration/03_recon_tolerances.json")
+    _git(ws, "rm", "-q", "--cached", ".migration/recon_tolerances.json")
     _git(ws, "commit", "-qm", "oops")
     c = doctor.check_allowlist_committed(ws)
-    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "untracked"
-    (ws / ".migration" / "03_recon_tolerances.json").unlink()
-    assert doctor.check_allowlist_committed(ws).data[".migration/03_recon_tolerances.json"] == "missing"
+    assert c.status == "fail" and c.data[".migration/recon_tolerances.json"] == "untracked"
+    (ws / ".migration" / "recon_tolerances.json").unlink()
+    assert doctor.check_allowlist_committed(ws).data[".migration/recon_tolerances.json"] == "missing"
 
 
 def test_authorizations_absent_is_ok(tmp_path):
@@ -2147,11 +2222,11 @@ def test_authorizations_uncommitted_diff_warns(tmp_path):
 
 def test_allowlist_committed_compares_bytes_not_git_status(tmp_path):
     ws = make_workspace(tmp_path)
-    _git(ws, "update-index", "--assume-unchanged", ".migration/03_recon_tolerances.json")
-    (ws / ".migration" / "03_recon_tolerances.json").write_text("{}")
+    _git(ws, "update-index", "--assume-unchanged", ".migration/recon_tolerances.json")
+    (ws / ".migration" / "recon_tolerances.json").write_text("{}")
     assert _git(ws, "status", "--porcelain").strip() == ""
     c = doctor.check_allowlist_committed(ws)
-    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "modified"
+    assert c.status == "fail" and c.data[".migration/recon_tolerances.json"] == "modified"
 
 
 def test_allowlist_committed_compares_to_origin_main_not_a_feature_head(tmp_path):
@@ -2203,7 +2278,7 @@ def test_allowlist_matches_contract(tmp_path):
 
 def test_run_blocks_on_an_uncommitted_contract_and_the_cli_parses_expect_catalogs(tmp_path):
     ws = make_workspace(tmp_path)
-    (ws / ".migration" / "03_recon_tolerances.json").write_text('{"row_count": 0.5}')
+    (ws / ".migration" / "recon_tolerances.json").write_text('{"row_count": 0.5}')
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True)
     assert "allowlist_committed=fail" in report["blocking"]
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--plugin-root",
@@ -2810,8 +2885,7 @@ def test_reuse_record_falls_back_to_a_full_run_when_not_reusable(tmp_path):
 
 
 def test_reusable_record_requires_the_checkouts_inputs_to_match():
-    """The record binds the inputs its source-side rows were computed from; a child whose
-    .migration/units or top-level .migration/*.json differ runs in full."""
+    """The record binds the unit and top-level contract inputs used by source-side rows."""
     manifest = {"wave": 1}
     record, manifest_bytes = _signed_record(manifest)
     got, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1",
@@ -2826,10 +2900,14 @@ def test_reusable_record_requires_the_checkouts_inputs_to_match():
     assert got is None and "inputs_sha" in why
 
 
-def test_inputs_sha_follows_unit_mappings_and_migration_json_not_the_doctors_own_output(tmp_path):
+def test_inputs_sha_follows_unit_mappings_and_layout_contracts_excluding_capabilities(tmp_path):
     ws = make_workspace(tmp_path)
     before = doctor.inputs_sha(ws)
-    (ws / ".migration" / "09_capabilities.json").write_text("{}")
+    (ws / ".migration" / "capabilities.json").write_text("{}")
+    assert doctor.inputs_sha(ws) == before
+    (ws / ".migration" / "09_capabilities.json").write_text('{"generated_at":"legacy"}')
+    assert doctor.inputs_sha(ws) == before
+    (ws / ".migration" / "unknown.json").write_text("{}")
     assert doctor.inputs_sha(ws) == before
     unit = ws / ".migration" / "units" / "u1"
     unit.mkdir(parents=True)
@@ -2891,17 +2969,17 @@ def test_allowlist_committed_other_contract_files_resolve_the_same_ref(tmp_path)
     ws = make_workspace(tmp_path)
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
-    _git(ws, "rm", "-q", "--cached", ".migration/03_recon_tolerances.json")
+    _git(ws, "rm", "-q", "--cached", ".migration/recon_tolerances.json")
     _git(ws, "commit", "-qm", "contract is the allowlist only")
     _git(ws, "remote", "add", "origin", str(origin))
     _git(ws, "push", "-q", "-u", "origin", "HEAD:main")
     _git(ws, "fetch", "-q", "origin")
     _git(ws, "remote", "set-head", "origin", "main")
     _git(ws, "checkout", "-qb", "feature")
-    _git(ws, "add", ".migration/03_recon_tolerances.json")
+    _git(ws, "add", ".migration/recon_tolerances.json")
     _git(ws, "commit", "-qm", "tolerances committed on a branch")
     c = doctor.check_allowlist_committed(ws)
-    assert c.status == "fail" and c.data[".migration/03_recon_tolerances.json"] == "untracked"
+    assert c.status == "fail" and c.data[".migration/recon_tolerances.json"] == "untracked"
 
 
 class _OracleCur:

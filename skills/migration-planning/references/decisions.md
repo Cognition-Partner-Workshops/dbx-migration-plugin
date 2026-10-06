@@ -17,7 +17,12 @@ them closed (`kind: repo` | `kind: secret` | `kind: mcp`).
 | D7 | external hand-off (SFTP drop, message queue, partner feed) | `preserve` : preserve the format contract exactly, re-platform the transport at cutover | none |
 | D8 | security / governance contract (row-level security, PII masking, retention) | `uc` : reproduce in UC (row filters, masks, grants) before any consumer re-points | none |
 | D9 | ML model or scoring consumer of the data | `parity` : prediction-parity gate per the ML-SCORING profile before re-pointing | none |
-| D10 | environment/access dependency (network path, service principal, sample-data approval) | `fire` : fire the request now, track to closure; the fired request carries the exact commands or grant statements and the one-line reply that closes it | `check: {kind: repo}` / `{kind: secret}` / `{kind: mcp}` proving the access exists |
+| D10 | environment/access dependency (network path, service principal, sample-data approval) | `fire` : fire the request now; track it as a `plan.yaml` blocker carrying the exact request text and its check, with reply or pending state on that blocker | `check: {kind: repo}` / `{kind: secret}` / `{kind: mcp}` proving the access exists |
+
+Target state is recorded as one `target-*` decision per surface. A selected option names the
+target and cites a reference implementation (which outranks a document) or a standards document;
+an N/A option gives its reason. The wave manifest copies those selected decisions into
+`target_state`.
 
 Rules:
 
@@ -27,6 +32,8 @@ Rules:
   gate fan-out width. A `secret` blocker closes when `databricks secrets list-secrets` would list
   it; a `repo` blocker closes when the repo is connected; an `mcp` blocker when the server is
   installed.
+- Every fired request is a `plan.yaml` blocker carrying the exact request text and its check; the
+  reply or pending state is recorded on that blocker.
 - `important: true` is for choices with real blast radius — tolerances, coexistence mode,
   production-affecting sequencing — never for routine defaults.
 - A waived wave gate is recorded on the gate itself: the manifest row carries `decision_id` of

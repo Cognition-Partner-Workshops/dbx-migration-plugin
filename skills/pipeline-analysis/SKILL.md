@@ -12,8 +12,8 @@ batches. No plan and no code: the output is the analysis the manager plans from.
 
 - The pinned pipeline boundary, entry feeds, terminal outputs, and exclusions; the estate
   inventory and shared-object map; the committed `.migration/` workspace.
-- CORE, matching workload profiles, DATA/DEPENDENCY, and the destination for
-  `<Pipeline>_analysis.md`.
+- CORE, matching workload profiles, DATA/DEPENDENCY, and the ticket to which
+  `<Pipeline>_analysis.md` will be attached.
 - The source-dialect skill for per-unit enumeration and the dependency-analysis shape it emits
   (`.migration/units/<unit>/dependencies.json`).
 
@@ -31,13 +31,13 @@ batches. No plan and no code: the output is the analysis the manager plans from.
    edges in one batch or serialize them; no two same-wave batches share targets.
 6. Add a size-aware recon row per unit: gates, live/snapshot source, threshold/sampling rule,
    determinism rule, projected legacy load, and cap check.
-7. Write `<Pipeline>_analysis.md` with scope, inventory, DAG, dictionary, dependency table,
-   waves/batches, recon plan, and risks.
+7. Prepare `<Pipeline>_analysis.md` with scope, inventory, DAG, dictionary, dependency table,
+   waves/batches, recon plan, and risks. Attach it to the ticket, never under `.migration/`.
 
 ## Evidence the ticket must attach
 
-- `<Pipeline>_analysis.md` with the wave/batch grouping, the type dictionary, and the
-  dependency table.
+- `<Pipeline>_analysis.md` attached to the ticket with the wave/batch grouping, the type
+  dictionary, and the dependency table; never under `.migration/`.
 - Per-unit `dependencies.json` rows the dialect skill emits (transitive reads/writes/calls) —
   the wave manifest's `write_targets` come from these.
 - The recon plan row for every unit.

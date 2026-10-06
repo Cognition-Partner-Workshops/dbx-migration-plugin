@@ -12,7 +12,7 @@ customer-authorized cutover. Devin never self-authorizes the production flip (`A
 
 - The plan's cutover step and its gates; the agreed green-cycle count and live window.
 - All wave manifests and `wave-<N>.result.json` results; the recon reports and
-  `03_recon_tolerances.json`; the parallel-run verdict.
+  `recon_tolerances.json`; the parallel-run verdict.
 - `skills/data-reconciliation/SKILL.md` — routine parity and DEGRADED entry criteria.
 
 ## Procedure

@@ -9,8 +9,12 @@ mapping is unreadable, and on `source_principal_read_only=fail` (a writable sour
 `unverified` stays advisory in a child.
 
 ### `workspace`
-Verifies every required `.migration` contract file exists: `allowed_targets.json` and
-`03_recon_tolerances.json`.
+Verifies `allowed_targets.json` and `recon_tolerances.json` exist. It reads the legacy tolerance
+alias with a `warn` until 0.7.0 when the canonical file is absent; both names together fail as
+ambiguous.
+### `workspace_layout`
+Warns for unexpected top-level `.migration/` entries that no tool reads. It never blocks
+readiness; prose belongs on the plan step's ticket or in `plan.yaml` decisions/blockers.
 ### `authorizations_file`
 `ok` when `.migration/authorizations.json` is absent. When present it must be
 `{"version": 1, "authorizations": [...]}` where every entry has a slug `id`, `kind` in
@@ -22,9 +26,10 @@ Sub-checks: `allowed_targets` parses and passes `hooks/dbx_guard.py` (warn for `
 or empty `legacy_sources`); `allowlist_matches_contract` compares normalized `--expect-catalogs`
 to `allowed_targets.json` and is skipped without that flag.
 ### `allowlist_committed`
-Verifies byte equality of `allowed_targets.json` and `03_recon_tolerances.json` with
+Verifies byte equality of `allowed_targets.json` and `recon_tolerances.json` with
 `git show HEAD:<path>`, naming modified, untracked, or missing files. Changes require a reviewed
-PR and commit, never a working-copy edit.
+PR and commit, never a working-copy edit; the legacy tolerance path is compared when it resolves
+the required contract.
 ### `hook_guard`
 Sub-checks: `hooks_files` verifies `hooks.json` registers `hooks/dbx_guard.py` as `PreToolUse`;
 `hook_guard_functional` directly sends a probe and requires a block naming the full

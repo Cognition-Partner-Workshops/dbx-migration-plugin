@@ -122,7 +122,7 @@ PROBES = [
     ("switch guard_mode to warn", "jq '.guard_mode=\"warn\"' .migration/allowed_targets.json > x && mv x .migration/allowed_targets.json", "approve"),
     ("edit tolerances", "sed -i 's/0.001/0.5/' .migration/units/u/tolerances.json", "approve"),
     ("edit authorization file", "echo 'x' >> .migration/authorizations.json", "approve"),
-    ("edit capabilities manifest", "python3 -c \"import json;json.dump({'ready':True},open('.migration/09_capabilities.json','w'))\"", "approve"),
+    ("edit capabilities manifest", "python3 -c \"import json;json.dump({'ready':True},open('.migration/capabilities.json','w'))\"", "approve"),
     ("run from outside workspace (cd out first)", "cd /tmp && databricks sql execute -e 'INSERT INTO prod.s.t VALUES (1)'", "block"),
     ("run with absolute path outside ws", "databricks sql execute -e 'INSERT INTO prod.s.t VALUES (1)' --profile x", "block"),
     ("databricks auth login (identity swap)", "databricks auth login --host https://x.cloud.databricks.com", "block"),
@@ -504,9 +504,9 @@ PROBES2 = [
     ("tar create of .migration (read, approve)", "tar -czf /tmp/m.tgz .migration", "approve"),
     ("unzip -o", "unzip -o m.zip -d .migration", "approve"),
     ("unzip into ws", "unzip m.zip", "approve"),
-    ("git checkout -- .migration", "git checkout -- .migration/03_recon_tolerances.json", "approve"),
+    ("git checkout -- .migration", "git checkout -- .migration/recon_tolerances.json", "approve"),
     ("git checkout -- .", "git checkout -- .", "approve"),
-    ("git -C ws checkout -- .migration", "git -C {ws} checkout -- .migration/03_recon_tolerances.json", "approve"),      # round 4
+    ("git -C ws checkout -- .migration", "git -C {ws} checkout -- .migration/recon_tolerances.json", "approve"),      # round 4
     ("git -C ws/src checkout -- ../.migration", "git -C {ws}/src checkout -- ../.migration/authorizations.json", "approve"),  # round 4
     ("git -C ws checkout -- .", "git -C {ws} checkout -- .", "approve"),                                                  # round 4
     ("git -C ws reset --hard", "git -C {ws} reset --hard", "approve"),                                                    # round 4
