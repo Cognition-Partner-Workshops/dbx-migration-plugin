@@ -1,3 +1,28 @@
+# 0.5.2 — guard: the doctor's hook probe blocks from any shell, not only inside a workspace
+
+`hooks/dbx_guard.py` 0.5.1 checked the probe sentinel (`__dbx_guard_probe__<nonce>`) only inside
+`evaluate()`, which runs once a `.migration/allowed_targets.json` resolves. A probe sent from a
+shell that resolves no workspace — a hosted exec without `workdir`, a fresh child session, hook
+process in `/` with a HOME that has no `.migration` — hit `if cfg is None: return 0` and the echo
+PRINTED, so the doctor's live probe could never produce `blocked:<nonce>` there even though
+hooks.json was loaded.
+
+## Changed
+
+- `hooks/dbx_guard.py`: the probe violation text is factored into `_probe_violation()`; `main()`
+  now blocks a probe command (rc 2, reason names the full `__dbx_guard_probe__<nonce>` token) even
+  when no allowlist resolves. Non-probe commands outside a workspace are still a silent pass, and
+  every cfg-resolved path (warn-mode rows included) is unchanged.
+- `skills/factory-doctor/doctor.py`: `hook_guard_functional` sends the probe in the workspace shape
+  and in the no-workspace hosted shape (cwd `/`, project dirs `/`, a HOME with no workspace) and is
+  `ok` only if both block naming the full token — children catch a stale, cwd-dependent guard.
+- Tests: `test_doctor_probe_blocks_in_every_session_shell_shape` (the six shell shapes a run sees),
+  `test_probe_sentinel_outside_a_migration_workspace_blocks`, a doctor test that fails a guard
+  which only blocks inside a workspace, and one that proves the platform row via a live probe run
+  from a shell without a workspace.
+- Docs: the probe blocks from any shell or directory; the "run in the lead session's exec tool"
+  instruction is unchanged.
+
 # 0.5.1 — guard: the plugin's own factory-doctor is not a scanned script
 
 `hooks/dbx_guard.py` 0.5.0 refused the documented

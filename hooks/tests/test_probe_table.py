@@ -1040,10 +1040,12 @@ def test_probe_sentinel_with_nonce_blocks_and_is_echoed_in_the_reason(workspace:
     assert token in r.stdout
 
 
-def test_probe_sentinel_outside_a_migration_workspace_passes_through(tmp_path: Path):
-    # the doctor runs the probe inside a workspace, where it must block; outside one nothing blocks
+def test_probe_sentinel_outside_a_migration_workspace_blocks(tmp_path: Path):
+    # the probe blocks from any shell, not only inside a workspace
     r = run_hook("echo __dbx_guard_probe__zz", tmp_path)
-    assert r.returncode == 0
+    assert r.returncode == 2
+    out = json.loads(r.stdout)
+    assert "__dbx_guard_probe__zz" in out["reason"]
 
 
 # ---------------------------------------------------------------- the running guard's own tree

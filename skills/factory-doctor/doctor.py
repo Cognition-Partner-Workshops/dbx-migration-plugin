@@ -20,6 +20,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -338,12 +339,27 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
     nonce = issued or secrets.token_hex(4)
     token = HOOK_PROBE_TOKEN.format(nonce=nonce)
     event = json.dumps({"tool_name": "exec", "tool_input": {"command": HOOK_PROBE_COMMAND.format(nonce=nonce)}})
+    def probe_blocked(r: subprocess.CompletedProcess) -> bool:
+        return r.returncode == 2 and '"block"' in r.stdout and token in r.stdout
     try:
         r = subprocess.run([sys.executable, str(guard)], input=event, text=True, capture_output=True, timeout=30,
             cwd=ws, env={**os.environ, "CLAUDE_PROJECT_DIR": str(ws)})
-        if r.returncode == 2 and '"block"' in r.stdout and token in r.stdout:
-            out.append(Check("hook_guard_functional", "ok",
-                f"dbx_guard.py blocks the probe command when invoked directly and names {token}"))
+        if probe_blocked(r):
+            # The hosted no-workspace shape: hook process in `/`, project dirs `/`, a HOME with no
+            # workspace, no `workdir` in tool_input — a hosted exec without workdir / a fresh child.
+            with tempfile.TemporaryDirectory() as home:
+                r2 = subprocess.run([sys.executable, str(guard)], input=event, text=True, capture_output=True,
+                    timeout=30, cwd="/", env={**os.environ, "CLAUDE_PROJECT_DIR": "/", "DEVIN_PROJECT_DIR": "/",
+                                              "HOME": home})
+            if probe_blocked(r2):
+                out.append(Check("hook_guard_functional", "ok",
+                    f"dbx_guard.py blocks the probe command when invoked directly and names {token}"))
+            else:
+                out.append(Check("hook_guard_functional", "fail",
+                    f"dbx_guard.py blocks the probe inside a workspace but passes it through from a shell with "
+                    f"no resolvable workspace (a hosted exec without workdir / a fresh child session), so the "
+                    f"live probe would print there (rc={r2.returncode}): {_redact(r2.stderr or r2.stdout)} — "
+                    "upgrade the plugin"))
         else:
             out.append(Check("hook_guard_functional", "fail",
                 f"dbx_guard.py did not block the probe naming {token} (rc={r.returncode}): "

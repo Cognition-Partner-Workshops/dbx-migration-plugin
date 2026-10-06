@@ -2408,6 +2408,51 @@ def test_hook_guard_functional_requires_the_probe_token_in_the_block_reason(tmp_
         assert c.status == "fail" and "__dbx_guard_probe__" in c.detail, reason
 
 
+def test_hook_guard_functional_fails_a_guard_that_only_blocks_inside_a_workspace(tmp_path):
+    """A guard whose probe block depends on resolving a workspace (a stale, cwd-dependent guard)
+    passes the workspace shape but must fail the no-workspace hosted shape; the real plugin's
+    guard passes both."""
+    ws = make_workspace(tmp_path)
+    fake_root = tmp_path / "plugin"
+    (fake_root / "hooks").mkdir(parents=True)
+    (fake_root / "hooks.json").write_text(json.dumps(
+        {"PreToolUse": [{"matcher": "exec", "hooks": [{"command": "python hooks/dbx_guard.py"}]}]}))
+    guard = fake_root / "hooks" / "dbx_guard.py"
+    guard.write_text(
+        'import sys, json, os\n'
+        'from pathlib import Path\n'
+        'cmd = json.load(sys.stdin)["tool_input"]["command"]\n'
+        'if Path(os.environ.get("CLAUDE_PROJECT_DIR", "/"), ".migration").is_dir():\n'
+        '    print(json.dumps({"decision": "block", "reason": "blocked: " + cmd})); sys.exit(2)\n'
+        'sys.exit(0)\n')
+    c = {x.id: x for x in doctor.check_hooks(fake_root, ws, "not-blocked")}["hook_guard_functional"]
+    assert c.status == "fail" and "no resolvable workspace" in c.detail
+    real = {x.id: x for x in doctor.check_hooks(PLUGIN_ROOT, ws, "not-blocked")}["hook_guard_functional"]
+    assert real.status == "ok"
+
+
+def test_live_probe_from_a_shell_without_workspace_proves_the_platform_row(tmp_path):
+    """What the session actually does: run the report's probe_command in the hosted no-workdir
+    shape (hook process in `/`, a HOME with no workspace), then hand the nonce the block reason
+    names back as `blocked:<nonce>`."""
+    ws = make_workspace(tmp_path)
+    first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)
+    (ws / ".migration" / "09_capabilities.json").write_text(json.dumps(first))
+    probe_command = sub_by_id(first, "hook_guard")["hook_platform_loaded"]["data"]["probe_command"]
+    home = tmp_path / "no-workspace-home"
+    home.mkdir()
+    r = subprocess.run([sys.executable, str(PLUGIN_ROOT / "hooks" / "dbx_guard.py")],
+                       input=json.dumps({"tool_name": "exec", "tool_input": {"command": probe_command}}),
+                       text=True, capture_output=True, cwd="/",
+                       env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": "/", "DEVIN_PROJECT_DIR": "/",
+                            "HOME": str(home)})
+    assert r.returncode == 2
+    nonce = re.search(r"__dbx_guard_probe__([0-9a-f]{8})", r.stdout).group(1)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", f"blocked:{nonce}", None, True)
+    assert sub_by_id(report, "hook_guard")["hook_platform_loaded"]["status"] == "ok"
+    assert by_id(report)["hook_guard"]["status"] == "ok"
+
+
 def test_child_never_live_probes_the_platform_hook(tmp_path):
     ws = make_workspace(tmp_path)
     first = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "unknown", None, True)

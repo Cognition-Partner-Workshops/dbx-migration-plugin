@@ -27,8 +27,10 @@ Verifies byte equality of `allowed_targets.json` and `03_recon_tolerances.json` 
 PR and commit, never a working-copy edit.
 ### `hook_guard`
 Sub-checks: `hooks_files` verifies `hooks.json` registers `hooks/dbx_guard.py` as `PreToolUse`;
-`hook_guard_functional` directly sends a probe and requires a block naming the full
-`__dbx_guard_probe__<nonce>`; `hook_platform_loaded` is `unverified` until the session blocks the
+`hook_guard_functional` directly sends the probe in the workspace shape and in the no-workspace
+hosted shape (hook process in `/`, project dirs `/`, a HOME with no workspace, no `workdir`) and
+requires a block naming the full `__dbx_guard_probe__<nonce>` in both — the probe blocks from any
+shell, not only inside a workspace; `hook_platform_loaded` is `unverified` until the session blocks the
 pending nonce, or fails when the echo runs. One nonce per report serves the functional row and the
 probe command, which are in `data`. The platform row is the wave ticket worker's only: its live
 probe proves the platform once per wave and is signed into `wave-N.doctor.json`; a child never runs

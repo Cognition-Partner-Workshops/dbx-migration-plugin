@@ -1,6 +1,6 @@
 {
   "name": "dbx-migration-factory",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Databricks migration factory on a board: a manager writes plan.yaml, humans approve it in the Plan view, worker tickets run waves; source-dialect skills, a reconciliation harness, enforcement hooks, and target routing onto the official Databricks skills.",
   "requiredPlugins": [
     {
