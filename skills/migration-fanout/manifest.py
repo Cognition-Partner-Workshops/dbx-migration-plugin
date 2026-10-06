@@ -21,9 +21,16 @@ PIPELINE_RE = re.compile(r"[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*")
 # a plan decision id: the lowercase slug of a plan.yaml decision
 DECISION_ID = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 
-TARGET_SURFACES = frozenset({
-    "core", "sql", "pipeline", "orchestration", "consumer", "lakebase", "ml_scoring", "data_dependency",
-})
+TARGET_DECISIONS = {
+    "core": "target-core",
+    "sql": "target-sql",
+    "pipeline": "target-pipeline",
+    "orchestration": "target-orchestration",
+    "consumer": "target-consumer",
+    "lakebase": "target-lakebase",
+    "ml_scoring": "target-ml-scoring",
+    "data_dependency": "target-data-dependency",
+}
 
 
 # a skill name: skills/<name>/SKILL.md under the plugin root
@@ -181,13 +188,16 @@ def validate_manifest(m, plugin=None):
         target_state = m["target_state"]
         req(isinstance(target_state, dict) and target_state,
             "manifest key 'target_state' must be a non-empty object")
-        unknown_surfaces = sorted(set(target_state) - TARGET_SURFACES)
+        unknown_surfaces = sorted(set(target_state) - TARGET_DECISIONS.keys())
         req(not unknown_surfaces,
             f"manifest 'target_state' has unknown surface(s): {unknown_surfaces}")
         for surface, state in target_state.items():
             req(isinstance(state, dict) and isinstance(state.get("decision"), str)
                 and DECISION_ID.fullmatch(state["decision"]),
                 f"manifest 'target_state.{surface}.decision' must be a lowercase plan decision slug")
+            req(state["decision"] == TARGET_DECISIONS[surface],
+                f"manifest 'target_state.{surface}.decision' must be "
+                f"'{TARGET_DECISIONS[surface]}', the plan decision for that surface")
             target_fields = {"decision", "target", "ref"}
             na_fields = {"decision", "na"}
             req(set(state) in (target_fields, na_fields),

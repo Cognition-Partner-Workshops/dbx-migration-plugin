@@ -166,20 +166,124 @@ def test_cli_reports_the_effective_depth_not_the_requested_one(tmp_path: Path, m
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig"]}))
+    legacy_tolerances = Path(".migration/03_recon_tolerances.json")
+    legacy_tolerances.write_text(json.dumps({"version": "legacy-v1"}))
     source, target = make_green()
     monkeypatch.setitem(adapters.SOURCE_ADAPTERS, "oracle", lambda secret: source)
     monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: target)
     monkeypatch.setattr(cli, "load_mapping_spec", lambda path, params: SPEC)
-    monkeypatch.setattr(cli, "load_tolerances", lambda path: TOL)
+    original_load_tolerances = cli.load_tolerances
+    loaded_tolerances = []
+
+    def load_tolerances(path):
+        loaded_tolerances.append(path)
+        return original_load_tolerances(path)
+
+    monkeypatch.setattr(cli, "load_tolerances", load_tolerances)
     monkeypatch.setattr(cli, "load_canon_rules", lambda path: RULES)
     rc = cli.main(["run", "--unit", "u", "--family", "oracle", "--mode", "continuous", "--depth", "full",
-                   "--mapping", "m", "--tolerances", "t", "--canonicalization", "c",
+                   "--mapping", "m", "--tolerances", ".migration/recon_tolerances.json",
+                   "--canonicalization", "c",
                    "--source-dsn-secret", "SOURCE", "--target-secret", "TARGET",
                    "--target-catalog", "mig", "--target-schema", "s", "--out", str(tmp_path / "out")])
     assert rc == 0
-    line = capsys.readouterr().out
+    captured = capsys.readouterr()
+    line = captured.out
     assert "depth=sampled" in line and "depth=full" not in line
+    assert "tolerances=legacy-v1" in line
+    assert loaded_tolerances == [legacy_tolerances]
+    assert captured.err == (
+        "dbx-recon: warning: .migration/recon_tolerances.json missing; reading legacy "
+        ".migration/03_recon_tolerances.json; rename it to recon_tolerances.json "
+        "(legacy name read until 0.7.0)\n")
     assert json.loads((tmp_path / "out" / "result.json").read_text())["depth"] == "sampled"
+
+
+def test_cli_estimate_uses_legacy_tolerances(tmp_path: Path, monkeypatch, capsys):
+    from recon import cli
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    legacy_tolerances = Path(".migration/03_recon_tolerances.json")
+    legacy_tolerances.write_text(json.dumps({"version": "legacy-v1"}))
+    monkeypatch.setattr(cli, "_load_spec", lambda *args: (SPEC, None))
+    original_load_tolerances = cli.load_tolerances
+    loaded_tolerances = []
+
+    def load_tolerances(path):
+        loaded_tolerances.append(path)
+        return original_load_tolerances(path)
+
+    monkeypatch.setattr(cli, "load_tolerances", load_tolerances)
+    rc = cli.main(["estimate", "--mapping", "mapping.json",
+                   "--tolerances", ".migration/recon_tolerances.json"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert loaded_tolerances == [legacy_tolerances]
+    assert captured.err == (
+        "dbx-recon: warning: .migration/recon_tolerances.json missing; reading legacy "
+        ".migration/03_recon_tolerances.json; rename it to recon_tolerances.json "
+        "(legacy name read until 0.7.0)\n")
+    assert json.loads(captured.out)
+
+
+def test_resolve_tolerances_path_uses_legacy_with_warning(tmp_path: Path, capsys):
+    from recon.cli import resolve_tolerances_path
+    canonical = tmp_path / ".migration" / "recon_tolerances.json"
+    canonical.parent.mkdir()
+    legacy = canonical.parent / "03_recon_tolerances.json"
+    legacy.write_text(json.dumps({"version": "legacy-v1"}))
+
+    resolved = resolve_tolerances_path(canonical)
+
+    assert resolved == legacy
+    assert load_tolerances(resolved).version == "legacy-v1"
+    assert capsys.readouterr().err == (
+        f"dbx-recon: warning: {canonical} missing; reading legacy {legacy}; rename it to "
+        "recon_tolerances.json (legacy name read until 0.7.0)\n")
+
+
+def test_resolve_tolerances_path_prefers_canonical_without_warning(tmp_path: Path, capsys):
+    from recon.cli import resolve_tolerances_path
+    canonical = tmp_path / ".migration" / "recon_tolerances.json"
+    canonical.parent.mkdir()
+    canonical.write_text(json.dumps({"version": "canonical-v1"}))
+    (canonical.parent / "03_recon_tolerances.json").write_text(json.dumps({"version": "legacy-v1"}))
+
+    resolved = resolve_tolerances_path(canonical)
+
+    assert resolved == canonical
+    assert load_tolerances(resolved).version == "canonical-v1"
+    assert capsys.readouterr().err == ""
+
+
+def test_resolve_tolerances_path_preserves_missing_canonical_error(tmp_path: Path, capsys):
+    from recon.cli import resolve_tolerances_path
+    canonical = tmp_path / ".migration" / "recon_tolerances.json"
+    canonical.parent.mkdir()
+
+    resolved = resolve_tolerances_path(canonical)
+
+    assert resolved == canonical
+    with pytest.raises(FileNotFoundError) as original:
+        load_tolerances(canonical)
+    with pytest.raises(FileNotFoundError) as resolved_error:
+        load_tolerances(resolved)
+    assert str(resolved_error.value) == str(original.value)
+    assert capsys.readouterr().err == ""
+
+
+def test_resolve_tolerances_path_does_not_fallback_for_custom_name(tmp_path: Path, capsys):
+    from recon.cli import resolve_tolerances_path
+    custom = tmp_path / ".migration" / "custom.json"
+    custom.parent.mkdir()
+    (custom.parent / "03_recon_tolerances.json").write_text(json.dumps({"version": "legacy-v1"}))
+
+    resolved = resolve_tolerances_path(custom)
+
+    assert resolved == custom
+    with pytest.raises(FileNotFoundError):
+        load_tolerances(resolved)
+    assert capsys.readouterr().err == ""
 
 
 def test_determinism():

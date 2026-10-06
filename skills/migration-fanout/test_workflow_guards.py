@@ -44,7 +44,7 @@ def _functions():
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
-                                                         "DECISION_ID", "TARGET_SURFACES", "SKILL_NAME", "_SEGMENT",
+                                                         "DECISION_ID", "TARGET_DECISIONS", "SKILL_NAME", "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE",
                                                          "REPO_RE", "BARE_PATH"}
                     for t in node.targets))]
@@ -153,6 +153,15 @@ def test_validate_manifest_accepts_target_state():
         "core": {"decision": "target-core", "target": "Delta table", "ref": "examples/core.sql"},
         "lakebase": {"decision": "target-lakebase", "na": "No operational data in this estate"},
     }))
+
+
+def test_validate_manifest_rejects_target_state_with_wrong_surface_decision():
+    with pytest.raises(SystemExit) as exc:
+        _functions()["validate_manifest"](_manifest(target_state={
+            "core": {"decision": "target-sql", "target": "Delta table", "ref": "examples/core.sql"},
+        }))
+    assert str(exc.value) == (
+        "manifest 'target_state.core.decision' must be 'target-core', the plan decision for that surface")
 
 
 def test_validate_manifest_rejects_unknown_target_state_surface():

@@ -75,6 +75,17 @@ def _load_allowed_targets(path: Path) -> list[str]:
     return [_single_identifier(value, "allowed-targets-file") for value in values]
 
 
+def resolve_tolerances_path(path: Path) -> Path:
+    if path.is_file() or path.name != "recon_tolerances.json":
+        return path
+    legacy = path.parent / "03_recon_tolerances.json"
+    if not legacy.is_file():
+        return path
+    print(f"dbx-recon: warning: {path} missing; reading legacy {legacy}; rename it to "
+          "recon_tolerances.json (legacy name read until 0.7.0)", file=sys.stderr)
+    return legacy
+
+
 def _validate_sql(sql: str, name: str) -> None:
     stripped = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     stripped = re.sub(r"--[^\r\n]*", " ", stripped)
@@ -445,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--canonicalization needs --family so its type_map is selected")
         spec, _ = _load_spec(args.mapping, args.canonicalization, args.family,
                              args.target_kind, params)
+        args.tolerances = resolve_tolerances_path(args.tolerances)
         tol = load_tolerances(args.tolerances)
         row_counts = None
         if args.row_counts is not None:
@@ -503,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
 
     spec, type_map = _load_spec(args.mapping, args.canonicalization, args.family,
                                 args.target_kind, params)
+    args.tolerances = resolve_tolerances_path(args.tolerances)
     tol = load_tolerances(args.tolerances)
     rules = load_canon_rules(args.canonicalization)
 

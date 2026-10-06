@@ -17,7 +17,10 @@ checks); the sandbox imports them from the pointer's plugin root.
 Optional and non-empty when present; keys are `core`, `sql`, `pipeline`, `orchestration`,
 `consumer`, `lakebase`, `ml_scoring`, or `data_dependency`. Each value is exactly
 `{decision, target, ref}` with non-empty strings, or `{decision, na}` with a non-empty reason.
-`decision` is the lowercase slug of the corresponding `target-*` plan decision.
+`decision` must be the surface's exact plan decision: `core=target-core`, `sql=target-sql`,
+`pipeline=target-pipeline`, `orchestration=target-orchestration`, `consumer=target-consumer`,
+`lakebase=target-lakebase`, `ml_scoring=target-ml-scoring`, or
+`data_dependency=target-data-dependency`.
 
 ## How to use it
 
