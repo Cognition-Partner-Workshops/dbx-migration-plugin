@@ -7,12 +7,14 @@ gates and blockers per the estate. Step ids are slugs; `depends_on` names earlie
   traceability with the request's answers recorded.
 - Phase `foundation`
   - `workspace-setup` — worker ticket invoking `skills/workspace-setup`: writes the committed
-    `.migration/` workspace (`allowed_targets.json`, `03_recon_tolerances.json`,
-    `09_capabilities.json`), runs the probes and the doctor, and reports blocked items back as
+    `.migration/` workspace (`allowed_targets.json`, `recon_tolerances.json`,
+    `capabilities.json`), runs the probes and the doctor, and reports blocked items back as
     plan blockers.
   - `scaffold-wave-0` — catalog/schemas, federation or backfill, CI, harness install, bundle/job
     shells; serial (its wave manifest has `width: 1`), `depends_on: [workspace-setup]`.
-  - `access-requests` — every fired D10 blocker; depends on nothing but blocks later phases.
+  - `access-requests` — every fired request is a `plan.yaml` blocker carrying the exact request
+    text and its check; the reply or pending state is recorded on that blocker. Depends on
+    nothing but blocks later phases.
 - Phase `waves`
   - `pilot` — wave 1, width ≤ 5; one unit of each new pattern class runs narrow before fan-out.
   - `run-wave-<N>` — one step per wave, `depends_on` the previous `run-wave-*` step (merge order

@@ -41,7 +41,7 @@ dbx-recon run \
   --unit <unit_id> \
   --family sqlserver|postgres|databricks \
   --mapping .migration/units/<unit_id>/mapping_spec.json \
-  --tolerances .migration/03_recon_tolerances.json \
+  --tolerances .migration/recon_tolerances.json \
   --canonicalization skills/<source>-sql/canonicalization.json \
   --mode fixture|live|snapshot|continuous|transactional|structural \
   --source-dsn-secret <SOURCE_SECRET_NAME> \
@@ -72,7 +72,7 @@ The depth is recorded in `result.json` and the summary.
 | `redshift`, `snowflake`, `teradata` | **untested**: the adapter raises `NotImplementedError("<family> source adapter is untested; see SKILL.md")` before any connection. Reconcile these through Lakehouse Federation (`--family databricks`) or land an adapter with a rehearsal first. |
 
 ```bash
-dbx-recon estimate --mapping <mapping_spec.json> --tolerances .migration/03_recon_tolerances.json \
+dbx-recon estimate --mapping <mapping_spec.json> --tolerances .migration/recon_tolerances.json \
   --depth sampled --row-counts <{root_table: rows}.json> [--ops-count N]
 ```
 
@@ -208,7 +208,7 @@ It is the default recon and coexistence bridge whenever a JDBC path exists.
 2. Put legacy credentials in a Databricks secret scope and reference scope/key names only.
 3. Create `CREATE CONNECTION ... OPTIONS (... secret(...))` with the read-only legacy principal, never an admin login.
 4. Create `CREATE FOREIGN CATALOG ... USING CONNECTION` and grant `USE` to the migration principal only.
-5. Verify a trivial `SELECT COUNT(*)` on an in-scope table, record it in the `workspace-setup` probe results, and reuse existing connections/catalogs rather than duplicating them.
+5. Verify a trivial `SELECT COUNT(*)` on an in-scope table, record it in the `workspace-setup` ticket's probe table, and reuse existing connections/catalogs rather than duplicating them.
 - Federation is read-only by policy even where the engine allows writes; aggregates and filters push down, but wide row-level pulls do not, so large comparisons use the size tiers.
 - Every federated query loads the legacy production engine and counts against the legacy-query concurrency cap in the tolerance record.
 - Small-table backfill uses CTAS from the foreign catalog; federation is never the production consumer path.
@@ -294,7 +294,7 @@ needs the read-only principal to hold EXECUTE on the routines under test; `intak
    stderr), and `result.json` records the outcome under `type_map` (`null` when the family has
    no map, so unaudited is never mistaken for clean).
 3. On FAIL: read `report.md`, fix converted code or the load only. Never touch the source.
-   Never change `03_recon_tolerances.json` (that needs a new `important` plan decision).
+   Never change `recon_tolerances.json` (that needs a new `important` plan decision).
 4. Paste `recon.summary.md` into the PR body, link `result.json` and `report.md`. Never paste
    the JSON.
 5. Validate `--param` values against the unit brief before running. A parameter is a scope

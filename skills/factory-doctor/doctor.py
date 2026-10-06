@@ -24,7 +24,15 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-REQUIRED_FILES = ("allowed_targets.json", "03_recon_tolerances.json")
+REQUIRED_FILES = ("allowed_targets.json", "recon_tolerances.json")
+MIGRATION_LAYOUT = frozenset({
+    "allowed_targets.json", "authorizations.json", "recon_tolerances.json", "capabilities.json",
+    ".hook_probe_nonce", "units", "waves", "recon", "snapshots",
+})
+LEGACY_ALIASES = {
+    "03_recon_tolerances.json": "recon_tolerances.json",
+    "09_capabilities.json": "capabilities.json",
+}
 OFFICIAL_SKILLS = ("databricks-core", "databricks-dbsql", "databricks-pipelines", "databricks-jobs",
     "databricks-dabs", "databricks-unity-catalog", "databricks-lakeflow-connect", "databricks-lakebase")
 SECURITY_CONTROLS = ("hook_guard_functional", "hook_platform_loaded", "databricks_identity")
@@ -43,9 +51,9 @@ SOURCE_FAMILIES = ("databricks", "oracle", "postgres", "redshift", "snowflake", 
 TARGET_KINDS = ("databricks", "lakebase")  # the harness's --target-kind values; the type map is keyed by both
 # The committed wave contract: the guard and the harness read the working copy, so a working copy
 # that differs from HEAD is a contract nobody reviewed.
-CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/03_recon_tolerances.json")
+CONTRACT_FILES = (".migration/allowed_targets.json", ".migration/recon_tolerances.json")
 AUTHORIZATIONS_REL = ".migration/authorizations.json"
-CAPABILITIES = ".migration/09_capabilities.json"
+CAPABILITIES = ".migration/capabilities.json"
 HOOK_PROBE_NONCE = ".migration/.hook_probe_nonce"
 HOOK_PROBE_NONCE_TTL = 8 * 60 * 60
 # Safe live probe: if the platform loads hooks.json the guard blocks this; else `echo` prints and
@@ -115,9 +123,12 @@ DOCTOR_MAX_AGE_MINUTES = 15
 
 
 def inputs_sha(ws: Path) -> str:
-    """sha256 over .migration/units/** and top-level .migration/*.json except 09_capabilities.json."""
+    """sha256 over unit files and top-level contract files except capability records."""
     mig = ws / ".migration"
-    files = sorted({*mig.joinpath("units").rglob("*"), *mig.glob("*.json")} - {mig / "09_capabilities.json"})
+    files = sorted({*mig.joinpath("units").rglob("*"),
+        *(mig / name for name in MIGRATION_LAYOUT if name.endswith(".json")),
+        *(mig / name for name, canonical in LEGACY_ALIASES.items() if canonical != "capabilities.json")} -
+        {mig / CAPABILITIES.rsplit("/", 1)[-1], mig / "09_capabilities.json"})
     h = hashlib.sha256()
     for f in files:
         if f.is_file():
@@ -163,7 +174,7 @@ def reusable_record(record, manifest, manifest_bytes: bytes, expect_identity: st
         return None, "record carries no inputs_sha"
     if inputs_sha is not None and record["inputs_sha"] != inputs_sha:
         return (None,
-            "workspace inputs differ from the record's (units or .migration/*.json changed since it was signed)")
+            "workspace inputs differ from the record's (unit files or top-level contract files changed since it was signed)")
     return record, ""
 
 
@@ -189,10 +200,57 @@ def check_workspace(ws: Path) -> Check:
     mig = ws / ".migration"
     if not mig.is_dir():
         return Check("workspace", "fail", f"{mig} missing; the intake step creates it")
-    missing = [f for f in REQUIRED_FILES if not (mig / f).is_file()]
+    resolved = {name: resolve_migration_file(ws, name) for name in REQUIRED_FILES}
+    ambiguous = [name for name, (_, _, both) in resolved.items() if both]
+    if ambiguous:
+        return Check("workspace", "fail",
+            f".migration/ has ambiguous contract files for {ambiguous}: both canonical and legacy names exist",
+            {"ambiguous": ambiguous})
+    missing = [name for name, (path, _, _) in resolved.items() if path is None]
     if missing:
         return Check("workspace", "fail", f".migration/ incomplete: missing {missing}", {"missing": missing})
+    legacy = [LEGACY_ALIASES_REVERSE[name] for name, (_, is_legacy, _) in resolved.items() if is_legacy]
+    if legacy:
+        names = [".migration/" + name for name in legacy]
+        destinations = [LEGACY_ALIASES[name] for name in legacy]
+        renames = "; ".join(f"rename {old} to {new}" for old, new in zip(names, destinations))
+        return Check("workspace", "warn",
+            f"{renames}; the legacy name is read until 0.7.0", {"resolved": {
+                name: str(path.relative_to(ws)) for name, (path, _, _) in resolved.items()}})
     return Check("workspace", "ok", f".migration/ has all {len(REQUIRED_FILES)} required files")
+
+
+LEGACY_ALIASES_REVERSE = {new: old for old, new in LEGACY_ALIASES.items()}
+
+
+def resolve_migration_file(ws: Path, canonical: str) -> tuple[Path | None, bool, bool]:
+    """Resolve a canonical contract path, returning (path, legacy name used, both names exist)."""
+    mig = ws / ".migration"
+    canonical_path = mig / canonical
+    legacy_name = LEGACY_ALIASES_REVERSE.get(canonical)
+    legacy_path = mig / legacy_name if legacy_name else None
+    canonical_exists = canonical_path.is_file()
+    legacy_exists = bool(legacy_path and legacy_path.is_file())
+    if canonical_exists and legacy_exists:
+        return canonical_path, False, True
+    if canonical_exists:
+        return canonical_path, False, False
+    if legacy_exists:
+        return legacy_path, True, False
+    return None, False, False
+
+
+def check_workspace_layout(ws: Path) -> Check:
+    mig = ws / ".migration"
+    if not mig.is_dir():
+        return Check("workspace_layout", "ok", ".migration/ is not present")
+    allowed = MIGRATION_LAYOUT | LEGACY_ALIASES.keys()
+    unexpected = sorted(entry.name for entry in mig.iterdir() if entry.name not in allowed)
+    if unexpected:
+        return Check("workspace_layout", "warn",
+            f"{', '.join(unexpected)} are not read by any tool; prose belongs on the plan step's ticket or "
+            "in plan.yaml (decisions/blockers), not in .migration/", {"unexpected": unexpected})
+    return Check("workspace_layout", "ok", ".migration/ top-level entries match the machine-file layout")
 
 
 _ENTRY_AUTHOR = re.compile(r"user:[\w][\w.@/-]*")
@@ -283,7 +341,14 @@ def _issued_nonce(ws: Path) -> str | None:
     except OSError:
         pass
     try:
-        report = json.loads((ws / CAPABILITIES).read_text())
+        capabilities_path = ws / CAPABILITIES
+        if not capabilities_path.is_file():
+            legacy_capabilities = ws / ".migration" / "09_capabilities.json"
+            if legacy_capabilities.is_file():
+                capabilities_path = legacy_capabilities
+            else:
+                return None
+        report = json.loads(capabilities_path.read_text())
         row = next(c for c in report.get("checks", []) if c.get("id") == "hook_guard")
         generated_at = report.get("generated_at") or report.get("timestamp")
         if isinstance(generated_at, str):
@@ -418,9 +483,16 @@ def check_allowlist_committed(ws: Path) -> Check:
         return Check("allowlist_committed", "fail",
             f"git cannot read the repository under {ws}: {_redact(r.stderr.decode(errors='replace').strip())}; "
             "the workspace must be the committed repository the wave is planned from")
-    _, ref = _committed(ws, CONTRACT_FILES[0])   # the whole contract is pinned to the one ref the allowlist is on
+    tolerance_path, _, ambiguous = resolve_migration_file(ws, "recon_tolerances.json")
+    if ambiguous:
+        return Check("allowlist_committed", "fail",
+            "the tolerance contract has both recon_tolerances.json and its legacy alias")
+    tolerance_rel = (tolerance_path.relative_to(ws).as_posix() if tolerance_path
+                     else CONTRACT_FILES[1])
+    contract_files = (CONTRACT_FILES[0], tolerance_rel)
+    _, ref = _committed(ws, contract_files[0])   # the whole contract is pinned to the one ref the allowlist is on
     states: dict[str, str] = {}
-    for rel in CONTRACT_FILES:
+    for rel in contract_files:
         committed, _ = _committed(ws, rel, (ref,) if ref else ())
         if not (ws / rel).is_file():
             states[rel] = "missing"
@@ -434,7 +506,7 @@ def check_allowlist_committed(ws: Path) -> Check:
         return Check("allowlist_committed", "fail", "the working copy is not the committed contract: " + shown
             + ". Merge the allowlist PR into the protected branch and `git fetch`, then re-run", states)
     return Check("allowlist_committed", "ok",
-        f"allowed_targets.json and 03_recon_tolerances.json are byte-equal to {ref}", states)
+        f"allowed_targets.json and {Path(tolerance_rel).name} are byte-equal to {ref}", states)
 
 
 def _norm_catalog(name) -> str:
@@ -1789,6 +1861,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     sec = security_controls(role)
     checks: list[Check] = [
         check_workspace(ws),
+        check_workspace_layout(ws),
         check_authorizations(ws),
         _merge("allowed_targets", [check_allowed_targets(ws, plugin_root),
             check_allowlist_matches_contract(ws, expect_catalogs)]),
@@ -1928,7 +2001,7 @@ def main(argv: list[str] | None = None) -> int:
         help="promotion schema the principal must be able to write")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
         help="mapping ${NAME} placeholder value, same rules as dbx-recon run --param")
-    p.add_argument("--out", type=Path, help="default .migration/09_capabilities.json; '-' for stdout only")
+    p.add_argument("--out", type=Path, help="default .migration/capabilities.json; '-' for stdout only")
     a = p.parse_args(argv)
     if a.hook_probe_result == "blocked":
         p.error("--hook-probe-result blocked:<nonce> is required: the nonce the guard's block message "
@@ -1991,7 +2064,7 @@ def main(argv: list[str] | None = None) -> int:
     text = json.dumps(report, indent=2, sort_keys=True)
     out = a.out
     if out is None:
-        out = a.workspace / ".migration" / "09_capabilities.json"
+        out = a.workspace / CAPABILITIES
     if str(out) != "-" and (a.workspace / ".migration").is_dir():
         out.write_text(text + "\n")
     for c in report["checks"]:

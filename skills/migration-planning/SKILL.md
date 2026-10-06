@@ -12,7 +12,7 @@ Nothing you write launches until the human approves `plan.yaml` in the Plan view
 ## Ticket inputs (cold start)
 
 - The intake artifacts: committed `.migration/` workspace (`allowed_targets.json`,
-  `03_recon_tolerances.json`, `09_capabilities.json`), the target profiles, the estate inventory
+  `recon_tolerances.json`, `capabilities.json`), the target profiles, the estate inventory
   and the chosen pipeline boundary.
 - The dialect skill's per-unit analysis under `.migration/units/<unit_id>/` (`dependencies.json`,
   `mapping_spec.json`) or a blocker when it is absent.
@@ -26,11 +26,11 @@ Nothing you write launches until the human approves `plan.yaml` in the Plan view
 ## Procedure
 
 1. Run `factory-doctor` with the hook probe, expected catalogs, the source secret/parameters and
-   all unit mappings; refresh `09_capabilities.json`. A `fail` row, an unverified hook state, or
+   all unit mappings; refresh `capabilities.json`. A `fail` row, an unverified hook state, or
    an uncommitted allowlist/tolerance is a plan blocker (`kind: repo`/`secret`/`mcp` on the step
    that needs it) — a red `named_secrets_exist` row means the secret must be created before the
    wave launches, never left for a worker to discover. On a cold start with no `.migration/`
-   workspace yet, the doctor's missing `allowed_targets.json` / `03_recon_tolerances.json` rows
+   workspace yet, the doctor's missing `allowed_targets.json` / `recon_tolerances.json` rows
    are the `workspace-setup` step's deliverables, not blockers: write the plan with that step
    first in `foundation` and record as blockers only the access and lead-time gaps the doctor's
    other rows show.
@@ -40,7 +40,9 @@ Nothing you write launches until the human approves `plan.yaml` in the Plan view
    `blockers` for every access/lead-time gap with its machine check. `important: true` marks the
    decisions the human should weigh before approving; its `selected` stays null until they do.
 3. Decide every dependency: fire each lead-time request (network path, service principal,
-   secrets, sample-data approval) now and leave no open decision the wave tickets depend on.
+   secrets, sample-data approval) now. Every fired request is a `plan.yaml` blocker carrying the
+   exact request text and its check; record the reply or pending state on that blocker. Do not
+   create a separate register.
 4. Specify wave-0 scaffolding: catalog/schemas, federation or backfill, CI, recon harness,
    bundle/job shells. Where the load posture is materialized backfill, classify every table with
    the load-posture table in `skills/data-reconciliation/SKILL.md` and give each class beyond
@@ -94,11 +96,11 @@ a PR merged on the protected branch.
 ## Evidence the manager attaches
 
 - `plan.yaml` committed and passing `devin_common.migration_plan.validate` with no errors.
-- The signed `wave-<N>.doctor.json` for the upcoming wave plus `09_capabilities.json` refreshed.
-- Every `.migration/` contract committed: `allowed_targets.json`, `03_recon_tolerances.json`,
-  `authorizations.json` (if any), `09_capabilities.json`.
-- The fired-request register: each blocker, the request text (exact commands/grants), and the
-  reply or pending state that closes it.
+- The signed `wave-<N>.doctor.json` for the upcoming wave plus `capabilities.json` refreshed.
+- Every `.migration/` contract committed: `allowed_targets.json`, `recon_tolerances.json`,
+  `authorizations.json` (if any), `capabilities.json`.
+- Every fired request is a `plan.yaml` blocker carrying the exact request text and its check; the
+  reply or pending state is recorded on that blocker.
 - The wave manifest set committed on the integration branch (`wave-<pipeline>-<N>.json` for
   siblings), each with its plan `plan_step` id.
 - The cost estimate per unit and verifier depth, and the wave-0 scaffolding checklist.

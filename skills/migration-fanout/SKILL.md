@@ -12,6 +12,13 @@ selection and scope), `manifest.py` (manifest grammar, skill paths, gate shapes,
 predicate checks), `report.py` (child, verifier, close and resync report schemas, protected-file
 checks); the sandbox imports them from the pointer's plugin root.
 
+## Manifest grammar: `target_state`
+
+Optional and non-empty when present; keys are `core`, `sql`, `pipeline`, `orchestration`,
+`consumer`, `lakebase`, `ml_scoring`, or `data_dependency`. Each value is exactly
+`{decision, target, ref}` with non-empty strings, or `{decision, na}` with a non-empty reason.
+`decision` is the lowercase slug of the corresponding `target-*` plan decision.
+
 ## How to use it
 
 1. The "Run wave N" ticket's worker reads the committed `wave-<N>.json` the wave-plan ticket
@@ -88,6 +95,7 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 |---|---|
 | Manifest check | Validates shape, plan step, skills, source names, batches, units, width, and migration contract. |
 | Signed doctor gate | Requires an HMAC-bound doctor record with 15-minute freshness, hook probe, and matching capabilities. |
+| Manifest `target_state` | Validated per the manifest grammar above. |
 | One manifest one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts), refuses a manifest whose sha is already in `wave-N.runs.jsonl`, refuses a manifest whose `plan_sha` differs from the one its plan step already ran, and refuses a plan step whose earlier run sent PRs to merge. |
 | Repo preflight | Halts before anything launches when `repo` is not `host/owner/name` or origin points elsewhere. |
 | Duplicate wave | Refuses any existing result, including halted or unreadable files. |

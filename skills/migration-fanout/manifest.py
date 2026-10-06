@@ -21,6 +21,10 @@ PIPELINE_RE = re.compile(r"[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*")
 # a plan decision id: the lowercase slug of a plan.yaml decision
 DECISION_ID = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 
+TARGET_SURFACES = frozenset({
+    "core", "sql", "pipeline", "orchestration", "consumer", "lakebase", "ml_scoring", "data_dependency",
+})
+
 
 # a skill name: skills/<name>/SKILL.md under the plugin root
 SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -173,6 +177,27 @@ def validate_manifest(m, plugin=None):
     req("target_namespace" not in m or valid_namespace(m["target_namespace"]),
         "manifest 'target_namespace' must be the dotted catalog.schema (or schema) the harness run is "
         "given, so a bare write target or mapping object is that table and no other")
+    if "target_state" in m:
+        target_state = m["target_state"]
+        req(isinstance(target_state, dict) and target_state,
+            "manifest key 'target_state' must be a non-empty object")
+        unknown_surfaces = sorted(set(target_state) - TARGET_SURFACES)
+        req(not unknown_surfaces,
+            f"manifest 'target_state' has unknown surface(s): {unknown_surfaces}")
+        for surface, state in target_state.items():
+            req(isinstance(state, dict) and isinstance(state.get("decision"), str)
+                and DECISION_ID.fullmatch(state["decision"]),
+                f"manifest 'target_state.{surface}.decision' must be a lowercase plan decision slug")
+            target_fields = {"decision", "target", "ref"}
+            na_fields = {"decision", "na"}
+            req(set(state) in (target_fields, na_fields),
+                f"manifest 'target_state.{surface}' must have decision and either target/ref or na")
+            if set(state) == target_fields:
+                req(all(isinstance(state.get(key), str) and state[key].strip() for key in ("target", "ref")),
+                    f"manifest 'target_state.{surface}' target and ref must be non-empty strings")
+            else:
+                req(isinstance(state.get("na"), str) and state["na"].strip(),
+                    f"manifest 'target_state.{surface}.na' must be a non-empty reason")
     req(m["base_branch"] not in ("main", "master")
         or (isinstance(m.get("trunk_base_decision"), str) and m["trunk_base_decision"].strip()),
         "base_branch 'main' is the trunk: wave results and unit PRs land on the engagement "
@@ -192,7 +217,7 @@ def validate_manifest(m, plugin=None):
         req(isinstance(b["brief"], str) and len(b["brief"]) <= BRIEF_MAX_CHARS,
             f"batch {b['id']} brief is {len(str(b['brief']))} chars; the cap is {BRIEF_MAX_CHARS}. A brief names "
             "the units, targets, gates and the files to read (skills/migration-fanout/references/brief_template.md); "
-            "hosts, principals, warehouses and secret names live in the manifest and 09_capabilities.json, "
+            "hosts, principals, warehouses and secret names live in the manifest and capabilities.json, "
             "which every child already reads")
         req(strs(b.get("write_targets")) and all(t.strip() for t in b["write_targets"]),
             f"batch {b['id']} needs 'write_targets', a list of table names (empty only for a batch "
@@ -255,7 +280,7 @@ def validate_manifest(m, plugin=None):
     caps = m.get("capabilities")
     req(isinstance(caps, dict) and isinstance(caps.get("identity"), str) and caps["identity"],
         "manifest 'capabilities' must be an object with a non-empty 'identity' "
-        "(the migration principal's userName from 09_capabilities.json); no wave "
+        "(the migration principal's userName from capabilities.json); no wave "
         "launches without the factory-doctor contract the children compare against")
     req(isinstance(caps.get("catalogs"), list) and caps["catalogs"]
         and all(isinstance(c, str) and c for c in caps["catalogs"]),
@@ -279,7 +304,7 @@ def check_doctor_contract(m, doctor):
     ident = doctor.get("identity")
     rows = {c.get("id"): c.get("data") or {} for c in doctor.get("checks", []) if isinstance(c, dict)}
     req(isinstance(ident, dict) and ident.get("userName") and ident.get("host"),
-        "09_capabilities.json records no verified identity and host; a wave launches only from a "
+        "capabilities.json records no verified identity and host; a wave launches only from a "
         "doctor report that saw the migration principal")
     recorded = {"identity": ident["userName"], "host": ident["host"],
                 "catalogs": sorted(rows.get("allowed_targets", {}).get("catalogs") or []),
@@ -287,7 +312,7 @@ def check_doctor_contract(m, doctor):
     for key, want in recorded.items():
         got = sorted(c.strip().strip("`").lower() for c in caps["catalogs"]) if key == "catalogs" else caps.get(key)
         req(got == want, f"manifest 'capabilities.{key}' is {got!r} but the doctor recorded {want!r} in "
-            "09_capabilities.json; copy the doctor's values, never edit them")
+            "capabilities.json; copy the doctor's values, never edit them")
     req(doctor.get("source") == m.get("source"),
         "manifest 'source' differs from the source the doctor was signed for; "
         "re-run the doctor with --wave on this manifest")

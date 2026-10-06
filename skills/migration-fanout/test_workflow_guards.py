@@ -44,7 +44,7 @@ def _functions():
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
-                                                         "DECISION_ID", "SKILL_NAME", "_SEGMENT",
+                                                         "DECISION_ID", "TARGET_SURFACES", "SKILL_NAME", "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE",
                                                          "REPO_RE", "BARE_PATH"}
                     for t in node.targets))]
@@ -146,6 +146,40 @@ def test_validate_manifest_accepts_a_batch_max_minutes_override():
     m = _manifest()
     m["batches"][0]["max_minutes"] = 30
     _functions()["validate_manifest"](m)
+
+
+def test_validate_manifest_accepts_target_state():
+    _functions()["validate_manifest"](_manifest(target_state={
+        "core": {"decision": "target-core", "target": "Delta table", "ref": "examples/core.sql"},
+        "lakebase": {"decision": "target-lakebase", "na": "No operational data in this estate"},
+    }))
+
+
+def test_validate_manifest_rejects_unknown_target_state_surface():
+    with pytest.raises(SystemExit, match="unknown surface"):
+        _functions()["validate_manifest"](_manifest(target_state={
+            "unknown": {"decision": "target-core", "target": "Delta table", "ref": "examples/core.sql"},
+        }))
+
+
+def test_validate_manifest_rejects_target_state_without_decision():
+    with pytest.raises(SystemExit, match="decision"):
+        _functions()["validate_manifest"](_manifest(target_state={
+            "core": {"target": "Delta table", "ref": "examples/core.sql"},
+        }))
+
+
+def test_validate_manifest_rejects_target_state_with_target_and_na():
+    with pytest.raises(SystemExit, match="either target/ref or na"):
+        _functions()["validate_manifest"](_manifest(target_state={
+            "core": {"decision": "target-core", "target": "Delta table", "ref": "examples/core.sql",
+                     "na": "not applicable"},
+        }))
+
+
+def test_validate_manifest_rejects_empty_target_state():
+    with pytest.raises(SystemExit, match="non-empty object"):
+        _functions()["validate_manifest"](_manifest(target_state={}))
 
 
 def test_validate_manifest_rejects_max_minutes_over_sixty():
@@ -1813,8 +1847,8 @@ def test_prompts_name_every_merge_evidence_mode():
 
 # ---------------------------------------------------------------- protected-files gate (changed_paths)
 
-PROTECTED_FILES = [".migration/03_recon_tolerances.json", ".migration/allowed_targets.json",
-                   ".migration/authorizations.json", ".migration/09_capabilities.json",
+PROTECTED_FILES = [".migration/recon_tolerances.json", ".migration/allowed_targets.json",
+                   ".migration/authorizations.json", ".migration/capabilities.json",
                    ".migration/units/u/mapping_spec.json", ".migration/waves/wave-0.json"]
 
 
@@ -1848,7 +1882,7 @@ def test_pass_without_a_usable_changed_paths_is_not_pass(report):
 def test_a_failed_child_that_touched_a_protected_file_is_still_reclassified():
     out = _run_one(_batch_runtime(), {"status": "FAIL", "recon_verdict": "FAIL", "recon_mode": "live",
                                       "failure_class": "decimal_rounding", "one_line_summary": "off by one",
-                                      "changed_paths": [".migration/03_recon_tolerances.json"]})
+                                      "changed_paths": [".migration/recon_tolerances.json"]})
     assert out["failure_class"] == "protected_files_tampered"
 
 
@@ -1887,7 +1921,7 @@ def test_prompts_demand_changed_paths_and_base_branch_policy_files():
     assert ".migration/recon/<unit_id>/" in child and "protected_files_tampered" in child
     verify = ns["verify_prompt"]([{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1"}])
     assert "git diff --name-only" in verify and "changed_paths" in verify
-    assert "03_recon_tolerances.json" in verify and "allowed_targets.json" in verify
+    assert "recon_tolerances.json" in verify and "allowed_targets.json" in verify
     assert "base branch" in verify and "not the PR" in verify
     assert ".migration/recon/<unit_id>/" in verify and "protected_files_tampered" in verify
 
@@ -1899,8 +1933,8 @@ def test_validate_verify_requires_changed_paths_inside_the_wave_report_dir():
           "changed_paths": [".migration/recon/wave-2/report.md"]}
     assert validate_verify(ok, passed, wave=2, observed=[]) == []
     problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-2/report.md",
-                                                        ".migration/03_recon_tolerances.json"]}, passed, 2, [])
-    assert problems == ["verifier output invalid: protected files tampered, changed .migration/03_recon_tolerances.json"]
+                                                        ".migration/recon_tolerances.json"]}, passed, 2, [])
+    assert problems == ["verifier output invalid: protected files tampered, changed .migration/recon_tolerances.json"]
     problems = validate_verify({**ok, "changed_paths": [".migration/recon/wave-3/report.md"]}, passed, 2, [])
     assert problems == ["verifier output invalid: protected files tampered, changed .migration/recon/wave-3/report.md"]
     problems = validate_verify({k: v for k, v in ok.items() if k != "changed_paths"}, passed, 2, [])
@@ -1945,11 +1979,11 @@ def test_validate_manifest_compares_the_contract_with_the_doctor_record():
                          (_caps(host=DOCTOR["identity"]["host"], identity="sp-2"), "identity"),
                          (_caps(host=DOCTOR["identity"]["host"], catalogs=["mig", "prod"]), "catalogs"),
                          (_caps(host=DOCTOR["identity"]["host"], guard_mode="warn"), "guard_mode")):
-        with pytest.raises(SystemExit, match=f"capabilities.*{needle}.*09_capabilities.json"):
+        with pytest.raises(SystemExit, match=f"capabilities.*{needle}.*capabilities.json"):
             validate_manifest(_manifest(capabilities=caps, auto_merge=False), DOCTOR)
     with pytest.raises(SystemExit, match="ready"):
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "ready": False})
-    with pytest.raises(SystemExit, match="09_capabilities.json"):
+    with pytest.raises(SystemExit, match="capabilities.json"):
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "identity": None})
     source = {"family": "sqlserver", "secret": "LEGACY_DSN", "params": {"db": "loans"}}
     with pytest.raises(SystemExit, match="manifest 'source' differs"):
@@ -2136,7 +2170,7 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
             return subprocess.CompletedProcess(cmd, 0, stdout=trees[cmd[6], cmd[9]])
         return subprocess.CompletedProcess(cmd, 0, stdout=(
             ".migration/recon/wave-2/report.md\nsrc/loans.sql\n.migration/recon/u/result.json\n"
-            ".migration/recon/u/rows.csv\n.migration/recon/v/result.json\n.migration/03_recon_tolerances.json\n"))
+            ".migration/recon/u/rows.csv\n.migration/recon/v/result.json\n.migration/recon_tolerances.json\n"))
 
     ns = _launch_ns(tmp_path, fake_run)
     passed = [{"batch": "b1", "units": ["u"], "pr_head": "1" * 40}, {"batch": "b2", "units": ["v"], "pr_head": "2" * 40},
@@ -2145,8 +2179,8 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
     # touched (its tree equals the launch base: with auto_merge off it merges nothing); a rewritten
     # result.json, the verifier's own report and anything else that reached the branch stay
     assert ns["verifier_changed_paths"](2, passed) == [
-        ".migration/03_recon_tolerances.json", ".migration/recon/u/result.json", ".migration/recon/wave-2/report.md",
-        "src/loans.sql"]
+        ".migration/recon/u/result.json", ".migration/recon/wave-2/report.md",
+        ".migration/recon_tolerances.json", "src/loans.sql"]
     assert calls[0][3:] == ["fetch", "-q", "origin", "+recon/wave-2:refs/migration/wave-orders-1/recon/wave-2"]
     assert calls[5][3:] == ["diff", "--name-only", "--no-renames", "t" * 40 + "..." + "v" * 40]
     assert calls[6][3:] == ["diff", "--name-only", "--no-renames", "1" * 40, "v" * 40, "--", ".migration/recon/u/"]
@@ -2166,10 +2200,10 @@ def test_verifier_changed_paths_is_the_verifier_branch_minus_the_gated_pr_trees_
 def test_git_observed_protected_file_changes_beat_a_clean_self_report():
     ns = _batch_runtime()
     seen = []
-    ns["pr_changed_paths"] = lambda pr_url: seen.append(pr_url) or ("c" * 40, ["src/loans.sql", ".migration/03_recon_tolerances.json"])
+    ns["pr_changed_paths"] = lambda pr_url: seen.append(pr_url) or ("c" * 40, ["src/loans.sql", ".migration/recon_tolerances.json"])
     out = _run_one(ns, _pass(changed_paths=["src/loans.sql"]))
     assert out["status"] == "FAIL" and out["failure_class"] == "protected_files_tampered"
-    assert ".migration/03_recon_tolerances.json" in out["one_line_summary"]
+    assert ".migration/recon_tolerances.json" in out["one_line_summary"]
     assert seen == ["https://example/pr/1"]  # the PR, not the branch the child names
     assert out["pr_head"] == "c" * 40  # the gated head, for the verifier's tree to be held to
     ns["pr_changed_paths"] = lambda pr_url: ("c" * 40, ["src/loans.sql"])
@@ -2197,7 +2231,7 @@ def test_validate_manifest_rejects_a_unit_owned_by_two_batches():
                                              {"id": "b2", "units": ["orders_load", "v"], "write_targets": ["t2"], "brief": "y"}]))
 
 
-@pytest.mark.parametrize("unit", ["../03_recon_tolerances.json", "u/..", "a/b", "wave-1", "", ".", "..", ".hidden", 3])
+@pytest.mark.parametrize("unit", ["../recon_tolerances.json", "u/..", "a/b", "wave-1", "", ".", "..", ".hidden", 3])
 def test_validate_manifest_rejects_unit_ids_that_are_not_a_plain_recon_dir_name(unit):
     validate_manifest = _functions()["validate_manifest"]
     with pytest.raises(SystemExit, match="unit id"):

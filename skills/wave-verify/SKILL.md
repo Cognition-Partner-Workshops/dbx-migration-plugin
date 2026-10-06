@@ -14,7 +14,7 @@ what merges. Source and target are read-only to you.
   child's claimed evidence, and any `merge_authority` override records.
 - The wave manifest's `verify_depth` per batch (default sampled; never lower it — raising is
   allowed and noted in findings) and its `degraded` flag.
-- `03_recon_tolerances.json` and `allowed_targets.json` **from the base branch**, not the PR —
+- `recon_tolerances.json` and `allowed_targets.json` **from the base branch**, not the PR —
   a child that loosened a tolerance fails here.
 - `skills/data-reconciliation/SKILL.md` — tiers, finding codes, DEGRADED wording.
 

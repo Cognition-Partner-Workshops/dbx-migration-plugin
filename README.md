@@ -34,7 +34,7 @@ Pin a version instead of tracking the default branch:
 ```json
 {
   "requiredPlugins": [
-    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.5.1" }
+    { "source": "github", "repo": "Cognition-Partner-Workshops/dbx-migration-plugin", "ref": "v0.6.0" }
   ]
 }
 ```
@@ -133,3 +133,20 @@ branch (`origin/HEAD`, else `origin/main`/`origin/master`, else local `HEAD`; ne
 never authorizes. The fan-out workflow resolves a wave manifest's waived-gate `decision_id`s and `merge_overrides`
 decisions the same way, against `gate_waived` / `merge_override` entries whose `objects` name the units, on the wave's
 base branch.
+
+## `.migration/` machine files
+
+| file | written by | read by |
+|---|---|---|
+| `.migration/allowed_targets.json` | `workspace-setup`, by reviewed PR | guard, factory-doctor, reconciliation harness |
+| `.migration/authorizations.json` | human by reviewed PR | guard, migration-fanout, factory-doctor |
+| `.migration/recon_tolerances.json` | `workspace-setup` | factory-doctor, reconciliation harness |
+| `.migration/capabilities.json` | factory-doctor | factory-doctor, wave-plan, migration-fanout |
+| `.migration/.hook_probe_nonce` | factory-doctor | factory-doctor |
+| `.migration/units/` (`dependencies.json`, `mapping_spec.json`) | pipeline analysis / dialect skill | wave-plan, factory-doctor, migration-fanout, reconciliation harness |
+| `.migration/waves/` (manifests, signatures, run records, results, current pointer) | wave-plan, migration-fanout | factory-doctor, migration-fanout, wave-verify |
+| `.migration/recon/` (unit reconciliation evidence) | unit-migration / reconciliation harness | wave-verify, migration-fanout, manager |
+| `.migration/snapshots/` (snapshot manifests) | snapshot/export workflow | reconciliation harness |
+
+Anything a human reads lives on the board (`plan.yaml` decisions/blockers/gates or ticket evidence),
+not in `.migration/`.

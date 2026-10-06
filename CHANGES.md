@@ -1,3 +1,5 @@
+# 0.6.0 — .migration/ holds machine files only
+
 # 0.5.1 — guard: the plugin's own factory-doctor is not a scanned script
 
 `hooks/dbx_guard.py` 0.5.0 refused the documented

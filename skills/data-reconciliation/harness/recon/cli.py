@@ -257,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--mapping", required=True, type=Path,
                    help="mapping spec JSON: source table -> target table, keys, fields")
     r.add_argument("--tolerances", required=True, type=Path,
-                   help=".migration/03_recon_tolerances.json, versioned")
+                   help=".migration/recon_tolerances.json, versioned")
     r.add_argument("--canonicalization", required=True, type=Path,
                    help="the source-dialect skill's recon_canonicalization rules, as JSON")
     r.add_argument("--mode", required=True, choices=MODES + PLANNED_MODES)
