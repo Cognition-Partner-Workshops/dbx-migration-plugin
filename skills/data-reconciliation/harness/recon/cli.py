@@ -76,7 +76,7 @@ def _load_allowed_targets(path: Path) -> list[str]:
 
 
 def resolve_tolerances_path(path: Path) -> Path:
-    if path.is_file() or path.name != "recon_tolerances.json":
+    if path.resolve() != Path(".migration/recon_tolerances.json").resolve() or path.is_file():
         return path
     legacy = path.parent / "03_recon_tolerances.json"
     if not legacy.is_file():

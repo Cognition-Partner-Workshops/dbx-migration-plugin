@@ -226,9 +226,10 @@ def test_cli_estimate_uses_legacy_tolerances(tmp_path: Path, monkeypatch, capsys
     assert json.loads(captured.out)
 
 
-def test_resolve_tolerances_path_uses_legacy_with_warning(tmp_path: Path, capsys):
+def test_resolve_tolerances_path_uses_legacy_with_warning(tmp_path: Path, monkeypatch, capsys):
     from recon.cli import resolve_tolerances_path
-    canonical = tmp_path / ".migration" / "recon_tolerances.json"
+    monkeypatch.chdir(tmp_path)
+    canonical = Path(".migration/recon_tolerances.json")
     canonical.parent.mkdir()
     legacy = canonical.parent / "03_recon_tolerances.json"
     legacy.write_text(json.dumps({"version": "legacy-v1"}))
@@ -281,6 +282,20 @@ def test_resolve_tolerances_path_does_not_fallback_for_custom_name(tmp_path: Pat
     resolved = resolve_tolerances_path(custom)
 
     assert resolved == custom
+    with pytest.raises(FileNotFoundError):
+        load_tolerances(resolved)
+    assert capsys.readouterr().err == ""
+
+
+def test_resolve_tolerances_path_does_not_fallback_outside_workspace(tmp_path: Path, capsys):
+    from recon.cli import resolve_tolerances_path
+    canonical = tmp_path / "workspace" / "recon_tolerances.json"
+    canonical.parent.mkdir()
+    (canonical.parent / "03_recon_tolerances.json").write_text(json.dumps({"version": "legacy-v1"}))
+
+    resolved = resolve_tolerances_path(canonical)
+
+    assert resolved == canonical
     with pytest.raises(FileNotFoundError):
         load_tolerances(resolved)
     assert capsys.readouterr().err == ""
