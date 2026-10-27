@@ -288,7 +288,9 @@ class Verdict:
         reason = ("dbx-migration-factory guard: " + "; ".join(violations) + ". Fix the command or, if the target is legitimate, add "
                   "it to .migration/allowed_targets.json by a PR to the protected branch "
                   f"(allowlist in force: {cfg.policy_ref}); never work around the guard.")
-        if cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
+        if not cfg.catalogs:
+            reason += " No write scope exists until .migration/allowed_targets.json lands on the protected branch."
+        if cfg.catalogs and cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
             return cls("approve", "WARN (guard_mode=warn): " + reason, violations)
         return cls("block", reason, violations)
 
@@ -308,6 +310,10 @@ def _committed(ws: Path, rel: str) -> tuple[str | None, str | None]:
             return r.stdout.decode(errors="replace"), ref
     return None, None
 
+def _unscoped(path: Path) -> GuardConfig:
+    return GuardConfig(catalogs=[], legacy_sources=[], mode="block", path=path,
+                       policy_ref=f"none (no {CONFIG_REL} at {path.parent.parent}; .migration/ exists)")
+
 def load_config(start: Path) -> GuardConfig | None:
     start = start.resolve()
     for d in [start, *start.parents]:
@@ -318,6 +324,8 @@ def load_config(start: Path) -> GuardConfig | None:
         if text is None:
             if not path.is_file() and not path.parent.is_dir():
                 return None
+            if path.parent.is_dir() and not path.is_file():
+                return _unscoped(path)
             text = path.read_text()
         policy_ref = f"{ref}:{CONFIG_REL}" if ref else "working copy"
         data = json.loads(text)
@@ -852,18 +860,23 @@ def _check_unreadable(segs: list[_Seg], cfg: GuardConfig, text: str) -> list[str
                 and (wrapped := _CLIENT_WORD.search(" ".join(s.argv[1:]))):
             violations.append(f"unrecognised wrapper `{base}` in front of client `{wrapped.group()}`; the guard has no rule for `{base}`, so "
                               "it cannot tell how or where the client would run (run the client directly)")
-        for i, (r, w, prev) in enumerate(zip(s.raw, s.words, ["", *s.words])):   # an expansion inside what is (or looks like) SQL
-            if (prev in _SQL_VALUE_FLAGS or w.split("=", 1)[0] in _SQL_VALUE_FLAGS or
-                    (re.search(r"[\s;]", w) and prev not in _HOST_FLAGS) or (
-                    i >= 2 and s.words[i - 2] == "tools" and prev == "query")) and _expands(r) and not _REDIRECT_OP.fullmatch(prev):
-                violations.append(f"shell expansion inside the SQL argument `{r[:60]}` (substitution); expand it in the command text so the guard can "
-                                  "read the statement")
-                break
-        if any(re.fullmatch(r"\d*<<-?", w) and _expands(s.raw[i + 1]) for i, w in enumerate(s.words[:-1])):
-            violations.append("unquoted heredoc expands `$`/backticks in its body; quote the delimiter (<<'EOF') or inline the values")
+        if base in _SQL_CLIENTS or (base not in ("echo", "printf", "cat", "tee") and base not in _READERS):
+            for i, (r, w, prev) in enumerate(zip(s.raw, s.words, ["", *s.words])):   # an expansion inside what is (or looks like) SQL
+                if (prev in _SQL_VALUE_FLAGS or w.split("=", 1)[0] in _SQL_VALUE_FLAGS or
+                        (re.search(r"[\s;]", w) and prev not in _HOST_FLAGS) or (
+                        i >= 2 and s.words[i - 2] == "tools" and prev == "query")) and _expands(r) and not _REDIRECT_OP.fullmatch(prev):
+                    violations.append(f"shell expansion inside the SQL argument `{r[:60]}` (substitution); expand it in the command text so the guard can "
+                                      "read the statement")
+                    break
+            if any(re.fullmatch(r"\d*<<-?", w) and _expands(s.raw[i + 1]) for i, w in enumerate(s.words[:-1])):
+                violations.append("unquoted heredoc expands `$`/backticks in its body; quote the delimiter (<<'EOF') or inline the values")
         if base not in _KNOWN and base not in _INERT and base not in defined and not _PYTHON.fullmatch(base) and (hits := _conn(s, cfg, "")[0]):
             violations.append(f"unrecognised command `{base}` names legacy connection {hits}; the guard cannot verify its operation")
-    if any(_CLIENT_WORD.search(m.group(1)) for m in _FUNCTION_DEF.finditer(re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', " ", text))):
+    words, raw = _shell_tokens(text)
+    syntax = [" ".join(r for i, r in enumerate(raw) if not i or not re.fullmatch(r"\d*<<-?", words[i - 1]))]
+    syntax += [body for s in segs if s.argv0 in _SHELLS for body in s.heredocs]
+    if any(_CLIENT_WORD.search(m.group(1)) for code in syntax for m in _FUNCTION_DEF.finditer(
+            re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', " ", code))):
         violations.append("shell function wrapping a SQL client; the guard cannot follow what a call of it would run (same class as `eval`)")
     return violations
 
@@ -1096,8 +1109,6 @@ def _runs_plugin_doctor(seg: _Seg, root: Path) -> bool:
     argv = seg.argv
     if seg.at is None or len(argv) < 2 or argv[1].startswith("-") or seg.heredocs:
         return False
-    if any(w == "--plugin-root" or w.startswith("--plugin-root=") for w in argv[2:]):
-        return False
     names = [a.split("=", 1)[0] for a in seg.assigns] + list(seg.env)
     if any(n.startswith("PYTHON") for n in names):
         return False
@@ -1105,6 +1116,13 @@ def _runs_plugin_doctor(seg: _Seg, root: Path) -> bool:
     if not script.endswith(".py") or _expands(script) or _expands(script, subst=True):
         return False
     base = root if not seg.at else Path(seg.at) if seg.at.startswith("/") else root / seg.at
+    for i, word in enumerate(argv[2:], 2):
+        if word == "--plugin-root" or word.startswith("--plugin-root="):
+            value = argv[i + 1] if word == "--plugin-root" and i + 1 < len(argv) else word.partition("=")[2]
+            raw = seg.raw_of(argv[i + 1] if word == "--plugin-root" and i + 1 < len(argv) else word)
+            if not value or _expands(raw) or _expands(raw, subst=True) or os.path.realpath(
+                    base / os.path.expanduser(value)) != str(_GUARD_TREE):
+                return False
     return os.path.realpath(base / os.path.expanduser(script)) == str(_DOCTOR)
 
 def _strip_python_comments(text: str) -> str:

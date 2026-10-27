@@ -39,21 +39,25 @@ dbx-recon selftest                                                              
 
 dbx-recon run \
   --unit <unit_id> \
-  --family sqlserver|postgres|databricks \
+  --family oracle \
   --mapping .migration/units/<unit_id>/mapping_spec.json \
   --tolerances .migration/recon_tolerances.json \
   --canonicalization skills/<source>-sql/canonicalization.json \
-  --mode fixture|live|snapshot|continuous|transactional|structural \
+  --mode live \
   --source-dsn-secret <SOURCE_SECRET_NAME> \
-  --target-kind databricks|lakebase \
-  [--target-http-path <warehouse path>] --target-catalog <migration catalog> \
-  # lakebase instead: --target-secret LAKEBASE_MIGRATION_DSN; databricks connects as the \
-  # session's service principal (DATABRICKS_HTTP_PATH names the warehouse; see target-routing) \
+  --target-kind databricks \
+  [--target-http-path <warehouse path>] --target-catalog mig_cat \
   --allowed-targets-file .migration/allowed_targets.json --target-schema <schema> \
   --snapshot-manifest .migration/snapshots/<unit_id>.json \
-  --seed 0 --depth threshold|sampled|full [--param from_date=2024-01-01 ...] \
+  --seed 0 --depth threshold [--param from_date=2024-01-01 ...] \
   --out .migration/recon/<unit_id>/
 ```
+
+The example uses Oracle, live mode, and the allowlisted migration catalog `mig_cat`; substitute
+the source family, mode, and catalog declared by the workspace. For Lakebase use
+`--target-kind lakebase --target-secret LAKEBASE_MIGRATION_DSN` instead of the Databricks
+target flags. Databricks connects as the session's service principal (`DATABRICKS_HTTP_PATH`
+names the warehouse; see target-routing).
 
 Exit code 0 is PASS, 1 is FAIL. `--depth` sets Tier 3: `threshold` (default; the tolerance
 file's `full_diff_row_threshold` decides per table), `sampled` (always the stratified sample; the
