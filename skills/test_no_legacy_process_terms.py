@@ -21,11 +21,16 @@ CASE_TERMS = (
     "03_recon_tolerances.md", "_plan.md", ".brief.md", "notification contract",
     "ledger_tampered", "child_macro", "verify_macro", "decision_ledger",
 )
+# the validator refuses the removed fields by name
+TERM_EXEMPTIONS = {t: ("skills/migration-fanout/manifest.py", "skills/migration-fanout/test_workflow_guards.py")
+                   for t in ("child_macro", "verify_macro", "stop_c", "gates_sha")}
 # words banned whatever their case
 CI_TERMS = (r"STOP [A-E]\b", r"playbook", r"macro", r"orchestrator", r"\bledger\b")
 # The doctor keeps `--role orchestrator` as a CLI value; Teradata "macros" in skills-extra are
 # the source engine's own feature name, not the deleted model's macro mechanism.
-EXEMPTIONS = {r"orchestrator": ("skills/factory-doctor/",), r"macro": ("skills-extra/",)}
+EXEMPTIONS = {r"orchestrator": ("skills/factory-doctor/",),
+              r"macro": ("skills-extra/", "skills/migration-fanout/manifest.py",
+                         "skills/migration-fanout/test_workflow_guards.py")}
 
 
 def repo_files():
@@ -53,6 +58,8 @@ def test_no_legacy_process_terms(path, rel):
     hits = []
     for i, line in enumerate(text.splitlines(), 1):
         for term in CASE_TERMS:
+            if rel.as_posix().startswith(TERM_EXEMPTIONS.get(term, ())):
+                continue
             if term in line:
                 hits.append(f"{rel}:{i}: {term!r}")
         for pattern in CI_TERMS:

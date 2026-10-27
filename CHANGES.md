@@ -1,3 +1,11 @@
+# 0.6.1 (unreleased)
+
+## Changed
+
+- Wave manifests and the doctor accept a wave's catalogs as a subset of the allowlist.
+- Manifests refuse pre-0.6.0 fields by name and give the replacement or deletion.
+- Missing `plan_step` and overlong brief messages say what to change.
+
 # 0.6.0 — .migration/ holds machine files only
 
 0.5.0 moved the human-readable ledger onto the board but several skills still asked for prose

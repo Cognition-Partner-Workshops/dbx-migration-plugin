@@ -2261,16 +2261,22 @@ def test_allowlist_matches_contract(tmp_path):
     c = doctor.check_allowlist_matches_contract(ws, None)
     assert c.status == "skipped" and "--expect-catalogs" in c.detail
     c = doctor.check_allowlist_matches_contract(ws, ["mig_cat"])
-    assert c.status == "ok" and c.data == {"expected": ["mig_cat"], "allowlist": ["mig_cat"]}
+    assert c.status == "ok" and c.data == {"expected": ["mig_cat"], "allowlist": ["mig_cat"], "outside": []}
     c = doctor.check_allowlist_matches_contract(ws, ["mig_cat", "prod"])
-    assert c.status == "fail" and "prod" in c.detail and c.data["expected"] == ["mig_cat", "prod"]
+    assert c.status == "fail" and "prod" in c.detail and c.data["outside"] == ["prod"]
     report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True, expect_catalogs=["other"])
     assert "allowed_targets=fail" in report["blocking"]
+    (ws / ".migration" / "allowed_targets.json").write_text(
+        '{"catalogs": ["mig_cat", "other"], "legacy_sources": []}')
+    c = doctor.check_allowlist_matches_contract(ws, ["mig_cat"])
+    assert c.status == "ok" and c.data == {
+        "expected": ["mig_cat"], "allowlist": ["mig_cat", "other"], "outside": []}
     # the guard accepts backticked / mixed-case spellings and normalizes them; the contract carries the
     # normalized names, so the comparison must use the guard's rule on both sides
     (ws / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["`Mig_Cat`"], "legacy_sources": []}')
     c = doctor.check_allowlist_matches_contract(ws, [" MIG_CAT "])
-    assert c.status == "ok" and c.data == {"expected": ["mig_cat"], "allowlist": ["mig_cat"]}
+    assert c.status == "ok" and c.data == {
+        "expected": ["mig_cat"], "allowlist": ["mig_cat"], "outside": []}
     assert doctor.check_allowlist_matches_contract(ws, ["mig_cat2"]).status == "fail"
     (ws / ".migration" / "allowed_targets.json").write_text("{}")
     assert doctor.check_allowlist_matches_contract(ws, ["mig_cat"]).status == "fail"
@@ -2284,7 +2290,7 @@ def test_run_blocks_on_an_uncommitted_contract_and_the_cli_parses_expect_catalog
     r = subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--plugin-root",
                         str(PLUGIN_ROOT), "--no-databricks", "--expect-catalogs", "mig_cat, other", "--out", "-"],
                        capture_output=True, text=True, check=False)
-    assert "allowed_targets=fail" in r.stdout and "['mig_cat', 'other']" in r.stdout
+    assert "allowed_targets=fail" in r.stdout and "['other']" in r.stdout
 
 
 # ------------------------------------------------------------------ identity + host (A3)

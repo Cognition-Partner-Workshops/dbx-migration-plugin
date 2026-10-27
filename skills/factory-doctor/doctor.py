@@ -515,7 +515,7 @@ def _norm_catalog(name) -> str:
 
 
 def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None) -> Check:
-    """--expect-catalogs must equal the allowlist's catalogs under the guard's normalization."""
+    """--expect-catalogs must be a subset of the allowlist's catalogs under the guard's normalization."""
     if expect_catalogs is None:
         return Check("allowlist_matches_contract", "skipped",
             "no --expect-catalogs given (the catalogs in the wave's capability contract); nothing to compare")
@@ -526,12 +526,18 @@ def check_allowlist_matches_contract(ws: Path, expect_catalogs: list[str] | None
         return Check("allowlist_matches_contract", "fail", f"{p.name} unreadable: {_redact(str(e))}")
     expected = [_norm_catalog(c) for c in expect_catalogs]
     cats = [_norm_catalog(c) for c in cats] if isinstance(cats, list) else cats
-    data = {"expected": expected, "allowlist": cats}
-    if not isinstance(cats, list) or sorted(cats) != sorted(expected):
+    outside = sorted(set(expected) - set(cats)) if isinstance(cats, list) else []
+    data = {"expected": expected, "allowlist": cats, "outside": outside}
+    if not isinstance(cats, list):
         return Check("allowlist_matches_contract", "fail",
-            f"allowlist catalogs {cats} differ from the contract's {expected}; "
-            "a catalog is added by a PR to the protected branch carrying a `D-<id>` row, then a new doctor run", data)
-    return Check("allowlist_matches_contract", "ok", f"allowlist catalogs match the contract: {cats}", data)
+            f"allowed_targets.json catalogs must be a list, got {cats!r}", data)
+    if outside:
+        return Check("allowlist_matches_contract", "fail",
+            f"contract catalogs {outside} are outside the allowlist {cats}; drop them from the wave's "
+            "capabilities.catalogs, or add them to allowed_targets.json by a PR to the protected branch "
+            "carrying a `D-<id>` row, then a new doctor run", data)
+    return Check("allowlist_matches_contract", "ok", f"contract catalogs {expected} are within the allowlist {cats}",
+        data)
 
 
 def check_official_plugin(plugin_root: Path) -> Check:
@@ -1975,7 +1981,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--expect-identity", help="userName the session must be authenticated as")
     p.add_argument("--expect-host", help="workspace host the session must be authenticated against (the contract's)")
     p.add_argument("--expect-catalogs", metavar="A,B", type=lambda s: [c.strip() for c in s.split(",") if c.strip()],
-        help="catalogs the wave's capability contract names; must equal allowed_targets.json's")
+        help="catalogs the wave's capability contract names; must be a subset of allowed_targets.json's")
     p.add_argument("--no-databricks", action="store_true",
         help="skip CLI/identity checks (offline; the report is never ready)")
     p.add_argument("--unit", action="append", default=[], metavar="UNIT_ID",
