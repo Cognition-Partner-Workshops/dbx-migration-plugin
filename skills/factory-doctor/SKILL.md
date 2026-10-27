@@ -34,7 +34,9 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
 
 `--role orchestrator` is kept as the CLI value for the wave ticket's worker (the session that proves
 the platform hook once per wave and signs `wave-N.doctor.json`); `--role setup` is the intake /
-wave-plan worker before mappings exist; `--role child` is a batch worker. Writes
+wave-plan worker before mappings exist. Setup runs the read-only source probe from
+`--source-secret NAME --source-family F` alone; `--mapping` is not needed (the row is
+principal-level; table grants are checked per unit later). `--role child` is a batch worker. Writes
 `.migration/capabilities.json` and prints one line per row. Exit 0 means `ready`.
 
 A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the wave worker's signed

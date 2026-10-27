@@ -3292,3 +3292,65 @@ def test_oracle_source_principal_ok_with_public_select(monkeypatch):
     row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
                                         connect=lambda dsn: conn)
     assert row.status == "ok", row.detail
+
+
+def test_setup_source_principal_probe_without_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_privs=("CREATE SESSION",))
+    monkeypatch.setattr(doctor, "_oracledb_connect", lambda dsn: conn)
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        source_secret="ORA_DSN", source_family="oracle")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "ok" and row["data"]["scope"] == "principal"
+    assert row["detail"].startswith("setup probe")
+
+
+def test_setup_source_principal_with_unit_requires_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_privs=("CREATE SESSION",))
+    monkeypatch.setattr(doctor, "_oracledb_connect", lambda dsn: conn)
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        units=["loans"], source_secret="ORA_DSN", source_family="oracle")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "--unit narrows nothing" in row["detail"]
+    assert report["ready"] is False
+
+
+def test_setup_source_principal_probe_fails_on_write_system_privilege(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_privs=("CREATE SESSION", "INSERT ANY TABLE"))
+    monkeypatch.setattr(doctor, "_oracledb_connect", lambda dsn: conn)
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        source_secret="ORA_DSN", source_family="oracle")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "INSERT ANY TABLE" in row["detail"]
+
+
+def test_setup_source_principal_without_family_is_blocking_unverified(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        source_secret="ORA_DSN")
+    assert by_id(report)["source_principal_read_only"]["status"] == "unverified"
+    assert "source_principal_read_only=unverified" in report["blocking"]
+
+
+def test_setup_source_principal_without_secret_stays_skipped(tmp_path):
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        source_family="oracle")
+    assert by_id(report)["source_principal_read_only"]["status"] == "skipped"
+
+
+def test_orchestrator_source_principal_without_mapping_stays_skipped(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="ORA_DSN", source_family="oracle")
+    assert by_id(report)["source_principal_read_only"]["status"] == "skipped"
+
+
+@pytest.mark.parametrize("family", ["sqlserver", "postgres"])
+def test_source_principal_accepts_empty_table_list_for_sqlserver_and_postgres(monkeypatch, family):
+    monkeypatch.setenv("SOURCE_DSN", "source")
+    conn = FakePrivConn()
+    row = doctor.check_source_principal([], family, "SOURCE_DSN", connect=lambda dsn: conn)
+    assert row.status == "ok", row.detail
+    assert row.data["tables"] == [] and conn.closed

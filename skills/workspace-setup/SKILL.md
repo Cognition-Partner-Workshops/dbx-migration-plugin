@@ -45,7 +45,8 @@ never build it in the shell (the guard refuses reassigning a `legacy_sources` na
    table attached to the ticket. Report each BLOCKED item so the manager can file it as a plan
    blocker. Do not create a probe-table file.
 5. Run `factory-doctor` in setup posture and commit `.migration/capabilities.json` with the
-   `source_principal`; the recorded identity is the one every worker session expects.
+   `source_principal`; pass `--source-secret NAME --source-family F` (no `--mapping` is needed).
+   The recorded identity is the one every worker session expects.
 6. Record which secret holds each of the three principal tiers (`skills/target-routing/SKILL.md`).
 7. Keep `.migration/.hook_probe_nonce` out of git (`.gitignore` entry).
 8. Legacy writes a worker must make: list the exact objects on the ticket for the human's
