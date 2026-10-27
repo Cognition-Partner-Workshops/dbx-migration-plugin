@@ -1369,8 +1369,11 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
             violations.append(f"remote client `{base}` on legacy host {hits} writes query output to a file on the legacy host; legacy hosts are read-only")
         elif base in (*_LEGACY_ONLY, *_GENERIC, "spark-sql", "dbsqlcli") and _non_reads(_sql_text(seg, root)[0]):
             violations.append(f"remote client `{base}` on legacy host {hits} is not read-only; legacy hosts are read-only")
-        elif base == "git" and _git_reads(seg.argv[1:]):
-            continue
+        elif base == "git":
+            if _remote_git_reads(seg):
+                continue
+            violations.append(f"remote git on legacy host {hits} is not a read shape the guard models; use `git status`, "
+                              "`git log --oneline` or `git diff --no-ext-diff --no-textconv` without output-file or extension options")
         elif base not in (*_SQL_CLIENTS, *_REST_CLIENTS, *_SHELLS) and not _PYTHON.fullmatch(base) and not (
                 base in _READERS and not _mutates(base, seg.argv) and base not in ("unzip", "tee")
                 and not (base == "tar" and any(re.search(r"^-.*[cxru]", w) for w in seg.argv[1:]))):
@@ -1430,6 +1433,15 @@ def _git_reads(gargv: list[str]) -> bool:
     return verb in _GIT_READS
 
 _Write = tuple[str, str, bool, bool, str | None]   # (path, how, acts on a whole tree, destructive, directory)
+
+def _remote_git_reads(seg: _Seg) -> bool:
+    """Local workspace-safe Git operations (e.g. fetch) are not necessarily remote-host reads."""
+    argv = seg.argv[1:]
+    verbs = ("status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "show-ref", "describe", "merge-base")
+    flags = ("--", "--short", "--porcelain", "--stat", "--name-only", "--name-status", "--oneline", "--verify", "--abbrev-ref",
+             "--no-ext-diff", "--no-textconv", "--no-renames", "--color=never", "-p", "-s")
+    return bool(argv and argv[0] in verbs and not any(_expands(seg.raw_of(w)) or _expands(seg.raw_of(w), subst=True) for w in seg.argv) and
+                all(not w.startswith("-") or w in flags or re.fullmatch(r"-\d+|--max-count=\d+", w) for w in argv[1:]))
 
 def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[_Write]:
     argv, env, i, tree = s.argv, dict(a.split("=", 1) for a in s.assigns), 1, {}
