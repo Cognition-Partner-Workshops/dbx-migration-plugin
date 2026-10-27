@@ -122,6 +122,42 @@ def derive(root, namespace="", batch_max=5, max_cycle=4, first_wave=1, shared_wa
                          "the dialect skill emits them")
 
     rows_by_unit = {path.name: unit_rows(path / "dependencies.json") for path in unit_dirs}
+    owner, routine_names = {}, {}
+    for unit, rows in rows_by_unit.items():
+        for row in rows:
+            key = row["routine"].casefold()
+            if key in owner:
+                prior_unit = owner[key]
+                routine = routine_names[key]
+                raise SystemExit(f"routine {routine} is analysed by units {prior_unit}, {unit}; "
+                                 "one routine belongs to one unit's dependencies.json, then re-run")
+            owner[key] = unit
+            routine_names[key] = row["routine"]
+
+    called_units = {unit: set() for unit in rows_by_unit}
+    for unit, rows in rows_by_unit.items():
+        for row in rows:
+            for callee in row["calls"]:
+                callee_owner = owner.get(callee.casefold())
+                if callee_owner is None:
+                    raise SystemExit(f"unit {unit}: routine {row['routine']} calls {callee}, which the dependency "
+                                     "analysis does not cover, so its writes are unknown")
+                if callee_owner != unit:
+                    called_units[unit].add(callee_owner)
+
+    call_closures = {}
+    for unit in rows_by_unit:
+        reachable, todo = set(), [unit]
+        while todo:
+            current = todo.pop()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            todo.extend(called_units[current] - reachable)
+        call_closures[unit] = [
+            row for owner_unit in sorted(reachable) for row in rows_by_unit[owner_unit]
+        ]
+
     specs = {}
     for path in unit_dirs:
         spec_path = path / "mapping_spec.json"
@@ -140,14 +176,13 @@ def derive(root, namespace="", batch_max=5, max_cycle=4, first_wave=1, shared_wa
             raise SystemExit(f"mapping spec {spec_path} is not valid JSON ({e})") from None
 
     writes = {}
-    for unit, rows in rows_by_unit.items():
-        spec = specs[unit]
-
+    for unit, rows in call_closures.items():
         def resolve(routine, table):
-            targets = mapped_target(spec, table, namespace)
+            owner_unit = owner[routine["routine"].casefold()]
+            targets = mapped_target(specs[owner_unit], table, namespace)
             if not targets:
-                raise SystemExit(f"unit {unit}'s routine {routine['routine']} writes '{table}', which no object of "
-                                 "its mapping_spec.json has as root_table, so its target is unknown")
+                raise SystemExit(f"unit {owner_unit}'s routine {routine['routine']} writes '{table}', which no "
+                                 "object of its mapping_spec.json has as root_table, so its target is unknown")
             return {target_key(target, namespace) for target in targets}
 
         try:
@@ -166,6 +201,10 @@ def derive(root, namespace="", batch_max=5, max_cycle=4, first_wave=1, shared_wa
         reads[unit] = targets
 
     dependencies = {unit: set() for unit in rows_by_unit}
+    for unit, callees in called_units.items():
+        for callee in callees:
+            dependencies[unit].add(callee)
+            dependencies[callee].add(unit)
     for unit in rows_by_unit:
         for other in rows_by_unit:
             if unit != other and (reads[unit] & writes[other] or writes[unit] & writes[other]):
@@ -316,6 +355,14 @@ def check(root, manifest_path, derived):
                 continue
             source, target = placements.get(unit), placements.get(dependency)
             if source is None or target is None:
+                if source is not None:
+                    source_label = f"wave {source[0]} {source[1]}/{source[2]}"
+                    findings.append(f"dependency {unit} ({source_label}) -> {dependency} is not placed in any "
+                                    "wave manifest")
+                elif target is not None:
+                    target_label = f"wave {target[0]} {target[1]}/{target[2]}"
+                    findings.append(f"dependency {dependency} ({target_label}) is depended on by {unit}, which no "
+                                    "wave manifest places")
                 continue
             source_label = f"wave {source[0]} {source[1]}/{source[2]}"
             target_label = f"wave {target[0]} {target[1]}/{target[2]}"

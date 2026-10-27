@@ -9,10 +9,11 @@ import pytest
 SCRIPT = Path(__file__).with_name("derive_waves.py")
 
 
-def _unit(root, name, reads=(), writes=(), mapping=True):
+def _unit(root, name, reads=(), writes=(), mapping=True, routine=None, calls=()):
     path = root / ".migration" / "units" / name
     path.mkdir(parents=True, exist_ok=True)
-    row = {"routine": f"{name}_routine", "reads": list(reads), "writes": list(writes), "calls": []}
+    row = {"routine": routine or f"{name}_routine", "reads": list(reads), "writes": list(writes),
+           "calls": list(calls)}
     (path / "dependencies.json").write_text(json.dumps({"routines": [row]}))
     if mapping:
         objects = [{"object": table, "root_table": table} for table in writes]
@@ -89,6 +90,34 @@ def test_units_writing_the_same_target_share_a_batch(tmp_path):
 
     result = _derived(tmp_path)
     assert result["waves"][0]["batches"][0]["units"] == ["a", "b"]
+
+
+def test_cross_unit_call_shares_a_batch_and_includes_callee_writes(tmp_path):
+    _unit(tmp_path, "a", writes=["ta"], routine="app.run", calls=["app.log"])
+    _unit(tmp_path, "b", writes=["tb"], routine="app.log")
+
+    result = _derived(tmp_path)
+    assert result["waves"][0]["batches"][0]["units"] == ["a", "b"]
+    assert result["units"]["a"]["writes"] == ["ta", "tb"]
+
+
+def test_call_to_unanalysed_routine_refuses_with_caller_and_callee(tmp_path):
+    _unit(tmp_path, "a", writes=["ta"], routine="app.run", calls=["app.log"])
+
+    result = _run(tmp_path)
+    assert result.returncode != 0
+    assert ("unit a: routine app.run calls app.log, which the dependency analysis does not cover, "
+            "so its writes are unknown") in result.stderr
+
+
+def test_routine_analysed_in_two_units_is_refused(tmp_path):
+    _unit(tmp_path, "a", writes=["ta"], routine="app.run")
+    _unit(tmp_path, "b", writes=["tb"], routine="app.run")
+
+    result = _run(tmp_path)
+    assert result.returncode != 0
+    assert ("routine app.run is analysed by units a, b; one routine belongs to one unit's "
+            "dependencies.json, then re-run") in result.stderr
 
 
 def test_shared_leaf_stays_in_wave_one_without_the_opt_in_flag(tmp_path):
@@ -179,6 +208,21 @@ def test_check_finds_dependency_units_split_across_batches_in_one_wave(tmp_path)
     result = _run(tmp_path, "--check", ".migration/waves/wave-1.json")
     assert result.returncode == 1
     assert all(value in result.stdout for value in ("a", "b", "wave 1", "batch-a", "batch-b"))
+
+
+def test_check_finds_dependency_missing_from_all_wave_manifests(tmp_path):
+    _unit(tmp_path, "a", reads=["tb"], writes=["ta"])
+    _unit(tmp_path, "b", writes=["tb"])
+    waves_dir = tmp_path / ".migration" / "waves"
+    waves_dir.mkdir(parents=True)
+    (waves_dir / "wave-2.json").write_text(json.dumps({
+        "wave": 2,
+        "batches": [{"id": "batch-a", "units": ["a"]}],
+    }))
+
+    result = _run(tmp_path, "--check", ".migration/waves/wave-2.json")
+    assert result.returncode == 1
+    assert "dependency a (wave 2 wave-2.json/batch-a) -> b is not placed in any wave manifest" in result.stdout
 
 
 def test_check_accepts_derived_batches_across_sibling_waves(tmp_path):
