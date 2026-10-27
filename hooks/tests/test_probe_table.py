@@ -978,11 +978,12 @@ def test_warn_mode_remote_violation_is_legacy_marker(tmp_path_factory):
 WRITES = ("sqlcmd -S sqlserver-demo -Q 'DROP TABLE t'", Q + "'DROP TABLE prod.s.t'", "databricks api post /api/2.1/jobs/create --json '{}'")
 
 
-def test_missing_allowlist_in_a_migration_workspace_fails_closed(tmp_path: Path):
+def test_missing_allowlist_in_a_migration_workspace_denies_only_writes(tmp_path: Path):
     (tmp_path / ".migration").mkdir()
-    for cmd in (*WRITES, "ls"):
+    for cmd in WRITES:
         decision, reason = decide(cmd, tmp_path)
-        assert decision == "block" and "cannot read .migration/allowed_targets.json" in reason, (cmd, decision, reason)
+        assert decision == "block" and "No write scope exists until" in reason, (cmd, decision, reason)
+    assert decide("ls", tmp_path) == ("approve", "")
 
 
 def test_missing_allowlist_in_a_parent_migration_workspace_fails_closed(tmp_path: Path):

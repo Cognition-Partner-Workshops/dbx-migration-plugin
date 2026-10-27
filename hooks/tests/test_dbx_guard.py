@@ -11,6 +11,10 @@ HOOKS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HOOKS))
 
 import dbx_guard as g  # noqa: E402
+import test_guard_policy as policy  # noqa: E402
+import test_guard_v03 as v03  # noqa: E402
+import test_probe_table as probes  # noqa: E402
+import test_edit_events as edits  # noqa: E402
 
 CFG = g.GuardConfig.from_dict({
     "catalogs": ["mig_cat"],
@@ -1111,6 +1115,214 @@ def test_main_blocks_when_allowlist_is_broken(tmp_path: Path):
     (tmp_path / ".migration" / "allowed_targets.json").write_text("{not json")
     r = _run({"tool_name": "exec", "tool_input": {"command": "git status"}}, tmp_path)
     assert r.returncode == 2
+
+
+@pytest.fixture
+def unscoped_workspace(tmp_path: Path) -> Path:
+    mapping = tmp_path / ".migration" / "units" / "u" / "mapping_spec.json"
+    mapping.parent.mkdir(parents=True)
+    mapping.write_text("{}")
+    return tmp_path
+
+
+@pytest.mark.parametrize("command", ["ls", "cat .migration/units/u/mapping_spec.json", "databricks catalogs list", "git status"])
+def test_main_unscoped_reads_pass(unscoped_workspace: Path, command: str):
+    r = _run({"tool_name": "exec", "tool_input": {"command": command}}, unscoped_workspace)
+    assert r.returncode == 0 and r.stdout.strip() == "", r.stderr
+
+
+def _policy_commands(test):
+    return next(mark.args[1] for mark in test.pytestmark if mark.name == "parametrize")
+
+
+@pytest.mark.parametrize("command", [
+    *_policy_commands(policy.test_databricks_unrecognised_or_mutating_shapes_block),
+    *_policy_commands(policy.test_databricks_mutation_of_an_allowlisted_securable_passes),
+    *_policy_commands(policy.test_generic_write_to_an_unlisted_host_blocks),
+    *_policy_commands(policy.test_generic_write_to_a_listed_host_or_any_read_is_fine)[:3],
+    *_policy_commands(policy.test_identity_swaps_block),
+    *_policy_commands(policy.test_writes_to_the_databricks_config_files_are_identity_swaps),
+    *_policy_commands(v03.test_python_legacy_connections_block),
+    *(f'sqlplus $ORACLE_DSN -c "{sql}"' for sql in _policy_commands(policy.test_legacy_non_read_shapes_block)),
+    "python3 -c \"spark.sql('INSERT INTO mig_cat.s.t VALUES (1)')\"",
+    "python3 -c \"pyodbc.connect(os.environ['ORACLE_DSN']).execute('DROP TABLE x')\"",
+    "DATABRICKS_HOST=x databricks catalogs list",
+])
+def test_main_unscoped_keeps_write_blocks(unscoped_workspace: Path, command: str):
+    r = _run({"tool_name": "exec", "tool_input": {"command": command}}, unscoped_workspace)
+    assert r.returncode == 2, command
+    assert "No write scope exists until .migration/allowed_targets.json lands on the protected branch." in r.stderr
+
+
+@pytest.mark.parametrize("command", [command for _, command, expected in
+                                   _policy_commands(probes.test_running_guard_tree_is_tamper_proof) if expected == "block"])
+def test_main_unscoped_keeps_guard_tree_blocks(unscoped_workspace: Path, command: str):
+    (unscoped_workspace / "plug").symlink_to(g._GUARD_TREE, target_is_directory=True)
+    command = command.format(plugin=g._GUARD_TREE, plugin_name=g._GUARD_TREE.name, ws=unscoped_workspace, repo=HOOKS.parent)
+    r = _run({"tool_name": "exec", "tool_input": {"command": command}}, unscoped_workspace)
+    assert r.returncode == 2, command
+
+
+@pytest.mark.parametrize("tool,path,tool_input", [(tool, path, tool_input) for tool, path, tool_input, expected in
+                                              _policy_commands(edits.test_edit_event) if expected == "block"])
+def test_main_unscoped_keeps_authorization_blocks(unscoped_workspace: Path, tool, path, tool_input):
+    r = _run({"tool_name": tool, "tool_input": {**tool_input, "file_path": str(unscoped_workspace / path)}},
+             unscoped_workspace)
+    assert r.returncode == 2, r.stdout
+
+
+@pytest.mark.parametrize("path,content", [
+    (str(g._GUARD_TREE / "hooks" / "dbx_guard.py"), "x"),
+    (".databrickscfg", "token = x"),
+    (".migration/authorizations.json", '{"kind": "legacy_write_authorized"}'),
+])
+def test_main_unscoped_keeps_edit_blocks(unscoped_workspace: Path, path: str, content: str):
+    r = _run({"tool_name": "write", "tool_input": {"file_path": str(unscoped_workspace / path), "content": content}},
+             unscoped_workspace)
+    assert r.returncode == 2, r.stdout
+
+
+def test_unscoped_never_uses_warn_mode(unscoped_workspace: Path):
+    cfg = g.load_config(unscoped_workspace)
+    assert cfg.catalogs == [] and cfg.legacy_sources == [] and cfg.mode == "block"
+    assert cfg.policy_ref == f"none (no {g.CONFIG_REL} at {unscoped_workspace}; .migration/ exists)"
+    cfg.mode = "warn"
+    assert g.evaluate("databricks tables delete mig_cat.s.t", cfg, unscoped_workspace).decision == "block"
+
+
+@pytest.mark.parametrize("content", ["{}", '{"catalogs": []}', '{"catalogs": "mig_cat"}', "[]"])
+def test_main_invalid_allowlist_still_blocks_reads(unscoped_workspace: Path, content: str):
+    (unscoped_workspace / g.CONFIG_REL).write_text(content)
+    r = _run({"tool_name": "exec", "tool_input": {"command": "git status"}}, unscoped_workspace)
+    assert r.returncode == 2
+
+
+@pytest.mark.parametrize("command", [
+    'echo "sqlplus $ORACLE_DSN UPDATE" >> notes.md',
+    'printf \'%s\\n\' "psql -c \'DELETE FROM t\' $X" > n.md',
+    'cat > notes.md <<EOF\nsqlplus $ORACLE_DSN UPDATE\nEOF',
+    'tee notes.md <<EOF\npsql $X DELETE\nEOF',
+    'grep "sqlplus $ORACLE_DSN UPDATE" notes.md',
+])
+def test_text_tools_are_not_sql_clients(command: str):
+    approve(command)
+
+
+def test_file_payload_is_not_shell_function_syntax():
+    approve("cat > notes.py <<'EOF'\ndef f():\n    return 'sqlplus'\nEOF")
+    for command in ["f() { sqlplus $ORACLE_DSN; }; f",
+                    "sh <<'EOF'\nf() { sqlplus $ORACLE_DSN; }; f\nEOF"]:
+        assert "shell function" in block(command).reason
+
+
+@pytest.mark.parametrize("command", [
+    'echo "UPDATE x SET a=1" | sqlplus $ORACLE_DSN',
+    'echo "$X" | sqlplus scott/x@h:1/s',
+    "Q='databricks sql query'; $Q 'SELECT 1'",
+])
+def test_text_tools_do_not_hide_client_invocations(command: str):
+    assert g.evaluate(command, CFG).decision == "block"
+
+
+@pytest.mark.parametrize("command", [
+    'echo "$(sqlplus $ORACLE_DSN -c \'DELETE FROM orders\')"',
+    'printf "%s\\n" "$(psql $ORACLE_DSN -c \'DELETE FROM orders\')"',
+    'grep "`sqlplus $ORACLE_DSN -c \'DELETE FROM orders\'`" notes.md',
+    'cat "$(sqlplus $ORACLE_DSN -c \'DELETE FROM orders\')"',
+    'echo "$(printf \')\'; sqlplus $ORACLE_DSN -c \'DELETE FROM orders\')"',
+    'echo "$(echo $(sqlplus $ORACLE_DSN -c \'DELETE FROM orders\'))"',
+    'echo "sqlplus $($Q)"',
+    'echo "$(find . -exec sqlplus x -c \'DELETE FROM orders\' \\;)"',
+])
+def test_text_tool_executable_substitutions_still_block(command: str):
+    assert "command substitution" in block(command).reason
+
+
+@pytest.mark.parametrize("command", [
+    'echo \'sqlplus\' "$(date)"',
+    'echo "sqlplus $(date)"',
+    'echo "$(date) sqlplus"',
+    'echo "sqlplus $(printf \')\')"',
+    'grep \'sqlplus\' "$(pwd)/notes.md"',
+    'echo "$(printf \'%s\' sqlplus)"',
+    'echo "$(echo sqlplus)"',
+    'echo \'$(sqlplus $ORACLE_DSN -c "DELETE FROM orders")\'',
+])
+def test_text_tool_unrelated_substitutions_are_not_sql(command: str):
+    approve(command)
+
+
+@pytest.mark.parametrize("command,rc", [
+    ("ssh legacy-prod 'rm /etc/legacy.conf'", 2),
+    ("ssh legacy-prod 'echo x > /etc/legacy.conf'", 2),
+    ("ssh legacy-prod 'python3 remote.py'", 2),
+    ("ssh legacy-prod 'ls /etc'", 0),
+    ("ssh legacy-prod 'cat /etc/legacy.conf'", 0),
+    ("ssh legacy-prod 'git status'", 0),
+    ("ssh legacy-prod 'git diff'", 0),
+    ("ssh legacy-prod 'git checkout main'", 2),
+    ("ssh legacy-prod 'git config user.name x'", 2),
+    ("ssh legacy-prod 'git fetch'", 2),
+    ("ssh legacy-prod 'git reflog delete HEAD@{0}'", 2),
+    ("ssh legacy-prod 'git diff --output=report'", 2),
+    ("ssh legacy-prod 'git diff --output report'", 2),
+    ("ssh legacy-prod 'git diff --ext-diff'", 2),
+    ("ssh legacy-prod 'git diff --textconv'", 2),
+    ("ssh legacy-prod 'git diff $FLAGS'", 2),
+    ("ssh legacy-prod 'git log --oneline'", 0),
+    ("ssh legacy-prod 'git diff --no-ext-diff --no-textconv'", 0),
+    ("ssh legacy-prod \"sqlplus x -c 'SELECT 1'\"", 0),
+    ("ssh legacy-prod \"sqlplus x -c 'DELETE FROM orders'\"", 2),
+])
+def test_main_unscoped_remote_is_read_only(unscoped_workspace: Path, command: str, rc: int):
+    r = _run({"tool_name": "exec", "tool_input": {"command": command}}, unscoped_workspace)
+    assert r.returncode == rc, r.stderr
+
+
+@pytest.mark.parametrize("client", ["sqlplus", "bteq"])
+def test_main_unscoped_authorization_never_creates_write_scope(unscoped_workspace: Path, client: str):
+    ws = unscoped_workspace
+    (ws / ".migration" / "authorizations.json").write_text(edits.AUTHORIZATIONS.replace("tolerance_change", "legacy_write_authorized"))
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    subprocess.run(["git", "-C", str(ws), "add", ".migration"], check=True)
+    subprocess.run(["git", "-C", str(ws), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                    "commit", "-qm", "authorization without policy"], check=True)
+    command = f"DBX_DECISION=D-7 {client} x -c 'ALTER TABLE dbo.orders ADD cdc_ts INT'"
+    seg = g._segments(command)[0]
+    assert g._decision(seg, ["ALTER TABLE dbo.orders ADD cdc_ts INT"], ws)[1] is None
+    r = _run({"tool_name": "exec", "tool_input": {"command": command}}, ws)
+    assert r.returncode == 2 and "No write scope exists until" in r.stderr
+
+
+@pytest.mark.parametrize("option", [f"--plugin-root {g._GUARD_TREE}", f"--plugin-root={g._GUARD_TREE}"])
+def test_doctor_literal_plugin_root_approves(tmp_path: Path, option: str):
+    command = f"python3 {g._DOCTOR} --workspace {tmp_path} {option}"
+    assert g.evaluate(command, CFG, tmp_path).decision == "approve"
+
+
+@pytest.mark.parametrize("option", ["--plugin-root $P", "--plugin-root=$P", "--plugin-root /tmp/other", "--plugin-root"])
+def test_doctor_other_plugin_root_blocks(tmp_path: Path, option: str):
+    command = f"python3 {g._DOCTOR} --workspace {tmp_path} {option}"
+    assert g.evaluate(command, CFG, tmp_path).decision == "block"
+
+
+@pytest.mark.parametrize("option", ["--plugin-root $P", "--plugin-root=$P"])
+def test_doctor_resolved_variable_root_is_not_literal(tmp_path: Path, option: str):
+    command = f"P={g._GUARD_TREE}; python3 {g._DOCTOR} --workspace {tmp_path} {option}"
+    assert g.evaluate(command, CFG, tmp_path).decision == "block"
+
+
+def test_policy_mismatch_reads_pass_without_widening(tmp_path: Path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".migration").mkdir()
+    policy_path = tmp_path / g.CONFIG_REL
+    policy_path.write_text(json.dumps({"catalogs": ["mig_cat"]}))
+    subprocess.run(["git", "-C", str(tmp_path), "add", ".migration"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                    "commit", "-qm", "policy"], check=True)
+    policy_path.write_text(json.dumps({"catalogs": ["wide"]}))
+    for command, rc in [("git status", 0), ("databricks catalogs list", 0), ("databricks tables delete wide.s.t", 2)]:
+        assert _run({"tool_name": "exec", "tool_input": {"command": command}}, tmp_path).returncode == rc
 
 
 def test_main_tolerates_garbage_input(tmp_path: Path):

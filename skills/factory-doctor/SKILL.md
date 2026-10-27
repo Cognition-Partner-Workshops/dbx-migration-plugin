@@ -32,6 +32,9 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--reuse-record PATH] [--out PATH]
 ```
 
+`--plugin-root` is optional. The guard accepts it only as the literal path of the running plugin
+(not a shell variable or another plugin tree).
+
 `--role orchestrator` is kept as the CLI value for the wave ticket's worker (the session that proves
 the platform hook once per wave and signs `wave-N.doctor.json`); `--role setup` is the intake /
 wave-plan worker before mappings exist. Setup runs the read-only source probe from

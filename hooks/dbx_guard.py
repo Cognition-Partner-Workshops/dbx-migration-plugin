@@ -288,7 +288,9 @@ class Verdict:
         reason = ("dbx-migration-factory guard: " + "; ".join(violations) + ". Fix the command or, if the target is legitimate, add "
                   "it to .migration/allowed_targets.json by a PR to the protected branch "
                   f"(allowlist in force: {cfg.policy_ref}); never work around the guard.")
-        if cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
+        if not cfg.catalogs:
+            reason += " No write scope exists until .migration/allowed_targets.json lands on the protected branch."
+        if cfg.catalogs and cfg.mode == "warn" and not any(isinstance(v, _Legacy) for v in real):
             return cls("approve", "WARN (guard_mode=warn): " + reason, violations)
         return cls("block", reason, violations)
 
@@ -308,6 +310,10 @@ def _committed(ws: Path, rel: str) -> tuple[str | None, str | None]:
             return r.stdout.decode(errors="replace"), ref
     return None, None
 
+def _unscoped(path: Path) -> GuardConfig:
+    return GuardConfig(catalogs=[], legacy_sources=[], mode="block", path=path,
+                       policy_ref=f"none (no {CONFIG_REL} at {path.parent.parent}; .migration/ exists)")
+
 def load_config(start: Path) -> GuardConfig | None:
     start = start.resolve()
     for d in [start, *start.parents]:
@@ -318,6 +324,8 @@ def load_config(start: Path) -> GuardConfig | None:
         if text is None:
             if not path.is_file() and not path.parent.is_dir():
                 return None
+            if path.parent.is_dir() and not path.is_file():
+                return _unscoped(path)
             text = path.read_text()
         policy_ref = f"{ref}:{CONFIG_REL}" if ref else "working copy"
         data = json.loads(text)
@@ -479,6 +487,51 @@ def _expands(text: str, subst: bool = False) -> bool:
     live = re.sub(r"\\.|'[^']*'?", lambda m: " " * len(m.group()), text, flags=re.DOTALL)
     return any(not re.fullmatch(r"[\w$-]+", m.group(1)) for m in re.finditer(r"`([^`]*)`", live)) or (
         bool(re.search(r"\$\(|(?<![\w])[<>]\(", live)) if subst else "$" in live)
+
+def _client_substitution(raw: str) -> bool:
+    unsafe = False
+
+    def scan(i: int, stop: str = "", level: int = 0) -> int:
+        nonlocal unsafe
+        if level > 32:
+            unsafe = True
+            return len(raw)
+        quote, depth = "", 1
+        while i < len(raw):
+            c = raw[i]
+            if c == "\\" and quote != "'":
+                i += 2
+                continue
+            if quote == "'":
+                quote = "" if c == "'" else quote
+            elif stop == "`" and c == "`":
+                return i + 1
+            elif c in ('"', "'"):
+                quote = "" if c == quote else c if not quote else quote
+            elif raw.startswith("$(", i) or (not quote and raw[i:i + 2] in ("<(", ">(")) or c == "`":
+                width = 1 if c == "`" else 2
+                end = scan(i + width, "`" if c == "`" else ")", level + 1)
+                body = raw[i + width:end - 1]
+                for sub in _segments(body):
+                    base = sub.argv0
+                    text_tool = base in ("echo", "printf", "cat", "tee") or base in _READERS
+                    executes = base == "find" and any(w.startswith(("-exec", "-ok")) for w in sub.argv)
+                    if base in _SQL_CLIENTS or sub.unreadable or (sub.argv and _expands(sub.raw_of(sub.argv[0]))) or (
+                            (not text_tool or executes) and _CLIENT_WORD.search(" ".join(sub.argv))):
+                        unsafe = True
+                i = end
+                continue
+            elif stop == ")" and not quote:
+                depth += (c == "(") - (c == ")")
+                if not depth:
+                    return i + 1
+            i += 1
+        if stop:
+            unsafe = True
+        return i
+
+    scan(0)
+    return unsafe
 
 def _lakebase(verb: str, project: str | None, branch: str | None, cfg: GuardConfig) -> list[str]:
     if project is not None and project not in cfg.lakebase_projects:
@@ -852,18 +905,25 @@ def _check_unreadable(segs: list[_Seg], cfg: GuardConfig, text: str) -> list[str
                 and (wrapped := _CLIENT_WORD.search(" ".join(s.argv[1:]))):
             violations.append(f"unrecognised wrapper `{base}` in front of client `{wrapped.group()}`; the guard has no rule for `{base}`, so "
                               "it cannot tell how or where the client would run (run the client directly)")
-        for i, (r, w, prev) in enumerate(zip(s.raw, s.words, ["", *s.words])):   # an expansion inside what is (or looks like) SQL
-            if (prev in _SQL_VALUE_FLAGS or w.split("=", 1)[0] in _SQL_VALUE_FLAGS or
-                    (re.search(r"[\s;]", w) and prev not in _HOST_FLAGS) or (
-                    i >= 2 and s.words[i - 2] == "tools" and prev == "query")) and _expands(r) and not _REDIRECT_OP.fullmatch(prev):
-                violations.append(f"shell expansion inside the SQL argument `{r[:60]}` (substitution); expand it in the command text so the guard can "
-                                  "read the statement")
-                break
-        if any(re.fullmatch(r"\d*<<-?", w) and _expands(s.raw[i + 1]) for i, w in enumerate(s.words[:-1])):
-            violations.append("unquoted heredoc expands `$`/backticks in its body; quote the delimiter (<<'EOF') or inline the values")
+        if base in _SQL_CLIENTS or (base not in ("echo", "printf", "cat", "tee") and base not in _READERS):
+            for i, (r, w, prev) in enumerate(zip(s.raw, s.words, ["", *s.words])):   # an expansion inside what is (or looks like) SQL
+                if (prev in _SQL_VALUE_FLAGS or w.split("=", 1)[0] in _SQL_VALUE_FLAGS or
+                        (re.search(r"[\s;]", w) and prev not in _HOST_FLAGS) or (
+                        i >= 2 and s.words[i - 2] == "tools" and prev == "query")) and _expands(r) and not _REDIRECT_OP.fullmatch(prev):
+                    violations.append(f"shell expansion inside the SQL argument `{r[:60]}` (substitution); expand it in the command text so the guard can "
+                                      "read the statement")
+                    break
+            if any(re.fullmatch(r"\d*<<-?", w) and _expands(s.raw[i + 1]) for i, w in enumerate(s.words[:-1])):
+                violations.append("unquoted heredoc expands `$`/backticks in its body; quote the delimiter (<<'EOF') or inline the values")
+        elif any(_client_substitution(s.raw_of(w)) for w in s.argv[1:]):
+            violations.append(f"command substitution in `{base}` names a SQL client; run the client directly so the guard can read the call")
         if base not in _KNOWN and base not in _INERT and base not in defined and not _PYTHON.fullmatch(base) and (hits := _conn(s, cfg, "")[0]):
             violations.append(f"unrecognised command `{base}` names legacy connection {hits}; the guard cannot verify its operation")
-    if any(_CLIENT_WORD.search(m.group(1)) for m in _FUNCTION_DEF.finditer(re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', " ", text))):
+    words, raw = _shell_tokens(text)
+    syntax = [" ".join(r for i, r in enumerate(raw) if not i or not re.fullmatch(r"\d*<<-?", words[i - 1]))]
+    syntax += [body for s in segs if s.argv0 in _SHELLS for body in s.heredocs]
+    if any(_CLIENT_WORD.search(m.group(1)) for code in syntax for m in _FUNCTION_DEF.finditer(
+            re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', " ", code))):
         violations.append("shell function wrapping a SQL client; the guard cannot follow what a call of it would run (same class as `eval`)")
     return violations
 
@@ -885,6 +945,8 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         bad.insert(0, f"script(s) {unreadable} the guard cannot read")
     if not bad:
         return violations
+    if not cfg.catalogs:
+        return violations + [_Legacy(f"non-read statement through `{base}` without an allowlisted write scope: `{bad[0]}`")]
     if legacy or hits:
         violation = (f"non-read statement through a legacy-only client `{base}`" if legacy
                      else f"non-read statement against legacy source {hits}") + f": `{bad[0]}`"
@@ -1096,8 +1158,6 @@ def _runs_plugin_doctor(seg: _Seg, root: Path) -> bool:
     argv = seg.argv
     if seg.at is None or len(argv) < 2 or argv[1].startswith("-") or seg.heredocs:
         return False
-    if any(w == "--plugin-root" or w.startswith("--plugin-root=") for w in argv[2:]):
-        return False
     names = [a.split("=", 1)[0] for a in seg.assigns] + list(seg.env)
     if any(n.startswith("PYTHON") for n in names):
         return False
@@ -1105,6 +1165,13 @@ def _runs_plugin_doctor(seg: _Seg, root: Path) -> bool:
     if not script.endswith(".py") or _expands(script) or _expands(script, subst=True):
         return False
     base = root if not seg.at else Path(seg.at) if seg.at.startswith("/") else root / seg.at
+    for i, word in enumerate(argv[2:], 2):
+        if word == "--plugin-root" or word.startswith("--plugin-root="):
+            value = argv[i + 1] if word == "--plugin-root" and i + 1 < len(argv) else word.partition("=")[2]
+            raw = seg.raw_of(argv[i + 1] if word == "--plugin-root" and i + 1 < len(argv) else word)
+            if not value or _expands(raw) or _expands(raw, subst=True) or os.path.realpath(
+                    base / os.path.expanduser(value)) != str(_GUARD_TREE):
+                return False
     return os.path.realpath(base / os.path.expanduser(script)) == str(_DOCTOR)
 
 def _strip_python_comments(text: str) -> str:
@@ -1276,8 +1343,9 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
         if seg.remote == seg.argv0:                            # `aws ssm ... --instance-ids H` / `--targets ...,Values=H`: H is the target
             outer += [p.lower() for w in seg.argv[1:] for p in re.split(r"[=,]", w)]
         hits = list(dict.fromkeys([*(t for t in cfg.legacy_sources if t.lower() in outer), *_conn(seg, cfg, "\n".join(seg.heredocs))[0]]))
-        if not hits:
+        if not hits and cfg.catalogs:
             continue
+        hits = hits or ["unscoped remote host (no allowlist)"]
         base = seg.argv0
         if not seg.argv:
             violations.append(f"`{seg.remote}` opens an interactive session on legacy source {hits}; the guard cannot read what would run")
@@ -1301,6 +1369,11 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
             violations.append(f"remote client `{base}` on legacy host {hits} writes query output to a file on the legacy host; legacy hosts are read-only")
         elif base in (*_LEGACY_ONLY, *_GENERIC, "spark-sql", "dbsqlcli") and _non_reads(_sql_text(seg, root)[0]):
             violations.append(f"remote client `{base}` on legacy host {hits} is not read-only; legacy hosts are read-only")
+        elif base == "git":
+            if _remote_git_reads(seg):
+                continue
+            violations.append(f"remote git on legacy host {hits} is not a read shape the guard models; use `git status`, "
+                              "`git log --oneline` or `git diff --no-ext-diff --no-textconv` without output-file or extension options")
         elif base not in (*_SQL_CLIENTS, *_REST_CLIENTS, *_SHELLS) and not _PYTHON.fullmatch(base) and not (
                 base in _READERS and not _mutates(base, seg.argv) and base not in ("unzip", "tee")
                 and not (base == "tar" and any(re.search(r"^-.*[cxru]", w) for w in seg.argv[1:]))):
@@ -1360,6 +1433,15 @@ def _git_reads(gargv: list[str]) -> bool:
     return verb in _GIT_READS
 
 _Write = tuple[str, str, bool, bool, str | None]   # (path, how, acts on a whole tree, destructive, directory)
+
+def _remote_git_reads(seg: _Seg) -> bool:
+    """Local workspace-safe Git operations (e.g. fetch) are not necessarily remote-host reads."""
+    argv = seg.argv[1:]
+    verbs = ("status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "show-ref", "describe", "merge-base")
+    flags = ("--", "--short", "--porcelain", "--stat", "--name-only", "--name-status", "--oneline", "--verify", "--abbrev-ref",
+             "--no-ext-diff", "--no-textconv", "--no-renames", "--color=never", "-p", "-s")
+    return bool(argv and argv[0] in verbs and not any(_expands(seg.raw_of(w)) or _expands(seg.raw_of(w), subst=True) for w in seg.argv) and
+                all(not w.startswith("-") or w in flags or re.fullmatch(r"-\d+|--max-count=\d+", w) for w in argv[1:]))
 
 def _git_writes(s: _Seg, here: str, root: Path, out: list[str]) -> list[_Write]:
     argv, env, i, tree = s.argv, dict(a.split("=", 1) for a in s.assigns), 1, {}
