@@ -12,7 +12,7 @@ description: Preflight for a DBX migration workspace. Verifies setup, hooks, con
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
 | `recon_harness` | harness self-test/import or a required driver fails | install the harness extras |
-| `type_map_audit` | a unit mapping declares a `target_type` the source family's `type_map.<family>.<target_kind>` forbids | fix the declared type or add the required `evidence` token |
+| `type_map_audit` | a unit mapping declares a `target_type` the source family's `type_map.<family>.<target_kind>` forbids | fix the declared type or add the required `evidence` token; a spec's top-level `target_kind` (databricks\|lakebase) overrides --target-kind for that spec |
 | `delete_evidence` | mapped CDC evidence is absent, incomplete, or unreadable | provide source CDC evidence; never enable it here |
 | `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a plan decision attesting the source |
 | `databricks_identity` | CLI/auth/host/identity is missing, human, or mismatched | use the expected OAuth M2M principal and host |
