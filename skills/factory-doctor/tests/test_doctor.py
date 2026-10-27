@@ -3131,6 +3131,17 @@ def test_setup_source_principal_probe_without_mapping(monkeypatch, tmp_path):
     assert row["detail"].startswith("setup probe")
 
 
+def test_setup_source_principal_with_unit_requires_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_privs=("CREATE SESSION",))
+    monkeypatch.setattr(doctor, "_oracledb_connect", lambda dsn: conn)
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        units=["loans"], source_secret="ORA_DSN", source_family="oracle")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "--unit narrows nothing" in row["detail"]
+    assert report["ready"] is False
+
+
 def test_setup_source_principal_probe_fails_on_write_system_privilege(monkeypatch, tmp_path):
     monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
     conn = _OracleConn(session_privs=("CREATE SESSION", "INSERT ANY TABLE"))

@@ -1321,7 +1321,7 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
             "so the principal's privileges can be checked", lambda tables, family: (_attested(ws, attested, family,
             tables) if attested else check_source_principal(tables, family, source_secret)))
 
-    if role == "setup" and source_secret and not mappings and not sorted(ws.glob(UNIT_MAPPINGS)):
+    if role == "setup" and source_secret and not units and not mappings and not sorted(ws.glob(UNIT_MAPPINGS)):
         if attested and source_family:
             return _attested(ws, attested, source_family, [])
         if not source_family:
