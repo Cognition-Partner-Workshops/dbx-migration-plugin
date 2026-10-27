@@ -1321,6 +1321,19 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
             "so the principal's privileges can be checked", lambda tables, family: (_attested(ws, attested, family,
             tables) if attested else check_source_principal(tables, family, source_secret)))
 
+    if role == "setup" and source_secret and not mappings and not sorted(ws.glob(UNIT_MAPPINGS)):
+        if attested and source_family:
+            return _attested(ws, attested, source_family, [])
+        if not source_family:
+            return Check(cid, "unverified", "pass --source-family oracle|sqlserver|postgres with --source-secret "
+                "so setup can probe the source principal (no unit mapping exists yet)")
+        if source_family == "databricks":
+            return Check(cid, "skipped", "not applicable at setup: the databricks source check reads grants on "
+                "mapped tables")
+        c = check_source_principal([], source_family, source_secret)
+        return Check(c.id, c.status, "setup probe, principal-level only (no unit mapping yet; table grants are "
+            f"checked per unit later): {c.detail}", {**(c.data or {}), "scope": "principal"})
+
     return per_unit(cid, ws, role, units, mappings, principal)
 
 

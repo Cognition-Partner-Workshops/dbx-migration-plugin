@@ -1,3 +1,10 @@
+# 0.6.1 (unreleased)
+
+## Changed
+
+- `factory-doctor`: setup probes `--source-secret` at principal level before mappings exist; table
+  grants remain per-unit.
+
 # 0.6.0 — .migration/ holds machine files only
 
 0.5.0 moved the human-readable ledger onto the board but several skills still asked for prose
