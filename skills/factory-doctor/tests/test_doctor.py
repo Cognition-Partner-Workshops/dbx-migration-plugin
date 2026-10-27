@@ -2163,7 +2163,7 @@ def test_type_map_audit_uses_each_specs_declared_target_kind(tmp_path, monkeypat
     ws = make_workspace(tmp_path)
     oltp = _typed_unit_mapping(ws, "accounts", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
     _declare_target_kind(oltp, "lakebase")
-    delta = _typed_unit_mapping(ws, "ledger", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    delta = _typed_unit_mapping(ws, "analytics", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
     calls = _record_harness_argv(monkeypatch)
     c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT,
                                     target_kind="databricks")
@@ -2187,7 +2187,7 @@ def test_type_map_audit_fails_on_a_contradiction_even_when_another_kind_has_no_m
     ws = make_workspace(tmp_path)
     oltp = _typed_unit_mapping(ws, "accounts", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
     _declare_target_kind(oltp, "lakebase")
-    _typed_unit_mapping(ws, "ledger", [_field("AMOUNT", "NUMBER(12,2)", "double")])
+    _typed_unit_mapping(ws, "analytics", [_field("AMOUNT", "NUMBER(12,2)", "double")])
 
     def fake(cmd, subcommand):
         if subcommand[subcommand.index("--target-kind") + 1] == "lakebase":
@@ -2490,6 +2490,60 @@ def test_wave_flag_writes_a_signed_record_beside_the_manifest(tmp_path):
         capture_output=True, text=True, check=False,
     )
     assert json.loads(default_manifest.with_suffix(".doctor.json").read_text())["hook_probe"] == "unknown"
+
+
+def _ready_wave(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "authenticated as sp-1 (service principal)"),
+    ])
+    ws = make_workspace(tmp_path / "ws")
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"capabilities": {"identity": "sp-1", "host": "https://h",
+                                                      "catalogs": ["mig_cat"]}}))
+    return ws, manifest, home / doctor.POINTER_HOME_REL
+
+
+def test_ready_wave_writes_the_fanout_pointer(tmp_path, monkeypatch, capsys):
+    ws, manifest, pointer = _ready_wave(tmp_path, monkeypatch)
+    hook_probe = probed(ws)
+    monkeypatch.chdir(tmp_path)
+    assert doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT),
+                        "--hook-probe-result", hook_probe, "--wave", ".migration/waves/wave-1.json"]) == 0
+    assert manifest.with_suffix(".doctor.json").exists()
+    assert json.loads(pointer.read_text()) == {"manifest": "wave-1.json", "hook_probe": hook_probe,
+                                               "workspace": str(ws.resolve()), "plugin": str(PLUGIN_ROOT.resolve())}
+    assert f"pointer -> {pointer}" in capsys.readouterr().out
+
+
+def test_not_ready_or_child_wave_writes_no_pointer(tmp_path, monkeypatch, capsys):
+    ws, manifest, pointer = _ready_wave(tmp_path, monkeypatch)
+    assert doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--wave", str(manifest)]) == 1
+    assert not pointer.exists() and "no pointer written: not ready" in capsys.readouterr().out
+    hook_probe = probed(ws)
+    real_run = doctor.run  # the orchestrator's checks, so only the child role keeps the pointer unwritten
+    monkeypatch.setattr(doctor, "run", lambda ws, plugin, role, *a, **kw: real_run(ws, plugin, "orchestrator", *a, **kw))
+    assert doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--role", "child",
+                        "--hook-probe-result", hook_probe, "--wave", str(manifest)]) == 0
+    assert not pointer.exists() and "pointer" not in capsys.readouterr().out
+
+
+def test_wave_manifest_must_sit_in_the_workspace_waves_dir(tmp_path, monkeypatch, capsys):
+    ws, manifest, pointer = _ready_wave(tmp_path, monkeypatch)
+    outside = tmp_path / "wave-1.json"
+    outside.write_text(manifest.read_text())
+    with pytest.raises(SystemExit) as e:
+        doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--wave", str(outside)])
+    assert e.value.code == 2 and str(ws.resolve() / ".migration" / "waves") in capsys.readouterr().err
+    assert not outside.with_suffix(".doctor.json").exists() and not pointer.exists()
+
+
+def test_pointer_path_matches_the_fanout_workflow():
+    source = (PLUGIN_ROOT / "skills" / "migration-fanout" / "workflow.py").read_text()
+    match = re.search(r'^POINTER_REL = Path\("([^"]+)"\)$', source, re.M)
+    assert match and Path(match.group(1)) == doctor.POINTER_HOME_REL
 
 
 def test_wave_rejects_explicit_source_settings(tmp_path):
@@ -3292,3 +3346,65 @@ def test_oracle_source_principal_ok_with_public_select(monkeypatch):
     row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN",
                                         connect=lambda dsn: conn)
     assert row.status == "ok", row.detail
+
+
+def test_setup_source_principal_probe_without_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_privs=("CREATE SESSION",))
+    monkeypatch.setattr(doctor, "_oracledb_connect", lambda dsn: conn)
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        source_secret="ORA_DSN", source_family="oracle")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "ok" and row["data"]["scope"] == "principal"
+    assert row["detail"].startswith("setup probe")
+
+
+def test_setup_source_principal_with_unit_requires_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_privs=("CREATE SESSION",))
+    monkeypatch.setattr(doctor, "_oracledb_connect", lambda dsn: conn)
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        units=["loans"], source_secret="ORA_DSN", source_family="oracle")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "--unit narrows nothing" in row["detail"]
+    assert report["ready"] is False
+
+
+def test_setup_source_principal_probe_fails_on_write_system_privilege(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    conn = _OracleConn(session_privs=("CREATE SESSION", "INSERT ANY TABLE"))
+    monkeypatch.setattr(doctor, "_oracledb_connect", lambda dsn: conn)
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        source_secret="ORA_DSN", source_family="oracle")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "INSERT ANY TABLE" in row["detail"]
+
+
+def test_setup_source_principal_without_family_is_blocking_unverified(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        source_secret="ORA_DSN")
+    assert by_id(report)["source_principal_read_only"]["status"] == "unverified"
+    assert "source_principal_read_only=unverified" in report["blocking"]
+
+
+def test_setup_source_principal_without_secret_stays_skipped(tmp_path):
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "setup", "blocked", None, True,
+                        source_family="oracle")
+    assert by_id(report)["source_principal_read_only"]["status"] == "skipped"
+
+
+def test_orchestrator_source_principal_without_mapping_stays_skipped(monkeypatch, tmp_path):
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    report = doctor.run(make_workspace(tmp_path), PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_secret="ORA_DSN", source_family="oracle")
+    assert by_id(report)["source_principal_read_only"]["status"] == "skipped"
+
+
+@pytest.mark.parametrize("family", ["sqlserver", "postgres"])
+def test_source_principal_accepts_empty_table_list_for_sqlserver_and_postgres(monkeypatch, family):
+    monkeypatch.setenv("SOURCE_DSN", "source")
+    conn = FakePrivConn()
+    row = doctor.check_source_principal([], family, "SOURCE_DSN", connect=lambda dsn: conn)
+    assert row.status == "ok", row.detail
+    assert row.data["tables"] == [] and conn.closed

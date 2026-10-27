@@ -35,11 +35,13 @@ Optional and non-empty when present; keys are `core`, `sql`, `pipeline`, `orches
    writes `wave-<N>.doctor.json`, signed over the manifest bytes. Commit it beside the manifest:
    it carries no secret values (manifest hash, timestamp, principal name, host, readiness,
    `inputs_sha`, signature), and children reuse it per `skills/factory-doctor/SKILL.md`, running
-   the doctor in full when it is stale or absent.
-3. Write `~/.dbx-migration-factory/current-wave.json`; its `plugin` key names the plugin root the skills and
-   `pipeline_updates.py` resolve from:
-   `{"manifest": "wave-<N>.json", "hook_probe": "blocked:<nonce>|not-blocked|unknown", "workspace": "/abs/repo", "plugin": "<plugin>"}`.
-   Never create `.migration/` outside a repo; the guard treats it as a broken workspace.
+   the doctor in full when it is stale or absent. When the report is ready the doctor also writes the
+   pointer `~/.dbx-migration-factory/current-wave.json`; a not-ready run writes none and leaves any
+   earlier pointer in place.
+3. Check `~/.dbx-migration-factory/current-wave.json` names this manifest:
+   `{"manifest": "wave-<N>.json", "hook_probe": "blocked:<nonce>|not-blocked|unknown", "workspace": "/abs/repo", "plugin": "<plugin>"}`
+   (`plugin` is the root the skills and `pipeline_updates.py` resolve from). If it names another
+   manifest, step 2 was not ready: fix and re-run the doctor, never hand-write the pointer.
 4. Run `run_workflow(workflow_name="migration-wave-<N>", script_path="<plugin>/skills/migration-fanout/workflow.py")`.
 5. Post `.migration/waves/wave-<N>.card.md` on the ticket with the result's `brief` lines and a link
    to `wave-<N>.result.json`; the manager ticks the gate.

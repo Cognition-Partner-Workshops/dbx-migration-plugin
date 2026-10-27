@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 REQUIRED_FILES = ("allowed_targets.json", "recon_tolerances.json")
+POINTER_HOME_REL = Path(".dbx-migration-factory/current-wave.json")
 MIGRATION_LAYOUT = frozenset({
     "allowed_targets.json", "authorizations.json", "recon_tolerances.json", "capabilities.json",
     ".hook_probe_nonce", "units", "waves", "recon", "snapshots",
@@ -1363,6 +1364,19 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
             "so the principal's privileges can be checked", lambda tables, family: (_attested(ws, attested, family,
             tables) if attested else check_source_principal(tables, family, source_secret)))
 
+    if role == "setup" and source_secret and not units and not mappings and not sorted(ws.glob(UNIT_MAPPINGS)):
+        if attested and source_family:
+            return _attested(ws, attested, source_family, [])
+        if not source_family:
+            return Check(cid, "unverified", "pass --source-family oracle|sqlserver|postgres with --source-secret "
+                "so setup can probe the source principal (no unit mapping exists yet)")
+        if source_family == "databricks":
+            return Check(cid, "skipped", "not applicable at setup: the databricks source check reads grants on "
+                "mapped tables")
+        c = check_source_principal([], source_family, source_secret)
+        return Check(c.id, c.status, "setup probe, principal-level only (no unit mapping yet; table grants are "
+            f"checked per unit later): {c.detail}", {**(c.data or {}), "scope": "principal"})
+
     return per_unit(cid, ws, role, units, mappings, principal)
 
 
@@ -2050,6 +2064,10 @@ def main(argv: list[str] | None = None) -> int:
             "named for the probe_command of the last report")
     manifest_bytes = None
     if a.wave:
+        a.wave = a.workspace.resolve() / a.wave  # a relative manifest path is the workspace's, not the cwd's
+        waves_dir = a.workspace.resolve() / ".migration" / "waves"
+        if a.wave.resolve().parent != waves_dir:
+            p.error(f"--wave must name a manifest in {waves_dir}: the fan-out workflow reads it from there")
         manifest_bytes, manifest = _load_manifest(p, a.wave, "wave manifest")
         caps = manifest.get("capabilities") if isinstance(manifest, dict) else None
         if not isinstance(caps, dict):
@@ -2118,6 +2136,14 @@ def main(argv: list[str] | None = None) -> int:
         signed = sign_wave_report({**report, "hook_probe": a.hook_probe_result,
             "source": manifest.get("source"), "inputs_sha": inputs_sha(a.workspace.resolve())}, manifest_bytes)
         a.wave.with_suffix(".doctor.json").write_text(json.dumps(signed, indent=2, sort_keys=True) + "\n")
+        if a.role != "child" and report["ready"]:
+            pointer = Path.home() / POINTER_HOME_REL
+            pointer.parent.mkdir(parents=True, exist_ok=True)
+            pointer.write_text(json.dumps({"manifest": a.wave.name, "hook_probe": a.hook_probe_result,
+                "workspace": str(a.workspace.resolve()), "plugin": str(a.plugin_root.resolve())}) + "\n")
+            print(f"pointer -> {pointer}")
+        elif a.role != "child":
+            print("no pointer written: not ready")
     if a.role != "child":
         probe = next((s for c in report["checks"]
             for s in (c.get("data") or {}).get("sub_results") or []

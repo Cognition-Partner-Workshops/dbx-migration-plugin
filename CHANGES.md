@@ -6,6 +6,9 @@
   `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
   every command. `workspace` is now required, and the old path (or a leftover `.migration/` beside
   the new pointer outside a repo) is refused with a hint that deletes only empty directories.
+- A ready `doctor.py --wave` run (not `--role child`) writes that pointer itself, so a wave launches
+  without a hand-written one; a not-ready run writes none. `--wave` refuses a manifest outside
+  `<workspace>/.migration/waves/`.
 - Wave manifests and the doctor accept a wave's catalogs as a subset of the allowlist.
 - Qualified batch `write_targets` must sit in the wave's `capabilities.catalogs`.
 - Manifests refuse pre-0.6.0 fields by name and give the replacement or deletion.
@@ -17,6 +20,8 @@
 - factory-doctor `type_map_audit` audits each unit mapping against its own top-level `target_kind`
   (databricks|lakebase), falling back to `--target-kind`, so a run mixing Lakebase and Delta units
   can reach one green doctor; a mixed audit records `target_kind: "mixed"` and is never reused by a child.
+- `factory-doctor`: setup probes `--source-secret` at principal level before mappings exist; table
+  grants remain per-unit.
 
 # 0.6.0 — .migration/ holds machine files only
 
