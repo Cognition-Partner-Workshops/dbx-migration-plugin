@@ -6,6 +6,10 @@
   `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
   every command. `workspace` is now required, and the old path (or a leftover `.migration/` beside
   the new pointer outside a repo) is refused with a hint that deletes only empty directories.
+- Wave manifests and the doctor accept a wave's catalogs as a subset of the allowlist.
+- Qualified batch `write_targets` must sit in the wave's `capabilities.catalogs`.
+- Manifests refuse pre-0.6.0 fields by name and give the replacement or deletion.
+- Missing `plan_step` and overlong brief messages say what to change.
 - Oracle source DSN secrets may be JSON objects `{user|username, password, host, port,
   service|service_name}`; factory-doctor and the recon harness share `recon/dsn.py`, so the
   doctor cannot pass a form `dbx-recon run` rejects.
