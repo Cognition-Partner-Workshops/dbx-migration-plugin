@@ -78,7 +78,7 @@ contract.
 
 ## The hook probe
 
-1. Run the exact `probe_command` in the `hook_guard` row, from the workspace.
+1. Run the exact `probe_command` in the `hook_guard` row — the guard blocks it from any shell or directory, not only inside the workspace.
 2. A guard refusal naming `__dbx_guard_probe__<nonce>` proves hooks are live.
 3. Re-run with `--hook-probe-result blocked:<nonce>`; the nonce is in the `hook_guard` row.
 4. If the echo prints, re-run with `not-blocked`, record a plan blocker, and do not launch children.

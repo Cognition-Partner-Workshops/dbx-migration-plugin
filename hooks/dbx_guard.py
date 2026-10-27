@@ -1447,13 +1447,17 @@ def _check_integrity(segs: list[_Seg], root: Path, here: str = "") -> list[str]:
                                   "disabled or removed from a session (a block is a finding to report)")
     return violations
 
+def _probe_violation(command: str) -> str | None:
+    m = _PROBE.search(command)
+    return (f"`{m.group()}` is the factory-doctor's hook probe; it always blocks so the doctor can tell the "
+            "hook is loaded without touching Databricks") if m else None
+
 def evaluate(command: str, cfg: GuardConfig, root: Path | None = None, cwd: str = "", here: str = "") -> Verdict:
     """The verdict on a command in the workspace at `root`, run from `cwd` (the event's; '' for the root) by a guard process in `here`."""
     root = root or Path.cwd()
     violations: list[str] = []
-    if m := _PROBE.search(command):
-        violations.append(f"`{m.group()}` is the factory-doctor's hook probe; it always blocks so the doctor can tell the "
-                          "hook is loaded without touching Databricks")
+    if probe := _probe_violation(command):
+        violations.append(probe)
     segs = _segments(command, at=cwd, root=root)
     violations += _check_unreadable(segs, cfg, command) + _check_identity(segs, cfg) + _check_integrity(segs, root, here) + _check_remote(segs, cfg, root)
     for seg in segs:
@@ -1582,10 +1586,13 @@ def main(stdin_text: str | None = None) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:   # a broken allowlist is itself a setup violation: refuse rather than guess
         verdict = Verdict("block", f"dbx-migration-factory guard: cannot read {CONFIG_REL}: {exc}")
     else:
-        if cfg is None:
+        if cfg is not None:
+            verdict = evaluate_with_workdirs(command, cfg, root, cwd, here) if command is not None else evaluate_edit(
+                event.get("tool_name", ""), tool_input, cfg, root, cwd)
+        elif command is not None and (probe := _probe_violation(command)):
+            verdict = Verdict("block", f"dbx-migration-factory guard: {probe}")
+        else:
             return 0
-        verdict = evaluate_with_workdirs(command, cfg, root, cwd, here) if command is not None else evaluate_edit(
-            event.get("tool_name", ""), tool_input, cfg, root, cwd)
     if verdict.reason:
         print(json.dumps({"decision": verdict.decision, "reason": verdict.reason}))
     if verdict.decision == "block":
