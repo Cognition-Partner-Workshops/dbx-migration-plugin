@@ -9,6 +9,9 @@
 - A ready `doctor.py --wave` run (not `--role child`) writes that pointer itself, so a wave launches
   without a hand-written one; a not-ready run writes none. `--wave` refuses a manifest outside
   `<workspace>/.migration/waves/`.
+- factory-doctor `type_map_audit` audits each unit mapping against its own top-level `target_kind`
+  (databricks|lakebase), falling back to `--target-kind`, so a run mixing Lakebase and Delta units
+  can reach one green doctor; a mixed audit records `target_kind: "mixed"` and is never reused by a child.
 
 # 0.6.0 — .migration/ holds machine files only
 
