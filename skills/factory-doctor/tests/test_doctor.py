@@ -2434,8 +2434,10 @@ def _ready_wave(tmp_path, monkeypatch):
 def test_ready_wave_writes_the_fanout_pointer(tmp_path, monkeypatch, capsys):
     ws, manifest, pointer = _ready_wave(tmp_path, monkeypatch)
     hook_probe = probed(ws)
+    monkeypatch.chdir(tmp_path)
     assert doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT),
-                        "--hook-probe-result", hook_probe, "--wave", str(manifest)]) == 0
+                        "--hook-probe-result", hook_probe, "--wave", ".migration/waves/wave-1.json"]) == 0
+    assert manifest.with_suffix(".doctor.json").exists()
     assert json.loads(pointer.read_text()) == {"manifest": "wave-1.json", "hook_probe": hook_probe,
                                                "workspace": str(ws.resolve()), "plugin": str(PLUGIN_ROOT.resolve())}
     assert f"pointer -> {pointer}" in capsys.readouterr().out

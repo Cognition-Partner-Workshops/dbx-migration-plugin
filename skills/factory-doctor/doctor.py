@@ -2009,6 +2009,7 @@ def main(argv: list[str] | None = None) -> int:
             "named for the probe_command of the last report")
     manifest_bytes = None
     if a.wave:
+        a.wave = a.workspace.resolve() / a.wave  # a relative manifest path is the workspace's, not the cwd's
         waves_dir = a.workspace.resolve() / ".migration" / "waves"
         if a.wave.resolve().parent != waves_dir:
             p.error(f"--wave must name a manifest in {waves_dir}: the fan-out workflow reads it from there")

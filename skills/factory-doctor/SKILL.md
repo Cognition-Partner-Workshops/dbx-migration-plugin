@@ -36,7 +36,7 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
 the platform hook once per wave and signs `wave-N.doctor.json`); `--role setup` is the intake /
 wave-plan worker before mappings exist; `--role child` is a batch worker. Writes
 `.migration/capabilities.json` and prints one line per row. Exit 0 means `ready`.
-`--wave` takes a manifest in `<workspace>/.migration/waves/` and, when ready and not `--role child`,
+`--wave` takes a manifest in `<workspace>/.migration/waves/` (a relative path is the workspace's) and, when ready and not `--role child`,
 writes the fan-out pointer `~/.dbx-migration-factory/current-wave.json` (`pointer -> <path>`).
 
 A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the wave worker's signed
