@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 import time
@@ -3202,10 +3203,56 @@ def test_oracle_source_principal_unresolvable_table_is_unverified(monkeypatch):
     assert row.status == "unverified" and "'t'" in row.detail
 
 
-def test_oracle_dsn_parse():
-    m = doctor._ORACLE_DSN_RE.match("oracle://u:p@host:1521/FREEPDB1")
-    assert m["user"] == "u" and m["dsn"] == "host:1521/FREEPDB1"
-    assert doctor._ORACLE_DSN_RE.match("not-a-dsn") is None
+def test_oracledb_connect_parses_json_and_sets_read_only(monkeypatch):
+    calls, executed = {}, []
+
+    class Cursor:
+        def execute(self, sql):
+            executed.append(sql)
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    def connect(**kwargs):
+        calls.update(kwargs)
+        return Conn()
+
+    monkeypatch.setitem(sys.modules, "oracledb", types.SimpleNamespace(connect=connect))
+    monkeypatch.setenv("ORA_DSN", json.dumps({
+        "user": "scott", "password": "tiger", "host": "db.example.com", "port": 1521,
+        "service": "SVC",
+    }))
+    doctor._oracledb_connect(os.environ["ORA_DSN"])
+    assert calls == {"user": "scott", "password": "tiger", "dsn": "db.example.com:1521/SVC"}
+    assert executed == ["SET TRANSACTION READ ONLY"]
+
+
+def test_oracle_source_principal_redacts_connect_error_from_json_dsn(monkeypatch):
+    password = "s3cr3t-Pw"
+    monkeypatch.setenv("ORA_DSN", json.dumps({
+        "user": "scott", "password": password, "host": "db.example.com", "port": 1521,
+        "service": "SVC",
+    }))
+
+    def connect(**kwargs):
+        raise RuntimeError(f"DPY-4011: connect to {kwargs['dsn']} failed for password={kwargs['password']}")
+
+    monkeypatch.setitem(sys.modules, "oracledb", types.SimpleNamespace(connect=connect))
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN")
+    assert row.status == "fail" and "source query failed" in row.detail
+    assert password not in row.detail
+
+
+def test_oracle_source_principal_redacts_json_dsn_validation_error(monkeypatch):
+    password = "s3cr3t-Pw"
+    monkeypatch.setenv("ORA_DSN", json.dumps({
+        "user": "scott", "password": password, "port": 1521, "service": "SVC",
+    }))
+    monkeypatch.setitem(sys.modules, "oracledb", types.SimpleNamespace(connect=lambda **kwargs: None))
+    row = doctor.check_source_principal(["t"], "oracle", "ORA_DSN")
+    assert row.status == "fail" and "host" in row.detail
+    assert password not in row.detail
 
 
 def test_oracle_source_principal_fails_when_session_user_owns_the_table(monkeypatch):
