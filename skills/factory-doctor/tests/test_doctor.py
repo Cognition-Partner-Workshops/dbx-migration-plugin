@@ -2182,6 +2182,24 @@ def test_type_map_audit_fails_on_an_unknown_declared_target_kind(tmp_path, monke
     assert c.data["units_problem"] is True and calls == []
 
 
+def test_type_map_audit_fails_on_a_contradiction_even_when_another_kind_has_no_map(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    oltp = _typed_unit_mapping(ws, "accounts", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    _declare_target_kind(oltp, "lakebase")
+    _typed_unit_mapping(ws, "ledger", [_field("AMOUNT", "NUMBER(12,2)", "double")])
+
+    def fake(cmd, subcommand):
+        if subcommand[subcommand.index("--target-kind") + 1] == "lakebase":
+            return {"findings": [], "family_known": True, "target_known": False, "map": None}, 0, ""
+        return {"findings": [{"field": "orders.AMOUNT", "verdict": "contradiction", "detail": "decimal(12,2)",
+                              "source_type": "NUMBER(12,2)", "target_type": "double"}],
+                "family_known": True, "target_known": True, "map": None}, 0, ""
+    monkeypatch.setattr(doctor, "_harness_json", fake)
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and "orders.AMOUNT" in c.detail
+    assert c.data["unaudited_kinds"] == ["lakebase"] and c.data["target_kind"] == "mixed"
+
+
 def test_type_map_audit_records_the_cli_kind_when_no_spec_declares_one(tmp_path, monkeypatch):
     ws = make_workspace(tmp_path)
     _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])

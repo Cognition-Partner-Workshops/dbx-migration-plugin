@@ -748,6 +748,8 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
         data.update({"target_kind": uniq[0] if len(uniq) == 1 else "mixed", "target_kinds": kinds})
         missing = [k for k in uniq if k not in mapped_kinds]
         if missing:
+            data["unaudited_kinds"] = missing
+        if not contradictions and missing:
             if family_known:
                 return Check(cid, "warn", f"no {source_family}->{','.join(missing)} type map in any "
                     f"skills/*/canonicalization.json ({how}); the spec's target types are unaudited", {**data,
