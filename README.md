@@ -144,7 +144,7 @@ base branch.
 | `.migration/capabilities.json` | factory-doctor | factory-doctor, wave-plan, migration-fanout |
 | `.migration/.hook_probe_nonce` | factory-doctor | factory-doctor |
 | `.migration/units/` (`dependencies.json`, `mapping_spec.json`) | pipeline analysis / dialect skill | wave-plan, factory-doctor, migration-fanout, reconciliation harness |
-| `.migration/waves/` (manifests, signatures, run records, results, current pointer) | wave-plan, migration-fanout | factory-doctor, migration-fanout, wave-verify |
+| `.migration/waves/` (manifests, signatures, run records, results) | wave-plan, migration-fanout | factory-doctor, migration-fanout, wave-verify |
 | `.migration/recon/` (unit reconciliation evidence) | unit-migration / reconciliation harness | wave-verify, migration-fanout, manager |
 | `.migration/snapshots/` (snapshot manifests) | snapshot/export workflow | reconciliation harness |
 
