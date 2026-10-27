@@ -225,6 +225,21 @@ def test_check_finds_dependency_missing_from_all_wave_manifests(tmp_path):
     assert "dependency a (wave 2 wave-2.json/batch-a) -> b is not placed in any wave manifest" in result.stdout
 
 
+def test_check_accepts_leaf_wave_before_later_dependent_is_placed(tmp_path):
+    _unit(tmp_path, "a", reads=["tb"], writes=["ta"])
+    _unit(tmp_path, "b", writes=["tb"])
+    waves_dir = tmp_path / ".migration" / "waves"
+    waves_dir.mkdir(parents=True)
+    (waves_dir / "wave-1.json").write_text(json.dumps({
+        "wave": 1,
+        "batches": [{"id": "batch-b", "units": ["b"]}],
+    }))
+
+    result = _run(tmp_path, "--check", ".migration/waves/wave-1.json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "consistent with the derived dependency order" in result.stdout
+
+
 def test_check_accepts_derived_batches_across_sibling_waves(tmp_path):
     _unit(tmp_path, "a", reads=["tb"], writes=["ta"])
     _unit(tmp_path, "b", writes=["tb"])

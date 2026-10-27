@@ -359,10 +359,6 @@ def check(root, manifest_path, derived):
                     source_label = f"wave {source[0]} {source[1]}/{source[2]}"
                     findings.append(f"dependency {unit} ({source_label}) -> {dependency} is not placed in any "
                                     "wave manifest")
-                elif target is not None:
-                    target_label = f"wave {target[0]} {target[1]}/{target[2]}"
-                    findings.append(f"dependency {dependency} ({target_label}) is depended on by {unit}, which no "
-                                    "wave manifest places")
                 continue
             source_label = f"wave {source[0]} {source[1]}/{source[2]}"
             target_label = f"wave {target[0]} {target[1]}/{target[2]}"
