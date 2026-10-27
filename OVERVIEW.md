@@ -40,7 +40,8 @@ objects go first in a `wave: 0`, `width: 1` manifest; a small first wave tunes t
 skill before full fan-out.
 
 For each wave the worker: writes `.migration/waves/wave-N.json` → runs `factory-doctor`
-(which signs `wave-N.doctor.json`) → writes the `waves/current.json` pointer → calls
+(which signs `wave-N.doctor.json`) → writes the `~/.dbx-migration-factory/current-wave.json`
+pointer → calls
 `run_workflow` with `skills/migration-fanout/workflow.py`. The script holds no credentials: it
 checks the signed doctor file, refuses write-target collisions and a manifest that already ran
 (`wave-N.runs.jsonl`), launches the children with batch briefs of at most 4000 characters that

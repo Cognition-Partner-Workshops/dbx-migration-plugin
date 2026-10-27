@@ -36,9 +36,10 @@ Optional and non-empty when present; keys are `core`, `sql`, `pipeline`, `orches
    it carries no secret values (manifest hash, timestamp, principal name, host, readiness,
    `inputs_sha`, signature), and children reuse it per `skills/factory-doctor/SKILL.md`, running
    the doctor in full when it is stale or absent.
-3. Write `~/.migration/waves/current.json`; its `plugin` key names the plugin root the skills and
+3. Write `~/.dbx-migration-factory/current-wave.json`; its `plugin` key names the plugin root the skills and
    `pipeline_updates.py` resolve from:
    `{"manifest": "wave-<N>.json", "hook_probe": "blocked:<nonce>|not-blocked|unknown", "workspace": "/abs/repo", "plugin": "<plugin>"}`.
+   Never create `.migration/` outside a repo; the guard treats it as a broken workspace.
 4. Run `run_workflow(workflow_name="migration-wave-<N>", script_path="<plugin>/skills/migration-fanout/workflow.py")`.
 5. Post `.migration/waves/wave-<N>.card.md` on the ticket with the result's `brief` lines and a link
    to `wave-<N>.result.json`; the manager ticks the gate.
@@ -86,7 +87,7 @@ The credential-free smoke manifest exercises pointer discovery, registration, an
 writing without a doctor, git origin, or child launch:
 
 ```sh
-mkdir -p /tmp/fanout-smoke/.migration/waves && printf '{"smoke": true, "wave": 0, "width": 1, "batches": []}' > /tmp/fanout-smoke/.migration/waves/wave-0.json && mkdir -p ~/.migration/waves && printf '{"manifest": "wave-0.json", "hook_probe": "unknown", "workspace": "/tmp/fanout-smoke", "plugin": "<plugin>"}' > ~/.migration/waves/current.json
+mkdir -p /tmp/fanout-smoke/.migration/waves && printf '{"smoke": true, "wave": 0, "width": 1, "batches": []}' > /tmp/fanout-smoke/.migration/waves/wave-0.json && mkdir -p ~/.dbx-migration-factory && printf '{"manifest": "wave-0.json", "hook_probe": "unknown", "workspace": "/tmp/fanout-smoke", "plugin": "<plugin>"}' > ~/.dbx-migration-factory/current-wave.json
 ```
 
 Then run `run_workflow(workflow_name="smoke-wave-0", script_path="<plugin>/skills/migration-fanout/workflow.py")`.

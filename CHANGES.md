@@ -1,5 +1,11 @@
 # 0.6.1 (unreleased)
 
+## Changed
+
+- The migration-fanout pointer moves from `.migration/waves/current.json` to
+  `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
+  every command. `workspace` is now required, and the old path (or a leftover `.migration/` beside
+  the new pointer outside a repo) is refused with a hint that deletes only empty directories.
 - factory-doctor `type_map_audit` audits each unit mapping against its own top-level `target_kind`
   (databricks|lakebase), falling back to `--target-kind`, so a run mixing Lakebase and Delta units
   can reach one green doctor; a mixed audit records `target_kind: "mixed"` and is never reused by a child.
