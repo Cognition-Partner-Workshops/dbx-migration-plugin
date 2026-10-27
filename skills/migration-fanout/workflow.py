@@ -20,7 +20,8 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-POINTER_REL = Path(".migration/waves/current.json")
+POINTER_REL = Path(".dbx-migration-factory/current-wave.json")
+LEGACY_POINTER_REL = Path(".migration/waves/current.json")
 HOOK_PROBE = re.compile(r"blocked:[0-9a-f]{8}|not-blocked|unknown")
 DOCTOR_MAX_AGE = datetime.timedelta(minutes=15)
 
@@ -30,6 +31,13 @@ def find_pointer(start):
     for d in (start, *start.parents):
         if (d / POINTER_REL).is_file():
             return d / POINTER_REL
+    for d in (start, *start.parents):
+        if (d / LEGACY_POINTER_REL).is_file():
+            raise SystemExit(
+                f"{d / LEGACY_POINTER_REL} is the pre-0.6.1 pointer path: a .migration/ directory outside a repo "
+                f"makes dbx_guard refuse every command there. Move it to {d / POINTER_REL} and delete "
+                f"{d / '.migration'} (it holds nothing else), then re-run"
+            )
     raise SystemExit(f"no {POINTER_REL} at or above {start}; write the wave ticket's pointer, then re-run")
 
 
@@ -46,11 +54,13 @@ if isinstance(POINTER, dict) and ("mode" in POINTER or "run_id" in POINTER):
     )
 if not isinstance(POINTER, dict) or not isinstance(POINTER.get("manifest"), str):
     raise SystemExit(f"{POINTER_PATH} must be {{manifest: 'wave-N.json', hook_probe, workspace, plugin}}")
+if not isinstance(POINTER.get("workspace"), str):
+    raise SystemExit(f"{POINTER_PATH} must name 'workspace': the absolute repo path")
 HOOK_PROBE_RESULT = POINTER.get("hook_probe")
 if not isinstance(HOOK_PROBE_RESULT, str) or not HOOK_PROBE.fullmatch(HOOK_PROBE_RESULT):
     raise SystemExit(f"{POINTER_PATH} hook_probe must be blocked:<nonce>, not-blocked or unknown (the probe run in the "
                      "worker's shell; the doctor was given the same value)")
-ROOT = Path(POINTER["workspace"]).resolve() if isinstance(POINTER.get("workspace"), str) else POINTER_PATH.parents[2]
+ROOT = Path(POINTER["workspace"]).resolve()
 PLUGIN = Path(POINTER["plugin"]).resolve() if isinstance(POINTER.get("plugin"), str) else None
 if PLUGIN:
     sys.path.insert(0, str(PLUGIN / "skills" / "migration-fanout"))
@@ -190,7 +200,7 @@ def signed_doctor_report(path, manifest_bytes, manifest_sha, now=None):
         raise SystemExit(f"{path} signature does not verify: the record was edited after the doctor wrote it; "
                          "re-run the doctor")
     if report.get("hook_probe") != HOOK_PROBE_RESULT:
-        raise SystemExit(f"{path} was signed for hook_probe {report.get('hook_probe')!r} but current.json "
+        raise SystemExit(f"{path} was signed for hook_probe {report.get('hook_probe')!r} but the pointer "
                          f"says {HOOK_PROBE_RESULT!r}; give the doctor and the pointer the same probe result")
     return report
 

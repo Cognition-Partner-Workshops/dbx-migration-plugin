@@ -1,3 +1,11 @@
+# 0.6.1 (unreleased)
+
+## Changed
+
+- The migration-fanout pointer moves from `.migration/waves/current.json` to
+  `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
+  every command. `workspace` is now required, and the old path is refused with a move hint.
+
 # 0.6.0 — .migration/ holds machine files only
 
 0.5.0 moved the human-readable ledger onto the board but several skills still asked for prose
