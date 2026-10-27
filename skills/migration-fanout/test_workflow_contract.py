@@ -2,6 +2,7 @@ import datetime
 import fcntl
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -149,14 +150,13 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
     subprocess.run(["git", "-C", str(ws), "commit", "-qm", "setup"], check=True)
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:migration/x"], check=True)
     pointer_root = tmp_path / "home" if pointer_at == "home" else ws
-    pointer_dir = pointer_root / ".migration" / "waves"
+    pointer_dir = pointer_root / ".dbx-migration-factory"
     pointer_dir.mkdir(parents=True, exist_ok=True)
     pointer = {"manifest": manifest_name, "hook_probe": hook_probe}
     if plugin is not None:
         pointer["plugin"] = str(plugin)
-    if pointer_at == "home":
-        pointer["workspace"] = str(ws)
-    (pointer_dir / "current.json").write_text(json.dumps(pointer))
+    pointer["workspace"] = str(ws)
+    (pointer_dir / "current-wave.json").write_text(json.dumps(pointer))
     cwd = tmp_path / "home" / "sub" / "dir" if pointer_at == "home" else ws
     cwd.mkdir(parents=True, exist_ok=True)
     return ws, cwd
@@ -872,6 +872,96 @@ def test_pointer_above_the_cwd_names_the_workspace(tmp_path):
     assert [c["label"] for c in calls if c["kind"] == "agent"] == ["b-1"]
 
 
+def test_legacy_pointer_path_is_refused_with_the_move_hint(tmp_path):
+    ws, cwd = _workspace(tmp_path, pointer_at="home")
+    pointer_path = tmp_path / "home" / ".dbx-migration-factory" / "current-wave.json"
+    pointer = pointer_path.read_text()
+    pointer_path.unlink()
+    legacy_path = tmp_path / "home" / ".migration" / "waves" / "current.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(pointer)
+
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+
+    assert proc.returncode != 0
+    assert ".dbx-migration-factory/current-wave.json" in proc.stderr
+    assert "delete" in proc.stderr
+    assert "-empty -delete" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_legacy_pointer_is_refused_even_beside_the_new_one(tmp_path):
+    ws, cwd = _workspace(tmp_path, pointer_at="home")
+    home = tmp_path / "home"
+    legacy_path = home / ".migration" / "waves" / "current.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text((home / ".dbx-migration-factory" / "current-wave.json").read_text())
+
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+
+    assert proc.returncode != 0
+    assert "pre-0.6.1" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_leftover_migration_dir_beside_the_pointer_is_refused(tmp_path):
+    ws, cwd = _workspace(tmp_path, pointer_at="home")
+    (tmp_path / "home" / ".migration" / "waves").mkdir(parents=True)
+
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+
+    assert proc.returncode != 0
+    assert "-empty -delete" in proc.stderr
+    assert "sits beside" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_pointer_without_workspace_is_refused(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pointer_path = ws / ".dbx-migration-factory" / "current-wave.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer.pop("workspace")
+    pointer_path.write_text(json.dumps(pointer))
+
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+
+    assert proc.returncode != 0 and "must name 'workspace'" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_pointer_dir_is_not_a_guard_workspace(tmp_path):
+    home = tmp_path / "home"
+    pointer_path = home / ".dbx-migration-factory" / "current-wave.json"
+    pointer_path.parent.mkdir(parents=True)
+    pointer_path.write_text(json.dumps({
+        "manifest": "wave-0.json", "hook_probe": "unknown", "workspace": str(tmp_path / "repo"),
+        "plugin": str(PLUGIN),
+    }))
+    event = {"tool_name": "exec", "tool_input": {"command": "ls", "workdir": str(home)}}
+    proc = subprocess.run([sys.executable, str(PLUGIN / "hooks" / "dbx_guard.py")], cwd=home,
+                          env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+                          input=json.dumps(event), capture_output=True, text=True)
+
+    assert proc.returncode == 0
+    assert proc.stdout == ""
+
+
+def test_legacy_pointer_in_a_repo_keeps_its_files(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pointer_path = ws / ".dbx-migration-factory" / "current-wave.json"
+    legacy_path = ws / ".migration" / "waves" / "current.json"
+    legacy_path.write_text(pointer_path.read_text())
+    pointer_path.unlink()
+
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+
+    assert proc.returncode != 0
+    assert "-empty -delete" in proc.stderr
+    assert (ws / ".migration" / "waves" / "wave-0.json").is_file()
+    assert "holds nothing else" not in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
 def test_pipeline_manifest_tags_the_verifier_branch_and_workflow(tmp_path):
     ws, cwd = _workspace(tmp_path, manifest_name="wave-p2-1.json", wave=1, pipelines={"p2": 1})
     subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:refs/pull/1/head",
@@ -992,7 +1082,7 @@ def test_script_reads_no_environment_and_no_file_path():
 
 def test_docs_describe_the_pointer_and_doctor_wave_steps():
     doc = (WORKFLOW.parent / "SKILL.md").read_text()
-    assert "current.json" in doc
+    assert "current-wave.json" in doc
     assert "run_workflow" in doc
     assert '"mode"' not in doc and '"run_id"' not in doc
     assert '"workspace"' in doc or "workspace" in doc
@@ -1646,7 +1736,7 @@ def test_the_wave_plan_and_fanout_docs_produce_the_pipeline_check_inputs_the_wor
     plan = (PLUGIN / "skills" / "wave-plan" / "SKILL.md").read_text()
     assert "`lakeflow_pipelines`" in plan and "`serialized_pipelines`" in plan
     fanout = (WORKFLOW.parent / "SKILL.md").read_text()
-    assert "`plugin`" in fanout and "current.json" in fanout
+    assert "`plugin`" in fanout and "current-wave.json" in fanout
 
 
 def test_a_pointer_with_the_plugin_root_and_declared_pipelines_launches(tmp_path):
