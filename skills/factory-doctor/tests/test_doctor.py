@@ -2143,6 +2143,74 @@ def test_type_map_audit_asks_the_installed_harness_first(tmp_path, monkeypatch):
     assert c.status == "ok" and c.data["harness"] == "dbx-recon" and c.data["fields"] == 1
 
 
+def _record_harness_argv(monkeypatch) -> list[list[str]]:
+    calls = []
+
+    def fake(cmd, subcommand):
+        calls.append(subcommand)
+        return {"findings": [], "family_known": True, "target_known": True,
+                "map": str(PLUGIN_ROOT / "skills/oracle-plsql/canonicalization.json")}, 0, ""
+    monkeypatch.setattr(doctor, "_harness_json", fake)
+    return calls
+
+
+def _declare_target_kind(p: Path, kind) -> None:
+    p.write_text(json.dumps({**json.loads(p.read_text()), "target_kind": kind}))
+
+
+def test_type_map_audit_uses_each_specs_declared_target_kind(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    oltp = _typed_unit_mapping(ws, "accounts", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    _declare_target_kind(oltp, "lakebase")
+    delta = _typed_unit_mapping(ws, "ledger", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    calls = _record_harness_argv(monkeypatch)
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT,
+                                    target_kind="databricks")
+    kinds = {argv[argv.index("--spec") + 1]: argv[argv.index("--target-kind") + 1] for argv in calls}
+    assert kinds == {str(oltp): "lakebase", str(delta): "databricks"}
+    assert c.status == "ok" and c.data["target_kind"] == "mixed"
+    assert c.data["target_kinds"] == kinds and "databricks: 1, lakebase: 1 specs" in c.detail
+
+
+def test_type_map_audit_fails_on_an_unknown_declared_target_kind(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    p = _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    _declare_target_kind(p, "delta")
+    calls = _record_harness_argv(monkeypatch)
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and str(p) in c.detail and str(doctor.TARGET_KINDS) in c.detail
+    assert c.data["units_problem"] is True and calls == []
+
+
+def test_type_map_audit_fails_on_a_contradiction_even_when_another_kind_has_no_map(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    oltp = _typed_unit_mapping(ws, "accounts", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    _declare_target_kind(oltp, "lakebase")
+    _typed_unit_mapping(ws, "ledger", [_field("AMOUNT", "NUMBER(12,2)", "double")])
+
+    def fake(cmd, subcommand):
+        if subcommand[subcommand.index("--target-kind") + 1] == "lakebase":
+            return {"findings": [], "family_known": True, "target_known": False, "map": None}, 0, ""
+        return {"findings": [{"field": "orders.AMOUNT", "verdict": "contradiction", "detail": "decimal(12,2)",
+                              "source_type": "NUMBER(12,2)", "target_type": "double"}],
+                "family_known": True, "target_known": True, "map": None}, 0, ""
+    monkeypatch.setattr(doctor, "_harness_json", fake)
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and "orders.AMOUNT" in c.detail
+    assert c.data["unaudited_kinds"] == ["lakebase"] and c.data["target_kind"] == "mixed"
+
+
+def test_type_map_audit_records_the_cli_kind_when_no_spec_declares_one(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "loans", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    _typed_unit_mapping(ws, "fees", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    calls = _record_harness_argv(monkeypatch)
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT,
+                                    target_kind="lakebase")
+    assert c.status == "ok" and c.data["target_kind"] == "lakebase"
+    assert {argv[argv.index("--target-kind") + 1] for argv in calls} == {"lakebase"}
+
+
 
 # ------------------------------------------------------------------ contract integrity rows (A2c)
 
@@ -2814,6 +2882,14 @@ def test_run_recomputes_type_map_audit_when_the_recorded_target_kind_differs(tmp
     report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True,
                         expect_host="https://adb-1", target_kind="lakebase", reused=reused)
     assert by_id(report)["type_map_audit"]["detail"].startswith("reused from")
+    rows = [{"id": "type_map_audit", "status": "ok", "detail": "audited",
+             "data": {"target_kind": "mixed"}}]
+    record, manifest_bytes = _signed_record(manifest, rows=rows)
+    reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True,
+                        expect_host="https://adb-1", target_kind="lakebase", reused=reused)
+    row = by_id(report)["type_map_audit"]
+    assert row["detail"] == "fresh" and row["data"]["target_kind"] == "lakebase"
 
 
 def test_run_computes_a_reusable_row_the_record_lacks(tmp_path, monkeypatch):

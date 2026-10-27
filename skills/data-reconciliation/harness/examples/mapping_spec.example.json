@@ -1,5 +1,6 @@
 {
   "version": "map-v1",
+  "target_kind": "databricks",
   "tables": [
     {
       "source_table": "public.orders",

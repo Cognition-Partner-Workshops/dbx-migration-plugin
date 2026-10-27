@@ -683,6 +683,16 @@ def per_unit(cid: str, ws: Path, role: str, units: list[str], mappings: list[Pat
     return fn(expected, todo)
 
 
+def spec_target_kind(path: Path, default: str) -> tuple[str | None, str | None]:
+    """A spec's top-level `target_kind` overrides the CLI default for that spec."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        return None, f"{path}: cannot read target_kind: {e}"
+    v = data.get("target_kind", default) if isinstance(data, dict) else default
+    return (v, None) if v in TARGET_KINDS else (None, f"{path}: target_kind {v!r} must be one of {TARGET_KINDS}")
+
+
 def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[Path], source_family: str | None,
     plugin_root: Path, params: dict[str, str] | None = None, target_kind: str = "databricks") -> Check:
     """Committed specs' declared target types against the dialect skill's type_map (see references/checks.md)."""
@@ -702,21 +712,27 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
         pargs = [a for k, v in (params or {}).items() for a in ("--param", f"{k}={v}")]
         data = {"family": source_family, "target_kind": target_kind, "harness": how}
         contradictions, unmapped, undeclared, fields = [], [], 0, 0
-        family_known = target_known = False
+        family_known = False
+        kinds, mapped_kinds = {}, set()
         rel = None
         for _, p_ in sorted(todo.items(), key=lambda kv: str(kv[1])):
             _, spec_err = _load_mapping(p_, params, plugin_root)
             if spec_err:
                 return Check(cid, "fail", f"{p_}: {spec_err}", {**data, "units_problem": True})
+            kind, err = spec_target_kind(p_, target_kind)
+            if err:
+                return Check(cid, "fail", err, {**data, "units_problem": True})
+            kinds[str(p_)] = kind
             reg, rc, shown = _harness_json(cmd, ["type-map-audit", "--spec", str(p_), "--family", source_family,
-                "--target-kind", target_kind, *cargs, *pargs])
+                "--target-kind", kind, *cargs, *pargs])
             if (not isinstance(reg, dict) or not isinstance(reg.get("findings"), list) or
                     not all(isinstance(f.get("verdict"), str) for f in reg["findings"])):
                 return Check(cid, "fail", f"cannot audit target types ({how} type-map-audit rc={rc}): {shown}", data)
             if reg.get("error"):
                 return Check(cid, "fail", f"{p_}: {_redact(str(reg['error']))} ({how})", data)
             family_known |= bool(reg.get("family_known"))
-            target_known |= bool(reg.get("target_known"))
+            if reg.get("target_known"):
+                mapped_kinds.add(kind)
             if reg.get("map"):
                 mp = Path(reg["map"])
                 rel = str(mp.relative_to(plugin_root)) if mp.is_relative_to(plugin_root) else str(mp)
@@ -728,9 +744,14 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
                     unmapped.append(row)
                 elif row["verdict"] == "undeclared":
                     undeclared += 1
-        if not target_known:
+        uniq = sorted(set(kinds.values()))
+        data.update({"target_kind": uniq[0] if len(uniq) == 1 else "mixed", "target_kinds": kinds})
+        missing = [k for k in uniq if k not in mapped_kinds]
+        if missing:
+            data["unaudited_kinds"] = missing
+        if not contradictions and missing:
             if family_known:
-                return Check(cid, "warn", f"no {source_family}->{target_kind} type map in any "
+                return Check(cid, "warn", f"no {source_family}->{','.join(missing)} type map in any "
                     f"skills/*/canonicalization.json ({how}); the spec's target types are unaudited", {**data,
                     "family_known": True})
             return Check(cid, "warn", f"no type map for {source_family} in any skills/*/canonicalization.json; "
@@ -744,7 +765,8 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
             return Check(cid, "fail", f"{len(contradictions)} field(s) declare a target type the "
                 f"{source_family} type map forbids: {shown}{more} ({how})", {**data,
                 "contradictions": contradictions})
-        return Check(cid, "ok", f"{fields} typed fields agree with {rel}; {len(unmapped)} unmapped "
+        per_kind = ", ".join(f"{k}: {list(kinds.values()).count(k)}" for k in uniq)
+        return Check(cid, "ok", f"{fields} typed fields agree with {rel} ({per_kind} specs); {len(unmapped)} unmapped "
             f"source types recorded, {undeclared} undeclared targets the harness fills at run time ({how})", data)
 
     return per_unit(cid, ws, role, units, mappings, audit)
@@ -1988,7 +2010,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source-family", choices=SOURCE_FAMILIES,
         help="source engine behind --source-secret (default: implied by the mappings' delete_evidence kind)")
     p.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks",
-        help="recon target the type_map is audited against")
+        help="default recon target for specs that do not declare top-level target_kind")
     p.add_argument("--source-attested", metavar="<id>",
         help="plan decision id attesting the source has no principal to query; rejected for families "
         "with a privilege query")

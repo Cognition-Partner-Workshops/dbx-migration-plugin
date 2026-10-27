@@ -106,3 +106,4 @@ the family or the spec will not load; `unverified` when no family is declared;
 harness fills; `skipped` only at setup. The audit runs on the same harness `recon_harness`
 ran (`dbx-recon` on PATH, else the checkout's `python -m recon.cli type-map-audit`); a
 missing harness or unreadable output also fails.
+A spec's top-level `target_kind` (databricks|lakebase) overrides --target-kind for that spec.
