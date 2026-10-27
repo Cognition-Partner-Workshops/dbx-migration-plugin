@@ -870,6 +870,8 @@ def _check_unreadable(segs: list[_Seg], cfg: GuardConfig, text: str) -> list[str
                     break
             if any(re.fullmatch(r"\d*<<-?", w) and _expands(s.raw[i + 1]) for i, w in enumerate(s.words[:-1])):
                 violations.append("unquoted heredoc expands `$`/backticks in its body; quote the delimiter (<<'EOF') or inline the values")
+        elif any(_expands(s.raw_of(w), subst=True) for w in s.argv[1:]):
+            violations.append(f"command substitution in `{base}` names a SQL client; run the client directly so the guard can read the call")
         if base not in _KNOWN and base not in _INERT and base not in defined and not _PYTHON.fullmatch(base) and (hits := _conn(s, cfg, "")[0]):
             violations.append(f"unrecognised command `{base}` names legacy connection {hits}; the guard cannot verify its operation")
     words, raw = _shell_tokens(text)
@@ -898,6 +900,8 @@ def _check_sql_client(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
         bad.insert(0, f"script(s) {unreadable} the guard cannot read")
     if not bad:
         return violations
+    if not cfg.catalogs:
+        return violations + [_Legacy(f"non-read statement through `{base}` without an allowlisted write scope: `{bad[0]}`")]
     if legacy or hits:
         violation = (f"non-read statement through a legacy-only client `{base}`" if legacy
                      else f"non-read statement against legacy source {hits}") + f": `{bad[0]}`"
@@ -1294,8 +1298,9 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
         if seg.remote == seg.argv0:                            # `aws ssm ... --instance-ids H` / `--targets ...,Values=H`: H is the target
             outer += [p.lower() for w in seg.argv[1:] for p in re.split(r"[=,]", w)]
         hits = list(dict.fromkeys([*(t for t in cfg.legacy_sources if t.lower() in outer), *_conn(seg, cfg, "\n".join(seg.heredocs))[0]]))
-        if not hits:
+        if not hits and cfg.catalogs:
             continue
+        hits = hits or ["unscoped remote host (no allowlist)"]
         base = seg.argv0
         if not seg.argv:
             violations.append(f"`{seg.remote}` opens an interactive session on legacy source {hits}; the guard cannot read what would run")

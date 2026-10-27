@@ -1224,6 +1224,45 @@ def test_text_tools_do_not_hide_client_invocations(command: str):
     assert g.evaluate(command, CFG).decision == "block"
 
 
+@pytest.mark.parametrize("command", [
+    'echo "$(sqlplus $ORACLE_DSN -c \'DELETE FROM orders\')"',
+    'printf "%s\\n" "$(psql $ORACLE_DSN -c \'DELETE FROM orders\')"',
+    'grep "`sqlplus $ORACLE_DSN -c \'DELETE FROM orders\'`" notes.md',
+    'cat "$(sqlplus $ORACLE_DSN -c \'DELETE FROM orders\')"',
+])
+def test_text_tool_executable_substitutions_still_block(command: str):
+    assert "command substitution" in block(command).reason
+
+
+@pytest.mark.parametrize("command,rc", [
+    ("ssh legacy-prod 'rm /etc/legacy.conf'", 2),
+    ("ssh legacy-prod 'echo x > /etc/legacy.conf'", 2),
+    ("ssh legacy-prod 'python3 remote.py'", 2),
+    ("ssh legacy-prod 'ls /etc'", 0),
+    ("ssh legacy-prod 'cat /etc/legacy.conf'", 0),
+    ("ssh legacy-prod \"sqlplus x -c 'SELECT 1'\"", 0),
+    ("ssh legacy-prod \"sqlplus x -c 'DELETE FROM orders'\"", 2),
+])
+def test_main_unscoped_remote_is_read_only(unscoped_workspace: Path, command: str, rc: int):
+    r = _run({"tool_name": "exec", "tool_input": {"command": command}}, unscoped_workspace)
+    assert r.returncode == rc, r.stderr
+
+
+@pytest.mark.parametrize("client", ["sqlplus", "bteq"])
+def test_main_unscoped_authorization_never_creates_write_scope(unscoped_workspace: Path, client: str):
+    ws = unscoped_workspace
+    (ws / ".migration" / "authorizations.json").write_text(edits.AUTHORIZATIONS.replace("tolerance_change", "legacy_write_authorized"))
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    subprocess.run(["git", "-C", str(ws), "add", ".migration"], check=True)
+    subprocess.run(["git", "-C", str(ws), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                    "commit", "-qm", "authorization without policy"], check=True)
+    command = f"DBX_DECISION=D-7 {client} x -c 'ALTER TABLE dbo.orders ADD cdc_ts INT'"
+    seg = g._segments(command)[0]
+    assert g._decision(seg, ["ALTER TABLE dbo.orders ADD cdc_ts INT"], ws)[1] is None
+    r = _run({"tool_name": "exec", "tool_input": {"command": command}}, ws)
+    assert r.returncode == 2 and "No write scope exists until" in r.stderr
+
+
 @pytest.mark.parametrize("option", [f"--plugin-root {g._GUARD_TREE}", f"--plugin-root={g._GUARD_TREE}"])
 def test_doctor_literal_plugin_root_approves(tmp_path: Path, option: str):
     command = f"python3 {g._DOCTOR} --workspace {tmp_path} {option}"
