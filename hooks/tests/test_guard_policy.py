@@ -158,6 +158,7 @@ def test_psql_meta_commands_that_read_pass():
 
 @pytest.mark.parametrize("cmd", [
     "databricks --version", "databricks -h", "databricks jobs list --help", "databricks current-user me",
+    "databricks metastores current", "databricks metastores summary",
     "databricks catalogs list", "databricks schemas get prod.s", "databricks tables list prod s",
     "databricks volumes list prod s", "databricks functions get prod.s.f", "databricks api get /api/2.0/clusters/list",
     "databricks bundle summary -t prod", "databricks fs ls dbfs:/Volumes/prod/s/v", "databricks jobs list-runs --job-id 1",
@@ -187,6 +188,7 @@ def test_auth_commands_that_print_the_bearer_token_block():
     "databricks api post /api/2.1/jobs/create --json @j.json", "databricks api delete /api/2.1/unity-catalog/tables/prod.s.t",
     "databricks api patch /api/2.1/unity-catalog/catalogs/prod", "databricks catalogs update prod --json '{}'",
     "databricks experimental something new", "databricks tables delete prod.s.t", "databricks volumes create prod s v MANAGED",
+    "databricks metastores delete 123",
 ])
 def test_databricks_unrecognised_or_mutating_shapes_block(cmd):
     block(cmd)

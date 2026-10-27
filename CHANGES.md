@@ -2,6 +2,10 @@
 
 ## Changed
 
+- The migration-fanout pointer moves from `.migration/waves/current.json` to
+  `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
+  every command. `workspace` is now required, and the old path (or a leftover `.migration/` beside
+  the new pointer outside a repo) is refused with a hint that deletes only empty directories.
 - Wave manifests and the doctor accept a wave's catalogs as a subset of the allowlist.
 - Qualified batch `write_targets` must sit in the wave's `capabilities.catalogs`.
 - Manifests refuse pre-0.6.0 fields by name and give the replacement or deletion.
