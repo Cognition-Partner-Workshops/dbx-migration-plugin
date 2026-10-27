@@ -6,6 +6,9 @@
   `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
   every command. `workspace` is now required, and the old path (or a leftover `.migration/` beside
   the new pointer outside a repo) is refused with a hint that deletes only empty directories.
+- A ready `doctor.py --wave` run (not `--role child`) writes that pointer itself, so a wave launches
+  without a hand-written one; a not-ready run writes none. `--wave` refuses a manifest outside
+  `<workspace>/.migration/waves/`.
 
 # 0.6.0 — .migration/ holds machine files only
 

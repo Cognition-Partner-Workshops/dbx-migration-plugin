@@ -2417,6 +2417,58 @@ def test_wave_flag_writes_a_signed_record_beside_the_manifest(tmp_path):
     assert json.loads(default_manifest.with_suffix(".doctor.json").read_text())["hook_probe"] == "unknown"
 
 
+def _ready_wave(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "authenticated as sp-1 (service principal)"),
+    ])
+    ws = make_workspace(tmp_path / "ws")
+    manifest = ws / ".migration" / "waves" / "wave-1.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"capabilities": {"identity": "sp-1", "host": "https://h",
+                                                      "catalogs": ["mig_cat"]}}))
+    return ws, manifest, home / doctor.POINTER_HOME_REL
+
+
+def test_ready_wave_writes_the_fanout_pointer(tmp_path, monkeypatch, capsys):
+    ws, manifest, pointer = _ready_wave(tmp_path, monkeypatch)
+    hook_probe = probed(ws)
+    assert doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT),
+                        "--hook-probe-result", hook_probe, "--wave", str(manifest)]) == 0
+    assert json.loads(pointer.read_text()) == {"manifest": "wave-1.json", "hook_probe": hook_probe,
+                                               "workspace": str(ws.resolve()), "plugin": str(PLUGIN_ROOT.resolve())}
+    assert f"pointer -> {pointer}" in capsys.readouterr().out
+
+
+def test_not_ready_or_child_wave_writes_no_pointer(tmp_path, monkeypatch, capsys):
+    ws, manifest, pointer = _ready_wave(tmp_path, monkeypatch)
+    assert doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--wave", str(manifest)]) == 1
+    assert not pointer.exists() and "no pointer written: not ready" in capsys.readouterr().out
+    hook_probe = probed(ws)
+    real_run = doctor.run  # the orchestrator's checks, so only the child role keeps the pointer unwritten
+    monkeypatch.setattr(doctor, "run", lambda ws, plugin, role, *a, **kw: real_run(ws, plugin, "orchestrator", *a, **kw))
+    assert doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--role", "child",
+                        "--hook-probe-result", hook_probe, "--wave", str(manifest)]) == 0
+    assert not pointer.exists() and "pointer" not in capsys.readouterr().out
+
+
+def test_wave_manifest_must_sit_in_the_workspace_waves_dir(tmp_path, monkeypatch, capsys):
+    ws, manifest, pointer = _ready_wave(tmp_path, monkeypatch)
+    outside = tmp_path / "wave-1.json"
+    outside.write_text(manifest.read_text())
+    with pytest.raises(SystemExit) as e:
+        doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--wave", str(outside)])
+    assert e.value.code == 2 and str(ws.resolve() / ".migration" / "waves") in capsys.readouterr().err
+    assert not outside.with_suffix(".doctor.json").exists() and not pointer.exists()
+
+
+def test_pointer_path_matches_the_fanout_workflow():
+    source = (PLUGIN_ROOT / "skills" / "migration-fanout" / "workflow.py").read_text()
+    match = re.search(r'^POINTER_REL = Path\("([^"]+)"\)$', source, re.M)
+    assert match and Path(match.group(1)) == doctor.POINTER_HOME_REL
+
+
 def test_wave_rejects_explicit_source_settings(tmp_path):
     ws = make_workspace(tmp_path)
     manifest = ws / ".migration" / "waves" / "wave-1.json"
