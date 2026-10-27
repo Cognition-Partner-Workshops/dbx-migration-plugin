@@ -581,7 +581,7 @@ def test_target_namespace_when_present_is_a_dotted_identifier(namespace):
     validate_manifest = _functions()["validate_manifest"]
     with pytest.raises(SystemExit, match="target_namespace"):
         validate_manifest({**_manifest(), "target_namespace": namespace})
-    validate_manifest({**_manifest(), "target_namespace": "cat.mig"})
+    validate_manifest(_manifest(target_namespace="cat.mig", capabilities=_caps(host=HOST, catalogs=["cat"])))
 
 
 @pytest.mark.parametrize("where", ["1 = 1", "1=1", "'a' = 'a'", "TRUE", "NOT (1 = 2)", "${as_of} = ${as_of}",
@@ -1413,6 +1413,28 @@ def test_validate_manifest_names_plan_step_fix_when_missing():
     del m["plan_step"]
     with pytest.raises(SystemExit, match="plan.yaml step id"):
         _functions()["validate_manifest"](m)
+
+
+def test_validate_manifest_scopes_fully_qualified_write_targets_to_capabilities_catalogs():
+    validate_manifest = _functions()["validate_manifest"]
+    m = _manifest()
+    m["batches"][0]["write_targets"] = ["other.s.t"]
+    with pytest.raises(SystemExit) as exc:
+        validate_manifest(m)
+    assert "other.s.t" in str(exc.value) and "capabilities.catalogs" in str(exc.value)
+
+    m = _manifest()
+    m["batches"][0]["write_targets"] = ["MIG.s.t"]
+    validate_manifest(m)
+
+    m = _manifest(target_namespace="other.s")
+    m["batches"][0]["write_targets"] = ["t"]
+    with pytest.raises(SystemExit, match="capabilities.catalogs"):
+        validate_manifest(m)
+
+    m = _manifest()
+    m["batches"][0]["write_targets"] = ["s.t"]
+    validate_manifest(m)
 
 
 def test_validate_manifest_allows_serial_wave_zero_only():

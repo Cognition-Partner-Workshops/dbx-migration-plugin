@@ -3,6 +3,7 @@
 ## Changed
 
 - Wave manifests and the doctor accept a wave's catalogs as a subset of the allowlist.
+- Qualified batch `write_targets` must sit in the wave's `capabilities.catalogs`.
 - Manifests refuse pre-0.6.0 fields by name and give the replacement or deletion.
 - Missing `plan_step` and overlong brief messages say what to change.
 

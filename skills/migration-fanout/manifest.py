@@ -312,6 +312,15 @@ def validate_manifest(m, plugin=None):
         and all(isinstance(c, str) and c for c in caps["catalogs"]),
         "manifest 'capabilities.catalogs' must be the non-empty list of the catalogs this wave writes "
         "(a subset of the allowlist)")
+    cats = {c.strip().strip("`").lower() for c in caps["catalogs"]}
+    for b in m["batches"]:
+        stray = sorted(
+            t for t in b["write_targets"]
+            if len(k := target_key(t, ns).split(".")) == 3 and k[0] not in cats
+        )
+        req(not stray, f"batch {b['id']} write_targets {stray} are in catalogs outside "
+            f"capabilities.catalogs {sorted(cats)}; add the catalog to "
+            "capabilities.catalogs (within the allowlist) or fix the target")
     req(caps.get("guard_mode") in GUARD_MODES, f"manifest 'capabilities.guard_mode' must be one of {GUARD_MODES}")
     req(caps.get("ready") is True,
         "manifest 'capabilities.ready' must be true: the factory-doctor preflight "
