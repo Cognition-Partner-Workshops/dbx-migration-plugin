@@ -562,25 +562,25 @@ def test_call_graph_writes_are_compared_as_the_mapping_specs_target_names(tmp_pa
 
 
 def test_child_reported_targets_compare_under_the_manifests_namespace_after_the_run(tmp_path):
-    """The manifest declares `orders` under target_namespace `cat.mig`; a child reports the same table
-    as `CAT.MIG.orders`. That is one declared target, not an undeclared write and not an overlap."""
-    ws, cwd = _workspace(tmp_path / "ok", namespace="cat.mig", write_targets=("orders",))
+    """The manifest declares `orders` under target_namespace `mig.s`; a child reports the same table
+    as `MIG.S.orders`. That is one declared target, not an undeclared write and not an overlap."""
+    ws, cwd = _workspace(tmp_path / "ok", namespace="mig.s", write_targets=("orders",))
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["CAT.MIG.orders", "orders"]),
+    proc, _ = _run(cwd, tmp_path / "ok", [_pass_report(pr, write_targets=["MIG.S.orders", "orders"]),
                                            _verify_report(), {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
     assert "outside their declared targets" not in proc.stdout and "overlapping" not in proc.stdout
     assert _result(ws)["closed"] is True
 
-    ws, cwd = _workspace(tmp_path / "other", namespace="cat.mig", write_targets=("orders",))
+    ws, cwd = _workspace(tmp_path / "other", namespace="mig.s", write_targets=("orders",))
     pr = _push_pr(ws)
-    proc, _ = _run(cwd, tmp_path / "other", [_pass_report(pr, write_targets=["cat.mig.orders", "cat.mig.other"]),
+    proc, _ = _run(cwd, tmp_path / "other", [_pass_report(pr, write_targets=["mig.s.orders", "mig.s.other"]),
                                               _verify_report(),
                                        {"error": "close step stubbed"}])
     assert proc.returncode == 0, proc.stderr
-    assert "outside their declared targets" in proc.stdout and "cat.mig.other" in proc.stdout
-    assert "cat.mig.orders" not in proc.stdout.split("outside their declared targets")[1].splitlines()[0]
-    assert "cat.mig.other" in "\n".join(_result(ws)["brief"])
+    assert "outside their declared targets" in proc.stdout and "mig.s.other" in proc.stdout
+    assert "mig.s.orders" not in proc.stdout.split("outside their declared targets")[1].splitlines()[0]
+    assert "mig.s.other" in "\n".join(_result(ws)["brief"])
 
 
 def test_read_only_batch_declares_no_targets_only_with_an_analysis_that_writes_nothing(tmp_path):

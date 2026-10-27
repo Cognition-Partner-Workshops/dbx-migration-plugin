@@ -2030,14 +2030,14 @@ def test_validate_manifest_compares_the_contract_with_the_doctor_record():
         with pytest.raises(SystemExit, match=f"capabilities.*{needle}.*capabilities.json"):
             validate_manifest(_manifest(capabilities=caps, auto_merge=False), DOCTOR)
     subset_doctor = {**DOCTOR, "checks": [
-        {**DOCTOR["checks"][0], "data": {"catalogs": ["billing_demo", "ow_tp"], "guard_mode": "block"}},
+        {**DOCTOR["checks"][0], "data": {"catalogs": ["other_cat", "mig_cat"], "guard_mode": "block"}},
         *DOCTOR["checks"][1:],
     ]}
-    validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"], catalogs=["ow_tp"])),
+    validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"], catalogs=["mig_cat"])),
                       subset_doctor)
     with pytest.raises(SystemExit) as exc:
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"],
-                                                       catalogs=["ow_tp", "prod"])), subset_doctor)
+                                                       catalogs=["mig_cat", "prod"])), subset_doctor)
     assert "prod" in str(exc.value) and "allowed_targets.json" in str(exc.value)
     with pytest.raises(SystemExit, match="ready"):
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "ready": False})
