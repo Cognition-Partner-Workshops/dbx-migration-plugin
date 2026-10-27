@@ -804,20 +804,18 @@ def _psycopg_connect(dsn: str):
     return conn
 
 
-_ORACLE_DSN_RE = re.compile(
-    r"^(?:oracle://)?(?P<user>[^:/@\s]+)[:/](?P<password>[^@\s]*)@(?P<dsn>[^:/@\s]+:\d+/\S+)\s*$")
-
-
 def _oracledb_connect(dsn: str):
-    """Thin-mode oracledb connect from `oracle://user:pass@host:port/service` or
-    `user/pass@host:port/service`; the transaction is pinned read-only for the session."""
+    """Thin-mode oracledb connect from `oracle://user:pass@host:port/service`,
+    `user/pass@host:port/service`, or JSON `{user, password, host, port, service}`; the transaction
+    is pinned read-only."""
     import oracledb
 
-    m = _ORACLE_DSN_RE.match(dsn)
-    if not m:
-        raise ValueError("oracle DSN must be oracle://user:pass@host:port/service or "
-                         "user/pass@host:port/service")
-    conn = oracledb.connect(user=m["user"], password=m["password"], dsn=m["dsn"])
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "skills" / "data-reconciliation" /
+                            "harness"))
+    from recon.dsn import oracle_dsn_parts
+
+    user, password, target = oracle_dsn_parts(dsn)
+    conn = oracledb.connect(user=user, password=password, dsn=target)
     conn.cursor().execute("SET TRANSACTION READ ONLY")
     return conn
 
