@@ -1,3 +1,12 @@
+# 0.6.1 (unreleased)
+
+## Changed
+
+- Oracle source DSN secrets may be JSON objects `{user|username, password, host, port,
+  service|service_name}`; factory-doctor and the recon harness share `recon/dsn.py`, so the
+  doctor cannot pass a form `dbx-recon run` rejects.
+- `workspace-setup` states the accepted source secret formats.
+
 # 0.6.0 — .migration/ holds machine files only
 
 0.5.0 moved the human-readable ledger onto the board but several skills still asked for prose

@@ -24,6 +24,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .fingerprint import DIGEST_MODULUS
 from .fingerprint import normalise as _digest_value
+from .dsn import oracle_dsn_parts
 from .rerun import normalize_type
 from .watermarks import instant
 from .watermarks import literal as watermark_literal
@@ -1535,24 +1536,16 @@ class DatabricksSourceAdapter(_SqlAdapterBase):
 
 # ---- Oracle source ------------------------------------------------------------------------
 
-# oracle://user:pass@host:port/service and user/pass@host:port/service; the form some managers
-# emit (host:port:SID or a TNS alias) is refused rather than guessed at.
-_ORACLE_DSN_RE = re.compile(
-    r"^(?:oracle://)?(?P<user>[^:/@\s]+)[:/](?P<password>[^@\s]*)@(?P<host>[^:/@\s]+)"
-    r":(?P<port>\d+)/(?P<service>[^\s/]+)\s*$")
-
-
 def _oracle_dsn_parts(secret: str) -> tuple[str, str, str]:
     raw = os.environ.get(secret)
     if not raw:
         from .config import ConfigError
         raise ConfigError(f"source secret {secret} is not set in the environment")
-    m = _ORACLE_DSN_RE.match(raw)
-    if not m:
+    try:
+        return oracle_dsn_parts(raw)
+    except ValueError as e:
         from .config import ConfigError
-        raise ConfigError(f"source secret {secret} is not an oracle DSN of the form "
-                          "oracle://user:pass@host:port/service or user/pass@host:port/service")
-    return m["user"], m["password"], f"{m['host']}:{m['port']}/{m['service']}"
+        raise ConfigError(f"source secret {secret}: {e}") from None
 
 
 class OracleSourceAdapter(_SqlAdapterBase):
