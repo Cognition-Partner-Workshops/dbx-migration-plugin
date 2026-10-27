@@ -1229,9 +1229,27 @@ def test_text_tools_do_not_hide_client_invocations(command: str):
     'printf "%s\\n" "$(psql $ORACLE_DSN -c \'DELETE FROM orders\')"',
     'grep "`sqlplus $ORACLE_DSN -c \'DELETE FROM orders\'`" notes.md',
     'cat "$(sqlplus $ORACLE_DSN -c \'DELETE FROM orders\')"',
+    'echo "$(printf \')\'; sqlplus $ORACLE_DSN -c \'DELETE FROM orders\')"',
+    'echo "$(echo $(sqlplus $ORACLE_DSN -c \'DELETE FROM orders\'))"',
+    'echo "sqlplus $($Q)"',
+    'echo "$(find . -exec sqlplus x -c \'DELETE FROM orders\' \\;)"',
 ])
 def test_text_tool_executable_substitutions_still_block(command: str):
     assert "command substitution" in block(command).reason
+
+
+@pytest.mark.parametrize("command", [
+    'echo \'sqlplus\' "$(date)"',
+    'echo "sqlplus $(date)"',
+    'echo "$(date) sqlplus"',
+    'echo "sqlplus $(printf \')\')"',
+    'grep \'sqlplus\' "$(pwd)/notes.md"',
+    'echo "$(printf \'%s\' sqlplus)"',
+    'echo "$(echo sqlplus)"',
+    'echo \'$(sqlplus $ORACLE_DSN -c "DELETE FROM orders")\'',
+])
+def test_text_tool_unrelated_substitutions_are_not_sql(command: str):
+    approve(command)
 
 
 @pytest.mark.parametrize("command,rc", [
@@ -1240,6 +1258,10 @@ def test_text_tool_executable_substitutions_still_block(command: str):
     ("ssh legacy-prod 'python3 remote.py'", 2),
     ("ssh legacy-prod 'ls /etc'", 0),
     ("ssh legacy-prod 'cat /etc/legacy.conf'", 0),
+    ("ssh legacy-prod 'git status'", 0),
+    ("ssh legacy-prod 'git diff'", 0),
+    ("ssh legacy-prod 'git checkout main'", 2),
+    ("ssh legacy-prod 'git config user.name x'", 2),
     ("ssh legacy-prod \"sqlplus x -c 'SELECT 1'\"", 0),
     ("ssh legacy-prod \"sqlplus x -c 'DELETE FROM orders'\"", 2),
 ])

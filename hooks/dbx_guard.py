@@ -488,6 +488,51 @@ def _expands(text: str, subst: bool = False) -> bool:
     return any(not re.fullmatch(r"[\w$-]+", m.group(1)) for m in re.finditer(r"`([^`]*)`", live)) or (
         bool(re.search(r"\$\(|(?<![\w])[<>]\(", live)) if subst else "$" in live)
 
+def _client_substitution(raw: str) -> bool:
+    unsafe = False
+
+    def scan(i: int, stop: str = "", level: int = 0) -> int:
+        nonlocal unsafe
+        if level > 32:
+            unsafe = True
+            return len(raw)
+        quote, depth = "", 1
+        while i < len(raw):
+            c = raw[i]
+            if c == "\\" and quote != "'":
+                i += 2
+                continue
+            if quote == "'":
+                quote = "" if c == "'" else quote
+            elif stop == "`" and c == "`":
+                return i + 1
+            elif c in ('"', "'"):
+                quote = "" if c == quote else c if not quote else quote
+            elif raw.startswith("$(", i) or (not quote and raw[i:i + 2] in ("<(", ">(")) or c == "`":
+                width = 1 if c == "`" else 2
+                end = scan(i + width, "`" if c == "`" else ")", level + 1)
+                body = raw[i + width:end - 1]
+                for sub in _segments(body):
+                    base = sub.argv0
+                    text_tool = base in ("echo", "printf", "cat", "tee") or base in _READERS
+                    executes = base == "find" and any(w.startswith(("-exec", "-ok")) for w in sub.argv)
+                    if base in _SQL_CLIENTS or sub.unreadable or (sub.argv and _expands(sub.raw_of(sub.argv[0]))) or (
+                            (not text_tool or executes) and _CLIENT_WORD.search(" ".join(sub.argv))):
+                        unsafe = True
+                i = end
+                continue
+            elif stop == ")" and not quote:
+                depth += (c == "(") - (c == ")")
+                if not depth:
+                    return i + 1
+            i += 1
+        if stop:
+            unsafe = True
+        return i
+
+    scan(0)
+    return unsafe
+
 def _lakebase(verb: str, project: str | None, branch: str | None, cfg: GuardConfig) -> list[str]:
     if project is not None and project not in cfg.lakebase_projects:
         return [f"`databricks postgres {verb}` targets Lakebase project {project!r} outside allowed lakebase_projects "
@@ -870,7 +915,7 @@ def _check_unreadable(segs: list[_Seg], cfg: GuardConfig, text: str) -> list[str
                     break
             if any(re.fullmatch(r"\d*<<-?", w) and _expands(s.raw[i + 1]) for i, w in enumerate(s.words[:-1])):
                 violations.append("unquoted heredoc expands `$`/backticks in its body; quote the delimiter (<<'EOF') or inline the values")
-        elif any(_expands(s.raw_of(w), subst=True) for w in s.argv[1:]):
+        elif any(_client_substitution(s.raw_of(w)) for w in s.argv[1:]):
             violations.append(f"command substitution in `{base}` names a SQL client; run the client directly so the guard can read the call")
         if base not in _KNOWN and base not in _INERT and base not in defined and not _PYTHON.fullmatch(base) and (hits := _conn(s, cfg, "")[0]):
             violations.append(f"unrecognised command `{base}` names legacy connection {hits}; the guard cannot verify its operation")
@@ -1324,6 +1369,8 @@ def _check_remote(segs: list[_Seg], cfg: GuardConfig, root: Path) -> list[str]:
             violations.append(f"remote client `{base}` on legacy host {hits} writes query output to a file on the legacy host; legacy hosts are read-only")
         elif base in (*_LEGACY_ONLY, *_GENERIC, "spark-sql", "dbsqlcli") and _non_reads(_sql_text(seg, root)[0]):
             violations.append(f"remote client `{base}` on legacy host {hits} is not read-only; legacy hosts are read-only")
+        elif base == "git" and _git_reads(seg.argv[1:]):
+            continue
         elif base not in (*_SQL_CLIENTS, *_REST_CLIENTS, *_SHELLS) and not _PYTHON.fullmatch(base) and not (
                 base in _READERS and not _mutates(base, seg.argv) and base not in ("unzip", "tee")
                 and not (base == "tar" and any(re.search(r"^-.*[cxru]", w) for w in seg.argv[1:]))):
