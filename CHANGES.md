@@ -1,3 +1,9 @@
+# 0.6.1 (unreleased)
+
+- factory-doctor `type_map_audit` audits each unit mapping against its own top-level `target_kind`
+  (databricks|lakebase), falling back to `--target-kind`, so a run mixing Lakebase and Delta units
+  can reach one green doctor; a mixed audit records `target_kind: "mixed"` and is never reused by a child.
+
 # 0.6.0 — .migration/ holds machine files only
 
 0.5.0 moved the human-readable ledger onto the board but several skills still asked for prose
