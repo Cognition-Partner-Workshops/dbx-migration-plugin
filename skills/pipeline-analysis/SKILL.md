@@ -27,8 +27,12 @@ batches. No plan and no code: the output is the analysis the manager plans from.
    numeric, timestamp, collation, and nondeterminism risks.
 4. Register every D2–D10 crossing with a complete contract; unresolved fields remain explicit
    blockers on the plan.
-5. Topologically group units into wave-0 shared objects, then leaf-first waves. Put INFERRED
-   edges in one batch or serialize them; no two same-wave batches share targets.
+5. Run `python3 <plugin>/skills/wave-plan/derive_waves.py --root <repo> --namespace <catalog.schema> --out /tmp/waves.json`
+   over the per-unit `dependencies.json` and `mapping_spec.json` files, and attach its output
+   to the analysis. Put INFERRED edges in `dependencies.json` so they land in one batch. Derived
+   waves start at 1; wave 0 (serial shared objects, width 1) is opt-in via `--shared-wave-0`
+   as a plan decision. When selected, `shared_not_wave_0` lists shared units kept in normal waves
+   and why.
 6. Add a size-aware recon row per unit: gates, live/snapshot source, threshold/sampling rule,
    determinism rule, projected legacy load, and cap check.
 7. Prepare `<Pipeline>_analysis.md` with scope, inventory, DAG, dictionary, dependency table,

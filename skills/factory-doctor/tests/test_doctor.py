@@ -2163,7 +2163,7 @@ def test_type_map_audit_uses_each_specs_declared_target_kind(tmp_path, monkeypat
     ws = make_workspace(tmp_path)
     oltp = _typed_unit_mapping(ws, "accounts", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
     _declare_target_kind(oltp, "lakebase")
-    delta = _typed_unit_mapping(ws, "ledger", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    delta = _typed_unit_mapping(ws, "analytics", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
     calls = _record_harness_argv(monkeypatch)
     c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT,
                                     target_kind="databricks")
@@ -2187,7 +2187,7 @@ def test_type_map_audit_fails_on_a_contradiction_even_when_another_kind_has_no_m
     ws = make_workspace(tmp_path)
     oltp = _typed_unit_mapping(ws, "accounts", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
     _declare_target_kind(oltp, "lakebase")
-    _typed_unit_mapping(ws, "ledger", [_field("AMOUNT", "NUMBER(12,2)", "double")])
+    _typed_unit_mapping(ws, "analytics", [_field("AMOUNT", "NUMBER(12,2)", "double")])
 
     def fake(cmd, subcommand):
         if subcommand[subcommand.index("--target-kind") + 1] == "lakebase":
