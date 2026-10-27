@@ -9,6 +9,10 @@
 - A ready `doctor.py --wave` run (not `--role child`) writes that pointer itself, so a wave launches
   without a hand-written one; a not-ready run writes none. `--wave` refuses a manifest outside
   `<workspace>/.migration/waves/`.
+- Wave manifests and the doctor accept a wave's catalogs as a subset of the allowlist.
+- Qualified batch `write_targets` must sit in the wave's `capabilities.catalogs`.
+- Manifests refuse pre-0.6.0 fields by name and give the replacement or deletion.
+- Missing `plan_step` and overlong brief messages say what to change.
 - Oracle source DSN secrets may be JSON objects `{user|username, password, host, port,
   service|service_name}`; factory-doctor and the recon harness share `recon/dsn.py`, so the
   doctor cannot pass a form `dbx-recon run` rejects.

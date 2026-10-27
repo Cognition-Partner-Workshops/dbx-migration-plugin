@@ -44,7 +44,8 @@ def _functions():
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
-                                                         "DECISION_ID", "TARGET_DECISIONS", "SKILL_NAME", "_SEGMENT",
+                                                         "DECISION_ID", "TARGET_DECISIONS", "SKILL_NAME", "REMOVED_FIELDS",
+                                                         "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE",
                                                          "REPO_RE", "BARE_PATH"}
                     for t in node.targets))]
@@ -580,7 +581,7 @@ def test_target_namespace_when_present_is_a_dotted_identifier(namespace):
     validate_manifest = _functions()["validate_manifest"]
     with pytest.raises(SystemExit, match="target_namespace"):
         validate_manifest({**_manifest(), "target_namespace": namespace})
-    validate_manifest({**_manifest(), "target_namespace": "cat.mig"})
+    validate_manifest(_manifest(target_namespace="cat.mig", capabilities=_caps(host=HOST, catalogs=["cat"])))
 
 
 @pytest.mark.parametrize("where", ["1 = 1", "1=1", "'a' = 'a'", "TRUE", "NOT (1 = 2)", "${as_of} = ${as_of}",
@@ -1398,6 +1399,44 @@ def test_validate_manifest_accepts_capability_contract():
     validate_manifest(_manifest(capabilities=_caps(guard_mode="warn"), auto_merge=False))
 
 
+@pytest.mark.parametrize("field,fix", _functions()["REMOVED_FIELDS"].items())
+def test_validate_manifest_refuses_pre_060_fields_by_name(field, fix):
+    m = _manifest()
+    m[field] = "legacy"
+    with pytest.raises(SystemExit) as exc:
+        _functions()["validate_manifest"](m)
+    assert field in str(exc.value) and fix in str(exc.value)
+
+
+def test_validate_manifest_names_plan_step_fix_when_missing():
+    m = _manifest()
+    del m["plan_step"]
+    with pytest.raises(SystemExit, match="plan.yaml step id"):
+        _functions()["validate_manifest"](m)
+
+
+def test_validate_manifest_scopes_fully_qualified_write_targets_to_capabilities_catalogs():
+    validate_manifest = _functions()["validate_manifest"]
+    m = _manifest()
+    m["batches"][0]["write_targets"] = ["other.s.t"]
+    with pytest.raises(SystemExit) as exc:
+        validate_manifest(m)
+    assert "other.s.t" in str(exc.value) and "capabilities.catalogs" in str(exc.value)
+
+    m = _manifest()
+    m["batches"][0]["write_targets"] = ["MIG.s.t"]
+    validate_manifest(m)
+
+    m = _manifest(target_namespace="other.s")
+    m["batches"][0]["write_targets"] = ["t"]
+    with pytest.raises(SystemExit, match="capabilities.catalogs"):
+        validate_manifest(m)
+
+    m = _manifest()
+    m["batches"][0]["write_targets"] = ["s.t"]
+    validate_manifest(m)
+
+
 def test_validate_manifest_allows_serial_wave_zero_only():
     validate_manifest = _functions()["validate_manifest"]
     validate_manifest(_manifest(wave=0, width=1))
@@ -1412,7 +1451,8 @@ def test_validate_manifest_caps_the_brief_so_estate_config_stays_in_the_manifest
     validate_manifest(short)
     long = _manifest()
     long["batches"][0]["brief"] = "host=adb-123.azuredatabricks.net " * 400
-    with pytest.raises(SystemExit, match=r"batch b brief is 13200 chars; the cap is 4000"):
+    with pytest.raises(SystemExit, match=r"trim batch b brief to <= 4000 chars: batch b brief is 13200 chars; "
+                                         r"the cap is 4000"):
         validate_manifest(long)
 
 
@@ -1981,15 +2021,24 @@ DOCTOR = {"schema": "dbx-migration-factory/capabilities/1", "ready": True,
 def test_validate_manifest_compares_the_contract_with_the_doctor_record():
     validate_manifest = _functions()["check_doctor_contract"]
     validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), DOCTOR)
-    # the doctor records guard-normalized catalog names; a manifest spelling the guard accepts is the same contract
+    # the doctor records guard-normalized catalog names
     validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"], catalogs=["`MIG` "])), DOCTOR)
     for caps, needle in ((_caps(), "host"),
                          (_caps(host="https://adb-2.azuredatabricks.net"), "host"),
                          (_caps(host=DOCTOR["identity"]["host"], identity="sp-2"), "identity"),
-                         (_caps(host=DOCTOR["identity"]["host"], catalogs=["mig", "prod"]), "catalogs"),
                          (_caps(host=DOCTOR["identity"]["host"], guard_mode="warn"), "guard_mode")):
         with pytest.raises(SystemExit, match=f"capabilities.*{needle}.*capabilities.json"):
             validate_manifest(_manifest(capabilities=caps, auto_merge=False), DOCTOR)
+    subset_doctor = {**DOCTOR, "checks": [
+        {**DOCTOR["checks"][0], "data": {"catalogs": ["billing_demo", "ow_tp"], "guard_mode": "block"}},
+        *DOCTOR["checks"][1:],
+    ]}
+    validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"], catalogs=["ow_tp"])),
+                      subset_doctor)
+    with pytest.raises(SystemExit) as exc:
+        validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"],
+                                                       catalogs=["ow_tp", "prod"])), subset_doctor)
+    assert "prod" in str(exc.value) and "allowed_targets.json" in str(exc.value)
     with pytest.raises(SystemExit, match="ready"):
         validate_manifest(_manifest(capabilities=_caps(host=DOCTOR["identity"]["host"])), {**DOCTOR, "ready": False})
     with pytest.raises(SystemExit, match="capabilities.json"):

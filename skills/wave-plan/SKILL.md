@@ -24,7 +24,8 @@ doctor signs `wave-<N>.doctor.json` over them.
    (`unit-migration`), `verify_skill` (`wave-verify`), `plan_step` (the plan step id, a
    lowercase slug), `width`, `breaker_threshold`, `auto_merge`, `base_branch` (the engagement
    feature branch; `main`/`master` need `trunk_base_decision`), `source` family/secret/params,
-   `capabilities` (identity, host, catalogs, `ready`, `guard_mode` — matching
+   `capabilities` (identity, host, catalogs (the subset of the allowlist this wave writes),
+   `ready`, `guard_mode` — matching
    `capabilities.json`), `target_state` copied from the selected `target-*` decisions in
    `plan.yaml`, `verify_depth`, `max_minutes`, `cost_estimate`, `degraded` when the
    wave is export-only, `target_namespace` when the harness runs under a fixed catalog.schema,

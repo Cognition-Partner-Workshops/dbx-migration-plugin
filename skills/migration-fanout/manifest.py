@@ -58,6 +58,14 @@ UNIT_ID = re.compile(r"(?!wave-)[A-Za-z0-9_][A-Za-z0-9_.-]*")
 BRIEF_MAX_CHARS = 4000
 
 
+REMOVED_FIELDS = {
+    "child_macro": "rename it to 'child_skill' (a skill under <plugin>/skills/, normally 'unit-migration')",
+    "verify_macro": "rename it to 'verify_skill' (normally 'wave-verify')",
+    "stop_c": "delete it; the plan step's gates replace it",
+    "gates_sha": "delete it; 'plan_step' binds the plan",
+}
+
+
 WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
 
 
@@ -146,8 +154,15 @@ def validate_manifest(m, plugin=None):
         v = m.get(key)
         return key not in m or (isinstance(v, int) and not isinstance(v, bool)
                                 and (v > 0 if hi is None else 0 < v <= hi))
+    old = [k for k in REMOVED_FIELDS if k in m]
+    if old:
+        raise SystemExit('manifest carries pre-0.6.0 field(s): ' + '; '.join(
+            f"'{k}': {REMOVED_FIELDS[k]}" for k in old) + '. Then add plan_step and re-sign with the doctor')
     for key in ("wave", "repo", "child_skill", "verify_skill", "batches", "base_branch", "plan_step"):
-        req(key in m, f"manifest is missing '{key}'")
+        missing = f"manifest is missing '{key}'"
+        if key == "plan_step":
+            missing += "; add 'plan_step': the plan.yaml step id this wave ticket runs (lowercase slug)"
+        req(key in m, missing)
     req(bool(m["batches"]), "manifest has no batches")
     req(isinstance(m["plan_step"], str) and DECISION_ID.fullmatch(m["plan_step"]),
         f"manifest 'plan_step' must be the lowercase slug of the plan step this wave ticket runs, got "
@@ -225,6 +240,7 @@ def validate_manifest(m, plugin=None):
             req(bool(b.get(key)),
                 f"batch {b['id']} is missing '{key}' (a child with no brief cannot be launched safely)")
         req(isinstance(b["brief"], str) and len(b["brief"]) <= BRIEF_MAX_CHARS,
+            f"trim batch {b['id']} brief to <= {BRIEF_MAX_CHARS} chars: "
             f"batch {b['id']} brief is {len(str(b['brief']))} chars; the cap is {BRIEF_MAX_CHARS}. A brief names "
             "the units, targets, gates and the files to read (skills/migration-fanout/references/brief_template.md); "
             "hosts, principals, warehouses and secret names live in the manifest and capabilities.json, "
@@ -294,7 +310,17 @@ def validate_manifest(m, plugin=None):
         "launches without the factory-doctor contract the children compare against")
     req(isinstance(caps.get("catalogs"), list) and caps["catalogs"]
         and all(isinstance(c, str) and c for c in caps["catalogs"]),
-        "manifest 'capabilities.catalogs' must be the non-empty allowlist of catalog names")
+        "manifest 'capabilities.catalogs' must be the non-empty list of the catalogs this wave writes "
+        "(a subset of the allowlist)")
+    cats = {c.strip().strip("`").lower() for c in caps["catalogs"]}
+    for b in m["batches"]:
+        stray = sorted(
+            t for t in b["write_targets"]
+            if len(k := target_key(t, ns).split(".")) == 3 and k[0] not in cats
+        )
+        req(not stray, f"batch {b['id']} write_targets {stray} are in catalogs outside "
+            f"capabilities.catalogs {sorted(cats)}; add the catalog to "
+            "capabilities.catalogs (within the allowlist) or fix the target")
     req(caps.get("guard_mode") in GUARD_MODES, f"manifest 'capabilities.guard_mode' must be one of {GUARD_MODES}")
     req(caps.get("ready") is True,
         "manifest 'capabilities.ready' must be true: the factory-doctor preflight "
@@ -304,7 +330,7 @@ def validate_manifest(m, plugin=None):
 
 def check_doctor_contract(m, doctor):
     """The manifest's capabilities are the doctor's, copied: a wave launches only from a signed
-    preflight that saw the same identity, host, catalogs, guard mode and source."""
+    preflight that saw the same identity, host, guard mode and source, with catalogs within the allowlist."""
     def req(cond, msg):
         if not cond:
             raise SystemExit(msg)
@@ -320,9 +346,17 @@ def check_doctor_contract(m, doctor):
                 "catalogs": sorted(rows.get("allowed_targets", {}).get("catalogs") or []),
                 "guard_mode": rows.get("allowed_targets", {}).get("guard_mode")}
     for key, want in recorded.items():
-        got = sorted(c.strip().strip("`").lower() for c in caps["catalogs"]) if key == "catalogs" else caps.get(key)
-        req(got == want, f"manifest 'capabilities.{key}' is {got!r} but the doctor recorded {want!r} in "
-            "capabilities.json; copy the doctor's values, never edit them")
+        if key == "catalogs":
+            got = sorted(c.strip().strip("`").lower() for c in caps["catalogs"])
+            want = sorted(c.strip().strip("`").lower() for c in want)
+            extra = sorted(set(got) - set(want))
+            req(got and not extra, f"manifest 'capabilities.catalogs' names {extra} outside the allowlist "
+                f"the doctor recorded {want}; drop them from capabilities.catalogs, or add them to "
+                ".migration/allowed_targets.json by a PR to the protected branch and re-run the doctor")
+        else:
+            got = caps.get(key)
+            req(got == want, f"manifest 'capabilities.{key}' is {got!r} but the doctor recorded {want!r} in "
+                "capabilities.json; copy the doctor's values, never edit them")
     req(doctor.get("source") == m.get("source"),
         "manifest 'source' differs from the source the doctor was signed for; "
         "re-run the doctor with --wave on this manifest")
