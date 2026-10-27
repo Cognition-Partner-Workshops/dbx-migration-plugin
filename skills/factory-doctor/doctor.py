@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 REQUIRED_FILES = ("allowed_targets.json", "recon_tolerances.json")
+POINTER_HOME_REL = Path(".dbx-migration-factory/current-wave.json")
 MIGRATION_LAYOUT = frozenset({
     "allowed_targets.json", "authorizations.json", "recon_tolerances.json", "capabilities.json",
     ".hook_probe_nonce", "units", "waves", "recon", "snapshots",
@@ -2063,6 +2064,10 @@ def main(argv: list[str] | None = None) -> int:
             "named for the probe_command of the last report")
     manifest_bytes = None
     if a.wave:
+        a.wave = a.workspace.resolve() / a.wave  # a relative manifest path is the workspace's, not the cwd's
+        waves_dir = a.workspace.resolve() / ".migration" / "waves"
+        if a.wave.resolve().parent != waves_dir:
+            p.error(f"--wave must name a manifest in {waves_dir}: the fan-out workflow reads it from there")
         manifest_bytes, manifest = _load_manifest(p, a.wave, "wave manifest")
         caps = manifest.get("capabilities") if isinstance(manifest, dict) else None
         if not isinstance(caps, dict):
@@ -2131,6 +2136,14 @@ def main(argv: list[str] | None = None) -> int:
         signed = sign_wave_report({**report, "hook_probe": a.hook_probe_result,
             "source": manifest.get("source"), "inputs_sha": inputs_sha(a.workspace.resolve())}, manifest_bytes)
         a.wave.with_suffix(".doctor.json").write_text(json.dumps(signed, indent=2, sort_keys=True) + "\n")
+        if a.role != "child" and report["ready"]:
+            pointer = Path.home() / POINTER_HOME_REL
+            pointer.parent.mkdir(parents=True, exist_ok=True)
+            pointer.write_text(json.dumps({"manifest": a.wave.name, "hook_probe": a.hook_probe_result,
+                "workspace": str(a.workspace.resolve()), "plugin": str(a.plugin_root.resolve())}) + "\n")
+            print(f"pointer -> {pointer}")
+        elif a.role != "child":
+            print("no pointer written: not ready")
     if a.role != "child":
         probe = next((s for c in report["checks"]
             for s in (c.get("data") or {}).get("sub_results") or []

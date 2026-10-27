@@ -38,6 +38,8 @@ wave-plan worker before mappings exist. Setup runs the read-only source probe fr
 `--source-secret NAME --source-family F` alone; `--mapping` is not needed (the row is
 principal-level; table grants are checked per unit later). `--role child` is a batch worker. Writes
 `.migration/capabilities.json` and prints one line per row. Exit 0 means `ready`.
+`--wave` takes a manifest in `<workspace>/.migration/waves/` (a relative path is the workspace's) and, when ready and not `--role child`,
+writes the fan-out pointer `~/.dbx-migration-factory/current-wave.json` (`pointer -> <path>`).
 
 A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the wave worker's signed
 record, committed beside the wave manifest). When the record is the wave worker's, `ready`, signed
