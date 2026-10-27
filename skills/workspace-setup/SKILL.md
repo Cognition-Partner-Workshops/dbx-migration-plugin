@@ -19,6 +19,11 @@ decisions, a probe result, or a referenced standards document.
 - `skills/data-reconciliation/SKILL.md` — the tolerance fields the recon harness reads.
 - `skills/factory-doctor/SKILL.md` — the doctor posture and its record format.
 
+Source DSN secret formats: oracle — `oracle://user:pass@host:port/service`,
+`user/pass@host:port/service`, or JSON `{user, password, host, port, service}`; sqlserver — an
+ODBC connection string; postgres — a libpq URI or conninfo. Save the secret in one of these forms;
+never build it in the shell (the guard refuses reassigning a `legacy_sources` name).
+
 ## Procedure
 
 1. Write `.migration/allowed_targets.json` before any source probe: `catalogs`,

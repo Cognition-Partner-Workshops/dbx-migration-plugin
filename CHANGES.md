@@ -6,6 +6,10 @@
   `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
   every command. `workspace` is now required, and the old path (or a leftover `.migration/` beside
   the new pointer outside a repo) is refused with a hint that deletes only empty directories.
+- Oracle source DSN secrets may be JSON objects `{user|username, password, host, port,
+  service|service_name}`; factory-doctor and the recon harness share `recon/dsn.py`, so the
+  doctor cannot pass a form `dbx-recon run` rejects.
+- `workspace-setup` states the accepted source secret formats.
 - factory-doctor `type_map_audit` audits each unit mapping against its own top-level `target_kind`
   (databricks|lakebase), falling back to `--target-kind`, so a run mixing Lakebase and Delta units
   can reach one green doctor; a mixed audit records `target_kind: "mixed"` and is never reused by a child.

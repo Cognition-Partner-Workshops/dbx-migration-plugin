@@ -12,6 +12,7 @@ import pytest
 import recon.adapters as adapters
 from recon.adapters import IdentityState, OracleSourceAdapter, _SqlAdapterBase, _oracle_dsn_parts
 from recon.config import ConfigError
+from recon.dsn import oracle_dsn_parts
 
 
 _NUMERIC = ("NUMBER", "FLOAT", "BINARY_FLOAT", "BINARY_DOUBLE")
@@ -67,11 +68,57 @@ class _OracleLike(OracleSourceAdapter):
         self._schema = "APP"
 
 
-def test_oracle_dsn_parses_both_secret_forms(monkeypatch):
-    monkeypatch.setenv("ORA_DSN", "oracle://scott:tiger@db.example.com:1521/FREEPDB1")
+@pytest.mark.parametrize("raw", [
+    "oracle://scott:tiger@db.example.com:1521/FREEPDB1",
+    "scott/tiger@db.example.com:1521/FREEPDB1",
+    '{"user":"scott","password":"tiger","host":"db.example.com","port":1521,"service":"FREEPDB1"}',
+    '{"username":"scott","password":"tiger","host":"db.example.com","port":"1521",'
+    '"service_name":"FREEPDB1"}',
+    '{"user":"scott","password":"tiger","host":"db.example.com","port":1521,'
+    '"service":"FREEPDB1","extra":"ignored"}',
+    '  {"user":"scott","password":"tiger","host":"db.example.com","port":1521,'
+    '"service":"FREEPDB1"}',
+])
+def test_oracle_dsn_parts_parses_supported_forms(raw):
+    assert oracle_dsn_parts(raw) == ("scott", "tiger", "db.example.com:1521/FREEPDB1")
+
+
+def test_oracle_dsn_parts_rejects_missing_json_host_without_leaking_password():
+    with pytest.raises(ValueError) as exc:
+        oracle_dsn_parts('{"user":"scott","password":"s3cr3t-Pw","port":1521,"service":"FREEPDB1"}')
+    assert "host" in str(exc.value) and "s3cr3t-Pw" not in str(exc.value)
+
+
+def test_oracle_dsn_parts_rejects_garbage():
+    with pytest.raises(ValueError):
+        oracle_dsn_parts("definitely-not-a-dsn")
+
+
+def test_oracle_dsn_parts_rejects_invalid_json_without_leaking_password():
+    with pytest.raises(ValueError) as exc:
+        oracle_dsn_parts('{"user": "scott", "password": "s3cr3t-Pw"')
+    assert "s3cr3t-Pw" not in str(exc.value)
+    assert exc.value.__cause__ is None
+
+
+def test_oracle_dsn_parts_rejects_invalid_port():
+    with pytest.raises(ValueError) as exc:
+        oracle_dsn_parts(
+            '{"user":"scott","password":"tiger","host":"db.example.com","port":"15x1",'
+            '"service":"FREEPDB1"}')
+    assert "port" in str(exc.value)
+
+
+def test_oracle_dsn_parts_adapters_accept_json_and_sanitize_errors(monkeypatch):
+    monkeypatch.setenv("ORA_DSN", '{"user":"scott","password":"tiger","host":"db.example.com",'
+                                  '"port":1521,"service":"FREEPDB1"}')
     assert _oracle_dsn_parts("ORA_DSN") == ("scott", "tiger", "db.example.com:1521/FREEPDB1")
-    monkeypatch.setenv("ORA_DSN", "scott/tiger@db.example.com:1521/FREEPDB1")
-    assert _oracle_dsn_parts("ORA_DSN") == ("scott", "tiger", "db.example.com:1521/FREEPDB1")
+    monkeypatch.setenv("ORA_DSN", '{"user":"scott","password":"s3cr3t-Pw","port":1521,'
+                                  '"service":"FREEPDB1"}')
+    with pytest.raises(ConfigError) as exc:
+        _oracle_dsn_parts("ORA_DSN")
+    assert "ORA_DSN" in str(exc.value) and "host" in str(exc.value)
+    assert "s3cr3t-Pw" not in str(exc.value)
 
 
 def test_oracle_dsn_rejects_malformed_and_never_leaks_the_secret(monkeypatch):
