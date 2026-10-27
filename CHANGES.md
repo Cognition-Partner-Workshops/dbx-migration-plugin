@@ -4,7 +4,8 @@
 
 - The migration-fanout pointer moves from `.migration/waves/current.json` to
   `~/.dbx-migration-factory/current-wave.json`; a `.migration/` outside a repo made dbx_guard refuse
-  every command. `workspace` is now required, and the old path is refused with a move hint.
+  every command. `workspace` is now required, and the old path (or a leftover `.migration/` beside
+  the new pointer outside a repo) is refused with a hint that deletes only empty directories.
 
 # 0.6.0 — .migration/ holds machine files only
 

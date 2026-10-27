@@ -886,6 +886,33 @@ def test_legacy_pointer_path_is_refused_with_the_move_hint(tmp_path):
     assert proc.returncode != 0
     assert ".dbx-migration-factory/current-wave.json" in proc.stderr
     assert "delete" in proc.stderr
+    assert "-empty -delete" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_legacy_pointer_is_refused_even_beside_the_new_one(tmp_path):
+    ws, cwd = _workspace(tmp_path, pointer_at="home")
+    home = tmp_path / "home"
+    legacy_path = home / ".migration" / "waves" / "current.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text((home / ".dbx-migration-factory" / "current-wave.json").read_text())
+
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+
+    assert proc.returncode != 0
+    assert "pre-0.6.1" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+
+def test_leftover_migration_dir_beside_the_pointer_is_refused(tmp_path):
+    ws, cwd = _workspace(tmp_path, pointer_at="home")
+    (tmp_path / "home" / ".migration" / "waves").mkdir(parents=True)
+
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+
+    assert proc.returncode != 0
+    assert "-empty -delete" in proc.stderr
+    assert "sits beside" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
 
 
@@ -917,6 +944,22 @@ def test_pointer_dir_is_not_a_guard_workspace(tmp_path):
 
     assert proc.returncode == 0
     assert proc.stdout == ""
+
+
+def test_legacy_pointer_in_a_repo_keeps_its_files(tmp_path):
+    ws, cwd = _workspace(tmp_path)
+    pointer_path = ws / ".dbx-migration-factory" / "current-wave.json"
+    legacy_path = ws / ".migration" / "waves" / "current.json"
+    legacy_path.write_text(pointer_path.read_text())
+    pointer_path.unlink()
+
+    proc, calls = _run(cwd, tmp_path, [_pass_report()])
+
+    assert proc.returncode != 0
+    assert "-empty -delete" in proc.stderr
+    assert (ws / ".migration" / "waves" / "wave-0.json").is_file()
+    assert "holds nothing else" not in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
 
 
 def test_pipeline_manifest_tags_the_verifier_branch_and_workflow(tmp_path):

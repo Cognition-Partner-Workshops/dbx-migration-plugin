@@ -28,16 +28,21 @@ DOCTOR_MAX_AGE = datetime.timedelta(minutes=15)
 
 def find_pointer(start):
     """The sandbox gives this script one thing: its cwd (the session's home directory, not the workspace)."""
-    for d in (start, *start.parents):
-        if (d / POINTER_REL).is_file():
-            return d / POINTER_REL
-    for d in (start, *start.parents):
+    dirs = (start, *start.parents)
+    for d in dirs:
         if (d / LEGACY_POINTER_REL).is_file():
             raise SystemExit(
-                f"{d / LEGACY_POINTER_REL} is the pre-0.6.1 pointer path: a .migration/ directory outside a repo "
-                f"makes dbx_guard refuse every command there. Move it to {d / POINTER_REL} and delete "
-                f"{d / '.migration'} (it holds nothing else), then re-run"
-            )
+                f"{d / LEGACY_POINTER_REL} is the pre-0.6.1 pointer path. Move it to {d / POINTER_REL}, then delete "
+                f"the empty directories it leaves (`find {d / '.migration'} -depth -type d -empty -delete` keeps "
+                "every file): a .migration/ outside a repo makes dbx_guard refuse every command there. Then re-run")
+    for d in dirs:
+        if (d / POINTER_REL).is_file():
+            if (d / ".migration").is_dir() and not (d / ".git").exists():
+                raise SystemExit(
+                    f"{d / '.migration'} sits beside {d / POINTER_REL} outside a repo, so dbx_guard refuses every "
+                    f"command there; delete it if it holds only empty directories (`find {d / '.migration'} -depth "
+                    "-type d -empty -delete`), then re-run")
+            return d / POINTER_REL
     raise SystemExit(f"no {POINTER_REL} at or above {start}; write the wave ticket's pointer, then re-run")
 
 
