@@ -10,6 +10,9 @@
 - Qualified batch `write_targets` must sit in the wave's `capabilities.catalogs`.
 - Manifests refuse pre-0.6.0 fields by name and give the replacement or deletion.
 - Missing `plan_step` and overlong brief messages say what to change.
+- factory-doctor `type_map_audit` audits each unit mapping against its own top-level `target_kind`
+  (databricks|lakebase), falling back to `--target-kind`, so a run mixing Lakebase and Delta units
+  can reach one green doctor; a mixed audit records `target_kind: "mixed"` and is never reused by a child.
 
 # 0.6.0 — .migration/ holds machine files only
 
