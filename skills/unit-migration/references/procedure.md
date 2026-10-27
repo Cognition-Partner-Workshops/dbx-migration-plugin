@@ -46,7 +46,7 @@ Convert one batch of units, prove parity, and open one evidence-backed PR. The w
   `--rerun-proof` with `--rerun-source` to `run`. What the proof must show is the unit's
   `rerun_posture` in the committed `mapping_spec.json`, never a run flag you choose.
 - On FAIL, capture evidence, fix converted code only, rerun, and stop after 3 full runs.
-- Never change a tolerance or `03_recon_tolerances.json`.
+- Never change a tolerance or `recon_tolerances.json`.
 - Read `result.json` as `parity` plus `merge_policy`: each `blockers` entry has a `reason` and a
   `class` (the classes also in `blocker_classes`; `merge_block_reasons` is the reasons alone).
   `data` means fix converted code; `structural` (a missing constraint, trigger, index, identity,

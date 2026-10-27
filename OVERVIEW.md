@@ -15,9 +15,8 @@ Independent units migrate many at a time.
 
 1. A human files the migration request on the board.
 2. The manager (`intake`) turns the request's answers into phase-1 decisions and blockers; a
-   `workspace-setup` worker ticket then writes the committed `.migration/` workspace:
-   `allowed_targets.json`, `03_recon_tolerances.json`, `09_capabilities.json`, and
-   `authorizations.json` (by human PR) when legacy writes are needed.
+   `workspace-setup` worker ticket then writes the committed `.migration/` machine files
+   (writers and readers: the [README table](README.md#migration-machine-files)).
 3. `estate-inventory` and `pipeline-analysis` tickets census the estate and analyze the chosen
    pipeline into units and waves.
 4. The manager (`migration-planning`) writes `plan.yaml`: phases, steps with `depends_on`,
@@ -58,7 +57,7 @@ blocker's class; merge eligibility is `skills/data-reconciliation/SKILL.md`.
 | Control | Where | What it does |
 |---|---|---|
 | Write-scope guard | `hooks/dbx_guard.py` (PreToolUse) | blocks writes outside `.migration/allowed_targets.json` — the allowlist in force is the copy committed on the protected branch, so `.migration/` is writable and scope widens only by PR — non-read statements against legacy sources, identity swaps, unreadable commands; policy table in `README.md` |
-| Authorization file | `.migration/authorizations.json` | a legacy write needs a committed `legacy_write_authorized` entry naming the literal objects, a waived gate a `gate_waived` entry and a merge override a `merge_override` entry naming the units, all entered only by reviewed PR; the guard and the fan-out workflow resolve decision ids against the committed copy alone |
+| Machine-file contracts | [README: `.migration/` machine files](README.md#migration-machine-files) | table lists every `.migration/` entry with its writer and readers; human-readable state stays on the board |
 | Preflight doctor | `skills/factory-doctor/doctor.py` | CLI and identity, harness self-test, `.migration/` integrity, committed allowlist equal to the wave contract, source principal cannot write, hook nonce probe, authorizations file well-formed; signs the wave's doctor file |
 | Fan-out workflow | `skills/migration-fanout/workflow.py` (+ `manifest.py`, `report.py`, `cards.py`) | doctor-file gate, collision check, one launch per manifest sha, circuit breaker, merge overrides and waived gates read from the committed manifest and resolved against the committed authorization file, single writer of wave results, wave and halt cards |
 | Reconciliation harness | `skills/data-reconciliation/harness` (`dbx-recon`) | tiered parity with agreed tolerances, transactional mode for Lakebase, delete evidence, rerun posture from the committed mapping spec, blocker classes per failed tier, verdict line names fixture vs live; holds the verdict authority rule |

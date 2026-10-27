@@ -12,7 +12,8 @@ from the brief stops you: report blocked, never improvise.
 
 Batch id, units, targets, brief, capability contract, source block, `doctor_max_age`,
 `max_minutes`, declared gates; each unit's `.migration/units/<id>/` handoff (`mapping_spec.json`
-declares `rerun_posture`); the signed `.migration/waves/wave-<TAG>.doctor.json`;
+declares `rerun_posture`); target=`manifest.target_state`; the signed
+`.migration/waves/wave-<TAG>.doctor.json`;
 `skills/data-reconciliation/SKILL.md` (verdict authority); `skills/target-routing/SKILL.md` (auth).
 
 ## Procedure

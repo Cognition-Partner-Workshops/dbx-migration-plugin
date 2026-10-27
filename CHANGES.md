@@ -1,27 +1,30 @@
-# 0.5.2 — guard: the doctor's hook probe blocks from any shell, not only inside a workspace
+# 0.6.0 — .migration/ holds machine files only
 
-`hooks/dbx_guard.py` 0.5.1 checked the probe sentinel (`__dbx_guard_probe__<nonce>`) only inside
-`evaluate()`, which runs once a `.migration/allowed_targets.json` resolves. A probe sent from a
-shell that resolves no workspace — a hosted exec without `workdir`, a fresh child session, hook
-process in `/` with a HOME that has no `.migration` — hit `if cfg is None: return 0` and the echo
-PRINTED, so the doctor's live probe could never produce `blocked:<nonce>` there even though
-hooks.json was loaded.
+0.5.0 moved the human-readable ledger onto the board but several skills still asked for prose
+artifacts with no stated home, so workers recreated numbered files under `.migration/`
+(`04_target_state.md`, `05_access_probes.md`, `10_access_requests.md`, inventories). `.migration/`
+now holds only files a tool reads; everything a human reads lives in `plan.yaml` or on the ticket.
 
 ## Changed
 
-- `hooks/dbx_guard.py`: the probe violation text is factored into `_probe_violation()`; `main()`
-  now blocks a probe command (rc 2, reason names the full `__dbx_guard_probe__<nonce>` token) even
-  when no allowlist resolves. Non-probe commands outside a workspace are still a silent pass, and
-  every cfg-resolved path (warn-mode rows included) is unchanged.
-- `skills/factory-doctor/doctor.py`: `hook_guard_functional` sends the probe in the workspace shape
-  and in the no-workspace hosted shape (cwd `/`, project dirs `/`, a HOME with no workspace) and is
-  `ok` only if both block naming the full token — children catch a stale, cwd-dependent guard.
-- Tests: `test_doctor_probe_blocks_in_every_session_shell_shape` (the six shell shapes a run sees),
-  `test_probe_sentinel_outside_a_migration_workspace_blocks`, a doctor test that fails a guard
-  which only blocks inside a workspace, and one that proves the platform row via a live probe run
-  from a shell without a workspace.
-- Docs: the probe blocks from any shell or directory; the "run in the lead session's exec tool"
-  instruction is unchanged.
+- Renamed `.migration/03_recon_tolerances.json` to `recon_tolerances.json` and
+  `.migration/09_capabilities.json` to `capabilities.json`. The doctor still reads the legacy
+  names until 0.7.0 and its `workspace` check warns with the rename; both names present fails.
+  The doctor writes `capabilities.json`.
+- `factory-doctor`: `MIGRATION_LAYOUT` lists the allowed top-level `.migration/` entries; the new
+  `workspace_layout` check warns (never fails) on anything else.
+- Target state is one `target-<surface>` decision per surface in `plan.yaml`, proposed by
+  `workspace-setup`; wave manifests may carry it as `target_state`, validated by `manifest.py`.
+- `workspace-setup` probe table, `estate-inventory` inventory and `pipeline-analysis` analysis are
+  ticket attachments, never `.migration/` files; fired access requests are `plan.yaml` blockers,
+  with no separate register.
+- README lists every `.migration/` machine file with its writer and readers;
+  `skills/test_migration_layout.py` fails when shipped text names any other `.migration/` path.
+
+## Calls
+
+- Existing workspaces: rename the two files in one PR (`git mv`), and move any prose under
+  `.migration/` onto the ticket or into `plan.yaml`.
 
 # 0.5.1 — guard: the plugin's own factory-doctor is not a scanned script
 

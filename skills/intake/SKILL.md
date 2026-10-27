@@ -34,11 +34,11 @@ that after the human approves the plan.
 |---|---|
 | Source system, versions, dialect | Estate-type routing (below); dialect skill on every worker ticket |
 | Named secret for legacy read-only principal | Phase `foundation` blocker `{kind: secret, secret: <name>}` |
-| Named secret for the migration principal | Phase `foundation` blocker `{kind: secret}` + `09_capabilities.json` identity |
+| Named secret for the migration principal | Phase `foundation` blocker `{kind: secret}` + `capabilities.json` identity |
 | Cutover principal holder | `cutover` phase blocker `{kind: secret}` + the `authorized` gate |
 | First pipeline / scope / exclusions | Phase-1 decisions `first-pipeline` and `scope-exclusions` |
 | Coexistence mode | Phase-1 decision `coexistence-mode` (recommended option `selected`) |
-| Correctness deviations | Phase-1 decision `recon-tolerances` — `important: true, selected: null` — then `03_recon_tolerances.json` |
+| Correctness deviations | Phase-1 decision `recon-tolerances` — `important: true, selected: null` — then `recon_tolerances.json` |
 | Access posture (federation / snapshot / export) | Phase-1 decision `source-access` |
 | Target catalogs / Lakebase project | Phase-1 decision `target-catalogs` → `allowed_targets.json` |
 | Notification route (Slack/webhook) | Blocker `{kind: mcp}` or `{kind: secret}` on the step that posts |

@@ -14,6 +14,13 @@ phases:
             label: Lakeflow Connect managed connector
         selected: federate
         important: false
+      - id: target-core
+        description: Select the core-table target and cite its reference implementation.
+        options:
+          - id: delta
+            label: Delta table; reference implementation at examples/core.sql
+        selected: delta
+        important: false
     steps:
       - id: scaffold-wave-0
         title: Wave 0 scaffolding

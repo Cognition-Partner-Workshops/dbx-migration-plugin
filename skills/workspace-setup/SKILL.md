@@ -25,18 +25,21 @@ decisions, a probe result, or a referenced standards document.
    `legacy_sources`, `guard_mode`, `target_hosts`, `bundle_targets`, `lakebase_projects`,
    `lakebase_branches`, `run_mode`, `fixture_endpoints` (key semantics: `README.md`; who may
    widen it: `AGENTS.md`).
-2. Pin the plan's tolerance decision into `.migration/03_recon_tolerances.json`: exact-match or
+2. Pin the plan's tolerance decision into `.migration/recon_tolerances.json`: exact-match or
    per-type/per-surface tolerances, row and aggregate thresholds, populations, nondeterminism,
    the legacy-query concurrency cap, live vs degraded mode, and the amendment procedure (every
    amendment preserves the old row and names its re-verification scope).
-3. Write the target-state artifact the workers consume: per surface (CORE, SQL, PIPELINE,
-   ORCHESTRATION, CONSUMER, LAKEBASE, ML-SCORING, DATA/DEPENDENCY) cite a reference
-   implementation or a standards document, or mark the surface N/A with a reason. A reference
-   implementation outranks a document; cite real files.
+3. Propose one `plan.yaml` decision per target surface: `target-core`, `target-sql`,
+   `target-pipeline`, `target-orchestration`, `target-consumer`, `target-lakebase`,
+   `target-ml-scoring`, and `target-data-dependency`. Each selected option names the target and
+   cites a reference implementation (which outranks a document) or a standards document, or says
+   N/A with a reason. Attach the proposals to this ticket; the manager writes them into
+   `plan.yaml`. Do not create a target-state file.
 4. Probe legacy read, Databricks query, and target write (the write probe covers the promotion
-   schema the target profile names); record each result as WORKS or BLOCKED with output, and
-   report every blocked item on the ticket so the manager can fire it as a plan blocker.
-5. Run `factory-doctor` in setup posture and commit `.migration/09_capabilities.json` with the
+   schema the target profile names); record each result as WORKS or BLOCKED with output in a
+   table attached to the ticket. Report each BLOCKED item so the manager can file it as a plan
+   blocker. Do not create a probe-table file.
+5. Run `factory-doctor` in setup posture and commit `.migration/capabilities.json` with the
    `source_principal`; the recorded identity is the one every worker session expects.
 6. Record which secret holds each of the three principal tiers (`skills/target-routing/SKILL.md`).
 7. Keep `.migration/.hook_probe_nonce` out of git (`.gitignore` entry).
@@ -45,9 +48,10 @@ decisions, a probe result, or a referenced standards document.
 
 ## Evidence the ticket must attach
 
-- Committed `.migration/allowed_targets.json`, `03_recon_tolerances.json`, and
-  `09_capabilities.json` on the protected branch.
+- Committed `.migration/allowed_targets.json`, `recon_tolerances.json`, and
+  `capabilities.json` on the protected branch.
 - The doctor record and its identity.
-- The probe results table: WORKS/BLOCKED per access path, with output, plus the list of items
-  handed to the manager as blockers.
-- The target-state artifact with every field cited.
+- The WORKS/BLOCKED probe table with output, attached to the ticket; each BLOCKED item is
+  reported for the manager to file as a plan blocker.
+- The proposed `target-*` decisions with every selected option cited; the manager records them
+  in `plan.yaml`.

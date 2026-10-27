@@ -34,13 +34,14 @@ go in a PROPOSED-unused set.
    enter the inventory.
 7. Register every D3–D9 crossing with a complete contract; unresolved fields stay explicit
    blockers on the plan.
-8. Record per-pipeline width, serial floor, and D10-constrained concurrency. Write
-   `<Estate>_inventory.md`, render the DAG, and hand the recommendation to the manager.
+8. Record per-pipeline width, serial floor, and D10-constrained concurrency. Attach
+   `<Estate>_inventory.md` to the ticket, render the DAG, and hand the recommendation to the
+   manager. Never put the inventory under `.migration/`.
 
 ## Evidence the ticket must attach
 
-- `<Estate>_inventory.md`: the pipeline catalog, shared-object map, DAG, PROPOSED-unused set,
-  governance section.
+- `<Estate>_inventory.md` attached to the ticket: the pipeline catalog, shared-object map, DAG,
+  PROPOSED-unused set, governance section; never under `.migration/`.
 - The exact coverage arithmetic (`N = pipelines + shared + PROPOSED-unused + confirmed
   exclusions`) and which counts are UNVERIFIABLE.
 - The dependency table: every crossing with a complete contract.

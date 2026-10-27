@@ -164,7 +164,7 @@ _SIDE_EFFECT_FN = re.compile(
 _UC_READ = {"list", "get", "exists"}
 _DBX_READ = {
     "current-user": {"me"}, "catalogs": _UC_READ, "schemas": _UC_READ, "tables": _UC_READ, "volumes": _UC_READ, "functions": _UC_READ,
-    "metastores": _UC_READ, "external-locations": _UC_READ, "storage-credentials": _UC_READ, "connections": _UC_READ,
+    "metastores": _UC_READ | {"current", "summary"}, "external-locations": _UC_READ, "storage-credentials": _UC_READ, "connections": _UC_READ,
     "grants": {"get", "get-effective"}, "jobs": {"list", "get", "list-runs", "get-run", "get-run-output"},
     "pipelines": {"list", "get", "list-updates", "get-update", "list-pipeline-events"}, "warehouses": {"list", "get"},
     "clusters": {"list", "get", "events", "spark-versions", "list-node-types", "list-zones"},
