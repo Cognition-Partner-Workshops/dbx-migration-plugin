@@ -22,9 +22,9 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from .dsn import oracle_dsn_parts
 from .fingerprint import DIGEST_MODULUS
 from .fingerprint import normalise as _digest_value
-from .dsn import oracle_dsn_parts
 from .rerun import normalize_type
 from .watermarks import instant
 from .watermarks import literal as watermark_literal
