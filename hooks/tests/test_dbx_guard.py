@@ -1079,9 +1079,9 @@ def test_doctor_probe_blocks_in_every_session_shell_shape(tmp_path: Path, shape:
     home = tmp_path / "home"
     child_home = tmp_path / "child-home"
     child_home.mkdir()
-    ws = home / "repos" / "otterworks"
+    ws = home / "repos" / "acme-target"
     (ws / ".migration").mkdir(parents=True)
-    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["ow_tp"], "guard_mode": "block"}))
+    (ws / ".migration" / "allowed_targets.json").write_text(json.dumps({"catalogs": ["mig_cat"], "guard_mode": "block"}))
     event = {"tool_name": "exec", "tool_input": {"command": command or probe}}
     if shape == "direct-cwd-ws":
         run_cwd = str(ws)
