@@ -19,6 +19,15 @@
   output's missing PK/identity, and a `grant_extra` for the run's own principal (`run
   --capabilities`); gated on `--target-kind databricks`, Lakebase unchanged, duplicates and
   every other grantee/grant_missing still block.
+- Merge overrides move out of the wave manifest into `.migration/authorizations.json`: a committed
+  `merge_override` entry names its `wave` (the manifest file stem) and the units in `objects`, with
+  optional `blocker_classes` (harness policy classes only; `data` is rejected). A manifest carrying
+  `merge_overrides` is refused, so authorizing an override keeps the `plan_sha` and the wave reruns
+  under its plan step. factory-doctor validates those entries, reads the authorization file from the
+  manifest's `base_branch`, parses the `grants get-effective` payload the CLI really returns
+  (`{privilege, inherited_from_type, ...}` items, recorded in `data.writable`), and accepts
+  `--source-attested` for a Databricks source only as a committed `source_principal_attested` entry
+  covering every in-scope table (row `warn`, never `ok`); dbx_guard blocks sessions adding that kind.
 
 ## Fixed
 

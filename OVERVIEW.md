@@ -24,7 +24,8 @@ Independent units migrate many at a time.
 5. The human approves `plan.yaml` in the Plan view; approval is the only gate between plan and
    execution.
 6. Each `Run wave N` step becomes a ticket. A `wave-plan` worker writes the wave manifest
-   (`plan_step`, `child_skill`, `verify_skill`, batches, gates, `merge_overrides`, `resync`) and
+   (`plan_step`, `child_skill`, `verify_skill`, batches, gates, `resync`; merge overrides are
+   committed `merge_override` authorizations naming the wave, never manifest fields) and
    has `factory-doctor` sign it; a `migration-fanout` worker runs `workflow.py`, which launches
    one `unit-migration` child per batch and one independent `wave-verify` verifier.
 7. The manager ticks gates from verdict files, merged PRs, and job runs.

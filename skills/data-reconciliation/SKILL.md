@@ -27,9 +27,9 @@ This section is the only home for the merge-authority rule; other files point he
   `rerun_policy`, `evidence` (mode, snapshot manifest, unlisted routines, ungraded embeds, provenance).
   The report's headline is `parity PASS, merge blocked (rerun_policy)`, never a bare FAIL when the
   rows matched; `verdict` stays every tier's pass/fail for the workflow.
-- The only exception is a `merge_overrides` entry in the committed wave manifest naming exactly the
-  affected units and citing the plan decision that cleared them; it lifts merge policy only, never
-  a `data` blocker, and parity stays as measured.
+- The only exception is a committed `merge_override` entry of `.migration/authorizations.json`
+  naming the wave and the affected units (the plan decision that cleared them); it lifts merge
+  policy only, never a `data` blocker, and parity stays as measured.
 
 ## Run it
 
@@ -159,8 +159,8 @@ provenance warning and the run is not merge-eligible.
   findings and every hole is a permission refusal (`DictionaryError.kind == "privilege"`, or a
   reader that marked grants `privilege_denied`), `structural` otherwise. No harness flag lifts a
   visibility gap: the caller cannot declare a category unreadable, so a refused read always
-  blocks with that class and is accepted, if at all, by a `merge_overrides` entry in the committed
-  wave manifest whose plan decision names `privilege_visibility`. `--source-dictionary`/`--target-dictionary`
+  blocks with that class and is accepted, if at all, by a committed `merge_override` authorization
+  for the wave whose `blocker_classes` (or unscoped policy default) covers `privilege_visibility`. `--source-dictionary`/`--target-dictionary`
   substitute a fixture JSON (`harness/fixtures/example_<family>/dictionary.json` shows the
   shape per family) for the live catalog read; structure proven from a fixture never merges.
 - Rerun proof (schema evolution): `dbx-recon rerun-proof --unit <id> --source <job file>... --prior-proof
@@ -227,7 +227,7 @@ provenance warning and the run is not merge-eligible.
 - A table without a watermark is graded strictly (no in-flight allowance).
 - Embedded arrays are refused on a Lakebase target: map operational children as separate objects.
 - Only PASS results in `live`, `snapshot`, or `transactional` mode have `merge_eligible=true`; fixture and continuous evidence never merges.
-- `result.json` always names `merge_authority: {kind: harness, decision_id: null}`; the harness never writes `human_override`. Merging past `merge_eligible=false` is the workflow's `merge_authority` check against a `merge_overrides` entry in the committed wave manifest (see `migration-fanout`).
+- `result.json` always names `merge_authority: {kind: harness, decision_id: null}`; the harness never writes `human_override`. Merging past `merge_eligible=false` is the workflow's `merge_authority` check against a committed `merge_override` entry of `.migration/authorizations.json` naming the wave (see `migration-fanout`).
 
 ## Source access
 

@@ -2,8 +2,9 @@
 and the wave result the wave ticket's worker hands back to the manager. Guarantees: no two
 batches share a write target, at most `width` children at once, a circuit breaker on repeated
 failure classes, this script is the single writer of the result, only verifier-PASS PRs merge
-(auto_merge or a merge_overrides entry of the committed manifest). Each invocation launches one
-run of one manifest through `run_workflow`; the run log refuses the same manifest bytes twice.
+(auto_merge or a committed `merge_override` authorization naming the wave and its units). Each
+invocation launches one run of one manifest through `run_workflow`; the run log refuses the same
+manifest bytes twice.
 """
 
 import asyncio
@@ -72,7 +73,7 @@ if PLUGIN:
 try:  # the sandbox runs a copy of this script; the pointer's plugin root names its siblings
     import cards
     from decisions import (UNSCOPED_OVERRIDE, merge_override_for, override_forgives, plan_authorizations, plan_sha,
-                           unauthorized_decisions)
+                           unauthorized_decisions, wave_overrides)
     from manifest import (BARE_PATH, MERGE_EVIDENCE_MODES, PR_URL, TAG_RE, _is_manifest, bounded_readers,
                           check_doctor_contract, check_pipeline_updates, check_repo_origin, check_wave_tag,
                           disjoint_slices, evidence_path, mapped_target, other_wave_manifests, reader_slices,
@@ -241,7 +242,7 @@ def committed_authorizations():
         return plan_authorizations(text)
     except ValueError as e:
         raise SystemExit(f"origin/{BASE_BRANCH}:.migration/authorizations.json {e}; the manifest's waived gates and "
-                         "merge_overrides cannot be resolved against it") from None
+                         "this wave's merge overrides cannot be resolved against it") from None
 
 
 def evidence_in_pr(head, path, units):
@@ -646,11 +647,13 @@ check_wave_tag(TAG, MANIFEST)
 BASE_SHA = wave_base()
 DOCTOR = signed_doctor_report(DOCTOR_PATH, MANIFEST_BYTES, MANIFEST_SHA)
 check_doctor_contract(MANIFEST, DOCTOR)
-UNAUTHORIZED = unauthorized_decisions(MANIFEST, committed_authorizations)
+AUTHORIZATIONS = committed_authorizations()
+UNAUTHORIZED = unauthorized_decisions(MANIFEST, AUTHORIZATIONS)
 if UNAUTHORIZED:
-    raise SystemExit("; ".join(UNAUTHORIZED) + ". A waiver or override is a plan decision the human selected, mirrored to "
-                     f".migration/authorizations.json on origin/{BASE_BRANCH} by reviewed PR (kind gate_waived or "
-                     "merge_override, by user:<id>, objects naming the units); a slug the manifest names alone waives nothing")
+    raise SystemExit("; ".join(UNAUTHORIZED) + ". A waiver is a plan decision the human selected, mirrored to "
+                     f".migration/authorizations.json on origin/{BASE_BRANCH} by reviewed PR (kind gate_waived, "
+                     "by user:<id>, objects naming the units); a slug the manifest names alone waives nothing")
+OVERRIDES = wave_overrides(AUTHORIZATIONS, MANIFEST_PATH.stem)
 
 
 def _git_paths(*args):
@@ -863,6 +866,7 @@ def resync_prompt(cfg):
 
 
 def child_prompt(batch):
+    override = merge_override_for(batch["units"], AUTHORIZATIONS, MANIFEST_PATH.stem)
     gates = [g for g in batch.get("gates", []) if g["status"] != "waived"]
     skill_path, skill_body = skill_text(MANIFEST["child_skill"])
     return (
@@ -880,9 +884,9 @@ def child_prompt(batch):
         "sequence_behind_source, missing_rule).\n"
         f"The harness is the merge authority: status=PASS needs a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} "
         "(transactional for Lakebase/operational units) and merge_eligible=true in every unit's "
-        ".migration/recon/<unit>/result.json. Fixture evidence is never PASS. If a unit is not eligible and exactly "
-        "one committed merge_overrides entry covers your units, report merge_authority {kind: human_override, "
-        "decision_id: <its decision>}; never edit the manifest.\n"
+        ".migration/recon/<unit>/result.json. Fixture evidence is never PASS. If not eligible, claim merge_authority "
+        "{kind: human_override, decision_id: <id>} only for the single committed merge_override authorization of "
+        f"{MANIFEST_PATH.stem} covering your units (here: {json.dumps(override['decision']) if override else 'none'}).\n"
         "Open exactly one PR, first line PASS or FAIL. Do not merge it; wave close reviews.\n"
         "Edit nothing under .migration/ except .migration/recon/<unit_id>/; report every path the PR changes in "
         "changed_paths (`git diff --name-only <base>...<head>`); any other .migration/ path is FAIL "
@@ -893,12 +897,26 @@ def child_prompt(batch):
     )
 
 
+def source_attestation():
+    """The committed attestation the signed doctor record ran under (its source_principal_read_only row's
+    data.attested), so a child's own doctor run passes the same --source-attested instead of re-blocking on
+    the grants the human waived; None when the record attests nothing."""
+    for row in DOCTOR.get("checks") or []:
+        if isinstance(row, dict) and row.get("id") == "source_principal_read_only":
+            attested = (row.get("data") or {}).get("attested") if isinstance(row.get("data"), dict) else None
+            return attested if isinstance(attested, str) and attested else None
+    return None
+
+
 def capability_block(units):
     caps, src = MANIFEST["capabilities"], MANIFEST.get("source") or {}
     flags = " ".join(f"--unit {u}" for u in units)
     if src:
         flags += " " + " ".join([f"--source-family {src['family']} --source-secret {src['secret']}"]
                                 + [f"--param {shlex.quote(f'{k}={v}')}" for k, v in src.get("params", {}).items()])
+    attested = source_attestation()
+    if attested:
+        flags += f" --source-attested {shlex.quote(attested)}"
     return (
         f"Capability contract: {json.dumps(caps, sort_keys=True)}\nBefore converting run "
         f"`factory-doctor --role child --reuse-record .migration/waves/wave-{TAG}.doctor.json "
@@ -942,8 +960,8 @@ def verify_prompt(passed):
            f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
            "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
            "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. ")
-        + "A batch listed with merge_authority kind human_override was cleared by the named entry of the "
-        f"committed manifest's merge_overrides {json.dumps(MANIFEST.get('merge_overrides', []), sort_keys=True)}: "
+        + "A batch listed with merge_authority kind human_override was cleared by the named committed "
+        f"merge_override authorization of this wave {json.dumps(OVERRIDES, sort_keys=True)}: "
         "mark it PASS on a PASS verdict even if merge_eligible is false, and cite the decision id in findings. "
         "Each batch lists "
         "its acceptance gates with the evidence the child gave; open the evidence of every passed gate and FAIL "
@@ -1060,7 +1078,7 @@ async def _run_batch(batch, sem, breaker):
             if out.get("merge_eligible") is True and not ineligible:
                 out["merge_authority"] = {"kind": "harness", "decision_id": None}
             else:
-                entry = merge_override_for(batch["units"], MANIFEST.get("merge_overrides"))
+                entry = merge_override_for(batch["units"], AUTHORIZATIONS, MANIFEST_PATH.stem)
                 scope = entry.get("blocker_classes") if entry else None
                 uncovered = {u: c for u, (_, c) in recon.items() if c is None or not set(c) <= override_forgives(scope)}
                 why = "; ".join(
@@ -1070,13 +1088,14 @@ async def _run_batch(batch, sem, breaker):
                 if entry is None:
                     downgrade("merge_authority",
                               f"recon evidence is not merge_eligible=true for every unit ({why}) and no single "
-                              f"merge_overrides entry of the committed manifest covers {', '.join(batch['units'])}",
+                              f"committed merge_override authorization for {MANIFEST_PATH.stem} covers "
+                              f"{', '.join(batch['units'])}",
                               drop="merge_authority")
                 elif not (isinstance(claimed, dict) and claimed.get("kind") == "human_override"
                           and claimed.get("decision_id") == entry["decision"]):
                     downgrade("merge_authority",
-                              f"recon evidence is not merge_eligible=true for every unit ({why}); the manifest's "
-                              f"merge_overrides entry {entry['decision']} covers the batch but the child claimed "
+                              f"recon evidence is not merge_eligible=true for every unit ({why}); the committed "
+                              f"merge_override authorization {entry['decision']} covers the batch but the child claimed "
                               f"{claimed!r}: a PASS on an override names exactly that entry's decision",
                               drop="merge_authority")
                 elif uncovered:
@@ -1084,7 +1103,7 @@ async def _run_batch(batch, sem, breaker):
                                      for u, c in sorted(uncovered.items()))
                     downgrade("merge_authority",
                               f"recon evidence is not merge_eligible=true for every unit ({why}); "
-                              f"merge_overrides entry {entry['decision']} covers blocker classes "
+                              f"merge_override authorization {entry['decision']} covers blocker classes "
                               f"{scope if scope is not None else sorted(UNSCOPED_OVERRIDE) + ['(unscoped)']} "
                               f"only, but {what}",
                               drop="merge_authority")

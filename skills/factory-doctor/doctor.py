@@ -257,11 +257,47 @@ def check_workspace_layout(ws: Path) -> Check:
 
 _ENTRY_AUTHOR = re.compile(r"user:[\w][\w.@/-]*")
 _ENTRY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-_AUTH_KINDS = {"legacy_write_authorized", "gate_waived", "merge_override"}
+_AUTH_KINDS = {"legacy_write_authorized", "gate_waived", "merge_override", "source_principal_attested"}
+_WAVE_STEM = re.compile(r"wave-[A-Za-z0-9_-]+")
 
 
-def check_authorizations(ws: Path) -> Check:
-    """.migration/authorizations.json shape, and warn when the working copy is not the committed one."""
+def _policy_blocker_classes(plugin_root: Path | None) -> frozenset[str] | None:
+    """The harness blocker classes a merge_override may forgive (recon.report.BLOCKER_CLASSES minus `data`),
+    None when the harness is not importable."""
+    if plugin_root is None:
+        return None
+    sys.path.insert(0, str(plugin_root / "skills" / "data-reconciliation" / "harness"))
+    try:
+        from recon.report import BLOCKER_CLASSES
+    except ImportError:
+        return None
+    return frozenset(BLOCKER_CLASSES) - {"data"}
+
+
+def _entry_problem(e: dict, policy_classes: frozenset[str] | None) -> str | None:
+    """Why one well-shaped authorization entry is still malformed for its kind, else None. A `merge_override`
+    names its wave (`wave-<tag>`, the manifest file stem) and may scope `blocker_classes` to harness policy
+    classes; `data` is never forgivable, so an entry naming it is rejected."""
+    if e["kind"] != "merge_override":
+        return None
+    if not (isinstance(e.get("wave"), str) and _WAVE_STEM.fullmatch(e["wave"])):
+        return "a merge_override needs `wave`: the manifest file stem it clears, wave-<tag>"
+    if "blocker_classes" not in e:
+        return None
+    classes = e["blocker_classes"]
+    if not (isinstance(classes, list) and classes and all(isinstance(c, str) for c in classes)):
+        return "`blocker_classes` must be a non-empty list of harness blocker classes"
+    if policy_classes is None:
+        return "`blocker_classes` cannot be checked: the recon harness (recon.report.BLOCKER_CLASSES) is not importable"
+    if bad := sorted(set(classes) - policy_classes):
+        return (f"`blocker_classes` {bad} are not forgivable classes {sorted(policy_classes)}"
+                + (" (a data blocker is fixed in converted code, never overridden)" if "data" in bad else ""))
+    return None
+
+
+def check_authorizations(ws: Path, plugin_root: Path | None = None, base_branch: str | None = None) -> Check:
+    """.migration/authorizations.json shape, and warn when the working copy is not the committed one
+    (on origin/<base_branch> when a manifest names it, else the protected branch)."""
     cid = "authorizations_file"
     p = ws / AUTHORIZATIONS_REL
     if not p.is_file():
@@ -273,19 +309,27 @@ def check_authorizations(ws: Path) -> Check:
     if not isinstance(doc, dict) or doc.get("version") != 1 or not isinstance(doc.get("authorizations"), list):
         return Check(cid, "fail", f"{AUTHORIZATIONS_REL} must be "
             '{"version": 1, "authorizations": [...]}')
-    bad = []
+    bad, why = [], []
+    policy_classes = _policy_blocker_classes(plugin_root)
     for i, e in enumerate(doc["authorizations"]):
         if (not isinstance(e, dict) or not _ENTRY_ID.fullmatch(str(e.get("id") or "")) or
                 e.get("kind") not in _AUTH_KINDS or
-                not (isinstance(e.get("objects"), list) and e["objects"]) or
+                not (isinstance(e.get("objects"), list) and e["objects"]
+                     and all(isinstance(o, str) for o in e["objects"])) or
                 not _ENTRY_AUTHOR.fullmatch(str(e.get("by") or ""))):
             bad.append(f"entry {i}")
+        elif problem := _entry_problem(e, policy_classes):
+            bad.append(f"entry {i}")
+            why.append(f"entry {i}: {problem}")
     if bad:
         return Check(cid, "fail", f"{AUTHORIZATIONS_REL}: malformed {', '.join(bad)} — each entry needs "
-            "a slug id, kind in " + str(sorted(_AUTH_KINDS)) + ", a non-empty objects list and a "
-            "`by` matching `user:...`", {"malformed": bad})
+            "a slug id, kind in " + str(sorted(_AUTH_KINDS)) + ", a non-empty objects list of strings and a "
+            "`by` matching `user:...`" + ("; " + "; ".join(why) if why else ""), {"malformed": bad})
     data = {"entries": len(doc["authorizations"])}
-    committed, ref = _committed(ws, AUTHORIZATIONS_REL)
+    committed, ref = _committed(ws, AUTHORIZATIONS_REL, _authorization_refs(base_branch))
+    if committed is None and base_branch:
+        return Check(cid, "warn", f"refs/remotes/origin/{base_branch} has no {AUTHORIZATIONS_REL} (or is not fetched): "
+            "only the committed copy on the wave's base branch authorizes anything", data)
     if committed is not None and p.read_bytes() != committed:
         return Check(cid, "warn", f"the working copy differs from {ref}:{AUTHORIZATIONS_REL}: "
             "authorizations change only by PR", data)
@@ -475,6 +519,12 @@ def check_hooks(plugin_root: Path, ws: Path, probe_result: str, role: str = "orc
 
 
 _POLICY_REFS = ("refs/remotes/origin/HEAD", "origin/main", "origin/master", "HEAD")
+
+
+def _authorization_refs(base_branch: str | None) -> tuple[str, ...]:
+    """Where the committed authorization file is read from: the wave's base branch when a manifest names one
+    (the ref the fan-out workflow reads), else the protected branch the guard reads."""
+    return (f"refs/remotes/origin/{base_branch}",) if base_branch else _POLICY_REFS
 
 
 def _committed(ws: Path, rel: str, refs: tuple[str, ...] = _POLICY_REFS) -> tuple[bytes | None, str | None]:
@@ -1291,7 +1341,8 @@ _DBX_GET_COMMAND = {"catalog": "catalogs", "schema": "schemas", "table": "tables
 
 
 def _uc_privileges(cli: str, kind: str, name: str, principal: str, env: dict | None = None, strict: bool = False):
-    """(privilege set, shown) of `grants get-effective`; (None, shown) when the grants are unreadable."""
+    """(privileges, shown) of `grants get-effective`: a privilege set, or with `strict` the
+    {PRIVILEGE: inherited_from_type} dict of exactly that response; (None, shown) when the grants are unreadable."""
     payload, shown = _cli_json(cli, "grants", "get-effective", kind, name, "--principal", principal, env=env)
     if payload is None:
         return None, shown
@@ -1336,8 +1387,10 @@ def _check_databricks_source_principal(tables: list[str]) -> Check:
         privileges, shown = _uc_privileges(cli, kind, name, principal, strict=True)
         if privileges is None:
             return Check(cid, "unverified", f"databricks: grants get-effective {kind} {name} failed: {shown}", data)
-        if offending := sorted(privileges - _DBX_READ_PRIVILEGES):
-            data["writable"][name] = data["writable"].get(name, []) + offending
+        if offending := sorted(set(privileges) - _DBX_READ_PRIVILEGES):
+            # each write privilege with where it is inherited from (CATALOG, SCHEMA, ...; none when granted here)
+            data["writable"][name] = data["writable"].get(name, []) + [
+                f"{p} (inherited from {privileges[p]})" if privileges[p] else p for p in offending]
     if data["writable"]:
         shown = "; ".join(f"{n}: {', '.join(p_)}" for n, p_ in list(data["writable"].items())[:6])
         shown += f"; +{len(data['writable']) - 6} more in data" if len(data["writable"]) > 6 else ""
@@ -1351,17 +1404,67 @@ def _check_databricks_source_principal(tables: list[str]) -> Check:
         f"{len(tables)} in-scope table(s), their schemas and catalogs; no ownership", data)
 
 
-def _attested(ws: Path, decision: str, family: str, tables: list[str]) -> Check:
-    """--source-attested <id>: a plan decision standing in for a privilege query the family lacks.
-    The decision is human-owned; the doctor records it without verifying it."""
+def _committed_attestation(ws: Path, decision: str, base_branch: str | None) -> tuple[dict | None, str]:
+    """(entry, why-not) for a committed `source_principal_attested` authorization with this id by a user."""
+    refs = _authorization_refs(base_branch)
+    text, ref = _committed(ws, AUTHORIZATIONS_REL, refs)
+    if text is None:
+        return None, f"no {AUTHORIZATIONS_REL} committed on {', '.join(refs)}"
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None, f"{ref}:{AUTHORIZATIONS_REL} is not valid JSON"
+    entries = doc.get("authorizations") if isinstance(doc, dict) else None
+    for e in entries if isinstance(entries, list) else []:
+        if isinstance(e, dict) and e.get("id") == decision:
+            if (e.get("kind") == "source_principal_attested" and _ENTRY_AUTHOR.fullmatch(str(e.get("by") or ""))
+                    and isinstance(e.get("objects"), list) and e["objects"]
+                    and all(isinstance(o, str) for o in e["objects"])):
+                return e, ref
+            return None, (f"{ref}:{AUTHORIZATIONS_REL} entry {decision} is not a source_principal_attested entry by "
+                "a user with a non-empty objects list")
+    return None, f"{ref}:{AUTHORIZATIONS_REL} has no entry {decision}"
+
+
+def _attested(ws: Path, decision: str, family: str, tables: list[str], base_branch: str | None = None) -> Check:
+    """--source-attested <id>: a plan decision standing in for a privilege query the family lacks, recorded
+    without verification. For a databricks source the query exists and still runs; the decision must then be
+    a committed `source_principal_attested` authorization whose objects cover every in-scope
+    catalog.schema.table (or its catalog), and the row is `warn`, carrying the live write privileges it
+    waives, never `ok`; a live check that is `unverified` stays so (nothing known is waived). Oracle, SQL
+    Server and Postgres sources always run their query."""
     cid = "source_principal_read_only"
-    if family == "databricks" or family in _PRIVILEGE_QUERIES:
+    if family in _PRIVILEGE_QUERIES:
         return Check(cid, "fail", f"{family}: --source-attested {decision} rejected, this family has a "
             "privilege query: run the query instead (drop --source-attested)", {"family": family,
             "decision": decision})
-    return Check(cid, "ok", f"{family}: source principal attested by plan decision {decision} "
-        "(human-owned; not machine-checkable)", {"decision": decision, "attested": decision,
-        "family": family, "tables": tables})
+    if family != "databricks":
+        return Check(cid, "ok", f"{family}: source principal attested by plan decision {decision} "
+            "(human-owned; not machine-checkable)", {"decision": decision, "attested": decision,
+            "family": family, "tables": tables})
+    entry, why = _committed_attestation(ws, decision, base_branch)
+    data: dict = {"family": family, "decision": decision, "tables": tables}
+    if entry is None:
+        return Check(cid, "fail", f"databricks: --source-attested {decision} rejected: {why}; an attestation is a "
+            "committed authorization entry {id, kind: source_principal_attested, by: user:<id>, objects: "
+            "[catalog.schema.table or catalog, ...]} covering every in-scope table", data)
+    covered = set(entry["objects"])
+    uncovered = sorted(t for t in tables if t not in covered
+                       and not (t.count(".") == 2 and t.split(".")[0] in covered))
+    if uncovered or not tables:
+        return Check(cid, "fail", f"databricks: --source-attested {decision} rejected: its objects "
+            + (f"do not cover {uncovered}" if uncovered else "cover no in-scope table (none is mapped)")
+            + "; every in-scope catalog.schema.table (or its catalog) must be named", {**data, "uncovered": uncovered})
+    live = _check_databricks_source_principal(tables)
+    if live.status not in ("ok", "fail"):
+        # an attestation waives write privileges the doctor could read, never a principal it could not
+        return Check(cid, live.status, f"databricks: --source-attested {decision} covers the scope, but the live "
+            f"grant check is {live.status} ({live.detail}); an attestation waives known write privileges, not "
+            "unreadable grants", {**(live.data or {}), **data})
+    return Check(cid, "warn", f"databricks: source principal attested by plan decision {decision} ({entry['by']}) "
+        f"covering {len(tables)} in-scope table(s); live check {live.status}: {live.detail}",
+        {**data, "attested": decision, "offending": (live.data or {}).get("writable"),
+         "live": {"status": live.status, "detail": live.detail, "principal": (live.data or {}).get("principal")}})
 
 
 def _load_mapping(path: Path, params: dict[str, str] | None, plugin_root: Path):
@@ -1409,18 +1512,18 @@ def _from_mappings(cid, todo, params, plugin_root, source_family, unknown_detail
 
 def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str | None,
     source_family: str | None, plugin_root: Path, params: dict[str, str] | None = None, attested: str | None = None,
-    wave_units: list[str] | None = None) -> Check:
+    wave_units: list[str] | None = None, base_branch: str | None = None) -> Check:
     """Every source table the resolved mappings read, against --source-family or the mappings' implied family."""
     cid = "source_principal_read_only"
 
     def principal(_expected, todo):
         return _from_mappings(cid, todo, params, plugin_root, source_family,
             "so the principal's privileges can be checked", lambda tables, family: (_attested(ws, attested, family,
-            tables) if attested else check_source_principal(tables, family, source_secret)))
+            tables, base_branch) if attested else check_source_principal(tables, family, source_secret)))
 
     if role == "setup" and source_secret and not units and not mappings and not sorted(ws.glob(UNIT_MAPPINGS)):
         if attested and source_family:
-            return _attested(ws, attested, source_family, [])
+            return _attested(ws, attested, source_family, [], base_branch)
         if not source_family:
             return Check(cid, "unverified", "pass --source-family oracle|sqlserver|postgres with --source-secret "
                 "so setup can probe the source principal (no unit mapping exists yet)")
@@ -1785,16 +1888,28 @@ def _effective_privileges(payload) -> set[str]:
         isinstance(v, dict) and isinstance(v.get("privilege"), str)}
 
 
-def _effective_privileges_strict(payload) -> set[str] | None:
-    """None unless the payload is exactly a get-effective grants response (unreadable grants must not pass)."""
+def _effective_privileges_strict(payload) -> dict[str, str | None] | None:
+    """{PRIVILEGE: inherited_from_type or None} of exactly a `grants get-effective` response, else None
+    (unreadable grants must not pass). The CLI lists each privilege as `{"privilege": "SELECT",
+    "inherited_from_type": "CATALOG", "inherited_from_name": ...}`; a bare privilege string is accepted too.
+    Anything else in `privileges` (a string instead of a list, an item with no `privilege`) is not that
+    response."""
     if not isinstance(payload, dict) or not isinstance(payload.get("privilege_assignments"), list):
         return None
-    found: set[str] = set()
+    found: dict[str, str | None] = {}
     for assignment in payload["privilege_assignments"]:
         privileges = assignment.get("privileges") if isinstance(assignment, dict) else None
-        if not isinstance(privileges, list) or not all(isinstance(p, str) for p in privileges):
+        if not isinstance(privileges, list):
             return None
-        found.update(p.upper() for p in privileges)
+        for item in privileges:
+            if isinstance(item, str):
+                found.setdefault(item.upper(), None)
+            elif isinstance(item, dict) and isinstance(item.get("privilege"), str):
+                inherited = item.get("inherited_from_type")
+                found[item["privilege"].upper()] = inherited if isinstance(inherited, str) else found.get(
+                    item["privilege"].upper())
+            else:
+                return None
     return found
 
 
@@ -1955,7 +2070,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     lakebase_dsn: str | None = None, lakebase_schema: str | None = None, analytical_schema: str | None = None,
     source_attested: str | None = None, target_kind: str = "databricks",
     secret_names: list[str] | None = None, list_secrets=None, reused: dict | None = None,
-    wave_units: list[str] | None = None) -> dict:
+    wave_units: list[str] | None = None, base_branch: str | None = None) -> dict:
     def _row(row_id, thunk, **binds):
         """`binds` are data keys the recorded row must carry with these exact values to stand in; the
         recorded row's `data.units` must also cover every unit of this run (the orchestrator audits
@@ -1977,7 +2092,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     checks: list[Check] = [
         check_workspace(ws),
         check_workspace_layout(ws),
-        check_authorizations(ws),
+        check_authorizations(ws, plugin_root, base_branch),
         _merge("allowed_targets", [check_allowed_targets(ws, plugin_root),
             check_allowlist_matches_contract(ws, expect_catalogs)]),
         check_allowlist_committed(ws),
@@ -1994,7 +2109,8 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
                 params=params, wave_units=wave_units, source_family=source_family)),
         _row("source_principal_read_only",
             lambda: check_source_principal_all(ws, role, units, mappings, source_secret, source_family,
-                plugin_root, params=params, attested=source_attested, wave_units=wave_units)),
+                plugin_root, params=params, attested=source_attested, wave_units=wave_units,
+                base_branch=base_branch)),
         _row("dictionary_readable",
             lambda: check_dictionary_readable_all(ws, role, units, mappings, source_secret, source_family,
                 plugin_root, params=params, wave_units=wave_units)),
@@ -2073,6 +2189,13 @@ def _load_manifest(p: argparse.ArgumentParser, path: Path, what: str):
         p.error(f"cannot read {what} {path}: {e}")
 
 
+def _manifest_base_branch(manifest) -> str | None:
+    """The wave's `base_branch` when the manifest names a plain branch: the ref the committed authorization
+    file is read from, the same one the fan-out workflow reads."""
+    b = manifest.get("base_branch") if isinstance(manifest, dict) else None
+    return b if isinstance(b, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", b) and ".." not in b else None
+
+
 def _apply_manifest(a, manifest):
     """Fill expect_host/expect_catalogs/source settings/secrets from a wave manifest onto parsed args."""
     family, secret, mparams, names, caps = _manifest_source(manifest)
@@ -2116,8 +2239,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target-kind", choices=TARGET_KINDS, default="databricks",
         help="default recon target for specs that do not declare top-level target_kind")
     p.add_argument("--source-attested", metavar="<id>",
-        help="plan decision id attesting the source has no principal to query; rejected for families "
-        "with a privilege query")
+        help="plan decision id attesting the source principal: recorded unverified for families without a "
+        "privilege query; for a databricks source it must be a committed source_principal_attested authorization "
+        "covering every in-scope table (the row is warn, the live grants still recorded); rejected for "
+        "oracle/sqlserver/postgres")
     p.add_argument("--lakebase-project", help="Lakebase project id for the branch-create preflight")
     p.add_argument("--lakebase-parent-branch", help="Lakebase parent branch for the branch-create preflight")
     p.add_argument("--lakebase-dsn", metavar="ENV_VAR_NAME",
@@ -2132,7 +2257,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.hook_probe_result == "blocked":
         p.error("--hook-probe-result blocked:<nonce> is required: the nonce the guard's block message "
             "named for the probe_command of the last report")
-    manifest_bytes, wave_units = None, None
+    manifest_bytes, wave_units, base_branch = None, None, None
     if a.wave:
         a.wave = a.workspace.resolve() / a.wave  # a relative manifest path is the workspace's, not the cwd's
         waves_dir = a.workspace.resolve() / ".migration" / "waves"
@@ -2148,6 +2273,7 @@ def main(argv: list[str] | None = None) -> int:
             p.error("--wave takes source settings from the manifest; drop --source-family/--source-secret/--param")
         _apply_manifest(a, manifest)
         wave_units = manifest_units(manifest)
+        base_branch = _manifest_base_branch(manifest)
 
     reused, reuse_why = None, ""
     if a.reuse_record:
@@ -2171,6 +2297,7 @@ def main(argv: list[str] | None = None) -> int:
                 p.error(f"{flag} differs from the manifest's source block; --reuse-record takes source settings "
                     "from the manifest, so pass the same values or none")
         _apply_manifest(a, manifest)
+        base_branch = _manifest_base_branch(manifest)
         reused, reuse_why = reusable_record(record, manifest if isinstance(manifest, dict) else {}, manifest_bytes,
             a.expect_identity, a.expect_host, inputs_sha=inputs_sha(a.workspace.resolve()))
 
@@ -2185,7 +2312,8 @@ def main(argv: list[str] | None = None) -> int:
         a.no_databricks, a.unit, a.mapping, a.source_secret, params, a.expect_catalogs, a.source_family,
         a.expect_host, a.lakebase_project, a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema,
         a.analytical_schema, source_attested=a.source_attested,
-        target_kind=a.target_kind, secret_names=a.secret, reused=reused, wave_units=wave_units)
+        target_kind=a.target_kind, secret_names=a.secret, reused=reused, wave_units=wave_units,
+        base_branch=base_branch)
     if a.reuse_record:
         report["checks"].append({**asdict(Check("doctor_record", "ok" if reused else "skipped",
             f"reused the orchestrator's record signed {reused['signed_at']}" if reused else reuse_why)),

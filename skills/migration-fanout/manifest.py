@@ -278,17 +278,11 @@ def validate_manifest(m, plugin=None):
         validate_gates(b)
     shared = {u: bs for u, bs in owners.items() if len(bs) > 1}
     req(not shared, f"a unit id belongs to one batch (its child alone writes .migration/recon/<unit_id>/): {shared}")
-    overrides = m.get("merge_overrides", [])
-    req(isinstance(overrides, list) and all(
-            isinstance(e, dict) and {"decision", "units"} <= set(e) <= {"decision", "units", "blocker_classes"}
-            and isinstance(e["decision"], str) and DECISION_ID.fullmatch(e["decision"])
-            and strs(e["units"]) and e["units"] and ("blocker_classes" not in e or strs(e["blocker_classes"]))
-            for e in overrides),
-        "manifest 'merge_overrides' must be a list of {decision: <plan decision slug>, units: [unit ids], "
-        "blocker_classes?: [classes it forgives]} entries: the plan decisions that let a batch merge on a PASS "
-        "verdict while a unit's result.json says merge_eligible=false")
-    ghosts = sorted({u for e in overrides for u in e["units"] if u not in owners})
-    req(not ghosts, f"manifest 'merge_overrides' units {ghosts!r} are not units of this wave's batches")
+    req("merge_overrides" not in m,
+        "manifest 'merge_overrides' is not a manifest field: merge overrides live in .migration/authorizations.json "
+        "as committed entries {id, kind: merge_override, by: user:<id>, wave: wave-<tag>, objects: [unit ids], "
+        "blocker_classes?: [policy classes]}; delete the key (the plan_sha is unchanged, so the wave reruns under "
+        "its plan step) and re-sign with the doctor")
     src = m.get("source")
     req(src is None or (isinstance(src, dict) and isinstance(src.get("params", {}), dict)
         and all(isinstance(v, str) and WORD.fullmatch(v) for v in (src.get("family"), *src.get("params", {}).keys()))

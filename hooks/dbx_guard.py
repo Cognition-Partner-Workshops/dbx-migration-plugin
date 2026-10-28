@@ -121,7 +121,7 @@ _WRITE_OBJECT = re.compile(
     r"(?:GRANT|REVOKE)\b.*?\bON\s+ALL\s+\w+\s+IN\s+SCHEMA|GRANT\b.*?\bON(?:\s+\w+)?|REVOKE\b.*?\bON(?:\s+\w+)?)\s+([\w.$\"\[\]`]+)")
 _WRITE_OBJECT_NEXT = re.compile(r"\s*,\s*([\w.$\"\[\]`]+)")
 _AUTHORIZED = "authorized: decision "
-_AUTHORIZED_KINDS = ("legacy_write_authorized", "gate_waived", "merge_override")
+_AUTHORIZED_KINDS = ("legacy_write_authorized", "gate_waived", "merge_override", "source_principal_attested")
 _LEGACY_TAIL = " (legacy is read-only in every phase)"
 
 class _Legacy(str):

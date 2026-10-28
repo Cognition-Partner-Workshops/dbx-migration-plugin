@@ -7,8 +7,8 @@ only writer of the wave result, the card and the run log.
 
 The manifest must be a valid wave contract: naming, plan step, `child_skill` / `verify_skill`
 (lowercase skill names whose `SKILL.md` exists under the pointer's plugin root), source fields,
-batches, units, briefs, targets, gates, `merge_overrides`, width, branch, and capabilities are
-checked before children.
+batches, units, briefs, targets, gates, width, branch, and capabilities are checked before
+children; a manifest carrying `merge_overrides` is refused (overrides are authorization entries).
 
 ## Signed doctor gate
 
@@ -89,18 +89,20 @@ Git-observed changes to protected `.migration/` files are reclassified as
 ## Merge authority
 
 PASS requires merge-eligible harness evidence for every unit, unless exactly one
-`merge_overrides` entry of the committed manifest covers every unit of the batch and the
-child reports that entry's decision. A `blocker_classes` scope forgives only the classes it
-lists; an entry with no scope forgives every policy class but never `data` (a data blocker
-needs an entry that names it; a unit with no recorded blocker classes fits no override).
+`merge_override` entry of `.migration/authorizations.json` on origin/`base_branch` names this
+wave (`wave: wave-<tag>`, the manifest file stem), covers every unit of the batch in `objects`,
+and the child reports that entry's id. A `blocker_classes` scope forgives only the policy
+classes it lists; an entry with no scope forgives every policy class; `data` is never forgiven
+(an entry naming it is malformed; a unit with no recorded blocker classes fits no override).
 
 ## Plan decisions
 
-A waived gate's `decision_id` and a `merge_overrides` entry's `decision` name a plan decision
-the human selected; before launch each must be an entry of `.migration/authorizations.json` on
-origin/`base_branch` with that `id`, `kind: gate_waived` or `merge_override`, `by: user:<id>` and
-`objects` naming every unit it covers. The working copy never counts, and a session cannot add
-those kinds (the guard blocks the edit): the authorization arrives by reviewed PR.
+A waived gate's `decision_id` names a plan decision the human selected; before launch it must
+be an entry of `.migration/authorizations.json` on origin/`base_branch` with that `id`, `kind:
+gate_waived`, `by: user:<id>` and `objects` naming every unit it covers. A merge override is the
+same file's `merge_override` entry naming its `wave`, read at the same ref when the batch
+reports. The working copy never counts, and a session cannot add those kinds (the guard blocks
+the edit): the authorization arrives by reviewed PR.
 
 ## Acceptance gates
 
