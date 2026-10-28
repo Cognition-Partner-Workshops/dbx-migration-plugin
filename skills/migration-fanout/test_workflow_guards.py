@@ -2397,7 +2397,7 @@ def test_param_values_follow_the_recon_contract_so_a_timestamp_is_accepted():
 
 
 def test_child_prompt_passes_the_records_source_attestation_to_the_doctor():
-    """The orchestrator's record ran under --source-attested; a child whose record is too old to reuse re-runs
+    """The signed record ran under --source-attested; a child whose record is too old to reuse re-runs
     the source check itself and would block on the grants the human waived without the same flag."""
     attested = {"checks": [{"id": "source_principal_read_only", "status": "warn", "detail": "x",
                             "data": {"attested": "D-7", "offending": {"mig.raw.t": ["MODIFY"]}}}]}
