@@ -50,7 +50,7 @@ def _functions():
                                       "batch_verdicts", "merge_override_for", "wave_overrides", "_strs", "skill_text",
                                       "check_repo_origin",
                                       "check_doctor_contract", "scope_covers", "override_forgives", "skill_file",
-                                      "check_by_design_unverified", "grading_mismatch"})
+                                      "check_by_design_unverified", "grading_mismatch"}), "insteadof_rewrites",
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
@@ -2710,6 +2710,69 @@ def test_check_repo_origin_accepts_origin_at_the_manifests_repo(origin):
 def test_check_repo_origin_halts_when_children_would_open_prs_elsewhere(origin):
     with pytest.raises(SystemExit, match="manifest 'repo'"):
         _functions()["check_repo_origin"]("github.com/acme/target", origin)
+
+
+PROXY_REWRITES = [("https://git-manager.devin.ai/proxy/github.com/", "https://github.com/")]
+
+
+@pytest.mark.parametrize("origin", [
+    "https://git-manager.devin.ai/proxy/github.com/acme/target.git\n",
+    "https://git-manager.devin.ai/proxy/github.com/Acme/Target",
+    "git@github.com:acme/target.git",            # no rewrite applies: compared as today
+    "https://github.com/acme/target.git",
+])
+def test_check_repo_origin_undoes_the_configured_insteadof_rewrite(origin):
+    _functions()["check_repo_origin"]("github.com/acme/target", origin, PROXY_REWRITES)
+
+
+@pytest.mark.parametrize("origin, rewrites", [
+    ("https://git-manager.devin.ai/proxy/github.com/acme/other.git", PROXY_REWRITES),       # other owner/name via the proxy
+    ("https://git-manager.devin.ai/proxy/github.com/acme/target.git", []),                   # no insteadOf configured
+    ("https://evil.example/proxy/github.com/acme/target.git", PROXY_REWRITES),              # a proxy-shaped path on another host
+    ("https://git-manager.devin.ai/proxy/ghe.acme.com/acme/target.git", PROXY_REWRITES),    # the proxy, but for another host
+    ("git@github.com:acme/target-fork.git", PROXY_REWRITES),
+])
+def test_check_repo_origin_rejects_proxy_origins_the_config_does_not_map(origin, rewrites):
+    with pytest.raises(SystemExit, match="manifest 'repo'"):
+        _functions()["check_repo_origin"]("github.com/acme/target", origin, rewrites)
+
+
+def test_check_repo_origin_applies_the_longest_matching_rewrite_only_once():
+    rewrites = [("https://proxy.example/github.com/acme/", "https://ghe.acme.com/acme/"),
+                ("https://proxy.example/github.com/", "https://github.com/")]
+    check = _functions()["check_repo_origin"]
+    check("ghe.acme.com/acme/target", "https://proxy.example/github.com/acme/target.git", rewrites)
+    with pytest.raises(SystemExit, match="manifest 'repo'"):
+        check("github.com/acme/target", "https://proxy.example/github.com/acme/target.git", rewrites)
+
+
+def test_insteadof_rewrites_reads_git_config_longest_target_first(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=(
+            "url.https://git-manager.devin.ai/proxy/github.com/.insteadof https://github.com/\n"
+            "url.https://git-manager.devin.ai/proxy/.insteadof https://\n"
+            "url.git@github.com:.pushinsteadof https://github.com/\n"
+            "url.ssh://git@github.com/.insteadof git@github.com:\n"), stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _functions()["insteadof_rewrites"](Path("/ws")) == [
+        ("https://git-manager.devin.ai/proxy/github.com/", "https://github.com/"),
+        ("https://git-manager.devin.ai/proxy/", "https://"),
+        ("ssh://git@github.com/", "git@github.com:"),
+    ]
+    assert seen["cmd"][:3] == ["git", "-C", "/ws"] and seen["cmd"][3:] == ["config", "--get-regexp", r"url\..*\.insteadof"]
+
+
+@pytest.mark.parametrize("outcome", ["none", "oserror"])
+def test_insteadof_rewrites_is_empty_without_config_or_git(monkeypatch, outcome):
+    def fake_run(cmd, **kw):
+        if outcome == "oserror":
+            raise OSError("no git")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")   # --get-regexp exits 1 on no match
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _functions()["insteadof_rewrites"](Path("/ws")) == []
 
 
 @pytest.mark.parametrize("repo", ["target", "acme/target", "https://github.com/acme/target", "github.com/acme/target/pull"])

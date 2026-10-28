@@ -667,10 +667,33 @@ def mapped_target(spec, table, namespace=""):
             if isinstance(o, dict) and target_key(o.get("root_table") or o.get("source_table") or "") == k}
 
 
-def check_repo_origin(repo, origin_url):
+def insteadof_rewrites(root):
+    """git's `url.<target>.insteadOf <source>` pairs in force at root, longest target first.
+    `git remote get-url` reports origin after the rewrite (a VM-wide proxy prefix, say), so the
+    repo check undoes the configured rewrite before comparing; an unconfigured prefix stays as is."""
+    try:
+        out = subprocess.run(["git", "-C", str(root), "config", "--get-regexp", r"url\..*\.insteadof"],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pairs = []
+    for line in out.splitlines():
+        key, _, source = line.partition(" ")
+        if key.startswith("url.") and key.endswith(".insteadof") and source:
+            pairs.append((key[len("url."):-len(".insteadof")], source))
+    return sorted(pairs, key=lambda p: len(p[0]), reverse=True)
+
+
+def check_repo_origin(repo, origin_url, rewrites=()):
     """The manifest's repo is where the children's PR URLs must live; when origin is a remote URL it
-    has to be that repo, or every PR check fails after the child, not before it."""
+    has to be that repo, or every PR check fails after the child, not before it. `rewrites` are the
+    insteadOf pairs from insteadof_rewrites(); origin is mapped back through the first (longest)
+    matching target before the comparison, exactly inverting what git applied."""
     url = origin_url.strip()
+    for target, source in rewrites:
+        if url.startswith(target):
+            url = source + url[len(target):]
+            break
     if "://" in url:
         parts = urllib.parse.urlsplit(url)
         host, path = parts.hostname, parts.path      # the port, if any, is not part of the repo

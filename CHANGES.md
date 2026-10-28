@@ -49,6 +49,9 @@
   `by_design_unverified` (in `plan_sha`); the launch halts when spec and manifest disagree, the batch
   fails `grading_mismatch` when the results' set differs from the manifest's, and a matching
   declaration is what clears the blocker.
+- migration-fanout's repo preflight undoes the `url.<target>.insteadOf` rewrites in `git config` before
+  comparing origin with the manifest's `repo`, so a wave launches behind a git proxy; a proxy-shaped
+  origin with no configured rewrite still halts.
 
 ## Fixed
 
