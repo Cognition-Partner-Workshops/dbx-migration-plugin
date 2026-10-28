@@ -25,7 +25,9 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
                pipelines=None, auto_merge=None, close_minutes=None, other_batch=None,
                lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1,
                manifest_extra=None, plan_step="run-wave-0", child_skill="unit-migration",
-               verify_skill="wave-verify", drop_keys=(), authorizations=None):
+               verify_skill="wave-verify", drop_keys=(), authorizations=None, overrides=None):
+    """`overrides` are `{decision, units, blocker_classes?, wave?}` rows committed as `merge_override`
+    authorizations of this manifest's wave (its file stem) unless a row names another `wave`."""
     ws = tmp_path / "ws"
     waves = ws / ".migration" / "waves"
     waves.mkdir(parents=True)
@@ -135,8 +137,7 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
         authorizations = [{"id": g["decision_id"], "kind": "gate_waived", "objects": list(b["units"]), "by": "user:t"}
                           for b in manifest["batches"] for g in b.get("gates", [])
                           if g.get("status") == "waived" and isinstance(g.get("decision_id"), str)]
-        authorizations += [{"id": e["decision"], "kind": "merge_override", "objects": list(e["units"]), "by": "user:t"}
-                           for e in manifest.get("merge_overrides", [])]
+    authorizations = list(authorizations) + [_override_entry(e, manifest_name) for e in overrides or []]
     if authorizations:
         (ws / ".migration" / "authorizations.json").write_text(
             json.dumps({"version": 1, "authorizations": authorizations}))
@@ -160,6 +161,20 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
     cwd = tmp_path / "home" / "sub" / "dir" if pointer_at == "home" else ws
     cwd.mkdir(parents=True, exist_ok=True)
     return ws, cwd
+
+
+def _override_entry(e, manifest_name="wave-0.json"):
+    return {"id": e["decision"], "kind": "merge_override", "objects": list(e["units"]), "by": e.get("by", "user:t"),
+            "wave": e.get("wave", manifest_name[:-len(".json")]),
+            **({"blocker_classes": e["blocker_classes"]} if "blocker_classes" in e else {})}
+
+
+def _commit_authorizations(ws, entries):
+    """Commit the authorization file to the base branch, as the human's reviewed PR would."""
+    (ws / ".migration" / "authorizations.json").write_text(json.dumps({"version": 1, "authorizations": entries}))
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "authorize"], check=True)
+    subprocess.run(["git", "-C", str(ws), "push", "-q", "origin", "HEAD:migration/x"], check=True)
 
 
 def _run(cwd, tmp_path, agent_reports):
@@ -265,9 +280,6 @@ def test_wave_closes_only_when_every_declared_gate_is_passed_or_waived_in_the_ma
 
 
 WAIVED = {"id": "g-export", "kind": "export_file", "status": "waived", "evidence": "", "decision_id": "waive-export"}
-OVERRIDE = {"merge_overrides": [{"decision": "mo-u", "units": ["u"]}]}
-
-
 @pytest.mark.parametrize("sub,kwargs", [
     ("no-file", dict(gates=[GATE, WAIVED], authorizations=[])),
     ("wrong-kind", dict(gates=[GATE, WAIVED], authorizations=[
@@ -276,17 +288,79 @@ OVERRIDE = {"merge_overrides": [{"decision": "mo-u", "units": ["u"]}]}
         {"id": "waive-export", "kind": "gate_waived", "objects": ["u"], "by": "devin:w"}])),
     ("other-units", dict(gates=[GATE, WAIVED], authorizations=[
         {"id": "waive-export", "kind": "gate_waived", "objects": ["v"], "by": "user:t"}])),
-    ("override-no-file", dict(manifest_extra=OVERRIDE, recon={"u": False}, authorizations=[])),
-    ("override-other-units", dict(manifest_extra=OVERRIDE, recon={"u": False}, authorizations=[
-        {"id": "mo-u", "kind": "merge_override", "objects": ["v"], "by": "user:t"}])),
 ])
-def test_a_waiver_or_override_without_a_committed_authorization_halts_before_launch(tmp_path, sub, kwargs):
+def test_a_waiver_without_a_committed_authorization_halts_before_launch(tmp_path, sub, kwargs):
     ws, cwd = _workspace(tmp_path / sub, **kwargs)
     proc, calls = _run(cwd, tmp_path / sub, [_pass_report()])
     assert proc.returncode != 0
     assert "committed authorization file" in proc.stderr or "whose objects do not name" in proc.stderr
     assert not [c for c in calls if c["kind"] == "agent"]
     assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_a_manifest_carrying_merge_overrides_is_refused_before_launch(tmp_path):
+    """Overrides are committed authorization entries, never manifest fields: a manifest that carries the
+    old key halts with the move spelled out, whatever the entries say."""
+    for sub, entries in (("entries", [{"decision": "mo-u", "units": ["u"]}]), ("empty", [])):
+        ws, cwd = _workspace(tmp_path / sub, manifest_extra={"merge_overrides": entries}, recon={"u": False},
+                             overrides=[{"decision": "mo-u", "units": ["u"]}])
+        proc, calls = _run(cwd, tmp_path / sub, [_pass_report()])
+        assert proc.returncode != 0, sub
+        assert "merge_overrides" in proc.stderr and "authorizations.json" in proc.stderr and "plan_sha" in proc.stderr
+        assert not [c for c in calls if c["kind"] == "agent"]
+        assert not (ws / ".migration/waves/wave-0.result.json").exists()
+
+
+def test_authorizing_an_override_after_a_run_keeps_the_plan_sha_and_the_wave_reruns(tmp_path):
+    """The observed failure: an override added to the manifest changed plan_sha, so the plan step could not
+    rerun and each lane needed a hand-written `-1b` step. Now the human commits the entry; the manifest is
+    untouched, so the result is deleted, a plumbing field bumped, and the same plan step runs again."""
+    claim = {"kind": "human_override", "decision_id": "mo-u"}
+    ws, cwd = _workspace(tmp_path, recon={"u": False})
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
+    assert proc.returncode == 0, proc.stderr
+    first = _result(ws)
+    assert first["batches"][0]["status"] == "FAIL" and first["batches"][0]["failure_class"] == "merge_authority"
+    assert "wave-0" in first["batches"][0]["one_line_summary"]
+    _commit_authorizations(ws, [_override_entry({"decision": "mo-u", "units": ["u"]})])
+    (ws / ".migration/waves/wave-0.result.json").unlink()
+    _resign(ws, max_minutes=50)
+    pr = _push_pr(ws, n=2)
+    proc, calls = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=claim), _verify_report(),
+                                       {"error": "close step stubbed"}])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    assert result["plan_sha"] == first["plan_sha"] and result["plan_step"] == "run-wave-0"
+    assert result["batches"][0]["status"] == "PASS" and result["batches"][0]["merge_authority"] == claim
+    assert result["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "mo-u"}]
+    logged = [json.loads(l) for l in (ws / ".migration/waves/wave-0.runs.jsonl").read_text().splitlines()]
+    assert len([l for l in logged if "merged" not in l]) == 2 and {l["plan_sha"] for l in logged} == {first["plan_sha"]}
+    child = [c for c in calls if c.get("label") == "b-1"]
+    assert '(here: "mo-u")' in child[0]["prompt"]
+
+
+def test_an_override_committed_for_another_wave_clears_nothing(tmp_path):
+    claim = {"kind": "human_override", "decision_id": "mo-u"}
+    ws, cwd = _workspace(tmp_path, recon={"u": False}, overrides=[{"decision": "mo-u", "units": ["u"], "wave": "wave-1"}])
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
+    assert "wave-0" in batch["one_line_summary"] and "mo-u" not in batch["one_line_summary"]
+
+
+def test_an_override_in_the_working_copy_alone_clears_nothing(tmp_path):
+    claim = {"kind": "human_override", "decision_id": "mo-u"}
+    ws, cwd = _workspace(tmp_path, recon={"u": False})
+    (ws / ".migration" / "authorizations.json").write_text(json.dumps({"version": 1, "authorizations": [
+        _override_entry({"decision": "mo-u", "units": ["u"]})]}))
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "merge_authority"
 
 
 def test_an_authorization_in_the_working_copy_alone_waives_nothing(tmp_path):
@@ -718,10 +792,9 @@ def _verify_report(**extra):
             "findings": [], "changed_paths": [], **extra}
 
 
-def test_merge_eligible_false_is_recorded_as_merged_only_by_a_manifest_override(tmp_path):
+def test_merge_eligible_false_is_recorded_as_merged_only_by_a_committed_override(tmp_path):
     override = {"kind": "human_override", "decision_id": "mo-u"}
-    ws, cwd = _workspace(tmp_path,
-                         manifest_extra={"merge_overrides": [{"decision": "mo-u", "units": ["u"]}]})
+    ws, cwd = _workspace(tmp_path, overrides=[{"decision": "mo-u", "units": ["u"]}])
     pr = _push_pr(ws)
     proc, calls = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=override),
                                        _verify_report(), {"error": "close step stubbed"}])
@@ -754,7 +827,7 @@ def test_every_unit_of_the_batch_must_be_merge_eligible_in_its_own_result_json(t
 
     override = {"kind": "human_override", "decision_id": "mo-u-u2"}
     ws, cwd = _workspace(tmp_path / "override", units=("u", "u2"), recon={"u": True, "u2": False},
-                         manifest_extra={"merge_overrides": [{"decision": "mo-u-u2", "units": ["u", "u2"]}]})
+                         overrides=[{"decision": "mo-u-u2", "units": ["u", "u2"]}])
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "override", [_pass_report(pr, merge_authority=override),
                                            _verify_report(),
@@ -766,8 +839,8 @@ def test_every_unit_of_the_batch_must_be_merge_eligible_in_its_own_result_json(t
 
 
 def test_a_merge_override_must_cover_exactly_the_batch_units_in_one_entry(tmp_path):
-    """A non-eligible unit is cleared only when exactly one merge_overrides entry covers the batch's
-    units: a different unit set, two competing entries, or a different decision id does not count."""
+    """A non-eligible unit is cleared only when exactly one committed merge_override entry of this wave covers
+    the batch's units: a different unit set, two competing entries, or a different decision id does not count."""
     override = {"kind": "human_override", "decision_id": "mo-1"}
     wrong = {"kind": "human_override", "decision_id": "mo-2"}
     for sub, entries, claimed, cleared in [
@@ -778,7 +851,7 @@ def test_a_merge_override_must_cover_exactly_the_batch_units_in_one_entry(tmp_pa
         ("exact", [{"decision": "mo-1", "units": ["u", "u2"]}], override, True),
     ]:
         ws, cwd = _workspace(tmp_path / sub, units=("u", "u2"), recon={"u": True, "u2": False},
-                             manifest_extra={"merge_overrides": entries})
+                             overrides=entries)
         pr = _push_pr(ws)
         proc, _ = _run(cwd, tmp_path / sub, [_pass_report(pr, merge_authority=claimed)] +
                        ([_verify_report(), {"error": "close step stubbed"}] if cleared else []))
@@ -1768,7 +1841,7 @@ def test_a_scoped_override_forgives_only_the_blocker_classes_it_names(tmp_path):
     claim = {"kind": "human_override", "decision_id": "accept-rerun-u"}
     blocked = json.dumps({"verdict": "PASS", "parity": "PASS", "merge_eligible": False,
                           "blocker_classes": ["rerun_policy"], "merge_authority": claim})
-    ws, cwd = _workspace(tmp_path, manifest_extra={"merge_overrides": scoped}, recon={"u": blocked})
+    ws, cwd = _workspace(tmp_path, overrides=scoped, recon={"u": blocked})
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path, [_pass_report(pr, merge_eligible=False, merge_authority=claim), _verify_report(),
                                    {"error": "close step stubbed"}])
@@ -1779,7 +1852,7 @@ def test_a_scoped_override_forgives_only_the_blocker_classes_it_names(tmp_path):
 
     out_of_scope = blocked.replace('["rerun_policy"]', '["data", "rerun_policy"]')
     for sub, entries in (("scope", scoped), ("unscoped", [{"decision": "accept-rerun-u", "units": ["u"]}])):
-        ws, cwd = _workspace(tmp_path / sub, manifest_extra={"merge_overrides": entries}, recon={"u": out_of_scope})
+        ws, cwd = _workspace(tmp_path / sub, overrides=entries, recon={"u": out_of_scope})
         pr = _push_pr(ws)
         proc, _ = _run(cwd, tmp_path / sub, [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
         assert proc.returncode == 0, proc.stderr
@@ -1790,7 +1863,7 @@ def test_a_scoped_override_forgives_only_the_blocker_classes_it_names(tmp_path):
     # a harness that records blockers as {reason, class} rows only is read the same way
     by_rows = blocked.replace('"blocker_classes": ["rerun_policy"]',
                               '"blockers": [{"reason": "rerun_unsupported", "class": "rerun_policy"}]')
-    ws, cwd = _workspace(tmp_path / "rows", manifest_extra={"merge_overrides": scoped}, recon={"u": by_rows})
+    ws, cwd = _workspace(tmp_path / "rows", overrides=scoped, recon={"u": by_rows})
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "rows", [_pass_report(pr, merge_eligible=False, merge_authority=claim),
                                             _verify_report(), {"error": "close step stubbed"}])
@@ -1798,7 +1871,7 @@ def test_a_scoped_override_forgives_only_the_blocker_classes_it_names(tmp_path):
     assert _result(ws)["merge_overrides"] == [{"batch": "b-1", "units": ["u"], "decision_id": "accept-rerun-u"}]
 
     unrecorded = json.dumps({"verdict": "PASS", "parity": "PASS", "merge_eligible": False, "merge_authority": claim})
-    ws, cwd = _workspace(tmp_path / "unrecorded", manifest_extra={"merge_overrides": scoped}, recon={"u": unrecorded})
+    ws, cwd = _workspace(tmp_path / "unrecorded", overrides=scoped, recon={"u": unrecorded})
     pr = _push_pr(ws)
     proc, _ = _run(cwd, tmp_path / "unrecorded", [_pass_report(pr, merge_eligible=False, merge_authority=claim)])
     assert proc.returncode == 0, proc.stderr

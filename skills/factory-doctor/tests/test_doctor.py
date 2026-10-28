@@ -1886,6 +1886,52 @@ def test_databricks_source_principal_unverified_on_string_privileges(monkeypatch
     assert "no privilege_assignments" in c.detail
 
 
+CLI_EFFECTIVE = {"privilege_assignments": [{"principal": DBX_PRINCIPAL, "privileges": [
+    {"privilege": "SELECT", "inherited_from_name": "mig", "inherited_from_type": "CATALOG"},
+    {"privilege": "USE_CATALOG"}]}]}
+
+
+def test_effective_privileges_strict_reads_the_payload_grants_get_effective_returns():
+    """The CLI lists each privilege as {privilege, inherited_from_type, inherited_from_name}; the strict parser
+    accepts that and bare strings, records the origin per privilege, and refuses anything else."""
+    strict = doctor._effective_privileges_strict
+    assert strict(CLI_EFFECTIVE) == {"SELECT": "CATALOG", "USE_CATALOG": None}
+    assert strict({"privilege_assignments": [{"privileges": ["select", {"privilege": "modify",
+        "inherited_from_type": "SCHEMA"}]}]}) == {"SELECT": None, "MODIFY": "SCHEMA"}
+    assert strict({"privilege_assignments": []}) == {}
+    assert strict({"privilege_assignments": [{"principal": "p", "privileges": []}]}) == {}
+    # the same privilege through two assignments keeps where it is inherited from
+    assert strict({"privilege_assignments": [{"privileges": [{"privilege": "MODIFY", "inherited_from_type": "CATALOG"}]},
+                                             {"privileges": ["MODIFY"]}]}) == {"MODIFY": "CATALOG"}
+    for bad in (None, [], "x", {}, {"privileges": ["SELECT"]}, {"privilege_assignments": None},
+                {"privilege_assignments": [{"privileges": "SELECT"}]}, {"privilege_assignments": ["SELECT"]},
+                {"privilege_assignments": [{"privileges": [{"inherited_from_type": "CATALOG"}]}]},
+                {"privilege_assignments": [{"privileges": [{"privilege": 1}]}]},
+                {"privilege_assignments": [{"privileges": [["SELECT"]]}]}):
+        assert strict(bad) is None, bad
+    # the non-strict reader stays as it was
+    assert doctor._effective_privileges(CLI_EFFECTIVE) == {"SELECT", "USE_CATALOG"}
+
+
+def test_databricks_source_principal_reads_dict_privileges_and_records_where_writes_are_inherited_from(monkeypatch):
+    """The observed failure: the CLI's dict items made the strict parser return None, so a readable principal
+    was always `unverified`. Now read-only dict grants pass and a write privilege names its origin."""
+    read_only = {name: {"privilege_assignments": [{"principal": DBX_PRINCIPAL, "privileges": [
+        {"privilege": p, "inherited_from_type": "CATALOG", "inherited_from_name": "mig"} for p in privs]}]}
+        for name, privs in DBX_READ_GRANTS.items()}
+    _dbx_source_cli(monkeypatch, grants={}, raw_get_effective=read_only)
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
+    assert c.status == "ok", c.detail
+    writable = dict(read_only, **{"mig.raw.payments": {"privilege_assignments": [{"principal": DBX_PRINCIPAL, "privileges": [
+        {"privilege": "SELECT"}, {"privilege": "MODIFY", "inherited_from_type": "CATALOG", "inherited_from_name": "mig"},
+        "CREATE_TABLE"]}]}})
+    _dbx_source_cli(monkeypatch, grants={}, raw_get_effective=writable)
+    c = doctor.check_source_principal(DBX_TABLES, "databricks", None)
+    assert c.status == "fail", c.detail
+    assert c.data["writable"] == {"mig.raw.payments": ["CREATE_TABLE", "MODIFY (inherited from CATALOG)"]}
+    assert "mig.raw.payments: CREATE_TABLE, MODIFY (inherited from CATALOG)" in c.detail
+
+
 def test_databricks_source_principal_two_part_names_are_unresolved(monkeypatch):
     _dbx_source_cli(monkeypatch, grants=DBX_READ_GRANTS)
     c = doctor.check_source_principal(["raw.loans"], "databricks", None)
@@ -1910,11 +1956,118 @@ def test_source_attested_is_rejected_for_families_with_a_privilege_query(tmp_pat
     monkeypatch.setattr(doctor, "check_source_principal", lambda *a, **k: pytest.fail("must not connect"))
     ws = make_workspace(tmp_path)
     _unit_mapping(ws, "loans", evidence=False)
-    for family in ("postgres", "databricks"):
+    for family in ("postgres", "sqlserver", "oracle"):
         report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
                             source_family=family, source_attested="D-7")
         row = by_id(report)["source_principal_read_only"]
         assert row["status"] == "fail" and "run the query instead" in row["detail"], family
+
+
+ATTESTED = {"id": "D-7", "kind": "source_principal_attested", "objects": ["raw.loans"], "by": "user:t"}
+
+
+def _commit_authorizations(ws, entries, ref=None):
+    (ws / ".migration" / "authorizations.json").write_text(json.dumps({"version": 1, "authorizations": entries}))
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "authorize")
+    if ref:
+        _git(ws, "update-ref", ref, "HEAD")
+
+
+def _live_databricks(monkeypatch, status="fail", writable=None):
+    """A live databricks source check standing in for the CLI: records the tables it was asked about."""
+    asked = []
+    writable = {"mig.raw.payments": ["MODIFY (inherited from CATALOG)"]} if writable is None else writable
+
+    def fake(tables):
+        asked.append(list(tables))
+        return doctor.Check("source_principal_read_only", status, f"live {status}",
+                            {"family": "databricks", "tables": tables, "writable": writable, "principal": "sp-1"})
+    monkeypatch.setattr(doctor, "_check_databricks_source_principal", fake)
+    return asked
+
+
+def test_source_attested_databricks_is_a_warn_only_with_a_covering_committed_entry(tmp_path, monkeypatch):
+    """Flipped from the former rejection: a databricks attestation is a committed `source_principal_attested`
+    entry covering every in-scope table; the live grants still run, the row is warn (never ok), and
+    data carries the attestation and the write privileges it waives."""
+    ws = make_workspace(tmp_path)
+    _unit_mapping(ws, "loans", evidence=False)
+    asked = _live_databricks(monkeypatch)
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_family="databricks", source_attested="D-7")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "fail" and "rejected" in row["detail"] and "no .migration/authorizations.json committed" in row["detail"]
+    assert "source_principal_read_only=fail" in report["blocking"] and asked == []
+
+    _commit_authorizations(ws, [ATTESTED])
+    report = doctor.run(ws, PLUGIN_ROOT, "orchestrator", "blocked", None, True,
+                        source_family="databricks", source_attested="D-7")
+    row = by_id(report)["source_principal_read_only"]
+    assert row["status"] == "warn", row["detail"]
+    assert row["data"]["attested"] == "D-7" and row["data"]["decision"] == "D-7"
+    assert row["data"]["offending"] == {"mig.raw.payments": ["MODIFY (inherited from CATALOG)"]}
+    assert row["data"]["live"]["status"] == "fail" and asked == [["raw.loans"]]
+    assert "plan decision D-7 (user:t)" in row["detail"] and "live check fail" in row["detail"]
+    assert not [b for b in report["blocking"] if b.startswith("source_principal_read_only")]
+
+
+@pytest.mark.parametrize("entry,why", [
+    ({**ATTESTED, "objects": ["mig.raw.loans"]}, "do not cover ['mig.raw.payments']"),
+    ({**ATTESTED, "objects": ["mig.raw"]}, "do not cover"),                        # a schema is not a catalog
+    ({**ATTESTED, "objects": ["other"]}, "do not cover"),
+    ({**ATTESTED, "kind": "gate_waived", "objects": DBX_TABLES}, "not a source_principal_attested entry"),
+    ({**ATTESTED, "by": "devin:w", "objects": DBX_TABLES}, "not a source_principal_attested entry"),
+    ({**ATTESTED, "id": "D-8", "objects": DBX_TABLES}, "has no entry D-7"),
+])
+def test_source_attested_databricks_fails_when_the_entry_does_not_cover_the_scope(tmp_path, monkeypatch, entry, why):
+    ws = make_workspace(tmp_path)
+    asked = _live_databricks(monkeypatch)
+    _commit_authorizations(ws, [entry])
+    c = doctor._attested(ws, "D-7", "databricks", DBX_TABLES)
+    assert c.status == "fail" and why in c.detail, c.detail
+    assert c.data["decision"] == "D-7" and "attested" not in c.data and asked == []
+    assert "source_principal_read_only=fail" in doctor._blocking("orchestrator", [c])
+
+
+def test_source_attested_databricks_covers_tables_by_name_or_by_catalog(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _live_databricks(monkeypatch, status="ok", writable={})
+    _commit_authorizations(ws, [{**ATTESTED, "objects": ["mig"]}])
+    c = doctor._attested(ws, "D-7", "databricks", DBX_TABLES)
+    assert c.status == "warn" and c.data["offending"] == {} and c.data["live"]["status"] == "ok"
+    assert not [b for b in doctor._blocking("orchestrator", [c]) if b.startswith("source_principal_read_only")]
+    _commit_authorizations(ws, [{**ATTESTED, "objects": ["mig.raw.payments", "mig.raw.loans"]}])
+    assert doctor._attested(ws, "D-7", "databricks", DBX_TABLES).status == "warn"
+    # an unverified live check leaves offending unknown; the row is still warn, the live detail recorded
+    _live_databricks(monkeypatch, status="unverified")
+    c = doctor._attested(ws, "D-7", "databricks", DBX_TABLES)
+    assert c.status == "warn" and c.data["offending"] is None and c.data["live"]["status"] == "unverified"
+    # no mapped table: nothing to attest
+    assert doctor._attested(ws, "D-7", "databricks", []).status == "fail"
+
+
+def test_source_attested_databricks_reads_the_committed_copy_on_the_wave_base_branch(tmp_path, monkeypatch):
+    """The workflow reads origin/<base_branch>; with a manifest the doctor reads the same ref, so an entry on
+    the run branch is seen by both, and a working-copy or HEAD-only entry authorizes nothing there."""
+    ws = make_workspace(tmp_path)
+    _live_databricks(monkeypatch)
+    (ws / ".migration" / "authorizations.json").write_text(json.dumps({"version": 1, "authorizations": [
+        {**ATTESTED, "objects": DBX_TABLES}]}))
+    c = doctor._attested(ws, "D-7", "databricks", DBX_TABLES)
+    assert c.status == "fail" and "no .migration/authorizations.json committed" in c.detail
+    _commit_authorizations(ws, [{**ATTESTED, "objects": DBX_TABLES}])
+    assert doctor._attested(ws, "D-7", "databricks", DBX_TABLES).status == "warn"      # HEAD, no manifest
+    c = doctor._attested(ws, "D-7", "databricks", DBX_TABLES, base_branch="migration/x")
+    assert c.status == "fail" and "refs/remotes/origin/migration/x" in c.detail
+    _git(ws, "update-ref", "refs/remotes/origin/migration/x", "HEAD")
+    assert doctor._attested(ws, "D-7", "databricks", DBX_TABLES, base_branch="migration/x").status == "warn"
+
+
+def test_manifest_base_branch_is_a_plain_branch_name():
+    assert doctor._manifest_base_branch({"base_branch": "migration/x"}) == "migration/x"
+    for bad in ({"base_branch": "../x"}, {"base_branch": "a b"}, {"base_branch": 3}, {}, None, {"base_branch": ""}):
+        assert doctor._manifest_base_branch(bad) is None
 
 
 def test_source_principal_unsupported_family_stays_unverified_and_blocking(tmp_path):
@@ -2381,6 +2534,56 @@ def test_authorizations_malformed_entry_fails(tmp_path, entry):
     (ws / ".migration" / "authorizations.json").write_text(_auth_doc([entry]))
     c = doctor.check_authorizations(ws)
     assert c.status == "fail" and "malformed entry 0" in c.detail
+
+
+MO = {"id": "mo-u", "kind": "merge_override", "objects": ["u"], "by": "user:t", "wave": "wave-custbill-1"}
+
+
+def test_authorizations_merge_override_needs_its_wave_and_policy_blocker_classes(tmp_path):
+    ws = make_workspace(tmp_path)
+    auth = ws / ".migration" / "authorizations.json"
+    auth.write_text(_auth_doc([MO, {**MO, "id": "mo-v", "objects": ["v"], "blocker_classes": ["rerun_policy",
+        "privilege_visibility"]}, {"id": "D-7", "kind": "source_principal_attested", "objects": ["mig.raw.loans"],
+        "by": "user:t"}]))
+    c = doctor.check_authorizations(ws, PLUGIN_ROOT)
+    assert c.status == "ok" and c.data["entries"] == 3, c.detail
+    for entry, why in [
+        ({k: v for k, v in MO.items() if k != "wave"}, "needs `wave`"),
+        ({**MO, "wave": "custbill-1"}, "needs `wave`"),
+        ({**MO, "wave": 1}, "needs `wave`"),
+        ({**MO, "blocker_classes": ["data"]}, "never overridden"),
+        ({**MO, "blocker_classes": ["rerun_policy", "data"]}, "['data'] are not forgivable"),
+        ({**MO, "blocker_classes": ["typo"]}, "['typo'] are not forgivable"),
+        ({**MO, "blocker_classes": []}, "non-empty list"),
+        ({**MO, "blocker_classes": "rerun_policy"}, "non-empty list"),
+        ({**MO, "objects": ["u", 1]}, "objects list of strings"),
+    ]:
+        auth.write_text(_auth_doc([entry]))
+        c = doctor.check_authorizations(ws, PLUGIN_ROOT)
+        assert c.status == "fail" and "malformed entry 0" in c.detail and why in c.detail, (entry, c.detail)
+    # the forgivable classes come from the harness; without a plugin root a scoped entry cannot be checked
+    auth.write_text(_auth_doc([{**MO, "blocker_classes": ["rerun_policy"]}]))
+    c = doctor.check_authorizations(ws)
+    assert c.status == "fail" and "cannot be checked" in c.detail
+    assert doctor._policy_blocker_classes(PLUGIN_ROOT) == frozenset({"structural", "privilege_visibility",
+                                                                     "rerun_policy", "evidence"})
+    assert doctor._policy_blocker_classes(None) is None
+
+
+def test_authorizations_compare_against_the_wave_base_branch_when_given(tmp_path):
+    ws = make_workspace(tmp_path)
+    auth = ws / ".migration" / "authorizations.json"
+    auth.write_text(_auth_doc([MO]))
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "authorization")
+    assert doctor.check_authorizations(ws, PLUGIN_ROOT).status == "ok"
+    c = doctor.check_authorizations(ws, PLUGIN_ROOT, base_branch="migration/x")
+    assert c.status == "warn" and "refs/remotes/origin/migration/x" in c.detail
+    _git(ws, "update-ref", "refs/remotes/origin/migration/x", "HEAD")
+    assert doctor.check_authorizations(ws, PLUGIN_ROOT, base_branch="migration/x").status == "ok"
+    auth.write_text(_auth_doc([{**MO, "id": "mo-w"}]))
+    c = doctor.check_authorizations(ws, PLUGIN_ROOT, base_branch="migration/x")
+    assert c.status == "warn" and "authorizations change only by PR" in c.detail
 
 
 def test_authorizations_malformed_json_fails(tmp_path):

@@ -20,6 +20,14 @@ WORKFLOW = Path(__file__).with_name("workflow.py")
 MODULES = [WORKFLOW, *(WORKFLOW.with_name(n) for n in ("decisions.py", "manifest.py", "report.py"))]
 
 
+def _auth(overrides, wave="wave-0", by="user:t"):
+    """Committed `merge_override` authorizations by id from `{decision, units, blocker_classes?}` rows."""
+    return {o["decision"]: {"id": o["decision"], "kind": "merge_override", "by": by, "wave": wave,
+                            "objects": list(o["units"]),
+                            **({"blocker_classes": o["blocker_classes"]} if "blocker_classes" in o else {})}
+            for o in overrides}
+
+
 def _tree():
     """The workflow and the modules it imports from the plugin root, as one body."""
     return ast.Module(body=[n for p in MODULES for n in ast.parse(p.read_text()).body], type_ignores=[])
@@ -39,7 +47,8 @@ def _functions():
                                       "column_key", "unit_dependencies", "transitive_writes", "check_dependencies",
                                       "mapped_target", "predicate_slices", "reader_slices", "disjoint_slices", "check_wave_tag",
                                       "check_pipelines_published", "_is_manifest", "validate_close", "check_pipeline_updates",
-                                      "batch_verdicts", "merge_override_for", "skill_text", "check_repo_origin",
+                                      "batch_verdicts", "merge_override_for", "wave_overrides", "_strs", "skill_text",
+                                      "check_repo_origin",
                                       "check_doctor_contract", "scope_covers", "override_forgives", "skill_file"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
@@ -51,7 +60,7 @@ def _functions():
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
                  "subprocess": subprocess, "sys": sys, "urllib": urllib, "PLUGIN": WORKFLOW.parents[2],
-                 "MANIFEST": {"merge_overrides": []}}
+                 "MANIFEST": {}}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
     validate = namespace["validate_manifest"]
     namespace["validate_manifest"] = lambda m, plugin=WORKFLOW.parents[2]: validate(m, plugin)
@@ -64,7 +73,8 @@ def _batch_runtime():
                 if (isinstance(node, ast.ClassDef) and node.name == "Breaker")
                 or (isinstance(node, ast.AsyncFunctionDef) and node.name in {"run_batch", "_run_batch"})
                 or (isinstance(node, ast.FunctionDef) and node.name in {"protected_files_violations", "prompt_sha",
-                                                                         "merge_override_for", "gate_outcomes", "batch_max_minutes",
+                                                                         "merge_override_for", "wave_overrides", "_strs",
+                                                                         "gate_outcomes", "batch_max_minutes",
                                                                          "scope_covers", "override_forgives", "evidence_path", "skill_file"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "SKILL_NAME", "_SEGMENT",
@@ -79,7 +89,9 @@ def _batch_runtime():
         "Counter": Counter,
         "hashlib": hashlib,
         "re": re,
-        "MANIFEST": {"merge_overrides": [{"decision": "mo-u", "units": ["u"]}]},
+        "MANIFEST": {},
+        "MANIFEST_PATH": Path(".migration/waves/wave-0.json"),
+        "AUTHORIZATIONS": _auth([{"decision": "mo-u", "units": ["u"]}]),
         "MAX_MINUTES": 45,
         "CHILD_SCHEMA": {},
         "REPO": ".",
@@ -1518,21 +1530,24 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
                                           "brief": "brief", "verify_depth": "sampled"}]))
 
 
-def _prompt_ns(manifest):
+def _prompt_ns(manifest, overrides=()):
     tree = _tree()
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
-             "sum_cost", "cost_line", "close_prompt", "skill_text", "skill_file"}
+             "sum_cost", "cost_line", "close_prompt", "skill_text", "skill_file", "merge_override_for",
+             "wave_overrides", "_strs"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES", "RESYNC_CLASS"}
                     for t in node.targets))]
     ns = {"json": __import__("json"), "shlex": __import__("shlex"), "re": re, "WAVE": 1, "TAG": "0",
-          "PLUGIN": WORKFLOW.parents[2],
+          "PLUGIN": WORKFLOW.parents[2], "MANIFEST_PATH": Path(".migration/waves/wave-0.json"),
+          "AUTHORIZATIONS": _auth(overrides),
           "REPO": "github.com/acme/target", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
           "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
+    ns["OVERRIDES"] = ns["wave_overrides"](ns["AUTHORIZATIONS"], "wave-0")
     return ns
 
 
@@ -1748,9 +1763,9 @@ _pass_nomerge = {"status": "PASS", "recon_verdict": "PASS", "recon_mode": "live"
                  "one_line_summary": "ok"}
 
 
-def _ns_with_overrides(entries):
+def _ns_with_overrides(entries, wave="wave-0"):
     ns = _batch_runtime()
-    ns["MANIFEST"] = {"merge_overrides": entries}
+    ns["AUTHORIZATIONS"] = _auth(entries, wave=wave)
     return ns
 
 
@@ -1766,18 +1781,28 @@ def _ns_with_overrides(entries):
     {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "7 mo"}},
     {**_pass_nomerge, "merge_eligible": False, "merge_authority": "mo-u"},
 ])
-def test_pass_without_merge_eligible_true_needs_the_manifests_override(report):
+def test_pass_without_merge_eligible_true_needs_the_committed_override(report):
     out = _run_one(_batch_runtime(), report)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
-    assert "merge_overrides" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
+    assert "merge_override" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
     assert "merge_authority" not in out or out["merge_authority"]["kind"] != "human_override"
 
 
-def test_manifest_override_entry_for_the_batches_units_keeps_the_pass():
+def test_committed_override_entry_for_the_batches_units_and_wave_keeps_the_pass():
     out = _run_one(_batch_runtime(), {**_pass_nomerge, "merge_eligible": False,
                                       "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}})
     assert out["status"] == "PASS" and "failure_class" not in out
     assert out["merge_authority"] == {"kind": "human_override", "decision_id": "mo-u"}
+
+
+def test_an_override_for_another_wave_or_by_a_session_clears_nothing():
+    claim = {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}}
+    out = _run_one(_ns_with_overrides([{"decision": "mo-u", "units": ["u"]}], wave="wave-1"), claim)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "wave-0" in out["one_line_summary"]
+    ns = _batch_runtime()
+    ns["AUTHORIZATIONS"] = _auth([{"decision": "mo-u", "units": ["u"]}], by="devin:w")
+    out = _run_one(ns, claim)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
 
 
 def test_override_does_not_bypass_the_merge_evidence_mode_gate():
@@ -1786,26 +1811,51 @@ def test_override_does_not_bypass_the_merge_evidence_mode_gate():
     assert out["status"] == "FAIL" and out["failure_class"] == "non_merge_evidence"
 
 
-def test_override_claim_with_no_manifest_entry_fails_closed():
+def test_override_claim_with_no_committed_entry_fails_closed():
     ns = _ns_with_overrides([])
     out = _run_one(ns, {**_pass_nomerge, "merge_eligible": False,
                         "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}})
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
 
 
-def test_merge_override_for_is_the_single_entry_covering_every_unit():
-    merge_override_for = _batch_runtime()["merge_override_for"]
-    assert merge_override_for(["u"], [{"decision": "mo-u", "units": ["u"]}]) == {"decision": "mo-u", "units": ["u"]}
+def test_merge_override_for_is_the_single_committed_entry_covering_every_unit_of_the_wave():
+    ns = _batch_runtime()
+    merge_override_for, wave_overrides = ns["merge_override_for"], ns["wave_overrides"]
+    one = _auth([{"decision": "mo-u", "units": ["u"]}])
+    assert merge_override_for(["u"], one, "wave-0") == {"decision": "mo-u", "units": ["u"]}
     # an entry may name more units than the batch asks for; the claim still cites its decision
-    assert merge_override_for(["u"], [{"decision": "mo-all", "units": ["u", "v"]}]) == {"decision": "mo-all", "units": ["u", "v"]}
+    assert merge_override_for(["u"], _auth([{"decision": "mo-all", "units": ["u", "v"]}]), "wave-0") == {
+        "decision": "mo-all", "units": ["u", "v"]}
+    # blocker_classes travel with the entry
+    scoped = _auth([{"decision": "mo-u", "units": ["u"], "blocker_classes": ["rerun_policy"]}])
+    assert merge_override_for(["u"], scoped, "wave-0") == {"decision": "mo-u", "units": ["u"], "blocker_classes": ["rerun_policy"]}
     # two entries both covering the batch's units: no single authority, claim must fail closed
-    assert merge_override_for(["u"], [{"decision": "a", "units": ["u"]}, {"decision": "b", "units": ["u"]}]) is None
+    assert merge_override_for(["u"], _auth([{"decision": "a", "units": ["u"]}, {"decision": "b", "units": ["u"]}]), "wave-0") is None
+    # a second entry for another wave does not compete
+    both = {**one, **_auth([{"decision": "b", "units": ["u"]}], wave="wave-1")}
+    assert merge_override_for(["u"], both, "wave-0") == {"decision": "mo-u", "units": ["u"]}
+    assert merge_override_for(["u"], both, "wave-1") == {"decision": "b", "units": ["u"]}
     # an entry covering only some of the batch's units clears nothing
-    assert merge_override_for(["u", "v"], [{"decision": "a", "units": ["u"]}]) is None
-    # no merge_overrides key, a non-list value, or malformed rows clear nothing either
-    assert merge_override_for(["u"], None) is None
-    for bad in ("x", [{"decision": "a"}], [{"units": ["u"]}], ["a"]):
-        assert merge_override_for(["u"], bad) is None
+    assert merge_override_for(["u", "v"], _auth([{"decision": "a", "units": ["u"]}]), "wave-0") is None
+    # the wave must match the manifest file stem exactly; no wave, another wave or a tag alone is no override
+    for wave in ("wave-1", "0", "wave-0-1", None):
+        assert merge_override_for(["u"], _auth([{"decision": "a", "units": ["u"]}], wave=wave), "wave-0") is None
+    assert wave_overrides(one, "wave-1") == [] and wave_overrides(one, "wave-0") == [{"decision": "mo-u", "units": ["u"]}]
+    # the author is a user; a session or an unknown author authorizes nothing
+    for by in ("devin:w", "", None):
+        assert merge_override_for(["u"], _auth([{"decision": "a", "units": ["u"]}], by=by), "wave-0") is None
+    # only kind merge_override counts, even with the right wave and objects
+    waived = {"w": {**one["mo-u"], "id": "w", "kind": "gate_waived"}}
+    assert merge_override_for(["u"], waived, "wave-0") is None
+    # blocker_classes naming data (never forgivable) or an unknown class, or not a list of strings, is no override
+    for classes in (["data"], ["data", "rerun_policy"], ["typo"], "rerun_policy", [1], None):
+        bad = _auth([{"decision": "a", "units": ["u"], "blocker_classes": classes}])
+        assert merge_override_for(["u"], bad, "wave-0") is None, classes
+    # no entries, a non-dict value, or malformed rows clear nothing either
+    assert merge_override_for(["u"], {}, "wave-0") is None and merge_override_for(["u"], None, "wave-0") is None
+    for bad in ("x", [{"decision": "a"}], {"a": {"kind": "merge_override"}}, {"a": {"id": "a", "kind": "merge_override",
+                "by": "user:t", "wave": "wave-0", "objects": []}}, {"a": "a"}):
+        assert merge_override_for(["u"], bad, "wave-0") is None
 
 
 def test_an_unscoped_override_forgives_every_policy_class_and_never_data():
@@ -1813,7 +1863,10 @@ def test_an_unscoped_override_forgives_every_policy_class_and_never_data():
     assert scope_covers(None, {"u": ["rerun_policy", "privilege_visibility", "structural", "evidence"]})
     assert not scope_covers(None, {"u": ["data"]}) and not scope_covers(None, {"u": ["rerun_policy", "data"]})
     assert not scope_covers(None, {"u": ["rerun_policy"], "v": None})   # unrecorded: cannot be shown non-data
-    assert scope_covers(["data"], {"u": ["data"]}) and not scope_covers(["data"], {"u": ["rerun_policy"]})
+    # a scope naming data forgives nothing of the sort: data is never a forgivable class (wave_overrides rejects
+    # the entry outright; this is the second lock)
+    assert not scope_covers(["data"], {"u": ["data"]}) and not scope_covers(["data"], {"u": ["rerun_policy"]})
+    assert scope_covers(["data", "rerun_policy"], {"u": ["rerun_policy"]})
     assert scope_covers(None, {})
 
 
@@ -1829,24 +1882,27 @@ def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
     report = {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}}
     out = _run_one(ns_with(scoped, ["rerun_policy"]), report)
     assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "mo-u"
-    # a data blocker is forgiven only by an entry that names data: the unscoped entry does not, so the halt names it
+    # a data blocker is never forgiven: the unscoped entry does not name it, so the halt names the entry
     out = _run_one(ns_with(unscoped, ["data", "rerun_policy"]), report)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
     assert "mo-u" in out["one_line_summary"] and "(unscoped)" in out["one_line_summary"]
     out = _run_one(ns_with(scoped, ["data", "rerun_policy"]), report)
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
     assert "mo-u" in out["one_line_summary"] and "data" in out["one_line_summary"]
-    out = _run_one(ns_with(named, ["data", "rerun_policy"]), report)
-    assert out["status"] == "PASS" and out["merge_authority"]["decision_id"] == "mo-u"
-    out = _run_one(ns_with(named, None), report)   # even the entry naming data cannot cover what was not recorded
+    # an entry that names data is not an override at all (the doctor rejects the file; the workflow matches nothing)
+    for classes in (["data", "rerun_policy"], ["data"], ["rerun_policy"]):
+        out = _run_one(ns_with(named, classes), report)
+        assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority", classes
+        assert "no single committed merge_override authorization" in out["one_line_summary"]
+    out = _run_one(ns_with(scoped, None), report)   # nothing covers what was not recorded
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority" and "unrecorded" in out["one_line_summary"]
-    out = _run_one(ns_with(named, ["data"]), {**_pass_nomerge, "merge_eligible": False})   # the entry must be claimed
+    out = _run_one(ns_with(scoped, ["rerun_policy"]), {**_pass_nomerge, "merge_eligible": False})   # the entry must be claimed
     assert out["status"] == "FAIL" and "mo-u" in out["one_line_summary"]
 
 
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
-    ns["MANIFEST"] = {"merge_overrides": [{"decision": "mo-all", "units": ["u", "u2", "u3"]}]}
+    ns["AUTHORIZATIONS"] = _auth([{"decision": "mo-all", "units": ["u", "u2", "u3"]}])
     ns["unit_recon"] = lambda head, units: {"u": (True, []), "u2": (False, ["rerun_policy"]), "u3": (None, ["rerun_policy"])}
 
     def run(report):
@@ -1865,7 +1921,7 @@ def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child
     out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "mo-all"}})
     assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "mo-all"}
     # an entry covering only part of the batch clears nothing
-    ns["MANIFEST"] = {"merge_overrides": [{"decision": "mo-part", "units": ["u", "u2"]}]}
+    ns["AUTHORIZATIONS"] = _auth([{"decision": "mo-part", "units": ["u", "u2"]}])
     out = run({**base, "merge_authority": {"kind": "human_override", "decision_id": "mo-part"}})
     assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
 
@@ -1876,13 +1932,16 @@ def test_child_schema_and_prompt_carry_merge_eligible_and_merge_authority():
                   if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHILD_SCHEMA" for t in n.targets))
     assert "merge_eligible" in schema["required"] and schema["properties"]["merge_eligible"]["type"] == "boolean"
     assert schema["properties"]["merge_authority"]["properties"]["kind"]["enum"] == ["harness", "human_override"]
-    ns = _prompt_ns(_manifest())
+    ns = _prompt_ns(_manifest(), overrides=[{"decision": "mo-u", "units": ["u"]}])
     child = ns["child_prompt"](_manifest()["batches"][0])
-    assert "merge_eligible" in child and "merge_overrides" in child
+    assert "merge_eligible" in child and "merge_override authorization" in child and "wave-0" in child
+    assert '(here: "mo-u")' in child   # the child is told the one entry it may claim
+    assert "(here: none)" in _prompt_ns(_manifest())["child_prompt"](_manifest()["batches"][0])
     passed = [{"batch": "b", "units": ["u"], "pr_url": "https://example/pr/1",
                "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}}]
     verify = ns["verify_prompt"](passed)
     assert "human_override" in verify and "mo-u" in verify
+    assert "merge_overrides" not in ns["verify_prompt"](passed) and "merge_overrides" not in child
 
 
 def test_prompts_name_every_merge_evidence_mode():

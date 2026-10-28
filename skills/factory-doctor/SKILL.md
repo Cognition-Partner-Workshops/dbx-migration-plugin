@@ -82,10 +82,22 @@ blocks it; a missing or unreadable unit mapping still blocks, and so does a requ
 sub-result that never ran. A `source_principal_read_only=fail` (a writable source principal) also
 blocks a child; `unverified` stays advisory.
 `authorizations_file` is `ok` when the file is absent; `warn` when the working copy differs from
-the committed one (authorizations change only by PR); `fail` on malformed JSON or an entry without
-a slug `id`, `kind: legacy_write_authorized`, a non-empty `objects` list, and `by: user:...`.
-`--source-attested <id>` yields an `ok` row whose data carries `attested`/`decision`: the plan
-decision is human-owned, so the doctor records it rather than verifying it. Sub-results live in
+the committed one (on origin/`base_branch` when run with `--wave` or `--reuse-record`, else the
+protected branch; authorizations change only by PR); `fail` on malformed JSON or an entry without a
+slug `id`, a `kind` in `legacy_write_authorized` / `gate_waived` / `merge_override` /
+`source_principal_attested`, a non-empty `objects` list of strings, and `by: user:...`. A
+`merge_override` entry also needs `wave: wave-<tag>` (the manifest file stem) and may scope
+`blocker_classes` to the harness policy classes (`recon.report.BLOCKER_CLASSES` minus `data`; an
+entry naming `data` fails the file).
+`--source-attested <id>` yields an `ok` row whose data carries `attested`/`decision` for a family
+with no privilege query (the plan decision is human-owned, so the doctor records it rather than
+verifying it); it is rejected for oracle/sqlserver/postgres. For a `databricks` source the live
+`grants get-effective` check still runs (its payload lists each privilege as `{privilege,
+inherited_from_type, ...}`; `data.writable` records the origin of every write privilege), and the
+id must be a committed `source_principal_attested` entry whose `objects` cover every in-scope
+`catalog.schema.table` (or its catalog): the row is then `warn`, never `ok`, with `data.attested`
+and `data.offending` (the live write privileges it waives); any other databricks attestation is
+`fail`. Sub-results live in
 `data.sub_results`; `--no-databricks` leaves `databricks_identity=skipped` and never authorizes a
 wave. The report identity, host, catalogs, and guard mode are the wave manifest's capability
 contract.

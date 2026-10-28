@@ -66,10 +66,11 @@ Convert one batch of units, prove parity, and open one evidence-backed PR. The w
   (`timestamp_precision`, `decimal_rounding`, `sequence_behind_source`, `missing_rule`).
   A `failure_class` containing "identity" or "sequence" flags a parent-owned resync, not
   something you fix in the batch.
-- The harness is the merge authority. If a unit is not eligible and the committed manifest's
-  `merge_overrides` has exactly one entry covering your units, report
-  `merge_authority {kind: human_override, decision_id: <that entry's decision>}`; never write
-  or edit the manifest.
+- The harness is the merge authority. If a unit is not eligible and exactly one committed
+  `merge_override` entry of `.migration/authorizations.json` names your wave and covers your
+  units (the launch prompt tells you which), report
+  `merge_authority {kind: human_override, decision_id: <that entry's id>}`; never write or edit
+  the manifest or the authorization file.
 
 ## Deliver
 

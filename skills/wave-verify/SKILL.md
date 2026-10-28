@@ -28,9 +28,9 @@ what merges. Source and target are read-only to you.
    seed different from the child's; full = keyed full diff. Mark the unit PASS only when the
    run's `result.json` records the unit merge-eligible; otherwise the finding carries the
    run's `parity` and every class in `blocker_classes`, never a bare FAIL for matched rows.
-3. For a batch listed with `merge_authority` kind `human_override`: the committed manifest's
-   `merge_overrides` entry cleared it — mark PASS on a PASS verdict even if `merge_eligible` is
-   false, and cite the decision id in findings.
+3. For a batch listed with `merge_authority` kind `human_override`: the committed
+   `merge_override` authorization the prompt lists cleared it — mark PASS on a PASS verdict even
+   if `merge_eligible` is false, and cite the decision id in findings.
 4. A batch declared DEGRADED (the manifest's `degraded: true`) verifies at the structural tier
    only: run the harness in structural mode (Tier 0: keys, constraints, indexes, triggers,
    identity columns, grants — read from both catalogs, no row tier) and mark the unit PASS only

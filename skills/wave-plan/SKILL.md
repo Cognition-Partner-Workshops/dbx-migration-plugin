@@ -46,12 +46,13 @@ doctor signs `wave-<N>.doctor.json` over them.
    `.migration/recon/wave-<tag>/`, which is the verifier's dir and a protected file to the child's
    PR — the workflow refuses the manifest before any child launches), optional
    `max_minutes`, `secrets`, `verify_depth`, `lakeflow_pipelines`.
-4. `merge_overrides`: when a unit cannot reach `merge_eligible` on evidence alone, one manifest
-   entry per covered unit set — `{decision: <plan decision slug>, units: [...]}` — citing the
-   plan decision that authorizes the merge; the workflow launches only when that decision is a
-   committed `merge_override` entry of `.migration/authorizations.json` whose `objects` name the
-   units (the human mirrors a selected waiver or override there by PR). The child clears a batch
-   only when exactly one entry covers all its units and it claims that entry's decision.
+4. Merge overrides are not manifest fields (a manifest with `merge_overrides` is refused). When
+   a unit cannot reach `merge_eligible` on evidence alone, the human commits one entry to
+   `.migration/authorizations.json` by PR: `{id: <plan decision slug>, kind: merge_override,
+   by: user:<id>, wave: wave-<tag>, objects: [unit ids], blocker_classes?: [policy classes]}`,
+   `wave` being this manifest's file stem. Nothing in the manifest changes, so the `plan_sha`
+   holds and the wave reruns under its plan step. The child clears a batch only when exactly one
+   entry of its wave covers all its units and it claims that entry's id.
 5. Pipelines: each batch lists the pipelines it updates as `lakeflow_pipelines` (`[]` when
    none). Two batches sharing one pipeline is a launch halt unless the wave is serial
    (`width` 1) or `serialized_pipelines` maps the pipeline to the plan decision slug that
