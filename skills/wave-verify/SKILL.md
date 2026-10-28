@@ -26,7 +26,10 @@ what merges. Source and target are read-only to you.
    `transactional` — the same mode the child used; transactional for Lakebase/operational
    units) at the batch's listed depth: sampled = Tier 1+2 plus a stratified Tier 3 with a
    seed different from the child's; full = keyed full diff. Mark the unit PASS only when the
-   run's `result.json` records the unit merge-eligible; otherwise the finding carries the
+   run's `result.json` records the unit merge-eligible, or blocks on `by_design_unverified`
+   alone with `grading` marking exactly the objects the batch lists as `by_design_unverified`
+   (a plan decision pinned in the manifest; an object graded so that the batch does not list is
+   FAIL with finding `grading_mismatch`); otherwise the finding carries the
    run's `parity` and every class in `blocker_classes`, never a bare FAIL for matched rows.
 3. For a batch listed with `merge_authority` kind `human_override`: the committed
    `merge_override` authorization the prompt lists cleared it — mark PASS on a PASS verdict even
