@@ -154,6 +154,30 @@ def selftest() -> int:
     return 0
 
 
+def _own_principals(capabilities: Path | None, target) -> frozenset[str]:
+    """The run's own principal from the doctor's capabilities file, accepted only when it is the
+    principal the target session actually authenticated as (`current_principal()`): a file naming
+    any other grantee would otherwise turn that grantee's extra grants informational."""
+    if capabilities is None:
+        return frozenset()
+    try:
+        identity = json.loads(capabilities.read_text()).get("identity") or {}
+        name = str(identity.get("userName") or "")
+    except (OSError, json.JSONDecodeError, AttributeError) as exc:
+        raise SystemExit(f"cannot read {capabilities}: {exc}") from None
+    if not name:
+        return frozenset()
+    current = getattr(target, "current_principal", None)
+    if current is None:
+        raise SystemExit(f"--capabilities: --target-kind {getattr(target, 'target_kind', '?')} has no "
+                         "own-principal carve-out; drop the flag")
+    actual = str(current())
+    if actual.lower() != name.lower():
+        raise SystemExit(f"--capabilities names identity {name!r} but the target session runs as "
+                         f"{actual!r}: refusing to treat its grants as the run's own")
+    return frozenset({actual})
+
+
 def _load_spec(mapping, canonicalization, family, target_kind, params):
     """Mapping spec with the family's type map applied for the given target kind — the same
     shape `run` reconciles, so `estimate` counts the statements the run will issue."""
@@ -525,13 +549,6 @@ def main(argv: list[str] | None = None) -> int:
     rules = load_canon_rules(args.canonicalization)
 
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
-    own_principals: frozenset[str] = frozenset()
-    if args.capabilities is not None:
-        try:
-            identity = json.loads(args.capabilities.read_text()).get("identity") or {}
-            own_principals = frozenset({str(identity["userName"])}) if identity.get("userName") else frozenset()
-        except (OSError, json.JSONDecodeError, AttributeError, KeyError, TypeError) as exc:
-            raise SystemExit(f"cannot read {args.capabilities}: {exc}") from None
     rerun_proof = None
     if args.rerun_proof is not None:
         if not args.rerun_source:
@@ -566,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(str(exc)) from None
     else:
         target = DatabricksTargetAdapter(args.target_http_path, target_catalog, target_schema)
+    own_principals = _own_principals(args.capabilities, target)
     if args.source_dictionary or args.target_dictionary:
         from .structure import DictionaryOverlay, load_dictionary
         try:

@@ -145,8 +145,11 @@ provenance warning and the run is not merge-eligible.
   `identity_not_applicable` (detail `not_applicable(<table_type>)`) for a Lakeflow
   `MATERIALIZED_VIEW` / `STREAMING_TABLE` output, which declares no PK or identity of its own,
   again only when the probe passes; and `grant_extra` whose grantee is the run's own migration
-  principal (`run --capabilities <capabilities.json>`, its `identity.userName`; without the file
-  nothing is softened). Any other grantee's `grant_extra` and every `grant_missing` (source
+  principal (`run --capabilities <capabilities.json>`, its `identity.userName`, accepted only
+  when it is the principal the target session authenticated as, `SELECT current_user()`; a file
+  naming anyone else is refused, and without the file nothing is softened). The probe runs over
+  the mapping's `target_where` partition and costs one target aggregate statement per object
+  (`estimate --mode structural` counts it). Any other grantee's `grant_extra` and every `grant_missing` (source
   grantees mapped through `principal_map`) stay blocking. The target reader sees MANAGED,
   EXTERNAL, shallow clones, MATERIALIZED_VIEW and STREAMING_TABLE objects and records the kind
   as `table_type`; a `VIEW` or a `FOREIGN` (federated) table is absent. `result.json`'s

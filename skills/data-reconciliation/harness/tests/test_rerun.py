@@ -780,3 +780,40 @@ def test_databricks_key_uniqueness_probe_counts_rows_and_distinct_keys(monkeypat
     assert target.key_uniqueness("orders", ["order_id", "line_no"]) == (10, 9)
     sql, _ = conn.executed[-1]
     assert "COUNT(*), COUNT(DISTINCT `order_id`, `line_no`)" in sql and "`mig`.`sales`.`orders`" in sql
+
+
+def test_databricks_current_principal_is_current_user(monkeypatch):
+    from recon import adapters
+    conn = _StubConn([("sp-migration",)])
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    target = adapters.DatabricksTargetAdapter("D", "mig", "sales")
+    assert target.current_principal() == "sp-migration"
+    assert conn.executed[-1][0] == "SELECT current_user()"
+
+
+def test_run_capabilities_identity_must_be_the_target_session_principal(tmp_path):
+    """`--capabilities` softens grant_extra only for the principal the target session really is:
+    a file naming another grantee is refused, a non-Databricks target has no carve-out."""
+    caps = tmp_path / "capabilities.json"
+    caps.write_text(json.dumps({"identity": {"userName": "sp-migration", "service_principal": True}}))
+
+    class Target:
+        target_kind = "databricks"
+
+        def __init__(self, who):
+            self.who = who
+
+        def current_principal(self):
+            return self.who
+
+    assert cli._own_principals(None, Target("sp-migration")) == frozenset()
+    assert cli._own_principals(caps, Target("SP-Migration")) == frozenset({"SP-Migration"})
+    with pytest.raises(SystemExit, match="runs as 'analysts'"):
+        cli._own_principals(caps, Target("analysts"))
+
+    class Lakebase:
+        target_kind = "lakebase"
+    with pytest.raises(SystemExit, match="no own-principal carve-out"):
+        cli._own_principals(caps, Lakebase())
+    caps.write_text(json.dumps({"identity": None}))
+    assert cli._own_principals(caps, Target("sp-migration")) == frozenset()

@@ -1377,12 +1377,13 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
     platform = getattr(target, "target_kind", None) == "databricks"
     key_uniqueness = getattr(target, "key_uniqueness", None) if platform else None
 
-    def probe(obj: str, key: tuple[str, ...]) -> tuple[bool, str]:
-        """(unique, note): the target uniqueness probe, false whenever it cannot run."""
+    def probe(obj: str, key: tuple[str, ...], where: str | None) -> tuple[bool, str]:
+        """(unique, note): the target uniqueness probe over the mapping's own partition
+        (`target_where`), false whenever it cannot run."""
         if key_uniqueness is None:
             return False, ""
         try:
-            rows, distinct = key_uniqueness(obj, list(key))
+            rows, distinct = key_uniqueness(obj, list(key), where)
         except Exception as exc:  # noqa: BLE001 - a failed probe is a blocking finding, not a crash
             return False, f"failed ({exc})"
         return rows == distinct, f"{rows} rows, {distinct} distinct keys"
@@ -1435,7 +1436,7 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
         pipeline = platform and kind in UC_PIPELINE_KINDS
         if pk != t_lower.primary_key:
             if pk and not t_lower.primary_key and t_lower.primary_key_informational == pk:
-                unique, note = probe(c.object, pk)
+                unique, note = probe(c.object, pk, c.target_where)
                 if unique:
                     findings.append(Finding(c.object, "primary_key_informational_only",
                                             "target PK is informational (Unity Catalog does not "
@@ -1446,7 +1447,7 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                                             "target PK is informational, not enforced: duplicate keys "
                                             "would be accepted" + (f"; uniqueness probe: {note}" if note else "")))
             elif pipeline and pk and not t_lower.primary_key and not t_lower.primary_key_informational:
-                unique, note = probe(c.object, pk)
+                unique, note = probe(c.object, pk, c.target_where)
                 if unique:
                     findings.append(Finding(c.object, "primary_key_not_applicable",
                                             f"not_applicable({kind}): a pipeline output declares no "
@@ -1465,9 +1466,21 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                                         f"{t.primary_key}", s.primary_key, t.primary_key))
         if (pk_info and not s.primary_key and pk_info != t_lower.primary_key
                 and pk_info != t_lower.primary_key_informational):
-            findings.append(Finding(c.object, "primary_key_informational_missing",
-                                    f"source PK {s.primary_key_informational} is informational and "
-                                    "absent on the target: duplicate keys would be accepted"))
+            # a Databricks source declares its PK informationally too; a pipeline output
+            # carrying it as unique keys is the same not_applicable case as an enforced one
+            unique, note = (probe(c.object, pk_info, c.target_where)
+                            if pipeline and not t_lower.primary_key and not t_lower.primary_key_informational
+                            else (False, ""))
+            if unique:
+                findings.append(Finding(c.object, "primary_key_not_applicable",
+                                        f"not_applicable({kind}): a pipeline output declares no "
+                                        f"primary key; uniqueness probe passed: {note}",
+                                        severity="info"))
+            else:
+                findings.append(Finding(c.object, "primary_key_informational_missing",
+                                        f"source PK {s.primary_key_informational} is informational and "
+                                        "absent on the target: duplicate keys would be accepted"
+                                        + (f"; uniqueness probe: {note}" if note else "")))
         # a unique constraint rejects the same duplicates whatever order its columns are
         # declared in, so parity is by column set; the declared order is an access path and
         # is kept for the coverage check (`_covered`) and noted when only the order differs

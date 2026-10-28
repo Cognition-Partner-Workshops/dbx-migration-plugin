@@ -1930,6 +1930,8 @@ class DatabricksTargetAdapter:
 
     # Unity Catalog reads share _uc_schema_facts/_uc_identity_state with the source adapter.
     CATALOG_STATEMENTS = {"schema_facts": 6, "identity_state": 2, "session": 0}
+    # the key uniqueness probe schema_parity may issue per object (one aggregate row back)
+    KEY_PROBE_STATEMENTS = 1
     target_kind = "databricks"
 
     def __init__(self, http_path: str | None, catalog: str, schema: str):
@@ -1989,6 +1991,12 @@ class DatabricksTargetAdapter:
     def table_exists(self, object: str) -> bool:
         """Catalog check that tells an absent table from one with no columns."""
         return self.table_kind(object) is not None
+
+    def current_principal(self) -> str:
+        """The principal this session authenticated as (`current_user()`): what a capabilities
+        file's `identity.userName` must match before it counts as the run's own principal."""
+        (name,), = self._sql._rows("SELECT current_user()")
+        return str(name)
 
     def key_uniqueness(self, object: str, key_cols: list[str], where: str | None = None) -> tuple[int, int]:
         """(rows, distinct keys) over the key columns: the probe that says whether an unenforced
