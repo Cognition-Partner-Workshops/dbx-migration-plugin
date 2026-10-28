@@ -60,6 +60,18 @@ def test_parity_pass_with_a_blocked_merge_policy_never_reads_as_fail():
     assert cards.status_phrase("PASS", False) == "parity PASS, merge policy BLOCKED (class not reported)"
 
 
+def test_wave_card_labels_by_design_unverified_objects_beside_the_blockers():
+    result = _result([
+        {**_batch("b-1", eligible=False, classes=["evidence"]), "by_design_unverified": ["mig.quarantine", "mig.totals"]},
+        _batch("b-2"),
+    ])
+    lines = _lines(cards.wave_card(result))
+    assert len(lines) == 6
+    assert lines[0] == "WAVE 1  open  parity PASS 2/2  merge-eligible 1/2  verify PASS"
+    assert lines[1] == "Blockers: evidence x1; unverified(by_design) mig.quarantine, mig.totals"
+    assert "FAIL" not in lines[1]
+
+
 def test_wave_card_counts_parity_and_merge_policy_separately_and_groups_blockers_by_class():
     result = _result([
         _batch("b-1", eligible=False, classes=["rerun_policy"]),

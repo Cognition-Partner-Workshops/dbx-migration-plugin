@@ -119,7 +119,8 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Single result writer | Keeps the result, card and run log out of child writes. |
 | Child report | Validates schema, status, recon evidence, and changed paths. |
 | Protected files gate | Reclassifies unauthorized `.migration/` changes as `protected_files_tampered`. |
-| Merge authority | Requires harness evidence or the one committed `merge_override` authorization naming this wave and covering the batch's units. |
+| Grading | Halts the launch unless every object a unit spec grades `by_design_unverified` is in its batch's `by_design_unverified` and vice versa; after the run, fails a batch `grading_mismatch` when the results' `by_design_unverified` set differs from the batch's. |
+| Merge authority | Requires harness evidence or the one committed `merge_override` authorization naming this wave and covering the batch's units.; a result blocked only by `by_design_unverified` for the objects the batch declares counts as harness evidence. |
 | Acceptance gates | Requires every declared gate to pass; a waived gate carries its plan `decision_id`, a committed `gate_waived` authorization naming the units. |
 | Resync | Runs only the declared parent-owned resync and holds affected merges on trouble. |
 | Independent verify | Rechecks passing batches from the base branch; a `degraded: true` wave runs the harness in `--mode structural`, never merge-eligible. |

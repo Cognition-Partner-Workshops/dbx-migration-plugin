@@ -199,7 +199,8 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
                           routine_parity=routine_parity, routine_writers=routine_writers,
                           routine_analysis_missing=routine_analysis_missing,
                           routine_dependencies=routine_dependencies,
-                          rerun_proof=rerun_proof, rerun_posture=rerun_posture)
+                          rerun_proof=rerun_proof, rerun_posture=rerun_posture,
+                          grading={c.object: c.grading for c in spec.objects})
     if table_kinds:
         result["target_table_kinds"] = table_kinds
     if posture_reason:

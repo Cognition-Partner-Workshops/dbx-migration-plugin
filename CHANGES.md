@@ -29,6 +29,15 @@
   `--source-attested` for a Databricks source only as a committed `source_principal_attested` entry
   covering every in-scope table (row `warn`, never `ok`); dbx_guard blocks sessions adding that kind.
 
+- Plan-chosen grading for target-only outputs: a mapping-spec object may carry
+  `"grading": "by_design_unverified"` (reject-only quarantine sinks, rollups). The harness keeps
+  target rows <= root rows and the structural tier, skips the value tiers, records `grading` in
+  `result.json`, labels the object `unverified(by_design)`, and blocks the merge with reason
+  `by_design_unverified` (class `evidence`). The wave manifest batch declares the same objects in
+  `by_design_unverified` (in `plan_sha`); the launch halts when spec and manifest disagree, the batch
+  fails `grading_mismatch` when the results' set differs from the manifest's, and a matching
+  declaration is what clears the blocker.
+
 ## Fixed
 
 - `hooks/dbx_guard.py`: a `databricks postgres` JSON key containing `branch` whose value is a full

@@ -525,6 +525,8 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
     stats: dict[str, Any] = {}
     obj_uns: dict[str, set] = {}  # categories a live read failed for this object
     for c in spec.objects:
+        if c.grading != "full":
+            continue  # a target-only output has no key set to match; tier 1 bounds its count
         n = source.row_count(c.root_table, c.root_where)
         checks += 1
         diff = KeyDiff()
@@ -691,6 +693,8 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
     stats: dict[str, Any] = {}
     obj_uns: dict[str, set] = {}  # categories a live read failed for this object
     for c in spec.objects:
+        if c.grading != "full":
+            continue
         diff = ctx.key_diffs.get(c.object, KeyDiff())
         if c.delete_evidence is not None:
             checks += 1

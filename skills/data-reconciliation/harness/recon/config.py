@@ -196,6 +196,16 @@ class DeleteEvidenceSpec:
     applied_where: str | None = None
 
 
+# How an object is graded against its root, declared in the committed mapping spec (`grading`):
+#   full                  the target is a copy of the root: every tier runs
+#   by_design_unverified  a target-only output of the unit (a reject-only quarantine sink, a rollup):
+#                         rows are not graded, but the target may not hold more rows than its root
+#                         and its structure is still read. The result blocks on `by_design_unverified`
+#                         (class evidence); only the wave manifest's declaration of the same object
+#                         clears it, so an undeclared one never merges
+GRADINGS = ("full", "by_design_unverified")
+
+
 @dataclass(frozen=True)
 class ObjectMapping:
     object: str
@@ -206,6 +216,7 @@ class ObjectMapping:
     embeds: list[EmbedMapping] = field(default_factory=list)
     root_where: str | None = None
     target_where: str | None = None
+    grading: str = "full"
     # Transactional mode (operational track). watermark: the change column on each side; rows
     # whose source watermark is newer than the target's applied high-watermark are in flight,
     # not defects. unit: what a numeric watermark measures (WATERMARK_UNITS); a datetime column
@@ -429,6 +440,9 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
         if len(key["source"]) != len(key_targets):
             raise ConfigError(
                 f"{path}: object '{c.get('object')}' comparison key source/target lengths differ")
+        grading = c.get("grading", "full")
+        if grading not in GRADINGS:
+            raise ConfigError(f"{path}: object '{c.get('object')}' grading must be one of {GRADINGS}, got {grading!r}")
         objects.append(ObjectMapping(
             object=c.get("object") or c["target_table"], root_table=c.get("root_table") or c["source_table"],
             key_source=list(key["source"]), key_target=key_targets,
@@ -441,6 +455,7 @@ def load_mapping_spec(path: Path, params: dict[str, str] | None = None) -> Mappi
             identity_source=(c.get("identity") or {}).get("source"),
             identity_target=(c.get("identity") or {}).get("target"),
             delete_evidence=_delete_evidence(c, params, path),
+            grading=grading,
         ))
     if not objects:
         raise ConfigError(f"{path}: mapping spec has no objects")

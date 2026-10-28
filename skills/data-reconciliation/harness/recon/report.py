@@ -10,7 +10,7 @@ import json
 import re
 from pathlib import Path
 
-from .config import RERUN_POSTURES, ConfigError
+from .config import GRADINGS, RERUN_POSTURES, ConfigError
 from .rerun import rerun_first_run_baseline, rerun_gap, rerun_missing, rerun_unsupported
 from .routines import parity_missing, routine_gap
 from .tiers import TierResult, blocking
@@ -41,7 +41,7 @@ def data_failed(tier: TierResult) -> bool:
 #                         the category blind; nothing is known to differ
 #   rerun_policy          the rerun proof is missing, failed or unsupported under the posture
 #   evidence              the run is not merge evidence (mode, snapshot manifest, unlisted
-#                         routines, ungraded embeds, provenance)
+#                         routines, ungraded embeds, provenance, objects graded by_design_unverified)
 BLOCKER_CLASSES = ("data", "structural", "privilege_visibility", "rerun_policy", "evidence")
 
 MODE_NOTES = {
@@ -90,6 +90,21 @@ def _blocker_lines(result: dict) -> list[str]:
     return ["- Blockers: " + "; ".join(f"{cls}: {', '.join(reasons)}" for cls, reasons in by_class.items())]
 
 
+def by_design_unverified(grading: dict | None) -> list[str]:
+    """The objects a result grades `by_design_unverified`, sorted; what the workflow compares
+    against the wave manifest's declaration."""
+    return sorted(o for o, g in (grading or {}).items() if g == "by_design_unverified")
+
+
+def _grading_line(result: dict) -> list[str]:
+    objects = by_design_unverified(result.get("grading"))
+    if not objects:
+        return []
+    return ["- Unverified by design: " + ", ".join(f"`{o}` unverified(by_design)" for o in objects)
+            + " (target rows <= root rows and structure graded; values not graded; merges only when the wave "
+              "manifest's `by_design_unverified` declares the same objects)"]
+
+
 def _authority_line(result: dict) -> str:
     """The harness is the only authority this file writes. A merge past merge_eligible=false needs a
     human_override the workflow checks against a merge_overrides entry of the committed wave manifest."""
@@ -111,13 +126,20 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
                  routine_analysis_missing: bool = False,
                  routine_dependencies: str | None = None,
                  rerun_proof: dict | None = None,
-                 rerun_posture: str = "required") -> dict:
+                 rerun_posture: str = "required",
+                 grading: dict[str, str] | None = None) -> dict:
     """`verdict` is every tier's pass/fail and `merge_eligible` the harness's merge answer, as
     the workflow reads them. Alongside them the result separates what a reader has to act on:
     `parity` (did the rows and routines match), `merge_policy` (eligible/blocked) and
-    `blockers`, each block reason with the class of work it needs (BLOCKER_CLASSES)."""
+    `blockers`, each block reason with the class of work it needs (BLOCKER_CLASSES).
+    `grading` records each object's spec grading (GRADINGS); every `by_design_unverified` object
+    blocks the merge until the wave manifest declares the same object."""
     if rerun_posture not in RERUN_POSTURES:
         raise ConfigError(f"rerun_posture must be one of {RERUN_POSTURES}, got {rerun_posture!r}")
+    grading = dict(grading or {})
+    bad = sorted(o for o, g in grading.items() if g not in GRADINGS)
+    if bad:
+        raise ConfigError(f"grading of {bad} must be one of {GRADINGS}")
     warnings = []
     for t in tiers:
         for path in t.stats.get("embeds_ungraded", []):
@@ -173,6 +195,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         block("routine_gap", "data")
     if parity_gap:
         block("routine_parity_missing", "evidence")
+    if by_design_unverified(grading):
+        block("by_design_unverified", "evidence")
     if warnings:
         block("warnings", structural_class if all(w.startswith(structural_warning) for w in warnings)
               else "evidence")
@@ -212,6 +236,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         "blockers": blockers,
         "blocker_classes": sorted({b["class"] for b in blockers}),
         "merge_authority": {"kind": "harness", "decision_id": None},
+        "grading": grading,
         "type_map": type_map,
         "rerun_proof": rerun_proof,
         "rerun_posture": rerun_posture,
@@ -259,6 +284,7 @@ def render_report(result: dict) -> str:
          "(fixture/continuous evidence never merges)"),
         f"- Rerun posture: `{result.get('rerun_posture', 'required')}`",
         _authority_line(result),
+        *_grading_line(result),
         f"- Mapping version: `{result['mapping_version']}`",
         f"- Tolerance version: `{result['tolerance_version']}`",
         f"- Seed: `{result.get('seed', 0)}`" + (f" | Params: `{result['params']}`"
@@ -321,6 +347,7 @@ def render_summary(result: dict) -> str:
          "(fixture/continuous evidence never merges)"),
         f"- Rerun posture: `{result.get('rerun_posture', 'required')}`",
         _authority_line(result),
+        *_grading_line(result),
         f"- Mapping `{result['mapping_version']}` / tolerances `{result['tolerance_version']}`"
         f" / seed `{result.get('seed', 0)}` / depth `{result.get('depth', 'threshold')}`"
         + (f" / params `{result['params']}`" if result.get("params") else ""),

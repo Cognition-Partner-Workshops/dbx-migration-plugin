@@ -49,7 +49,8 @@ def _functions():
                                       "check_pipelines_published", "_is_manifest", "validate_close", "check_pipeline_updates",
                                       "batch_verdicts", "merge_override_for", "wave_overrides", "_strs", "skill_text",
                                       "check_repo_origin",
-                                      "check_doctor_contract", "scope_covers", "override_forgives", "skill_file"})
+                                      "check_doctor_contract", "scope_covers", "override_forgives", "skill_file",
+                                      "check_by_design_unverified", "grading_mismatch"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
@@ -75,7 +76,8 @@ def _batch_runtime():
                 or (isinstance(node, ast.FunctionDef) and node.name in {"protected_files_violations", "prompt_sha",
                                                                          "merge_override_for", "wave_overrides", "_strs",
                                                                          "gate_outcomes", "batch_max_minutes",
-                                                                         "scope_covers", "override_forgives", "evidence_path", "skill_file"})
+                                                                         "scope_covers", "override_forgives", "evidence_path", "skill_file",
+                                                                         "grading_mismatch", "target_key"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"MERGE_EVIDENCE_MODES", "DECISION_ID", "SKILL_NAME", "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "BARE_PATH", "EVIDENCE_META",
@@ -84,7 +86,7 @@ def _batch_runtime():
     namespace = {
         "asyncio": asyncio,
         "json": json,
-        "unit_recon": lambda head, units: {u: (True, ["rerun_policy"]) for u in units},
+        "unit_recon": lambda head, units: {u: (True, ["rerun_policy"], [], []) for u in units},
         "evidence_in_pr": lambda head, path, units: bool(head) and any(path.startswith(f".migration/recon/{u}/") for u in units),
         "Counter": Counter,
         "hashlib": hashlib,
@@ -1873,7 +1875,7 @@ def test_an_unscoped_override_forgives_every_policy_class_and_never_data():
 def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
     def ns_with(entries, classes):
         ns = _ns_with_overrides(entries)
-        ns["unit_recon"] = lambda head, units: {u: (False, classes) for u in units}
+        ns["unit_recon"] = lambda head, units: {u: (False, classes, None, []) for u in units}
         return ns
 
     unscoped = [{"decision": "mo-u", "units": ["u"]}]
@@ -1903,7 +1905,8 @@ def test_a_scoped_override_covers_only_the_blocker_classes_it_names():
 def test_one_ineligible_unit_in_the_batch_needs_the_override_even_when_the_child_says_eligible():
     ns = _batch_runtime()
     ns["AUTHORIZATIONS"] = _auth([{"decision": "mo-all", "units": ["u", "u2", "u3"]}])
-    ns["unit_recon"] = lambda head, units: {"u": (True, []), "u2": (False, ["rerun_policy"]), "u3": (None, ["rerun_policy"])}
+    ns["unit_recon"] = lambda head, units: {"u": (True, [], [], []), "u2": (False, ["rerun_policy"], ["rerun_missing"], []),
+                                            "u3": (None, ["rerun_policy"], ["rerun_missing"], [])}
 
     def run(report):
         async def agent(prompt, **kwargs):
@@ -2756,3 +2759,139 @@ def test_validate_manifest_accepts_declared_evidence_under_an_own_unit_recon_dir
     validate_manifest(_evidence_manifest(evidence, units=("u", "w"), status="pending"))
     if evidence:
         validate_manifest(_evidence_manifest(evidence, units=("u", "w")))
+
+
+# ---------------------------------------------------------------- plan-chosen grading (by_design_unverified)
+
+def _manifest_with_by_design(objects):
+    return {**_manifest(), "batches": [{**_manifest()["batches"][0], "by_design_unverified": objects}]}
+
+
+@pytest.mark.parametrize("objects", ["mig.q", [""], ["mig.q", 3], ["mig.q", "MIG.Q"]])
+def test_validate_manifest_wants_by_design_unverified_as_distinct_object_names(objects):
+    with pytest.raises(SystemExit, match="by_design_unverified"):
+        _functions()["validate_manifest"](_manifest_with_by_design(objects))
+
+
+def test_validate_manifest_accepts_a_batch_by_design_unverified_list():
+    _functions()["validate_manifest"](_manifest_with_by_design(["mig.quarantine", "mig.totals"]))
+    _functions()["validate_manifest"](_manifest_with_by_design([]))
+
+
+def _spec_with(*objects):
+    return {"version": "1", "objects": [
+        {"object": name, "root_table": "src.t", "key": {"source": ["id"], "target": "id"}, "fields": [],
+         **({"grading": grading} if grading else {})} for name, grading in objects]}
+
+
+def test_check_by_design_unverified_needs_the_manifest_and_the_unit_spec_to_agree():
+    check = _functions()["check_by_design_unverified"]
+    agree = {"u": _spec_with(("mig.t", None), ("mig.q", "by_design_unverified"))}
+    batches = [{"id": "b", "units": ["u"], "write_targets": ["mig.t", "mig.q"], "by_design_unverified": ["MIG.Q"]}]
+    check(batches, mapping=agree.get)
+    check([{**batches[0], "by_design_unverified": ["q"]}], mapping=agree.get, namespace="mig")
+    # the spec grades it but the manifest omits it: grading is a plan decision the human sees in plan_sha
+    with pytest.raises(SystemExit, match=r"grades 'mig.q' by_design_unverified, but the manifest batch does not"):
+        check([{**batches[0], "by_design_unverified": []}], mapping=agree.get)
+    with pytest.raises(SystemExit, match="does not declare"):
+        check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"]}], mapping=agree.get)
+    # the manifest names an object no spec of the batch grades so (absent, or graded full)
+    for spec in (_spec_with(("mig.t", None)), _spec_with(("mig.t", None), ("mig.q", "full"))):
+        with pytest.raises(SystemExit, match=r"names \['MIG.Q'\], which no object of .migration/units/u/mapping_spec.json grades"):
+            check(batches, mapping={"u": spec}.get)
+    # a declaration over a unit whose spec is not there cannot be checked
+    with pytest.raises(SystemExit, match="mapping_spec.json is missing"):
+        check(batches, mapping={}.get)
+    # nothing declared and no spec yet: nothing to compare (the post-run grading check still applies)
+    check([{"id": "b", "units": ["u"], "write_targets": ["mig.t"]}], mapping={}.get)
+
+
+def test_grading_mismatch_compares_the_results_by_design_set_to_the_batch_declaration():
+    mismatch = _functions()["grading_mismatch"]
+    assert mismatch({"u": (False, ["evidence"], ["by_design_unverified"], ["mig.q"])}, ["MIG.Q"]) is None
+    assert mismatch({"u": (True, [], [], []), "v": (False, ["evidence"], ["by_design_unverified"], ["q"])},
+                    ["mig.q"], namespace="mig") is None
+    assert mismatch({"u": (True, [], [], [])}, []) is None
+    assert "does not declare" in mismatch({"u": (False, ["evidence"], ["by_design_unverified"], ["mig.q"])}, [])
+    assert "no result.json grades" in mismatch({"u": (True, [], [], [])}, ["mig.q"])
+    assert "unreadable" in mismatch({"u": (None, None, None, None)}, ["mig.q"])
+    assert "unreadable" in mismatch({"u": (True, [], [], []), "v": (None, None, None, None)}, ["mig.q"])
+    # nothing declared: an unreadable result is the merge-authority check's refusal, not a grading mismatch
+    assert mismatch({"u": (None, None, None, None)}, []) is None
+
+
+_BY_DESIGN_BATCH = {**BATCH, "by_design_unverified": ["mig.q"]}
+_blocked_by_design = (False, ["evidence"], ["by_design_unverified"], ["mig.q"])
+
+
+def _run_batch_with(recon, batch=_BY_DESIGN_BATCH, report=None, overrides=()):
+    ns = _batch_runtime()
+    ns["MANIFEST"] = {"merge_overrides": list(overrides)}
+    ns["unit_recon"] = lambda head, units: {u: recon[u] for u in units}
+
+    async def agent(prompt, **kwargs):
+        return dict(report or {**_pass_nomerge, "merge_eligible": False})
+
+    ns["agent"] = agent
+
+    async def exercise():
+        return await ns["run_batch"](dict(batch), asyncio.Semaphore(1), ns["Breaker"](3))
+
+    return asyncio.run(exercise())
+
+
+def test_the_manifest_declaration_clears_a_result_blocked_only_by_its_by_design_objects():
+    out = _run_batch_with({"u": _blocked_by_design})
+    assert out["status"] == "PASS" and "failure_class" not in out
+    assert out["merge_authority"] == {"kind": "harness", "decision_id": None}
+    assert out["by_design_unverified"] == ["mig.q"]
+    assert out["merge_eligible"] is False  # the child's mirror of result.json is not rewritten
+
+
+def test_a_by_design_object_the_manifest_does_not_declare_is_grading_mismatch():
+    out = _run_batch_with({"u": _blocked_by_design}, batch=BATCH)
+    assert out["status"] == "FAIL" and out["failure_class"] == "grading_mismatch"
+    assert "['mig.q']" in out["one_line_summary"] and out["one_line_summary"].startswith("PASS downgraded")
+    assert "by_design_unverified" not in out
+
+
+def test_a_declared_object_no_result_grades_by_design_is_grading_mismatch():
+    # a harness that predates grading records none: the declaration is not met and the batch does not pass
+    out = _run_batch_with({"u": (True, [], [], [])})
+    assert out["status"] == "FAIL" and out["failure_class"] == "grading_mismatch"
+    out = _run_batch_with({"u": (None, None, None, None)}, report={**_pass_nomerge, "merge_eligible": True})
+    assert out["status"] == "FAIL" and out["failure_class"] == "grading_mismatch" and "unreadable" in out["one_line_summary"]
+
+
+def test_the_declaration_clears_nothing_but_the_by_design_blocker():
+    recon = {"u": (False, ["evidence", "rerun_policy"], ["by_design_unverified", "rerun_missing"], ["mig.q"])}
+    out = _run_batch_with(recon)
+    assert out["status"] == "FAIL" and out["failure_class"] == "merge_authority"
+    # the usual override path still applies to the other blocker
+    claim = {**_pass_nomerge, "merge_eligible": False, "merge_authority": {"kind": "human_override", "decision_id": "mo-u"}}
+    out = _run_batch_with(recon, report=claim, overrides=[{"decision": "mo-u", "units": ["u"]}])
+    assert out["status"] == "PASS" and out["merge_authority"] == {"kind": "human_override", "decision_id": "mo-u"}
+    assert out["by_design_unverified"] == ["mig.q"]
+
+
+def test_grading_is_checked_before_merge_authority_and_the_breaker_counts_it():
+    ns = _batch_runtime()
+    ns["unit_recon"] = lambda head, units: {u: _blocked_by_design for u in units}
+
+    async def agent(prompt, **kwargs):
+        return {**_pass_nomerge, "merge_eligible": False}
+
+    ns["agent"] = agent
+    breaker = ns["Breaker"](1)
+
+    async def exercise():
+        await ns["run_batch"](dict(BATCH), asyncio.Semaphore(1), breaker)
+        return breaker
+
+    assert asyncio.run(exercise()).tripped_on == "grading_mismatch"
+
+
+def test_child_and_verifier_prompts_name_the_batches_by_design_objects():
+    src = WORKFLOW.read_text()
+    assert "by_design_unverified" in src.split("def child_prompt", 1)[1].split("def capability_block", 1)[0]
+    assert "grading_mismatch" in src.split("def verify_prompt", 1)[1].split("def close_prompt", 1)[0]

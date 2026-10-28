@@ -530,6 +530,45 @@ def check_write_targets(batches, other_waves, mapping=None, namespace=""):
                                      "both hold. Fix the mapping specs, then re-run.")
 
 
+def check_by_design_unverified(batches, mapping=None, namespace=""):
+    """An object graded `by_design_unverified` is a plan decision: the manifest batch declares it and a unit
+    spec of that batch grades it so. Either side alone is a halt, so a spec cannot quietly stop grading a
+    table and a manifest cannot clear an object the harness grades in full."""
+    mapping = unit_mapping if mapping is None else mapping
+    for b in batches:
+        declared = {target_key(o, namespace): o for o in b.get("by_design_unverified", [])}
+        graded, missing = {}, []
+        for u in b["units"]:
+            spec = mapping(u)
+            path = f".migration/units/{u}/mapping_spec.json"
+            if spec is None:
+                missing.append(path)
+                continue
+            objects = (spec.get("objects") or spec.get("tables") or []) if isinstance(spec, dict) else []
+            for o in objects if isinstance(objects, list) else []:
+                if not isinstance(o, dict):
+                    continue
+                name = o.get("object") or o.get("target_table") or ""
+                if o.get("grading", "full") == "by_design_unverified" and target_key(name, namespace):
+                    graded.setdefault(target_key(name, namespace), (path, name))
+        if declared and missing:
+            raise SystemExit(f"batch {b['id']} 'by_design_unverified' {sorted(declared.values())} cannot be checked: "
+                             f"{', '.join(missing)} is missing; every object it names is graded "
+                             "by_design_unverified by a unit spec of the batch")
+        undeclared = sorted(k for k in graded if k not in declared)
+        if undeclared:
+            raise SystemExit(f"batch {b['id']}: " + "; ".join(
+                f"{graded[k][0]} grades '{graded[k][1]}' by_design_unverified" for k in undeclared)
+                + ", but the manifest batch does not declare it. Grading an object unverified(by_design) is a "
+                "plan decision: add it to the batch's 'by_design_unverified' (a plan_sha change the human "
+                "approves) or grade it full, then re-sign with the doctor")
+        ungraded = sorted(declared[k] for k in declared if k not in graded)
+        if ungraded:
+            raise SystemExit(f"batch {b['id']} 'by_design_unverified' names {ungraded}, which no object of "
+                             f"{', '.join(f'.migration/units/{u}/mapping_spec.json' for u in b['units'])} grades "
+                             "by_design_unverified; the manifest clears only objects the unit specs grade so")
+
+
 def unit_dependencies(unit):
     p = ROOT / ".migration" / "units" / unit / "dependencies.json"
     if not p.is_file():
@@ -639,6 +678,8 @@ def launch_checks():
                         namespace=MANIFEST.get("target_namespace", ""))
     check_dependencies(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                        namespace=MANIFEST.get("target_namespace", ""))
+    check_by_design_unverified(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
+                               namespace=MANIFEST.get("target_namespace", ""))
     return check_pipeline_updates(PIPELINE_UPDATES, MANIFEST_PATH)
 
 
@@ -678,26 +719,55 @@ def ref_changed_paths(ref):
 
 def unit_recon(head, units):
     """Each unit's .migration/recon/<unit>/result.json at the PR head, read once: (merge_eligible, blocker
-    classes). Eligibility is None unless the file says true or false; classes are `blocker_classes`, else
-    the `class` of each `blockers` entry, else None (a harness that predates blocker classes cannot be
-    matched against a scoped override)."""
+    classes, blocker reasons, by_design_unverified objects). Eligibility is None unless the file says true
+    or false; classes are `blocker_classes`, else the `class` of each `blockers` entry, else None (a harness
+    that predates blocker classes cannot be matched against a scoped override); reasons are the `reason` of
+    each `blockers` entry; the by_design objects are those `grading` marks so, [] when the harness recorded
+    no grading, None when the result is unreadable."""
     def read(u):
         try:
             result = json.loads(subprocess.run(
                 ["git", "-C", str(ROOT), "show", f"{head}:.migration/recon/{u}/result.json"],
                 check=True, capture_output=True, text=True, timeout=300).stdout)
         except (OSError, subprocess.SubprocessError, ValueError):
-            return None, None
+            return None, None, None, None
         if not isinstance(result, dict):
-            return None, None
+            return None, None, None, None
         eligible = result.get("merge_eligible")
         classes = result.get("blocker_classes")
-        if classes is None and isinstance(result.get("blockers"), list):
-            classes = [b.get("class") for b in result["blockers"] if isinstance(b, dict)]
+        blockers = result.get("blockers") if isinstance(result.get("blockers"), list) else None
+        if classes is None and blockers is not None:
+            classes = [b.get("class") for b in blockers if isinstance(b, dict)]
+        reasons = [b.get("reason") for b in blockers if isinstance(b, dict)] if blockers is not None else None
+        grading = result.get("grading", {})
+        by_design = (sorted(o for o, g in grading.items() if g == "by_design_unverified")
+                     if isinstance(grading, dict) and all(isinstance(o, str) for o in grading) else None)
         return (eligible if isinstance(eligible, bool) else None,
                 sorted(set(classes)) if isinstance(classes, list) and all(isinstance(c, str) for c in classes)
-                else None)
+                else None,
+                sorted(set(reasons)) if isinstance(reasons, list) and all(isinstance(r, str) for r in reasons)
+                else None,
+                by_design)
     return {u: read(u) for u in units}
+
+
+def grading_mismatch(recon, declared, namespace=""):
+    """Why the units' recorded grading is not the batch's declaration, or None: the objects every result
+    grades by_design_unverified, as one set, must be exactly the manifest batch's `by_design_unverified`.
+    An unreadable result cannot meet a declaration; with nothing declared it is left to the merge-authority
+    check, which refuses evidence it cannot read."""
+    unreadable = sorted(u for u, r in recon.items() if r[3] is None)
+    if unreadable:
+        return ("result.json grading unreadable for " + ", ".join(unreadable)) if declared else None
+    recorded = {target_key(o, namespace): o for _, _, _, objects in recon.values() for o in objects}
+    wanted = {target_key(o, namespace): o for o in declared}
+    extra = sorted(recorded[k] for k in recorded if k not in wanted)
+    absent = sorted(wanted[k] for k in wanted if k not in recorded)
+    if not extra and not absent:
+        return None
+    return "; ".join(filter(None, [
+        f"result.json grades {extra} by_design_unverified but the manifest batch does not declare them" if extra else "",
+        f"the manifest batch declares {absent} by_design_unverified but no result.json grades them so" if absent else ""]))
 
 
 def pr_changed_paths(pr_url):
@@ -884,7 +954,10 @@ def child_prompt(batch):
         "sequence_behind_source, missing_rule).\n"
         f"The harness is the merge authority: status=PASS needs a recon PASS in one of {list(MERGE_EVIDENCE_MODES)} "
         "(transactional for Lakebase/operational units) and merge_eligible=true in every unit's "
-        ".migration/recon/<unit>/result.json. Fixture evidence is never PASS. If not eligible, claim merge_authority "
+        ".migration/recon/<unit>/result.json. Fixture evidence is never PASS. "
+        + (f"A result blocked only by by_design_unverified for exactly this batch's by_design_unverified objects "
+           f"{json.dumps(batch['by_design_unverified'])} counts as eligible. " if batch.get("by_design_unverified") else "")
+        + "If not eligible, claim merge_authority "
         "{kind: human_override, decision_id: <id>} only for the single committed merge_override authorization of "
         f"{MANIFEST_PATH.stem} covering your units (here: {json.dumps(override['decision']) if override else 'none'}).\n"
         "Open exactly one PR, first line PASS or FAIL. Do not merge it; wave close reviews.\n"
@@ -960,7 +1033,11 @@ def verify_prompt(passed):
            f"Run with `--depth <d>` per batch, exactly as listed here: {json.dumps(depths, sort_keys=True)} "
            "(sampled = Tier 1+2 plus a stratified Tier 3 with a seed different from the child's; full = keyed "
            "full diff). Never lower a batch's depth; raising it is allowed and noted in findings. ")
-        + "A batch listed with merge_authority kind human_override was cleared by the named committed "
+        + "A batch listed with by_design_unverified objects grades them unverified(by_design) by plan decision: "
+        "its result.json may block on by_design_unverified alone (merge_eligible false) for exactly those objects "
+        "and still be PASS; the harness still fails such an object that holds more rows than its root, and any "
+        "object graded by_design_unverified that the batch does not list is FAIL with finding grading_mismatch. "
+        "A batch listed with merge_authority kind human_override was cleared by the named committed "
         f"merge_override authorization of this wave {json.dumps(OVERRIDES, sort_keys=True)}: "
         "mark it PASS on a PASS verdict even if merge_eligible is false, and cite the decision id in findings. "
         "Each batch lists "
@@ -1072,15 +1149,28 @@ async def _run_batch(batch, sem, breaker):
                           "not verifiable from git (not a PR of this repo, or its fetch or diff failed)")
                       + ", protected files unverified")
         if out["status"] == "PASS":
-            claimed = out.get("merge_authority")
             recon = unit_recon(out["pr_head"], batch["units"])
-            ineligible = sorted(u for u, (eligible, _) in recon.items() if eligible is not True)
-            if out.get("merge_eligible") is True and not ineligible:
+            declared = batch.get("by_design_unverified", [])
+            mismatch = grading_mismatch(recon, declared, MANIFEST.get("target_namespace", ""))
+            if mismatch:
+                downgrade("grading_mismatch", mismatch + "; an object is unverified(by_design) only when the "
+                          "committed manifest batch and the harness result both say so")
+            elif declared:
+                out["by_design_unverified"] = sorted(declared)
+        if out["status"] == "PASS":
+            claimed = out.get("merge_authority")
+            # the manifest's declaration clears a result whose only blocker is the by_design_unverified
+            # objects it names (the grading matched above); any other blocker needs an override
+            by_design_only = {u for u, (eligible, _, reasons, objects) in recon.items()
+                              if eligible is False and reasons == ["by_design_unverified"] and objects}
+            ineligible = sorted(u for u, (eligible, *_) in recon.items()
+                                if eligible is not True and u not in by_design_only)
+            if not ineligible and (out.get("merge_eligible") is True or by_design_only):
                 out["merge_authority"] = {"kind": "harness", "decision_id": None}
             else:
                 entry = merge_override_for(batch["units"], AUTHORIZATIONS, MANIFEST_PATH.stem)
                 scope = entry.get("blocker_classes") if entry else None
-                uncovered = {u: c for u, (_, c) in recon.items() if c is None or not set(c) <= override_forgives(scope)}
+                uncovered = {u: c for u, (_, c, *_) in recon.items() if c is None or not set(c) <= override_forgives(scope)}
                 why = "; ".join(
                     f".migration/recon/{u}/result.json at the PR head "
                     + ("is missing or malformed" if recon[u][0] is None else f"has merge_eligible={recon[u][0]!r}")
@@ -1172,6 +1262,12 @@ def brief_lines(results, verify, surprises, undeclared, unreported, auto_merge, 
         lines.append("Human override authority (merge_eligible=false): "
                      + "; ".join(f"{o['batch']} ({', '.join(o['units'])}) by {o['decision_id']}"
                                 for o in overrides) + ".")
+    by_design = [(b["id"], r["by_design_unverified"]) for b, r in zip(BATCHES, results)
+                 if r["status"] == "PASS" and r.get("by_design_unverified")]
+    if by_design:
+        lines.append("Unverified by design (manifest grading, values not graded): "
+                     + "; ".join(f"{batch}: {', '.join(f'{o} unverified(by_design)' for o in objects)}"
+                                for batch, objects in by_design) + ".")
     if resync:
         report = resync.get("report") if isinstance(resync.get("report"), dict) else {}
         lines += ["", f"Identity resync (`{resync['command']}` over {', '.join(resync['units'])}): "
@@ -1264,7 +1360,7 @@ async def main():
 
     passed = [{"batch": b["id"], "units": b["units"], "pr_url": r.get("pr_url", ""),
                "branch": r.get("branch", ""), "pr_head": r.get("pr_head"), "merge_authority": r.get("merge_authority"),
-               "gates": r.get("gates", [])}
+               "gates": r.get("gates", []), "by_design_unverified": r.get("by_design_unverified", [])}
               for b, r in zip(BATCHES, results) if r["status"] == "PASS"]
     verify = None
     if passed:
