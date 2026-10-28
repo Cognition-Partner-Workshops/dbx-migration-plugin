@@ -24,7 +24,6 @@ from pathlib import Path
 POINTER_REL = Path(".dbx-migration-factory/current-wave.json")
 LEGACY_POINTER_REL = Path(".migration/waves/current.json")
 HOOK_PROBE = re.compile(r"blocked:[0-9a-f]{8}|not-blocked|unknown")
-DOCTOR_MAX_AGE = datetime.timedelta(minutes=15)
 
 
 def find_pointer(start):
@@ -76,7 +75,8 @@ try:  # the sandbox runs a copy of this script; the pointer's plugin root names 
                            unauthorized_decisions, wave_overrides)
     from manifest import (BARE_PATH, MERGE_EVIDENCE_MODES, PR_URL, TAG_RE, _is_manifest, bounded_readers,
                           check_doctor_contract, check_pipeline_updates, check_repo_origin, check_wave_tag,
-                          disjoint_slices, evidence_path, insteadof_rewrites, mapped_target, other_wave_manifests, reader_slices,
+                          disjoint_slices, doctor_max_age_minutes, evidence_path, insteadof_rewrites, mapped_target,
+                          other_wave_manifests, reader_slices,
                           skill_file, target_key, transitive_writes, valid_namespace, validate_manifest,
                           wave_signature)
     from report import (CHILD_SCHEMA, CLOSE_SCHEMA, COST_KEYS, RESYNC_SCHEMA, VERIFY_SCHEMA, _verify_sink,
@@ -178,6 +178,9 @@ def skill_text(name):
 
 
 def signed_doctor_report(path, manifest_bytes, manifest_sha, now=None):
+    """The wave's doctor record, verified against the manifest bytes and fresher than the manifest's
+    plan-set `doctor_max_age` (minutes; 15 when absent) so two parents never re-sign on a fixed clock."""
+    max_age = datetime.timedelta(minutes=doctor_max_age_minutes(MANIFEST))
     try:
         report = json.loads(path.read_text())
     except OSError:
@@ -197,10 +200,10 @@ def signed_doctor_report(path, manifest_bytes, manifest_sha, now=None):
     if signed_at.tzinfo is None:
         raise SystemExit(f"{path} signed_at must carry a UTC offset")
     now = now or datetime.datetime.now(datetime.timezone.utc)
-    if not (datetime.timedelta(0) <= now - signed_at <= DOCTOR_MAX_AGE):
-        raise SystemExit(f"{path} was signed at {report['signed_at']}, more than {DOCTOR_MAX_AGE} ago "
-                         "(or in the future); re-run the doctor with --wave so the wave launches from a "
-                         "current preflight")
+    if not (datetime.timedelta(0) <= now - signed_at <= max_age):
+        raise SystemExit(f"{path} was signed at {report['signed_at']}, more than {max_age} ago "
+                         "(the manifest's doctor_max_age, or in the future); re-run the doctor with --wave so "
+                         "the wave launches from a current preflight")
     if not isinstance(report.get("signature"), str) or not hmac.compare_digest(
             report["signature"], wave_signature(report, manifest_bytes)):
         raise SystemExit(f"{path} signature does not verify: the record was edited after the doctor wrote it; "
@@ -1004,7 +1007,7 @@ def capability_block(units):
         f"Capability contract: {json.dumps(caps, sort_keys=True)}\nBefore converting run "
         f"`factory-doctor --role child --reuse-record .migration/waves/wave-{TAG}.doctor.json "
         f"--expect-identity {shlex.quote(caps['identity'])} --expect-host {shlex.quote(caps['host'])} {flags}` "
-        f"(its signed source rows are reused while fresher than doctor_max_age {MANIFEST.get('doctor_max_age', 15)} "
+        f"(its signed source rows are reused while fresher than doctor_max_age {doctor_max_age_minutes(MANIFEST)} "
         "minutes and bound to this manifest and identity; otherwise the doctor runs in full). A fail row means "
         "status=BLOCKED naming the check id; a warn row goes in your summary and you continue. Never switch "
         "identity, run `databricks auth login`, or edit .migration/allowed_targets.json.\n"

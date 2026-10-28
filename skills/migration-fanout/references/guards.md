@@ -12,8 +12,11 @@ children; a manifest carrying `merge_overrides` is refused (overrides are author
 
 ## Signed doctor gate
 
-The doctor record is bound to the exact manifest bytes and identity/host, has a recent
-signature, records the hook probe, and must be ready with capabilities matching the plan.
+The doctor record is bound to the exact manifest bytes and identity/host, was signed within the
+manifest's `doctor_max_age` minutes (15 when the manifest says nothing; a plan-set value outside the
+plumbing keys, so changing it is a new plan sha), records the hook probe, and must be ready with
+capabilities matching the plan. A `doctor_max_age` that is not a positive integer of at most 1440
+halts the launch rather than falling back to the default.
 
 ## One manifest one run
 

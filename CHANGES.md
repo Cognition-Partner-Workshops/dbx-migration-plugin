@@ -54,6 +54,10 @@
   get-url` reports, so a wave launches behind a git proxy; a proxy-shaped origin no configured
   rewrite explains is compared as reported and still halts.
 - fanout/recon/skills: `unit-migration` states every guarded statement is a literal and a block is a halt; the DAB bundle name is `mig_<run_id>_<batch_id>` (target-routing text, literal in the fanout child brief); `DatabricksTargetAdapter` accepts a spec's `catalog.schema.table` only when it spells the adapter's own catalog and schema (case-insensitive, backticks stripped) and refuses two-part or foreign names with a `ConfigError`, Lakebase unchanged; `load_canon_rules` raises a `ConfigError` naming the path for an empty or non-object `profile.canon.json`, which `workspace-setup` now commits as `{"rules": []}` when a run has no rules.
+- migration-fanout's signed-doctor launch gate honours the manifest's plan-set `doctor_max_age`
+  (minutes; 15 when absent, as before) instead of a fixed 15-minute clock, so a wave whose plan allows a
+  30-minute record no longer re-signs it on every parent launch; a value that is not a positive integer
+  of at most 1440 halts the launch.
 
 ## Fixed
 
