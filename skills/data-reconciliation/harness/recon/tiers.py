@@ -43,11 +43,19 @@ class Finding:
     source_value: Any = None
     target_value: Any = None
     rules_applied: list[str] = field(default_factory=list)
+    # "error" fails the tier and blocks merge; "info" is a platform-inherent difference the
+    # reader proved harmless (recon.transactional.schema_parity): shown, never blocking
+    severity: str = "error"
 
     def as_dict(self) -> dict:
         return {"object": self.object, "check": self.check, "detail": self.detail,
                 "source_value": repr(self.source_value), "target_value": repr(self.target_value),
-                "rules_applied": self.rules_applied}
+                "rules_applied": self.rules_applied, "severity": self.severity}
+
+
+def blocking(findings: list[Finding]) -> list[Finding]:
+    """The findings that fail a tier: everything but severity "info"."""
+    return [f for f in findings if f.severity != "info"]
 
 
 @dataclass

@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from .adapters import StatementCounting
+from .adapters import UC_PIPELINE_KINDS, StatementCounting
 from .canon import Canonicalizer
 from .config import CanonRule, ConfigError, MappingSpec, Tolerances
 from .report import build_result, write_outputs
@@ -80,9 +80,10 @@ def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | No
 
 def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source, target,
                seed: int, depth: str, mode: str, ops: list[dict] | None, run_source, run_target,
-               ctx) -> list:
+               ctx, own_principals: frozenset[str] = frozenset()) -> list:
     if mode == "structural":
-        return [tier0_structural_parity(spec, tol, source, target, catalog_only=True)]
+        return [tier0_structural_parity(spec, tol, source, target, catalog_only=True,
+                                        own_principals=own_principals)]
     tiers = [tier1_counts(spec, source, target, ctx=ctx)]
     if tiers[0].passed:
         # Tier 1 failures are load defects or mapping-spec violations; nothing else runs.
@@ -95,13 +96,33 @@ def _run_tiers(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer, source,
         # keys and the lag behind a count gap instead of just the gap
         tiers.append(tier5_pk_set(spec, tol, ctx, source, target))
         tiers.append(tier6_cdc(spec, tol, ctx, source, target))
-        tiers.append(tier7_schema_parity(spec, tol, source, target))
+        tiers.append(tier7_schema_parity(spec, tol, source, target, own_principals=own_principals))
         # the window closes last so every tier above read inside it; a moved side fails the run
         tiers.insert(0, close_window(spec, tol, ctx, source, target))
     elif mode != "continuous":
         # structural parity outside a window: runs regardless of tier 1's outcome, gates nothing
-        tiers.insert(0, tier0_structural_parity(spec, tol, source, target))
+        tiers.insert(0, tier0_structural_parity(spec, tol, source, target,
+                                                own_principals=own_principals))
     return tiers
+
+
+def derived_rerun_posture(spec: MappingSpec, target) -> tuple[str, dict[str, str], str | None]:
+    """(posture, kinds, reason): the spec's `rerun_posture`, except when every mapped target
+    object is a Lakeflow pipeline output (`table_kind` MATERIALIZED_VIEW / STREAMING_TABLE):
+    then `not_applicable`, reason `not_applicable(<kind>)`. A pipeline update recomputes a
+    materialized view from its definition and advances a streaming table from its checkpoint
+    (no new source rows: a no-op); neither runs the unit's DDL against an existing table, so the
+    fresh/evolved rerun proof has nothing to grade. A unit mixing kinds keeps the spec posture:
+    its landed tables still need the proof. Gated on `target_kind == "databricks"` (Lakebase has
+    no pipeline outputs): other targets record no kinds."""
+    table_kind = getattr(target, "table_kind", None)
+    if getattr(target, "target_kind", None) != "databricks" or table_kind is None:
+        return spec.rerun_posture, {}, None
+    kinds = {c.object: table_kind(c.object) for c in spec.objects}
+    present = {k for k in kinds.values() if k}
+    if present and present <= UC_PIPELINE_KINDS and all(kinds.values()):
+        return "not_applicable", kinds, f"not_applicable({'/'.join(sorted(present))})"
+    return spec.rerun_posture, kinds, None
 
 
 def _report_release_failure(exc: BaseException, note: str) -> None:
@@ -131,7 +152,8 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
               routine_writers: list[str] | None = None,
               routine_analysis_missing: bool = False,
               routine_dependencies: str | None = None,
-              rerun_proof: dict | None = None) -> dict:
+              rerun_proof: dict | None = None,
+              own_principals: frozenset[str] = frozenset()) -> dict:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     if depth not in DEPTHS:
@@ -158,7 +180,7 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         if mode == "transactional":
             ctx = open_window(spec, source, target, tol)
         tiers = _run_tiers(spec, tol, canon, source, target, seed, depth, mode, ops,
-                           run_source, run_target, ctx)
+                           run_source, run_target, ctx, own_principals)
     except BaseException as exc:
         # a marker or tier query that raises must not leave either side's window pinned; the
         # run's error is what propagates, with any release failure attached to it
@@ -168,6 +190,8 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
         raise
     provenance_warnings = _snapshot_provenance_warnings(
         snapshot, source_family, spec, next((t for t in tiers if t.tier == 1), None))
+    rerun_posture, table_kinds, posture_reason = (
+        (spec.rerun_posture, {}, None) if mode == "structural" else derived_rerun_posture(spec, target))
     result = build_result(unit, mode, spec.version, tol.version, tiers,
                           seed=seed, params=params, snapshot=snapshot,
                           provenance_warnings=provenance_warnings, depth=depth,
@@ -175,7 +199,11 @@ def run_recon(unit: str, mode: str, spec: MappingSpec, tol: Tolerances,
                           routine_parity=routine_parity, routine_writers=routine_writers,
                           routine_analysis_missing=routine_analysis_missing,
                           routine_dependencies=routine_dependencies,
-                          rerun_proof=rerun_proof, rerun_posture=spec.rerun_posture)
+                          rerun_proof=rerun_proof, rerun_posture=rerun_posture)
+    if table_kinds:
+        result["target_table_kinds"] = table_kinds
+    if posture_reason:
+        result["rerun_posture_reason"] = posture_reason
     if out_dir is not None:
         write_outputs(out_dir, result)
     return result

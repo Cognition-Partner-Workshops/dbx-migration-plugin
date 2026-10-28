@@ -11,6 +11,14 @@
   mapping specs may declare a top-level `family`, a mismatch with `--source-family` fails
   `type_map_audit` and the other source rows, and every reusable row records `data.units` so a child
   reuses a signed row only for units it covered.
+- data-reconciliation: the Databricks target reader sees Lakeflow `MATERIALIZED_VIEW` /
+  `STREAMING_TABLE` outputs (`table_kind`, recorded as `table_type`; `VIEW` and `FOREIGN` stay
+  absent), derives `rerun_posture: not_applicable(<kind>)` for a unit made only of them, and
+  records Unity Catalog's platform-inherent differences as `severity: info` findings that never
+  block — an unenforced PK whose key the target uniqueness probe proves unique, a pipeline
+  output's missing PK/identity, and a `grant_extra` for the run's own principal (`run
+  --capabilities`); gated on `--target-kind databricks`, Lakebase unchanged, duplicates and
+  every other grantee/grant_missing still block.
 
 ## Fixed
 

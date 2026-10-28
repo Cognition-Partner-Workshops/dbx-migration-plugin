@@ -52,6 +52,7 @@ from .adapters import (
     StatementCounting,
     StratifiedKeys,
     TransactionalSide,
+    UC_PIPELINE_KINDS,
     WholeNumberColumns,
     normalize_sql_text,
 )
@@ -65,7 +66,7 @@ from .structure import (
     diff_by_object,
     structural_checks,
 )
-from .tiers import Finding, TierResult
+from .tiers import Finding, TierResult, blocking
 from .watermarks import (
     EPOCH_SCALE,
     check_comparable,
@@ -895,7 +896,8 @@ def _lower_facts(f: SchemaFacts) -> SchemaFacts:
         triggers={n: (t, tuple(e), g) for n, (t, e, g) in f.triggers.items()},
         grants={g.lower(): frozenset(p.lower() for p in ps) for g, ps in f.grants.items()},
         unsupported=f.unsupported,
-        declares_not_null=f.declares_not_null)
+        declares_not_null=f.declares_not_null,
+        table_type=f.table_type)
 
 
 # Lexer for index expression text as the catalogs render it (pg_get_indexdef): a string literal
@@ -1340,7 +1342,8 @@ def _covered(leading: tuple, facts: SchemaFacts) -> bool:
 
 
 def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, source, target,
-                  strict: bool, catalog_only: bool = False) -> TierResult:
+                  strict: bool, catalog_only: bool = False,
+                  own_principals: frozenset[str] = frozenset()) -> TierResult:
     """Constraints are compared both ways: a source constraint the target lacks lets bad data in,
     a target constraint the source lacks rejects writes the legacy application makes today.
     Indexes stay one-directional (an extra target index changes cost, not acceptance). Triggers
@@ -1348,7 +1351,18 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
     (tier 7) records an unreadable catalog as `unverified`; tier 0 records it as
     `dictionary_unavailable` with every category unsupported for that object — a hole the
     report turns into a structural_gap warning, so an unread dictionary blocks merge.
-    `catalog_only` (structural mode) skips the row-backed identity bounds. Every hole records its
+    `catalog_only` (structural mode) skips the row-backed identity bounds.
+
+    Platform-inherent differences (severity "info", never blocking) exist only when the target
+    adapter declares `target_kind == "databricks"` (never by absence: Lakebase/Postgres are
+    unchanged): a `primary_key_informational_only` whose key the target uniqueness probe
+    (`key_uniqueness`: COUNT(*) = COUNT(DISTINCT key)) proves unique; a pipeline output
+    (MATERIALIZED_VIEW / STREAMING_TABLE, `SchemaFacts.table_type`) with no primary key at all,
+    recorded `primary_key_not_applicable` when the same probe passes, and its identity checks
+    recorded `identity_not_applicable`; and a `grant_extra` whose grantee is one of
+    `own_principals`. Duplicate keys, any other grantee's extra and every grant_missing stay
+    blocking. The probe is a target-only aggregate and runs in structural mode too.
+    Every hole records its
     kind in `stats.hole_kinds` ("privilege" when a reader was refused, "read" otherwise), so the
     report can class a refused read as a visibility gap rather than a mismatch; nothing the caller
     passes can mask one."""
@@ -1360,6 +1374,18 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
     def hole(note: str, kind: str = "read", key: str = "unverified") -> None:
         hole_kinds.add(kind)
         stats.setdefault(key, []).append(note)
+    platform = getattr(target, "target_kind", None) == "databricks"
+    key_uniqueness = getattr(target, "key_uniqueness", None) if platform else None
+
+    def probe(obj: str, key: tuple[str, ...]) -> tuple[bool, str]:
+        """(unique, note): the target uniqueness probe, false whenever it cannot run."""
+        if key_uniqueness is None:
+            return False, ""
+        try:
+            rows, distinct = key_uniqueness(obj, list(key))
+        except Exception as exc:  # noqa: BLE001 - a failed probe is a blocking finding, not a crash
+            return False, f"failed ({exc})"
+        return rows == distinct, f"{rows} rows, {distinct} distinct keys"
     # both catalogs are read first so every foreign key resolves against the qualified identity
     # of every mapped table, not just the ones graded before it
     tables, targets = _TableIndex(), _TableIndex()
@@ -1405,11 +1431,32 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
             s, t, t_lower = (mask_unsupported(f_, uns) for f_ in (s, t, t_lower))
         pk = _map_cols(s.primary_key, colmap)
         pk_info = _map_cols(s.primary_key_informational, colmap)
+        kind = (t_raw.table_type or "").upper()
+        pipeline = platform and kind in UC_PIPELINE_KINDS
         if pk != t_lower.primary_key:
             if pk and not t_lower.primary_key and t_lower.primary_key_informational == pk:
-                findings.append(Finding(c.object, "primary_key_informational_only",
-                                        "target PK is informational, not enforced: duplicate keys "
-                                        "would be accepted"))
+                unique, note = probe(c.object, pk)
+                if unique:
+                    findings.append(Finding(c.object, "primary_key_informational_only",
+                                            "target PK is informational (Unity Catalog does not "
+                                            f"enforce it); uniqueness probe passed: {note}",
+                                            severity="info"))
+                else:
+                    findings.append(Finding(c.object, "primary_key_informational_only",
+                                            "target PK is informational, not enforced: duplicate keys "
+                                            "would be accepted" + (f"; uniqueness probe: {note}" if note else "")))
+            elif pipeline and pk and not t_lower.primary_key and not t_lower.primary_key_informational:
+                unique, note = probe(c.object, pk)
+                if unique:
+                    findings.append(Finding(c.object, "primary_key_not_applicable",
+                                            f"not_applicable({kind}): a pipeline output declares no "
+                                            f"primary key; uniqueness probe passed: {note}",
+                                            severity="info"))
+                else:
+                    findings.append(Finding(c.object, "primary_key_mismatch",
+                                            f"source {s.primary_key} -> expected {pk}, target "
+                                            f"{kind} declares none; uniqueness probe: {note}",
+                                            s.primary_key, t.primary_key))
             elif not pk and pk_info and pk_info == t_lower.primary_key:
                 pass  # the target enforces what the source only declared informationally
             else:
@@ -1626,7 +1673,16 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                     f"{c.object}: source index on ({expr}) has no target index on ({want}); "
                     "confirm the access path by hand")
         seq_note = None
-        if "sequences_identity" not in uns and c.identity_source and c.identity_target:
+        if pipeline and "sequences_identity" not in uns and (c.identity_source or s.identity_columns):
+            # a pipeline recomputes the output from its definition: no sequence or identity
+            # column of its own to be behind, missing or mis-stepped
+            checks += 1
+            seq_note = {"not_applicable": kind}
+            findings.append(Finding(c.object, "identity_not_applicable",
+                                    f"not_applicable({kind}): source identity "
+                                    f"{c.identity_source or sorted(s.identity_columns)} has no "
+                                    "counterpart on a pipeline output", severity="info"))
+        elif "sequences_identity" not in uns and c.identity_source and c.identity_target:
             checks += 1
             try:
                 t_state = target.identity_state(c.object, c.identity_target)
@@ -1703,8 +1759,9 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
             tr_findings, tr_extra = compare_triggers(c.object, s, t_lower)
             findings += tr_findings + tr_extra
         if "grants" not in uns:
-            findings += compare_grants(c.object, s, t_lower, spec.principal_map)
-        if "sequences_identity" not in uns:
+            findings += compare_grants(c.object, s, t_lower, spec.principal_map,
+                                       own_principals if platform else frozenset())
+        if "sequences_identity" not in uns and not pipeline:
             id_findings, id_extra = compare_identity_columns(c.object, s, t_lower, colmap)
             findings += id_findings + id_extra
         # a category the target reader marks unsupported is a hole in the evidence, not a pass;
@@ -1738,6 +1795,8 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
         checks_map = {cat: "unsupported" for cat in CATEGORIES}
     stats["structural_checks"] = checks_map
     stats["structural_diff"] = diff_by_object(findings)
+    stats["platform_inherent"] = [{"object": f.object, "check": f.check, "detail": f.detail}
+                                  for f in findings if f.severity == "info"]
     stats["dictionary"] = {"source": getattr(source, "dictionary_label", "live"),
                            "target": getattr(target, "dictionary_label", "live")}
     for label in stats["dictionary"].values():
@@ -1746,13 +1805,15 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                  "not the live catalog", "fixture")
     if hole_kinds:
         stats["hole_kinds"] = sorted(hole_kinds)
-    return TierResult(tier, name, not findings, checks, findings, stats)
+    return TierResult(tier, name, not blocking(findings), checks, findings, stats)
 
 
-def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target) -> TierResult:
+def tier7_schema_parity(spec: MappingSpec, tol: Tolerances, source, target,
+                        own_principals: frozenset[str] = frozenset()) -> TierResult:
     """Tier 7 of the transactional track: structural parity graded strictly — an unreadable
     catalog is unverified evidence, which blocks merge there."""
-    return schema_parity(7, "schema_parity", spec, tol, source, target, strict=True)
+    return schema_parity(7, "schema_parity", spec, tol, source, target, strict=True,
+                         own_principals=own_principals)
 
 
 def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any, Any]:
@@ -1762,7 +1823,8 @@ def _key_bounds(source, table: str, column: str, where: str | None) -> tuple[Any
 
 
 def _facts_dict(f: SchemaFacts) -> dict:
-    return {"primary_key": list(f.primary_key),
+    return {"table_type": f.table_type,
+            "primary_key": list(f.primary_key),
             "primary_key_informational": list(f.primary_key_informational),
             "unique": sorted(map(list, f.unique)),
             "unique_nulls_equal": sorted(map(list, f.unique_nulls_equal)),

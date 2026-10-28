@@ -29,9 +29,16 @@ from .rerun import normalize_type
 from .watermarks import instant
 from .watermarks import literal as watermark_literal
 
-# the object kinds a CREATE TABLE leaves behind; views, materialized views, streaming tables and
-# foreign tables with the same columns are not the table the rerun proof grades
-_UC_PHYSICAL = "t.table_type IN ('MANAGED', 'EXTERNAL', 'MANAGED_SHALLOW_CLONE', 'EXTERNAL_SHALLOW_CLONE')"
+# the object kinds a unit's job leaves behind in Unity Catalog: CREATE TABLE's tables and the
+# MATERIALIZED_VIEW / STREAMING_TABLE outputs a Lakeflow pipeline owns. A VIEW with the same
+# columns is not a landed table, and a FOREIGN table federates back to the source, so either
+# would match it trivially: both stay absent.
+UC_PHYSICAL_KINDS = ("MANAGED", "EXTERNAL", "MANAGED_SHALLOW_CLONE", "EXTERNAL_SHALLOW_CLONE",
+                     "MATERIALIZED_VIEW", "STREAMING_TABLE")
+# the kinds a pipeline recomputes from its definition on every update: no rerun or identity
+# semantics of their own (recon.structure / recon.engine record them `not_applicable(<kind>)`)
+UC_PIPELINE_KINDS = frozenset({"MATERIALIZED_VIEW", "STREAMING_TABLE"})
+_UC_PHYSICAL = "t.table_type IN (" + ", ".join(f"'{k}'" for k in UC_PHYSICAL_KINDS) + ")"
 _PG_PHYSICAL = "c.relkind IN ('r', 'p')"
 
 
@@ -121,6 +128,9 @@ class SchemaFacts:
     # the subset of `unsupported` the principal was refused (a permission error on the view),
     # as opposed to a catalog that has no such dictionary
     privilege_denied: frozenset[str] = frozenset()
+    # the catalog's object kind (Unity Catalog information_schema.tables.table_type: MANAGED,
+    # EXTERNAL, MATERIALIZED_VIEW, STREAMING_TABLE, ...); None when the reader has no such notion
+    table_type: str | None = None
     # relations that cannot carry NOT NULL (Postgres views and materialized views:
     # pg_attribute.attnotnull is always false for them) set this False so tier 7 reports
     # nullability as unverified instead of missing
@@ -1009,6 +1019,11 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         except Exception as exc:
             raise dictionary_error(table, view, exc) from exc
 
+    rows = q("information_schema.tables",
+        f"SELECT t.table_type FROM {catalog}.information_schema.tables t "
+        "WHERE t.table_catalog = %(catalog)s AND t.table_schema = %(schema)s AND t.table_name = %(table)s",
+        {"catalog": catalog, "schema": schema, "table": table})
+    facts.table_type = str(rows[0][0]).upper() if rows else None
     rows = q("information_schema.table_constraints",
         f"SELECT tc.constraint_type, tc.constraint_name, kcu.column_name, "
         "uk.table_schema, uk.table_name, uk.column_name "
@@ -1914,7 +1929,8 @@ class DatabricksTargetAdapter:
     them with the migration catalog and schema so a spec never points at production."""
 
     # Unity Catalog reads share _uc_schema_facts/_uc_identity_state with the source adapter.
-    CATALOG_STATEMENTS = {"schema_facts": 5, "identity_state": 2, "session": 0}
+    CATALOG_STATEMENTS = {"schema_facts": 6, "identity_state": 2, "session": 0}
+    target_kind = "databricks"
 
     def __init__(self, http_path: str | None, catalog: str, schema: str):
         # names are validated before a session is opened so a bad name never leaks one
@@ -1960,14 +1976,29 @@ class DatabricksTargetAdapter:
         return [{"name": str(name).lower(), "type": normalize_type(dtype),
                  "nullable": str(nullable).upper() != "NO"} for name, dtype, nullable, _ in rows]
 
-    def table_exists(self, object: str) -> bool:
-        """Catalog check that tells an absent table from one with no columns."""
+    def table_kind(self, object: str) -> str | None:
+        """The catalog's `table_type` for the object (UC_PHYSICAL_KINDS when it is a landed table
+        or a pipeline output); None when the object is absent or a VIEW/FOREIGN table."""
         rows = self._sql._rows(
-            f"SELECT t.table_name FROM {quote_ident(self._catalog, '`')}.information_schema.tables t "
+            f"SELECT t.table_type FROM {quote_ident(self._catalog, '`')}.information_schema.tables t "
             "WHERE t.table_catalog = %(catalog)s AND t.table_schema = %(schema)s AND t.table_name = %(table)s "
             f"AND {_UC_PHYSICAL}",
             {"catalog": self._catalog, "schema": self._schema, "table": object})
-        return bool(rows)
+        return str(rows[0][0]).upper() if rows else None
+
+    def table_exists(self, object: str) -> bool:
+        """Catalog check that tells an absent table from one with no columns."""
+        return self.table_kind(object) is not None
+
+    def key_uniqueness(self, object: str, key_cols: list[str], where: str | None = None) -> tuple[int, int]:
+        """(rows, distinct keys) over the key columns: the probe that says whether an unenforced
+        (informational) or undeclared primary key actually holds on the target. UC primary key
+        columns are NOT NULL, so COUNT(DISTINCT) counts every row's key."""
+        w = f" WHERE {where}" if where else ""
+        cols = ", ".join(quote_ident(c, "`") for c in key_cols)
+        (rows, distinct), = self._sql._rows(
+            f"SELECT COUNT(*), COUNT(DISTINCT {cols}) FROM {self._q(object)}{w}")
+        return int(rows), int(distinct)
 
     def table_aggregates(self, object: str, columns: list[str], numeric: list[str],
                          where: str | None = None,
@@ -2352,6 +2383,7 @@ class TargetIdentityError(RuntimeError):
 
 
 class LakebaseTargetAdapter(_PostgresBase):
+    target_kind = "lakebase"
     """Target side for the operational track: one schema inside a Lakebase branch database.
     Secret value: the branch endpoint's libpq DSN (OAuth token as the password, minted by
     `databricks postgres` for the migration principal; never the production branch). The DSN

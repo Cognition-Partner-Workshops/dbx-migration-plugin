@@ -317,6 +317,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--rerun-source", action="append", default=[], type=Path,
                    help="with --rerun-proof: the job's source files as committed now (the same set "
                         "rerun-proof was given); a proof of other files is stale and refused")
+    r.add_argument("--capabilities", type=Path,
+                   help="the doctor's capabilities.json; its `identity.userName` is the run's own "
+                        "migration principal, whose extra Unity Catalog grants on a target are "
+                        "informational (every other grantee's still block). Without it no grant_extra "
+                        "is softened")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -520,6 +525,13 @@ def main(argv: list[str] | None = None) -> int:
     rules = load_canon_rules(args.canonicalization)
 
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
+    own_principals: frozenset[str] = frozenset()
+    if args.capabilities is not None:
+        try:
+            identity = json.loads(args.capabilities.read_text()).get("identity") or {}
+            own_principals = frozenset({str(identity["userName"])}) if identity.get("userName") else frozenset()
+        except (OSError, json.JSONDecodeError, AttributeError, KeyError, TypeError) as exc:
+            raise SystemExit(f"cannot read {args.capabilities}: {exc}") from None
     rerun_proof = None
     if args.rerun_proof is not None:
         if not args.rerun_source:
@@ -602,7 +614,8 @@ def main(argv: list[str] | None = None) -> int:
                        source_family=args.family, depth=args.depth, type_map=type_map,
                        routine_parity=routine_parity, routine_writers=routine_writers,
                        routine_analysis_missing=routine_analysis_missing,
-                       routine_dependencies=routine_dependencies, rerun_proof=rerun_proof)
+                       routine_dependencies=routine_dependencies, rerun_proof=rerun_proof,
+                       own_principals=own_principals)
     print(f"dbx-recon {result['verdict']}: {status_line(result)}; unit={args.unit} mode={args.mode} "
           f"depth={result['depth']} mapping={spec.version} tolerances={tol.version} "
           f"merge_eligible={result['merge_eligible']} -> {args.out}/result.json")
