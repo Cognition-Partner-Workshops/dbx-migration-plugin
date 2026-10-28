@@ -1930,8 +1930,10 @@ class DatabricksTargetAdapter:
 
     # Unity Catalog reads share _uc_schema_facts/_uc_identity_state with the source adapter.
     CATALOG_STATEMENTS = {"schema_facts": 6, "identity_state": 2, "session": 0}
-    # the key uniqueness probe schema_parity may issue per object (one aggregate row back)
+    # the key uniqueness probe schema_parity may issue per object (one aggregate row back), and
+    # the one `current_user()` read `run --capabilities` adds per run; both counted as ceilings
     KEY_PROBE_STATEMENTS = 1
+    OWN_PRINCIPAL_STATEMENTS = 1
     target_kind = "databricks"
 
     def __init__(self, http_path: str | None, catalog: str, schema: str):

@@ -306,14 +306,15 @@ def test_structural_estimate_counts_each_adapters_catalog_reads():
                         mode="structural", family="sqlserver", target_kind="databricks")
     assert est["mode"] == "structural" and est["tier3_mode"] == {}
     assert est["source_statements"]["tier0"] == 6 * n + n_id
-    assert est["target_statements"]["tier0"] == 6 * n + 2 * n_id + n  # + one key probe per object
-    assert est["target_rows_fetched"] == n
+    # + one key probe per object + the one current_user() read of `run --capabilities`
+    assert est["target_statements"]["tier0"] == 6 * n + 2 * n_id + n + 1
+    assert est["target_rows_fetched"] == n + 1
     lb = estimate_cost(spec, Tolerances("t1"), mode="structural", family="sqlserver", target_kind="lakebase")
     assert lb["target_rows_fetched"] == 0  # no probe off Databricks
     for side in ("source_statements", "target_statements"):
         assert est[side]["total"] == est[side]["tier0"]
         assert {k for k, v in est[side].items() if v and k not in ("tier0", "total")} == set()
-    assert est["source_rows_fetched"] == 0 and est["target_rows_fetched"] == n
+    assert est["source_rows_fetched"] == 0 and est["target_rows_fetched"] == n + 1
     pg = estimate_cost(spec, Tolerances("t1"), mode="structural",
                        family="postgres", target_kind="lakebase")
     assert pg["source_statements"]["tier0"] == 7 * n + 2 * n_id + 1

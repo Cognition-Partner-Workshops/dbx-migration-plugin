@@ -148,8 +148,9 @@ provenance warning and the run is not merge-eligible.
   principal (`run --capabilities <capabilities.json>`, its `identity.userName`, accepted only
   when it is the principal the target session authenticated as, `SELECT current_user()`; a file
   naming anyone else is refused, and without the file nothing is softened). The probe runs over
-  the mapping's `target_where` partition and costs one target aggregate statement per object
-  (`estimate --mode structural` counts it). Any other grantee's `grant_extra` and every `grant_missing` (source
+  the mapping's `target_where` partition and costs one target aggregate statement per object,
+  `--capabilities` one `current_user()` read per run (`estimate --mode structural` counts both as
+  the ceiling). Any other grantee's `grant_extra` and every `grant_missing` (source
   grantees mapped through `principal_map`) stay blocking. The target reader sees MANAGED,
   EXTERNAL, shallow clones, MATERIALIZED_VIEW and STREAMING_TABLE objects and records the kind
   as `table_type`; a `VIEW` or a `FOREIGN` (federated) table is absent. `result.json`'s
