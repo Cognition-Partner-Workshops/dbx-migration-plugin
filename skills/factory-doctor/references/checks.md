@@ -52,7 +52,8 @@ adapters' Databricks SQL, `pyodbc`, and `psycopg` drivers, warning when the
 ### `delete_evidence`
 Checks every resolved mapping: CDC is enabled, the capture is visible and captures every mapped
 source key column, and a bounded read-only `fn_cdc_get_all_changes_<capture>` probe works. Children
-name units; the wave ticket's worker covers every mapping; setup skips before mappings exist. The
+name units; the wave ticket's worker covers the wave's units (see "resolved mappings" below); setup
+skips before mappings exist. The
 doctor never runs `sp_cdc_enable_*`; source-side changes are customer decisions.
 ### `source_principal_read_only`
 Verifies the source principal cannot write mapped objects. SQL Server checks server roles
@@ -102,10 +103,24 @@ the org blueprint (see target-routing), a wrong identity or host is `fail`.
 `fail` when a resolved unit mapping declares a `target_type` the source family's
 `type_map.<family>.<target_kind>` forbids — including a `conditional` alternative whose
 token is not in the field's `evidence` list — or when two `canonicalization.json` files claim
-the family or the spec will not load; `unverified` when no family is declared;
+the family or the spec will not load, or a spec's optional top-level `family` names another
+family than `--source-family` (`spec X declares family=databricks but this run reconciles
+oracle: move the unit to its own pipeline's wave or fix the spec`; each spec's declared family is
+recorded in `data.families`, and the same mismatch fails `delete_evidence`,
+`source_principal_read_only` and `dictionary_readable`); `unverified` when no family is declared;
 `warn` when no dialect skill carries a map for the family or the chosen `--target-kind`;
 `ok` counts typed fields and records unmapped source types plus undeclared targets the
 harness fills; `skipped` only at setup. The audit runs on the same harness `recon_harness`
 ran (`dbx-recon` on PATH, else the checkout's `python -m recon.cli type-map-audit`); a
 missing harness or unreadable output also fails.
 A spec's top-level `target_kind` (databricks|lakebase) overrides --target-kind for that spec.
+
+### Resolved mappings
+
+`type_map_audit`, `delete_evidence`, `source_principal_read_only` and `dictionary_readable` share one
+unit set, recorded on each row as `data.units`. A child's is its `--unit`s
+(`.migration/units/<id>/mapping_spec.json` each). An orchestrator's with `--wave` is the manifest's
+units — the union of `batches[].units` — so two pipelines sharing `.migration/units/` are each
+audited by their own wave's doctor; a wave unit without a spec fails as "hand-off incomplete"
+(`data.missing_units`). Without `--wave` (setup, or an orchestrator before the manifest exists) every
+`.migration/units/*/mapping_spec.json` is resolved. `--unit` narrows nothing for an orchestrator.

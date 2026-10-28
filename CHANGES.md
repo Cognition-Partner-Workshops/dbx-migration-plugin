@@ -6,6 +6,11 @@
   `.migration/recon/<one of the batch's units>/`, naming the allowed roots; a gate pointed at the
   verifier's `.migration/recon/wave-<tag>/` made every child PR `protected_files_tampered` on lanes
   whose parity passed.
+- factory-doctor `--wave` audits the manifest's units (union of `batches[].units`) instead of every
+  spec under `.migration/units/`, so pipelines of different source families can share a workspace;
+  mapping specs may declare a top-level `family`, a mismatch with `--source-family` fails
+  `type_map_audit` and the other source rows, and every reusable row records `data.units` so a child
+  reuses a signed row only for units it covered.
 
 ## Fixed
 

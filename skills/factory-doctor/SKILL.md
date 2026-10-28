@@ -12,7 +12,7 @@ description: Preflight for a DBX migration workspace. Verifies setup, hooks, con
 | `hook_guard` | hooks are missing, direct guard fails, or the live probe is unverified/unblocked | load hooks and complete the nonce probe |
 | `official_databricks_plugin` | routed official skills are missing or not visible locally | install/load the official skills |
 | `recon_harness` | harness self-test/import or a required driver fails | install the harness extras |
-| `type_map_audit` | a unit mapping declares a `target_type` the source family's `type_map.<family>.<target_kind>` forbids | fix the declared type or add the required `evidence` token; a spec's top-level `target_kind` (databricks\|lakebase) overrides --target-kind for that spec |
+| `type_map_audit` | a unit mapping declares a `target_type` the source family's `type_map.<family>.<target_kind>` forbids, or declares a top-level `family` other than the wave's `source.family` | fix the declared type or add the required `evidence` token; a spec's top-level `target_kind` (databricks\|lakebase) overrides --target-kind for that spec; a spec of another family belongs in its own pipeline's wave |
 | `delete_evidence` | mapped CDC evidence is absent, incomplete, or unreadable | provide source CDC evidence; never enable it here |
 | `source_principal_read_only` | source grants permit writes or cannot be verified | remove writes or record a plan decision attesting the source |
 | `databricks_identity` | CLI/auth/host/identity is missing, human, or mismatched | use the expected OAuth M2M principal and host |
@@ -43,6 +43,12 @@ principal-level; table grants are checked per unit later). `--role child` is a b
 `.migration/capabilities.json` and prints one line per row. Exit 0 means `ready`.
 `--wave` takes a manifest in `<workspace>/.migration/waves/` (a relative path is the workspace's) and, when ready and not `--role child`,
 writes the fan-out pointer `~/.dbx-migration-factory/current-wave.json` (`pointer -> <path>`).
+With `--wave`, the orchestrator's per-unit rows (`type_map_audit`, `delete_evidence`,
+`source_principal_read_only`, `dictionary_readable`) audit the manifest's units (the union of
+`batches[].units`), not every spec under `.migration/units/`: sibling pipelines sharing that directory
+are verified by their own wave doctors, and a wave unit without a spec is a hand-off failure. Without
+`--wave` (setup, or an orchestrator before the manifest exists) every unit mapping is audited. Each
+row records the unit set it covered as `data.units`.
 
 A `--role child` run may pass `--reuse-record <manifest>.doctor.json` (the wave worker's signed
 record, committed beside the wave manifest). When the record is the wave worker's, `ready`, signed
@@ -51,8 +57,9 @@ signed for the `--expect-identity`/`--expect-host` principal, and its `inputs_sh
 checkout's (sha256 over `.migration/units/**` and top-level contract files except `capabilities.json`,
 by relative path), the rows marked `reusable` (`type_map_audit`, `delete_evidence`,
 `dictionary_readable`) are taken from it — every other row, and the whole run when the record fails
-any check, is computed fresh; `type_map_audit` is reused only when its recorded `data.target_kind`
-equals the child's `--target-kind`. The signature's key is derivable from the manifest and the identity
+any check, is computed fresh; a row is reused only when its recorded `data.units` covers the child's
+`--unit`s, and `type_map_audit` only when its recorded `data.target_kind` also equals the child's
+`--target-kind`. The signature's key is derivable from the manifest and the identity
 (see the module docstring of `doctor.py`), so reuse is a cost policy, not trust: the rows that guard
 the source and the secrets (`source_principal_read_only`, `named_secrets_exist`,
 `recon_family_supported`), `databricks_identity`, `recon_harness` (its driver imports describe the

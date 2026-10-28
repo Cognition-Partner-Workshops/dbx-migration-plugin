@@ -663,9 +663,12 @@ def check_recon_family_supported(plugin_root: Path, source_family: str | None) -
 UNIT_MAPPINGS = ".migration/units/*/mapping_spec.json"
 
 
-def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path]) -> tuple[dict[str, Path], dict[str,
-    Path], tuple | None]:
-    """(expected unit -> mapping, every spec to check, problem): an empty `todo` is setup."""
+def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path],
+    wave_units: list[str] | None = None) -> tuple[dict[str, Path], dict[str, Path], tuple | None]:
+    """(expected unit -> mapping, every spec to check, problem): an empty `todo` is setup.
+
+    `wave_units` (the manifest's `batches[].units`) scopes an orchestrator to the wave it signs for;
+    sibling pipelines' specs under the same `units/` are verified by their own wave doctors."""
     unit_dir = ws / ".migration" / "units"
     if role == "child":
         if not units:
@@ -676,9 +679,13 @@ def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path]
     else:
         if units:
             return ({}, {}, ("fail",
-                "--unit narrows nothing for an orchestrator: it verifies every unit mapping under "
-                f"{UNIT_MAPPINGS}; --unit is for --role child", {"units": list(units), "mappings": {}}))
-        expected = {p.parent.name: p for p in sorted(ws.glob(UNIT_MAPPINGS))}
+                "--unit narrows nothing for an orchestrator: it verifies the wave's unit mappings (every one "
+                f"under {UNIT_MAPPINGS} without --wave); --unit is for --role child",
+                {"units": list(units), "mappings": {}}))
+        if wave_units is not None:
+            expected = {u: unit_dir / u / "mapping_spec.json" for u in dict.fromkeys(wave_units)}
+        else:
+            expected = {p.parent.name: p for p in sorted(ws.glob(UNIT_MAPPINGS))}
     missing = [u for u, p in expected.items() if not p.is_file()]
     if missing:
         return (expected, {}, ("fail", f"unit mapping(s) missing for {', '.join(missing)}: expected "
@@ -694,16 +701,19 @@ def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path]
 
 
 def per_unit(cid: str, ws: Path, role: str, units: list[str], mappings: list[Path], fn,
-    setup: Check | None = None) -> Check:
-    """resolve_mappings for row `cid`: the problem/setup row when applicable, else fn(expected, todo)."""
-    expected, todo, problem = resolve_mappings(ws, role, units, mappings)
+    setup: Check | None = None, wave_units: list[str] | None = None) -> Check:
+    """resolve_mappings for row `cid`: the problem/setup row when applicable, else fn(expected, todo).
+    The row's `data.units` records the unit set it audited (a child reuses the row only within it)."""
+    expected, todo, problem = resolve_mappings(ws, role, units, mappings, wave_units)
     if problem:
         status, detail, data = problem
         return Check(cid, status, detail, {**data, "units_problem": True})
     if not todo:
         return setup or Check(cid, "skipped",
-            f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}")
-    return fn(expected, todo)
+            f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}", {"units": []})
+    row = fn(expected, todo)
+    row.data = {**(row.data or {}), "units": list(expected)}
+    return row
 
 
 def spec_target_kind(path: Path, default: str) -> tuple[str | None, str | None]:
@@ -716,8 +726,36 @@ def spec_target_kind(path: Path, default: str) -> tuple[str | None, str | None]:
     return (v, None) if v in TARGET_KINDS else (None, f"{path}: target_kind {v!r} must be one of {TARGET_KINDS}")
 
 
+def spec_family(path: Path) -> tuple[str | None, str | None]:
+    """A spec's optional top-level `family`: the source family its unit reconciles."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        return None, f"{path}: cannot read family: {e}"
+    v = data.get("family") if isinstance(data, dict) else None
+    if v is None or v in SOURCE_FAMILIES:
+        return v, None
+    return None, f"{path}: family {v!r} must be one of {SOURCE_FAMILIES}"
+
+
+def declared_families(todo: dict[str, Path], source_family: str | None) -> tuple[dict[str, str | None], str | None]:
+    """({label: declared family or None}, problem): a spec declaring another family than the one this
+    run reconciles belongs to another pipeline's wave, so the row fails instead of auditing it."""
+    families: dict[str, str | None] = {}
+    for label, p in sorted(todo.items(), key=lambda kv: str(kv[1])):
+        fam, err = spec_family(p)
+        if err:
+            return families, err
+        families[label] = fam
+        if fam and source_family and fam != source_family:
+            return families, (f"spec {p} declares family={fam} but this run reconciles {source_family}: move "
+                "the unit to its own pipeline's wave or fix the spec")
+    return families, None
+
+
 def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[Path], source_family: str | None,
-    plugin_root: Path, params: dict[str, str] | None = None, target_kind: str = "databricks") -> Check:
+    plugin_root: Path, params: dict[str, str] | None = None, target_kind: str = "databricks",
+    wave_units: list[str] | None = None) -> Check:
     """Committed specs' declared target types against the dialect skill's type_map (see references/checks.md)."""
     cid = "type_map_audit"
 
@@ -725,6 +763,10 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
         if not source_family:
             return Check(cid, "unverified", "pass --source-family (or run with --wave): target types "
                 "cannot be audited without the source family")
+        families, family_err = declared_families(todo, source_family)
+        if family_err:
+            return Check(cid, "fail", family_err, {"family": source_family, "families": families,
+                "units_problem": True})
         cmd = _harness_command(plugin_root)
         if cmd is None:
             return Check(cid, "fail", "cannot audit target types: dbx-recon not on PATH and no " "checkout harness", {
@@ -733,7 +775,7 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
         cargs = [a for c in sorted(plugin_root.glob("skills/*/canonicalization.json")) for a in ("--canonicalization",
             str(c))]
         pargs = [a for k, v in (params or {}).items() for a in ("--param", f"{k}={v}")]
-        data = {"family": source_family, "target_kind": target_kind, "harness": how}
+        data = {"family": source_family, "families": families, "target_kind": target_kind, "harness": how}
         contradictions, unmapped, undeclared, fields = [], [], 0, 0
         family_known = False
         kinds, mapped_kinds = {}, set()
@@ -792,7 +834,7 @@ def check_type_map_audit(ws: Path, role: str, units: list[str], mappings: list[P
         return Check(cid, "ok", f"{fields} typed fields agree with {rel} ({per_kind} specs); {len(unmapped)} unmapped "
             f"source types recorded, {undeclared} undeclared targets the harness fills at run time ({how})", data)
 
-    return per_unit(cid, ws, role, units, mappings, audit)
+    return per_unit(cid, ws, role, units, mappings, audit, wave_units=wave_units)
 
 
 _CDC_QUERIES = {
@@ -849,7 +891,8 @@ def _env_dsn(cid: str, source_secret: str | None) -> str | Check:
 
 
 def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str | None,
-    plugin_root: Path, connect=_pyodbc_connect, params: dict[str, str] | None = None) -> Check:
+    plugin_root: Path, connect=_pyodbc_connect, params: dict[str, str] | None = None,
+    wave_units: list[str] | None = None) -> Check:
     """One row over every unit mapping this run is answerable for (resolve_mappings)."""
 
     def evidence(expected, todo):
@@ -864,7 +907,8 @@ def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: l
             data)
 
     return per_unit("delete_evidence", ws, role, units, mappings, evidence, setup=Check("delete_evidence", "skipped",
-        f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}", {"units": [], "mappings": {}}),)
+        f"not applicable at setup: no unit mapping exists yet under {UNIT_MAPPINGS}", {"units": [], "mappings": {}}),
+        wave_units=wave_units)
 
 
 def check_delete_evidence(mapping: Path, source_secret: str | None, plugin_root: Path, connect=_pyodbc_connect,
@@ -1327,7 +1371,11 @@ def _load_mapping(path: Path, params: dict[str, str] | None, plugin_root: Path):
 
 def _mapped_tables(todo: dict[str, Path], params: dict[str, str] | None, plugin_root: Path,
     source_family: str | None):
-    """(tables, family) over every mapping in `todo`, or a Check (id set by the caller) when a spec does not load."""
+    """(tables, family) over every mapping in `todo`, or a Check (id set by the caller) when a spec does not
+    load or declares another family than `source_family`."""
+    families, family_err = declared_families(todo, source_family)
+    if family_err:
+        return Check("", "fail", family_err, {"families": families, "units_problem": True})
     tables: dict[str, None] = {}
     kinds: set[str] = set()
     for p in todo.values():
@@ -1355,7 +1403,7 @@ def _from_mappings(cid, todo, params, plugin_root, source_family, unknown_detail
 
 def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str | None,
     source_family: str | None, plugin_root: Path, params: dict[str, str] | None = None, attested: str | None = None,
-    ) -> Check:
+    wave_units: list[str] | None = None) -> Check:
     """Every source table the resolved mappings read, against --source-family or the mappings' implied family."""
     cid = "source_principal_read_only"
 
@@ -1377,7 +1425,7 @@ def check_source_principal_all(ws: Path, role: str, units: list[str], mappings: 
         return Check(c.id, c.status, "setup probe, principal-level only (no unit mapping yet; table grants are "
             f"checked per unit later): {c.detail}", {**(c.data or {}), "scope": "principal"})
 
-    return per_unit(cid, ws, role, units, mappings, principal)
+    return per_unit(cid, ws, role, units, mappings, principal, wave_units=wave_units)
 
 
 # The structural tier reads these catalog objects; `views` probes readability, `trigger_census`
@@ -1469,7 +1517,7 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
 
 def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mappings: list[Path],
     source_secret: str | None, source_family: str | None, plugin_root: Path, params: dict[str,
-    str] | None = None) -> Check:
+    str] | None = None, wave_units: list[str] | None = None) -> Check:
     """Every source table the resolved mappings read, against --source-family or the mappings' implied family."""
     cid = "dictionary_readable"
 
@@ -1495,7 +1543,7 @@ def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mapping
         return _from_mappings(cid, todo, params, plugin_root, source_family, "so catalog visibility can be checked",
             probe)
 
-    return per_unit(cid, ws, role, units, mappings, dictionary)
+    return per_unit(cid, ws, role, units, mappings, dictionary, wave_units=wave_units)
 
 
 _APPLICATION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
@@ -1900,14 +1948,19 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     expect_host: str | None = None, lakebase_project: str | None = None, lakebase_parent_branch: str | None = None,
     lakebase_dsn: str | None = None, lakebase_schema: str | None = None, analytical_schema: str | None = None,
     source_attested: str | None = None, target_kind: str = "databricks",
-    secret_names: list[str] | None = None, list_secrets=None, reused: dict | None = None) -> dict:
+    secret_names: list[str] | None = None, list_secrets=None, reused: dict | None = None,
+    wave_units: list[str] | None = None) -> dict:
     def _row(row_id, thunk, **binds):
-        """`binds` are data keys the recorded row must carry with these exact values to stand in."""
+        """`binds` are data keys the recorded row must carry with these exact values to stand in; the
+        recorded row's `data.units` must also cover every unit of this run (the orchestrator audits
+        only its wave's units, so a row proves nothing about a unit outside them)."""
         if isinstance(reused, dict) and row_id in REUSABLE_ROWS:
             row = next((c for c in reused.get("checks") or [] if isinstance(c, dict) and c.get("id") == row_id), None)
             data = row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {}
+            covered = data.get("units")
             if (isinstance(row, dict) and isinstance(row.get("status"), str) and
-                    isinstance(row.get("detail"), str) and all(data.get(k) == v for k, v in binds.items())):
+                    isinstance(row.get("detail"), str) and all(data.get(k) == v for k, v in binds.items()) and
+                    isinstance(covered, list) and set(units or []) <= set(covered)):
                 return Check(row["id"], row["status"],
                     f"reused from the orchestrator's record signed {reused.get('signed_at')}: {row['detail']}",
                     {**(row.get("data") or {}), "reused_from": reused.get("signed_at")})
@@ -1929,16 +1982,16 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
             lambda: check_recon_family_supported(plugin_root, source_family)),
         _row("type_map_audit",
             lambda: check_type_map_audit(ws, role, units, mappings, source_family, plugin_root,
-                params=params, target_kind=target_kind), target_kind=target_kind),
+                params=params, target_kind=target_kind, wave_units=wave_units), target_kind=target_kind),
         _row("delete_evidence",
             lambda: check_delete_evidence_all(ws, role, units, mappings, source_secret, plugin_root,
-                params=params)),
+                params=params, wave_units=wave_units)),
         _row("source_principal_read_only",
             lambda: check_source_principal_all(ws, role, units, mappings, source_secret, source_family,
-                plugin_root, params=params, attested=source_attested)),
+                plugin_root, params=params, attested=source_attested, wave_units=wave_units)),
         _row("dictionary_readable",
             lambda: check_dictionary_readable_all(ws, role, units, mappings, source_secret, source_family,
-                plugin_root, params=params)),
+                plugin_root, params=params, wave_units=wave_units)),
         _row("named_secrets_exist",
             lambda: (Check("named_secrets_exist", "skipped", "--no-databricks") if no_databricks
                 else check_named_secrets(secret_names or [], list_secrets)))]
@@ -1983,6 +2036,16 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         "blocking": blocking,
         "reused_doctor": reused["signed_at"] if isinstance(reused, dict) else None,
         "checks": [{**asdict(c), "reusable": c.id in REUSABLE_ROWS} for c in checks]}
+
+
+def manifest_units(manifest) -> list[str] | None:
+    """The units a wave manifest's `batches[].units` name (the orchestrator's audit set), or None
+    when the manifest carries no batches list (the audit then covers every unit mapping)."""
+    batches = manifest.get("batches") if isinstance(manifest, dict) else None
+    if not isinstance(batches, list):
+        return None
+    return sorted({u for b in batches if isinstance(b, dict) for u in (b.get("units") or [])
+        if isinstance(u, str)})
 
 
 def _manifest_source(manifest) -> tuple:
@@ -2062,7 +2125,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.hook_probe_result == "blocked":
         p.error("--hook-probe-result blocked:<nonce> is required: the nonce the guard's block message "
             "named for the probe_command of the last report")
-    manifest_bytes = None
+    manifest_bytes, wave_units = None, None
     if a.wave:
         a.wave = a.workspace.resolve() / a.wave  # a relative manifest path is the workspace's, not the cwd's
         waves_dir = a.workspace.resolve() / ".migration" / "waves"
@@ -2077,6 +2140,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.source_family is not None or a.source_secret is not None or a.param:
             p.error("--wave takes source settings from the manifest; drop --source-family/--source-secret/--param")
         _apply_manifest(a, manifest)
+        wave_units = manifest_units(manifest)
 
     reused, reuse_why = None, ""
     if a.reuse_record:
@@ -2114,7 +2178,7 @@ def main(argv: list[str] | None = None) -> int:
         a.no_databricks, a.unit, a.mapping, a.source_secret, params, a.expect_catalogs, a.source_family,
         a.expect_host, a.lakebase_project, a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema,
         a.analytical_schema, source_attested=a.source_attested,
-        target_kind=a.target_kind, secret_names=a.secret, reused=reused)
+        target_kind=a.target_kind, secret_names=a.secret, reused=reused, wave_units=wave_units)
     if a.reuse_record:
         report["checks"].append({**asdict(Check("doctor_record", "ok" if reused else "skipped",
             f"reused the orchestrator's record signed {reused['signed_at']}" if reused else reuse_why)),
