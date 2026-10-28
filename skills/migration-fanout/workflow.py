@@ -1010,8 +1010,9 @@ def capability_block(units):
         "minutes and bound to this manifest and identity; otherwise the doctor runs in full). A fail row means "
         "status=BLOCKED naming the check id; a warn row goes in your summary and you continue. Never switch "
         "identity, run `databricks auth login`, or edit .migration/allowed_targets.json.\n"
-        + (f"Every dbx-recon run (fixture, merge-evidence, shape, rerun-proof) carries `{warehouse}`: the warehouse "
-           "the signed doctor record verified, never DATABRICKS_HTTP_PATH or another warehouse.\n"
+        + (f"Every `dbx-recon run` (fixture-first and merge-evidence) and `dbx-recon shape` invocation carries "
+           f"`{warehouse}`: the warehouse the signed doctor record verified, never DATABRICKS_HTTP_PATH or another "
+           "warehouse (fixture-shape and rerun-proof open no target connection and take no such flag).\n"
            if (warehouse := recon_warehouse_flag(MANIFEST)) else "")
     )
 
@@ -1031,7 +1032,7 @@ def verify_prompt(passed):
         "Re-run the recon harness yourself. Do not trust the PR's pasted evidence, and run it with the "
         "tolerances and allowed_targets.json from the base branch, not the PR (a child that loosened a "
         "tolerance must fail here). "
-        + (f"Every harness run carries `{warehouse}` (the warehouse the signed doctor record verified; never "
+        + (f"Every `dbx-recon run` carries `{warehouse}` (the warehouse the signed doctor record verified; never "
            "DATABRICKS_HTTP_PATH or another warehouse). " if (warehouse := recon_warehouse_flag(MANIFEST)) else "")
         + "For each PR run `git diff --name-only <base>...<head>`: any .migration/ "
         "path outside .migration/recon/<unit_id>/ is a FAIL for that unit with finding protected_files_tampered. "

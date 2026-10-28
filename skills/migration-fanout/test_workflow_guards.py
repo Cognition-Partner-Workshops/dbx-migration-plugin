@@ -1603,7 +1603,11 @@ def test_declared_warehouse_pins_every_child_and_verifier_recon_run():
     """The doctor verifies `capabilities.http_path`; a child or verifier that lets dbx-recon fall back
     to DATABRICKS_HTTP_PATH can reconcile on another warehouse than the one the signed record checked."""
     ns = _prompt_ns(_manifest(capabilities=_caps(host=HOST, http_path=WAREHOUSE)))
-    assert f"--target-http-path {WAREHOUSE}" in ns["capability_block"](["u"])
+    block = ns["capability_block"](["u"])
+    assert f"--target-http-path {WAREHOUSE}" in block
+    # only `run` and `shape` register --target-http-path; fixture-shape and rerun-proof must not be told to pass it
+    assert "`dbx-recon run`" in block and "`dbx-recon shape`" in block
+    assert "fixture-shape and rerun-proof open no target connection and take no such flag" in block
     assert f"--target-http-path {WAREHOUSE}" in ns["child_prompt"](ns["MANIFEST"]["batches"][0])
     passed = [{"batch": "b", "units": ["u"], "pr_url": ""}]
     assert f"--target-http-path {WAREHOUSE}" in ns["verify_prompt"](passed)
