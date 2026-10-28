@@ -186,19 +186,29 @@ def _fake_databricks_sql(monkeypatch, captured):
     monkeypatch.setattr(databricks, "sql", fake_sql, raising=False)
 
 
-def test_databricks_connect_uses_m2m_kwargs(monkeypatch):
+def test_databricks_connect_uses_sdk_bearer_for_m2m(monkeypatch):
+    """oauth-m2m: the connector's oauth_client_id/secret kwargs fall back to interactive U2M
+    browser auth and hang unattended, so the SDK mints the SP's token and connect takes
+    access_token."""
     monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net/")
     monkeypatch.setenv("DATABRICKS_CLIENT_ID", "sp-client-id")
     monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "sp-secret")
     monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/x")
+    fake_core = types.ModuleType("databricks.sdk.core")
+    fake_core.Config = lambda: types.SimpleNamespace(
+        authenticate=lambda: {"Authorization": "Bearer tok"})
+    monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake_core)
+    fake_sdk = types.ModuleType("databricks.sdk")
+    fake_sdk.core = fake_core
+    monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
     captured = {}
     _fake_databricks_sql(monkeypatch, captured)
     assert adapters._databricks_connect() == "conn"
     assert captured["server_hostname"] == "adb-1.azuredatabricks.net"
     assert captured["http_path"] == "/sql/1.0/warehouses/x"
-    assert captured["oauth_client_id"] == "sp-client-id"
-    assert captured["oauth_client_secret"] == "sp-secret"
-    assert "access_token" not in captured
+    assert captured["access_token"] == "tok"
+    assert "oauth_client_id" not in captured
+    assert "oauth_client_secret" not in captured
 
 
 def test_databricks_connect_env_oidc_uses_sdk_bearer(monkeypatch):

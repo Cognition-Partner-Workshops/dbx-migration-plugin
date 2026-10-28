@@ -1078,7 +1078,7 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         "  ON t.table_catalog = tp.table_catalog AND t.table_schema = tp.table_schema "
         " AND t.table_name = tp.table_name "
         "WHERE tp.table_catalog = %(catalog)s AND tp.table_schema = %(schema)s "
-        "AND tp.table_name = %(table)s AND tp.grantee <> t.owner "
+        "AND tp.table_name = %(table)s AND tp.grantee <> t.table_owner "
         "ORDER BY tp.grantee",
         {"catalog": catalog, "schema": schema, "table": table}))
     return facts
@@ -1894,13 +1894,12 @@ def _databricks_bearer() -> str:
 
 def _databricks_connect(http_path: str | None = None):
     """Session identity only: DATABRICKS_HOST + DATABRICKS_CLIENT_ID with DATABRICKS_CLIENT_SECRET (oauth-m2m)
-    or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from --target-http-path or DATABRICKS_HTTP_PATH."""
+    or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from --target-http-path or DATABRICKS_HTTP_PATH.
+    The connector's oauth_client_id/secret kwargs fall back to interactive U2M browser auth, which hangs
+    unattended, so the SDK mints the token (oauth-m2m or env-oidc) and the connection takes access_token."""
     from databricks import sql  # lazy: optional extra (databricks-sql-connector)
     host = _secret("DATABRICKS_HOST").removeprefix("https://").removeprefix("http://").rstrip("/")
     http_path = http_path or _secret("DATABRICKS_HTTP_PATH")
-    if os.environ.get("DATABRICKS_CLIENT_SECRET"):
-        return sql.connect(server_hostname=host, http_path=http_path,
-            oauth_client_id=_secret("DATABRICKS_CLIENT_ID"), oauth_client_secret=_secret("DATABRICKS_CLIENT_SECRET"))
     return sql.connect(server_hostname=host, http_path=http_path, access_token=_databricks_bearer())
 
 
