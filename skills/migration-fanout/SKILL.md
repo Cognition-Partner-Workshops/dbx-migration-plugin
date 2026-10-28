@@ -107,7 +107,7 @@ Expect `/tmp/fanout-smoke/.migration/waves/wave-0.result.json` with `"smoke": tr
 | Signed doctor gate | Requires an HMAC-bound doctor record with 15-minute freshness, hook probe, and matching capabilities. |
 | Manifest `target_state` | Validated per the manifest grammar above. |
 | One manifest one run | Holds `.wave-N.lock` for the run (a second launch of the same wave halts), refuses a manifest whose sha is already in `wave-N.runs.jsonl`, refuses a manifest whose `plan_sha` differs from the one its plan step already ran, and refuses a plan step whose earlier run sent PRs to merge. |
-| Repo preflight | Halts before anything launches when `repo` is not `host/owner/name` or origin points elsewhere. |
+| Repo preflight | Halts before anything launches when `repo` is not `host/owner/name` or origin points elsewhere; when a configured `insteadOf` rewrite maps the unexpanded `remote.origin.url` to the reported origin, the unexpanded URL is compared, so a proxied remote compares as the repo it stands for. |
 | Duplicate wave | Refuses any existing result, including halted or unreadable files. |
 | Manifest name / pipelines barrier | Checks tags and waits for declared sibling manifests on origin. |
 | Collision check | Rejects overlapping declared targets within and across waves. |

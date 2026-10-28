@@ -76,7 +76,7 @@ try:  # the sandbox runs a copy of this script; the pointer's plugin root names 
                            unauthorized_decisions, wave_overrides)
     from manifest import (BARE_PATH, MERGE_EVIDENCE_MODES, PR_URL, TAG_RE, _is_manifest, bounded_readers,
                           check_doctor_contract, check_pipeline_updates, check_repo_origin, check_wave_tag,
-                          disjoint_slices, evidence_path, mapped_target, other_wave_manifests, reader_slices,
+                          disjoint_slices, evidence_path, insteadof_rewrites, mapped_target, other_wave_manifests, reader_slices,
                           skill_file, target_key, transitive_writes, valid_namespace, validate_manifest,
                           wave_signature)
     from report import (CHILD_SCHEMA, CLOSE_SCHEMA, COST_KEYS, RESYNC_SCHEMA, VERIFY_SCHEMA, _verify_sink,
@@ -671,7 +671,9 @@ def launch_checks():
                                 capture_output=True, text=True, timeout=60).stdout
     except (OSError, subprocess.SubprocessError):
         raise SystemExit(f"{ROOT} has no git remote 'origin'; children push PRs to it") from None
-    check_repo_origin(MANIFEST["repo"], origin)
+    configured = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "remote.origin.url"],
+                                capture_output=True, text=True, timeout=60).stdout
+    check_repo_origin(MANIFEST["repo"], origin, insteadof_rewrites(ROOT), configured)
     check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                         other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),

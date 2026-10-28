@@ -31,7 +31,11 @@ edit from a changed plan.
 
 ## Repo preflight
 
-Before anything launches: `repo` is `host/owner/name` and matches a remote origin URL.
+Before anything launches: `repo` is `host/owner/name` and matches a remote origin URL. `git remote
+get-url origin` reports the URL after any `url.<target>.insteadOf` rewrite (a VM-wide proxy prefix such
+as `https://git-manager.devin.ai/proxy/github.com/`), so the check also reads the unexpanded
+`remote.origin.url` and compares that instead when a configured rewrite maps it to exactly the reported
+origin; a proxy-shaped URL no configured rewrite explains is compared as reported and halts.
 
 ## Duplicate wave
 
