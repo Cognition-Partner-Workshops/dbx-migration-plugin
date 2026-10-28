@@ -1881,16 +1881,17 @@ def is_untested_source_family(family: str) -> bool:
 
 # ---- Databricks target ------------------------------------------------------------------
 
-def _databricks_auth_headers() -> dict[str, str]:
-    """Workspace auth headers for the session's service principal (env-oidc or oauth-m2m), via the SDK.
-    Fresh on every call: the SDK re-mints an M2M/OIDC token once it nears expiry, so a run longer
-    than one token's TTL keeps working."""
+def _databricks_sdk_config():
+    """SDK Config for the session's service principal (env-oidc or oauth-m2m).
+    One per connection: the SDK caches the token on the Config's credentials provider and
+    re-mints only once it nears expiry, so a run longer than one token's TTL keeps working
+    without a token-endpoint round trip per request."""
     import databricks.sdk.core as _sdk_core  # lazy: optional extra (databricks-sdk)
     if os.environ.get("DATABRICKS_AUTH_TYPE") == "env-oidc" and not os.environ.get("DATABRICKS_OIDC_TOKEN"):
         audience = os.environ.get("DATABRICKS_DEVIN_AUDIENCE", "databricks")
         os.environ["DATABRICKS_OIDC_TOKEN"] = subprocess.run(["devin-oidc", "token", "--audience", audience],
             check=True, capture_output=True, text=True).stdout.strip()
-    return _sdk_core.Config().authenticate()
+    return _sdk_core.Config()
 
 
 def _databricks_connect(http_path: str | None = None):
@@ -1903,7 +1904,7 @@ def _databricks_connect(http_path: str | None = None):
     host = _secret("DATABRICKS_HOST").removeprefix("https://").removeprefix("http://").rstrip("/")
     http_path = http_path or _secret("DATABRICKS_HTTP_PATH")
     return sql.connect(server_hostname=host, http_path=http_path,
-        credentials_provider=_databricks_auth_headers)
+        credentials_provider=_databricks_sdk_config().authenticate)
 
 
 class DatabricksTargetAdapter:
