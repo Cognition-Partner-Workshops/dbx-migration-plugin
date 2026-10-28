@@ -50,10 +50,16 @@ def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
                         for c in spec.objects)
                     + (st["session"] if spec.objects else 0))
 
-        src, tgt = {"tier0": tier0(sides[0])}, {"tier0": tier0(sides[1])}
+        # the key uniqueness probe (schema_parity, Databricks targets): at most one aggregate
+        # statement per object, one row back, plus the `current_user()` read `--capabilities`
+        # adds once per run; counted as the ceiling
+        tcls = TARGET_ADAPTERS[target_kind]
+        probes = getattr(tcls, "KEY_PROBE_STATEMENTS", 0) * len(spec.objects)
+        principal = getattr(tcls, "OWN_PRINCIPAL_STATEMENTS", 0) if spec.objects else 0
+        src, tgt = {"tier0": tier0(sides[0])}, {"tier0": tier0(sides[1]) + probes + principal}
         src["total"], tgt["total"] = src["tier0"], tgt["tier0"]
         return {"mode": mode, "depth": depth, "tier3_mode": {}, "source_statements": src,
-                "target_statements": tgt, "source_rows_fetched": 0, "target_rows_fetched": 0,
+                "target_statements": tgt, "source_rows_fetched": 0, "target_rows_fetched": probes + principal,
                 "row_counts_known": row_counts is not None}
     src: dict[str, int] = {"tier1": 0, "tier2": 0, "tier3": 0, "tier4": ops}
     tgt: dict[str, int] = {"tier1": 0, "tier2": 0, "tier3": 0, "tier4": ops}

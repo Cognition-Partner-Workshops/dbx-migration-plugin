@@ -13,7 +13,7 @@ from pathlib import Path
 from .config import RERUN_POSTURES, ConfigError
 from .rerun import rerun_first_run_baseline, rerun_gap, rerun_missing, rerun_unsupported
 from .routines import parity_missing, routine_gap
-from .tiers import TierResult
+from .tiers import TierResult, blocking
 
 MAX_FINDINGS_IN_REPORT = 50
 
@@ -144,7 +144,7 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     # a hole the principal was refused is a visibility gap, not a mismatch; a hole of any other
     # kind (or a finding) is structural
     structural_class = "structural"
-    if structural is not None and not structural.findings \
+    if structural is not None and not blocking(structural.findings) \
             and set(structural.stats.get("hole_kinds") or []) == {"privilege"}:
         structural_class = "privilege_visibility"
     structural_warning = tuple(f"UNVERIFIED {t}" for t in STRUCTURAL_TIERS)
@@ -153,7 +153,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
     def block(reason: str, cls: str) -> None:
         blockers.append({"reason": reason, "class": cls})
 
-    if structural is not None and (structural.findings or structural.stats.get("unverified")
+    # severity "info" findings (platform-inherent, proven harmless) are shown, never a blocker
+    if structural is not None and (blocking(structural.findings) or structural.stats.get("unverified")
                                    or structural.stats.get("dictionary_unavailable")
                                    or structural_blind):
         block("structural_gap", structural_class)
@@ -280,8 +281,11 @@ def render_report(result: dict) -> str:
         "|---|---|---|---|",
     ]
     for t in result["tiers"]:
+        info = sum(f.get("severity") == "info" for f in t["findings"])
+        failing = len(t["findings"]) - info
         lines.append(f"| {t['tier']} | {t['name']} | {t['checks_run']} | "
-                     f"{'PASS' if t['passed'] else 'FAIL (' + str(len(t['findings'])) + ' findings)'} |")
+                     f"{'PASS' if t['passed'] else 'FAIL (' + str(failing) + ' findings)'}"
+                     f"{' + ' + str(info) + ' info' if info else ''} |")
     for t in result["tiers"]:
         if t.get("stats"):
             lines += ["", f"## Tier {t['tier']} coverage", "```json",
@@ -289,7 +293,8 @@ def render_report(result: dict) -> str:
         if t["findings"]:
             lines += ["", f"## Tier {t['tier']} findings ({len(t['findings'])})"]
             for f in t["findings"][:MAX_FINDINGS_IN_REPORT]:
-                lines.append(f"- `{f['object']}` {f['check']}: {f['detail']}"
+                lines.append(f"- `{f['object']}` {f['check']}"
+                             f"{' [info]' if f.get('severity') == 'info' else ''}: {f['detail']}"
                              + (f" | source={f['source_value']} target={f['target_value']}"
                                 f" | rules={f['rules_applied']}"
                                 if f["check"] in ("field_diff", "embed_field_diff",

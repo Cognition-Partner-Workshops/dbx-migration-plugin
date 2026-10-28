@@ -115,7 +115,9 @@ provenance warning and the run is not merge-eligible.
   isolation each side actually ran under.
 - `structural`: Tier 0 `structural_parity` only, both catalogs read and no row read on either
   side — the identity frontier-vs-rows collision check needs source MIN/MAX, so it is not checked
-  here (`source_bounds` reports `unread`). The independent verifier's run on a wave the manifest declares `degraded`; never merge
+  here (`source_bounds` reports `unread`); the one exception is the Databricks uniqueness probe
+  below (a target-only `COUNT(*), COUNT(DISTINCT key)` per unenforced primary key), so the
+  platform-inherent carve-out holds on the verifier's structural run too. The independent verifier's run on a wave the manifest declares `degraded`; never merge
   evidence: a clean run's `merge_block_reasons` is exactly `["mode"]` (no rerun proof applies, no
   row tier ran), and `estimate` counts only Tier 0's catalog statements per adapter
   (`CATALOG_STATEMENTS`), so `--family` is required in structural mode.
@@ -134,8 +136,26 @@ provenance warning and the run is not merge-eligible.
   Unity Catalog group membership is not expanded),
   or `unsupported`, and `stats.structural_diff` the per-object detail; an unsupported category
   is unchecked, not
-  clean. `result.json`'s `merge_block_reasons` puts `structural_gap` first when a structural
-  tier has findings or unverifiable objects; its class is `privilege_visibility` when there are no
+  clean. Each finding carries a `severity`: `error` (fails the tier) or `info`. `info` is
+  reserved for platform-inherent differences on a Databricks target only (`--target-kind
+  databricks`, never by absence: Lakebase/Postgres are unchanged), each proved harmless before it
+  is recorded and listed again in `stats.platform_inherent`: `primary_key_informational_only`
+  when Unity Catalog's unenforced PK passes the target uniqueness probe (`SELECT COUNT(*),
+  COUNT(DISTINCT <key>)`; duplicate keys keep it blocking); `primary_key_not_applicable` /
+  `identity_not_applicable` (detail `not_applicable(<table_type>)`) for a Lakeflow
+  `MATERIALIZED_VIEW` / `STREAMING_TABLE` output, which declares no PK or identity of its own,
+  again only when the probe passes; and `grant_extra` whose grantee is the run's own migration
+  principal (`run --capabilities <capabilities.json>`, its `identity.userName`, accepted only
+  when it is the principal the target session authenticated as, `SELECT current_user()`; a file
+  naming anyone else is refused, and without the file nothing is softened). The probe runs over
+  the mapping's `target_where` partition and costs one target aggregate statement per object,
+  `--capabilities` one `current_user()` read per run (`estimate --mode structural` counts both as
+  the ceiling). Any other grantee's `grant_extra` and every `grant_missing` (source
+  grantees mapped through `principal_map`) stay blocking. The target reader sees MANAGED,
+  EXTERNAL, shallow clones, MATERIALIZED_VIEW and STREAMING_TABLE objects and records the kind
+  as `table_type`; a `VIEW` or a `FOREIGN` (federated) table is absent. `result.json`'s
+  `merge_block_reasons` puts `structural_gap` first when a structural
+  tier has `error` findings or unverifiable objects; its class is `privilege_visibility` when there are no
   findings and every hole is a permission refusal (`DictionaryError.kind == "privilege"`, or a
   reader that marked grants `privilege_denied`), `structural` otherwise. No harness flag lifts a
   visibility gap: the caller cannot declare a category unreadable, so a refused read always
@@ -164,7 +184,12 @@ provenance warning and the run is not merge-eligible.
   failed leg adds `rerun_gap` to `merge_block_reasons`; what else blocks depends on the unit's
   `rerun_posture`, declared at the top level of its committed mapping spec (default `required`, recorded
   as `rerun_posture` in `result.json`; never a run flag, so the run being graded cannot pick its gate and
-  the verifier sees the posture in the reviewed spec):
+  the verifier sees the posture in the reviewed spec; the one derivation: on a Databricks target
+  whose mapped objects are all Lakeflow `MATERIALIZED_VIEW` / `STREAMING_TABLE` outputs the run
+  records `not_applicable` with `rerun_posture_reason: not_applicable(<kind>)` and
+  `target_table_kinds`, because a pipeline update recomputes a materialized view from its
+  definition and advances a streaming table from its checkpoint — no DDL runs against an
+  existing table, so there is no rerun to prove; a unit mixing kinds keeps the spec posture):
   `required` (a job that runs again against an existing target: pipelines, scheduled loads) also
   blocks on an unsupported evolved leg (`rerun_unsupported`) and on no proof at all
   (`rerun_missing`); `first_run_baseline` (the unit's first migration) needs the fresh leg, which

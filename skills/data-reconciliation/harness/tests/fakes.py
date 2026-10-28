@@ -355,6 +355,19 @@ class FakeCheckpointTarget:
 
 class FakeTarget(_TransactionalMixin):
     objects = property(lambda self: self.tables)
+    # set to "databricks" (with `table_types`) to stand in for DatabricksTargetAdapter; absent
+    # by default so a test models the Lakebase/Postgres path unless it says otherwise
+    target_kind: str | None = None
+    table_types: dict[str, str] = {}
+
+    def key_uniqueness(self, object: str, key_cols: list[str], where=None) -> tuple[int, int]:
+        self._count("key_uniqueness")
+        rows = self._rows(object, where)
+        return len(rows), len({self._key(r, key_cols) for r in rows})
+
+    def table_kind(self, object: str) -> str | None:
+        self._count("table_kind")
+        return self.table_types.get(object, "MANAGED" if object in self.tables else None)
 
     def target_row_count(self, object: str, where=None) -> int:
         self._count("target_row_count")

@@ -24,6 +24,7 @@ _CHECK_CATEGORY = {
     "primary_key_mismatch": "constraints",
     "primary_key_informational_only": "constraints",
     "primary_key_informational_missing": "constraints",
+    "primary_key_not_applicable": "constraints",
     "unique_missing": "constraints", "unique_extra": "constraints",
     "unique_nulls_equal_missing": "constraints", "unique_nulls_equal_extra": "constraints",
     "foreign_key_missing": "constraints", "foreign_key_extra": "constraints",
@@ -40,6 +41,7 @@ _CHECK_CATEGORY = {
     "sequence_direction_mismatch": "sequences_identity",
     "sequence_increment_mismatch": "sequences_identity",
     "identity_missing": "sequences_identity", "identity_extra": "sequences_identity",
+    "identity_not_applicable": "sequences_identity",
     "trigger_missing": "triggers", "trigger_extra": "triggers",
     "trigger_granularity_mismatch": "triggers",
     "grant_missing": "grants", "grant_extra": "grants",
@@ -143,12 +145,20 @@ def _capabilities(privs) -> set[str]:
 
 
 def compare_grants(obj: str, s: SchemaFacts, t: SchemaFacts,
-                   principal_map: dict[str, str]) -> list[Finding]:
+                   principal_map: dict[str, str],
+                   own_principals: frozenset[str] = frozenset()) -> list[Finding]:
     """Source grantee g is expected on the target as principal_map.get(g, g). Missing grantee or
     privileges -> grant_missing; a target grantee outside the mapped set, or extra privileges on
     a mapped one, -> grant_extra (a finding, not tightened: a wider target grant is a blast-radius
-    defect, and the allowlist forbids grants beyond it)."""
+    defect, and the allowlist forbids grants beyond it). A grant_extra whose grantee is one of
+    `own_principals` (the run's own migration/recon principal, which created the object and so
+    holds rights the source never granted anyone) is severity "info": shown, not blocking. Every
+    other grantee's extra blocks, and grant_missing is never softened."""
     findings = []
+    own = {p.lower() for p in own_principals}
+
+    def extra(detail: str, grantee: str) -> Finding:
+        return Finding(obj, "grant_extra", detail, severity="info" if grantee in own else "error")
     mapped: dict[str, list[str]] = {}
     for g in s.grants:
         mapped.setdefault(principal_map.get(g, g), []).append(g)
@@ -166,14 +176,12 @@ def compare_grants(obj: str, s: SchemaFacts, t: SchemaFacts,
     for tg in sorted(t.grants):
         if tg in mapped:
             union = set().union(*(_capabilities(s.grants[g]) for g in mapped[tg]))
-            if extra := sorted(_capabilities(t.grants[tg]) - union):
-                findings.append(Finding(obj, "grant_extra",
-                                        f"target grant {tg} carries {','.join(extra)} the source "
-                                        f"grant {','.join(sorted(mapped[tg]))} lacks"))
+            if more := sorted(_capabilities(t.grants[tg]) - union):
+                findings.append(extra(f"target grant {tg} carries {','.join(more)} the source "
+                                      f"grant {','.join(sorted(mapped[tg]))} lacks", tg))
         else:
-            findings.append(Finding(obj, "grant_extra",
-                                    f"target grant {tg} ({','.join(sorted(t.grants[tg]))}) has no "
-                                    "source counterpart"))
+            findings.append(extra(f"target grant {tg} ({','.join(sorted(t.grants[tg]))}) has no "
+                                  "source counterpart", tg))
     return findings
 
 
@@ -263,7 +271,8 @@ def load_dictionary(path: Path) -> FixtureDictionary:
                 grants={str(g).lower(): frozenset(str(p).lower() for p in ps)
                         for g, ps in (t.get("grants") or {}).items()},
                 unsupported=unsupported | frozenset(str(c) for c in (t.get("unsupported") or [])),
-                grants_effective=grants_effective)
+                grants_effective=grants_effective,
+                table_type=str(t["table_type"]).upper() if t.get("table_type") else None)
         except (KeyError, TypeError, ValueError) as e:
             raise ConfigError(f"{path}: table {name}: bad shape: {e}") from None
     return FixtureDictionary(family=str(data.get("family") or ""), path=str(path),
@@ -297,10 +306,11 @@ class DictionaryOverlay:
                 f"{self._dictionary.path} has no identity state for {table}.{column}") from None
 
 
-def tier0_structural_parity(spec, tol, source, target, catalog_only: bool = False) -> TierResult:
+def tier0_structural_parity(spec, tol, source, target, catalog_only: bool = False,
+                            own_principals: frozenset[str] = frozenset()) -> TierResult:
     """Structural parity outside a consistency window: the same grading as tier 7 but honest
     about holes — a catalog that cannot be read leaves categories unsupported, never clean.
     `catalog_only` (structural mode) skips the row-backed identity bounds."""
     from .transactional import schema_parity  # lazy: transactional imports this module
     return schema_parity(0, "structural_parity", spec, tol, source, target, strict=False,
-                         catalog_only=catalog_only)
+                         catalog_only=catalog_only, own_principals=own_principals)

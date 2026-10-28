@@ -157,17 +157,21 @@ def test_diff_by_object_groups_by_category():
 
 # ------------------------------------------------------------------ end-to-end, live mode
 
-def _live(loans_src_facts=LOANS_FACTS, loans_tgt_facts=None):
+def _live(loans_src_facts=LOANS_FACTS, loans_tgt_facts=None, *, target_kind=None, table_types=None,
+          extra_target_loans=(), mode="live", rerun_proof=PROVEN_RERUN, own_principals=frozenset()):
     loans, borrowers = _rows(12)
     source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
                         schema={"dbo.loans": loans_src_facts,
                                 "dbo.borrowers": BORROWER_FACTS},
                         sequences={("dbo.loans", "loan_id"): 13})
-    target = FakeTarget({"loans": [dict(r) for r in loans], "borrowers": borrowers},
+    target = FakeTarget({"loans": [dict(r) for r in loans] + [dict(r) for r in extra_target_loans],
+                         "borrowers": borrowers},
                         schema={"loans": loans_tgt_facts or TARGET_LOANS_FACTS,
                                 "borrowers": BORROWER_FACTS},
                         sequences={("loans", "loan_id"): 13})
-    return run_recon("u1", "live", _spec(), Tolerances("t1"), [], source, target, rerun_proof=PROVEN_RERUN)
+    target.target_kind, target.table_types = target_kind, table_types or {}
+    return run_recon("u1", mode, _spec(), Tolerances("t1"), [], source, target, rerun_proof=rerun_proof,
+                     own_principals=own_principals)
 
 
 def test_tier0_fails_on_missing_trigger_and_grant():
@@ -302,11 +306,15 @@ def test_structural_estimate_counts_each_adapters_catalog_reads():
                         mode="structural", family="sqlserver", target_kind="databricks")
     assert est["mode"] == "structural" and est["tier3_mode"] == {}
     assert est["source_statements"]["tier0"] == 6 * n + n_id
-    assert est["target_statements"]["tier0"] == 5 * n + 2 * n_id
+    # + one key probe per object + the one current_user() read of `run --capabilities`
+    assert est["target_statements"]["tier0"] == 6 * n + 2 * n_id + n + 1
+    assert est["target_rows_fetched"] == n + 1
+    lb = estimate_cost(spec, Tolerances("t1"), mode="structural", family="sqlserver", target_kind="lakebase")
+    assert lb["target_rows_fetched"] == 0  # no probe off Databricks
     for side in ("source_statements", "target_statements"):
         assert est[side]["total"] == est[side]["tier0"]
         assert {k for k, v in est[side].items() if v and k not in ("tier0", "total")} == set()
-    assert est["source_rows_fetched"] == 0 and est["target_rows_fetched"] == 0
+    assert est["source_rows_fetched"] == 0 and est["target_rows_fetched"] == n + 1
     pg = estimate_cost(spec, Tolerances("t1"), mode="structural",
                        family="postgres", target_kind="lakebase")
     assert pg["source_statements"]["tier0"] == 7 * n + 2 * n_id + 1
@@ -583,16 +591,173 @@ def test_tier0_informational_target_pk_still_counts_for_a_blind_source():
     assert t0["stats"]["loans"]["target"]["primary_key_informational"] == ["loan_id"]
 
 
-def test_tier0_informational_target_pk_is_a_finding_not_a_pass():
-    tgt_facts = _facts(TARGET_LOANS_FACTS, primary_key=(),
-                       primary_key_informational=("loan_id",))
-    result = _live(loans_tgt_facts=tgt_facts)
+_INFO_PK = _facts(TARGET_LOANS_FACTS, primary_key=(), primary_key_informational=("loan_id",))
+
+
+def test_tier0_informational_target_pk_blocks_on_lakebase_unchanged():
+    """No target_kind (Lakebase/Postgres path): an informational PK is a blocking finding, as
+    before the Databricks carve-out; the carve-out is gated on target_kind, never on its absence."""
+    result = _live(loans_tgt_facts=_INFO_PK)
     t0 = result["tiers"][0]
     codes = {f["check"] for f in t0["findings"]}
     assert "primary_key_informational_only" in codes and "primary_key_mismatch" not in codes
     assert t0["stats"]["structural_diff"]["loans"]["constraints"]
+    assert all(f["severity"] == "error" for f in t0["findings"])
+    assert t0["stats"]["platform_inherent"] == []
     assert result["merge_eligible"] is False
     assert "structural_gap" in result["merge_block_reasons"]
+
+
+def test_tier0_informational_uc_pk_with_unique_keys_is_info_and_merges():
+    """Databricks target (flipped from `..._is_a_finding_not_a_pass`): Unity Catalog cannot
+    enforce a PK, so an informational PK whose key the uniqueness probe proves unique is a
+    platform-inherent info finding: shown in the diff, never a blocker."""
+    result = _live(loans_tgt_facts=_INFO_PK, target_kind="databricks")
+    t0 = result["tiers"][0]
+    pk = [f for f in t0["findings"] if f["check"] == "primary_key_informational_only"]
+    assert len(pk) == 1 and pk[0]["severity"] == "info" and "12 rows, 12 distinct keys" in pk[0]["detail"]
+    assert t0["passed"] is True
+    assert t0["stats"]["structural_diff"]["loans"]["constraints"]  # diff_by_object shows it
+    assert t0["stats"]["platform_inherent"] == [{"object": "loans", "check": "primary_key_informational_only",
+                                                 "detail": pk[0]["detail"]}]
+    assert result["merge_eligible"] is True and result["merge_block_reasons"] == []
+
+
+def test_tier0_informational_uc_pk_with_duplicate_keys_still_blocks():
+    """Structural mode (the DEGRADED verifier path, no row tier to catch the duplicate): the
+    probe finds two rows per key, so the unenforced PK stays a blocking finding."""
+    loans, _ = _rows(12)
+    result = _live(loans_tgt_facts=_INFO_PK, target_kind="databricks", mode="structural",
+                   extra_target_loans=[loans[0]])
+    t0 = result["tiers"][0]
+    pk = [f for f in t0["findings"] if f["check"] == "primary_key_informational_only"]
+    assert len(pk) == 1 and pk[0]["severity"] == "error" and "13 rows, 12 distinct keys" in pk[0]["detail"]
+    assert t0["passed"] is False and result["merge_eligible"] is False
+    assert "structural_gap" in result["merge_block_reasons"]
+
+
+def test_tier0_informational_uc_pk_carve_out_holds_in_structural_mode():
+    result = _live(loans_tgt_facts=_INFO_PK, target_kind="databricks", mode="structural", rerun_proof=None)
+    t0 = result["tiers"][0]
+    assert t0["passed"] is True and [f["severity"] for f in t0["findings"]] == ["info"]
+    assert result["merge_block_reasons"] == ["mode"]  # exactly what a clean structural run blocks on
+
+
+def test_tier0_uniqueness_probe_is_scoped_to_the_mappings_target_where():
+    """A duplicate key in another unit's partition of a shared target table must not decide
+    this unit's probe: `key_uniqueness` gets the mapping's `target_where`."""
+    import dataclasses
+    from recon.structure import tier0_structural_parity
+    loans, borrowers = _rows(12)
+    spec = _spec()
+    scoped = dataclasses.replace(spec.objects[0], target_where="borrower_id = 1")
+    spec = dataclasses.replace(spec, objects=[scoped, spec.objects[1]])
+    source = FakeSource({"dbo.loans": loans, "dbo.borrowers": borrowers},
+                        schema={"dbo.loans": LOANS_FACTS, "dbo.borrowers": BORROWER_FACTS},
+                        sequences={("dbo.loans", "loan_id"): 13})
+    dup = dict(loans[0])  # borrower_id 2: outside this unit's partition
+    assert dup["borrower_id"] != 1
+    target = FakeTarget({"loans": [dict(r) for r in loans] + [dup], "borrowers": borrowers},
+                        schema={"loans": _INFO_PK, "borrowers": BORROWER_FACTS},
+                        sequences={("loans", "loan_id"): 13})
+    target.target_kind = "databricks"
+    t0 = tier0_structural_parity(spec, Tolerances("t1"), source, target)
+    pk = [f for f in t0.findings if f.check == "primary_key_informational_only"]
+    assert len(pk) == 1 and pk[0].severity == "info" and "4 rows, 4 distinct keys" in pk[0].detail
+    # the same table unscoped sees the duplicate
+    unscoped = tier0_structural_parity(_spec(), Tolerances("t1"), source, target)
+    pk = [f for f in unscoped.findings if f.check == "primary_key_informational_only"]
+    assert len(pk) == 1 and pk[0].severity == "error" and "13 rows, 12 distinct keys" in pk[0].detail
+
+
+def test_tier0_informational_source_key_on_a_pipeline_output_uses_the_probe():
+    """A Databricks source declares its PK informationally (`_uc_schema_facts`), so `pk` is empty
+    and `pk_info` carries the key: an MV/ST target with unique keys is not_applicable, not
+    `primary_key_informational_missing`; a duplicate keeps the blocking finding."""
+    src = _facts(LOANS_FACTS, primary_key=(), primary_key_informational=("loan_id",))
+    mv = _facts(TARGET_LOANS_FACTS, primary_key=(), primary_key_informational=(), identity_columns=set(),
+                table_type="MATERIALIZED_VIEW")
+    result = _live(loans_src_facts=src, loans_tgt_facts=mv, target_kind="databricks", rerun_proof=None,
+                   mode="structural", table_types={"loans": "MATERIALIZED_VIEW"})
+    codes = {f["check"]: f["severity"] for f in result["tiers"][0]["findings"] if f["object"] == "loans"}
+    assert codes["primary_key_not_applicable"] == "info" and "primary_key_informational_missing" not in codes
+    assert result["merge_block_reasons"] == ["mode"]
+    loans, _ = _rows(12)
+    result = _live(loans_src_facts=src, loans_tgt_facts=mv, target_kind="databricks", rerun_proof=None,
+                   mode="structural", table_types={"loans": "MATERIALIZED_VIEW"}, extra_target_loans=[loans[0]])
+    codes = {f["check"]: f["severity"] for f in result["tiers"][0]["findings"] if f["object"] == "loans"}
+    assert codes["primary_key_informational_missing"] == "error" and "primary_key_not_applicable" not in codes
+    # off Databricks the informational source key is still missing on a PK-less target
+    result = _live(loans_src_facts=src, loans_tgt_facts=mv, mode="structural", rerun_proof=None)
+    codes = {f["check"]: f["severity"] for f in result["tiers"][0]["findings"] if f["object"] == "loans"}
+    assert codes["primary_key_informational_missing"] == "error"
+
+
+def test_tier0_grant_extra_for_own_principal_is_info_any_other_grantee_blocks():
+    tgt = _facts(TARGET_LOANS_FACTS, grants={**TARGET_LOANS_FACTS.grants, "sp-migration": frozenset({"select", "modify"})})
+    own = frozenset({"SP-Migration"})
+    result = _live(loans_tgt_facts=tgt, target_kind="databricks", own_principals=own)
+    t0 = result["tiers"][0]
+    extra = [f for f in t0["findings"] if f["check"] == "grant_extra"]
+    assert len(extra) == 1 and extra[0]["severity"] == "info" and "sp-migration" in extra[0]["detail"]
+    assert result["merge_eligible"] is True
+    # another group holding the same extra grant is a blast-radius defect: blocks
+    tgt = _facts(TARGET_LOANS_FACTS, grants={**TARGET_LOANS_FACTS.grants, "analysts": frozenset({"select"})})
+    result = _live(loans_tgt_facts=tgt, target_kind="databricks", own_principals=own)
+    extra = [f for f in result["tiers"][0]["findings"] if f["check"] == "grant_extra"]
+    assert len(extra) == 1 and extra[0]["severity"] == "error"
+    assert result["merge_eligible"] is False and "structural_gap" in result["merge_block_reasons"]
+    # Lakebase: the own principal's extra still blocks (nothing is softened off-Databricks)
+    tgt = _facts(TARGET_LOANS_FACTS, grants={**TARGET_LOANS_FACTS.grants, "sp-migration": frozenset({"select"})})
+    result = _live(loans_tgt_facts=tgt, own_principals=own)
+    assert result["merge_eligible"] is False
+    assert [f["severity"] for f in result["tiers"][0]["findings"] if f["check"] == "grant_extra"] == ["error"]
+
+
+def test_tier0_grant_missing_is_never_softened_on_databricks():
+    src = _facts(LOANS_FACTS, grants={"app_role": frozenset({"select"})})
+    tgt = _facts(TARGET_LOANS_FACTS, grants={"sp-migration": frozenset({"select"})})
+    result = _live(loans_src_facts=src, loans_tgt_facts=tgt, target_kind="databricks",
+                   own_principals=frozenset({"sp-migration"}))
+    missing = [f for f in result["tiers"][0]["findings"] if f["check"] == "grant_missing"]
+    assert missing and all(f["severity"] == "error" for f in missing)
+    assert result["merge_eligible"] is False
+
+
+def test_materialized_view_target_with_unique_keys_is_eligible_and_rerun_not_applicable():
+    """A Lakeflow MATERIALIZED_VIEW declares no PK and no identity: with the probe passing both
+    are recorded not_applicable(<kind>) (info), and the rerun posture derives not_applicable
+    from the kind (no proof needed); a MANAGED table keeps the spec's `required`."""
+    mv = _facts(TARGET_LOANS_FACTS, primary_key=(), primary_key_informational=(), identity_columns=set(),
+                table_type="MATERIALIZED_VIEW")
+    result = _live(loans_tgt_facts=mv, target_kind="databricks", rerun_proof=None,
+                   table_types={"loans": "MATERIALIZED_VIEW", "borrowers": "STREAMING_TABLE"})
+    t0 = result["tiers"][0]
+    by_check = {f["check"]: f for f in t0["findings"] if f["object"] == "loans"}
+    assert by_check["primary_key_not_applicable"]["severity"] == "info"
+    assert by_check["primary_key_not_applicable"]["detail"].startswith("not_applicable(MATERIALIZED_VIEW)")
+    assert by_check["identity_not_applicable"]["severity"] == "info"
+    assert "primary_key_mismatch" not in by_check and "identity_missing" not in by_check
+    assert t0["stats"]["loans"]["identity"] == {"not_applicable": "MATERIALIZED_VIEW"}
+    assert t0["stats"]["loans"]["target"]["table_type"] == "MATERIALIZED_VIEW"
+    assert result["rerun_posture"] == "not_applicable"
+    assert result["rerun_posture_reason"] == "not_applicable(MATERIALIZED_VIEW/STREAMING_TABLE)"
+    assert result["target_table_kinds"] == {"loans": "MATERIALIZED_VIEW", "borrowers": "STREAMING_TABLE"}
+    assert result["merge_eligible"] is True and result["merge_block_reasons"] == []
+    # duplicate keys in the view: the missing PK is a real mismatch again
+    loans, _ = _rows(12)
+    result = _live(loans_tgt_facts=mv, target_kind="databricks", rerun_proof=None, mode="structural",
+                   extra_target_loans=[loans[0]], table_types={"loans": "MATERIALIZED_VIEW"})
+    codes = {f["check"]: f["severity"] for f in result["tiers"][0]["findings"] if f["object"] == "loans"}
+    assert codes["primary_key_mismatch"] == "error" and "primary_key_not_applicable" not in codes
+    # MANAGED (the default kind) keeps the spec posture: no proof blocks
+    result = _live(target_kind="databricks", rerun_proof=None)
+    assert result["rerun_posture"] == "required" and "rerun_missing" in result["merge_block_reasons"]
+    assert result["target_table_kinds"] == {"loans": "MANAGED", "borrowers": "MANAGED"}
+    assert "rerun_posture_reason" not in result
+    # a unit mixing a MANAGED table with an MV keeps `required`: the table still needs the proof
+    result = _live(target_kind="databricks", rerun_proof=None, table_types={"loans": "MATERIALIZED_VIEW"})
+    assert result["rerun_posture"] == "required"
 
 
 def test_tier0_source_unsupported_category_with_target_content_warns():

@@ -6,6 +6,7 @@ from the previously committed proof's shape (or the manifest-declared old shape 
 A failing run is `rerun_gap` and never merge-eligible."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -618,8 +619,10 @@ def test_databricks_target_reads_the_observed_shape_from_information_schema(monk
     sql, params = conn.executed[-1]
     assert "information_schema.columns" in sql and "ORDER BY ordinal_position" in sql
     assert params == {"catalog": "mig", "schema": "sales", "table": "orders"}
-    # a view or materialized view with the same columns is not the table the DDL creates
+    # a view with the same columns is not the table the DDL creates; a FOREIGN table federates
+    # back to the source and would match it trivially
     assert "information_schema.tables" in sql and "table_type IN ('MANAGED', 'EXTERNAL'" in sql
+    assert "'MATERIALIZED_VIEW', 'STREAMING_TABLE'" in sql and "'VIEW'" not in sql and "FOREIGN" not in sql
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".migration").mkdir()
     (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
@@ -717,3 +720,100 @@ def test_lakebase_target_table_exists_asks_pg_class(monkeypatch):
     assert "pg_class" in sql and "c.relkind IN ('r', 'p')" in sql and params == ("sales", "markers")
     conn.rows = []
     assert target.table_exists("gone") is False
+
+
+class _CatalogConn(_StubConn):
+    """information_schema.tables stand-in holding one object of `table_type`: answers the
+    `table_type IN (...)` filter the way the catalog would."""
+
+    def __init__(self, table_type: str):
+        super().__init__([(table_type,)])
+        self.table_type = table_type
+
+    def cursor(self):
+        conn, cur = self, super().cursor()
+        fetch = cur.fetchall
+
+        def filtered():
+            sql = conn.executed[-1][0]
+            allowed = re.search(r"table_type IN \(([^)]*)\)", sql)
+            if allowed and f"'{conn.table_type}'" not in allowed.group(1):
+                return []
+            return fetch()
+        cur.fetchall = filtered
+        return cur
+
+
+@pytest.mark.parametrize("table_type", ["MANAGED", "EXTERNAL", "MANAGED_SHALLOW_CLONE",
+                                        "EXTERNAL_SHALLOW_CLONE", "MATERIALIZED_VIEW", "STREAMING_TABLE"])
+def test_databricks_target_sees_every_landed_kind_including_lakeflow_outputs(monkeypatch, table_type):
+    """A Lakeflow pipeline's MATERIALIZED_VIEW / STREAMING_TABLE outputs are the unit's tables:
+    `table_exists` finds them and `table_kind` names the kind (the rerun posture derives from it)."""
+    from recon import adapters
+    conn = _CatalogConn(table_type)
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    target = adapters.DatabricksTargetAdapter("D", "mig", "sales")
+    assert target.table_kind("orders") == table_type
+    assert target.table_exists("orders") is True
+    assert table_type in adapters.UC_PHYSICAL_KINDS
+
+
+@pytest.mark.parametrize("table_type", ["VIEW", "FOREIGN"])
+def test_databricks_target_treats_views_and_foreign_tables_as_absent(monkeypatch, table_type):
+    """A VIEW is not a landed table; a FOREIGN table (Lakehouse Federation back to the source)
+    carries the source's own columns and rows, so grading it would prove nothing."""
+    from recon import adapters
+    conn = _CatalogConn(table_type)
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    target = adapters.DatabricksTargetAdapter("D", "mig", "sales")
+    assert target.table_kind("orders") is None
+    assert target.table_exists("orders") is False
+    assert target.column_shape("orders") == []
+    assert table_type not in adapters.UC_PHYSICAL_KINDS
+
+
+def test_databricks_key_uniqueness_probe_counts_rows_and_distinct_keys(monkeypatch):
+    from recon import adapters
+    conn = _StubConn([(10, 9)])
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    target = adapters.DatabricksTargetAdapter("D", "mig", "sales")
+    assert target.key_uniqueness("orders", ["order_id", "line_no"]) == (10, 9)
+    sql, _ = conn.executed[-1]
+    assert "COUNT(*), COUNT(DISTINCT `order_id`, `line_no`)" in sql and "`mig`.`sales`.`orders`" in sql
+
+
+def test_databricks_current_principal_is_current_user(monkeypatch):
+    from recon import adapters
+    conn = _StubConn([("sp-migration",)])
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    target = adapters.DatabricksTargetAdapter("D", "mig", "sales")
+    assert target.current_principal() == "sp-migration"
+    assert conn.executed[-1][0] == "SELECT current_user()"
+
+
+def test_run_capabilities_identity_must_be_the_target_session_principal(tmp_path):
+    """`--capabilities` softens grant_extra only for the principal the target session really is:
+    a file naming another grantee is refused, a non-Databricks target has no carve-out."""
+    caps = tmp_path / "capabilities.json"
+    caps.write_text(json.dumps({"identity": {"userName": "sp-migration", "service_principal": True}}))
+
+    class Target:
+        target_kind = "databricks"
+
+        def __init__(self, who):
+            self.who = who
+
+        def current_principal(self):
+            return self.who
+
+    assert cli._own_principals(None, Target("sp-migration")) == frozenset()
+    assert cli._own_principals(caps, Target("SP-Migration")) == frozenset({"SP-Migration"})
+    with pytest.raises(SystemExit, match="runs as 'analysts'"):
+        cli._own_principals(caps, Target("analysts"))
+
+    class Lakebase:
+        target_kind = "lakebase"
+    with pytest.raises(SystemExit, match="no own-principal carve-out"):
+        cli._own_principals(caps, Lakebase())
+    caps.write_text(json.dumps({"identity": None}))
+    assert cli._own_principals(caps, Target("sp-migration")) == frozenset()

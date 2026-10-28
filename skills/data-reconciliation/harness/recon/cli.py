@@ -154,6 +154,30 @@ def selftest() -> int:
     return 0
 
 
+def _own_principals(capabilities: Path | None, target) -> frozenset[str]:
+    """The run's own principal from the doctor's capabilities file, accepted only when it is the
+    principal the target session actually authenticated as (`current_principal()`): a file naming
+    any other grantee would otherwise turn that grantee's extra grants informational."""
+    if capabilities is None:
+        return frozenset()
+    try:
+        identity = json.loads(capabilities.read_text()).get("identity") or {}
+        name = str(identity.get("userName") or "")
+    except (OSError, json.JSONDecodeError, AttributeError) as exc:
+        raise SystemExit(f"cannot read {capabilities}: {exc}") from None
+    if not name:
+        return frozenset()
+    current = getattr(target, "current_principal", None)
+    if current is None:
+        raise SystemExit(f"--capabilities: --target-kind {getattr(target, 'target_kind', '?')} has no "
+                         "own-principal carve-out; drop the flag")
+    actual = str(current())
+    if actual.lower() != name.lower():
+        raise SystemExit(f"--capabilities names identity {name!r} but the target session runs as "
+                         f"{actual!r}: refusing to treat its grants as the run's own")
+    return frozenset({actual})
+
+
 def _load_spec(mapping, canonicalization, family, target_kind, params):
     """Mapping spec with the family's type map applied for the given target kind — the same
     shape `run` reconciles, so `estimate` counts the statements the run will issue."""
@@ -317,6 +341,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--rerun-source", action="append", default=[], type=Path,
                    help="with --rerun-proof: the job's source files as committed now (the same set "
                         "rerun-proof was given); a proof of other files is stale and refused")
+    r.add_argument("--capabilities", type=Path,
+                   help="the doctor's capabilities.json; its `identity.userName` is the run's own "
+                        "migration principal, whose extra Unity Catalog grants on a target are "
+                        "informational (every other grantee's still block). Without it no grant_extra "
+                        "is softened")
     r.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
 
@@ -554,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(str(exc)) from None
     else:
         target = DatabricksTargetAdapter(args.target_http_path, target_catalog, target_schema)
+    own_principals = _own_principals(args.capabilities, target)
     if args.source_dictionary or args.target_dictionary:
         from .structure import DictionaryOverlay, load_dictionary
         try:
@@ -602,7 +632,8 @@ def main(argv: list[str] | None = None) -> int:
                        source_family=args.family, depth=args.depth, type_map=type_map,
                        routine_parity=routine_parity, routine_writers=routine_writers,
                        routine_analysis_missing=routine_analysis_missing,
-                       routine_dependencies=routine_dependencies, rerun_proof=rerun_proof)
+                       routine_dependencies=routine_dependencies, rerun_proof=rerun_proof,
+                       own_principals=own_principals)
     print(f"dbx-recon {result['verdict']}: {status_line(result)}; unit={args.unit} mode={args.mode} "
           f"depth={result['depth']} mapping={spec.version} tolerances={tol.version} "
           f"merge_eligible={result['merge_eligible']} -> {args.out}/result.json")

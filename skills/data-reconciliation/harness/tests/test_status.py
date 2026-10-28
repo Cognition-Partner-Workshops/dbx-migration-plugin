@@ -167,6 +167,25 @@ def test_structural_finding_is_structural_and_parity_still_passes():
     assert "data" not in r["blocker_classes"]
 
 
+def test_structural_info_finding_is_shown_but_never_a_blocker():
+    """Flipped from "any structural finding blocks": a severity "info" finding (platform-inherent,
+    proven harmless by schema_parity) stays in the tier's findings and diff but sets no blocker."""
+    info = Finding("loans", "primary_key_informational_only", "uniqueness probe passed", severity="info")
+    t0 = TierResult(0, "structural_parity", True, 3, [info], {})
+    r = _green(tiers=[t0, TierResult(1, "row_count", True, 1, [], {})])
+    assert r["verdict"] == "PASS" and r["merge_eligible"] is True and r["blockers"] == []
+    assert r["tiers"][0]["findings"][0]["severity"] == "info"
+    # next to a blocking finding the info one changes nothing: structural_gap as before
+    t0 = _structural([info, Finding("loans", "grant_extra", "analysts", "-")])
+    r = _green(tiers=[t0, TierResult(1, "row_count", True, 1, [], {})])
+    assert [b["reason"] for b in r["blockers"]] == ["structural_gap", "tier_failed"]
+    # a privilege hole with only info findings is still the privilege_visibility class
+    t0 = TierResult(0, "structural_parity", True, 3, [info],
+                    {"hole_kinds": ["privilege"], "dictionary_unavailable": ["loans: grants (X)"]})
+    r = _green(tiers=[t0, TierResult(1, "row_count", True, 1, [], {})])
+    assert r["blocker_classes"] == ["privilege_visibility"]
+
+
 def test_privilege_hole_without_findings_is_privilege_visibility():
     t0 = _structural(stats={"hole_kinds": ["privilege"],
                             "dictionary_unavailable": ["loans: information_schema.table_privileges read failed (X)"],
