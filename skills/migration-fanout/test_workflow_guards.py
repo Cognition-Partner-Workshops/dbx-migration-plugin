@@ -1220,7 +1220,7 @@ def test_validate_manifest_accepts_every_gate_kind_and_status():
     validate_manifest = _functions()["validate_manifest"]
     kinds = ("byte_compare", "export_file", "publish_leg", "row_parity", "structural", "custom")
     gates = [{"id": f"g-{k}", "kind": k, "status": "pending", "evidence": ""} for k in kinds]
-    gates += [{"id": "g-p", "kind": "custom", "status": "passed", "evidence": "recon/u/result.json"},
+    gates += [{"id": "g-p", "kind": "custom", "status": "passed", "evidence": ".migration/recon/u/result.json"},
               {"id": "g-f", "kind": "custom", "status": "failed", "evidence": ""},
               {"id": "g-w", "kind": "custom", "status": "waived", "evidence": "", "decision_id": "waive-g-w"}]
     validate_manifest(_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "x", "gates": gates}]))
@@ -2643,3 +2643,40 @@ def test_validate_manifest_rejects_declared_evidence_that_is_not_a_bare_path():
     gates = [{"id": "g-p", "kind": "custom", "status": "passed", "evidence": "recon/u/result.json (checked)"}]
     with pytest.raises(SystemExit, match="bare path"):
         _functions()["validate_manifest"](_manifest(batches=[{"id": "b", "units": ["u"], "write_targets": ["t"], "brief": "x", "gates": gates}]))
+
+
+def _evidence_manifest(evidence, units=("u",), status="passed"):
+    gates = [{"id": "g-p", "kind": "custom", "status": status, "evidence": evidence}]
+    return _manifest(batches=[{"id": "b", "units": list(units), "write_targets": ["t"], "brief": "x", "gates": gates}])
+
+
+@pytest.mark.parametrize("evidence", [
+    ".migration/recon/wave-invoicing-1/report.json",   # the verifier's dir: UNT16 tripped the breaker on two PASS lanes
+    ".migration/recon/wave-1/report.json",
+    ".migration/recon/v/result.json",                   # another unit of the same wave
+    ".migration/recon/other_unit/result.json",
+    ".migration/recon/u/",                              # the dir, not a file in it
+    ".migration/recon/u/../wave-invoicing-1/report.json",
+    ".migration/recon/u//result.json",
+    ".migration/recon_tolerances.json",
+    "recon/u/result.json",
+    "plan/rows.md",
+])
+def test_validate_manifest_rejects_declared_evidence_outside_the_batchs_own_unit_recon_dirs(evidence):
+    """UNT16: a tagged wave's manifest pointed a gate at .migration/recon/wave-invoicing-1/report.json; the child
+    wrote it there, the PR tripped protected_files_tampered, and parity PASS lanes halted. The manifest is refused
+    before any child launches, naming the roots a gate may use."""
+    validate_manifest = _functions()["validate_manifest"]
+    with pytest.raises(SystemExit, match=r"gate g-p 'evidence'.*under one of this batch's unit recon dirs "
+                                         r"\(\.migration/recon/u/, \.migration/recon/w/\)"):
+        validate_manifest(_evidence_manifest(evidence, units=("u", "w")))
+    with pytest.raises(SystemExit, match="gate g-p 'evidence'"):
+        validate_manifest(_evidence_manifest(evidence, status="pending"))
+
+
+@pytest.mark.parametrize("evidence", [".migration/recon/u/result.json", ".migration/recon/w/gates/rows.md", ""])
+def test_validate_manifest_accepts_declared_evidence_under_an_own_unit_recon_dir_or_none_yet(evidence):
+    validate_manifest = _functions()["validate_manifest"]
+    validate_manifest(_evidence_manifest(evidence, units=("u", "w"), status="pending"))
+    if evidence:
+        validate_manifest(_evidence_manifest(evidence, units=("u", "w")))

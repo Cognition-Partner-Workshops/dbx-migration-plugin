@@ -41,7 +41,10 @@ doctor signs `wave-<N>.doctor.json` over them.
    writes, each taken to the target its `mapping_spec.json` names — the workflow refuses a
    differing list), `deploy_objects`, `brief`, `gates` (`{id, kind, status, evidence}` rows;
    `waived` rows carry `decision_id` of the plan decision that waived them, which must be a
-   committed `gate_waived` entry of `.migration/authorizations.json` naming the units), optional
+   committed `gate_waived` entry of `.migration/authorizations.json` naming the units; a declared
+   `evidence` path points at a file under `.migration/recon/<one of the batch's units>/`, never
+   `.migration/recon/wave-<tag>/`, which is the verifier's dir and a protected file to the child's
+   PR — the workflow refuses the manifest before any child launches), optional
    `max_minutes`, `secrets`, `verify_depth`, `lakeflow_pipelines`.
 4. `merge_overrides`: when a unit cannot reach `merge_eligible` on evidence alone, one manifest
    entry per covered unit set — `{decision: <plan decision slug>, units: [...]}` — citing the
