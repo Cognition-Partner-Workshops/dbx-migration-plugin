@@ -6,6 +6,10 @@
   `.migration/recon/<one of the batch's units>/`, naming the allowed roots; a gate pointed at the
   verifier's `.migration/recon/wave-<tag>/` made every child PR `protected_files_tampered` on lanes
   whose parity passed.
+- migration-fanout passes a manifest's pinned `capabilities.http_path` to every child and verifier
+  `dbx-recon` run as `--target-http-path` (structural/degraded verification included) and validates its
+  shape, so recon reconciles on the warehouse the signed doctor record verified instead of falling back
+  to `DATABRICKS_HTTP_PATH`; undeclared is unchanged.
 - factory-doctor `--wave` audits the manifest's units (union of `batches[].units`) instead of every
   spec under `.migration/units/`, so pipelines of different source families can share a workspace;
   mapping specs may declare a top-level `family`, a mismatch with `--source-family` fails

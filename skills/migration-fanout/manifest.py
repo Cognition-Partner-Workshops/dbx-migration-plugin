@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import re
+import shlex
 import subprocess
 import sys
 import urllib.parse
@@ -77,6 +78,7 @@ PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
 
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")  # host/owner/name
 DOCTOR_MAX_AGE_MINUTES = 15  # how long a signed doctor record stays fresh when the manifest says nothing
+WAREHOUSE_PATH = re.compile(r"/sql/1\.0/(?:warehouses|endpoints)/[A-Za-z0-9]+/?")  # the doctor's _WAREHOUSE_PATH
 
 
 PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
@@ -332,6 +334,9 @@ def validate_manifest(m, plugin=None):
     req(caps.get("ready") is True,
         "manifest 'capabilities.ready' must be true: the factory-doctor preflight "
         "did not pass; fix the D10 and re-run the doctor before launching a wave")
+    req("http_path" not in caps or (isinstance(caps["http_path"], str) and WAREHOUSE_PATH.fullmatch(caps["http_path"])),
+        "manifest 'capabilities.http_path', when declared, must be the SQL warehouse HTTP path the doctor verified "
+        "(/sql/1.0/warehouses/<id>); every child and verifier recon run is pinned to it")
     req(isinstance(m.get("auto_merge", False), bool), "manifest 'auto_merge' must be a boolean")
 
 
@@ -693,6 +698,14 @@ def doctor_max_age_minutes(manifest):
     if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= 1440:
         raise SystemExit(f"manifest key 'doctor_max_age' must be a positive integer of at most 1440 minutes, got {value!r}")
     return value
+
+
+def recon_warehouse_flag(m):
+    """The `--target-http-path` every dbx-recon run of this wave carries when the manifest pins
+    `capabilities.http_path` (the warehouse the signed doctor record verified), so a child or verifier
+    never reconciles on whatever DATABRICKS_HTTP_PATH happens to name; empty when undeclared."""
+    path = (m.get("capabilities") or {}).get("http_path")
+    return f"--target-http-path {shlex.quote(path)}" if isinstance(path, str) and path else ""
 
 
 def check_repo_origin(repo, origin_url, rewrites=(), configured_url=None):

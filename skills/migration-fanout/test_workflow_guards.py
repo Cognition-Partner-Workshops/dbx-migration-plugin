@@ -50,16 +50,16 @@ def _functions():
                                       "batch_verdicts", "merge_override_for", "wave_overrides", "_strs", "skill_text",
                                       "check_repo_origin",
                                       "check_doctor_contract", "scope_covers", "override_forgives", "skill_file",
-                                      "check_by_design_unverified", "grading_mismatch", "insteadof_rewrites", "doctor_max_age_minutes"})
+                                      "check_by_design_unverified", "grading_mismatch", "insteadof_rewrites", "doctor_max_age_minutes", "recon_warehouse_flag"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
                                                          "DECISION_ID", "TARGET_DECISIONS", "SKILL_NAME", "REMOVED_FIELDS",
                                                          "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE",
-                                                         "REPO_RE", "BARE_PATH", "DOCTOR_MAX_AGE_MINUTES"}
+                                                         "REPO_RE", "BARE_PATH", "DOCTOR_MAX_AGE_MINUTES", "WAREHOUSE_PATH"}
                     for t in node.targets))]
-    namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
+    namespace = {"Counter": Counter, "re": re, "shlex": __import__("shlex"), "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
                  "subprocess": subprocess, "sys": sys, "urllib": urllib, "PLUGIN": WORKFLOW.parents[2],
                  "MANIFEST": {}}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), namespace)
@@ -1551,7 +1551,7 @@ def _prompt_ns(manifest, overrides=(), doctor=None):
     tree = _tree()
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
              "sum_cost", "cost_line", "close_prompt", "skill_text", "skill_file", "merge_override_for",
-             "wave_overrides", "_strs", "source_attestation", "bundle_name", "doctor_max_age_minutes"}
+             "wave_overrides", "_strs", "source_attestation", "bundle_name", "doctor_max_age_minutes", "recon_warehouse_flag"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
@@ -1594,6 +1594,48 @@ def test_capability_block_points_children_at_the_signed_wave_doctor_record():
     assert "15" in text
     text = _prompt_ns(_manifest(doctor_max_age=30))["capability_block"](["u"])
     assert "doctor_max_age" in text and "30" in text
+
+
+WAREHOUSE = "/sql/1.0/warehouses/abc123"
+
+
+def test_declared_warehouse_pins_every_child_and_verifier_recon_run():
+    """The doctor verifies `capabilities.http_path`; a child or verifier that lets dbx-recon fall back
+    to DATABRICKS_HTTP_PATH can reconcile on another warehouse than the one the signed record checked."""
+    ns = _prompt_ns(_manifest(capabilities=_caps(host=HOST, http_path=WAREHOUSE)))
+    block = ns["capability_block"](["u"])
+    assert f"--target-http-path {WAREHOUSE}" in block
+    # only `run` and `shape` register --target-http-path; fixture-shape and rerun-proof must not be told to pass it
+    assert "`dbx-recon run`" in block and "`dbx-recon shape`" in block
+    assert "fixture-shape and rerun-proof open no target connection and take no such flag" in block
+    assert f"--target-http-path {WAREHOUSE}" in ns["child_prompt"](ns["MANIFEST"]["batches"][0])
+    passed = [{"batch": "b", "units": ["u"], "pr_url": ""}]
+    assert f"--target-http-path {WAREHOUSE}" in ns["verify_prompt"](passed)
+    degraded = _prompt_ns(_manifest(capabilities=_caps(host=HOST, http_path=WAREHOUSE), degraded=True))["verify_prompt"](passed)
+    assert f"--target-http-path {WAREHOUSE}" in degraded and "--mode structural" in degraded
+
+
+def test_undeclared_warehouse_leaves_the_recon_commands_unchanged():
+    ns = _prompt_ns(_manifest())
+    passed = [{"batch": "b", "units": ["u"], "pr_url": ""}]
+    for text in (ns["capability_block"](["u"]), ns["verify_prompt"](passed),
+                 _prompt_ns(_manifest(degraded=True))["verify_prompt"](passed)):
+        assert "--target-http-path" not in text and "DATABRICKS_HTTP_PATH" not in text
+    assert _functions()["recon_warehouse_flag"]({"capabilities": {}}) == ""
+    assert _functions()["recon_warehouse_flag"]({"capabilities": {"http_path": WAREHOUSE}}) == f"--target-http-path {WAREHOUSE}"
+
+
+@pytest.mark.parametrize("value", ["", "warehouses/abc", "/sql/1.0/warehouses/", "/sql/1.0/warehouses/abc;rm -rf x",
+                                   "/sql/2.0/warehouses/abc", 42, None, ["/sql/1.0/warehouses/abc"]])
+def test_validate_manifest_rejects_a_capabilities_http_path_that_is_not_a_warehouse_path(value):
+    with pytest.raises(SystemExit, match="capabilities.http_path"):
+        _functions()["validate_manifest"](_manifest(capabilities=_caps(host=HOST, http_path=value)))
+
+
+def test_validate_manifest_accepts_a_pinned_warehouse_path():
+    validate_manifest = _functions()["validate_manifest"]
+    validate_manifest(_manifest(capabilities=_caps(host=HOST, http_path=WAREHOUSE)))
+    validate_manifest(_manifest(capabilities=_caps(host=HOST, http_path="/sql/1.0/endpoints/abc123/")))
 
 
 def test_a_degraded_wave_runs_only_the_structural_tier_in_verify():
