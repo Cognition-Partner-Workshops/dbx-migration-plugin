@@ -669,8 +669,8 @@ def mapped_target(spec, table, namespace=""):
 
 def insteadof_rewrites(root):
     """git's `url.<target>.insteadOf <source>` pairs in force at root, longest target first.
-    `git remote get-url` reports origin after the rewrite (a VM-wide proxy prefix, say), so the
-    repo check undoes the configured rewrite before comparing; an unconfigured prefix stays as is."""
+    `git remote get-url` reports origin after the rewrite (a VM-wide proxy prefix, say); the repo
+    check compares the configured remote instead when one of these pairs explains the rewrite."""
     try:
         out = subprocess.run(["git", "-C", str(root), "config", "--get-regexp", r"url\..*\.insteadof"],
                              capture_output=True, text=True, timeout=60).stdout
@@ -684,16 +684,20 @@ def insteadof_rewrites(root):
     return sorted(pairs, key=lambda p: len(p[0]), reverse=True)
 
 
-def check_repo_origin(repo, origin_url, rewrites=()):
+def check_repo_origin(repo, origin_url, rewrites=(), configured_url=None):
     """The manifest's repo is where the children's PR URLs must live; when origin is a remote URL it
-    has to be that repo, or every PR check fails after the child, not before it. `rewrites` are the
-    insteadOf pairs from insteadof_rewrites(); origin is mapped back through the first (longest)
-    matching target before the comparison, exactly inverting what git applied."""
+    has to be that repo, or every PR check fails after the child, not before it. `origin_url` is
+    what `git remote get-url origin` reports, after any insteadOf rewrite; `configured_url` is the
+    unexpanded `remote.origin.url`. The configured URL is compared instead of the expanded one only
+    when a pair from insteadof_rewrites() maps it to exactly that expansion, which is what git did;
+    a prefix match alone proves nothing (git picks a rule by its source, not by the expanded
+    target), so anything else is compared as reported."""
     url = origin_url.strip()
-    for target, source in rewrites:
-        if url.startswith(target):
-            url = source + url[len(target):]
-            break
+    configured = (configured_url or "").strip()
+    if configured and configured != url and any(
+            configured.startswith(source) and target + configured[len(source):] == url
+            for target, source in rewrites):
+        url = configured
     if "://" in url:
         parts = urllib.parse.urlsplit(url)
         host, path = parts.hostname, parts.path      # the port, if any, is not part of the repo

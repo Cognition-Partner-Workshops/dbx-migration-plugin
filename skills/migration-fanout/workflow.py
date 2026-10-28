@@ -671,7 +671,9 @@ def launch_checks():
                                 capture_output=True, text=True, timeout=60).stdout
     except (OSError, subprocess.SubprocessError):
         raise SystemExit(f"{ROOT} has no git remote 'origin'; children push PRs to it") from None
-    check_repo_origin(MANIFEST["repo"], origin, insteadof_rewrites(ROOT))
+    configured = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "remote.origin.url"],
+                                capture_output=True, text=True, timeout=60).stdout
+    check_repo_origin(MANIFEST["repo"], origin, insteadof_rewrites(ROOT), configured)
     check_pipelines_published(WAVES_DIR, MANIFEST, published_manifests() if "pipelines" in MANIFEST else None)
     check_write_targets(sorted(MANIFEST["batches"], key=lambda b: b["id"]),
                         other_wave_manifests(WAVES_DIR, MANIFEST_PATH.name),

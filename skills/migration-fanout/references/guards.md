@@ -33,9 +33,9 @@ edit from a changed plan.
 
 Before anything launches: `repo` is `host/owner/name` and matches a remote origin URL. `git remote
 get-url origin` reports the URL after any `url.<target>.insteadOf` rewrite (a VM-wide proxy prefix such
-as `https://git-manager.devin.ai/proxy/github.com/`), so the check first maps origin back through the
-longest matching rewrite in `git config`, then compares; a proxy-shaped URL no rewrite is configured for
-is compared as is and halts.
+as `https://git-manager.devin.ai/proxy/github.com/`), so the check also reads the unexpanded
+`remote.origin.url` and compares that instead when a configured rewrite maps it to exactly the reported
+origin; a proxy-shaped URL no configured rewrite explains is compared as reported and halts.
 
 ## Duplicate wave
 
