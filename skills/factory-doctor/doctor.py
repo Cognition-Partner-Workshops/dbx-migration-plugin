@@ -1125,38 +1125,59 @@ _PRIVILEGE_QUERIES = {
         "read_only": None}}
 
 
-def _databricks_bearer() -> str:
-    """Workspace access token for the session's service principal (env-oidc or oauth-m2m), via the SDK."""
-    import databricks.sdk.core as _sdk_core  # optional extra (databricks-sdk)
-    if os.environ.get("DATABRICKS_AUTH_TYPE") == "env-oidc" and not os.environ.get("DATABRICKS_OIDC_TOKEN"):
-        audience = os.environ.get("DATABRICKS_DEVIN_AUDIENCE", "databricks")
-        os.environ["DATABRICKS_OIDC_TOKEN"] = subprocess.run(["devin-oidc", "token", "--audience", audience],
-            check=True, capture_output=True, text=True).stdout.strip()
-    headers = _sdk_core.Config().authenticate()
-    return headers["Authorization"].split(" ", 1)[1]
+# Thrift socket connect/send/recv timeout for the doctor's session-identity probes: a probe that
+# cannot reach the warehouse or finish its auth handshake fails with a detail instead of hanging.
+DATABRICKS_SOCKET_TIMEOUT = 60
+_WAREHOUSE_PATH = re.compile(r"/sql/1\.0/(?:warehouses|endpoints)/([A-Za-z0-9]+)/?")
+
+
+def _require_warehouse(http_path: str, origin: str) -> str:
+    """`databricks warehouses get <id>` for the warehouse the http path names, before any sql.connect:
+    a deleted warehouse is a detail naming it, never a connect that waits. Returns the id."""
+    m = _WAREHOUSE_PATH.fullmatch(http_path.strip())
+    if not m:
+        raise RuntimeError(f"{origin} {http_path!r} is not a SQL warehouse HTTP path (/sql/1.0/warehouses/<id>)")
+    wid = m.group(1)
+    cli = shutil.which("databricks")
+    if not cli:
+        raise RuntimeError(f"databricks CLI not on PATH, so warehouse {wid} ({origin}) cannot be verified before "
+            "connecting")
+    payload, shown = _cli_json(cli, "warehouses", "get", wid)
+    if isinstance(payload, dict) and payload.get("id") == wid:
+        return wid
+    gone = any(mark in shown for mark in ("does not exist", "RESOURCE_DOES_NOT_EXIST", "404"))
+    raise RuntimeError(f"{origin} names warehouse {wid} which does not exist" if gone
+        else f"{origin} names warehouse {wid} which could not be read: {shown}")
 
 
 def _databricks_session_connect(http_path: str | None = None):
-    """Session identity only: DATABRICKS_HOST + DATABRICKS_CLIENT_ID with DATABRICKS_CLIENT_SECRET
-    (oauth-m2m) or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from DATABRICKS_HTTP_PATH."""
+    """Session identity only (DATABRICKS_HOST with env-oidc or oauth-m2m), through the recon harness's
+    `credentials_provider`: the connector's oauth_client_id/secret kwargs fall back to interactive U2M
+    browser auth and hang unattended, and the env-oidc mint (`devin-oidc token`) lives inside the
+    provider. The warehouse path is `http_path` (--http-path or the manifest's) else DATABRICKS_HTTP_PATH;
+    its warehouse is verified with the CLI first and the socket gets a timeout, so no path can hang."""
     try:
         from databricks import sql  # optional extra (databricks-sql-connector)
     except ImportError:
         raise RuntimeError("databricks-sql-connector is not installed") from None
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "skills" / "data-reconciliation" /
+                            "harness"))
+    from recon.adapters import _databricks_credentials_provider
+
     host = os.environ.get("DATABRICKS_HOST", "").removeprefix("https://").removeprefix("http://").rstrip("/")
+    origin = "--http-path" if http_path else "DATABRICKS_HTTP_PATH"
     http_path = http_path or os.environ.get("DATABRICKS_HTTP_PATH")
     if not http_path:
-        raise RuntimeError("DATABRICKS_HTTP_PATH is not set (SQL warehouse HTTP path)")
-    if os.environ.get("DATABRICKS_CLIENT_SECRET"):
-        return sql.connect(server_hostname=host, http_path=http_path,
-            oauth_client_id=os.environ["DATABRICKS_CLIENT_ID"],
-            oauth_client_secret=os.environ["DATABRICKS_CLIENT_SECRET"])
-    return sql.connect(server_hostname=host, http_path=http_path, access_token=_databricks_bearer())
+        raise RuntimeError("DATABRICKS_HTTP_PATH is not set (SQL warehouse HTTP path); pass --http-path")
+    _require_warehouse(http_path, origin)
+    return sql.connect(server_hostname=host, http_path=http_path,
+        credentials_provider=_databricks_credentials_provider, _socket_timeout=DATABRICKS_SOCKET_TIMEOUT)
 
 
-def _databricks_sql_connect(_dsn: str):
-    """The _READ_ONLY_CONNECT slot for a Databricks-family source: the session's own identity."""
-    return _databricks_session_connect()
+def _databricks_sql_connect(http_path: str):
+    """The _READ_ONLY_CONNECT slot for a Databricks-family source: the session's own identity; the
+    slot's dsn argument is the warehouse http path ("" for DATABRICKS_HTTP_PATH), never a secret."""
+    return _databricks_session_connect(http_path or None)
 
 
 _READ_ONLY_CONNECT = {"sqlserver": _pyodbc_connect, "postgres": _psycopg_connect,
@@ -1555,8 +1576,9 @@ def _quote_ident(part: str) -> str:
 
 
 def check_dictionary_readable(tables: list[str], family: str, source_secret: str | None, connect=None,
-    views: list[tuple] | None = None) -> Check:
-    """Catalog visibility is not data SELECT (references/checks.md); `views` is the harness's probe table."""
+    views: list[tuple] | None = None, http_path: str | None = None) -> Check:
+    """Catalog visibility is not data SELECT (references/checks.md); `views` is the harness's probe table.
+    A Databricks-family source is probed as the session identity on `http_path`'s warehouse."""
     cid = "dictionary_readable"
     q = _TRIGGER_CENSUS.get(family)
     if not views:
@@ -1571,8 +1593,11 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
         if isinstance(dsn, Check):
             return dsn
     data: dict = {"family": family, "tables": tables, "views": [], "trigger_census": {}}
+    if family == "databricks":
+        data["http_path"] = http_path or os.environ.get("DATABRICKS_HTTP_PATH")
     try:
-        conn = (connect or _READ_ONLY_CONNECT[family])(os.environ.get(source_secret) or "")
+        conn = (connect or _READ_ONLY_CONNECT[family])((http_path or "") if family == "databricks"
+            else os.environ.get(source_secret) or "")
         try:
             cur = conn.cursor()
             for label, sql in views:
@@ -1626,7 +1651,7 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
 
 def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mappings: list[Path],
     source_secret: str | None, source_family: str | None, plugin_root: Path, params: dict[str,
-    str] | None = None, wave_units: list[str] | None = None) -> Check:
+    str] | None = None, wave_units: list[str] | None = None, http_path: str | None = None) -> Check:
     """Every source table the resolved mappings read, against --source-family or the mappings' implied family."""
     cid = "dictionary_readable"
 
@@ -1645,7 +1670,7 @@ def check_dictionary_readable_all(ws: Path, role: str, units: list[str], mapping
                 return Check(cid, "fail", f"cannot ask the harness which catalog objects to probe "
                     f"({how} dictionary-objects rc={rc}): {_redact(err or out)}", {"family": family,
                     "tables": tables})
-            c = check_dictionary_readable(tables, family, source_secret, views=views)
+            c = check_dictionary_readable(tables, family, source_secret, views=views, http_path=http_path)
             c.data["harness"] = how
             return c
 
@@ -2070,14 +2095,19 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     lakebase_dsn: str | None = None, lakebase_schema: str | None = None, analytical_schema: str | None = None,
     source_attested: str | None = None, target_kind: str = "databricks",
     secret_names: list[str] | None = None, list_secrets=None, reused: dict | None = None,
-    wave_units: list[str] | None = None, base_branch: str | None = None) -> dict:
+    wave_units: list[str] | None = None, base_branch: str | None = None,
+    http_path: str | None = None) -> dict:
+    def _recorded(row_id):
+        row = next((c for c in (reused or {}).get("checks") or [] if isinstance(c, dict) and c.get("id") == row_id),
+            None) if isinstance(reused, dict) else None
+        return row, (row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {})
+
     def _row(row_id, thunk, **binds):
         """`binds` are data keys the recorded row must carry with these exact values to stand in; the
         recorded row's `data.units` must also cover every unit of this run (the orchestrator audits
         only its wave's units, so a row proves nothing about a unit outside them)."""
         if isinstance(reused, dict) and row_id in REUSABLE_ROWS:
-            row = next((c for c in reused.get("checks") or [] if isinstance(c, dict) and c.get("id") == row_id), None)
-            data = row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {}
+            row, data = _recorded(row_id)
             covered = data.get("units")
             if (isinstance(row, dict) and isinstance(row.get("status"), str) and
                     isinstance(row.get("detail"), str) and all(data.get(k) == v for k, v in binds.items()) and
@@ -2113,7 +2143,10 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
                 base_branch=base_branch)),
         _row("dictionary_readable",
             lambda: check_dictionary_readable_all(ws, role, units, mappings, source_secret, source_family,
-                plugin_root, params=params, wave_units=wave_units)),
+                plugin_root, params=params, wave_units=wave_units, http_path=http_path),
+            # a Databricks-family row was probed on one warehouse; it stands in for that warehouse only
+            **({"http_path": http_path or os.environ.get("DATABRICKS_HTTP_PATH")}
+               if _recorded("dictionary_readable")[1].get("family") == "databricks" else {})),
         _row("named_secrets_exist",
             lambda: (Check("named_secrets_exist", "skipped", "--no-databricks") if no_databricks
                 else check_named_secrets(secret_names or [], list_secrets)))]
@@ -2153,6 +2186,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
         "role": role,
         "workspace": str(ws),
         "plugin_root": str(plugin_root),
+        "http_path": http_path or os.environ.get("DATABRICKS_HTTP_PATH"),
         "summary": counts,
         "ready": not blocking,
         "blocking": blocking,
@@ -2196,6 +2230,19 @@ def _manifest_base_branch(manifest) -> str | None:
     return b if isinstance(b, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", b) and ".." not in b else None
 
 
+def _pin_http_path(p: argparse.ArgumentParser, a, caps: dict, where: str):
+    """A manifest's `capabilities.http_path` is the wave's warehouse: `--http-path` may repeat it, never
+    differ from it (the record is signed for the declared warehouse)."""
+    declared = caps.get("http_path")
+    if declared is None:
+        return
+    if not (isinstance(declared, str) and declared.strip()):
+        p.error(f"{where} capabilities.http_path must be a SQL warehouse HTTP path when declared")
+    if a.http_path not in (None, declared):
+        p.error(f"--http-path {a.http_path} differs from the manifest's capabilities.http_path {declared}; "
+            "the wave runs on the declared warehouse, so pass the same value or none")
+
+
 def _apply_manifest(a, manifest):
     """Fill expect_host/expect_catalogs/source settings/secrets from a wave manifest onto parsed args."""
     family, secret, mparams, names, caps = _manifest_source(manifest)
@@ -2205,6 +2252,8 @@ def _apply_manifest(a, manifest):
         catalogs = caps.get("catalogs")
         a.expect_catalogs = catalogs if isinstance(catalogs, list) else None
     a.source_family, a.source_secret, a.param = family, secret, mparams
+    if a.http_path is None and isinstance(caps.get("http_path"), str):
+        a.http_path = caps["http_path"]
     a.secret = sorted({*a.secret, *names})
     return caps
 
@@ -2225,6 +2274,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--expect-host", help="workspace host the session must be authenticated against (the contract's)")
     p.add_argument("--expect-catalogs", metavar="A,B", type=lambda s: [c.strip() for c in s.split(",") if c.strip()],
         help="catalogs the wave's capability contract names; must be a subset of allowed_targets.json's")
+    p.add_argument("--http-path", metavar="/sql/1.0/warehouses/<id>",
+        help="SQL warehouse HTTP path for the session-identity source probes (default DATABRICKS_HTTP_PATH; "
+             "a plan or manifest pins the warehouse here, never by editing the environment)")
     p.add_argument("--no-databricks", action="store_true",
         help="skip CLI/identity checks (offline; the report is never ready)")
     p.add_argument("--unit", action="append", default=[], metavar="UNIT_ID",
@@ -2271,6 +2323,7 @@ def main(argv: list[str] | None = None) -> int:
             a.expect_identity = caps.get("identity")
         if a.source_family is not None or a.source_secret is not None or a.param:
             p.error("--wave takes source settings from the manifest; drop --source-family/--source-secret/--param")
+        _pin_http_path(p, a, caps, f"wave manifest {a.wave}")
         _apply_manifest(a, manifest)
         wave_units = manifest_units(manifest)
         base_branch = _manifest_base_branch(manifest)
@@ -2290,12 +2343,13 @@ def main(argv: list[str] | None = None) -> int:
             record = json.loads(a.reuse_record.read_bytes())
         except (OSError, ValueError) as e:
             p.error(f"cannot read --reuse-record or the manifest beside it: {e}")
-        want_family, want_secret, want_params, _names, _caps = _manifest_source(manifest)
+        want_family, want_secret, want_params, _names, caps = _manifest_source(manifest)
         for flag, given, want in (("--source-family", a.source_family, want_family), ("--source-secret",
             a.source_secret, want_secret), ("--param", sorted(a.param or []), sorted(want_params))):
             if given not in (None, [], want):
                 p.error(f"{flag} differs from the manifest's source block; --reuse-record takes source settings "
                     "from the manifest, so pass the same values or none")
+        _pin_http_path(p, a, caps, f"--reuse-record's manifest {manifest_path}")
         _apply_manifest(a, manifest)
         base_branch = _manifest_base_branch(manifest)
         reused, reuse_why = reusable_record(record, manifest if isinstance(manifest, dict) else {}, manifest_bytes,
@@ -2313,7 +2367,7 @@ def main(argv: list[str] | None = None) -> int:
         a.expect_host, a.lakebase_project, a.lakebase_parent_branch, a.lakebase_dsn, a.lakebase_schema,
         a.analytical_schema, source_attested=a.source_attested,
         target_kind=a.target_kind, secret_names=a.secret, reused=reused, wave_units=wave_units,
-        base_branch=base_branch)
+        base_branch=base_branch, http_path=a.http_path)
     if a.reuse_record:
         report["checks"].append({**asdict(Check("doctor_record", "ok" if reused else "skipped",
             f"reused the orchestrator's record signed {reused['signed_at']}" if reused else reuse_why)),
