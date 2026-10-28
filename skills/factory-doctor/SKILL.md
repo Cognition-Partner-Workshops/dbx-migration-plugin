@@ -96,8 +96,10 @@ verifying it); it is rejected for oracle/sqlserver/postgres. For a `databricks` 
 inherited_from_type, ...}`; `data.writable` records the origin of every write privilege), and the
 id must be a committed `source_principal_attested` entry whose `objects` cover every in-scope
 `catalog.schema.table` (or its catalog): the row is then `warn`, never `ok`, with `data.attested`
-and `data.offending` (the live write privileges it waives); any other databricks attestation is
-`fail`. Sub-results live in
+and `data.offending` (the live write privileges it waives); a live check that is `unverified` stays
+`unverified` (an attestation waives known grants, not unreadable ones), and any other databricks
+attestation is `fail`. The fan-out child prompt repeats the record's `--source-attested` id so a
+child's own doctor run does not re-block on the waived grants. Sub-results live in
 `data.sub_results`; `--no-databricks` leaves `databricks_identity=skipped` and never authorizes a
 wave. The report identity, host, catalogs, and guard mode are the wave manifest's capability
 contract.

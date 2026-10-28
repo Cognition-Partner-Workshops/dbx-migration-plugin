@@ -2039,10 +2039,11 @@ def test_source_attested_databricks_covers_tables_by_name_or_by_catalog(tmp_path
     assert not [b for b in doctor._blocking("orchestrator", [c]) if b.startswith("source_principal_read_only")]
     _commit_authorizations(ws, [{**ATTESTED, "objects": ["mig.raw.payments", "mig.raw.loans"]}])
     assert doctor._attested(ws, "D-7", "databricks", DBX_TABLES).status == "warn"
-    # an unverified live check leaves offending unknown; the row is still warn, the live detail recorded
+    # an unverified live check is not waived: nothing known is attested away, so the row stays unverified
     _live_databricks(monkeypatch, status="unverified")
     c = doctor._attested(ws, "D-7", "databricks", DBX_TABLES)
-    assert c.status == "warn" and c.data["offending"] is None and c.data["live"]["status"] == "unverified"
+    assert c.status == "unverified" and "attested" not in c.data and "unreadable grants" in c.detail
+    assert "source_principal_read_only=unverified" in doctor._blocking("orchestrator", [c])
     # no mapped table: nothing to attest
     assert doctor._attested(ws, "D-7", "databricks", []).status == "fail"
 

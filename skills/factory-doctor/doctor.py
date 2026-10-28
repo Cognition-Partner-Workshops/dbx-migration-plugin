@@ -1431,7 +1431,8 @@ def _attested(ws: Path, decision: str, family: str, tables: list[str], base_bran
     without verification. For a databricks source the query exists and still runs; the decision must then be
     a committed `source_principal_attested` authorization whose objects cover every in-scope
     catalog.schema.table (or its catalog), and the row is `warn`, carrying the live write privileges it
-    waives, never `ok`. Oracle, SQL Server and Postgres sources always run their query."""
+    waives, never `ok`; a live check that is `unverified` stays so (nothing known is waived). Oracle, SQL
+    Server and Postgres sources always run their query."""
     cid = "source_principal_read_only"
     if family in _PRIVILEGE_QUERIES:
         return Check(cid, "fail", f"{family}: --source-attested {decision} rejected, this family has a "
@@ -1455,10 +1456,14 @@ def _attested(ws: Path, decision: str, family: str, tables: list[str], base_bran
             + (f"do not cover {uncovered}" if uncovered else "cover no in-scope table (none is mapped)")
             + "; every in-scope catalog.schema.table (or its catalog) must be named", {**data, "uncovered": uncovered})
     live = _check_databricks_source_principal(tables)
-    offending = (live.data or {}).get("writable") if live.status in ("ok", "fail") else None
+    if live.status not in ("ok", "fail"):
+        # an attestation waives write privileges the doctor could read, never a principal it could not
+        return Check(cid, live.status, f"databricks: --source-attested {decision} covers the scope, but the live "
+            f"grant check is {live.status} ({live.detail}); an attestation waives known write privileges, not "
+            "unreadable grants", {**(live.data or {}), **data})
     return Check(cid, "warn", f"databricks: source principal attested by plan decision {decision} ({entry['by']}) "
         f"covering {len(tables)} in-scope table(s); live check {live.status}: {live.detail}",
-        {**data, "attested": decision, "offending": offending,
+        {**data, "attested": decision, "offending": (live.data or {}).get("writable"),
          "live": {"status": live.status, "detail": live.detail, "principal": (live.data or {}).get("principal")}})
 
 
