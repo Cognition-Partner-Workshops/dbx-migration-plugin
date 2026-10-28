@@ -14,7 +14,9 @@ decisions, a probe result, or a referenced standards document.
 - The approved `plan.yaml` phase-1 decisions: target catalogs, source access path, coexistence
   mode, guard_mode, recon tolerance set, base branch, and any legacy-write objects a
   `legacy_write_authorized` decision names.
-- The intake attachments the ticket links (named secrets, timeline, cutover principal holder).
+- The intake attachments the ticket links (named secrets, timeline, cutover principal holder,
+  and on a Lakebase track the adjacent-session list: every pipeline and every follow-on
+  session named at intake that will need its own `mig-*` branch).
 - `skills/target-routing/SKILL.md` — auth rules and the bounded 5xx retry rule.
 - `skills/data-reconciliation/SKILL.md` — the tolerance fields the recon harness reads.
 - `skills/factory-doctor/SKILL.md` — the doctor posture and its record format.
@@ -29,7 +31,14 @@ never build it in the shell (the guard refuses reassigning a `legacy_sources` na
 1. Write `.migration/allowed_targets.json` before any source probe: `catalogs`,
    `legacy_sources`, `guard_mode`, `target_hosts`, `bundle_targets`, `lakebase_projects`,
    `lakebase_branches`, `run_mode`, `fixture_endpoints` (key semantics: `README.md`; who may
-   widen it: `AGENTS.md`).
+   widen it: `AGENTS.md`). `lakebase_branches` globs are bare branch ids (`mig-*`).
+   On a Lakebase track, create every `mig-*` branch the plan declares now — one per pipeline
+   plus one per adjacent session named at intake (`databricks postgres create-branch
+   projects/<project> mig-<name>`, then `create-endpoint`) — and put each branch's endpoint
+   host (`ep-*.database.<region>.cloud.databricks.com`, read from `get-endpoint`) into
+   `target_hosts` as a literal in this same PR. The run must not need a mid-run allowlist
+   edit for a branch the plan already names; a branch that appears later is a plan decision
+   and a new PR. Never use a host glob: `target_hosts` entries are exact hosts.
 2. Pin the plan's tolerance decision into `.migration/recon_tolerances.json`: exact-match or
    per-type/per-surface tolerances, row and aggregate thresholds, populations, nondeterminism,
    the legacy-query concurrency cap, live vs degraded mode, and the amendment procedure (every
@@ -55,7 +64,9 @@ never build it in the shell (the guard refuses reassigning a `legacy_sources` na
 ## Evidence the ticket must attach
 
 - Committed `.migration/allowed_targets.json`, `recon_tolerances.json`, and
-  `capabilities.json` on the protected branch.
+  `capabilities.json` on the protected branch; on a Lakebase track, the `get-branch` output
+  for every declared `mig-*` branch and the endpoint host each one contributed to
+  `target_hosts`.
 - The doctor record and its identity.
 - The WORKS/BLOCKED probe table with output, attached to the ticket; each BLOCKED item is
   reported for the manager to file as a plan blocker.

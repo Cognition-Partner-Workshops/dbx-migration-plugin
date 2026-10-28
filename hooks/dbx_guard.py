@@ -1070,7 +1070,7 @@ def _check_databricks(seg: _Seg, cfg: GuardConfig, root: Path) -> list[str]:
                     ref = _LAKEBASE_REFERENCE.search(value)
                     for project, branch in ((value.removeprefix("projects/").split("/")[0], None) if value.startswith("projects/") else (None, None),
                                             ref.groups() if ref else (None, None), (value if "project" in k else None, None),
-                                            (None, value if "branch" in k and not k.startswith("source") else None)):
+                                            (None, value if "branch" in k and not k.startswith("source") and not ref else None)):
                         if (project, branch) != (None, None) and (violation := _lakebase(verb, project, branch, cfg)):
                             return violation
             for match in _LAKEBASE_REFERENCE.finditer(seg.text):

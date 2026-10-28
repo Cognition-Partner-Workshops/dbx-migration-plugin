@@ -7,6 +7,15 @@
   verifier's `.migration/recon/wave-<tag>/` made every child PR `protected_files_tampered` on lanes
   whose parity passed.
 
+## Fixed
+
+- `hooks/dbx_guard.py`: a `databricks postgres` JSON key containing `branch` whose value is a full
+  `projects/<p>/branches/<b>` path (what `create-synced-table` carries) was graded a second time
+  with the whole path as the branch id, so bare `lakebase_branches` globs like `mig-*` rejected it;
+  the reference match now grades it once by project and bare branch id. `workspace-setup`
+  pre-creates every declared `mig-*` branch and records its endpoint host in `target_hosts` in the
+  same PR; `intake` asks for the adjacent-session list.
+
 # 0.6.1 — waves launch without a hand-written pointer
 
 ## Changed
