@@ -1881,26 +1881,29 @@ def is_untested_source_family(family: str) -> bool:
 
 # ---- Databricks target ------------------------------------------------------------------
 
-def _databricks_bearer() -> str:
-    """Workspace access token for the session's service principal (env-oidc or oauth-m2m), via the SDK."""
+def _databricks_auth_headers() -> dict[str, str]:
+    """Workspace auth headers for the session's service principal (env-oidc or oauth-m2m), via the SDK.
+    Fresh on every call: the SDK re-mints an M2M/OIDC token once it nears expiry, so a run longer
+    than one token's TTL keeps working."""
     import databricks.sdk.core as _sdk_core  # lazy: optional extra (databricks-sdk)
     if os.environ.get("DATABRICKS_AUTH_TYPE") == "env-oidc" and not os.environ.get("DATABRICKS_OIDC_TOKEN"):
         audience = os.environ.get("DATABRICKS_DEVIN_AUDIENCE", "databricks")
         os.environ["DATABRICKS_OIDC_TOKEN"] = subprocess.run(["devin-oidc", "token", "--audience", audience],
             check=True, capture_output=True, text=True).stdout.strip()
-    headers = _sdk_core.Config().authenticate()
-    return headers["Authorization"].split(" ", 1)[1]
+    return _sdk_core.Config().authenticate()
 
 
 def _databricks_connect(http_path: str | None = None):
     """Session identity only: DATABRICKS_HOST + DATABRICKS_CLIENT_ID with DATABRICKS_CLIENT_SECRET (oauth-m2m)
     or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from --target-http-path or DATABRICKS_HTTP_PATH.
     The connector's oauth_client_id/secret kwargs fall back to interactive U2M browser auth, which hangs
-    unattended, so the SDK mints the token (oauth-m2m or env-oidc) and the connection takes access_token."""
+    unattended, and a static access_token dies mid-run once its TTL expires — so the connector gets a
+    credentials_provider that re-mints through the SDK."""
     from databricks import sql  # lazy: optional extra (databricks-sql-connector)
     host = _secret("DATABRICKS_HOST").removeprefix("https://").removeprefix("http://").rstrip("/")
     http_path = http_path or _secret("DATABRICKS_HTTP_PATH")
-    return sql.connect(server_hostname=host, http_path=http_path, access_token=_databricks_bearer())
+    return sql.connect(server_hostname=host, http_path=http_path,
+        credentials_provider=_databricks_auth_headers)
 
 
 class DatabricksTargetAdapter:
