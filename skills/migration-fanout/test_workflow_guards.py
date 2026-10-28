@@ -50,14 +50,14 @@ def _functions():
                                       "batch_verdicts", "merge_override_for", "wave_overrides", "_strs", "skill_text",
                                       "check_repo_origin",
                                       "check_doctor_contract", "scope_covers", "override_forgives", "skill_file",
-                                      "check_by_design_unverified", "grading_mismatch", "insteadof_rewrites"})
+                                      "check_by_design_unverified", "grading_mismatch", "insteadof_rewrites", "doctor_max_age_minutes"})
                 or (isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Name) and t.id in {"VERIFY_DEPTHS", "GUARD_MODES", "UNIT_ID", "WORD", "BRIEF_MAX_CHARS",
                                                          "ENV_NAME", "PARAM_VALUE", "GATE_KINDS", "GATE_STATUSES",
                                                          "DECISION_ID", "TARGET_DECISIONS", "SKILL_NAME", "REMOVED_FIELDS",
                                                          "_SEGMENT",
                                                          "PREDICATE_TOKEN", "PREDICATE_WORDS", "TAG_RE", "PIPELINE_RE",
-                                                         "REPO_RE", "BARE_PATH"}
+                                                         "REPO_RE", "BARE_PATH", "DOCTOR_MAX_AGE_MINUTES"}
                     for t in node.targets))]
     namespace = {"Counter": Counter, "re": re, "hashlib": hashlib, "json": json, "Path": Path, "ROOT": Path("/nonexistent"), "BASE_BRANCH": "migration/estate",
                  "subprocess": subprocess, "sys": sys, "urllib": urllib, "PLUGIN": WORKFLOW.parents[2],
@@ -1551,11 +1551,12 @@ def _prompt_ns(manifest, overrides=(), doctor=None):
     tree = _tree()
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
              "sum_cost", "cost_line", "close_prompt", "skill_text", "skill_file", "merge_override_for",
-             "wave_overrides", "_strs", "source_attestation", "bundle_name"}
+             "wave_overrides", "_strs", "source_attestation", "bundle_name", "doctor_max_age_minutes"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES", "RESYNC_CLASS"}
+                    isinstance(t, ast.Name) and t.id in {"COST_KEYS", "MERGE_EVIDENCE_MODES", "RESYNC_CLASS",
+                                                         "DOCTOR_MAX_AGE_MINUTES"}
                     for t in node.targets))]
     ns = {"json": __import__("json"), "shlex": __import__("shlex"), "re": re, "WAVE": 1, "TAG": "0",
           "PLUGIN": WORKFLOW.parents[2], "MANIFEST_PATH": Path(".migration/waves/wave-0.json"),
@@ -2134,22 +2135,22 @@ def test_workflow_launches_from_the_signed_doctor_record_not_the_editable_one():
     assert "fresh_doctor_report" not in src and "DOCTOR_PY" not in src
 
 
-def _launch_ns(tmp_path, fake_run=None):
+def _launch_ns(tmp_path, fake_run=None, manifest=None):
     tree = _tree()
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef)
                     and node.name in {"signed_doctor_report", "wave_signature", "pr_changed_paths",
                                       "ref_changed_paths", "wave_base", "evidence_in_pr",
                                       "verifier_changed_paths", "_git_paths", "_base_tip",
-                                      "fetch_ref", "pr_head"})
+                                      "fetch_ref", "pr_head", "doctor_max_age_minutes"})
                 or (isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id in {"PR_URL", "UNIT_ID"} for t in node.targets))]
+                    isinstance(t, ast.Name) and t.id in {"PR_URL", "UNIT_ID", "DOCTOR_MAX_AGE_MINUTES"}
+                    for t in node.targets))]
     ns = {"datetime": datetime, "hashlib": hashlib, "hmac": hmac, "json": json, "os": os, "re": re,
           "sys": sys, "subprocess": subprocess, "Path": Path, "ROOT": tmp_path,
           "BASE_BRANCH": "main", "BASE_SHA": "b" * 40, "REPO": "github.com/acme/dbx-target",
-          "TAG": "orders-1", "MANIFEST": {"repo": "github.com/acme/dbx-target"},
+          "TAG": "orders-1", "MANIFEST": manifest or {"repo": "github.com/acme/dbx-target"},
           "MANIFEST_PATH": tmp_path / ".migration" / "waves" / "wave-1.json",
-          "DOCTOR_MAX_AGE": datetime.timedelta(minutes=15),
           "HOOK_PROBE_RESULT": "blocked:0123abcd"}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(WORKFLOW), "exec"), ns)
     if fake_run is not None:
@@ -2190,6 +2191,50 @@ def test_signed_doctor_report_gate(tmp_path):
             ns["signed_doctor_report"](path, mb, doctor.manifest_sha(mb),
                                        now=datetime.datetime(2026, 1, 1, 0, 1, tzinfo=datetime.timezone.utc))
     assert ns["wave_signature"](signed, manifest_bytes) == doctor.wave_signature(signed, manifest_bytes)
+
+
+def _signed_record(tmp_path, signed_at):
+    sys.path.insert(0, str(WORKFLOW.parents[1] / "factory-doctor"))
+    import doctor
+    manifest_bytes = b'{"wave": 1}'
+    report = {"ready": True, "hook_probe": "blocked:0123abcd", "identity": {"principal": "sp", "host": "h"}}
+    path = tmp_path / "wave-1.doctor.json"
+    path.write_text(json.dumps(doctor.sign_wave_report(report, manifest_bytes, signed_at=signed_at)))
+    return path, manifest_bytes, doctor.manifest_sha(manifest_bytes)
+
+
+NOW = datetime.datetime(2026, 1, 1, 1, 0, tzinfo=datetime.timezone.utc)
+
+
+@pytest.mark.parametrize("manifest, signed_at, accepted", [
+    ({}, "2026-01-01T00:46:00+00:00", True),                           # absent: 15 minutes, as before
+    ({}, "2026-01-01T00:44:00+00:00", False),
+    ({"doctor_max_age": 30}, "2026-01-01T00:44:00+00:00", True),       # the plan-set value is honoured
+    ({"doctor_max_age": 30}, "2026-01-01T00:29:00+00:00", False),
+    ({"doctor_max_age": 5}, "2026-01-01T00:46:00+00:00", False),       # and can be tighter than the default
+])
+def test_signed_doctor_report_honours_the_manifests_doctor_max_age(tmp_path, manifest, signed_at, accepted):
+    """A fixed 15-minute clock in the launch gate made two parents re-sign the record on every launch
+    while the manifest (and the doctor's own reuse rule) said 30."""
+    ns = _launch_ns(tmp_path, manifest={"repo": "github.com/acme/dbx-target", **manifest})
+    path, manifest_bytes, sha = _signed_record(tmp_path, signed_at)
+    if accepted:
+        assert ns["signed_doctor_report"](path, manifest_bytes, sha, now=NOW)["ready"] is True
+    else:
+        with pytest.raises(SystemExit, match="more than .* ago"):
+            ns["signed_doctor_report"](path, manifest_bytes, sha, now=NOW)
+
+
+@pytest.mark.parametrize("value", ["30", 30.0, True, 0, -5, 1441, None])
+def test_signed_doctor_report_halts_on_a_doctor_max_age_that_is_not_a_positive_int(tmp_path, value):
+    ns = _launch_ns(tmp_path, manifest={"repo": "github.com/acme/dbx-target", "doctor_max_age": value})
+    path, manifest_bytes, sha = _signed_record(tmp_path, "2026-01-01T00:59:00+00:00")
+    with pytest.raises(SystemExit, match="'doctor_max_age' must be a positive integer"):
+        ns["signed_doctor_report"](path, manifest_bytes, sha, now=NOW)
+    with pytest.raises(SystemExit, match="'doctor_max_age' must be a positive integer"):
+        _functions()["doctor_max_age_minutes"]({"doctor_max_age": value})
+    assert _functions()["doctor_max_age_minutes"]({}) == 15
+    assert _functions()["doctor_max_age_minutes"]({"doctor_max_age": 30}) == 30
 
 
 def _git_fake(calls, head, merged, paths):

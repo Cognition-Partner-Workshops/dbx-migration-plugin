@@ -76,6 +76,7 @@ PARAM_VALUE = re.compile(r"[A-Za-z0-9_\-:.T/]+(?: [0-9:.]+)?")
 
 
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")  # host/owner/name
+DOCTOR_MAX_AGE_MINUTES = 15  # how long a signed doctor record stays fresh when the manifest says nothing
 
 
 PR_URL = re.compile(r"https://(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(?P<n>[0-9]+)/?")
@@ -682,6 +683,16 @@ def insteadof_rewrites(root):
         if key.startswith("url.") and key.endswith(".insteadof") and source:
             pairs.append((key[len("url."):-len(".insteadof")], source))
     return sorted(pairs, key=lambda p: len(p[0]), reverse=True)
+
+
+def doctor_max_age_minutes(manifest):
+    """The minutes a signed doctor record stays fresh for this wave: the manifest's plan-set
+    `doctor_max_age`, DOCTOR_MAX_AGE_MINUTES when absent. The launch gate reads it through here so a
+    value validate_manifest would refuse halts the same way instead of silently becoming the default."""
+    value = manifest.get("doctor_max_age", DOCTOR_MAX_AGE_MINUTES) if isinstance(manifest, dict) else DOCTOR_MAX_AGE_MINUTES
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= 1440:
+        raise SystemExit(f"manifest key 'doctor_max_age' must be a positive integer of at most 1440 minutes, got {value!r}")
+    return value
 
 
 def check_repo_origin(repo, origin_url, rewrites=(), configured_url=None):
