@@ -1,4 +1,4 @@
-# Unreleased
+# 0.6.2 — mixed-family estates run unpatched
 
 ## Changed
 
@@ -43,7 +43,6 @@
   probed on).
   The harness's provider now returns a header factory, as the connector's `ExternalAuthProvider`
   requires (it raised `'dict' object is not callable` on the first request).
-
 - Plan-chosen grading for target-only outputs: a mapping-spec object may carry
   `"grading": "by_design_unverified"` (reject-only quarantine sinks, rollups). The harness keeps
   target rows <= root rows and the structural tier (minus the root-key comparison; the target's own
