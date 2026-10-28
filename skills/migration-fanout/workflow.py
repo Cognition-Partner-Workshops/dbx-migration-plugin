@@ -939,8 +939,9 @@ def resync_prompt(cfg):
 
 def bundle_name(batch_id):
     """The DAB bundle name a batch deploys under: mig_<run_id>_<batch_id> with the wave tag as the run
-    id, so two batches of one wave (or two waves) never deploy over each other's resources."""
-    return "mig_" + "_".join(re.sub(r"[^A-Za-z0-9]+", "_", str(part)).strip("_").lower() for part in (TAG, batch_id))
+    id. Both are taken verbatim (validate_manifest keeps batch ids to letters, digits, `_ . -`, and
+    unique per wave), so no two batches of a wave share a bundle and deploy over each other."""
+    return f"mig_{TAG}_{batch_id}"
 
 
 def child_prompt(batch):

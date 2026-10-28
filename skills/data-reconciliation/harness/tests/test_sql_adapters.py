@@ -96,6 +96,25 @@ def test_untested_source_families_fail_fast_before_any_driver_or_the_target_is_t
                   "--out", str(tmp_path / "out")])
 
 
+def test_run_reports_an_empty_canon_file_as_a_one_line_error(monkeypatch, tmp_path):
+    """`dbx-recon run` on an empty profile.canon.json exits with the ConfigError text naming the
+    file, not a JSONDecodeError traceback."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".migration").mkdir()
+    (tmp_path / ".migration" / "allowed_targets.json").write_text('{"catalogs": ["mig"]}')
+    canon = tmp_path / "profile.canon.json"
+    canon.write_text("")
+    monkeypatch.setattr(cli, "_load_spec", lambda *a: (None, None))
+    monkeypatch.setattr(cli, "load_tolerances", lambda path: None)
+    monkeypatch.setattr(adapters, "DatabricksTargetAdapter", lambda *a: pytest.fail("target was built"))
+    with pytest.raises(SystemExit, match=rf"^{re.escape(str(canon))}: empty canonicalization file") as excinfo:
+        cli.main(["run", "--unit", "u", "--family", "oracle", "--mapping", "missing", "--tolerances", "missing",
+                  "--canonicalization", str(canon), "--mode", "fixture", "--source-dsn-secret", "SOURCE",
+                  "--target-secret", "TARGET", "--target-catalog", "mig", "--target-schema", "s",
+                  "--out", str(tmp_path / "out")])
+    assert excinfo.value.__cause__ is None
+
+
 def test_families_reports_the_registry(capsys):
     assert cli.main(["families"]) == 0
     reg = json.loads(capsys.readouterr().out)

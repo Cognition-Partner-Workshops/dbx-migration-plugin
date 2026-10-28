@@ -1489,9 +1489,11 @@ def test_child_prompt_names_a_per_batch_bundle_from_the_wave_tag():
         {"id": "w2-b04", "units": ["v"], "write_targets": ["t2"], "brief": "y"}]))
     ns["TAG"] = "orders-1"
     first, second = (ns["child_prompt"](b) for b in ns["MANIFEST"]["batches"])
-    assert "Bundle name: mig_orders_1_w2_b03 (mig_<run_id>_<batch_id>, one bundle per batch)" in first
-    assert "Bundle name: mig_orders_1_w2_b04 " in second
-    assert ns["bundle_name"]("B 5") == "mig_orders_1_b_5"
+    assert "Bundle name: mig_orders-1_w2-b03 (mig_<run_id>_<batch_id>, one bundle per batch)" in first
+    assert "Bundle name: mig_orders-1_w2-b04 " in second
+    # ids are taken verbatim: two distinct valid ids never collapse into one bundle
+    names = {ns["bundle_name"](i) for i in ("w2-b03", "w2_b03", "W2-B03", "w2.b03")}
+    assert len(names) == 4
 
 
 def test_child_prompt_embeds_capability_contract():
@@ -1549,7 +1551,7 @@ def _prompt_ns(manifest, overrides=(), doctor=None):
     tree = _tree()
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
              "sum_cost", "cost_line", "close_prompt", "skill_text", "skill_file", "merge_override_for",
-             "wave_overrides", "_strs", "source_attestation"}, "bundle_name",
+             "wave_overrides", "_strs", "source_attestation", "bundle_name"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(

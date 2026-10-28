@@ -546,7 +546,10 @@ def main(argv: list[str] | None = None) -> int:
                                 args.target_kind, params)
     args.tolerances = resolve_tolerances_path(args.tolerances)
     tol = load_tolerances(args.tolerances)
-    rules = load_canon_rules(args.canonicalization)
+    try:
+        rules = load_canon_rules(args.canonicalization)
+    except ConfigError as exc:
+        raise SystemExit(str(exc)) from None
 
     snapshot = _load_snapshot(args.snapshot_manifest, args.mode)
     rerun_proof = None
