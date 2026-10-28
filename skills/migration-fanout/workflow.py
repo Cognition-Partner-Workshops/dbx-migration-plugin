@@ -897,12 +897,26 @@ def child_prompt(batch):
     )
 
 
+def source_attestation():
+    """The committed attestation the signed doctor record ran under (its source_principal_read_only row's
+    data.attested), so a child's own doctor run passes the same --source-attested instead of re-blocking on
+    the grants the human waived; None when the record attests nothing."""
+    for row in DOCTOR.get("checks") or []:
+        if isinstance(row, dict) and row.get("id") == "source_principal_read_only":
+            attested = (row.get("data") or {}).get("attested") if isinstance(row.get("data"), dict) else None
+            return attested if isinstance(attested, str) and attested else None
+    return None
+
+
 def capability_block(units):
     caps, src = MANIFEST["capabilities"], MANIFEST.get("source") or {}
     flags = " ".join(f"--unit {u}" for u in units)
     if src:
         flags += " " + " ".join([f"--source-family {src['family']} --source-secret {src['secret']}"]
                                 + [f"--param {shlex.quote(f'{k}={v}')}" for k, v in src.get("params", {}).items()])
+    attested = source_attestation()
+    if attested:
+        flags += f" --source-attested {shlex.quote(attested)}"
     return (
         f"Capability contract: {json.dumps(caps, sort_keys=True)}\nBefore converting run "
         f"`factory-doctor --role child --reuse-record .migration/waves/wave-{TAG}.doctor.json "

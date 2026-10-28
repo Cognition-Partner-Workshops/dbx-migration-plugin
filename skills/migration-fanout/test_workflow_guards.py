@@ -1530,11 +1530,11 @@ def test_validate_manifest_accepts_depth_knob_and_estimate():
                                           "brief": "brief", "verify_depth": "sampled"}]))
 
 
-def _prompt_ns(manifest, overrides=()):
+def _prompt_ns(manifest, overrides=(), doctor=None):
     tree = _tree()
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
              "sum_cost", "cost_line", "close_prompt", "skill_text", "skill_file", "merge_override_for",
-             "wave_overrides", "_strs"}
+             "wave_overrides", "_strs", "source_attestation"}
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
@@ -1542,7 +1542,7 @@ def _prompt_ns(manifest, overrides=()):
                     for t in node.targets))]
     ns = {"json": __import__("json"), "shlex": __import__("shlex"), "re": re, "WAVE": 1, "TAG": "0",
           "PLUGIN": WORKFLOW.parents[2], "MANIFEST_PATH": Path(".migration/waves/wave-0.json"),
-          "AUTHORIZATIONS": _auth(overrides),
+          "AUTHORIZATIONS": _auth(overrides), "DOCTOR": doctor or {},
           "REPO": "github.com/acme/target", "MANIFEST": manifest,
           "BATCHES": manifest["batches"], "VERIFY_DEPTH": manifest.get("verify_depth", "sampled"),
           "MAX_MINUTES": int(manifest.get("max_minutes", 45))}
@@ -2394,6 +2394,23 @@ def test_param_values_follow_the_recon_contract_so_a_timestamp_is_accepted():
     flags = text[text.index("--source-family"):].split("`")[0]
     assert shlex.split(flags) == ["--source-family", "sqlserver", "--source-secret", "X",
                                   "--param", "as_of=2026-09-08 18:43:52", "--param", "db=loans"]
+
+
+def test_child_prompt_passes_the_records_source_attestation_to_the_doctor():
+    """The orchestrator's record ran under --source-attested; a child whose record is too old to reuse re-runs
+    the source check itself and would block on the grants the human waived without the same flag."""
+    attested = {"checks": [{"id": "source_principal_read_only", "status": "warn", "detail": "x",
+                            "data": {"attested": "D-7", "offending": {"mig.raw.t": ["MODIFY"]}}}]}
+    m = _manifest(source={"family": "databricks", "secret": "X", "params": {}})
+    text = _prompt_ns(m, doctor=attested)["child_prompt"](m["batches"][0])
+    flags = text[text.index("--source-family"):].split("`")[0]
+    assert shlex.split(flags) == ["--source-family", "databricks", "--source-secret", "X", "--source-attested", "D-7"]
+    assert "--source-attested" not in _prompt_ns(m)["child_prompt"](m["batches"][0])
+    for row in ({"id": "source_principal_read_only", "status": "ok", "data": {}},
+                {"id": "source_principal_read_only", "status": "ok", "data": {"attested": ""}},
+                {"id": "source_principal_read_only", "status": "ok", "data": {"attested": 7}},
+                {"id": "source_principal_read_only", "status": "ok"}, {"id": "other", "data": {"attested": "D-7"}}):
+        assert "--source-attested" not in _prompt_ns(m, doctor={"checks": [row]})["child_prompt"](m["batches"][0]), row
 
 
 def test_child_prompt_passes_the_source_family_and_secret_to_the_doctor():
