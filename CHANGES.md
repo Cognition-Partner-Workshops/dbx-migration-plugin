@@ -1,3 +1,12 @@
+# Unreleased
+
+## Changed
+
+- Wave manifests refuse a declared gate `evidence` path that is not a file under
+  `.migration/recon/<one of the batch's units>/`, naming the allowed roots; a gate pointed at the
+  verifier's `.migration/recon/wave-<tag>/` made every child PR `protected_files_tampered` on lanes
+  whose parity passed.
+
 # 0.6.1 — waves launch without a hand-written pointer
 
 ## Changed

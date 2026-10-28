@@ -108,6 +108,12 @@ def validate_gates(b):
             f"batch {b['id']} gate {g['id']} 'evidence' must be a string, non-empty once passed")
         req(not g["evidence"] or BARE_PATH.fullmatch(g["evidence"]),
             f"batch {b['id']} gate {g['id']} 'evidence' must be a bare path (no spaces or notes)")
+        parts = g["evidence"].split("/")
+        req(not g["evidence"] or (len(parts) >= 4 and parts[:2] == [".migration", "recon"] and parts[2] in b["units"]
+                                  and not any(p in ("", ".", "..") for p in parts[3:])),
+            f"batch {b['id']} gate {g['id']} 'evidence' {g['evidence']!r} must be a file under one of this batch's "
+            f"unit recon dirs ({', '.join(f'.migration/recon/{u}/' for u in b['units'])}): the child writes nothing "
+            "else under .migration/, and .migration/recon/wave-<tag>/ is the verifier's")
         decision = g.get("decision_id")
         req(not ((g["status"] == "waived" and decision is None)
                  or (decision is not None and not (isinstance(decision, str) and DECISION_ID.fullmatch(decision)))),
