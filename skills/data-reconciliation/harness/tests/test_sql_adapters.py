@@ -186,19 +186,33 @@ def _fake_databricks_sql(monkeypatch, captured):
     monkeypatch.setattr(databricks, "sql", fake_sql, raising=False)
 
 
-def test_databricks_connect_uses_m2m_kwargs(monkeypatch):
+def test_databricks_connect_uses_sdk_credentials_provider_for_m2m(monkeypatch):
+    """oauth-m2m: the connector's oauth_client_id/secret kwargs fall back to interactive U2M
+    browser auth and hang unattended, and a static access_token dies mid-run once its TTL
+    expires — so connect takes a credentials_provider that re-mints through the SDK."""
     monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net/")
     monkeypatch.setenv("DATABRICKS_CLIENT_ID", "sp-client-id")
     monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "sp-secret")
     monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/x")
+    minted = iter(["tok1", "tok2"])
+    fake_core = types.ModuleType("databricks.sdk.core")
+    fake_core.Config = lambda: types.SimpleNamespace(
+        authenticate=lambda: {"Authorization": f"Bearer {next(minted)}"})
+    monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake_core)
+    fake_sdk = types.ModuleType("databricks.sdk")
+    fake_sdk.core = fake_core
+    monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
     captured = {}
     _fake_databricks_sql(monkeypatch, captured)
     assert adapters._databricks_connect() == "conn"
     assert captured["server_hostname"] == "adb-1.azuredatabricks.net"
     assert captured["http_path"] == "/sql/1.0/warehouses/x"
-    assert captured["oauth_client_id"] == "sp-client-id"
-    assert captured["oauth_client_secret"] == "sp-secret"
     assert "access_token" not in captured
+    assert "oauth_client_id" not in captured
+    assert "oauth_client_secret" not in captured
+    # a run that outlives its first token re-mints through the provider
+    assert captured["credentials_provider"]() == {"Authorization": "Bearer tok1"}
+    assert captured["credentials_provider"]() == {"Authorization": "Bearer tok2"}
 
 
 def test_databricks_connect_env_oidc_uses_sdk_bearer(monkeypatch):
@@ -220,7 +234,7 @@ def test_databricks_connect_env_oidc_uses_sdk_bearer(monkeypatch):
     captured = {}
     _fake_databricks_sql(monkeypatch, captured)
     assert adapters._databricks_connect() == "conn"
-    assert captured["access_token"] == "tok"
+    assert captured["credentials_provider"]() == {"Authorization": "Bearer tok"}
     assert "oauth_client_secret" not in captured
 
 

@@ -1078,7 +1078,7 @@ def _uc_schema_facts(run_query, catalog: str, schema: str, table: str) -> Schema
         "  ON t.table_catalog = tp.table_catalog AND t.table_schema = tp.table_schema "
         " AND t.table_name = tp.table_name "
         "WHERE tp.table_catalog = %(catalog)s AND tp.table_schema = %(schema)s "
-        "AND tp.table_name = %(table)s AND tp.grantee <> t.owner "
+        "AND tp.table_name = %(table)s AND tp.grantee <> t.table_owner "
         "ORDER BY tp.grantee",
         {"catalog": catalog, "schema": schema, "table": table}))
     return facts
@@ -1881,27 +1881,30 @@ def is_untested_source_family(family: str) -> bool:
 
 # ---- Databricks target ------------------------------------------------------------------
 
-def _databricks_bearer() -> str:
-    """Workspace access token for the session's service principal (env-oidc or oauth-m2m), via the SDK."""
+def _databricks_sdk_config():
+    """SDK Config for the session's service principal (env-oidc or oauth-m2m).
+    One per connection: the SDK caches the token on the Config's credentials provider and
+    re-mints only once it nears expiry, so a run longer than one token's TTL keeps working
+    without a token-endpoint round trip per request."""
     import databricks.sdk.core as _sdk_core  # lazy: optional extra (databricks-sdk)
     if os.environ.get("DATABRICKS_AUTH_TYPE") == "env-oidc" and not os.environ.get("DATABRICKS_OIDC_TOKEN"):
         audience = os.environ.get("DATABRICKS_DEVIN_AUDIENCE", "databricks")
         os.environ["DATABRICKS_OIDC_TOKEN"] = subprocess.run(["devin-oidc", "token", "--audience", audience],
             check=True, capture_output=True, text=True).stdout.strip()
-    headers = _sdk_core.Config().authenticate()
-    return headers["Authorization"].split(" ", 1)[1]
+    return _sdk_core.Config()
 
 
 def _databricks_connect(http_path: str | None = None):
     """Session identity only: DATABRICKS_HOST + DATABRICKS_CLIENT_ID with DATABRICKS_CLIENT_SECRET (oauth-m2m)
-    or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from --target-http-path or DATABRICKS_HTTP_PATH."""
+    or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from --target-http-path or DATABRICKS_HTTP_PATH.
+    The connector's oauth_client_id/secret kwargs fall back to interactive U2M browser auth, which hangs
+    unattended, and a static access_token dies mid-run once its TTL expires — so the connector gets a
+    credentials_provider that re-mints through the SDK."""
     from databricks import sql  # lazy: optional extra (databricks-sql-connector)
     host = _secret("DATABRICKS_HOST").removeprefix("https://").removeprefix("http://").rstrip("/")
     http_path = http_path or _secret("DATABRICKS_HTTP_PATH")
-    if os.environ.get("DATABRICKS_CLIENT_SECRET"):
-        return sql.connect(server_hostname=host, http_path=http_path,
-            oauth_client_id=_secret("DATABRICKS_CLIENT_ID"), oauth_client_secret=_secret("DATABRICKS_CLIENT_SECRET"))
-    return sql.connect(server_hostname=host, http_path=http_path, access_token=_databricks_bearer())
+    return sql.connect(server_hostname=host, http_path=http_path,
+        credentials_provider=_databricks_sdk_config().authenticate)
 
 
 class DatabricksTargetAdapter:

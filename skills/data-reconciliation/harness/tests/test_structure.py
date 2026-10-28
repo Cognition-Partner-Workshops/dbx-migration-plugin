@@ -871,6 +871,7 @@ def test_databricks_schema_facts_maps_information_schema():
     for view in ("table_constraints", "key_column_usage", "referential_constraints",
                  "columns", "check_constraints", "table_privileges"):
         assert f"information_schema.{view}" in joined
+    assert "t.table_owner" in joined  # UC information_schema.tables has table_owner, not owner
 
 
 def test_build_result_merge_block_reasons():
