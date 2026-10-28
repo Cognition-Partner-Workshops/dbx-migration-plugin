@@ -468,6 +468,30 @@ def test_where_clause_params(tmp_path: Path):
         load_mapping_spec(tmp_path / "map.json")
 
 
+def _write(path: Path, text: str) -> Path:
+    path.write_text(text)
+    return path
+
+
+@pytest.mark.parametrize("text, reason", [
+    ("", "empty canonicalization file"),
+    ("   \n", "empty canonicalization file"),
+    ("{", "not valid JSON"),
+    ("42", "must be"),
+    ('"identity"', "must be"),
+    ('{"rules": "identity"}', "must be"),
+    ('{"rules": [{"applies_to": "*"}]}', "must be"),
+])
+def test_load_canon_rules_names_the_path_in_a_readable_error(tmp_path: Path, text, reason):
+    """An empty or non-object profile.canon.json is a config error that names the file, not a
+    JSONDecodeError traceback; `{"rules": []}` is how a run says it has no rules."""
+    path = _write(tmp_path / "profile.canon.json", text)
+    with pytest.raises(ConfigError, match=reason) as excinfo:
+        load_canon_rules(path)
+    assert str(path) in str(excinfo.value)
+    assert not isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+
+
 def test_config_loaders_and_report(tmp_path: Path):
     (tmp_path / "map.json").write_text(json.dumps({
         "version": "m1", "objects": [{
@@ -479,6 +503,7 @@ def test_config_loaders_and_report(tmp_path: Path):
     spec = load_mapping_spec(tmp_path / "map.json")
     tol = load_tolerances(tmp_path / "tol.json")
     rules = load_canon_rules(tmp_path / "rules.json")
+    assert load_canon_rules(_write(tmp_path / "empty_rules.json", '{"rules": []}')) == []
     source = FakeSource({"T": [{"ID": 1}]})
     target = FakeTarget({"c": [{"id": 1}]})
     result = run_recon("u", "snapshot", spec, tol, rules, source, target,

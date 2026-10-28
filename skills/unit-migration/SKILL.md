@@ -8,6 +8,9 @@ description: The worker ticket that converts one fan-out batch of units, proves 
 You own exactly the units and write targets your batch names — nowhere else. Anything missing
 from the brief stops you: report blocked, never improvise.
 
+Every statement the guard must see is a literal: static `.sql` files, inline SELECT text, no
+f-strings/lookup tables/runtime-built DDL. A block is a halt.
+
 ## Ticket inputs (cold start)
 
 Batch id, units, targets, brief, capability contract, source block, `doctor_max_age`,

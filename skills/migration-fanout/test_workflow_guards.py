@@ -1481,6 +1481,19 @@ def test_validate_manifest_requires_feature_branch_or_recorded_trunk_decision():
     validate_manifest(_manifest(base_branch="main", trunk_base_decision="trunk-2026-001"))
 
 
+def test_child_prompt_names_a_per_batch_bundle_from_the_wave_tag():
+    """Two batches deploying under one DAB bundle name replace each other's resources; the brief
+    states the literal `mig_<run_id>_<batch_id>` for this batch."""
+    ns = _prompt_ns(_manifest(batches=[
+        {"id": "w2-b03", "units": ["u"], "write_targets": ["t"], "brief": "x"},
+        {"id": "w2-b04", "units": ["v"], "write_targets": ["t2"], "brief": "y"}]))
+    ns["TAG"] = "orders-1"
+    first, second = (ns["child_prompt"](b) for b in ns["MANIFEST"]["batches"])
+    assert "Bundle name: mig_orders_1_w2_b03 (mig_<run_id>_<batch_id>, one bundle per batch)" in first
+    assert "Bundle name: mig_orders_1_w2_b04 " in second
+    assert ns["bundle_name"]("B 5") == "mig_orders_1_b_5"
+
+
 def test_child_prompt_embeds_capability_contract():
     ns = _prompt_ns(_manifest())
     text = ns["child_prompt"](ns["MANIFEST"]["batches"][0])
@@ -1536,7 +1549,7 @@ def _prompt_ns(manifest, overrides=(), doctor=None):
     tree = _tree()
     names = {"verify_prompt", "batch_verify_depth", "batch_max_minutes", "child_prompt", "capability_block",
              "sum_cost", "cost_line", "close_prompt", "skill_text", "skill_file", "merge_override_for",
-             "wave_overrides", "_strs", "source_attestation"}
+             "wave_overrides", "_strs", "source_attestation"}, "bundle_name",
     selected = [node for node in tree.body
                 if (isinstance(node, ast.FunctionDef) and node.name in names)
                 or (isinstance(node, ast.Assign) and any(
@@ -2453,12 +2466,12 @@ def test_a_pass_no_longer_needs_a_review_round():
     assert out["status"] == "PASS" and "failure_class" not in out and "review_waiver" not in out
 
 
-def test_child_prompt_is_s2_shaped_and_under_900_words():
+def test_child_prompt_is_s2_shaped_and_under_950_words():
     brief = " ".join(f"word{i}" for i in range(300))
     m = _manifest(batches=[{"id": "b", "units": ["loans", "payments"], "write_targets": ["mig.loans", "mig.pay"],
                             "brief": brief, "gates": [GATE]}])
     text = _prompt_ns(m)["child_prompt"](m["batches"][0])
-    assert len(text.split()) < 900, len(text.split())
+    assert len(text.split()) < 950, len(text.split())
     text = text[text.index("BRIEF:"):]                                     # the quoted skill body precedes it
     order = [text.index(s) for s in (
         '"loans"', "mig.loans",                                            # units and write targets

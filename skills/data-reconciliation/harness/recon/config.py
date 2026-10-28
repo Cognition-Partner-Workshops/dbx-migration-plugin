@@ -530,7 +530,16 @@ def load_tolerances(path: Path) -> Tolerances:
 
 
 def load_canon_rules(path: Path) -> list[CanonRule]:
-    data = json.loads(path.read_text())
-    rules = data if isinstance(data, list) else data.get("rules", [])
+    text = path.read_text()
+    if not text.strip():
+        raise ConfigError(f"{path}: empty canonicalization file; a file with no rules is {{\"rules\": []}}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path}: canonicalization is not valid JSON ({exc})") from None
+    rules = data if isinstance(data, list) else data.get("rules", []) if isinstance(data, dict) else None
+    if not isinstance(rules, list) or not all(isinstance(r, dict) and isinstance(r.get("rule"), str) for r in rules):
+        raise ConfigError(f"{path}: canonicalization must be {{\"rules\": [...]}} or a list of rules, each an "
+                          "object with a string 'rule'")
     return [CanonRule(rule=r["rule"], applies_to=r.get("applies_to", "*"),
                       params=dict(r.get("params", {}))) for r in rules]

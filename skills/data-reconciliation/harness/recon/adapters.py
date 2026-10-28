@@ -1933,8 +1933,9 @@ def _databricks_connect(http_path: str | None = None):
 class DatabricksTargetAdapter:
     """Target side: Unity Catalog tables under one catalog.schema. Nested (ARRAY<STRUCT>)
     columns are supported for cardinality via size(); dotted field paths address STRUCT
-    fields. Object names in the mapping spec are bare table names; the adapter qualifies
-    them with the migration catalog and schema so a spec never points at production."""
+    fields. Object names in the mapping spec are bare table names, which the adapter qualifies
+    with the migration catalog and schema so a spec never points at production; a spec may spell
+    the same `catalog.schema.table` out in full, and any other qualification is refused."""
 
     # Unity Catalog reads share _uc_schema_facts/_uc_identity_state with the source adapter.
     CATALOG_STATEMENTS = {"schema_facts": 6, "identity_state": 2, "session": 0}
@@ -1960,17 +1961,33 @@ class DatabricksTargetAdapter:
     def rows_fetched(self) -> int:
         return self._sql.rows_fetched
 
+    def _bare(self, object: str) -> str:
+        """The table name without the adapter's own catalog.schema: a bare name passes through, a
+        three-part name must spell this adapter's catalog and schema (case-insensitively, backticks
+        stripped), and a two-part or foreign qualification is refused before any query."""
+        parts = [p[1:-1] if len(p) > 1 and p[0] == p[-1] == "`" else p for p in object.split(".")]
+        if len(parts) == 1:
+            return object
+        from .config import ConfigError
+        own = f"{self._catalog}.{self._schema}"
+        if len(parts) != 3:
+            raise ConfigError(f"target object {object!r} must be a bare table name or {own}.<table>")
+        if (parts[0].casefold(), parts[1].casefold()) != (self._catalog.casefold(), self._schema.casefold()):
+            raise ConfigError(f"target object {object!r} is outside this target's {own}; the recon target "
+                              "is the migration catalog and schema, never another one")
+        return parts[2]
+
     def _q(self, object: str) -> str:
-        return self._prefix + quote_ident(object, "`")
+        return self._prefix + quote_ident(self._bare(object), "`")
 
     def schema_facts(self, object: str) -> SchemaFacts:
         return _uc_schema_facts(lambda sql, params: self._sql._rows(sql, params),
-                                self._catalog, self._schema, object)
+                                self._catalog, self._schema, self._bare(object))
 
     def identity_state(self, object: str, column: str) -> IdentityState | None:
         return _uc_identity_state(
             lambda sql, params: self._sql._rows(sql, params),
-            self._catalog, self._schema, object, column)
+            self._catalog, self._schema, self._bare(object), column)
 
     def column_shape(self, object: str) -> list[dict[str, Any]]:
         """Observed columns in declared order for the rerun proof (recon.rerun); a view with the
@@ -1984,7 +2001,7 @@ class DatabricksTargetAdapter:
             "AND t.table_name = c.table_name "
             "WHERE c.table_catalog = %(catalog)s AND c.table_schema = %(schema)s AND c.table_name = %(table)s "
             f"AND {_UC_PHYSICAL} ORDER BY ordinal_position",
-            {"catalog": self._catalog, "schema": self._schema, "table": object})
+            {"catalog": self._catalog, "schema": self._schema, "table": self._bare(object)})
         return [{"name": str(name).lower(), "type": normalize_type(dtype),
                  "nullable": str(nullable).upper() != "NO"} for name, dtype, nullable, _ in rows]
 
@@ -1995,7 +2012,7 @@ class DatabricksTargetAdapter:
             f"SELECT t.table_type FROM {quote_ident(self._catalog, '`')}.information_schema.tables t "
             "WHERE t.table_catalog = %(catalog)s AND t.table_schema = %(schema)s AND t.table_name = %(table)s "
             f"AND {_UC_PHYSICAL}",
-            {"catalog": self._catalog, "schema": self._schema, "table": object})
+            {"catalog": self._catalog, "schema": self._schema, "table": self._bare(object)})
         return str(rows[0][0]).upper() if rows else None
 
     def table_exists(self, object: str) -> bool:

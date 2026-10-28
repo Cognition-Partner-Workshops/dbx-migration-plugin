@@ -1,5 +1,7 @@
 ### Deploy and schedule
-- One bundle per pipeline (or per unit batch during fan-out). Bundle targets: `migration`
+- One bundle per pipeline (or per unit batch during fan-out), named `mig_<run_id>_<batch_id>`
+  (`skills/target-routing/SKILL.md`): two batches sharing a bundle name deploy over each other.
+  Bundle targets: `migration`
   (migration catalog + engagement warehouse) and `prod` (deployed only at cutover; `AGENTS.md`).
   Redeploys must converge; children redeploy after a partial failure rather than
   patching live resources.

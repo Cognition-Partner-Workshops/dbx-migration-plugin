@@ -168,6 +168,8 @@ def test_lakebase_target_validates_and_escapes_identifiers_before_it_connects(mo
     assert target._q('lo"ans') == '"loan""servicing"."lo""ans"'
     with pytest.raises(ConfigError, match="invalid SQL identifier"):
         target._q("public.loans")
+    with pytest.raises(ConfigError, match="invalid SQL identifier"):   # unlike Databricks, no 3-part names
+        target._q("db.public.loans")
 
 
 def test_databricks_target_validates_catalog_and_schema_before_it_connects(monkeypatch):
@@ -176,6 +178,61 @@ def test_databricks_target_validates_catalog_and_schema_before_it_connects(monke
     with pytest.raises(ConfigError, match="invalid SQL identifier"):
         adapters.DatabricksTargetAdapter("D", "", "silver")
     assert connects == []
+
+
+class _RecordingConn:
+    def __init__(self):
+        self.executed = []
+
+    def cursor(self):
+        conn = self
+
+        class Cursor:
+            def execute(self, sql, params=None):
+                conn.executed.append((sql, params))
+
+            def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+
+@pytest.mark.parametrize("spelled", ["orders", "mig.silver.orders", "MIG.Silver.orders", "`mig`.`silver`.`orders`"])
+def test_databricks_target_accepts_its_own_three_part_name_and_strips_it_to_the_bare_table(monkeypatch, spelled):
+    """A spec may spell the adapter's own catalog.schema out in full (any case, backticks or not);
+    the helpers that prefix catalog and schema themselves still see the bare table."""
+    conn = _RecordingConn()
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    target = adapters.DatabricksTargetAdapter("D", "mig", "silver")
+    assert target._q(spelled) == "`mig`.`silver`.`orders`"
+    target.column_shape(spelled)
+    target.table_exists(spelled)
+    assert [params for _, params in conn.executed] == [
+        {"catalog": "mig", "schema": "silver", "table": "orders"}] * 2
+    target.schema_facts(spelled)
+    assert all(params.get("table", "orders") == "orders" for _, params in conn.executed if isinstance(params, dict))
+    assert not any("mig.silver.orders" in sql or "`mig`.`silver`.`orders`.`" in sql for sql, _ in conn.executed)
+
+
+@pytest.mark.parametrize("spelled, reason", [
+    ("silver.orders", "bare table name or mig.silver"),
+    ("prod.silver.orders", "outside this target's mig.silver"),
+    ("mig.gold.orders", "outside this target's mig.silver"),
+    ("`prod`.`silver`.`orders`", "outside this target's mig.silver"),
+    ("mig.silver.orders.extra", "bare table name or mig.silver"),
+])
+def test_databricks_target_refuses_two_part_and_foreign_qualification_before_any_query(monkeypatch, spelled, reason):
+    conn = _RecordingConn()
+    monkeypatch.setattr(adapters, "_databricks_connect", lambda name: conn)
+    target = adapters.DatabricksTargetAdapter("D", "mig", "silver")
+    for call in (target._q, target.column_shape, target.table_exists, target.schema_facts,
+                 lambda o: target.identity_state(o, "id")):
+        with pytest.raises(ConfigError, match=reason):
+            call(spelled)
+    assert conn.executed == []
 
 
 def _fake_databricks_sql(monkeypatch, captured):

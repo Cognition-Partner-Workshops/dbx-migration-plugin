@@ -937,6 +937,12 @@ def resync_prompt(cfg):
     )
 
 
+def bundle_name(batch_id):
+    """The DAB bundle name a batch deploys under: mig_<run_id>_<batch_id> with the wave tag as the run
+    id, so two batches of one wave (or two waves) never deploy over each other's resources."""
+    return "mig_" + "_".join(re.sub(r"[^A-Za-z0-9]+", "_", str(part)).strip("_").lower() for part in (TAG, batch_id))
+
+
 def child_prompt(batch):
     override = merge_override_for(batch["units"], AUTHORIZATIONS, MANIFEST_PATH.stem)
     gates = [g for g in batch.get("gates", []) if g["status"] != "waived"]
@@ -946,6 +952,7 @@ def child_prompt(batch):
         f"Its full text follows; follow it exactly. Batch {batch['id']}.\n\n{skill_body}\n\nBRIEF:\n{batch['brief']}\n\n"
         f"Units: {json.dumps(batch['units'])}. Write targets you own: {json.dumps(batch.get('write_targets', []))}.\n"
         "Unit handoffs: .migration/units/<unit_id>/mapping_spec.json.\n"
+        f"Bundle name: {bundle_name(batch['id'])} (mig_<run_id>_<batch_id>, one bundle per batch).\n"
         + "\n" + capability_block(batch["units"])
         + f"Time budget: {batch_max_minutes(batch)} minutes; at the budget report status=BLOCKED with what landed.\n"
         "Declared gates (report each id in gates as passed with its evidence, a bare path or {path, label, verdict, "
