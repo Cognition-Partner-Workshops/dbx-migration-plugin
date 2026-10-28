@@ -42,7 +42,10 @@ never build it in the shell (the guard refuses reassigning a `legacy_sources` na
 2. Pin the plan's tolerance decision into `.migration/recon_tolerances.json`: exact-match or
    per-type/per-surface tolerances, row and aggregate thresholds, populations, nondeterminism,
    the legacy-query concurrency cap, live vs degraded mode, and the amendment procedure (every
-   amendment preserves the old row and names its re-verification scope).
+   amendment preserves the old row and names its re-verification scope). Beside it commit
+   `.migration/recon/profile.canon.json`, the engagement's canonicalization rules for `dbx-recon
+   --canonicalization`; with no engagement-specific rules it is exactly `{"rules": []}` (an empty
+   file is refused by the harness, not read as no rules).
 3. Propose one `plan.yaml` decision per target surface: `target-core`, `target-sql`,
    `target-pipeline`, `target-orchestration`, `target-consumer`, `target-lakebase`,
    `target-ml-scoring`, and `target-data-dependency`. Each selected option names the target and
@@ -63,10 +66,10 @@ never build it in the shell (the guard refuses reassigning a `legacy_sources` na
 
 ## Evidence the ticket must attach
 
-- Committed `.migration/allowed_targets.json`, `recon_tolerances.json`, and
-  `capabilities.json` on the protected branch; on a Lakebase track, the `get-branch` output
-  for every declared `mig-*` branch and the endpoint host each one contributed to
-  `target_hosts`.
+- Committed `.migration/allowed_targets.json`, `recon_tolerances.json`, `recon/profile.canon.json`
+  (`{"rules": []}` when empty), and `capabilities.json` on the protected branch; on a Lakebase
+  track, the `get-branch` output for every declared `mig-*` branch and the endpoint host each one
+  contributed to `target_hosts`.
 - The doctor record and its identity.
 - The WORKS/BLOCKED probe table with output, attached to the ticket; each BLOCKED item is
   reported for the manager to file as a plan blocker.

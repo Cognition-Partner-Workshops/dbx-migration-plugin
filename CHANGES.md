@@ -53,6 +53,7 @@
   `repo` when a `url.<target>.insteadOf` rewrite in `git config` maps it to the origin `git remote
   get-url` reports, so a wave launches behind a git proxy; a proxy-shaped origin no configured
   rewrite explains is compared as reported and still halts.
+- fanout/recon/skills: `unit-migration` states every guarded statement is a literal and a block is a halt; the DAB bundle name is `mig_<run_id>_<batch_id>` (target-routing text, literal in the fanout child brief); `DatabricksTargetAdapter` accepts a spec's `catalog.schema.table` only when it spells the adapter's own catalog and schema (case-insensitive, backticks stripped) and refuses two-part or foreign names with a `ConfigError`, Lakebase unchanged; `load_canon_rules` raises a `ConfigError` naming the path for an empty or non-object `profile.canon.json`, which `workspace-setup` now commits as `{"rules": []}` when a run has no rules.
 
 ## Fixed
 
