@@ -71,6 +71,17 @@ def estimate_cost(spec: MappingSpec, tol: Tolerances, depth: str = "threshold",
     modes: dict[str, str] = {}
     for c in spec.objects:
         n = (row_counts or {}).get(c.root_table)
+        if c.grading != "full":
+            # a by_design_unverified object: tier 1 reads one count per side and the value tiers skip it;
+            # in a window it is still marked at open and close and its schema is still read
+            src["tier1"] += 1
+            tgt["tier1"] += 1
+            if mode == "transactional":
+                src["tier0"] += 2 + (1 if c.watermark_source else 0)
+                tgt["tier0"] += 2
+                src["tier7"] += SCHEMA_FACT_STATEMENTS + (2 if c.identity_source else 0)
+                tgt["tier7"] += SCHEMA_FACT_STATEMENTS + (2 if c.identity_target else 0)
+            continue
         src["tier1"] += 1 + len(c.embeds)
         tgt["tier1"] += 1 + len(c.embeds)
         # Tier 2: one batched statement per table per side, plus one isolated probe per physical

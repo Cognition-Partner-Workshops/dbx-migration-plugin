@@ -2894,4 +2894,7 @@ def test_grading_is_checked_before_merge_authority_and_the_breaker_counts_it():
 def test_child_and_verifier_prompts_name_the_batches_by_design_objects():
     src = WORKFLOW.read_text()
     assert "by_design_unverified" in src.split("def child_prompt", 1)[1].split("def capability_block", 1)[0]
-    assert "grading_mismatch" in src.split("def verify_prompt", 1)[1].split("def close_prompt", 1)[0]
+    verify = src.split("def verify_prompt", 1)[1].split("def close_prompt", 1)[0]
+    assert "grading_mismatch" in verify
+    # a degraded wave's structural run blocks on the declared objects as well as on its mode
+    assert '[\\"by_design_unverified\\", \\"mode\\"]' in verify

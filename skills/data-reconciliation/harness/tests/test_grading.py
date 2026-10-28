@@ -17,6 +17,7 @@ from recon.config import (
     Tolerances,
     load_mapping_spec,
 )
+from recon.cost import estimate_cost
 from recon.engine import run_recon
 from recon.report import build_result, by_design_unverified, render_report, render_summary
 from recon.tiers import TierResult
@@ -116,3 +117,20 @@ def test_build_result_refuses_an_unknown_grading_and_records_none_by_default():
     assert r["grading"] == {} and r["merge_eligible"] is True
     with pytest.raises(ConfigError, match="grading"):
         build_result("u", "live", "m", "t", tiers, rerun_proof=PROVEN_RERUN, grading={"q": "subset"})
+
+
+def test_estimate_budgets_only_the_tiers_a_by_design_object_runs():
+    counts = {"ORDERS": 1_000_000}
+    for mode in ("live", "transactional"):
+        full = estimate_cost(_spec(grading="full"), TOL, "full", mode=mode, row_counts=counts)
+        graded = estimate_cost(_spec(), TOL, "full", mode=mode, row_counts=counts)
+        assert graded["source_rows_fetched"] < full["source_rows_fetched"]
+        assert graded["target_rows_fetched"] < full["target_rows_fetched"]
+        assert graded["source_statements"]["tier1"] == full["source_statements"]["tier1"]
+        for tier in ("tier2", "tier3") + (("tier5",) if mode == "transactional" else ()):
+            assert graded["source_statements"][tier] < full["source_statements"][tier]
+            assert graded["target_statements"][tier] < full["target_statements"][tier]
+        if mode == "transactional":
+            for side in ("source_statements", "target_statements"):
+                assert graded[side]["tier0"] == full[side]["tier0"] and graded[side]["tier7"] == full[side]["tier7"]
+        assert "quarantine" not in graded["tier3_mode"] and graded["tier3_mode"]
