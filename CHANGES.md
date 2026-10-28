@@ -28,6 +28,17 @@
   (`{privilege, inherited_from_type, ...}` items, recorded in `data.writable`), and accepts
   `--source-attested` for a Databricks source only as a committed `source_principal_attested` entry
   covering every in-scope table (row `warn`, never `ok`); dbx_guard blocks sessions adding that kind.
+- factory-doctor's session-identity connect (`dictionary_readable` on a Databricks-family source) no
+  longer passes `oauth_client_id/secret` to `databricks.sql.connect`, which the connector treats as
+  interactive U2M and waits on a browser for; it uses the recon harness's `credentials_provider`
+  (env-oidc mint inside the provider) with a socket timeout, verifies the warehouse with
+  `databricks warehouses get` before connecting (a deleted warehouse fails with
+  `DATABRICKS_HTTP_PATH names warehouse <id> which does not exist`), and takes `--http-path`
+  (recorded as `http_path`, signed; must equal a manifest's `capabilities.http_path` under `--wave`
+  and `--reuse-record`; a reused `dictionary_readable` row stands in only for the warehouse it was
+  probed on).
+  The harness's provider now returns a header factory, as the connector's `ExternalAuthProvider`
+  requires (it raised `'dict' object is not callable` on the first request).
 
 ## Fixed
 

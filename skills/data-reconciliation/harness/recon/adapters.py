@@ -1909,6 +1909,14 @@ def _databricks_sdk_config():
     return _sdk_core.Config()
 
 
+def _databricks_credentials_provider():
+    """The connector's `credentials_provider` contract (ExternalAuthProvider): called once per
+    connection for a header factory, which is then called per request. The factory is one Config's
+    `authenticate`, so the cached token is reused until near-expiry and the env-oidc mint happens
+    inside the provider, at connect time."""
+    return _databricks_sdk_config().authenticate
+
+
 def _databricks_connect(http_path: str | None = None):
     """Session identity only: DATABRICKS_HOST + DATABRICKS_CLIENT_ID with DATABRICKS_CLIENT_SECRET (oauth-m2m)
     or DATABRICKS_AUTH_TYPE=env-oidc; the warehouse path from --target-http-path or DATABRICKS_HTTP_PATH.
@@ -1919,7 +1927,7 @@ def _databricks_connect(http_path: str | None = None):
     host = _secret("DATABRICKS_HOST").removeprefix("https://").removeprefix("http://").rstrip("/")
     http_path = http_path or _secret("DATABRICKS_HTTP_PATH")
     return sql.connect(server_hostname=host, http_path=http_path,
-        credentials_provider=_databricks_sdk_config().authenticate)
+        credentials_provider=_databricks_credentials_provider)
 
 
 class DatabricksTargetAdapter:

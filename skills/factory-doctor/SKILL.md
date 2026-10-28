@@ -27,10 +27,21 @@ python3 <plugin>/skills/factory-doctor/doctor.py --workspace <repo root> [--role
     [--expect-identity <migration SP userName>] [--expect-host <workspace URL>] [--expect-catalogs a,b] \
     [--hook-probe-result blocked:<nonce>|not-blocked] [--unit <unit_id> ...] [--mapping <mapping_spec.json> ...] \
     [--source-secret <ENV VAR NAME> [--source-family sqlserver|postgres|...] --param name=value ...] \
-    [--source-attested <id>] [--lakebase-project NAME --lakebase-parent-branch NAME] \
+    [--source-attested <id>] [--http-path /sql/1.0/warehouses/<id>] \
+    [--lakebase-project NAME --lakebase-parent-branch NAME] \
     [--lakebase-dsn ENV_VAR_NAME] [--lakebase-schema NAME] [--analytical-schema CATALOG.SCHEMA] \
     [--reuse-record PATH] [--out PATH]
 ```
+
+A Databricks-family source is probed as the session identity (env-oidc or oauth-m2m, through the
+recon harness's `credentials_provider`, with a socket timeout) on the SQL warehouse named by
+`--http-path`, else `DATABRICKS_HTTP_PATH`. The doctor runs `databricks warehouses get <id>` on
+that path before it connects, so a deleted warehouse fails `dictionary_readable` with
+`DATABRICKS_HTTP_PATH names warehouse <id> which does not exist` instead of hanging. The effective
+path is recorded as `http_path` in the report and signed into `wave-N.doctor.json`. A manifest may
+pin the warehouse in `capabilities.http_path`; under `--wave` the doctor uses it, and a differing
+`--http-path` is an error. Pin the warehouse this way, never by editing `DATABRICKS_*` in the
+environment (the guard treats that as an identity swap).
 
 `--plugin-root` is optional. The guard accepts it only as the literal path of the running plugin
 (not a shell variable or another plugin tree).

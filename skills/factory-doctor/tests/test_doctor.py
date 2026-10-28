@@ -3751,3 +3751,146 @@ def test_source_principal_accepts_empty_table_list_for_sqlserver_and_postgres(mo
     row = doctor.check_source_principal([], family, "SOURCE_DSN", connect=lambda dsn: conn)
     assert row.status == "ok", row.detail
     assert row.data["tables"] == [] and conn.closed
+
+
+# ------------------------------------------------------------------ session-identity connect (warehouse, provider, timeout)
+
+def _fake_databricks_stack(monkeypatch, captured, *, headers=None, warehouse=(0, '{"id": "wh1", "state": "RUNNING"}', "")):
+    """databricks.sql.connect captures its kwargs; databricks.sdk.core.Config mints `headers`; the CLI
+    answers `warehouses get` with `warehouse` (rc, out, err)."""
+    import databricks  # real namespace package; its `sql` attribute is what `from databricks import sql` binds
+    fake_sql = types.ModuleType("databricks.sql")
+    fake_sql.connect = lambda **kw: captured.update(kw) or "conn"
+    monkeypatch.setitem(sys.modules, "databricks.sql", fake_sql)
+    monkeypatch.setattr(databricks, "sql", fake_sql, raising=False)
+    fake_core = types.ModuleType("databricks.sdk.core")
+    fake_core.Config = lambda: types.SimpleNamespace(authenticate=headers or (lambda: {"Authorization": "Bearer t"}))
+    monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake_core)
+    fake_sdk = types.ModuleType("databricks.sdk")
+    fake_sdk.core = fake_core
+    monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/databricks" if name == "databricks" else None)
+    cli_calls = []
+
+    def run(cmd, **kw):
+        cli_calls.append(cmd)
+        assert cmd[:3] == ["/usr/bin/databricks", "warehouses", "get"], cmd
+        return warehouse
+    monkeypatch.setattr(doctor, "_run", run)
+    return cli_calls
+
+
+def test_session_connect_uses_the_harness_credentials_provider_and_a_timeout(monkeypatch):
+    """oauth-m2m: oauth_client_id/secret make the connector wait on a browser (U2M) forever, so the
+    doctor connects through the recon harness's credentials_provider with a socket timeout, after
+    `warehouses get` proved the path's warehouse exists."""
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net/")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "sp-client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "sp-secret")
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/abc123")
+    captured = {}
+    cli_calls = _fake_databricks_stack(monkeypatch, captured)
+    assert doctor._databricks_session_connect() == "conn"
+    assert cli_calls == [["/usr/bin/databricks", "warehouses", "get", "abc123", "--output", "json"]]
+    assert captured["server_hostname"] == "adb-1.azuredatabricks.net"
+    assert captured["http_path"] == "/sql/1.0/warehouses/abc123"
+    assert captured["_socket_timeout"] == doctor.DATABRICKS_SOCKET_TIMEOUT > 0
+    assert not {"oauth_client_id", "oauth_client_secret", "access_token"} & set(captured)
+    from recon.adapters import _databricks_credentials_provider
+    assert captured["credentials_provider"] is _databricks_credentials_provider  # shared, not forked
+    factory = captured["credentials_provider"]()  # the connector asks the provider for a header factory
+    assert callable(factory) and factory() == {"Authorization": "Bearer t"}
+
+
+def test_session_connect_env_oidc_mints_inside_the_provider(monkeypatch):
+    import recon.adapters as adapters
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net")
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/abc123")
+    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "env-oidc")
+    monkeypatch.setenv("DATABRICKS_DEVIN_AUDIENCE", "aud-1")
+    monkeypatch.delenv("DATABRICKS_OIDC_TOKEN", raising=False)
+    monkeypatch.delenv("DATABRICKS_CLIENT_SECRET", raising=False)
+    minted = []
+
+    def devin_oidc(cmd, **kw):
+        minted.append(cmd)
+        return types.SimpleNamespace(stdout="oidc-jwt\n")
+    monkeypatch.setattr(adapters.subprocess, "run", devin_oidc)
+    captured = {}
+    _fake_databricks_stack(monkeypatch, captured)
+    assert doctor._databricks_session_connect() == "conn"
+    assert minted == [] and "DATABRICKS_OIDC_TOKEN" not in os.environ  # not before the connector asks
+    factory = captured["credentials_provider"]()
+    assert minted == [["devin-oidc", "token", "--audience", "aud-1"]]
+    assert os.environ["DATABRICKS_OIDC_TOKEN"] == "oidc-jwt"
+    assert factory() == {"Authorization": "Bearer t"}
+
+
+def test_session_connect_fails_fast_on_a_dead_warehouse(monkeypatch):
+    """DATABRICKS_HTTP_PATH pointing at a deleted warehouse used to surface only as a hang."""
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net")
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/890be8990bf134aa")
+    captured = {}
+    _fake_databricks_stack(monkeypatch, captured, warehouse=(1, "", 'Error: SQL warehouse 890be8990bf134aa does not exist.'))
+    with pytest.raises(RuntimeError, match="^DATABRICKS_HTTP_PATH names warehouse 890be8990bf134aa which does not exist$"):
+        doctor._databricks_session_connect()
+    assert captured == {}  # never reached sql.connect
+    with pytest.raises(RuntimeError, match="^--http-path names warehouse feed0000 which does not exist$"):
+        doctor._databricks_session_connect("/sql/1.0/warehouses/feed0000")
+    # any other CLI failure fails fast too, with the redacted reason
+    _fake_databricks_stack(monkeypatch, captured, warehouse=(1, "", "Error: PERMISSION_DENIED token=abc"))
+    with pytest.raises(RuntimeError, match="could not be read: Error: PERMISSION_DENIED"):
+        doctor._databricks_session_connect()
+    with pytest.raises(RuntimeError, match="not a SQL warehouse HTTP path"):
+        doctor._databricks_session_connect("/sql/protocolv1/o/1/cluster-1")
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+    with pytest.raises(RuntimeError, match="databricks CLI not on PATH"):
+        doctor._databricks_session_connect()
+    assert captured == {}
+    # the rows that open the session report the detail instead of hanging
+    _fake_databricks_stack(monkeypatch, captured, warehouse=(1, "", "RESOURCE_DOES_NOT_EXIST"))
+    c = doctor.check_dictionary_readable(["mig.raw.loans"], "databricks", None, views=[("tables", "SELECT 1")])
+    assert c.status == "fail" and "DATABRICKS_HTTP_PATH names warehouse 890be8990bf134aa which does not exist" in c.detail
+    assert captured == {}
+
+
+def test_http_path_reaches_the_databricks_connect_slot_and_wins_over_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/from-env")
+    seen = []
+    monkeypatch.setitem(doctor._READ_ONLY_CONNECT, "databricks", lambda arg: seen.append(arg) or FakeDictConn())
+    c = doctor.check_dictionary_readable(["mig.raw.loans"], "databricks", None, views=[("tables", "SELECT 1")],
+                                         http_path="/sql/1.0/warehouses/flag")
+    assert c.status == "ok" and seen == ["/sql/1.0/warehouses/flag"]
+    doctor.check_dictionary_readable(["mig.raw.loans"], "databricks", "SRC_DBX", views=[("tables", "SELECT 1")])
+    assert seen[-1] == ""  # no flag: the slot falls back to DATABRICKS_HTTP_PATH, never a secret value
+    ws = make_workspace(tmp_path)
+    out = tmp_path / "caps.json"
+    doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--out", str(out),
+                 "--http-path", "/sql/1.0/warehouses/flag"])
+    assert json.loads(out.read_text())["http_path"] == "/sql/1.0/warehouses/flag"
+    doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--out", str(out)])
+    assert json.loads(out.read_text())["http_path"] == "/sql/1.0/warehouses/from-env"
+
+
+def test_wave_http_path_must_match_the_manifests_declared_path(tmp_path, monkeypatch, capsys):
+    ws, manifest, _pointer = _ready_wave(tmp_path, monkeypatch)
+    m = json.loads(manifest.read_text())
+    m["capabilities"]["http_path"] = "/sql/1.0/warehouses/declared"
+    manifest.write_text(json.dumps(m))
+    base = ["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--wave", str(manifest)]
+    with pytest.raises(SystemExit) as e:
+        doctor.main([*base, "--http-path", "/sql/1.0/warehouses/other"])
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and "differs from the manifest's capabilities.http_path /sql/1.0/warehouses/declared" in err
+    assert not manifest.with_suffix(".doctor.json").exists()
+    # the same path, or none, runs on the declared warehouse and signs it into the record
+    for extra in (["--http-path", "/sql/1.0/warehouses/declared"], []):
+        doctor.main([*base, *extra])
+        record = json.loads(manifest.with_suffix(".doctor.json").read_text())
+        assert record["http_path"] == "/sql/1.0/warehouses/declared"
+        assert doctor.wave_signature(record, manifest.read_bytes()) == record["signature"]
+    m["capabilities"]["http_path"] = ""
+    manifest.write_text(json.dumps(m))
+    with pytest.raises(SystemExit):
+        doctor.main(base)
+    assert "capabilities.http_path must be a SQL warehouse HTTP path" in capsys.readouterr().err

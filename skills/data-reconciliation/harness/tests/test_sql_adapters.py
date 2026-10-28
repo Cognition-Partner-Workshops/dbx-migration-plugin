@@ -210,9 +210,12 @@ def test_databricks_connect_uses_sdk_credentials_provider_for_m2m(monkeypatch):
     assert "access_token" not in captured
     assert "oauth_client_id" not in captured
     assert "oauth_client_secret" not in captured
-    # a run that outlives its first token re-mints through the provider
-    assert captured["credentials_provider"]() == {"Authorization": "Bearer tok1"}
-    assert captured["credentials_provider"]() == {"Authorization": "Bearer tok2"}
+    # ExternalAuthProvider calls the provider once for a header factory, then the factory per request:
+    # a run that outlives its first token re-mints through that factory
+    factory = captured["credentials_provider"]()
+    assert callable(factory)
+    assert factory() == {"Authorization": "Bearer tok1"}
+    assert factory() == {"Authorization": "Bearer tok2"}
 
 
 def test_databricks_connect_env_oidc_uses_sdk_bearer(monkeypatch):
@@ -234,7 +237,7 @@ def test_databricks_connect_env_oidc_uses_sdk_bearer(monkeypatch):
     captured = {}
     _fake_databricks_sql(monkeypatch, captured)
     assert adapters._databricks_connect() == "conn"
-    assert captured["credentials_provider"]() == {"Authorization": "Bearer tok"}
+    assert captured["credentials_provider"]()() == {"Authorization": "Bearer tok"}
     assert "oauth_client_secret" not in captured
 
 
