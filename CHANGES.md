@@ -1,4 +1,4 @@
-# 0.6.1 (unreleased)
+# 0.6.1 — waves launch without a hand-written pointer
 
 ## Changed
 
@@ -22,6 +22,15 @@
   can reach one green doctor; a mixed audit records `target_kind: "mixed"` and is never reused by a child.
 - `factory-doctor`: setup probes `--source-secret` at principal level before mappings exist; table
   grants remain per-unit.
+- `wave-plan/derive_waves.py` derives units, waves and batches from `dependencies.json` and the
+  unit mapping specs (`--batch-max`, default 5); `--check` verifies a hand-edited manifest against
+  the derivation. Wave 0 for dependency-free shared units is opt-in via `--shared-wave-0`.
+- `hooks/dbx_guard.py` classifies the invoked client instead of payload text, so reads pass when
+  `.migration/` has no allowlist yet; writes without a committed allowlist, invalid allowlists,
+  legacy writes and identity swaps still block. `hooks/tests/test_guard_clean_shipped.py` runs the
+  guard over every shipped command.
+- `hooks/dbx_guard.py`: the doctor's hook probe blocks from any shell, not only inside a workspace.
+- `hooks/dbx_guard.py`: read-only `databricks metastores current|summary` are allowed.
 
 # 0.6.0 — .migration/ holds machine files only
 
