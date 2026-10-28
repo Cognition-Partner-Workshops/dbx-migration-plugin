@@ -2035,6 +2035,119 @@ def _field(source, source_type, target_type):
             "source_type": source_type, "target_type": target_type}
 
 
+def _family_unit_mapping(ws: Path, unit: str, family: str, fields=None) -> Path:
+    """A sibling pipeline's spec: same units/ dir, top-level `family` naming its own source."""
+    p = _typed_unit_mapping(ws, unit, fields or [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    p.write_text(json.dumps({**json.loads(p.read_text()), "family": family}))
+    return p
+
+
+def test_wave_units_scope_the_orchestrator_audit_to_the_manifests_units(tmp_path):
+    """Two pipelines share .migration/units/: the Oracle wave's doctor audits its own units and
+    leaves the Databricks-sourced lane to that lane's wave doctor."""
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "invoices", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    _family_unit_mapping(ws, "analytics", "databricks")
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT, wave_units=["invoices"])
+    assert c.status == "ok", c.detail
+    assert c.data["units"] == ["invoices"] and c.data["families"] == {"invoices": None}
+    # without a wave (setup, or an orchestrator before the manifest) the glob stays and the sibling
+    # spec is audited against this run's family
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT)
+    assert c.status == "fail" and c.data["units"] == ["analytics", "invoices"]
+    assert "declares family=databricks but this run reconciles oracle" in c.detail
+    expected, todo, problem = doctor.resolve_mappings(ws, "orchestrator", [], [], wave_units=["invoices", "invoices"])
+    assert problem is None and list(expected) == ["invoices"] and set(todo) == {"invoices"}
+    # a wave unit with no spec is a hand-off problem, never a shorter list
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT,
+                                    wave_units=["invoices", "ghost"])
+    assert c.status == "fail" and c.data["missing_units"] == ["ghost"] and "hand-off incomplete" in c.detail
+    assert c.data["units_problem"] is True
+    # a manifest whose batches name no unit is not a wave with nothing to audit but a broken hand-off:
+    # migration-fanout refuses it too, so the doctor must not sign a ready record for it
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT, wave_units=[])
+    assert c.status == "fail" and "names no units" in c.detail and "hand-off incomplete" in c.detail
+    assert c.data == {"units": [], "mappings": {}, "units_problem": True}
+    # --unit still narrows nothing for an orchestrator, wave or not
+    c = doctor.check_type_map_audit(ws, "orchestrator", ["invoices"], [], "oracle", PLUGIN_ROOT,
+                                    wave_units=["invoices"])
+    assert c.status == "fail" and "--unit narrows nothing" in c.detail
+
+
+def test_wave_unit_spec_declaring_another_family_fails_every_source_row(tmp_path, monkeypatch):
+    ws = make_workspace(tmp_path)
+    _family_unit_mapping(ws, "analytics", "databricks")
+    want = ("declares family=databricks but this run reconciles oracle: move the unit to its own pipeline's "
+            "wave or fix the spec")
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT, wave_units=["analytics"])
+    assert c.status == "fail" and want in c.detail and "analytics/mapping_spec.json" in c.detail
+    assert c.data["families"] == {"analytics": "databricks"} and c.data["units_problem"] is True
+    monkeypatch.setenv("ORA_DSN", "oracle://ro:pw@h:1521/SVC")
+    for row in (doctor.check_source_principal_all(ws, "orchestrator", [], [], "ORA_DSN", "oracle", PLUGIN_ROOT,
+                                                  wave_units=["analytics"]),
+                doctor.check_dictionary_readable_all(ws, "orchestrator", [], [], "ORA_DSN", "oracle", PLUGIN_ROOT,
+                                                     wave_units=["analytics"]),
+                doctor.check_delete_evidence_all(ws, "orchestrator", [], [], "ORA_DSN", PLUGIN_ROOT,
+                                                 connect=lambda *a, **k: pytest.fail("connected"),
+                                                 wave_units=["analytics"], source_family="oracle")):
+        assert row.status == "fail" and want in row.detail, row.id
+        assert row.data["families"] == {"analytics": "databricks"}
+    # the matching family, or none declared, audits as before
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "databricks", PLUGIN_ROOT, wave_units=["analytics"])
+    assert c.status != "fail" and c.data["families"] == {"analytics": "databricks"}
+    _family_unit_mapping(ws, "legacy", "mainframe")
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT, wave_units=["legacy"])
+    assert c.status == "fail" and "family 'mainframe' must be one of" in c.detail
+
+
+def test_manifest_units_is_the_union_of_the_batches_units_only():
+    manifest = {"batches": [{"id": "b1", "units": ["invoices", "payments"]}, {"id": "b2", "units": ["payments",
+                "fees"]}], "merge_overrides": [{"decision": "d", "units": ["analytics"]}]}
+    assert doctor.manifest_units(manifest) == ["fees", "invoices", "payments"]
+    assert doctor.manifest_units({"batches": []}) == []
+    assert doctor.manifest_units({"capabilities": {}}) is None
+    assert doctor.manifest_units("not a manifest") is None
+
+
+def test_wave_flag_audits_only_the_manifests_units(tmp_path):
+    ws = make_workspace(tmp_path)
+    _typed_unit_mapping(ws, "invoices", [_field("ORDER_ID", "NUMBER(18,0)", "bigint")])
+    _family_unit_mapping(ws, "analytics", "databricks")
+    manifest = ws / ".migration" / "waves" / "wave-invoicing-1.json"
+    manifest.parent.mkdir()
+    body = {"capabilities": {"identity": "sp-1", "host": "https://h", "catalogs": ["mig_cat"]},
+            "source": {"family": "oracle", "secret": "LEGACY_DSN"},
+            "batches": [{"id": "b1", "units": ["invoices"], "write_targets": []}]}
+    manifest.write_text(json.dumps(body))
+    hook_probe = probed(ws)
+
+    def record():
+        subprocess.run([sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--no-databricks",
+                        "--hook-probe-result", hook_probe, "--wave", str(manifest)],
+                       capture_output=True, text=True, check=False)
+        return {c["id"]: c for c in json.loads(manifest.with_suffix(".doctor.json").read_text())["checks"]}
+
+    row = record()["type_map_audit"]
+    assert row["status"] == "ok", row["detail"]
+    assert row["data"]["units"] == ["invoices"] and row["data"]["families"] == {"invoices": None}
+    manifest.write_text(json.dumps({**body, "batches": [{"id": "b1", "units": ["invoices", "ghost"]}]}))
+    row = record()["type_map_audit"]
+    assert row["status"] == "fail" and "hand-off incomplete" in row["detail"]
+    assert row["data"]["missing_units"] == ["ghost"]
+    manifest.write_text(json.dumps({**body, "batches": [{"id": "b1", "units": ["analytics"]}]}))
+    rows = record()
+    for cid in ("type_map_audit", "delete_evidence"):
+        assert rows[cid]["status"] == "fail", cid
+        assert "declares family=databricks but this run reconciles oracle" in rows[cid]["detail"], cid
+    manifest.write_text(json.dumps({**body, "batches": []}))
+    rows = record()
+    assert rows["type_map_audit"]["status"] == "fail" and "names no units" in rows["type_map_audit"]["detail"]
+    assert not manifest.with_suffix(".doctor.json").read_text().count('"ready": true')
+    manifest.write_text(json.dumps({k: v for k, v in body.items() if k != "batches"}))
+    rows = record()
+    assert rows["type_map_audit"]["data"]["units"] == ["analytics", "invoices"]  # no batches: the glob stays
+
+
 def test_type_map_audit_skipped_at_setup(tmp_path):
     ws = make_workspace(tmp_path)
     c = doctor.check_type_map_audit(ws, "orchestrator", [], [], None, PLUGIN_ROOT)
@@ -2829,7 +2942,7 @@ def _signed_record(manifest, *, identity="sp-1", host="https://adb-1", rows=None
     carry one row per reusable id, against manifest_bytes of this exact manifest."""
     manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
     rows = rows if rows is not None else [
-        {"id": rid, "status": "ok", "detail": f"{rid} done", "data": {"k": rid}}
+        {"id": rid, "status": "ok", "detail": f"{rid} done", "data": {"k": rid, "units": []}}
         for rid in doctor.REUSABLE_ROWS]
     report = {"schema": "dbx-migration-factory/capabilities/1", "role": "orchestrator",
               "ready": True, "identity": {"userName": identity, "host": host}, "inputs_sha": "inputs-a",
@@ -2923,7 +3036,7 @@ def test_reusable_rows_are_the_non_safety_checkout_bound_ones():
 def test_run_reuses_the_signed_source_side_rows_and_keeps_identity_fresh(tmp_path, monkeypatch):
     manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1"}}
     rows = [{"id": rid, "status": "ok", "detail": f"{rid} done",
-             "data": {"k": rid, "target_kind": "databricks"}}
+             "data": {"k": rid, "target_kind": "databricks", "units": []}}
             for rid in (*doctor.REUSABLE_ROWS, *SAFETY_ROWS, *LOCAL_ROWS)]
     record, manifest_bytes = _signed_record(manifest, rows=rows)
     reused, why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
@@ -2972,7 +3085,7 @@ def test_run_recomputes_type_map_audit_when_the_recorded_target_kind_differs(tmp
                         doctor.Check("type_map_audit", "ok", "fresh", {"target_kind": target_kind}))
     ws = make_workspace(tmp_path)
     for recorded, child in (("databricks", "lakebase"), (None, "databricks")):
-        data = {"k": "x"} if recorded is None else {"k": "x", "target_kind": recorded}
+        data = {"k": "x", "units": []} if recorded is None else {"k": "x", "target_kind": recorded, "units": []}
         rows = [{"id": "type_map_audit", "status": "ok", "detail": "audited", "data": data}]
         record, manifest_bytes = _signed_record(manifest, rows=rows)
         reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
@@ -2982,20 +3095,46 @@ def test_run_recomputes_type_map_audit_when_the_recorded_target_kind_differs(tmp
         row = by_id(report)["type_map_audit"]
         assert row["detail"] == "fresh" and row["data"]["target_kind"] == child, (recorded, child)
     rows = [{"id": "type_map_audit", "status": "ok", "detail": "audited",
-             "data": {"target_kind": "lakebase"}}]
+             "data": {"target_kind": "lakebase", "units": []}}]
     record, manifest_bytes = _signed_record(manifest, rows=rows)
     reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
     report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True,
                         expect_host="https://adb-1", target_kind="lakebase", reused=reused)
     assert by_id(report)["type_map_audit"]["detail"].startswith("reused from")
     rows = [{"id": "type_map_audit", "status": "ok", "detail": "audited",
-             "data": {"target_kind": "mixed"}}]
+             "data": {"target_kind": "mixed", "units": []}}]
     record, manifest_bytes = _signed_record(manifest, rows=rows)
     reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
     report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True,
                         expect_host="https://adb-1", target_kind="lakebase", reused=reused)
     row = by_id(report)["type_map_audit"]
     assert row["detail"] == "fresh" and row["data"]["target_kind"] == "lakebase"
+
+
+def test_run_refuses_a_reused_row_whose_units_exceed_the_recorded_set(tmp_path, monkeypatch):
+    """The orchestrator audits its wave's units only, so a child may stand on a recorded row just for
+    units that row covered; a row that recorded no unit set proves nothing."""
+    manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1"}}
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1", "host": "https://adb-1"})])
+    monkeypatch.setattr(doctor, "check_delete_evidence_all",
+                        lambda *a, **k: doctor.Check("delete_evidence", "ok", "fresh"))
+    ws = make_workspace(tmp_path)
+
+    def row_for(recorded, child_units):
+        data = {"k": "x"} if recorded is None else {"k": "x", "units": recorded}
+        rows = [{"id": "delete_evidence", "status": "ok", "detail": "audited", "data": data}]
+        record, manifest_bytes = _signed_record(manifest, rows=rows)
+        reused, _ = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+        assert reused is record
+        report = doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", True, units=child_units,
+                            expect_host="https://adb-1", reused=reused)
+        return by_id(report)["delete_evidence"]
+
+    assert row_for(["invoices", "payments"], ["invoices"])["detail"].startswith("reused from")
+    assert row_for(["invoices"], ["invoices", "payments"])["detail"] == "fresh"
+    assert row_for(None, ["invoices"])["detail"] == "fresh"
+    assert row_for("invoices", ["invoices"])["detail"] == "fresh"
 
 
 def test_run_computes_a_reusable_row_the_record_lacks(tmp_path, monkeypatch):

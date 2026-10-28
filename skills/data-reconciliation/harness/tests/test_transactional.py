@@ -360,6 +360,19 @@ def test_a_rowversion_watermark_is_the_unsigned_big_endian_counter_everywhere():
         check_comparable(_rowversion(1), T0, "rv")
 
 
+def test_mapping_spec_ignores_the_top_level_family_key(tmp_path):
+    """`family` is factory-doctor's: the spec names the source family its unit reconciles so a wave
+    doctor can refuse a sibling pipeline's spec; the harness takes the family from its run flags."""
+    spec = {"version": "m1", "family": "databricks", "objects": [{
+        "object": "loans", "root_table": "dbo.loans",
+        "key": {"source": ["loan_id"], "target": "loan_id"},
+        "fields": [{"source": "loan_number", "target": "loan_number"}]}]}
+    p = tmp_path / "m.json"
+    p.write_text(json.dumps(spec))
+    loaded = load_mapping_spec(p, {})
+    assert loaded.objects[0].root_table == "dbo.loans" and not hasattr(loaded, "family")
+
+
 def test_mapping_spec_loads_watermark_identity_and_unit(tmp_path):
     spec = {"version": "m1", "objects": [{
         "object": "loans", "root_table": "dbo.loans",
