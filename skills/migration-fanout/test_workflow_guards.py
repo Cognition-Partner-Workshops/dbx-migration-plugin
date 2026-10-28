@@ -2826,7 +2826,7 @@ _blocked_by_design = (False, ["evidence"], ["by_design_unverified"], ["mig.q"])
 
 def _run_batch_with(recon, batch=_BY_DESIGN_BATCH, report=None, overrides=()):
     ns = _batch_runtime()
-    ns["MANIFEST"] = {"merge_overrides": list(overrides)}
+    ns["AUTHORIZATIONS"] = _auth(list(overrides))
     ns["unit_recon"] = lambda head, units: {u: recon[u] for u in units}
 
     async def agent(prompt, **kwargs):
