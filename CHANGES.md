@@ -31,7 +31,8 @@
 
 - Plan-chosen grading for target-only outputs: a mapping-spec object may carry
   `"grading": "by_design_unverified"` (reject-only quarantine sinks, rollups). The harness keeps
-  target rows <= root rows and the structural tier, skips the value tiers, records `grading` in
+  target rows <= root rows and the structural tier (minus the root-key comparison; the target's own
+  key must be unique), skips the value tiers, records `grading` in
   `result.json`, labels the object `unverified(by_design)`, and blocks the merge with reason
   `by_design_unverified` (class `evidence`). The wave manifest batch declares the same objects in
   `by_design_unverified` (in `plan_sha`); the launch halts when spec and manifest disagree, the batch

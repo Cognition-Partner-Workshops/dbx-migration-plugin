@@ -134,3 +134,65 @@ def test_estimate_budgets_only_the_tiers_a_by_design_object_runs():
             for side in ("source_statements", "target_statements"):
                 assert graded[side]["tier0"] == full[side]["tier0"] and graded[side]["tier7"] == full[side]["tier7"]
         assert "quarantine" not in graded["tier3_mode"] and graded["tier3_mode"]
+
+
+# ------------------------------------------------------------------ structural parity
+
+def _estate_with_keys(target_name, target_pk, grading="by_design_unverified", key_target="order_id",
+                      rows=None, platform=False):
+    """ORDERS keyed by ORDER_ID; a second target object keyed as declared."""
+    obj = ObjectMapping(object=target_name, root_table="ORDERS", key_source=["ORDER_ID"], key_target=[key_target],
+                        fields=[FieldMapping("TOTAL", "total", "NUMBER(10,2)", "decimal(10,2)")], grading=grading)
+    spec = MappingSpec(version="map-v1", objects=[_spec().objects[0], obj])
+    source, target = _estate(0)
+    target.tables[target_name] = rows if rows is not None else [{key_target: 7, "total": 1.0}]
+    target.schema[target_name] = SchemaFacts(table=target_name, primary_key=target_pk)
+    if platform:
+        target.target_kind = "databricks"
+    return spec, source, target
+
+
+def _structural(spec, source, target):
+    r = run_recon("u", "live", spec, TOL, RULES, source, target, rerun_proof=PROVEN_RERUN)
+    tier0 = next(t for t in r["tiers"] if t["tier"] == 0)
+    return r, [(f["object"], f["check"]) for f in tier0["findings"]]
+
+
+ROLLUP_ROWS = [{"order_id": 1, "customer_id": 7, "total": 1.0}]
+
+
+def test_a_rollup_keyed_differently_from_its_root_passes_structural_parity():
+    # the root key maps to order_id; the rollup's enforced key is customer_id
+    spec, source, target = _estate_with_keys("totals", ("customer_id",), rows=ROLLUP_ROWS)
+    r, findings = _structural(spec, source, target)
+    assert ("totals", "primary_key_mismatch") not in findings and not findings
+    assert r["verdict"] == "PASS" and r["merge_block_reasons"] == ["by_design_unverified"]
+
+
+def test_a_same_key_reject_sink_grades_structurally_as_before():
+    spec, source, target = _estate_with_keys("quarantine", ("order_id",))
+    r, findings = _structural(spec, source, target)
+    assert not findings and r["verdict"] == "PASS"
+
+
+def test_a_by_design_target_without_an_enforced_key_must_prove_its_key_unique():
+    # no PK on the target and no uniqueness probe available: fail closed
+    spec, source, target = _estate_with_keys("totals", (), key_target="customer_id",
+                                             rows=[{"customer_id": 7, "total": 1.0}])
+    r, findings = _structural(spec, source, target)
+    assert findings == [("totals", "target_key_not_unique")] and r["verdict"] == "FAIL"
+    # a Databricks target probes the key: duplicates block, a unique key passes
+    dup = [{"customer_id": 7, "total": 1.0}, {"customer_id": 7, "total": 2.0}]
+    spec, source, target = _estate_with_keys("totals", (), key_target="customer_id", rows=dup, platform=True)
+    r, findings = _structural(spec, source, target)
+    assert findings == [("totals", "target_key_not_unique")] and r["verdict"] == "FAIL"
+    spec, source, target = _estate_with_keys("totals", (), key_target="customer_id",
+                                             rows=[{"customer_id": 7, "total": 1.0}], platform=True)
+    r, findings = _structural(spec, source, target)
+    assert not findings and r["verdict"] == "PASS"
+
+
+def test_an_object_graded_full_with_a_mismatched_key_still_blocks():
+    spec, source, target = _estate_with_keys("totals", ("customer_id",), grading="full", rows=ROLLUP_ROWS)
+    r, findings = _structural(spec, source, target)
+    assert ("totals", "primary_key_mismatch") in findings and r["verdict"] == "FAIL"
