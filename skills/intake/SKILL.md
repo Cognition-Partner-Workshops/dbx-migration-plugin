@@ -15,7 +15,10 @@ that after the human approves the plan.
 - Source family and engine versions (incl. driver/ODBC needs), and the estate type from
   `references/estate-types.md` (ETL, warehouse, code/ML, OLTP).
 - Target side: Unity Catalog catalog names for the migration catalog and cutover catalog(s),
-  or Lakebase project/branch for the operational track.
+  or Lakebase project/branch for the operational track. For Lakebase, also the adjacent-session
+  list: every pipeline and every follow-on session (parallel-run, consumer rehearsal, a second
+  pipeline) that will write its own `mig-*` branch, so `workspace-setup` creates them all and
+  records their endpoint hosts in `target_hosts` in one PR instead of a human edit per branch.
 - Coexistence posture: how long systems run in parallel and which parallel-run tier applies.
 - Correctness contract: exact match or the deviations (per-type/per-surface tolerances, row and
   aggregate thresholds, nondeterminism rules, legacy-query concurrency cap, live vs degraded
@@ -41,6 +44,7 @@ that after the human approves the plan.
 | Correctness deviations | Phase-1 decision `recon-tolerances` — `important: true, selected: null` — then `recon_tolerances.json` |
 | Access posture (federation / snapshot / export) | Phase-1 decision `source-access` |
 | Target catalogs / Lakebase project | Phase-1 decision `target-catalogs` → `allowed_targets.json` |
+| Lakebase adjacent-session list | Phase-1 decision `lakebase-branches` (one `mig-*` id per pipeline and per adjacent session) → `workspace-setup` creates them and fills `target_hosts` |
 | Notification route (Slack/webhook) | Blocker `{kind: mcp}` or `{kind: secret}` on the step that posts |
 | Connected repo / base branch | Blocker `{kind: repo, repo: <owner>/<name>}` + `base-branch` decision (`selected`) |
 | Timeline / freeze windows | `depends_on` ordering and gates on the cutover phase |

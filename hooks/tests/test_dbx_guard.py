@@ -168,6 +168,10 @@ def test_lakebase_writes_require_an_allowlisted_project():
     "databricks postgres get-branch projects/loan-mig/branches/w0-b1",
     """databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"database": "projects/loan-mig/branches/mig-w0/databases/app"}}'""",
     """databricks postgres create-catalog mig_cat --json '{"project": "loan-mig", "branch": "mig-w0"}'""",
+    """databricks postgres create-catalog mig_cat --json '{"branch": "mig-x"}'""",
+    """databricks postgres create-catalog mig_cat --json '{"branch": "projects/loan-mig/branches/mig-x"}'""",
+    """databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"branch": "projects/loan-mig/branches/mig-x"}}'""",
+    """databricks postgres create-catalog mig_cat --json '{"source_branch": "production", "branch": "mig-x"}'""",
 ])
 def test_lakebase_branch_globs_allow_matching_writes_and_reads(cmd):
     approve(cmd, LB2_CFG)
@@ -180,6 +184,11 @@ def test_lakebase_branch_globs_allow_matching_writes_and_reads(cmd):
     ("""databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"database": "projects/loan-mig/branches/w0-b1/databases/app"}}'""",
      "lakebase_branches"),
     ("""databricks postgres create-catalog mig_cat --json '{"project": "loan-mig", "branch": "w0-b1"}'""", "lakebase_branches"),
+    ("""databricks postgres create-catalog mig_cat --json '{"branch": "projects/loan-mig/branches/w0-b1"}'""", "lakebase_branches"),
+    ("""databricks postgres create-catalog mig_cat --json '{"branch": "projects/other/branches/mig-x"}'""", "lakebase_projects"),
+    ("""databricks postgres create-catalog mig_cat --json '{"branch": "projects/loan-mig/branches/production"}'""", "production"),
+    ("""databricks postgres create-synced-table mig_cat.oltp.loans --json '{"spec": {"branch": "projects/loan-mig/branches/production"}}'""",
+     "production"),
 ])
 def test_lakebase_branch_globs_block_nonmatching_writes(cmd, needle):
     assert needle in block(cmd, LB2_CFG).reason
