@@ -30,6 +30,18 @@ This section is the only home for the merge-authority rule; other files point he
 - The only exception is a committed `merge_override` entry of `.migration/authorizations.json`
   naming the wave and the affected units (the plan decision that cleared them); it lifts merge
   policy only, never a `data` blocker, and parity stays as measured.
+- A target-only output (a reject-only quarantine sink, a group-by rollup) is never a copy of its root,
+  so grading it 1:1 fails by construction. Its spec object carries `"grading": "by_design_unverified"`
+  (default `full`): tier 1 then checks only target rows <= root rows (`root_count_exceeded` fails),
+  tier 0/7 still read its structure but skip the root-key comparison (a rollup keyed by `customer_id`
+  over orders keyed by `order_id` is not `primary_key_mismatch`) while holding the target's own key
+  unique (an enforced PK, else a uniqueness probe of the mapping key; `target_key_not_unique` fails
+  closed), tiers 2-3 and 5-6 skip it, and `result.json["grading"]` records
+  every object's grading. Such an object blocks the merge with reason `by_design_unverified` (class
+  `evidence`); the report labels it `unverified(by_design)`. The block lifts only when the committed
+  wave manifest's batch lists the same object in `by_design_unverified` (a plan decision, see
+  `wave-plan`); the workflow fails a batch `grading_mismatch` when the result's set and the
+  manifest's differ, so an undeclared one never merges and a `merge_override` authorization is not needed.
 
 ## Run it
 

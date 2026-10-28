@@ -116,6 +116,10 @@ def wave_card(result: dict) -> str:
         blockers.append("undeclared write targets")
     if result.get("unreported_write_targets"):
         blockers.append("write targets not reported")
+    by_design = sorted({o for b in batches if isinstance(b.get("by_design_unverified"), list)
+                        for o in b["by_design_unverified"] if isinstance(o, str)})
+    if by_design:
+        blockers.append(f"unverified(by_design) {_ids(by_design)}")
 
     overrides = [o for o in result.get("merge_overrides", []) if isinstance(o, dict)]
     failed = [b["id"] for b in batches if b.get("status") in ("FAIL", "BLOCKED")]

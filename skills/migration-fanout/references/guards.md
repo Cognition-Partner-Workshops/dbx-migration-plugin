@@ -86,9 +86,21 @@ list changed paths and write targets for later gates.
 Git-observed changes to protected `.migration/` files are reclassified as
 `protected_files_tampered`, even when a child claims a clean or harmless diff.
 
+## Grading
+
+An object graded `unverified(by_design)` (a reject-only sink, a rollup) is named in three places or
+nowhere: the unit spec (`grading: by_design_unverified`), the committed manifest batch
+(`by_design_unverified`, part of `plan_sha`), and the harness result (`grading`). The launch halts
+when the spec and the manifest disagree; a batch whose results grade a different set than the
+manifest declares fails `grading_mismatch`, like `protected_files_tampered`, whatever the child
+claims. The harness still blocks such an object on its own (`by_design_unverified`, class
+`evidence`), so a declaration the manifest lacks never merges and no `authorizations.json` entry
+is involved.
+
 ## Merge authority
 
-PASS requires merge-eligible harness evidence for every unit, unless exactly one
+PASS requires merge-eligible harness evidence for every unit (a result blocked only by
+`by_design_unverified` for exactly the objects the batch declares counts as such), unless exactly one
 `merge_override` entry of `.migration/authorizations.json` on origin/`base_branch` names this
 wave (`wave: wave-<tag>`, the manifest file stem), covers every unit of the batch in `objects`,
 and the child reports that entry's id. A `blocker_classes` scope forgives only the policy

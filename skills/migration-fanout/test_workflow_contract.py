@@ -25,7 +25,8 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
                pipelines=None, auto_merge=None, close_minutes=None, other_batch=None,
                lakeflow_pipelines=(), extra_batches=(), serialized_pipelines=None, plugin=PLUGIN, width=1,
                manifest_extra=None, plan_step="run-wave-0", child_skill="unit-migration",
-               verify_skill="wave-verify", drop_keys=(), authorizations=None, overrides=None):
+               verify_skill="wave-verify", drop_keys=(), authorizations=None, overrides=None,
+               by_design_unverified=None):
     """`overrides` are `{decision, units, blocker_classes?, wave?}` rows committed as `merge_override`
     authorizations of this manifest's wave (its file stem) unless a row names another `wave`."""
     ws = tmp_path / "ws"
@@ -75,6 +76,8 @@ def _workspace(tmp_path, *, doctor=True, tamper=None,
         manifest["serialized_pipelines"] = dict(serialized_pipelines)
     if deploy_objects is not None:
         manifest["batches"][0]["deploy_objects"] = list(deploy_objects)
+    if by_design_unverified is not None:
+        manifest["batches"][0]["by_design_unverified"] = list(by_design_unverified)
     if max_minutes is not None:
         manifest["max_minutes"] = max_minutes
     if batch_max_minutes is not None:
@@ -790,6 +793,71 @@ def _merged(ws, pr, **extra):
 def _verify_report(**extra):
     return {"wave_verdict": "PASS", "unit_verdicts": {"b-1": "PASS"},
             "findings": [], "changed_paths": [], **extra}
+
+
+def _graded_spec(grading="by_design_unverified"):
+    return {"version": "1", "objects": [
+        {"object": "mig.t", "root_table": "src.t", "key": {"source": ["id"], "target": "id"}, "fields": []},
+        {"object": "mig.q", "root_table": "src.t", "key": {"source": ["id"], "target": "id"}, "fields": [],
+         "grading": grading}]}
+
+
+def _by_design_result(objects=("mig.q",)):
+    blockers = [{"reason": "by_design_unverified", "class": "evidence"}] if objects else []
+    return json.dumps({"verdict": "PASS", "parity": "PASS", "merge_eligible": not objects, "blockers": blockers,
+                       "blocker_classes": sorted({b["class"] for b in blockers}),
+                       "grading": {"mig.t": "full", **{o: "by_design_unverified" for o in objects}},
+                       "merge_authority": {"kind": "harness", "decision_id": None}})
+
+
+def test_a_by_design_unverified_object_merges_only_when_manifest_spec_and_result_all_name_it(tmp_path):
+    """A reject-only sink or a rollup is graded unverified(by_design) by a plan decision the manifest pins
+    (`batches[].by_design_unverified`, in plan_sha); the unit spec grades it so and the harness blocks on
+    it. All three agree, or the batch does not merge."""
+    from decisions import plan_sha
+    ws, cwd = _workspace(tmp_path / "agree", mappings={"u": _graded_spec()}, recon={"u": _by_design_result()},
+                         by_design_unverified=("mig.q",))
+    manifest = json.loads((ws / ".migration/waves/wave-0.json").read_text())
+    without = {**manifest, "batches": [{k: v for k, v in manifest["batches"][0].items() if k != "by_design_unverified"}]}
+    assert plan_sha(manifest) != plan_sha(without)  # the declaration is plan, never plumbing
+    pr = _push_pr(ws)
+    proc, calls = _run(cwd, tmp_path / "agree", [_pass_report(pr, merge_eligible=False), _verify_report(),
+                                                 {"error": "close step stubbed"}])
+    assert proc.returncode == 0, proc.stderr
+    result = _result(ws)
+    batch = result["batches"][0]
+    assert batch["status"] == "PASS" and batch["merge_authority"] == {"kind": "harness", "decision_id": None}
+    assert batch["by_design_unverified"] == ["mig.q"] and batch["merge_eligible"] is False
+    assert result["closed"] is True
+    assert any("mig.q unverified(by_design)" in line for line in result["brief"])
+    assert "unverified(by_design) mig.q" in (ws / ".migration/waves/wave-0.card.md").read_text()
+    verify_prompt = [c for c in calls if c["kind"] == "agent"][1]["prompt"]
+    listed = json.loads(verify_prompt.split("Verify these batches:\n", 1)[1].split("\n\nRe-run", 1)[0])
+    assert listed[0]["by_design_unverified"] == ["mig.q"] and "grading_mismatch" in verify_prompt
+
+    # the spec grades it but the manifest does not declare it: nothing launches
+    ws, cwd = _workspace(tmp_path / "undeclared", mappings={"u": _graded_spec()}, recon={"u": _by_design_result()})
+    proc, calls = _run(cwd, tmp_path / "undeclared", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "grades 'mig.q' by_design_unverified, but the manifest batch does not" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    # the manifest declares it but the spec grades it full: nothing launches
+    ws, cwd = _workspace(tmp_path / "ungraded", mappings={"u": _graded_spec("full")}, recon={"u": _by_design_result()},
+                         by_design_unverified=("mig.q",))
+    proc, calls = _run(cwd, tmp_path / "ungraded", [_pass_report("https://github.com/acme/target/pull/1")])
+    assert proc.returncode != 0 and "names ['mig.q'], which no object of" in proc.stderr
+    assert not [c for c in calls if c["kind"] == "agent"]
+
+    # manifest and spec agree but the child's result.json records no grading (an older harness, or an
+    # edited result): the batch fails grading_mismatch instead of passing on the declaration
+    ws, cwd = _workspace(tmp_path / "stale", mappings={"u": _graded_spec()}, recon={"u": True},
+                         by_design_unverified=("mig.q",))
+    pr = _push_pr(ws)
+    proc, _ = _run(cwd, tmp_path / "stale", [_pass_report(pr)])
+    assert proc.returncode == 0, proc.stderr
+    batch = _result(ws)["batches"][0]
+    assert batch["status"] == "FAIL" and batch["failure_class"] == "grading_mismatch"
+    assert "declares ['mig.q']" in batch["one_line_summary"] and "by_design_unverified" not in batch
 
 
 def test_merge_eligible_false_is_recorded_as_merged_only_by_a_committed_override(tmp_path):

@@ -263,6 +263,12 @@ def validate_manifest(m, plugin=None):
         outside = sorted(t for t in deploy if target_key(t, ns) not in declared)
         req(not outside, f"batch {b['id']} 'deploy_objects' {outside} are not in its write_targets; every object a "
             "child deploys is a write target (it collides like any other)")
+        by_design = b.get("by_design_unverified", [])
+        req(strs(by_design) and all(t.strip() for t in by_design)
+            and len({target_key(t, ns) for t in by_design}) == len(by_design),
+            f"batch {b['id']} 'by_design_unverified' must be a list of distinct object names: the target-only "
+            "outputs (reject-only sinks, rollups) the plan grades unverified(by_design), each an object a unit "
+            "spec of the batch grades by_design_unverified")
         req(b.get("verify_depth", "sampled") in VERIFY_DEPTHS,
             f"batch {b['id']} 'verify_depth' must be one of {VERIFY_DEPTHS}")
         req("max_minutes" not in b or (isinstance(b["max_minutes"], int) and not isinstance(b["max_minutes"], bool)

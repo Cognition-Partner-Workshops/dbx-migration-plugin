@@ -87,6 +87,15 @@ def tier1_counts(spec: MappingSpec, source, target, ctx=None) -> TierResult:
         src_n = source.row_count(c.root_table, c.root_where)
         tgt_n = target.target_row_count(c.object, c.target_where)
         stats["source_counts"][c.root_table] = src_n
+        if c.grading == "by_design_unverified":
+            # a target-only output is never a copy of its root: the one count fact that holds for a
+            # reject-only sink or a rollup is that it cannot have more rows than the root it derives from
+            stats.setdefault("by_design_unverified", []).append(c.object)
+            if tgt_n > src_n:
+                findings.append(Finding(c.object, "root_count_exceeded",
+                                        f"target rows={tgt_n} > rows({c.root_table})={src_n}; a by_design_unverified "
+                                        "object may not hold more rows than its root"))
+            continue
         in_flight = ctx.in_flight(c) if ctx is not None else 0
         in_flight_deletes = ctx.in_flight_deletes(c) if ctx is not None else 0
         # inserts the feed has not applied leave the target short; deletes it has not applied
@@ -290,6 +299,8 @@ def tier2_aggregates(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
     minmax_skipped: list[str] = []
     applied_subset: dict[str, dict[str, Any]] = {}
     for c in spec.objects:
+        if c.grading != "full":
+            continue  # tier 1 holds its count bound; its values are unverified by design
         in_flight = ctx.in_flight(c) if ctx is not None else 0
         in_flight_deletes = ctx.in_flight_deletes(c) if ctx is not None else 0
         if in_flight or in_flight_deletes:
@@ -458,6 +469,8 @@ def tier3_diffs(spec: MappingSpec, tol: Tolerances, canon: Canonicalizer,
     stats: dict[str, Any] = {}
     rng = random.Random(seed)
     for c in spec.objects:
+        if c.grading != "full":
+            continue
         wm = bool(ctx is not None and c.watermark_source and c.watermark_target)
         src_cols = [f.source for f in c.fields] + ([c.watermark_source] if wm else [])
         n = source.row_count(c.root_table, c.root_where)

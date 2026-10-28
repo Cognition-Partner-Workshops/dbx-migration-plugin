@@ -525,6 +525,8 @@ def tier5_pk_set(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
     stats: dict[str, Any] = {}
     obj_uns: dict[str, set] = {}  # categories a live read failed for this object
     for c in spec.objects:
+        if c.grading != "full":
+            continue  # a target-only output has no key set to match; tier 1 bounds its count
         n = source.row_count(c.root_table, c.root_where)
         checks += 1
         diff = KeyDiff()
@@ -691,6 +693,8 @@ def tier6_cdc(spec: MappingSpec, tol: Tolerances, ctx: TransactionalContext,
     stats: dict[str, Any] = {}
     obj_uns: dict[str, set] = {}  # categories a live read failed for this object
     for c in spec.objects:
+        if c.grading != "full":
+            continue
         diff = ctx.key_diffs.get(c.object, KeyDiff())
         if c.delete_evidence is not None:
             checks += 1
@@ -1434,7 +1438,20 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
         pk_info = _map_cols(s.primary_key_informational, colmap)
         kind = (t_raw.table_type or "").upper()
         pipeline = platform and kind in UC_PIPELINE_KINDS
-        if pk != t_lower.primary_key:
+        by_design = c.grading == "by_design_unverified"
+        if by_design:
+            # a target-only output has no value parity with its root, so its key is not the root's
+            # key: the root-key comparison is skipped and the target's own key is held unique (an
+            # enforced PK proves it; otherwise the mapping's key is probed, failing closed)
+            own_key = t_lower.primary_key or tuple(k.lower() for k in c.key_target)
+            if not t_lower.primary_key:
+                unique, note = probe(c.object, own_key, c.target_where)
+                if not unique:
+                    findings.append(Finding(c.object, "target_key_not_unique",
+                                            f"by_design_unverified target declares no enforced primary key and "
+                                            f"its key {own_key} is not proven unique"
+                                            + (f"; uniqueness probe: {note}" if note else "; no uniqueness probe")))
+        elif pk != t_lower.primary_key:
             if pk and not t_lower.primary_key and t_lower.primary_key_informational == pk:
                 unique, note = probe(c.object, pk, c.target_where)
                 if unique:
@@ -1464,7 +1481,7 @@ def schema_parity(tier: int, name: str, spec: MappingSpec, tol: Tolerances, sour
                 findings.append(Finding(c.object, "primary_key_mismatch",
                                         f"source {s.primary_key} -> expected {pk}, target "
                                         f"{t.primary_key}", s.primary_key, t.primary_key))
-        if (pk_info and not s.primary_key and pk_info != t_lower.primary_key
+        if (not by_design and pk_info and not s.primary_key and pk_info != t_lower.primary_key
                 and pk_info != t_lower.primary_key_informational):
             # a Databricks source declares its PK informationally too; a pipeline output
             # carrying it as unique keys is the same not_applicable case as an enforced one

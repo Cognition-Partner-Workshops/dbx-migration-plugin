@@ -45,7 +45,13 @@ doctor signs `wave-<N>.doctor.json` over them.
    `evidence` path points at a file under `.migration/recon/<one of the batch's units>/`, never
    `.migration/recon/wave-<tag>/`, which is the verifier's dir and a protected file to the child's
    PR — the workflow refuses the manifest before any child launches), optional
-   `max_minutes`, `secrets`, `verify_depth`, `lakeflow_pipelines`.
+   `max_minutes`, `secrets`, `verify_depth`, `lakeflow_pipelines`, and `by_design_unverified`: the
+   target-only outputs of the batch (a reject-only quarantine sink, a group-by rollup) the plan grades
+   `unverified(by_design)` instead of as copies of their root. Each must be an object a unit spec of
+   the batch grades `"grading": "by_design_unverified"`, and every object a spec grades so must be
+   listed; either side alone halts the launch. The list is plan, not plumbing (it changes `plan_sha`,
+   so the human sees it in the Plan view); it is never an `authorizations.json` entry. The harness
+   still fails such an object that holds more rows than its root and still reads its structure.
 4. Merge overrides are not manifest fields (a manifest with `merge_overrides` is refused). When
    a unit cannot reach `merge_eligible` on evidence alone, the human commits one entry to
    `.migration/authorizations.json` by PR: `{id: <plan decision slug>, kind: merge_override,
