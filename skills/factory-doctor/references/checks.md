@@ -107,7 +107,7 @@ the family or the spec will not load, or a spec's optional top-level `family` na
 family than `--source-family` (`spec X declares family=databricks but this run reconciles
 oracle: move the unit to its own pipeline's wave or fix the spec`; each spec's declared family is
 recorded in `data.families`, and the same mismatch fails `delete_evidence`,
-`source_principal_read_only` and `dictionary_readable`); `unverified` when no family is declared;
+`source_principal_read_only` and `dictionary_readable` before any source probe); `unverified` when no family is declared;
 `warn` when no dialect skill carries a map for the family or the chosen `--target-kind`;
 `ok` counts typed fields and records unmapped source types plus undeclared targets the
 harness fills; `skipped` only at setup. The audit runs on the same harness `recon_harness`
@@ -122,5 +122,5 @@ unit set, recorded on each row as `data.units`. A child's is its `--unit`s
 (`.migration/units/<id>/mapping_spec.json` each). An orchestrator's with `--wave` is the manifest's
 units — the union of `batches[].units` — so two pipelines sharing `.migration/units/` are each
 audited by their own wave's doctor; a wave unit without a spec fails as "hand-off incomplete"
-(`data.missing_units`). Without `--wave` (setup, or an orchestrator before the manifest exists) every
+(`data.missing_units`), and so does a manifest whose batches name no unit at all. Without `--wave` (setup, or an orchestrator before the manifest exists) every
 `.migration/units/*/mapping_spec.json` is resolved. `--unit` narrows nothing for an orchestrator.

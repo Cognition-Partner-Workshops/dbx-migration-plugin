@@ -2063,6 +2063,11 @@ def test_wave_units_scope_the_orchestrator_audit_to_the_manifests_units(tmp_path
                                     wave_units=["invoices", "ghost"])
     assert c.status == "fail" and c.data["missing_units"] == ["ghost"] and "hand-off incomplete" in c.detail
     assert c.data["units_problem"] is True
+    # a manifest whose batches name no unit is not a wave with nothing to audit but a broken hand-off:
+    # migration-fanout refuses it too, so the doctor must not sign a ready record for it
+    c = doctor.check_type_map_audit(ws, "orchestrator", [], [], "oracle", PLUGIN_ROOT, wave_units=[])
+    assert c.status == "fail" and "names no units" in c.detail and "hand-off incomplete" in c.detail
+    assert c.data == {"units": [], "mappings": {}, "units_problem": True}
     # --unit still narrows nothing for an orchestrator, wave or not
     c = doctor.check_type_map_audit(ws, "orchestrator", ["invoices"], [], "oracle", PLUGIN_ROOT,
                                     wave_units=["invoices"])
@@ -2081,7 +2086,10 @@ def test_wave_unit_spec_declaring_another_family_fails_every_source_row(tmp_path
     for row in (doctor.check_source_principal_all(ws, "orchestrator", [], [], "ORA_DSN", "oracle", PLUGIN_ROOT,
                                                   wave_units=["analytics"]),
                 doctor.check_dictionary_readable_all(ws, "orchestrator", [], [], "ORA_DSN", "oracle", PLUGIN_ROOT,
-                                                     wave_units=["analytics"])):
+                                                     wave_units=["analytics"]),
+                doctor.check_delete_evidence_all(ws, "orchestrator", [], [], "ORA_DSN", PLUGIN_ROOT,
+                                                 connect=lambda *a, **k: pytest.fail("connected"),
+                                                 wave_units=["analytics"], source_family="oracle")):
         assert row.status == "fail" and want in row.detail, row.id
         assert row.data["families"] == {"analytics": "databricks"}
     # the matching family, or none declared, audits as before
@@ -2127,8 +2135,14 @@ def test_wave_flag_audits_only_the_manifests_units(tmp_path):
     assert row["status"] == "fail" and "hand-off incomplete" in row["detail"]
     assert row["data"]["missing_units"] == ["ghost"]
     manifest.write_text(json.dumps({**body, "batches": [{"id": "b1", "units": ["analytics"]}]}))
-    row = record()["type_map_audit"]
-    assert row["status"] == "fail" and "declares family=databricks but this run reconciles oracle" in row["detail"]
+    rows = record()
+    for cid in ("type_map_audit", "delete_evidence"):
+        assert rows[cid]["status"] == "fail", cid
+        assert "declares family=databricks but this run reconciles oracle" in rows[cid]["detail"], cid
+    manifest.write_text(json.dumps({**body, "batches": []}))
+    rows = record()
+    assert rows["type_map_audit"]["status"] == "fail" and "names no units" in rows["type_map_audit"]["detail"]
+    assert not manifest.with_suffix(".doctor.json").read_text().count('"ready": true')
     manifest.write_text(json.dumps({k: v for k, v in body.items() if k != "batches"}))
     rows = record()
     assert rows["type_map_audit"]["data"]["units"] == ["analytics", "invoices"]  # no batches: the glob stays

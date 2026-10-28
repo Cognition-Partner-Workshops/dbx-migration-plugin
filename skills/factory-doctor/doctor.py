@@ -683,6 +683,9 @@ def resolve_mappings(ws: Path, role: str, units: list[str], mappings: list[Path]
                 f"under {UNIT_MAPPINGS} without --wave); --unit is for --role child",
                 {"units": list(units), "mappings": {}}))
         if wave_units is not None:
+            if not wave_units:
+                return ({}, {}, ("fail", "the wave manifest names no units in batches[].units, so there is "
+                    "nothing to audit (hand-off incomplete; report BLOCKED)", {"units": [], "mappings": {}}))
             expected = {u: unit_dir / u / "mapping_spec.json" for u in dict.fromkeys(wave_units)}
         else:
             expected = {p.parent.name: p for p in sorted(ws.glob(UNIT_MAPPINGS))}
@@ -892,15 +895,18 @@ def _env_dsn(cid: str, source_secret: str | None) -> str | Check:
 
 def check_delete_evidence_all(ws: Path, role: str, units: list[str], mappings: list[Path], source_secret: str | None,
     plugin_root: Path, connect=_pyodbc_connect, params: dict[str, str] | None = None,
-    wave_units: list[str] | None = None) -> Check:
+    wave_units: list[str] | None = None, source_family: str | None = None) -> Check:
     """One row over every unit mapping this run is answerable for (resolve_mappings)."""
 
     def evidence(expected, todo):
+        families, family_err = declared_families(todo, source_family)
+        if family_err:
+            return Check("delete_evidence", "fail", family_err, {"families": families, "units_problem": True})
         rows = {label: check_delete_evidence(p, source_secret, plugin_root, connect=connect, params=params) for label,
             p in todo.items()}
         worst = "fail" if any(c.status == "fail" for c in rows.values()) else "ok"
-        data = {"units": list(expected), "mappings": {label: {"status": c.status, "detail": c.detail,
-            **(c.data or {})} for label, c in rows.items()}}
+        data = {"units": list(expected), "families": families, "mappings": {label: {"status": c.status,
+            "detail": c.detail, **(c.data or {})} for label, c in rows.items()}}
         if any((c.data or {}).get("units_problem") for c in rows.values()):
             data["units_problem"] = True
         return Check("delete_evidence", worst, "; ".join(f"{label}: {c.detail}" for label, c in rows.items()),
@@ -1985,7 +1991,7 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
                 params=params, target_kind=target_kind, wave_units=wave_units), target_kind=target_kind),
         _row("delete_evidence",
             lambda: check_delete_evidence_all(ws, role, units, mappings, source_secret, plugin_root,
-                params=params, wave_units=wave_units)),
+                params=params, wave_units=wave_units, source_family=source_family)),
         _row("source_principal_read_only",
             lambda: check_source_principal_all(ws, role, units, mappings, source_secret, source_family,
                 plugin_root, params=params, attested=source_attested, wave_units=wave_units)),
@@ -2039,8 +2045,9 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
 
 
 def manifest_units(manifest) -> list[str] | None:
-    """The units a wave manifest's `batches[].units` name (the orchestrator's audit set), or None
-    when the manifest carries no batches list (the audit then covers every unit mapping)."""
+    """The units a wave manifest's `batches[].units` name (the orchestrator's audit set; empty when
+    the batches name none, which resolve_mappings fails), or None when the manifest carries no
+    batches list (the audit then covers every unit mapping)."""
     batches = manifest.get("batches") if isinstance(manifest, dict) else None
     if not isinstance(batches, list):
         return None
