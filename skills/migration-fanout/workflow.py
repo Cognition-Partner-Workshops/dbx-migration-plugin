@@ -75,8 +75,7 @@ try:  # the sandbox runs a copy of this script; the pointer's plugin root names 
                            unauthorized_decisions, wave_overrides)
     from manifest import (BARE_PATH, MERGE_EVIDENCE_MODES, PR_URL, TAG_RE, _is_manifest, bounded_readers,
                           check_doctor_contract, check_pipeline_updates, check_repo_origin, check_wave_tag,
-                          disjoint_slices, doctor_max_age_minutes, evidence_path, insteadof_rewrites, mapped_target,
-                          other_wave_manifests, reader_slices,
+                          disjoint_slices, doctor_max_age_minutes, evidence_path, insteadof_rewrites, mapped_target, other_wave_manifests, reader_slices, recon_warehouse_flag,
                           skill_file, target_key, transitive_writes, valid_namespace, validate_manifest,
                           wave_signature)
     from report import (CHILD_SCHEMA, CLOSE_SCHEMA, COST_KEYS, RESYNC_SCHEMA, VERIFY_SCHEMA, _verify_sink,
@@ -1011,6 +1010,9 @@ def capability_block(units):
         "minutes and bound to this manifest and identity; otherwise the doctor runs in full). A fail row means "
         "status=BLOCKED naming the check id; a warn row goes in your summary and you continue. Never switch "
         "identity, run `databricks auth login`, or edit .migration/allowed_targets.json.\n"
+        + (f"Every dbx-recon run (fixture, merge-evidence, shape, rerun-proof) carries `{warehouse}`: the warehouse "
+           "the signed doctor record verified, never DATABRICKS_HTTP_PATH or another warehouse.\n"
+           if (warehouse := recon_warehouse_flag(MANIFEST)) else "")
     )
 
 
@@ -1028,7 +1030,10 @@ def verify_prompt(passed):
         f"{skill_body}\n\nVerify these batches:\n{json.dumps(passed, sort_keys=True, indent=1)}\n\n"
         "Re-run the recon harness yourself. Do not trust the PR's pasted evidence, and run it with the "
         "tolerances and allowed_targets.json from the base branch, not the PR (a child that loosened a "
-        "tolerance must fail here). For each PR run `git diff --name-only <base>...<head>`: any .migration/ "
+        "tolerance must fail here). "
+        + (f"Every harness run carries `{warehouse}` (the warehouse the signed doctor record verified; never "
+           "DATABRICKS_HTTP_PATH or another warehouse). " if (warehouse := recon_warehouse_flag(MANIFEST)) else "")
+        + "For each PR run `git diff --name-only <base>...<head>`: any .migration/ "
         "path outside .migration/recon/<unit_id>/ is a FAIL for that unit with finding protected_files_tampered. "
         + ("This wave is declared DEGRADED (no live source read): run the harness with `--mode structural` "
            "for every unit (Tier 0 `structural_parity` only: keys, constraints, indexes, triggers, identity "
