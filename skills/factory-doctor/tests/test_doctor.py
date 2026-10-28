@@ -3755,9 +3755,9 @@ def test_source_principal_accepts_empty_table_list_for_sqlserver_and_postgres(mo
 
 # ------------------------------------------------------------------ session-identity connect (warehouse, provider, timeout)
 
-def _fake_databricks_stack(monkeypatch, captured, *, headers=None, warehouse=(0, '{"id": "wh1", "state": "RUNNING"}', "")):
+def _fake_databricks_stack(monkeypatch, captured, *, headers=None, warehouse=None):
     """databricks.sql.connect captures its kwargs; databricks.sdk.core.Config mints `headers`; the CLI
-    answers `warehouses get` with `warehouse` (rc, out, err)."""
+    answers `warehouses get <id>` with `warehouse` (rc, out, err), by default that warehouse's JSON."""
     import databricks  # real namespace package; its `sql` attribute is what `from databricks import sql` binds
     fake_sql = types.ModuleType("databricks.sql")
     fake_sql.connect = lambda **kw: captured.update(kw) or "conn"
@@ -3775,7 +3775,7 @@ def _fake_databricks_stack(monkeypatch, captured, *, headers=None, warehouse=(0,
     def run(cmd, **kw):
         cli_calls.append(cmd)
         assert cmd[:3] == ["/usr/bin/databricks", "warehouses", "get"], cmd
-        return warehouse
+        return warehouse or (0, json.dumps({"id": cmd[3], "state": "RUNNING"}), "")
     monkeypatch.setattr(doctor, "_run", run)
     return cli_calls
 
@@ -3841,6 +3841,9 @@ def test_session_connect_fails_fast_on_a_dead_warehouse(monkeypatch):
     _fake_databricks_stack(monkeypatch, captured, warehouse=(1, "", "Error: PERMISSION_DENIED token=abc"))
     with pytest.raises(RuntimeError, match="could not be read: Error: PERMISSION_DENIED"):
         doctor._databricks_session_connect()
+    _fake_databricks_stack(monkeypatch, captured, warehouse=(0, '{"id": "other"}', ""))  # not the asked-for one
+    with pytest.raises(RuntimeError, match="warehouse 890be8990bf134aa which could not be read"):
+        doctor._databricks_session_connect()
     with pytest.raises(RuntimeError, match="not a SQL warehouse HTTP path"):
         doctor._databricks_session_connect("/sql/protocolv1/o/1/cluster-1")
     monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
@@ -3861,8 +3864,14 @@ def test_http_path_reaches_the_databricks_connect_slot_and_wins_over_env(tmp_pat
     c = doctor.check_dictionary_readable(["mig.raw.loans"], "databricks", None, views=[("tables", "SELECT 1")],
                                          http_path="/sql/1.0/warehouses/flag")
     assert c.status == "ok" and seen == ["/sql/1.0/warehouses/flag"]
-    doctor.check_dictionary_readable(["mig.raw.loans"], "databricks", "SRC_DBX", views=[("tables", "SELECT 1")])
+    assert c.data["http_path"] == "/sql/1.0/warehouses/flag"
+    c = doctor.check_dictionary_readable(["mig.raw.loans"], "databricks", "SRC_DBX", views=[("tables", "SELECT 1")])
     assert seen[-1] == ""  # no flag: the slot falls back to DATABRICKS_HTTP_PATH, never a secret value
+    assert c.data["http_path"] == "/sql/1.0/warehouses/from-env"
+    monkeypatch.setitem(doctor._READ_ONLY_CONNECT, "sqlserver", lambda dsn: FakeDictConn())
+    monkeypatch.setenv("SRC_DSN", "Driver=x")
+    assert "http_path" not in doctor.check_dictionary_readable(["dbo.loans"], "sqlserver", "SRC_DSN",
+        views=[("tables", "SELECT 1")], http_path="/sql/1.0/warehouses/flag").data
     ws = make_workspace(tmp_path)
     out = tmp_path / "caps.json"
     doctor.main(["--workspace", str(ws), "--plugin-root", str(PLUGIN_ROOT), "--no-databricks", "--out", str(out),
@@ -3894,3 +3903,51 @@ def test_wave_http_path_must_match_the_manifests_declared_path(tmp_path, monkeyp
     with pytest.raises(SystemExit):
         doctor.main(base)
     assert "capabilities.http_path must be a SQL warehouse HTTP path" in capsys.readouterr().err
+
+
+def test_reused_databricks_dictionary_row_stands_in_for_its_own_warehouse_only(tmp_path, monkeypatch):
+    """The orchestrator probed warehouse A; a child on warehouse B probes B itself."""
+    manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1"}}
+    rows = [{"id": rid, "status": "ok", "detail": f"{rid} done", "data": {"k": rid, "units": []}} for rid in
+            (*doctor.REUSABLE_ROWS, *SAFETY_ROWS, *LOCAL_ROWS) if rid != "dictionary_readable"]
+    rows.append({"id": "dictionary_readable", "status": "ok", "detail": "probed A", "data": {"family": "databricks",
+        "units": [], "tables": ["mig.raw.loans"], "http_path": "/sql/1.0/warehouses/A"}})
+    record, manifest_bytes = _signed_record(manifest, rows=rows)
+    reused, _why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert reused is record
+    monkeypatch.setattr(doctor, "check_databricks", lambda expect, host=None: [
+        doctor.Check("databricks_identity", "ok", "as sp", {"userName": "sp-1", "host": "https://adb-1"})])
+    monkeypatch.setattr(doctor, "check_dictionary_readable_all", lambda *a, **k: doctor.Check(
+        "dictionary_readable", "unverified", f"fresh on {k['http_path'] or os.environ.get('DATABRICKS_HTTP_PATH')}"))
+    monkeypatch.delenv("DATABRICKS_HTTP_PATH", raising=False)
+    ws = make_workspace(tmp_path)
+    run = lambda **kw: by_id(doctor.run(ws, PLUGIN_ROOT, "child", "blocked", "sp-1", False,
+        expect_host="https://adb-1", reused=reused, **kw))["dictionary_readable"]["detail"]
+    assert run(http_path="/sql/1.0/warehouses/A").startswith("reused from the orchestrator's record")
+    assert run(http_path="/sql/1.0/warehouses/B") == "fresh on /sql/1.0/warehouses/B"
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/A")
+    assert run().startswith("reused from")
+    monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/B")
+    assert run() == "fresh on /sql/1.0/warehouses/B"
+    # a non-Databricks row never probed a warehouse, so the path does not bind it
+    rows[-1]["data"] = {"family": "oracle", "units": [], "tables": ["LOANS"]}
+    record, manifest_bytes = _signed_record(manifest, rows=rows)
+    reused, _why = doctor.reusable_record(record, manifest, manifest_bytes, "sp-1", "https://adb-1")
+    assert run(http_path="/sql/1.0/warehouses/B").startswith("reused from")
+
+
+def test_reuse_record_http_path_must_match_the_manifests_declared_path(tmp_path):
+    manifest = {"wave": 1, "capabilities": {"identity": "sp-1", "host": "https://adb-1", "catalogs": ["mig_cat"],
+                                            "http_path": "/sql/1.0/warehouses/declared"}}
+    ws, manifest_path, record_path = _reuse_ws(tmp_path, manifest=manifest)
+    out = tmp_path / "caps.json"
+    base = [sys.executable, str(SKILL / "doctor.py"), "--workspace", str(ws), "--role", "child",
+            "--reuse-record", str(record_path), "--expect-identity", "sp-1", "--expect-host", "https://adb-1",
+            "--out", str(out)]
+    r = subprocess.run(base + ["--http-path", "/sql/1.0/warehouses/other"], capture_output=True, text=True, check=False)
+    assert r.returncode == 2 and "differs from the manifest's capabilities.http_path" in r.stderr
+    assert not out.exists()
+    for extra in (["--http-path", "/sql/1.0/warehouses/declared"], []):
+        r = subprocess.run(base + extra, capture_output=True, text=True, check=False)
+        assert r.returncode != 2, r.stderr
+        assert json.loads(out.read_text())["http_path"] == "/sql/1.0/warehouses/declared"

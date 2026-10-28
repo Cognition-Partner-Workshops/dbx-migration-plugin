@@ -39,9 +39,11 @@ recon harness's `credentials_provider`, with a socket timeout) on the SQL wareho
 that path before it connects, so a deleted warehouse fails `dictionary_readable` with
 `DATABRICKS_HTTP_PATH names warehouse <id> which does not exist` instead of hanging. The effective
 path is recorded as `http_path` in the report and signed into `wave-N.doctor.json`. A manifest may
-pin the warehouse in `capabilities.http_path`; under `--wave` the doctor uses it, and a differing
-`--http-path` is an error. Pin the warehouse this way, never by editing `DATABRICKS_*` in the
-environment (the guard treats that as an identity swap).
+pin the warehouse in `capabilities.http_path`; under `--wave` and `--reuse-record` the doctor uses
+it, and a differing `--http-path` is an error. A child reusing the orchestrator's record reuses its
+`dictionary_readable` row only for the warehouse that row was probed on (its recorded `http_path`);
+on another warehouse it probes afresh. Pin the warehouse this way, never by editing `DATABRICKS_*`
+in the environment (the guard treats that as an identity swap).
 
 `--plugin-root` is optional. The guard accepts it only as the literal path of the running plugin
 (not a shell variable or another plugin tree).

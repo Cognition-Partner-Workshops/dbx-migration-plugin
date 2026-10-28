@@ -1143,7 +1143,7 @@ def _require_warehouse(http_path: str, origin: str) -> str:
         raise RuntimeError(f"databricks CLI not on PATH, so warehouse {wid} ({origin}) cannot be verified before "
             "connecting")
     payload, shown = _cli_json(cli, "warehouses", "get", wid)
-    if isinstance(payload, dict):
+    if isinstance(payload, dict) and payload.get("id") == wid:
         return wid
     gone = any(mark in shown for mark in ("does not exist", "RESOURCE_DOES_NOT_EXIST", "404"))
     raise RuntimeError(f"{origin} names warehouse {wid} which does not exist" if gone
@@ -1593,6 +1593,8 @@ def check_dictionary_readable(tables: list[str], family: str, source_secret: str
         if isinstance(dsn, Check):
             return dsn
     data: dict = {"family": family, "tables": tables, "views": [], "trigger_census": {}}
+    if family == "databricks":
+        data["http_path"] = http_path or os.environ.get("DATABRICKS_HTTP_PATH")
     try:
         conn = (connect or _READ_ONLY_CONNECT[family])((http_path or "") if family == "databricks"
             else os.environ.get(source_secret) or "")
@@ -2095,13 +2097,17 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
     secret_names: list[str] | None = None, list_secrets=None, reused: dict | None = None,
     wave_units: list[str] | None = None, base_branch: str | None = None,
     http_path: str | None = None) -> dict:
+    def _recorded(row_id):
+        row = next((c for c in (reused or {}).get("checks") or [] if isinstance(c, dict) and c.get("id") == row_id),
+            None) if isinstance(reused, dict) else None
+        return row, (row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {})
+
     def _row(row_id, thunk, **binds):
         """`binds` are data keys the recorded row must carry with these exact values to stand in; the
         recorded row's `data.units` must also cover every unit of this run (the orchestrator audits
         only its wave's units, so a row proves nothing about a unit outside them)."""
         if isinstance(reused, dict) and row_id in REUSABLE_ROWS:
-            row = next((c for c in reused.get("checks") or [] if isinstance(c, dict) and c.get("id") == row_id), None)
-            data = row.get("data") if isinstance(row, dict) and isinstance(row.get("data"), dict) else {}
+            row, data = _recorded(row_id)
             covered = data.get("units")
             if (isinstance(row, dict) and isinstance(row.get("status"), str) and
                     isinstance(row.get("detail"), str) and all(data.get(k) == v for k, v in binds.items()) and
@@ -2137,7 +2143,10 @@ def run(ws: Path, plugin_root: Path, role: str, probe_result: str, expect_identi
                 base_branch=base_branch)),
         _row("dictionary_readable",
             lambda: check_dictionary_readable_all(ws, role, units, mappings, source_secret, source_family,
-                plugin_root, params=params, wave_units=wave_units, http_path=http_path)),
+                plugin_root, params=params, wave_units=wave_units, http_path=http_path),
+            # a Databricks-family row was probed on one warehouse; it stands in for that warehouse only
+            **({"http_path": http_path or os.environ.get("DATABRICKS_HTTP_PATH")}
+               if _recorded("dictionary_readable")[1].get("family") == "databricks" else {})),
         _row("named_secrets_exist",
             lambda: (Check("named_secrets_exist", "skipped", "--no-databricks") if no_databricks
                 else check_named_secrets(secret_names or [], list_secrets)))]
@@ -2221,6 +2230,19 @@ def _manifest_base_branch(manifest) -> str | None:
     return b if isinstance(b, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", b) and ".." not in b else None
 
 
+def _pin_http_path(p: argparse.ArgumentParser, a, caps: dict, where: str):
+    """A manifest's `capabilities.http_path` is the wave's warehouse: `--http-path` may repeat it, never
+    differ from it (the record is signed for the declared warehouse)."""
+    declared = caps.get("http_path")
+    if declared is None:
+        return
+    if not (isinstance(declared, str) and declared.strip()):
+        p.error(f"{where} capabilities.http_path must be a SQL warehouse HTTP path when declared")
+    if a.http_path not in (None, declared):
+        p.error(f"--http-path {a.http_path} differs from the manifest's capabilities.http_path {declared}; "
+            "the wave runs on the declared warehouse, so pass the same value or none")
+
+
 def _apply_manifest(a, manifest):
     """Fill expect_host/expect_catalogs/source settings/secrets from a wave manifest onto parsed args."""
     family, secret, mparams, names, caps = _manifest_source(manifest)
@@ -2301,12 +2323,7 @@ def main(argv: list[str] | None = None) -> int:
             a.expect_identity = caps.get("identity")
         if a.source_family is not None or a.source_secret is not None or a.param:
             p.error("--wave takes source settings from the manifest; drop --source-family/--source-secret/--param")
-        declared = caps.get("http_path")
-        if declared is not None and not (isinstance(declared, str) and declared.strip()):
-            p.error(f"wave manifest {a.wave} capabilities.http_path must be a SQL warehouse HTTP path when declared")
-        if declared is not None and a.http_path not in (None, declared):
-            p.error(f"--http-path {a.http_path} differs from the manifest's capabilities.http_path {declared}; "
-                "the wave runs on the declared warehouse, so pass the same value or none")
+        _pin_http_path(p, a, caps, f"wave manifest {a.wave}")
         _apply_manifest(a, manifest)
         wave_units = manifest_units(manifest)
         base_branch = _manifest_base_branch(manifest)
@@ -2326,12 +2343,13 @@ def main(argv: list[str] | None = None) -> int:
             record = json.loads(a.reuse_record.read_bytes())
         except (OSError, ValueError) as e:
             p.error(f"cannot read --reuse-record or the manifest beside it: {e}")
-        want_family, want_secret, want_params, _names, _caps = _manifest_source(manifest)
+        want_family, want_secret, want_params, _names, caps = _manifest_source(manifest)
         for flag, given, want in (("--source-family", a.source_family, want_family), ("--source-secret",
             a.source_secret, want_secret), ("--param", sorted(a.param or []), sorted(want_params))):
             if given not in (None, [], want):
                 p.error(f"{flag} differs from the manifest's source block; --reuse-record takes source settings "
                     "from the manifest, so pass the same values or none")
+        _pin_http_path(p, a, caps, f"--reuse-record's manifest {manifest_path}")
         _apply_manifest(a, manifest)
         base_branch = _manifest_base_branch(manifest)
         reused, reuse_why = reusable_record(record, manifest if isinstance(manifest, dict) else {}, manifest_bytes,
