@@ -29,8 +29,12 @@ TARGET_FLAG = re.compile(r"(?:^|\s)(?:-t|--target)[=\s]+([^\s;&|]+)")
 ENV_ASSIGN = re.compile(
     r"(?:^|[;&|]|\s)(?:export\s+)?DATABRICKS_(?:HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)\s*=")
 G3_PATH = re.compile(r"(^|/)\.databrickscfg$|\.databricks/|\.config/databricks/|" + re.escape(ENVRC))
-WRITER = re.compile(r">+\s*\S|sed\s+-i|\b(?:tee|rm|mv|cp|vi|vim|nano|emacs|dd|truncate|chmod|chown)\b")
 HOOK_SELF = re.compile(r"guard\.py|hooks\.json")
+REDIRECT = re.compile(r">+\s*([^\s;&|]+)")
+WCMD = re.compile(r"\b(cp|mv|tee|rm|dd|truncate|chmod|chown|sed|vi|vim|nano|emacs)\b\s+([^;&|]+)")
+QARG = re.compile(r"(?:^|\s)-[ce]\s*('[^']*'|\"[^\"]*\")")
+RED = re.compile(r"(DATABRICKS_(?:HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)\s*=\s*)"
+                 r"(?:'[^']*'|\"[^\"]*\"|\S+)")
 
 
 def _has(cmd, tok):
@@ -42,8 +46,8 @@ def _g1(cmd, legacy):
     engaged = next((t for t in toks if _has(cmd, t)), None)
     if not engaged:
         return None
-    if (m := WRITE_VERB.search(cmd)):
-        return ("G1", f"legacy client/source `{engaged}` on a line with write verb `{m.group(0)}`"
+    if (m := _g1_write(cmd)):
+        return ("G1", f"legacy client/source `{engaged}` on a line with write verb `{m}`"
                       " (no DBX_DECISION downgrade exists in 0.7)")
     bare = SQUOTED.sub(" ", cmd)
     if re.search(r"(?:^|\s)(?:-[fi]\b|@)|<", bare):
@@ -53,6 +57,29 @@ def _g1(cmd, legacy):
     if any(_has(p, t) for p in re.split(r"(?<!\|)\|(?!\|)", cmd)[1:] for t in toks):
         return ("G1", f"a pipe into legacy client `{engaged}`")
     return None
+
+
+def _g1_write(cmd):
+    if (m := WRITE_VERB.search(SQUOTED.sub(" ", cmd))):
+        return m.group(0)
+    for c in SQUOTED.findall(cmd):
+        if len(c.split()) > 1 and (m := WRITE_VERB.search(c)):
+            return m.group(0)
+    for q in QARG.findall(cmd):
+        if (m := WRITE_VERB.search(SQUOTED.sub(" ", q[1:-1]))):
+            return m.group(0)
+    return None
+
+
+def _writes_to(cmd, pred):
+    for seg in re.split(r"[;&|]+", cmd):
+        targets = REDIRECT.findall(seg)
+        for m in WCMD.finditer(seg):
+            args = [a for a in m.group(2).split() if not a.startswith("-")]
+            targets += args[-1:] if m.group(1) in ("cp", "mv") else args
+        if any(pred(t) for t in targets):
+            return True
+    return False
 
 
 def _g2(cmd, pol):
@@ -79,7 +106,7 @@ def _g3_command(cmd):
     if ENV_ASSIGN.search(cmd):
         return ("G3", "assigns DATABRICKS_HOST/TOKEN/CLIENT_ID/CLIENT_SECRET;"
                       " the migration principal's credentials are fixed")
-    if G3_PATH.search(cmd) and WRITER.search(cmd):
+    if _writes_to(cmd, lambda t: G3_PATH.search(t)):
         return ("G3", "writes to a Databricks credential store (.databrickscfg/.databricks/envrc)")
     if re.search(r"\bdatabricks\s+(?:configure|auth\s+login)\b", cmd):
         return ("G3", "`databricks configure`/`auth login` would rewrite the principal's credentials")
@@ -87,7 +114,7 @@ def _g3_command(cmd):
 
 
 def _g5_command(cmd):
-    if WRITER.search(cmd) and (str(PLUGIN_ROOT) in cmd or HOOK_SELF.search(cmd)):
+    if _writes_to(cmd, lambda t: str(PLUGIN_ROOT) in t or HOOK_SELF.search(t)):
         return ("G5", "command writes inside the running plugin tree; the hook is never modified from a session")
     return None
 
@@ -134,8 +161,7 @@ def _policy(mdir):
 
 
 def _log(mdir, rule, decision, cmd):
-    safe = re.sub(r"(DATABRICKS_(?:HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)\s*=\s*)\S+",
-                  r"\1<redacted>", cmd)[:200]
+    safe = RED.sub(r"\1<redacted>", cmd)[:200]
     line = json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                        "rule": rule, "decision": decision, "cmd": safe})
     try:
@@ -159,7 +185,7 @@ def main(stdin_text=None):
         return 0
     cwd = ti.get("workdir") or event.get("cwd") or os.getcwd()
     if cmd:
-        dirs = [cwd] + [os.path.join(cwd, t) for t in
+        dirs = [cwd] + [os.path.join(cwd, os.path.expanduser(t.strip("'\""))) for t in
                         re.findall(r"(?:^|[;&|]\s*)cd\s+(?:-[LP]\s+)?([^\s;&|]+)", cmd)]
         mdir = next((m for m in map(_armed, dirs) if m), None)
     else:

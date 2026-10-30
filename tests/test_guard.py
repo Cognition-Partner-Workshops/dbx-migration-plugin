@@ -5,6 +5,7 @@ G1-G5 shape, positive and negative, plus arming and .migration/base
 resolution via `git show`.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,9 +25,11 @@ def git(ws, *args):
                           capture_output=True, text=True).stdout.strip()
 
 
-def run_guard(event, cwd):
+def run_guard(event, cwd, env=None):
+    e = dict(os.environ)
+    e.update(env or {})
     return subprocess.run([sys.executable, str(GUARD)], input=json.dumps(event),
-                          capture_output=True, text=True, cwd=str(cwd))
+                          capture_output=True, text=True, cwd=str(cwd), env=e)
 
 
 def exec_event(cmd):
@@ -87,6 +90,8 @@ G1 = [
     ("docker exec dbx psql -c 'select 1'", "block"),
     ("psql -c 'select 1' | grep x", "warn"),
     ("psql -c 'DROP TABLE t'", "block"),
+    ("psql -c 'COMMIT'", "block"),
+    ("psql -c \"SELECT * FROM audit WHERE action = 'DELETE'\"", "warn"),
     ("grep -r psql src/", "warn"),
     ("git commit -m 'note about psql'", "block"),  # COMMIT is a G1 verb and the token is engaged
 ]
@@ -128,6 +133,7 @@ G3_EXEC = [
     ("sed -i s/a/b/ /opt/.devin/envrc", "block"),
     ("echo hi | tee /opt/.devin/envrc", "block"),
     ("cat /opt/.devin/envrc", "warn"),
+    ("cat /opt/.devin/envrc && echo hi > /tmp/report", "warn"),
     ("source /opt/.devin/envrc", "warn"),
     ("echo x > ~/.databrickscfg", "block"),
     ("echo x > /home/u/.databricks/cfg", "block"),
@@ -141,8 +147,10 @@ G5_EXEC = [
     ("sed -i s/x/y/ hooks/guard.py", "block"),
     ("rm hooks/guard.py", "block"),
     ("echo x > " + str(PLUGIN_ROOT) + "/hooks.json", "block"),
-    ("cp " + str(PLUGIN_ROOT) + "/hooks/guard.py /tmp/g.py", "block"),
+    ("cp " + str(PLUGIN_ROOT) + "/hooks/guard.py /tmp/g.py", "warn"),
+    ("cp /tmp/x " + str(PLUGIN_ROOT) + "/hooks/", "block"),
     ("cat hooks/guard.py", "warn"),
+    ("cat hooks/guard.py && echo hi > /tmp/report", "warn"),
     (sys.executable + " hooks/guard.py", "warn"),
 ]
 
@@ -251,6 +259,9 @@ def test_g4_log_redacts_secret_values(armed):
     entry = json.loads(logged)
     assert entry["decision"] == "block" and "sekrit123" not in entry["cmd"]
     assert "<redacted>" in entry["cmd"]
+    run_guard(exec_event("export DATABRICKS_TOKEN='sekrit with spaces'"), armed)
+    entry = json.loads((armed / ".migration/guard.log").read_text().splitlines()[-1])
+    assert "sekrit" not in entry["cmd"]
 
 
 def test_arming_via_cd_target(tmp_path):
@@ -268,6 +279,16 @@ def test_arming_cd_into_unarmed_dir_stays_silent(tmp_path):
     (tmp_path / "empty").mkdir()
     r = run_guard(exec_event("cd ../empty && psql -f run.sql"), outside)
     assert r.returncode == 0 and r.stdout == ""
+
+
+def test_arming_cd_home_relative(tmp_path):
+    home, outside = tmp_path / "home", tmp_path / "outside"
+    (home / "ws" / ".migration").mkdir(parents=True)
+    outside.mkdir()
+    r = run_guard(exec_event("cd ~/ws && psql -f run.sql"), outside,
+                  env={"HOME": str(home)})
+    assert r.returncode == 2
+    assert (home / "ws" / ".migration/guard.log").exists()
 
 
 def test_no_log_for_edit_events(armed):
