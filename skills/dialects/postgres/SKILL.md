@@ -28,9 +28,10 @@ resolve `search_path`-dependent names, synonyms do not exist (use views/function
 ```
 
 `writes` = targets of `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`TRUNCATE`/`COPY ... TO` consumed as a
-write; `reads` = tables and views in `SELECT`/`FROM`/`JOIN`/cursor bodies. Every callee
-(including trigger-fired functions and the scheduler entry point) needs its own row, or
-`slices.py --check` fails the slice proposal.
+write; `reads` = tables and views in `SELECT`/`FROM`/`JOIN`/cursor bodies. Both lists are the
+transitive closure over the call graph: a routine's row carries what its callees write and read.
+Every callee (including trigger-fired functions and the scheduler entry point) needs its own
+row, or `slices.py --check` fails the slice proposal.
 
 ## Known traps with recon signature
 

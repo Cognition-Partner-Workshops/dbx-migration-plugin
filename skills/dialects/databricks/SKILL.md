@@ -29,9 +29,10 @@ keyed by routine to `.migration/recon/<slice>/inputs/dependencies.json`:
 ```
 
 `writes` = targets of `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`CREATE OR REPLACE TABLE`/`TRUNCATE`;
-`reads` = tables and views in `SELECT`/`FROM`/`JOIN`/pipeline dataset dependencies. Every callee
-(including notebook jobs whose SQL is extractable) needs its own row, or `slices.py --check`
-fails the slice proposal.
+`reads` = tables and views in `SELECT`/`FROM`/`JOIN`/pipeline dataset dependencies. Both lists
+are the transitive closure over the call graph: a routine's row carries what its callees write
+and read. Every callee (including notebook jobs whose SQL is extractable) needs its own row, or
+`slices.py --check` fails the slice proposal.
 
 ## Known traps with recon signature
 

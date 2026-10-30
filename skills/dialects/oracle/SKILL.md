@@ -26,9 +26,10 @@ scheduler job actions); resolve synonyms and case; output one map keyed by routi
 ```
 
 `writes` = targets of `INSERT`/`UPDATE`/`DELETE`/`MERGE INTO`/`TRUNCATE`; `reads` = tables and
-views in `SELECT`/`FROM`/`JOIN`/`MERGE USING`/cursor bodies. Every callee the scan names must be
-covered by its own row (trigger-fired routines and the job action included), or `slices.py
---check` fails the slice proposal.
+views in `SELECT`/`FROM`/`JOIN`/`MERGE USING`/cursor bodies. Both lists are the transitive
+closure over the call graph: a routine's row carries what its callees write and read. Every
+callee the scan names must be covered by its own row (trigger-fired routines and the job action
+included), or `slices.py --check` fails the slice proposal.
 
 ## Known traps with recon signature
 

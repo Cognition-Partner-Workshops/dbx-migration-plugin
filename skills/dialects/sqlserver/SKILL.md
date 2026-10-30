@@ -30,9 +30,10 @@ by routine to `.migration/recon/<slice>/inputs/dependencies.json`:
 ```
 
 `writes` = targets of `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`TRUNCATE`/`SELECT INTO`; `reads` =
-tables and views in `SELECT`/`FROM`/`JOIN`/`UPDATE ... FROM`/`MERGE USING`/cursor bodies. Every
-callee the scan names (including `sp_executesql` targets it can resolve and the job step action)
-needs its own row, or `slices.py --check` fails the slice proposal.
+tables and views in `SELECT`/`FROM`/`JOIN`/`UPDATE ... FROM`/`MERGE USING`/cursor bodies. Both
+lists are the transitive closure over the call graph: a routine's row carries what its callees
+write and read. Every callee the scan names (including `sp_executesql` targets it can resolve
+and the job step action) needs its own row, or `slices.py --check` fails the slice proposal.
 
 ## Known traps with recon signature
 

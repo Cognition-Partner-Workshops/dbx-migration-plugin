@@ -20,7 +20,8 @@ never a live write.
 2. **Consumer map.** Name every consumer (app, report, feed) and which objects it reads; a
    consumer names its `route_group` — the set of slices repointed together at one STOP 3.
 3. **Dependency scan.** Run the dialect skill's dependency scan over the routines: one
-   `{routine: {writes, reads}}` map per slice at `.migration/recon/<slice>/inputs/`.
+   `{routine: {writes, reads}}` map per slice at `.migration/recon/<slice>/inputs/`, `writes` and
+   `reads` transitive over the routine call graph so `slices.py --check` sees every shared write.
 4. **Slice.** Group objects into slices: a slice is a consumer-facing capability owning tables,
    routines, jobs and consumers, with `track` (`delta`|`lakebase`) and `routing`
    (`none`|`jdbc_url`|`synonym`|`api`). Shared reference tables read by several slices and owned
