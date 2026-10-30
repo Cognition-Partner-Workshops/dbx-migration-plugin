@@ -282,7 +282,7 @@ class _SqlAdapterBase:
 
     @staticmethod
     def _unquoted(sql: str) -> str:
-        out, i, n, mode = [], 0, len(sql), None
+        out, i, n, mode, tag = [], 0, len(sql), None, ""
         while i < n:
             ch = sql[i]
             if mode == "line_comment":
@@ -297,13 +297,22 @@ class _SqlAdapterBase:
                     i += 2
                 else:
                     i += 1
-            elif mode in ("squote", "dquote"):
-                quote = "'" if mode == "squote" else '"'
-                if sql.startswith(quote + quote, i):
+            elif mode in ("squote", "esquote", "dquote", "bracket"):
+                quote = {"squote": "'", "esquote": "'", "dquote": '"',
+                         "bracket": "]"}[mode]
+                if mode == "esquote" and ch == "\\":
+                    i += 2
+                elif sql.startswith(quote + quote, i):
                     i += 2
                 elif sql[i] == quote:
                     mode = None
                     i += 1
+                else:
+                    i += 1
+            elif mode == "dollar":
+                if sql.startswith(tag, i):
+                    mode = None
+                    i += len(tag)
                 else:
                     i += 1
             elif sql.startswith("--", i):
@@ -311,9 +320,17 @@ class _SqlAdapterBase:
             elif sql.startswith("/*", i):
                 mode, i = "block_comment", i + 2
             elif ch == "'":
-                mode, i = "squote", i + 1
+                prev = sql[i - 1] if i else ""
+                before = sql[i - 2] if i > 1 else " "
+                mode = ("esquote" if prev in "eE" and not
+                        (before.isalnum() or before in "_$") else "squote")
+                i += 1
             elif ch == '"':
                 mode, i = "dquote", i + 1
+            elif ch == "[":
+                mode, i = "bracket", i + 1
+            elif ch == "$" and (m := re.match(r"\$[A-Za-z_]*\$", sql[i:])):
+                mode, tag, i = "dollar", m.group(0), i + len(m.group(0))
             else:
                 out.append(ch)
                 i += 1
