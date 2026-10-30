@@ -186,6 +186,9 @@ def test_param_rejects_expression():
     with pytest.raises(Exception):
         cli.parse_params(["cutoff=1 OR 1=1"])
     assert cli.parse_params(["cutoff=2024-01-01"]) == {"cutoff": "2024-01-01"}
+    assert cli.parse_params(["batch=update"]) == {"batch": "update"}
+    with pytest.raises(Exception):
+        cli.parse_params(["batch=1 or true"])
 
 
 def test_run_cli_missing_inputs_is_not_run_exit(tmp_path, monkeypatch):
@@ -219,3 +222,13 @@ def test_blocking_findings_validation(tmp_path):
 def test_selftest(capsys):
     assert cli.main(["selftest"]) == 0
     assert "selftest PASS" in capsys.readouterr().out
+
+
+def test_run_query_literal_keywords_allowed():
+    from recon.adapters import _SqlAdapterBase
+    assert _SqlAdapterBase._unquoted("select id from t where c = 'update' -- drop") \
+        == "select id from t where c = '' "
+    assert not _SqlAdapterBase._WRITE_SQL.search(
+        _SqlAdapterBase._unquoted("select id from t where c = 'update' -- drop x"))
+    assert _SqlAdapterBase._WRITE_SQL.search(
+        _SqlAdapterBase._unquoted("select 1; drop table t"))

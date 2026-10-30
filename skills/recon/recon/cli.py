@@ -37,8 +37,8 @@ MIGRATION = Path(".migration")
 
 
 _PARAM_EXPR = re.compile(
-    r"[=<>()]|--|/\*|\*/|;|\b(or|and|not|union|select|insert|update|delete|drop|"
-    r"alter|grant|revoke|like|in|between|case|when|exists|is|null|true|false)\b", re.I)
+    r"[=<>()'\"`]|--|/\*|\*/|;|\b(or|and|not|union|is|in|like|between|exists|"
+    r"case|when|then|else|null|true|false)\b", re.I)
 
 
 def parse_params(items: list[str]) -> dict[str, str]:
