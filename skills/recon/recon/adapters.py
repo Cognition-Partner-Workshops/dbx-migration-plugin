@@ -329,7 +329,9 @@ class _SqlAdapterBase:
                 mode, i = "dquote", i + 1
             elif ch == "[":
                 mode, i = "bracket", i + 1
-            elif ch == "$" and (m := re.match(r"\$[A-Za-z_]*\$", sql[i:])):
+            elif (ch == "$" and (i == 0 or not
+                      (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+                  and (m := re.match(r"\$[A-Za-z_][A-Za-z_0-9]*\$|\$\$", sql[i:]))):
                 mode, tag, i = "dollar", m.group(0), i + len(m.group(0))
             else:
                 out.append(ch)
