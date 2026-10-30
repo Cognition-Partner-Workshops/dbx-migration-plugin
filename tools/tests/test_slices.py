@@ -54,6 +54,12 @@ def test_dup_and_bad_fields():
     assert {"dup_slice", "schema"} <= fails
 
 
+@pytest.mark.parametrize("sid", ["../escape", "a/b", "bad id", "..", ".hidden"])
+def test_slice_id_must_be_path_safe(sid):
+    doc = mk_doc(mk_slice(sid, depends_on=["slice-1"]))
+    assert "schema" in codes(sl.check(doc))
+
+
 # --- canary / auto_merge ----------------------------------------------------
 
 def test_canary_not_first():
@@ -150,6 +156,15 @@ def test_shared_writes_owner_must_hold_table():
     assert "shared_writes" in codes(sl.check(doc))
 
 
+def test_shared_writes_declared_by_non_holder():
+    doc = mk_doc(
+        mk_slice("slice-2", tables=["A.T1"], depends_on=["slice-1"]),
+        mk_slice("slice-3", tables=["A.T1"], depends_on=["slice-1"]),
+        mk_slice("slice-4", depends_on=["slice-1"],
+                 shared_writes={"A.T1": "merged:slice-2"}))
+    assert "shared_writes" in codes(sl.check(doc))
+
+
 def test_shared_writes_bad_format():
     doc = mk_doc(
         mk_slice("slice-2", tables=["A.T1"], depends_on=["slice-1"]),
@@ -213,6 +228,16 @@ def test_slice0_table_readable_by_all():
     doc["slices"][0]["tables"] = ["A.SHARED"]
     deps = deps_for({"PKG.R1": {"writes": [], "reads": ["A.SHARED"]}})
     assert "cross_route_read" not in codes(sl.check(doc, deps=deps))
+
+
+def test_job_same_name_does_not_hide_routine():
+    doc = mk_doc(mk_slice("slice-2", routines=["PKG.R1"], jobs=["PKG.R1"],
+                          tables=["A.OWN"], depends_on=["slice-1"]))
+    deps = mk_deps(routines={"PKG.R1": {"writes": ["A.OTHER"], "reads": []}},
+                   jobs={"PKG.R1": {"writes": ["A.OWN"], "reads": []}})
+    fails = codes(sl.check(doc, deps=deps))
+    assert "cross_slice_write" in fails
+    assert "unscanned_routine" not in fails
 
 
 def test_glob_routine_expansion():

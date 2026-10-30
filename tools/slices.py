@@ -30,16 +30,17 @@ census object is assigned when it matches any slice's `tables`, `routines` or
 import argparse
 import fnmatch
 import json
+import re
 import sys
 
 VERSION = 1
 SLICE_ZERO = "slice-0"
+SLICE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # path-safe: fanout writes recon/<id>/
 TRACKS = {"delta", "lakebase"}
 ROUTINGS = {"none", "jdbc_url", "synonym", "api"}
 GROUPED_ROUTINGS = {"jdbc_url", "synonym"}  # not independently switchable per capability
 VERIFY_DEPTHS = {"sampled", "full"}
 LIST_FIELDS = ("tables", "routines", "jobs", "consumers", "depends_on")
-DISPOSITION_KINDS = ("merged", "dual_write")
 
 
 def _norm(name):
@@ -67,6 +68,8 @@ def _schema_check(doc):
         tag = s.get("id") or f"index {i}"
         if not isinstance(s.get("id"), str) or not s["id"]:
             fails.append(("schema", f"slice index {i} missing string id"))
+        elif not SLICE_ID.fullmatch(s["id"]):
+            fails.append(("schema", f"{tag}: id must match {SLICE_ID.pattern}"))
         elif s["id"] in seen:
             fails.append(("dup_slice", s["id"]))
         seen.add(s.get("id"))
@@ -160,65 +163,63 @@ def _consumer_check(slices):
 
 
 def _shared_writes_check(slices):
-    """Returns (failures, valid_dispositions): table -> set of owner slice ids."""
     fails = []
     holders = {}
     for s in slices:
         for t in s.get("tables", []):
             holders.setdefault(_norm(t), []).append(s)
-    valid = {}
     for s in slices:
         for table, disp in (s.get("shared_writes") or {}).items():
             kind, sep, owner = str(disp).partition(":") if isinstance(disp, str) else ("", "", "")
-            if not sep or kind not in DISPOSITION_KINDS or not owner:
+            if not sep or kind not in ("merged", "dual_write") or not owner:
                 fails.append(("shared_writes", f"{s['id']}: {table} -> {disp!r} must be "
                                                "merged:<slice> or dual_write:<slice>"))
+                continue
+            if not any(_match(table, t) for t in s.get("tables", [])):
+                fails.append(("shared_writes", f"{s['id']}: {table} declared by a slice "
+                                               "that does not hold it"))
                 continue
             if not any(h["id"] == owner for h in holders.get(_norm(table), [])):
                 fails.append(("shared_writes", f"{s['id']}: {table} owner {owner} "
                                                "does not hold the table"))
-                continue
-            valid.setdefault(_norm(table), set()).add(owner)
     for table, slices_holding in holders.items():
-        if len(slices_holding) > 1 and table not in valid:
+        if len(slices_holding) > 1 and not any(
+                any(_match(table, t) for t in s.get("shared_writes") or {})
+                for s in slices_holding):
             fails.append(("shared_writes", f"{table} appears in "
                                            f"{[s['id'] for s in slices_holding]} "
-                                           "with no shared_writes disposition"))
-    return fails, valid
+                                           "with no disposition"))
+    return fails
 
 
-def _scan_entries(deps):
-    scan = {}
-    for section in ("routines", "jobs"):
-        for name, entry in (deps.get(section) or {}).items():
-            if isinstance(entry, dict):
-                scan[name] = {"writes": entry.get("writes") or [],
-                              "reads": entry.get("reads") or []}
-    return scan
+def _scan_entries(section):
+    return {name: {"writes": e.get("writes") or [], "reads": e.get("reads") or []}
+            for name, e in (section or {}).items() if isinstance(e, dict)}
 
 
 def _deps_check(slices, deps):
     fails = []
-    scan = _scan_entries(deps)
+    scans = {fld: _scan_entries(deps.get(fld)) for fld in ("routines", "jobs")}
     tables = {s["id"]: {_norm(t) for t in s.get("tables", [])} for s in slices}
     slice0_tables = tables.get(SLICE_ZERO, set())
     readers = {}
     for s in slices:
         allowed = tables[s["id"]] | slice0_tables
         read = set()
-        for pat in s.get("routines", []) + s.get("jobs", []):
-            matched = [n for n in scan if _match(pat, n)]
-            if not matched:
-                fails.append(("unscanned_routine",
-                              f"{s['id']}: {pat} matches no dependency-scan entry"))
-                continue
-            for name in matched:
-                read |= {_norm(r) for r in scan[name]["reads"]}
-                for w in scan[name]["writes"]:
-                    if _norm(w) not in allowed:
-                        fails.append(("cross_slice_write",
-                                      f"{s['id']}: {name} writes {w}, outside its "
-                                      f"slice and {SLICE_ZERO}"))
+        for fld in ("routines", "jobs"):
+            for pat in s.get(fld, []):
+                matched = [n for n in scans[fld] if _match(pat, n)]
+                if not matched:
+                    fails.append(("unscanned_routine",
+                                  f"{s['id']}: {pat} matches no dependency-scan entry"))
+                    continue
+                for name in matched:
+                    read |= {_norm(r) for r in scans[fld][name]["reads"]}
+                    for w in scans[fld][name]["writes"]:
+                        if _norm(w) not in allowed:
+                            fails.append(("cross_slice_write",
+                                          f"{s['id']}: {name} writes {w}, outside its "
+                                          f"slice and {SLICE_ZERO}"))
         readers[s["id"]] = read
     for s in slices:
         if s.get("routing") == "none":
@@ -265,8 +266,7 @@ def check(doc, deps=None, census=None):
     fails = _topology_check(slices)
     fails += _canary_check(slices)
     fails += _consumer_check(slices)
-    shared_fails, _ = _shared_writes_check(slices)
-    fails += shared_fails
+    fails += _shared_writes_check(slices)
     if deps is not None:
         fails += _deps_check(slices, deps)
     if census is not None:
