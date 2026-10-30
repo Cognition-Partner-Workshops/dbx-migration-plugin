@@ -1,33 +1,25 @@
 """Slice fan-out orchestrator (design-0.7 section 7).
 
-Reads `.migration/policy.json` and `.migration/slices.json`, then for every
-slice whose `depends_on` are all merged launches one `migrate` child, a `verify`
-child on PASS, and merges the slice PR at the verifier's `verified_head` when
-`auto_merge` holds. Per-slice state lives in `.migration/recon/<slice>/fanout.json`
-(manager-committed on base_branch); re-running is idempotent: merged slices are
-skipped, open PRs are refreshed via `pr_state`, and everything else is
-re-driven from its recorded state.
+For every slice in `.migration/slices.json` whose `depends_on` are merged:
+launch a `migrate` child, a `verify` child on PASS, and merge the slice PR at
+the verifier's `verified_head` when `auto_merge` holds. State lives in
+`.migration/recon/<slice>/fanout.json` (manager commits it on base_branch);
+re-runs are idempotent. The CLI loops passes until no child is in flight.
 
-All external effects sit behind the `Ops` interface so tests run offline:
-
-    launch(brief) -> report        terminal report, or
-                                   {"status": "launched", "session_id": ...}
-    poll(session_id) -> report|None  report once the child settles
+Ops contract (tests inject a fake):
+    launch(brief) -> report          terminal, or {"status": "launched",
+                                                 "session_id": ...}
+    poll(session_id) -> report|None  optional; resolves launched records
     pr_state(url) -> {"state": "open"|"merged"|"closed", "head": sha}
-    merge(url, sha)                merge the PR only at that head
-    changed_paths(url) -> [paths]  git diff --name-only <base>...<pr_head>
+    merge(url, sha)                  merge the PR only at that head
+    changed_paths(url) -> [paths]    git diff --name-only <base>...<pr_head>
+`GhOps` is the thin real adapter (gh CLI; Devin sessions API for launch/poll,
+non-blocking so `width` is real parallelism across passes). Slices after the
+canary always wait on its merged PR (the STOP 2 human gate).
 
-`GhOps` is the thin real adapter: `gh` CLI for PR state, diff and merge; the
-Devin sessions API for `launch`/`poll` (non-blocking, so `width` is real
-parallelism across run() passes). `poll` is optional: an Ops that returns
-terminal reports from `launch` never needs it. Later slices always wait on
-the canary's merged PR (the STOP 2 human gate), beyond declared `depends_on`.
-
-Child report schema (structured output):
-    {status: PASS|FAIL|BLOCKED, slice, pr_url, branch, parity: PASS|FAIL,
-     findings: [{class, code, detail}], failure_class?, changed_paths: [...],
-     recon_cost, one_line_summary}
-A verify child's report additionally carries `verified_head` and `blocking`.
+Child report: {status: PASS|FAIL|BLOCKED, slice, pr_url, branch, parity,
+findings: [{class, code, detail}], failure_class?, changed_paths: [...],
+recon_cost, one_line_summary}; verify adds `verified_head`, `blocking`.
 """
 import argparse
 import json
@@ -40,8 +32,8 @@ from collections import Counter
 from pathlib import Path
 
 BRIEF_LIMIT = 4000
+POLL_INTERVAL = 60  # seconds between CLI passes while children are in flight
 SLICE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # record path is recon/<id>/
-RUNNING = {"launched", "verify_pending", "merge_ready", "awaiting_human"}
 IN_FLIGHT = {"launched", "verify_pending", "merge_ready"}
 
 
@@ -59,8 +51,7 @@ def _load_record(migration_dir, s):
     if path.exists():
         try:
             rec.update(json.loads(path.read_text()))
-        except (OSError, json.JSONDecodeError):
-            rec["note"] = "fanout.json unreadable; starting over"
+        except (OSError, json.JSONDecodeError): rec["note"] = "fanout.json unreadable"
     return rec
 
 
@@ -73,8 +64,7 @@ def _write_record(migration_dir, rec):
 
 
 def _topo(slices):
-    """Dependency-first order, stable by slices.json order. A cycle (already a
-    --check refusal) is appended in declared order."""
+    """Dependency-first order, stable by slices.json order."""
     ids = {s["id"] for s in slices}
     done, order, pending = set(), [], list(slices)
     while pending:
@@ -150,8 +140,13 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
     bad_ids = [s["id"] for s in order if not SLICE_ID.fullmatch(s["id"])]
     order = [s for s in order if s["id"] not in bad_ids]
     by_id = {s["id"]: s for s in order}
-    pos = {s["id"]: i for i, s in enumerate(order)}
     canary_id = next((s["id"] for s in order if s.get("canary")), None)
+    prereqs, stack = set(), [canary_id] if canary_id else []
+    while stack:  # the canary's own prerequisites stay exempt from its gate
+        for dep in by_id.get(stack.pop(), {}).get("depends_on", []):
+            if dep in by_id and dep not in prereqs:
+                prereqs.add(dep)
+                stack.append(dep)
     records = {s["id"]: _load_record(migration_dir, s) for s in order}
     failures = Counter()
     events = [f"{sid}: invalid slice id, skipped" for sid in bad_ids]
@@ -201,8 +196,15 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
             return
         try:
             ops.merge(rec["pr_url"], rec["verified_head"])
-        except Exception as exc:  # head moved or API error: re-verify
-            reverify(rec, f"merge refused: {exc}")
+        except Exception as exc:
+            if ops.pr_state(rec["pr_url"]).get("head") != rec["verified_head"]:
+                reverify(rec, f"PR head moved during merge: {exc}")
+                return
+            rec["merge_refusals"] = rec.get("merge_refusals", 0) + 1
+            rec["note"] = f"merge refused at verified head: {exc}"
+            if rec["merge_refusals"] >= 2:
+                rec["status"] = "awaiting_human"
+            save(rec)
             return
         rec["status"] = "merged"
         events.append(f"{sid}: merged at {rec['verified_head']}")
@@ -219,7 +221,6 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
             pending(rec, "verify", report, "verifier in flight")
 
     def verify_report(s, rec, report):
-        sid = s["id"]
         status = report.get("status")
         rec["findings"] = report.get("findings", rec.get("findings", []))
         if status != "PASS":
@@ -239,7 +240,7 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
         if st.get("head") != rec["verified_head"]:
             reverify(rec, "PR head moved during verification")
             return
-        bad = _protected_paths(ops.changed_paths(rec["pr_url"]), sid)
+        bad = _protected_paths(ops.changed_paths(rec["pr_url"]), s["id"])
         if bad:
             fail(rec, "protected_files_tampered",
                  f"PR diff touches protected paths: {bad}")
@@ -249,16 +250,15 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
         try_merge(s, rec)
 
     def migrate(s, rec):
-        sid = s["id"]
-        shared = _collision(doc, s, {r["slice"] for r in records.values()
-                                     if r["status"] in RUNNING} - {s["id"]})
+        shared = _collision(doc, s, {r["slice"] for r in records.values() if r["status"]
+                                     in IN_FLIGHT | {"awaiting_human"}} - {s["id"]})
         if shared:
             fail(rec, "collision",
                  f"shares write table(s) {shared} with running slice(s), no disposition")
             return
         if in_flight() >= width:
             rec["status"] = "waiting"
-            events.append(f"{sid}: width {width} reached")
+            events.append(f"{s['id']}: width {width} reached")
             save(rec)
             return
         migrate_report(s, rec, ops.launch(_brief("migrate", s, policy)) or {})
@@ -289,7 +289,7 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
     for s in order:
         sid = s["id"]
         rec = records[sid]
-        if rec.get("pr_url") and rec["status"] in RUNNING:
+        if rec.get("pr_url") and rec["status"] in IN_FLIGHT | {"awaiting_human"}:
             st = ops.pr_state(rec["pr_url"])
             if st["state"] == "merged":
                 rec["status"] = "merged"
@@ -299,8 +299,7 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
         if rec["status"] in ("merged", "awaiting_human"):
             continue
         if rec["status"] == "launched" and rec.get("session"):
-            poll = getattr(ops, "poll", None)
-            report = poll(rec["session"]) if poll else None
+            report = ops.poll(rec["session"]) if getattr(ops, "poll", None) else None
             if report is None:
                 continue
             rec.pop("session", None)
@@ -309,13 +308,16 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
             else:
                 migrate_report(s, rec, report)
             continue
-        deps = {d for d in s.get("depends_on", []) if d in by_id}
-        if canary_id and pos[sid] > pos[canary_id]:
-            deps.add(canary_id)  # canary merge is the human gate for all later slices
+        missing = [d for d in s.get("depends_on", []) if d not in by_id]
+        if missing:
+            fail(rec, "deps", f"depends_on not runnable in plan: {sorted(missing)}")
+            continue
+        deps = set(s.get("depends_on", []))
+        if canary_id and sid != canary_id and sid not in prereqs:
+            deps.add(canary_id)  # canary merge is the human gate for later slices
         if not all(merged(d) for d in deps):
-            if rec["status"] != "waiting":
-                rec["status"] = "waiting"
-                save(rec)
+            rec["status"] = "waiting"
+            save(rec)
             continue
         if rec["status"] == "merge_ready":
             try_merge(s, rec)
@@ -402,9 +404,13 @@ def main(argv=None):
     ap.add_argument("--width", type=int)
     ap.add_argument("--breaker", type=int)
     args = ap.parse_args(argv)
-    summary = run(GhOps(), _read(args.policy), _read(args.slices),
-                  migration_dir=args.migration_dir,
-                  width=args.width, breaker=args.breaker)
+    while True:  # drive passes until no child is in flight
+        summary = run(GhOps(), _read(args.policy), _read(args.slices),
+                      migration_dir=args.migration_dir,
+                      width=args.width, breaker=args.breaker)
+        if not any(r["status"] in IN_FLIGHT for r in summary["slices"].values()):
+            break
+        time.sleep(POLL_INTERVAL)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 1 if summary["halted"] or summary["failures"] else 0
 

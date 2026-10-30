@@ -29,7 +29,6 @@ def codes(fails):
     return {c for c, _ in fails}
 
 
-# --- schema -----------------------------------------------------------------
 
 def test_valid_base_doc():
     assert sl.check(mk_doc()) == []
@@ -60,7 +59,6 @@ def test_slice_id_must_be_path_safe(sid):
     assert "schema" in codes(sl.check(doc))
 
 
-# --- canary / auto_merge ----------------------------------------------------
 
 def test_canary_not_first():
     doc = mk_doc(mk_slice("slice-2", canary=True, auto_merge=False,
@@ -88,7 +86,6 @@ def test_auto_merge_must_match_canary():
     assert "auto_merge" in codes(sl.check(doc2))
 
 
-# --- depends_on -------------------------------------------------------------
 
 def test_dependency_cycle():
     doc = mk_doc(mk_slice("slice-2", depends_on=["slice-3"]),
@@ -101,7 +98,6 @@ def test_unknown_dependency():
     assert "unknown_dependency" in codes(sl.check(doc))
 
 
-# --- consumers / route_group ------------------------------------------------
 
 def test_consumer_route_split():
     doc = mk_doc(
@@ -130,7 +126,6 @@ def test_consumer_independent_routing_ok():
     assert "consumer_route_split" not in codes(sl.check(doc))
 
 
-# --- shared_writes ----------------------------------------------------------
 
 def test_shared_table_needs_disposition():
     doc = mk_doc(
@@ -173,7 +168,6 @@ def test_shared_writes_bad_format():
     assert "shared_writes" in codes(sl.check(doc))
 
 
-# --- dependency scan rules --------------------------------------------------
 
 def deps_for(mapping):
     return mk_deps(routines=mapping)
@@ -249,7 +243,6 @@ def test_glob_routine_expansion():
     assert "unscanned_routine" not in codes(fails)
 
 
-# --- census -----------------------------------------------------------------
 
 def test_unassigned_census():
     doc = mk_doc(mk_slice("slice-2", tables=["A.T1"], depends_on=["slice-1"]))

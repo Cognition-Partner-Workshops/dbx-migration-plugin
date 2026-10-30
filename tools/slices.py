@@ -186,20 +186,16 @@ def _shared_writes_check(slices):
         if len(slices_holding) > 1 and not any(
                 any(_match(table, t) for t in s.get("shared_writes") or {})
                 for s in slices_holding):
-            fails.append(("shared_writes", f"{table} appears in "
-                                           f"{[s['id'] for s in slices_holding]} "
-                                           "with no disposition"))
+            fails.append(("shared_writes",
+                          f"{table} in {[s['id'] for s in slices_holding]} with no disposition"))
     return fails
-
-
-def _scan_entries(section):
-    return {name: {"writes": e.get("writes") or [], "reads": e.get("reads") or []}
-            for name, e in (section or {}).items() if isinstance(e, dict)}
 
 
 def _deps_check(slices, deps):
     fails = []
-    scans = {fld: _scan_entries(deps.get(fld)) for fld in ("routines", "jobs")}
+    scans = {fld: {n: {"writes": e.get("writes") or [], "reads": e.get("reads") or []}
+                   for n, e in (deps.get(fld) or {}).items() if isinstance(e, dict)}
+             for fld in ("routines", "jobs")}
     tables = {s["id"]: {_norm(t) for t in s.get("tables", [])} for s in slices}
     slice0_tables = tables.get(SLICE_ZERO, set())
     readers = {}
