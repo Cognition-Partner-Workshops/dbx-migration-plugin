@@ -98,33 +98,33 @@ def _split(cmd, seps):
 
 
 def _in_quotes(cmd, pos):
-    q, depth, bt = None, 0, False
-    i = 0
+    stack, i = [], 0
     while i < pos:
         ch = cmd[i]
-        if bt:
-            if ch == "`":
-                bt = False
-        elif depth:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-        elif q:
-            if ch == "$" and q == '"' and i + 1 < pos and cmd[i + 1] == "(":
-                depth, i = 1, i + 1
-            elif ch == "`" and q == '"':
-                bt = True
-            elif ch == q:
-                q = None
-        elif ch == "$" and i + 1 < pos and cmd[i + 1] == "(":
-            depth, i = 1, i + 1
-        elif ch == "`":
-            bt = True
-        elif ch in "'\"":
-            q = ch
+        top = stack[-1] if stack else ""
+        if top in ("'", "`"):
+            if ch == top:
+                stack.pop()
+        elif top == '"':
+            if ch == '"':
+                stack.pop()
+            elif ch == "$" and i + 1 < pos and cmd[i + 1] == "(":
+                stack.append("$(")
+                i += 1
+            elif ch == "`":
+                stack.append("`")
+        else:
+            if ch == "$" and i + 1 < pos and cmd[i + 1] == "(":
+                stack.append("$(")
+                i += 1
+            elif ch == "(":
+                stack.append("(")
+            elif ch == ")" and stack:
+                stack.pop()
+            elif ch in ("'", '"', "`"):
+                stack.append(ch)
         i += 1
-    return q is not None and not depth and not bt
+    return (stack or [""])[-1] in ("'", '"')
 
 
 def _payloads(cmd):
@@ -132,22 +132,26 @@ def _payloads(cmd):
             if not _in_quotes(cmd, m.start())]
 
 
-ARGFLAG = {"-u", "-g", "-h", "-p", "-C", "-T", "-n", "-S",
-           "--unset", "--chdir", "--adjustment", "--user", "--group",
-           "--host", "--prompt", "--type", "--split-string"}
+ARGFLAG = {"sudo": {"-u", "-g", "-h", "-p", "-C", "-T",
+                    "--user", "--group", "--host", "--prompt"},
+           "doas": {"-u"},
+           "env": {"-u", "-S", "-C", "--unset", "--split-string", "--chdir"},
+           "nice": {"-n", "--adjustment"},
+           "time": {"-o", "-f", "-v", "--output", "--format", "--verbose"}}
 
 
 def _head(words):
-    skip = {"sudo", "env", "time", "command", "nice", "noglob", "doas"}
-    expect_arg = False
+    skip = set(ARGFLAG) | {"command", "noglob"}
+    wrapper, expect_arg = "", False
     for i, w in enumerate(words):
         if expect_arg:
             expect_arg = False
             continue
         if w in skip:
+            wrapper = w
             continue
         if w.startswith("-"):
-            if w in ARGFLAG:
+            if w in ARGFLAG.get(wrapper, ()):
                 expect_arg = True
             continue
         if re.match(r"^[A-Za-z_]\w*=", w):
