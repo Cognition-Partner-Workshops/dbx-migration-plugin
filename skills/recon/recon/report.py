@@ -125,10 +125,12 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
         warnings.append(str(w))
         add("evidence", "provenance", unit, str(w))
 
+    snapshot_missing = mode == "snapshot" and snapshot is None
     if mode not in MERGE_MODES:
         add("evidence", "mode", unit, f"mode {mode!r} is not merge evidence")
-    if mode == "snapshot" and snapshot is None:
-        add("evidence", "snapshot_missing", unit, "mode snapshot without a snapshot manifest")
+    if snapshot_missing:
+        add("evidence", "snapshot_missing", unit,
+            "mode snapshot without a snapshot manifest: the export has no source-truth anchor")
 
     if mode != "structural":
         if rerun_missing(rerun_proof) and rerun_posture != "not_applicable":
@@ -142,7 +144,8 @@ def build_result(unit: str, mode: str, mapping_version: str, tolerance_version: 
             add("rerun_policy", "rerun_unsupported", unit,
                 f"rerun proof unsupported under posture {rerun_posture}")
 
-    if not data_tiers or routine_analysis_missing or unlisted or unproven:
+    if (not data_tiers or routine_analysis_missing or unlisted or unproven
+            or snapshot_missing):
         parity = "NOT_RUN"
     elif any(data_failed(t) for t in data_tiers) or routine_gap(routine_parity):
         parity = "FAIL"
