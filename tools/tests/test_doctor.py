@@ -43,13 +43,13 @@ SLICES = {
 }
 GOOD_ENV = {"DATABRICKS_AUTH_TYPE": "oauth-m2m"}
 
-
 def make_dbx(fixtures: dict):
     calls = []
 
     def dbx(args):
         calls.append(" ".join(args))
-        for key, val in fixtures.items():
+        for key in sorted(fixtures, key=len, reverse=True):
+            val = fixtures[key]
             if key in " ".join(args):
                 if isinstance(val, Exception):
                     raise val
@@ -59,22 +59,19 @@ def make_dbx(fixtures: dict):
     dbx.calls = calls
     return dbx
 
-
 def grants(*privs, principal="sp-123"):
     return {"privilege_assignments": [{"principal": principal,
                                        "privileges": [{"privilege": p} for p in privs]}]}
-
-
-def statement(statement_name: str, data):
-    return {f'"statement": "{statement_name}"': {"status": {"state": "SUCCEEDED"},
-                                                 "result": {"data_array": data}}}
-
 
 def ok_dbx(**overrides):
     fixtures = {
         "current-user me": {"userName": "sp-123", "servicePrincipalName": "sp-123"},
         "SHOW CATALOGS": {"status": {"state": "SUCCEEDED"},
                           "result": {"data_array": [["mig_cat"], ["fed_cat"], ["prod_cat"]]}},
+        "catalogs list": {"catalogs": [{"name": "mig_cat", "owner": "admin"},
+                                       {"name": "fed_cat", "owner": "admin"},
+                                       {"name": "prod_cat", "owner": "admin"}]},
+        "SHOW SCHEMAS": {"status": {"state": "SUCCEEDED"}, "result": {"data_array": []}},
         '"statement": "SELECT 1"': {"status": {"state": "SUCCEEDED"}, "result": {"data_array": [[1]]}},
         "grants get-effective catalog mig_cat": grants("ALL_PRIVILEGES"),
         "grants get-effective catalog fed_cat": grants("USE_CATALOG", "SELECT"),
@@ -94,7 +91,6 @@ def ok_dbx(**overrides):
     fixtures.update(overrides)
     return make_dbx(fixtures)
 
-
 def make_run_cmd(fixtures: dict | None = None):
     fixtures = {"dbx-recon selftest": (0, "", ""), "guard.py": (2, '{"decision": "block"}', ""),
                 **(fixtures or {})}
@@ -111,7 +107,6 @@ def make_run_cmd(fixtures: dict | None = None):
 
     run_cmd.calls = calls
     return run_cmd
-
 
 def make_repo(tmp_path, policy=POLICY, slices=SLICES, commit=True):
     repo = tmp_path / "run"
@@ -130,53 +125,60 @@ def make_repo(tmp_path, policy=POLICY, slices=SLICES, commit=True):
         git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "x")
     return repo
 
-
-def make_plugin(tmp_path, guard_body=""):
+def make_plugin(tmp_path, guard_body="", name="dbx_guard.py"):
     plugin = tmp_path / "plugin"
     (plugin / "hooks").mkdir(parents=True)
-    (plugin / "hooks" / "guard.py").write_text(guard_body)
+    (plugin / "hooks" / name).write_text(guard_body)
     return plugin
-
 
 def run(repo, plugin, dbx=None, run_cmd=None, env=None, run_sql=None):
     return doctor.run_doctor(repo, dbx=dbx or ok_dbx(), run_cmd=run_cmd or make_run_cmd(),
                              env=GOOD_ENV if env is None else env, run_sql=run_sql, plugin_root=plugin)
 
-
 def statuses(report):
     return {c["check"]: c["status"] for c in report["checks"]}
-
 
 def test_identity_ok():
     st, data = doctor.check_identity(POLICY, ok_dbx(), GOOD_ENV)
     assert st == "ok" and data["auth_type"] == "oauth-m2m"
 
-
 def test_identity_pat_fails():
     st, data = doctor.check_identity(POLICY, ok_dbx(), {"DATABRICKS_AUTH_TYPE": "pat"})
     assert st == "fail" and "PAT" in data["reason"]
-
 
 def test_identity_mismatch_fails():
     st, _ = doctor.check_identity(POLICY, ok_dbx(**{"current-user me": {"userName": "other-sp"}}), GOOD_ENV)
     assert st == "fail"
 
-
 def test_identity_auth_unset_fails():
     st, _ = doctor.check_identity(POLICY, ok_dbx(), {})
     assert st == "fail"
-
 
 def test_isolation_ok(tmp_path):
     st, data = doctor.check_isolation(POLICY, ok_dbx())
     assert st == "ok" and data["access_select"] is True
 
+def test_isolation_source_unreadable_fails():
+    st, data = doctor.check_isolation(
+        POLICY, ok_dbx(**{"grants get-effective catalog fed_cat": {"privilege_assignments": []}}))
+    assert st == "fail" and data["access_select"] is False
+
+def test_isolation_catalog_ownership_fails():
+    st, data = doctor.check_isolation(POLICY, ok_dbx(**{
+        "catalogs list": {"catalogs": [{"name": "prod_cat", "owner": "sp-123"}]}}))
+    assert st == "fail" and "catalog prod_cat:owns" in data["writes_outside_targets"]
+
+def test_isolation_schema_write_fails():
+    st, data = doctor.check_isolation(POLICY, ok_dbx(**{
+        "SHOW SCHEMAS IN `prod_cat`": {"status": {"state": "SUCCEEDED"},
+                                      "result": {"data_array": [["secret"]]}},
+        "grants get-effective schema prod_cat.secret": grants("USE_SCHEMA", "MODIFY")}))
+    assert st == "fail" and "prod_cat.secret:MODIFY" in data["writes_outside_targets"]
 
 def test_isolation_write_outside_targets_fails():
     st, data = doctor.check_isolation(
         POLICY, ok_dbx(**{"grants get-effective catalog prod_cat": grants("SELECT", "MODIFY")}))
     assert st == "fail" and any("prod_cat:MODIFY" in w for w in data["writes_outside_targets"])
-
 
 def test_isolation_external_location_write_fails():
     st, data = doctor.check_isolation(POLICY, ok_dbx(**{
@@ -184,13 +186,11 @@ def test_isolation_external_location_write_fails():
         "grants get-effective external_location ext1": grants("CREATE_EXTERNAL_TABLE")}))
     assert st == "fail" and any("ext1" in w for w in data["writes_outside_targets"])
 
-
 def test_isolation_lakebase_production_role_fails():
     st, data = doctor.check_isolation(POLICY, ok_dbx(**{
         "list-roles projects/lb-proj/branches/production": {
             "roles": [{"name": "projects/lb-proj/branches/production/roles/sp-123"}]}}))
     assert st == "fail" and data["lakebase_role_violations"]
-
 
 def test_isolation_extra_read_warns():
     st, data = doctor.check_isolation(POLICY, ok_dbx(**{
@@ -199,12 +199,10 @@ def test_isolation_extra_read_warns():
         "grants get-effective catalog weird_cat": grants("USE_CATALOG", "SELECT")}))
     assert st == "warn" and any("weird_cat" in r for r in data["unexpected_read_grants"])
 
-
 def test_policy_committed_ok(tmp_path):
     repo = make_repo(tmp_path)
     st, _ = doctor.check_policy_committed(repo, make_run_cmd())
     assert st == "ok"
-
 
 def test_policy_committed_dirty_fails(tmp_path):
     repo = make_repo(tmp_path)
@@ -212,19 +210,16 @@ def test_policy_committed_dirty_fails(tmp_path):
     st, data = doctor.check_policy_committed(repo, make_run_cmd())
     assert st == "fail" and "differs" in data["reason"]
 
-
 def test_policy_committed_uncommitted_fails(tmp_path):
     repo = make_repo(tmp_path, commit=False)
     subprocess.run(["git", "-C", str(repo), "add", ".migration/base"], check=True, capture_output=True)
     st, data = doctor.check_policy_committed(repo, make_run_cmd())
     assert st == "fail" and data["reason"] == "uncommitted working copy"
 
-
 def test_policy_committed_invalid_schema_fails(tmp_path):
     repo = make_repo(tmp_path, policy={**POLICY, "version": 1})
     st, data = doctor.check_policy_committed(repo, make_run_cmd())
     assert st == "fail" and any("version" in e for e in data["errors"])
-
 
 def test_policy_committed_missing_fails(tmp_path):
     repo = tmp_path / "run"
@@ -232,13 +227,11 @@ def test_policy_committed_missing_fails(tmp_path):
     st, data = doctor.check_policy_committed(repo, make_run_cmd())
     assert st == "fail" and "missing" in data["reason"]
 
-
 def test_policy_committed_waves_warns(tmp_path):
     repo = make_repo(tmp_path)
     (repo / ".migration" / "waves").mkdir()
     st, data = doctor.check_policy_committed(repo, make_run_cmd())
     assert st == "warn" and "0.6 workspace" in data["reason"]
-
 
 def test_policy_committed_lakebase_gap_fails(tmp_path):
     pol = {**POLICY, "targets": {**POLICY["targets"]}}
@@ -246,7 +239,6 @@ def test_policy_committed_lakebase_gap_fails(tmp_path):
     repo = make_repo(tmp_path, policy=pol)
     st, data = doctor.check_policy_committed(repo, make_run_cmd())
     assert st == "fail" and any("lakebase" in e for e in data["errors"])
-
 
 def oracle_run_sql(fixtures):
     def run_sql(sql):
@@ -263,12 +255,10 @@ ORACLE_OK = {
     "session_user": [("MIG_RO",)],
 }
 
-
 def test_source_read_only_oracle_ok():
     st, _ = doctor.check_source_read_only(POLICY, SLICES["slices"], ok_dbx(),
                                           oracle_run_sql(ORACLE_OK), "sp-123")
     assert st == "ok"
-
 
 def test_source_read_only_oracle_write_priv_fails():
     st, data = doctor.check_source_read_only(
@@ -276,100 +266,139 @@ def test_source_read_only_oracle_write_priv_fails():
         oracle_run_sql({**ORACLE_OK, "session_privs": [("CREATE SESSION",), ("DELETE ANY TABLE",)]}), "sp-123")
     assert st == "fail" and any("DELETE ANY TABLE" in v for v in data["violations"])
 
-
 def test_source_read_only_oracle_owns_schema_fails():
     st, data = doctor.check_source_read_only(
         POLICY, SLICES["slices"], ok_dbx(),
         oracle_run_sql({**ORACLE_OK, "session_user": [("BILLING",)]}), "sp-123")
     assert st == "fail" and "owns slice schema" in data["violations"]
 
-
 def test_source_read_only_no_adapter_warns():
     st, _ = doctor.check_source_read_only(POLICY, SLICES["slices"], ok_dbx(), None, "sp-123")
     assert st == "warn"
-
 
 def test_source_read_only_unknown_family_warns():
     st, _ = doctor.check_source_read_only({**POLICY, "source": {"family": "teradata", "access": "x"}},
                                           SLICES["slices"], ok_dbx(), None, "sp-123")
     assert st == "warn"
 
-
 def test_source_read_only_sqlserver_role_fails():
     fixtures = {"fn_my_permissions(NULL,'SERVER'": [("VIEW SERVER STATE",)],
                 "fn_my_permissions(NULL,'DATABASE'": [("CONNECT",), ("SELECT",)],
                 "IS_SRVROLEMEMBER": [{"sysadmin": 1, "db_owner": 0, "db_datawriter": 0,
                                       "db_ddladmin": 0, "db_securityadmin": 0}],
-                "fn_my_permissions('BILLING": [], "fn_my_permissions('PKG_PLANS": []}
+                "fn_my_permissions('BILLING": [], "fn_my_permissions('PKG_PLANS'": [],
+                "sys.objects": []}
     pol = {**POLICY, "source": {"family": "sqlserver", "secret": "D", "access": "fed_cat.legacy"}}
     st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(),
                                              oracle_run_sql(fixtures), "sp-123")
     assert st == "fail" and "role:sysadmin" in data["violations"]
 
+def test_source_read_only_sqlserver_glob_expands():
+    fixtures = {"fn_my_permissions(NULL,'SERVER'": [("VIEW SERVER STATE",)],
+                "fn_my_permissions(NULL,'DATABASE'": [("CONNECT",), ("SELECT",)],
+                "IS_SRVROLEMEMBER": [{"sysadmin": 0, "db_owner": 0, "db_datawriter": 0,
+                                      "db_ddladmin": 0, "db_securityadmin": 0}],
+                "sys.objects": [("PKG_PLANS.proc_a",)],
+                "fn_my_permissions('PKG_PLANS.proc_a'": [("EXECUTE",)],
+                "fn_my_permissions('PKG_PLANS'": [],
+                "fn_my_permissions('BILLING": []}
+    pol = {**POLICY, "source": {"family": "sqlserver", "secret": "D", "access": "fed_cat.legacy"}}
+    st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(),
+                                             oracle_run_sql(fixtures), "sp-123")
+    assert st == "fail" and any("PKG_PLANS.proc_a" in v for v in data["violations"])
+
+
+PG_BASE = {"pg_roles": [{"rolsuper": False, "rolcreatedb": False, "rolcreaterole": False,
+                        "rolbypassrls": False}],
+           "has_schema_privilege": [], "pg_proc": [], "pg_class": []}
 
 def test_source_read_only_postgres_can_write_fails():
-    fixtures = {"pg_roles": [{"rolsuper": False, "rolcreatedb": False, "rolcreaterole": False,
-                             "rolbypassrls": False}],
-                "has_table_privilege": [("BILLING.TENANTS", False), ("BILLING.SUBSCRIPTIONS", True)],
-                "pg_namespace": [], "pg_class": []}
+    fixtures = {**PG_BASE,
+                "has_table_privilege": [("BILLING.TENANTS", False), ("BILLING.SUBSCRIPTIONS", True)]}
     pol = {**POLICY, "source": {"family": "postgres", "secret": "D", "access": "fed_cat.legacy"}}
     st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(),
                                              oracle_run_sql(fixtures), "sp-123")
     assert st == "fail" and "table:BILLING.SUBSCRIPTIONS" in data["violations"]
 
+def test_source_read_only_postgres_schema_create_fails():
+    fixtures = {**PG_BASE, "has_table_privilege": [],
+                "has_schema_privilege": [("BILLING", False, True)]}
+    pol = {**POLICY, "source": {"family": "postgres", "secret": "D", "access": "fed_cat.legacy"}}
+    st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(),
+                                             oracle_run_sql(fixtures), "sp-123")
+    assert st == "fail" and "schema-create:BILLING" in data["violations"]
+
+def test_source_read_only_postgres_no_tables_ok():
+    fixtures = dict(PG_BASE)   # no has_table_privilege fixture: the query must not run
+    pol = {**POLICY, "source": {"family": "postgres", "secret": "D", "access": "fed_cat.legacy"}}
+    st, _ = doctor.check_source_read_only(pol, [{**SLICES["slices"][0], "tables": [], "routines": []}],
+                                          ok_dbx(), oracle_run_sql(fixtures), "sp-123")
+    assert st == "ok"
+
+def test_source_read_only_postgres_routine_execute_fails():
+    fixtures = {**PG_BASE, "has_table_privilege": [],
+                "pg_proc": [("PKG_PLANS.reset(int)",)], "has_function_privilege": [(True,)]}
+    pol = {**POLICY, "source": {"family": "postgres", "secret": "D", "access": "fed_cat.legacy"}}
+    st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(),
+                                             oracle_run_sql(fixtures), "sp-123")
+    assert st == "fail" and "routine:PKG_PLANS.reset(int)" in data["violations"]
+
+
+EXISTING_GRANTS = {
+    "grants get-effective catalog src_cat": grants("USE_CATALOG", "SELECT"),
+    "grants get-effective schema src_cat.BILLING": grants("USE_SCHEMA", "SELECT"),
+    "grants get-effective schema src_cat.PKG_PLANS": grants("USE_SCHEMA", "SELECT"),
+    "grants get-effective table src_cat.BILLING.TENANTS": grants("SELECT"),
+    "grants get-effective table src_cat.BILLING.SUBSCRIPTIONS": grants("SELECT"),
+}
 
 def test_source_read_only_databricks_existing():
     pol = {**POLICY, "source": {"family": "databricks", "kind": "existing", "access": "src_cat"}}
-    st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(**{
-        "grants get-effective catalog src_cat": grants("USE_CATALOG", "SELECT")}), None, "sp-123")
+    st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(**EXISTING_GRANTS),
+                                             None, "sp-123")
     assert st == "ok"
-    st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(**{
-        "grants get-effective catalog src_cat": grants("ALL_PRIVILEGES")}), None, "sp-123")
-    assert st == "fail" and "ALL_PRIVILEGES" in data["write_privileges"]
 
+def test_source_read_only_databricks_existing_write_fails():
+    pol = {**POLICY, "source": {"family": "databricks", "kind": "existing", "access": "src_cat"}}
+    bad = {**EXISTING_GRANTS,
+           "grants get-effective table src_cat.BILLING.SUBSCRIPTIONS": grants("SELECT", "MODIFY")}
+    st, data = doctor.check_source_read_only(pol, SLICES["slices"], ok_dbx(**bad), None, "sp-123")
+    assert st == "fail" and any("MODIFY" in w for w in data["write_privileges"])
 
 def test_hook_live_ok(tmp_path):
     st, data = doctor.check_hook_live(make_plugin(tmp_path), make_run_cmd())
-    assert st == "ok" and data["decision"] == "block"
-
+    assert st == "ok" and data["decision"] == "block" and data["guard"] == "dbx_guard.py"
 
 def test_hook_live_missing_fails(tmp_path):
     st, data = doctor.check_hook_live(tmp_path / "plugin", make_run_cmd())
     assert st == "fail" and "missing" in data["reason"]
 
-
 def test_hook_live_not_firing_fails(tmp_path):
     st, data = doctor.check_hook_live(make_plugin(tmp_path), make_run_cmd({"guard.py": (0, "", "")}))
     assert st == "fail" and data["exit"] == 0
 
-
 def test_harness_ok():
     st, data = doctor.check_harness(POLICY, SLICES["slices"], ok_dbx(), make_run_cmd())
     assert st == "ok" and data["warehouse"] == "ok" and data["lakebase"] == "ok"
-
 
 def test_harness_selftest_fails():
     st, data = doctor.check_harness(POLICY, SLICES["slices"], ok_dbx(),
                                   make_run_cmd({"dbx-recon selftest": (1, "", "boom")}))
     assert st == "fail" and data["selftest_rc"] == 1
 
-
 def test_harness_warehouse_unreachable_fails():
     st, data = doctor.check_harness(POLICY, SLICES["slices"], ok_dbx(**{
         '"statement": "SELECT 1"': {"status": {"state": "FAILED"}}}), make_run_cmd())
     assert st == "fail" and "warehouse" in data["reason"]
-
 
 def test_harness_lakebase_unreachable_fails():
     st, data = doctor.check_harness(POLICY, SLICES["slices"], ok_dbx(**{
         "psql": doctor.DbxError(2, "connection refused")}), make_run_cmd())
     assert st == "fail" and "lakebase" in data["reason"]
 
-
 def test_harness_delta_only_skips_lakebase():
     st, data = doctor.check_harness(POLICY, [SLICES["slices"][0]], ok_dbx(), make_run_cmd())
     assert st == "ok" and "lakebase" not in data
-
 
 def test_run_doctor_ready(tmp_path):
     report = run(make_repo(tmp_path), make_plugin(tmp_path),
@@ -378,14 +407,12 @@ def test_run_doctor_ready(tmp_path):
     assert set(statuses(report)) == {"identity", "isolation", "policy_committed",
                                      "source_read_only", "hook_live", "harness"}
 
-
 def test_run_doctor_not_ready(tmp_path):
     report = run(make_repo(tmp_path), make_plugin(tmp_path),
                  dbx=ok_dbx(**{"current-user me": {"userName": "other-sp"}}),
                  run_sql=oracle_run_sql(ORACLE_OK))
     assert report["ready"] is False
     assert statuses(report)["identity"] == "fail"
-
 
 def test_main_exit_and_markdown(tmp_path, capsys):
     repo, plugin = make_repo(tmp_path), make_plugin(tmp_path)
@@ -398,7 +425,6 @@ def test_main_exit_and_markdown(tmp_path, capsys):
     assert out["ready"] is True
     text = md.read_text()
     assert "| check | status | data |" in text and "**ready**: true" in text
-
 
 def test_main_exit_one_on_failure(tmp_path, capsys):
     repo, plugin = make_repo(tmp_path), tmp_path / "no-plugin"
