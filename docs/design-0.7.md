@@ -6,8 +6,8 @@ is parity only (F2), three human stops (F3), the unit of work is a consumer slic
 through a Lakeflow Connect mirror (F5), Lakebridge writes the first conversion draft where it has a
 dialect (F6). Whether 0.7 is a new tree or a trim of 0.6.2 is decided after this spec is red-teamed (F7).
 
-Why: four runs on 0.6.x (UNT15–18) halted on the plugin's own policy machinery and never on data;
-UNT18 spent ~170 ACU and 8.5 h for zero merged units with six human stops, one of them a real
+Why: four unattended runs on 0.6.x halted on the plugin's own policy machinery and never on data;
+the last run spent ~170 ACU and 8.5 h for zero merged units with six human stops, one of them a real
 decision. Line budget for 0.7: ≤ 10,000 lines including tests (0.6.2: 48,764), with the recon
 harness the majority.
 
@@ -128,19 +128,19 @@ checks, each `ok|fail|warn` with `data`; `ready` is every check not `fail`. No s
 {
   "version": 2,
   "repo": "github.com/<owner>/<name>",
-  "base_branch": "tp-run/databricks-<run>",
+  "base_branch": "mig/<run>",
   "migration_principal": "<application id or SP name>",
   "targets": {
     "catalog": "mig_cat",
     "schema_prefix": "mig_<run>_",
-    "lakebase": {"project": "ow-tp-billing", "branch": "mig-<run>", "endpoint_host": "ep-xxx.database.us-east-1.cloud.databricks.com"},
+    "lakebase": {"project": "acme-billing", "branch": "mig-<run>", "endpoint_host": "ep-xxx.database.us-east-1.cloud.databricks.com"},
     "warehouse_http_path": "/sql/1.0/warehouses/<id>"
   },
   "forbidden_catalogs": ["prod_cat"],
   "forbidden_targets": ["prod", "production"],
   "bundle_targets": ["migration"],
-  "legacy_sources": ["OW_BILLING_RO_DSN", "44.213.30.5"],
-  "source": {"family": "oracle", "secret": "OW_BILLING_RO_DSN", "load": "mirror"},
+  "legacy_sources": ["LEGACY_RO_DSN", "legacy-host.example"],
+  "source": {"family": "oracle", "secret": "LEGACY_RO_DSN", "load": "mirror"},
   "tolerances": {"version": "tol-<date>-v1", "exact": true, "per_type": {}, "mirror_lag_s": 900,
                   "full_diff_row_threshold": 1000000, "blocking_findings": []},
   "authorizations": []
@@ -155,9 +155,9 @@ checks, each `ok|fail|warn` with `data`; `ready` is every check not `fail`. No s
 {
   "version": 1,
   "slices": [
-    {"id": "slice-0", "name": "reference", "track": "delta", "tables": ["OW_BILLING.TENANTS", "OW_BILLING.PLANS", "OW_BILLING.CODES"],
+    {"id": "slice-0", "name": "reference", "track": "delta", "tables": ["BILLING.TENANTS", "BILLING.PLANS", "BILLING.CODES"],
      "routines": [], "jobs": [], "consumers": [], "depends_on": [], "routing": "none"},
-    {"id": "slice-1", "name": "plans", "track": "lakebase", "tables": ["OW_BILLING.SUBSCRIPTIONS", "OW_BILLING.SUBSCRIPTIONS_HIST"],
+    {"id": "slice-1", "name": "plans", "track": "lakebase", "tables": ["BILLING.SUBSCRIPTIONS", "BILLING.SUBSCRIPTIONS_HIST"],
      "routines": ["PKG_PLANS.*"], "jobs": [], "consumers": ["billing-api"], "depends_on": ["slice-0"], "routing": "jdbc_url", "canary": true},
     {"id": "slice-2", "name": "rating+invoicing", "track": "lakebase", "tables": ["..."], "routines": ["PKG_RATING.*", "PKG_INVOICING.*"],
      "jobs": ["NIGHTLY_RATING"], "consumers": ["billing-api", "finance-report"], "depends_on": ["slice-1"], "routing": "jdbc_url",
@@ -204,7 +204,7 @@ one_line_summary}`. `fanout.py` fails a child whose `changed_paths` touch `.migr
 | `grading` | `full|by_design_unverified` per object | unchanged, but an object graded `by_design_unverified` produces a finding `code: by_design_unverified`, never a block; no manifest mirroring |
 
 The verifier's merge rule: `parity == PASS` and `mode in {live, snapshot, transactional}` and no
-finding with `blocking: true`. The `privilege_visibility` class covers UNT18's `trigger_extra` (RO
+finding with `blocking: true`. The `privilege_visibility` class covers the last run's `trigger_extra` (RO
 principal cannot read `ALL_TRIGGERS`) and `grant_extra` on an inherited catalog grant; both are
 reported in the PR and the route packet and never gate a merge unless the plan says so.
 
@@ -262,7 +262,7 @@ Lakebridge `--source-dialect` value when one exists, (d) one `source_read_only` 
 Nothing else changes: no plan skeleton fork, no estate-type reference, no per-family guard rules.
 OLTP vs analytical is the slice's `track`, not the plan's shape.
 
-## 12. What a run looks like (OW_BILLING, replayed)
+## 12. What a run looks like (a billing estate, replayed)
 
 | Step | Session | Human |
 |---|---|---|
