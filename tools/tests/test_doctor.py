@@ -434,6 +434,19 @@ def test_hook_live_missing_fails(tmp_path):
     st, data = doctor.check_hook_live(tmp_path / "plugin", make_run_cmd())
     assert st == "fail" and "missing" in data["reason"]
 
+BLOCKING_GUARD = 'import sys; print(\'{"decision": "block"}\'); sys.exit(2)'
+
+def test_hook_live_relative_plugin_root_resolves_guard(tmp_path, monkeypatch):
+    make_plugin(tmp_path, guard_body=BLOCKING_GUARD)
+    monkeypatch.chdir(tmp_path)
+    st, data = doctor.check_hook_live(Path("plugin"), doctor.default_run_cmd)
+    assert st == "ok" and data["decision"] == "block", data
+
+def test_hook_live_exit_2_without_block_decision_fails(tmp_path):
+    st, data = doctor.check_hook_live(make_plugin(tmp_path),
+                                      make_run_cmd({"guard.py": (2, "python: can't open file", "")}))
+    assert st == "fail" and data["decision"] is None
+
 def test_hook_live_not_firing_fails(tmp_path):
     st, data = doctor.check_hook_live(make_plugin(tmp_path), make_run_cmd({"guard.py": (0, "", "")}))
     assert st == "fail" and data["exit"] == 0

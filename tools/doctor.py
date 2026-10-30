@@ -382,6 +382,7 @@ def check_hook_live(plugin_root: Path, run_cmd) -> tuple[str, dict]:
                   if p.is_file()), None)
     if guard is None:
         return "fail", {"reason": "hooks/dbx_guard.py missing"}
+    guard = guard.resolve()
     with tempfile.TemporaryDirectory(prefix="dbx-doctor-probe-") as tmp:
         (Path(tmp) / ".migration").mkdir()
         (Path(tmp) / POLICY_REL).write_text(json.dumps({"version": 2}))
@@ -391,14 +392,14 @@ def check_hook_live(plugin_root: Path, run_cmd) -> tuple[str, dict]:
         event = {"tool_name": "exec", "cwd": tmp,
                  "tool_input": {"command": "echo " + "__dbx_guard" + "_probe__"}}
         rc, out, err = run_cmd([sys.executable, str(guard)], cwd=tmp, stdin=json.dumps(event))
-    data = {"probe": "sentinel", "armed_cwd": "temp checkout", "guard": guard.name, "exit": rc,
-            "stdout": out.strip()[:200], "stderr": err.strip()[:200]}
-    if rc != 2:
-        return "fail", {**data, "reason": "guard did not block the probe"}
     try:
-        data["decision"] = json.loads(out).get("decision") if out.strip() else None
-    except json.JSONDecodeError:
-        data["decision"] = None
+        decision = json.loads(out).get("decision") if out.strip() else None
+    except (json.JSONDecodeError, AttributeError):
+        decision = None
+    data = {"probe": "sentinel", "armed_cwd": "temp checkout", "guard": guard.name, "exit": rc,
+            "decision": decision, "stdout": out.strip()[:200], "stderr": err.strip()[:200]}
+    if rc != 2 or decision != "block":
+        return "fail", {**data, "reason": "guard did not block the probe"}
     return "ok", data
 def check_harness(policy: dict, slices: list, dbx, run_cmd) -> tuple[str, dict]:
     rc, out, err = run_cmd(["dbx-recon", "selftest"])
