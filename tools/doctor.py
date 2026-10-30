@@ -23,8 +23,9 @@ from pathlib import Path
 POLICY_REL = ".migration/policy.json"
 SLICES_REL = ".migration/slices.json"
 
-UC_READ = {"SELECT", "READ", "READ_VOLUME", "EXECUTE", "USE_CATALOG", "USE_SCHEMA", "USE_SHARE",
-           "USE_PROVIDER", "USE_RECIPIENT", "USE_CONNECTION", "BROWSE", "ACCESS"}
+UC_READ = {"SELECT", "READ", "READ_VOLUME", "READ_METADATA", "EXECUTE", "USE_CATALOG", "USE_SCHEMA",
+           "USE_SHARE", "USE_PROVIDER", "USE_RECIPIENT", "USE_CONNECTION", "BROWSE", "ACCESS"}
+UC_ACCESS_SELECT = {"SELECT", "USE_CATALOG", "ALL_PRIVILEGES"}  # MANAGE grants no reads
 ORACLE_READ = {"SELECT", "READ", "CREATE SESSION", "SELECT ANY TABLE", "SELECT ANY DICTIONARY"}
 MSSQL_READ = {"SELECT", "VIEW DEFINITION", "VIEW ANY DEFINITION", "VIEW DATABASE STATE",
               "VIEW SERVER STATE", "CONNECT", "SHOWPLAN"}
@@ -121,7 +122,7 @@ def check_isolation(policy: dict, dbx) -> tuple[str, dict]:
         writes += [f"{cat}:{p}" for p in privs if p.upper() not in UC_READ and cat != targets_cat]
         extra_reads += [f"{cat}:{p}" for p in privs
                         if p.upper() in UC_READ and cat not in expected_reads and cat != targets_cat]
-        access_select |= cat == access_cat and bool(privs & {"SELECT", "USE_CATALOG"})
+        access_select |= cat == access_cat and bool({p.upper() for p in privs} & UC_ACCESS_SELECT)
         if cat == targets_cat:
             continue
         try:
@@ -274,7 +275,7 @@ def _source_queries(family: str, obj: dict) -> list[tuple[str, str]]:
     if family == "oracle":
         sch = ",".join(_q(s.upper()) for s in obj["schemas"]) or "''"
         return [("session_privs", "SELECT privilege FROM session_privs"),
-                ("tab_privs", "SELECT table_schema, table_name, privilege FROM all_tab_privs WHERE grantee IN "
+                ("tab_privs", "SELECT table_schema, table_name, privilege, type FROM all_tab_privs WHERE grantee IN "
                               "(SELECT SYS_CONTEXT('USERENV','SESSION_USER') FROM dual UNION SELECT 'PUBLIC' FROM dual "
                               f"UNION SELECT role FROM session_roles) AND table_schema IN ({sch})"),
                 ("session_user", "SELECT SYS_CONTEXT('USERENV','SESSION_USER') AS session_user FROM dual")]
@@ -316,7 +317,10 @@ def _source_violations(family: str, obj: dict, results: dict[str, list]) -> list
         bad = [f"session_priv:{p}" for p in col0(results.get("session_privs") or []) if p.upper() not in ORACLE_READ]
         schemas = {s.upper() for s in obj["schemas"]}
         for r in results.get("tab_privs") or []:
-            schema, priv = (r.get("table_schema"), r.get("privilege")) if isinstance(r, dict) else (r[0], r[2])
+            schema, priv, typ = ((r.get("table_schema"), r.get("privilege"), r.get("type")) if isinstance(r, dict)
+                                 else (r[0], r[2], r[3] if len(r) > 3 else None))
+            if str(typ or "").upper() == "USER":
+                continue
             if str(schema).upper() in schemas and str(priv).upper() not in ("SELECT", "READ"):
                 bad.append(f"tab_priv:{r}")
         return bad + (["owns slice schema"] if set(col0(results.get("session_user") or [])) & set(obj["schemas"]) else [])
