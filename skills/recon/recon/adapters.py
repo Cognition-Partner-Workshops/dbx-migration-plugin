@@ -282,10 +282,42 @@ class _SqlAdapterBase:
 
     @staticmethod
     def _unquoted(sql: str) -> str:
-        sql = re.sub(r"'(?:''|[^'])*'", "''", sql)
-        sql = re.sub(r'"(?:""|[^"])*"', '""', sql)
-        sql = re.sub(r"--[^\n]*", "", sql)
-        return re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
+        out, i, n, mode = [], 0, len(sql), None
+        while i < n:
+            ch = sql[i]
+            if mode == "line_comment":
+                if ch == "\n":
+                    mode = None
+                    out.append(" ")
+                i += 1
+            elif mode == "block_comment":
+                if sql.startswith("*/", i):
+                    mode = None
+                    out.append(" ")
+                    i += 2
+                else:
+                    i += 1
+            elif mode in ("squote", "dquote"):
+                quote = "'" if mode == "squote" else '"'
+                if sql.startswith(quote + quote, i):
+                    i += 2
+                elif sql[i] == quote:
+                    mode = None
+                    i += 1
+                else:
+                    i += 1
+            elif sql.startswith("--", i):
+                mode, i = "line_comment", i + 2
+            elif sql.startswith("/*", i):
+                mode, i = "block_comment", i + 2
+            elif ch == "'":
+                mode, i = "squote", i + 1
+            elif ch == '"':
+                mode, i = "dquote", i + 1
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
 
     def run_query(self, sql: str) -> list[dict[str, Any]]:
         head = sql.lstrip().lower()

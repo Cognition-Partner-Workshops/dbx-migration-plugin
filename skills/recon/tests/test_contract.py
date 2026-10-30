@@ -227,8 +227,10 @@ def test_selftest(capsys):
 def test_run_query_literal_keywords_allowed():
     from recon.adapters import _SqlAdapterBase
     assert _SqlAdapterBase._unquoted("select id from t where c = 'update' -- drop") \
-        == "select id from t where c = '' "
+        == "select id from t where c =  "
     assert not _SqlAdapterBase._WRITE_SQL.search(
         _SqlAdapterBase._unquoted("select id from t where c = 'update' -- drop x"))
     assert _SqlAdapterBase._WRITE_SQL.search(
         _SqlAdapterBase._unquoted("select 1; drop table t"))
+    assert _SqlAdapterBase._WRITE_SQL.search(_SqlAdapterBase._unquoted(
+        "WITH /*'*/x AS (DELETE FROM t RETURNING *)/*'*/ SELECT"))
