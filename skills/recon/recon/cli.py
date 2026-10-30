@@ -30,9 +30,15 @@ from .engine import DEPTHS, MODES, run_recon
 from .report import status_line
 from .rerun import check_proof, grade_rerun, load_prior, load_record, source_digest
 from .routines import check_parity, git_committed, grade_routines, load_runs, writers
+from .typemap import apply_type_map, load_type_map
 
 SOURCE_FAMILIES = ("oracle", "sqlserver", "postgres", "databricks")
 MIGRATION = Path(".migration")
+
+
+_PARAM_EXPR = re.compile(
+    r"[=<>()]|--|/\*|\*/|;|\b(or|and|not|union|select|insert|update|delete|drop|"
+    r"alter|grant|revoke|like|in|between|case|when|exists|is|null|true|false)\b", re.I)
 
 
 def parse_params(items: list[str]) -> dict[str, str]:
@@ -41,6 +47,8 @@ def parse_params(items: list[str]) -> dict[str, str]:
         name, sep, value = item.partition("=")
         if not sep:
             raise ConfigError(f"--param must be NAME=VALUE, got {item!r}")
+        if _PARAM_EXPR.search(value):
+            raise ConfigError(f"--param {name}: values are literals, not expressions: {value!r}")
         params[name] = value
     return params
 
@@ -66,6 +74,8 @@ def selftest() -> int:
 
 
 def _slice_paths(unit: str) -> tuple[Path, Path]:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", unit):
+        raise ConfigError(f"unit name must match [A-Za-z0-9][A-Za-z0-9_-]*, got {unit!r}")
     return MIGRATION / "recon" / unit / "inputs", MIGRATION / "recon" / unit / "out"
 
 
@@ -252,6 +262,9 @@ def _dispatch(args) -> int:
     if args.mode != "live" or family == "databricks":
         spec = _qualify_source(spec, policy["source"]["access"])
     kind, target = _target(policy, entry, args.unit)
+    type_map = None
+    if (tm := load_type_map(inputs / "canonicalization.json", family, kind)) is not None:
+        spec, type_map = apply_type_map(tm, spec)
     if ops:
         _validate_ops(ops)
         run_source = lambda op: source.run_query(op["source_sql"])
@@ -284,6 +297,7 @@ def _dispatch(args) -> int:
                        ops=ops, run_source=run_source, run_target=run_target,
                        out_dir=out, seed=args.seed,
                        params=params, snapshot=snapshot, source_family=family, depth=args.depth,
+                       type_map=type_map,
                        routine_parity=routine_parity,
                        routine_writers=routine_writers,
                        routine_analysis_missing=deps is None,

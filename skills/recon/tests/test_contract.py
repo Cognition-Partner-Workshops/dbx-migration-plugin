@@ -139,7 +139,9 @@ def _migration(root: Path) -> Path:
 
 def test_run_cli_writes_result(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    _migration(tmp_path)
+    inputs = _migration(tmp_path)
+    (inputs / "snapshot_manifest.json").write_text(json.dumps(
+        {"source": "oracle", "row_counts": {"t": 2}}))
     monkeypatch.setattr(cli, "DatabricksSourceAdapter",
                         lambda http_path=None: FakeSource({"mig_cat.legacy_fed.t": ROWS}))
     monkeypatch.setattr(cli, "DatabricksTargetAdapter",
@@ -158,6 +160,32 @@ def test_run_cli_out_must_be_under_slice_out(tmp_path, monkeypatch):
     rc = cli.main(["run", "--unit", "slice-1", "--mode", "snapshot",
                    "--out", str(tmp_path / "elsewhere")])
     assert rc == 3
+
+
+def test_run_cli_snapshot_needs_manifest(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _migration(tmp_path)
+    monkeypatch.setattr(cli, "DatabricksSourceAdapter",
+                        lambda http_path=None: FakeSource({"mig_cat.legacy_fed.t": ROWS}))
+    monkeypatch.setattr(cli, "DatabricksTargetAdapter",
+                        lambda http_path, catalog, schema: FakeTarget({"t": ROWS}))
+    out = tmp_path / ".migration" / "recon" / "slice-1" / "out"
+    rc = cli.main(["run", "--unit", "slice-1", "--mode", "snapshot", "--out", str(out)])
+    assert rc == 3
+    result = json.loads((out / "result.json").read_text())
+    assert result["parity"] == "NOT_RUN"
+    assert any(f["code"] == "snapshot_missing" for f in result["findings"])
+
+
+def test_unit_name_rejects_traversal():
+    with pytest.raises(Exception):
+        cli._slice_paths("../escape")
+
+
+def test_param_rejects_expression():
+    with pytest.raises(Exception):
+        cli.parse_params(["cutoff=1 OR 1=1"])
+    assert cli.parse_params(["cutoff=2024-01-01"]) == {"cutoff": "2024-01-01"}
 
 
 def test_run_cli_missing_inputs_is_not_run_exit(tmp_path, monkeypatch):
