@@ -38,7 +38,8 @@ mirror. One DAB per slice named `mig_<run>_<slice>`, target `migration`, schedul
 ## 3. Prove
 
 `dbx-recon run --unit <slice> --family <family> --mode live|transactional --depth threshold
---out .migration/recon/<slice>/out/`; retry cap 3; `data` findings are fixed in converted code;
+--out .migration/recon/<slice>/out/` — `snapshot` instead when `source.access.kind:
+loaded_from_export`; retry cap 3; `data` findings are fixed in converted code;
 `rerun-proof` once. Open the PR: parity on line 1, findings table, bill (`acus_consumed`, wall
 time) as the last section.
 
@@ -46,13 +47,14 @@ time) as the last section.
 
 Deploy a Lakeflow Job `mig_<run>_<slice>_shadow` that runs the slice on the legacy cadence and
 `dbx-recon run --mode continuous` after each cycle into `<catalog>.<schema_prefix>recon.drift`;
-`tolerances.green_cycles` (default 3) consecutive PASS ticks gate `g-shadow-<slice>`. The job is
+the slice's `green_cycles` (default 3) consecutive PASS ticks gate `g-shadow-<slice>`. The job is
 created paused and started by `fanout.py` after merge.
 
 ## 5. Route (after STOP 3 for the slice)
 
 Produce the route packet (`.migration/recon/<slice>/route.md`: parity history, findings, shadow
-drift, rollback steps) and the exact repoint change for the slice's `routing` mechanism
+drift, rollback steps) — a manager commit on `base_branch`, never in a slice PR — and the exact
+repoint change for the slice's `routing` mechanism
 (`jdbc_url` → the config diff; `synonym` → the Oracle DDL for the customer DBA; `api` → the
-client change). Devin opens the PR; the customer-held principal applies it. Legacy keeps running
-for `tolerances.rollback_window` (default 24 h); shadow recon keeps ticking.
+client change). Devin opens the repoint PR; the customer-held principal applies it. Legacy keeps
+running for the slice's `rollback_window_h` (default 24 h); shadow recon keeps ticking.

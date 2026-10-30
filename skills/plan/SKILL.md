@@ -39,8 +39,9 @@ and you ask the human exactly the three stops — plan approval, the canary PR, 
    the collision refusal, and `protected_files_tampered` are its halts, each ending in a card
    whose last line is the exact reply that resumes it.
 7. **Route.** At STOP 3 per `route_group`, `fanout.py` launches the route step of the slice's
-   `migrate` child; the route packet lands in the slice PR and the customer-held principal
-   applies the repoint. Legacy stays as fallback through `rollback_window_h`.
+   `migrate` child; the route packet (`route.md`) is the manager's own commit on `base_branch`,
+   never in a slice PR, and the customer-held principal applies the repoint. Legacy stays as
+   fallback through `rollback_window_h`.
 
 ## Example: a billing estate, replayed
 
