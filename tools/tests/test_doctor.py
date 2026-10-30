@@ -199,6 +199,19 @@ def test_isolation_extra_read_warns():
         "grants get-effective catalog weird_cat": grants("USE_CATALOG", "SELECT")}))
     assert st == "warn" and any("weird_cat" in r for r in data["unexpected_read_grants"])
 
+def test_isolation_unreadable_catalog_records_error_and_continues():
+    st, data = doctor.check_isolation(POLICY, ok_dbx(**{
+        "SHOW CATALOGS": {"status": {"state": "SUCCEEDED"},
+                          "result": {"data_array": [["other_cat"], ["mig_cat"], ["fed_cat"], ["prod_cat"]]}},
+        "grants get-effective catalog other_cat": doctor.DbxError(1, "PERMISSION_DENIED")}))
+    assert st == "warn" and data["access_select"] is True and not data["writes_outside_targets"]
+    assert any(e.startswith("grants other_cat:") for e in data["errors"])
+
+def test_isolation_admins_group_fails():
+    st, data = doctor.check_isolation(POLICY, ok_dbx(**{
+        "current-user me": {"userName": "sp-123", "groups": [{"display": "admins", "value": "g1"}]}}))
+    assert st == "fail" and data["admin_groups"] == ["admins"]
+
 def test_policy_committed_ok(tmp_path):
     repo = make_repo(tmp_path)
     st, _ = doctor.check_policy_committed(repo, make_run_cmd())
@@ -259,6 +272,33 @@ def test_source_read_only_oracle_ok():
     st, _ = doctor.check_source_read_only(POLICY, SLICES["slices"], ok_dbx(),
                                           oracle_run_sql(ORACLE_OK), "sp-123")
     assert st == "ok"
+
+def test_source_read_only_oracle_tab_privs_query_uses_table_schema():
+    sql = dict(doctor._source_queries("oracle", doctor._objects(SLICES["slices"])))["tab_privs"]
+    assert "table_schema" in sql and "owner" not in sql.lower() and "'BILLING'" in sql
+
+def test_source_read_only_oracle_scoped_to_slice_schemas():
+    public_stock = [("SYS", "DBMS_OUTPUT", "EXECUTE"), ("MDSYS", "SDO_GEOM", "EXECUTE"), ("XDB", "XDB$ACL", "SELECT")]
+    st, data = doctor.check_source_read_only(POLICY, SLICES["slices"], ok_dbx(),
+                                             oracle_run_sql({**ORACLE_OK, "all_tab_privs": public_stock}), "sp-123")
+    assert st == "ok" and data["violations"] == []
+    st, data = doctor.check_source_read_only(
+        POLICY, SLICES["slices"], ok_dbx(),
+        oracle_run_sql({**ORACLE_OK, "all_tab_privs": public_stock + [("BILLING", "TENANTS", "INSERT")]}), "sp-123")
+    assert st == "fail" and any("INSERT" in v for v in data["violations"])
+
+def failing_adapter(policy):
+    raise RuntimeError("DPY-6005: cannot connect to database (timed out)")
+
+def test_main_source_adapter_error_is_a_fail_row(tmp_path, capsys):
+    repo, plugin = make_repo(tmp_path), make_plugin(tmp_path)
+    rc = doctor.main(["--repo", str(repo), "--source-adapter", f"{__name__}:failing_adapter"],
+                     dbx=ok_dbx(), run_cmd=make_run_cmd(), env=GOOD_ENV, plugin_root=plugin)
+    assert rc == 1
+    report = json.loads(capsys.readouterr().out)
+    row = next(c for c in report["checks"] if c["check"] == "source_read_only")
+    assert row["status"] == "fail" and "DPY-6005" in row["data"]["error"]
+    assert statuses(report)["identity"] == "ok"
 
 def test_source_read_only_oracle_write_priv_fails():
     st, data = doctor.check_source_read_only(
@@ -368,6 +408,27 @@ def test_source_read_only_databricks_existing_write_fails():
 def test_hook_live_ok(tmp_path):
     st, data = doctor.check_hook_live(make_plugin(tmp_path), make_run_cmd())
     assert st == "ok" and data["decision"] == "block" and data["guard"] == "dbx_guard.py"
+
+def test_hook_live_probes_from_armed_temp_checkout(tmp_path):
+    plugin, seen = make_plugin(tmp_path), {}
+    inner = make_run_cmd()
+
+    def run_cmd(argv, cwd=None, stdin=""):
+        if argv[-1].endswith("dbx_guard.py"):
+            event = json.loads(stdin)
+            seen.update(cwd=cwd, event_cwd=event["cwd"],
+                        armed=(Path(event["cwd"]) / ".migration" / "policy.json").is_file(),
+                        committed=doctor.default_run_cmd(["git", "status", "--porcelain"], cwd=cwd)[1].strip() == "")
+        return inner(argv, cwd=cwd, stdin=stdin)
+
+    st, _ = doctor.check_hook_live(plugin, run_cmd)
+    assert st == "ok" and seen["armed"] and seen["committed"]
+    assert Path(seen["cwd"]) == Path(seen["event_cwd"]) and not Path(seen["cwd"]).is_relative_to(plugin)
+
+def test_hook_live_real_guard_blocks_sentinel():
+    plugin_root = Path(doctor.__file__).resolve().parents[1]
+    st, data = doctor.check_hook_live(plugin_root, doctor.default_run_cmd)
+    assert st == "ok" and data["exit"] == 2 and data["decision"] == "block", data
 
 def test_hook_live_missing_fails(tmp_path):
     st, data = doctor.check_hook_live(tmp_path / "plugin", make_run_cmd())

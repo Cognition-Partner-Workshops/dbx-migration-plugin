@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 POLICY_REL = ".migration/policy.json"
@@ -97,6 +98,12 @@ def check_isolation(policy: dict, dbx) -> tuple[str, dict]:
     access_cat = str(policy["source"]["access"]).split(".")[0]
     expected_reads = {access_cat} | set(policy.get("forbidden_catalogs") or [])
     writes, extra_reads, errors, bad_roles = [], [], [], []
+    try:
+        me = dbx(["current-user", "me"])
+        groups = {str(g.get("display") or "") for g in (me.get("groups") or []) if isinstance(g, dict)}
+    except DbxError as exc:
+        groups, errors = set(), errors + [f"current-user: {exc}"]
+    admin_groups = sorted(groups & {"admins"})
     catalogs = [r[0] for r in _sql(dbx, policy, "SHOW CATALOGS")]
     try:
         owners = {str(c.get("name")): c.get("owner") for c in _rows(dbx(["catalogs", "list"]))}
@@ -106,7 +113,11 @@ def check_isolation(policy: dict, dbx) -> tuple[str, dict]:
     for cat in catalogs:
         if cat != targets_cat and owners.get(cat) == principal:
             writes.append(f"catalog {cat}:owns")
-        privs = _grants(dbx, "catalog", cat, principal)
+        try:
+            privs = _grants(dbx, "catalog", cat, principal)
+        except DbxError as exc:
+            errors.append(f"grants {cat}: {exc}")
+            continue
         writes += [f"{cat}:{p}" for p in privs if p.upper() not in UC_READ and cat != targets_cat]
         extra_reads += [f"{cat}:{p}" for p in privs
                         if p.upper() in UC_READ and cat not in expected_reads and cat != targets_cat]
@@ -140,9 +151,10 @@ def check_isolation(policy: dict, dbx) -> tuple[str, dict]:
                         bad_roles.append(f"{pid}/{bid}:{_rid(role)}")
     except DbxError as exc:
         errors.append(f"postgres: {exc}")
-    data = {"writes_outside_targets": writes, "lakebase_role_violations": bad_roles,
+    data = {"writes_outside_targets": writes, "lakebase_role_violations": bad_roles, "admin_groups": admin_groups,
             "unexpected_read_grants": extra_reads, "access_select": access_select, "errors": errors}
-    status = "fail" if writes or bad_roles or not access_select else "warn" if extra_reads or errors else "ok"
+    status = ("fail" if writes or bad_roles or admin_groups or not access_select
+              else "warn" if extra_reads or errors else "ok")
     return status, data
 def validate_policy(p) -> list[str]:
     if not isinstance(p, dict):
@@ -260,10 +272,11 @@ def _col0(rows: list) -> list:
     return [str(r[0] if not isinstance(r, dict) else next(iter(r.values()))) for r in rows]
 def _source_queries(family: str, obj: dict) -> list[tuple[str, str]]:
     if family == "oracle":
+        sch = ",".join(_q(s.upper()) for s in obj["schemas"]) or "''"
         return [("session_privs", "SELECT privilege FROM session_privs"),
-                ("tab_privs", "SELECT owner, table_name, privilege FROM all_tab_privs WHERE grantee IN "
+                ("tab_privs", "SELECT table_schema, table_name, privilege FROM all_tab_privs WHERE grantee IN "
                               "(SELECT SYS_CONTEXT('USERENV','SESSION_USER') FROM dual UNION SELECT 'PUBLIC' FROM dual "
-                              "UNION SELECT role FROM session_roles)"),
+                              f"UNION SELECT role FROM session_roles) AND table_schema IN ({sch})"),
                 ("session_user", "SELECT SYS_CONTEXT('USERENV','SESSION_USER') AS session_user FROM dual")]
     if family == "sqlserver":
         return [("server_privs", "SELECT permission_name FROM fn_my_permissions(NULL,'SERVER')"),
@@ -301,8 +314,11 @@ def _source_violations(family: str, obj: dict, results: dict[str, list]) -> list
     col0 = _col0
     if family == "oracle":
         bad = [f"session_priv:{p}" for p in col0(results.get("session_privs") or []) if p.upper() not in ORACLE_READ]
-        bad += [f"tab_priv:{r}" for r in (results.get("tab_privs") or [])
-                if str(r.get("privilege") if isinstance(r, dict) else r[2]).upper() not in ("SELECT", "READ")]
+        schemas = {s.upper() for s in obj["schemas"]}
+        for r in results.get("tab_privs") or []:
+            schema, priv = (r.get("table_schema"), r.get("privilege")) if isinstance(r, dict) else (r[0], r[2])
+            if str(schema).upper() in schemas and str(priv).upper() not in ("SELECT", "READ"):
+                bad.append(f"tab_priv:{r}")
         return bad + (["owns slice schema"] if set(col0(results.get("session_user") or [])) & set(obj["schemas"]) else [])
     if family == "sqlserver":
         bad = []
@@ -366,10 +382,16 @@ def check_hook_live(plugin_root: Path, run_cmd) -> tuple[str, dict]:
                   if p.is_file()), None)
     if guard is None:
         return "fail", {"reason": "hooks/dbx_guard.py missing"}
-    event = {"tool_name": "exec", "cwd": str(plugin_root),
-             "tool_input": {"command": "echo " + "__dbx_guard" + "_probe__"}}
-    rc, out, err = run_cmd([sys.executable, str(guard)], cwd=str(plugin_root), stdin=json.dumps(event))
-    data = {"probe": "sentinel", "guard": guard.name, "exit": rc,
+    with tempfile.TemporaryDirectory(prefix="dbx-doctor-probe-") as tmp:
+        (Path(tmp) / ".migration").mkdir()
+        (Path(tmp) / POLICY_REL).write_text(json.dumps({"version": 2}))
+        for argv in (["git", "init", "-q", "-b", "main", "."], ["git", "add", "-A"],
+                     ["git", "-c", "user.email=doctor@local", "-c", "user.name=doctor", "commit", "-qm", "policy"]):
+            run_cmd(argv, cwd=tmp)
+        event = {"tool_name": "exec", "cwd": tmp,
+                 "tool_input": {"command": "echo " + "__dbx_guard" + "_probe__"}}
+        rc, out, err = run_cmd([sys.executable, str(guard)], cwd=tmp, stdin=json.dumps(event))
+    data = {"probe": "sentinel", "armed_cwd": "temp checkout", "guard": guard.name, "exit": rc,
             "stdout": out.strip()[:200], "stderr": err.strip()[:200]}
     if rc != 2:
         return "fail", {**data, "reason": "guard did not block the probe"}
@@ -403,7 +425,9 @@ def _load(path: Path):
         return None
     return doc if isinstance(doc, dict) else None
 def run_doctor(repo: Path, *, dbx=None, run_cmd=None, env=None, run_sql=None,
-               plugin_root: Path | None = None) -> dict:
+               plugin_root: Path | None = None, source_adapter=None) -> dict:
+    """`source_adapter` is a zero-arg factory for run_sql; it runs inside guarded() so a driver
+    or DSN error is a `fail` row, not a crash before the report."""
     dbx, run_cmd = dbx or default_dbx, run_cmd or default_run_cmd
     env = os.environ if env is None else env
     plugin_root = Path(plugin_root) if plugin_root else Path(__file__).resolve().parents[1]
@@ -425,7 +449,10 @@ def run_doctor(repo: Path, *, dbx=None, run_cmd=None, env=None, run_sql=None,
         ("isolation", *guarded(lambda: check_isolation(policy, dbx) if policy
                                else ("fail", {"reason": "policy unreadable"}))),
         ("policy_committed", *guarded(lambda: check_policy_committed(repo, run_cmd))),
-        ("source_read_only", *guarded(lambda: check_source_read_only(policy, slices, dbx, run_sql, principal)
+        ("source_read_only", *guarded(lambda: check_source_read_only(
+                                          policy, slices, dbx,
+                                          run_sql if run_sql is not None or source_adapter is None else source_adapter(),
+                                          principal)
                                       if policy and slices is not None
                                       else ("fail", {"reason": "policy/slices unreadable"}))),
         ("hook_live", *guarded(lambda: check_hook_live(plugin_root, run_cmd))),
@@ -447,15 +474,16 @@ def main(argv: list[str] | None = None, **injected) -> int:
     p.add_argument("--source-adapter", metavar="MODULE:CALLABLE",
                    help="callable(policy) -> run_sql for source_read_only (legacy drivers live in the harness)")
     args = p.parse_args(argv)
-    run_sql = injected.get("run_sql")
+    run_sql, source_adapter = injected.get("run_sql"), None
     if run_sql is None and args.source_adapter:
-        mod = __import__(args.source_adapter.split(":", 1)[0], fromlist=["x"])
-        factory = mod
-        for part in args.source_adapter.split(":", 1)[1].split("."):
-            factory = getattr(factory, part)
-        run_sql = factory(_load(Path(args.repo) / POLICY_REL))
+        def source_adapter(spec=args.source_adapter, repo=Path(args.repo)):
+            factory = __import__(spec.split(":", 1)[0], fromlist=["x"])
+            for part in spec.split(":", 1)[1].split("."):
+                factory = getattr(factory, part)
+            return factory(_load(repo / POLICY_REL))
     report = run_doctor(Path(args.repo), dbx=injected.get("dbx"), run_cmd=injected.get("run_cmd"),
-                        env=injected.get("env"), run_sql=run_sql, plugin_root=injected.get("plugin_root"))
+                        env=injected.get("env"), run_sql=run_sql, plugin_root=injected.get("plugin_root"),
+                        source_adapter=source_adapter)
     print(json.dumps(report, indent=2, sort_keys=True))
     if args.markdown:
         Path(args.markdown).write_text(render_markdown(report))
