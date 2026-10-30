@@ -276,10 +276,15 @@ class _SqlAdapterBase:
         except Exception as exc:
             raise dictionary_error(table, view, exc) from exc
 
+    _WRITE_SQL = re.compile(
+        r";|\b(insert|update|delete|merge|drop|create|alter|truncate|grant|revoke|"
+        r"call|execute|copy|comment|vacuum|analyze|checkpoint|set|use|show)\b", re.I)
+
     def run_query(self, sql: str) -> list[dict[str, Any]]:
-        if not sql.lstrip().lower().startswith(("select", "with")):
+        head = sql.lstrip().lower()
+        if not head.startswith(("select", "with")) or self._WRITE_SQL.search(sql):
             from .config import ConfigError
-            raise ConfigError("recorded SQL ops must be read-only SELECT or WITH queries")
+            raise ConfigError("recorded SQL ops must be a single read-only SELECT or WITH query")
         cur = self._execute(sql)
         names = self._result_names(cur.description or [])
         rows = cur.fetchall()
