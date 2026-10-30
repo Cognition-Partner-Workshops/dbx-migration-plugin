@@ -92,9 +92,9 @@ and the edit tool's `file_path` + content.
 
 | # | Rule | Decision | Regex family (illustrative; the test table pins exact strings) |
 |---|---|---|---|
-| G1 | A legacy-only client or a `legacy_sources` name on the same command line as a write verb | block | clients `sqlplus|sqlldr|bteq|mload|fastload|tbuild|tdload|snowsql`; or any `legacy_sources[]` token; verb `\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE|GRANT|REVOKE|EXEC(UTE)?|CALL|BEGIN|COMMIT)\b` outside single quotes. `DBX_DECISION=<id>` prefix downgrades to `warn` only when the id matches a committed `legacy_write_authorized` entry **and** every `objects[]` literal of that entry appears in the command text and no other `<schema>.<table>` token follows a write verb; otherwise block. |
+| G1 | A legacy-only client or a `legacy_sources` name on the same command line as a write verb | block | clients `sqlplus|sqlldr|bteq|mload|fastload|tbuild|tdload|snowsql`; or any `legacy_sources[]` token; verb `\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE|GRANT|REVOKE|EXEC(UTE)?|CALL|BEGIN|COMMIT)\b` outside single quotes. The only downgrade is fail-closed and parses no SQL: the command is exactly `DBX_DECISION=<id> <client> <connection flags> -f|@ <file>` (one client, one script file, no inline SQL, no pipes or substitutions), the id matches a committed `legacy_write_authorized` entry, and `sha256(<file>)` equals that entry's `script_sha256`; the human who committed the entry reviewed that exact script. Anything else under a `DBX_DECISION` prefix blocks. |
 | G2 | A deploy to a production target | block | `databricks bundle (deploy|run|destroy)` or `dbt (run|build|seed)` with `-t|--target` matching `policy.forbidden_targets` (default `prod`, `production`); any `--target` not in `policy.bundle_targets`; `databricks postgres` resource path containing `/branches/production` with a write verb (`create-|delete-|update-`). |
-| G3 | Editing the contract or a credential store | block | edit/write with `file_path` ending `.migration/policy.json` or `.migration/slices.json` from any session other than the manager's plan step (the manager sets `DBX_ROLE=manager`; a worker never does), and from any session when the new content adds a `legacy_write_authorized` entry; `file_path` matching `(^|/)\.databrickscfg$|\.databricks/|\.config/databricks/`; any command assigning `DATABRICKS_(HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)=` or editing `/opt/.devin/envrc`. |
+| G3 | Adding an authorization, or editing a credential store | block | edit/write with `file_path` ending `.migration/policy.json` whose new content adds or changes an `authorizations[]` entry (any other edit to `policy.json`/`slices.json` passes the guard and is fenced at merge: `CODEOWNERS` requires a human review for `.migration/` on `base_branch`, and `fanout.py`/`verify` fail a slice PR touching either file); `file_path` matching `(^|/)\.databrickscfg$|\.databricks/|\.config/databricks/`; any command assigning `DATABRICKS_(HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)=` or editing `/opt/.devin/envrc`. |
 | G4 | Anything the guard cannot read (script file it cannot open, `eval`, `$(…)` wrapping a G1 client) | warn | logged; the platform permission model is the control |
 | G5 | Edits under the running plugin tree | block | `file_path` under `realpath(__file__)/../..` |
 
@@ -149,9 +149,9 @@ checks, each `ok|fail|warn` with `data`; `ready` is every check not `fail`. No s
 }
 ```
 
-- `source.access` is the one Unity Catalog reference every slice and the harness read the source through: a foreign catalog (Lakehouse Federation: `<catalog>` or `<catalog>.<schema>`), a landed schema (Lakeflow Connect CDC or query-based pipeline: `<catalog>.<schema>`), or a volume of exports (`/Volumes/<catalog>/<schema>/<volume>`). Which one, and how it is created, is slice-0's job through `target-routing` (`databricks-lakeflow-connect`, `databricks-dbsql` federation, `databricks-unity-catalog`); the plugin holds no connector or loader code. `tolerances.mirror_lag_s` applies only to a landed schema (read from the pipeline's last update) and is otherwise ignored.
+- `source.access` is the one Unity Catalog reference every slice and the harness read the source through: always a queryable `<catalog>` or `<catalog>.<schema>`: a foreign catalog (Lakehouse Federation) or a landed schema (Lakeflow Connect CDC or query-based pipeline, or, with no network path, tables slice-0 loads from an export volume with `COPY INTO`). A volume path is never the access value; the harness reads `source.access` with its Databricks adapter (`--family databricks`) when the source is federated or landed, and with the native family adapter when `source.access` is absent and the source is reachable directly. Which one, and how it is created, is slice-0's job through `target-routing` (`databricks-lakeflow-connect`, `databricks-dbsql` federation, `databricks-unity-catalog`); the plugin holds no connector or loader code. `tolerances.mirror_lag_s` applies only to a landed schema (read from the pipeline's last update) and is otherwise ignored.
 - `tolerances.blocking_findings` lists structural classes the plan chose to make merge-blocking (`[]` by default). Any class not listed is a finding.
-- `authorizations` holds only `legacy_write_authorized` entries: `{"id", "by": "user:<id>", "objects": [...]}`.
+- `authorizations` holds only `legacy_write_authorized` entries: `{"id", "by": "user:<id>", "objects": [...], "script_sha256": "<sha256 of the reviewed SQL script>"}`; `objects` is documentation for the reviewer, the guard checks only the hash.
 
 ```json
 {
@@ -226,8 +226,8 @@ Cold-start inputs: slice id, `policy.json`, `slices.json`, the dialect skill nam
    `source.access` resolvable using the official skill the estate calls for (federation connection +
    foreign catalog; a Lakeflow Connect pipeline into a landed schema; a volume the export is copied
    into and loaded in FK order), prove it with a row count per table, and record
-   `{access, kind: federation|landed|volume, pipeline_id?}` in `.migration/recon/slice-0/access.json`.
-   Every later slice reads `source.access` and never re-creates it.
+   `{access, kind: federation|landed|loaded_from_export, pipeline_id?, export_manifest?}` in `.migration/recon/slice-0/access.json`.
+   Every later slice reads `source.access` and never re-creates it. For `loaded_from_export` the tables are a frozen snapshot: `mode: snapshot` is the only merge-evidence mode and the route packet says so.
 2. **Convert**: `databricks labs lakebridge transpile --source-dialect <family> --input-source
    <slice dir> --output-folder <work dir> --error-file-path <work dir>/errors.log` for SQL/DDL/
    views; PL/SQL bodies, triggers, schedulers and anything in `errors.log` are converted by hand
