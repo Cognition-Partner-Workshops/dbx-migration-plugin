@@ -98,14 +98,33 @@ def _split(cmd, seps):
 
 
 def _in_quotes(cmd, pos):
-    q = None
-    for ch in cmd[:pos]:
-        if q:
-            if ch == q:
+    q, depth, bt = None, 0, False
+    i = 0
+    while i < pos:
+        ch = cmd[i]
+        if bt:
+            if ch == "`":
+                bt = False
+        elif depth:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+        elif q:
+            if ch == "$" and q == '"' and i + 1 < pos and cmd[i + 1] == "(":
+                depth, i = 1, i + 1
+            elif ch == "`" and q == '"':
+                bt = True
+            elif ch == q:
                 q = None
+        elif ch == "$" and i + 1 < pos and cmd[i + 1] == "(":
+            depth, i = 1, i + 1
+        elif ch == "`":
+            bt = True
         elif ch in "'\"":
             q = ch
-    return q is not None
+        i += 1
+    return q is not None and not depth and not bt
 
 
 def _payloads(cmd):
@@ -113,10 +132,25 @@ def _payloads(cmd):
             if not _in_quotes(cmd, m.start())]
 
 
+ARGFLAG = {"-u", "-g", "-h", "-p", "-C", "-T", "-n", "-S",
+           "--unset", "--chdir", "--adjustment", "--user", "--group",
+           "--host", "--prompt", "--type", "--split-string"}
+
+
 def _head(words):
-    skip = {"sudo", "env", "time", "command", "nice", "noglob"}
+    skip = {"sudo", "env", "time", "command", "nice", "noglob", "doas"}
+    expect_arg = False
     for i, w in enumerate(words):
-        if w.startswith("-") or re.match(r"^[A-Za-z_]\w*=", w) or w in skip:
+        if expect_arg:
+            expect_arg = False
+            continue
+        if w in skip:
+            continue
+        if w.startswith("-"):
+            if w in ARGFLAG:
+                expect_arg = True
+            continue
+        if re.match(r"^[A-Za-z_]\w*=", w):
             continue
         return i
     return -1
