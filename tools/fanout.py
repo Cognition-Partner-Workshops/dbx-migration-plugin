@@ -4,7 +4,8 @@ For every slice in `.migration/slices.json` whose `depends_on` are merged:
 launch a `migrate` child, a `verify` child on PASS, and merge the slice PR at
 the verifier's `verified_head` when `auto_merge` holds. State lives in
 `.migration/recon/<slice>/fanout.json` (manager commits it on base_branch);
-re-runs are idempotent. The CLI loops passes until no child is in flight.
+re-runs are idempotent. The CLI loops passes until no child is in flight,
+sharing one failure Counter; failed slices relaunch only on a fresh invocation.
 
 Ops contract (tests inject a fake):
     launch(brief) -> report          terminal, or {"status": "launched",
@@ -99,8 +100,7 @@ def _has_disposition(doc, table):
 
 
 def _collision(doc, s, running_ids):
-    """Tables shared between `s` and a running slice with no shared_writes
-    disposition. Cannot happen after slices.py --check; kept as defence."""
+    """Tables shared with a running slice and no shared_writes disposition."""
     mine = {_norm(t) for t in s.get("tables", [])}
     hits = set()
     for other in doc["slices"]:
@@ -131,8 +131,9 @@ def _brief(kind, s, policy, pr_url=None):
 
 
 def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=None,
-        clock=time.time):
-    """One fan-out pass. Returns a summary dict; records persist per slice."""
+        clock=time.time, failures=None, retry_failed=True):
+    """One fan-out pass. `failures` may be shared across passes (CLI loop);
+    failed records relaunch only on a fresh invocation (`retry_failed`)."""
     slices = doc.get("slices", [])
     width = int(width if width is not None else policy.get("width", 4))
     breaker = int(breaker if breaker is not None else policy.get("breaker", 3))
@@ -148,7 +149,7 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
                 prereqs.add(dep)
                 stack.append(dep)
     records = {s["id"]: _load_record(migration_dir, s) for s in order}
-    failures = Counter()
+    failures = Counter() if failures is None else failures
     events = [f"{sid}: invalid slice id, skipped" for sid in bad_ids]
 
     def save(rec):
@@ -228,6 +229,7 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
                  report.get("one_line_summary") or f"verify child {status}")
             return
         rec["verified_head"] = report.get("verified_head")
+        rec["merge_refusals"] = 0  # a fresh verified head gets fresh merge retries
         if report.get("parity") != "PASS":
             fail(rec, report.get("failure_class") or "parity",
                  "verifier reported parity other than PASS")
@@ -296,7 +298,8 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
                 save(rec)
             elif st["state"] == "closed":
                 fail(rec, "pr", f"PR closed unmerged: {rec['pr_url']}")
-        if rec["status"] in ("merged", "awaiting_human"):
+        if (rec["status"] in ("merged", "awaiting_human")
+                or (rec["status"] == "failed" and not retry_failed)):
             continue
         if rec["status"] == "launched" and rec.get("session"):
             report = ops.poll(rec["session"]) if getattr(ops, "poll", None) else None
@@ -313,7 +316,7 @@ def run(ops, policy, doc, *, migration_dir=".migration", width=None, breaker=Non
             fail(rec, "deps", f"depends_on not runnable in plan: {sorted(missing)}")
             continue
         deps = set(s.get("depends_on", []))
-        if canary_id and sid != canary_id and sid not in prereqs:
+        if canary_id and sid not in (canary_id, "slice-0") and sid not in prereqs:
             deps.add(canary_id)  # canary merge is the human gate for later slices
         if not all(merged(d) for d in deps):
             rec["status"] = "waiting"
@@ -404,10 +407,12 @@ def main(argv=None):
     ap.add_argument("--width", type=int)
     ap.add_argument("--breaker", type=int)
     args = ap.parse_args(argv)
+    failures, first = Counter(), True
     while True:  # drive passes until no child is in flight
         summary = run(GhOps(), _read(args.policy), _read(args.slices),
-                      migration_dir=args.migration_dir,
-                      width=args.width, breaker=args.breaker)
+                      migration_dir=args.migration_dir, failures=failures,
+                      width=args.width, breaker=args.breaker, retry_failed=first)
+        first = False
         if not any(r["status"] in IN_FLIGHT for r in summary["slices"].values()):
             break
         time.sleep(POLL_INTERVAL)

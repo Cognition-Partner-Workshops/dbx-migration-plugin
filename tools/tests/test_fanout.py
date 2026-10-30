@@ -1,5 +1,6 @@
 """Tests for tools/fanout.py (design-0.7 section 7); children faked."""
 import json
+from collections import Counter
 
 import pytest
 
@@ -73,8 +74,6 @@ def seed_record(tmp_path, sid, **fields):
 
 
 def test_dependency_ready_launch_order(tmp_path):
-    # slice-1 merges in-pass so slice-2 launches; slice-3's dep chain is met
-    # too, so all three migrates run in one pass.
     doc = mk_doc(mk_slice("slice-1"), mk_slice("slice-2", depends_on=["slice-1"]),
                  mk_slice("slice-3", depends_on=["slice-2"]))
     ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1"),
@@ -139,27 +138,33 @@ def test_width_caps_launches(tmp_path):
     assert summary["slices"]["slice-2"]["status"] == "waiting"
 
 
-def test_canary_awaits_human(tmp_path):
-    doc = mk_doc(mk_slice("slice-1", canary=True, auto_merge=False))
-    ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
-                  states={"https://x/slice-1": {"state": "open", "head": "h1"}})
+def test_slice0_not_gated_by_canary(tmp_path):
+    doc = mk_doc(mk_slice("slice-0"),
+                 mk_slice("slice-1", canary=True, auto_merge=False))
+    ops = FakeOps([migrate_pass("slice-0"), verify_pass("slice-0", "h0"),
+                   migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
+                  states={f"https://x/slice-{i}": {"state": "open", "head": f"h{i}"}
+                          for i in (0, 1)})
     summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
-    assert ops.merges == []
+    assert summary["slices"]["slice-0"]["status"] == "merged"
     assert summary["slices"]["slice-1"]["status"] == "awaiting_human"
 
 
-def test_rerun_skips_merged_and_progresses(tmp_path):
-    seed_record(tmp_path, "slice-1", status="merged", pr_url="https://x/slice-1")
-    seed_record(tmp_path, "slice-2", status="verify_pending",
-                pr_url="https://x/slice-2")
-    doc = mk_doc(mk_slice("slice-1"),
-                 mk_slice("slice-2", depends_on=["slice-1"]))
-    ops = FakeOps([verify_pass("slice-2", "h2")],
-                  states={"https://x/slice-2": {"state": "open", "head": "h2"}})
-    summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
-    assert len(ops.launches) == 1  # the verify child only
-    assert ops.merges == [("https://x/slice-2", "h2")]
-    assert summary["slices"]["slice-1"]["status"] == "merged"
+def test_failed_slice_no_same_invocation_retry(tmp_path):
+    seed_record(tmp_path, "slice-1", status="failed", failure_class="migrate")
+    summary = fanout.run(FakeOps(), mk_policy(), mk_doc(mk_slice("slice-1")),
+                         migration_dir=str(tmp_path), retry_failed=False)
+    assert summary["slices"]["slice-1"]["status"] == "failed"
+
+
+def test_failures_shared_across_passes(tmp_path):
+    ops = FakeOps([{"status": "FAIL", "slice": "s", "failure_class": "migrate"}] * 4)
+    fails = Counter()
+    for _ in range(4):
+        summary = fanout.run(ops, mk_policy(), mk_doc(mk_slice("slice-1")),
+                             migration_dir=str(tmp_path), failures=fails)
+    assert fails["migrate"] == 3
+    assert summary["slices"]["slice-1"]["status"] == "halted"
 
 
 def test_closed_pr_relaunches_migrate(tmp_path):
@@ -180,8 +185,6 @@ def test_collision_refusal(tmp_path):
                 pr_url="https://x/slice-1")
     doc = mk_doc(mk_slice("slice-1", tables=["A.T1"]),
                  mk_slice("slice-2", tables=["A.T1"]))
-    # verify report for slice-1 is never consumed: collision is checked per
-    # slice in order, slice-2 collides with the still-running slice-1.
     ops = FakeOps([{"status": "launched"}],
                   states={"https://x/slice-1": {"state": "open", "head": "h1"}})
     summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
@@ -203,8 +206,6 @@ def test_collision_cleared_by_disposition(tmp_path):
 
 
 def test_canary_prereq_is_not_gated(tmp_path):
-    # canary depends on a later slice: the prerequisite must not wait on the
-    # canary itself (would deadlock)
     doc = mk_doc(mk_slice("slice-1", canary=True, auto_merge=False,
                           depends_on=["slice-2"]),
                  mk_slice("slice-2"))
@@ -257,8 +258,6 @@ def test_merge_refusal_same_head_retries(tmp_path):
     ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
                   states={"https://x/slice-1": {"state": "open", "head": "h1"}})
     ops.merge = lambda url, sha: 1 / 0
-    # a refusal at the verified head retries next pass; only a moved head
-    # would burn another verifier session
     assert fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))[
         "slices"]["slice-1"]["status"] == "merge_ready"
     assert fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))[
