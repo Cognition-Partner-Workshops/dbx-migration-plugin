@@ -1,111 +1,45 @@
 ---
 name: target-routing
-description: "Routes every Databricks-side step of a migration to the official `databricks` plugin skill that owns it, and carries only the migration-specific deltas (unattended service-principal auth, isolated per-batch targets, PAUSED schedules, never-prod-from-a-child). Use whenever a plan step touches Databricks: auth, SQL, pipelines, jobs, bundles, Unity Catalog, ingestion, Lakebase."
+description: "Routes every Databricks-side step of a migration to the official `databricks` plugin skill that owns it, plus the migration-only auth rules (one migration principal, env-based OIDC/M2M, never a PAT, never the production Lakebase branch). Use whenever a slice step touches Databricks: auth, SQL, pipelines, jobs, bundles, Unity Catalog, ingestion, Lakebase."
 ---
 
 # Target routing
 
-The factory owns the *migration* problem (source dialects, lineage, recon, fan-out, plan gates). The official
-`databricks` plugin (`databricks/databricks-agent-skills`, declared in `.devin-plugin/plugin.json`
-as a required plugin) owns *how Databricks works today*: current API names, CLI verbs, product
-decision trees. This skill does not duplicate that content. It says which official skill to load for
-each factory step, and lists the few rules that are true only inside a migration.
-
-Always load `databricks-core` first, then the product skill named below. If an official skill and a
-plugin rule disagree on a Databricks API or CLI detail, the official skill is right and the
-plugin rule needs a fix; if they disagree on *process* (gates, recon authority, write scope), the
-plugin rule is right.
+The factory owns the *migration* problem (slices, dialects, recon, fan-out, the three stops). The
+official `databricks` plugin (`databricks/databricks-agent-skills`, declared in
+`.devin-plugin/plugin.json` as a required plugin) owns *how Databricks works today*. This skill
+never duplicates that content; it says which official skill to load for each step. Always load
+`databricks-core` first, then the product skill named below. If an official skill and a plugin
+rule disagree on an API or CLI detail, the official skill is right; on *process* (parity
+authority, the stops, write scope) the plugin rule is right.
 
 ## Step → official skill
 
-| Factory step | Load | What it decides |
+| Slice step | Load | What it decides |
 |---|---|---|
-| Auth, CLI sanity, SQL/table exploration (every worker session) | `databricks-core` | CLI presence, identity check (`databricks current-user me`), `experimental aitools tools query` / `discover-schema` / `get-default-warehouse` for ad-hoc SQL. Do not hand-roll Statement Execution API polling. |
-| Converted views, procedures, functions, scheduled queries (`unit-migration`, warehouse family) | `databricks-dbsql` | SQL scripting (`BEGIN…END`, `DECLARE`, `IF/WHILE/FOR`, DBR 16.3+), `CREATE PROCEDURE`/`CALL` (DBR 17+), `WITH RECURSIVE`, temp tables, MVs, `COLLATE UTF8_LCASE` for case-insensitive legacy semantics. Like-for-like procedure ports go here first; PySpark is the fallback, not the default. |
-| Converted ETL mapping chains / graphs (`pipeline-analysis`, `unit-migration`, ETL family) | `databricks-pipelines` | Lakeflow Spark Declarative Pipelines (formerly DLT). Batch full-scan step → materialized view; continuously growing source → streaming table; CDC/update-strategy → `create_auto_cdc_flow`; reject rows → expectations. Modern API only: `from pyspark import pipelines as dp`, no `import dlt`, no `LIVE.` prefix, `cluster_by` not `partition_cols` (see its `references/dlt-migration.md`). |
-| Scheduler edges, task orchestration, converted batch runners (`unit-migration`, D5 decisions) | `databricks-jobs` | Lakeflow Jobs task types, triggers, schedules, notifications, run-as. |
-| Deploying anything (`unit-migration`, `cutover`) | `databricks-dabs` | Declarative Automation Bundles (`databricks.yml`, `resources/`, targets, `bundle validate/deploy/run`). Factory delta: the bundle `name` is `mig_<run_id>_<batch_id>` (run id = the wave tag, batch id = the fan-out batch; the brief states the literal), never a shared name across batches, or one batch's deploy replaces another's resources. |
-| Catalog/schema layout, grants, row filters, column masks, lineage, system tables (`intake`, governance steps of `estate-inventory`, `migration-planning` and `cutover`, D8) | `databricks-unity-catalog` | Securable DDL, access control, fine-grained access, external locations, volumes, system tables for evidence. |
-| Upstream feeds, coexistence ingestion, CDC catch-up (D3 decisions, `data-reconciliation` source access) | `databricks-lakeflow-connect` | Managed connectors: SQL Server CDC (GA), query-based Oracle/Teradata/SQL Server/PG/MySQL, Foreign Catalog Redshift/Synapse/BigQuery/Snowflake, SaaS connectors. First option before any hand-built ingestion. |
-| Operational-database track (the OLTP estate track) | `databricks-lakebase` | Lakebase Postgres Autoscaling (`databricks postgres`; the Provisioned tier is retired, never create it): projects, branches, endpoints, synced tables, Lakehouse Sync into UC, OAuth connectivity. Factory delta: one branch per wave batch with a TTL is the isolated namespace; migration sessions never write the `production` branch. |
-| Converted PySpark/Scala code that must run serverless (the code estate track) | `databricks-serverless-migration`, `databricks-execution-compute` | Serverless compatibility checks and fixes; how to execute code on compute. |
-| Streaming legacy jobs (Kafka consumers, CDC streams) | `databricks-spark-structured-streaming` | Trigger modes, checkpoints, sinks. |
-| Verifying a migrated model/scoring job (prediction parity, the wave-verify ML-SCORING step) | `databricks-model-serving`, `databricks-ml-training` | Endpoints, MLflow, batch inference. |
+| Auth, CLI sanity, ad-hoc SQL (every session) | `databricks-core` | CLI presence, `databricks current-user me`, `experimental aitools tools query` / `discover-schema` / `get-default-warehouse`. Never hand-roll Statement Execution API polling. |
+| Access — federation (`source.access` kind `federation`) | `databricks-dbsql` + `databricks-unity-catalog` | Lakehouse Federation connection + foreign catalog (`remote_query` for probing). |
+| Access — landed schema (`kind: landed`) or export volume (`kind: loaded_from_export`) | `databricks-lakeflow-connect`, `databricks-unity-catalog` | Managed connectors (query-based Oracle/Teradata/SQL Server/PG/MySQL, SQL Server CDC, Foreign Catalog); volumes + `COPY INTO` in FK order for an export. |
+| Convert views, procedures, functions, scheduled queries (`delta` track) | `databricks-dbsql` | SQL scripting (`BEGIN…END`, handlers, `SIGNAL`), `CREATE PROCEDURE`/`CALL`, `WITH RECURSIVE`, MVs, `COLLATE` for legacy comparison semantics. |
+| Convert ETL/mapping chains to pipelines (`delta` track) | `databricks-pipelines` | Lakeflow Spark Declarative Pipelines: streaming tables vs materialized views, `create_auto_cdc_flow`, expectations. Modern API only. |
+| `lakebase` track (tables, routines, synced reference data) | `databricks-lakebase` | Lakebase Postgres Autoscaling: projects, branches, endpoints, `create-synced-table`. One migration branch (`policy.targets.lakebase.branch`); never `production`. |
+| Jobs: scheduler edges, the shadow job, task graphs | `databricks-jobs` | Lakeflow Jobs task types, `quartz_cron_expression` + `timezone_id`, `run_if`, `max_concurrent_runs`, notifications. |
+| Deploy anything | `databricks-dabs` | `databricks.yml`, targets, `bundle validate/deploy/run`. One bundle per slice named `mig_<run>_<slice>`, bundle target `migration`, schedules `PAUSED`. |
+| Catalog/schema layout, grants, volumes, row filters, system tables | `databricks-unity-catalog` | Securable DDL, access control, external locations, volumes, system tables for evidence. |
+| Converted PySpark/Scala that must run serverless | `databricks-serverless-migration`, `databricks-execution-compute` | Serverless compatibility checks and fixes. |
+| Verifier's second opinion on `delta` slices | `databricks labs lakebridge reconcile` | Optional; `dbx-recon` stays authoritative. |
 
-## Route by call graph
+## Auth rules for migration sessions
 
-Track assignment follows the dependency analysis a source-dialect skill emits
-(`.migration/units/<unit>/dependencies.json`, `{routine, reads, writes, calls}` rows; shape and fixture in
-`skills/oracle-plsql/SKILL.md`), not the table's home schema. Walk each routine's `calls` transitively and
-union its `reads` and `writes`:
-
-- A routine on the operational-database track (Lakebase, the OLTP estate track) pulls every table it reads
-  onto that track as well: the converted PL/pgSQL runs inside a Postgres transaction and can only read
-  Postgres tables, so a lookup left analytical-only breaks the routine. Such a table lands on both tracks
-  (the Lakebase copy fed by the synced-table path in `databricks-lakebase`), with one side recorded as owner.
-- A routine on the analytical track routes its reads and writes to the DBSQL/Lakeflow skills above; a
-  table it writes that an OLTP routine also writes is a routing conflict the plan must decide (`plan.yaml` decisions), not
-  something to split silently.
-- The transitive `writes` of a unit's routines, each taken to the target its `mapping_spec.json` names for
-  that source table, are its write targets; the routines, views and jobs it deploys are its
-  `deploy_objects`. The fan-out workflow refuses a wave whose declared `write_targets` differ from them
-  (rule in `skills/migration-fanout/SKILL.md`).
-
-## Migration-only deltas (these override nothing in the official skills; they narrow them)
-
-Analytical-track deltas (deploy/schedule, pipelines, governance): [references/analytical-deltas.md](references/analytical-deltas.md); load for warehouse/ETL/code units, not for Lakebase-only units.
-
-### Auth for unattended sessions
-
-This section is the only home for the Databricks auth rules; other files point here.
-
-- Worker sessions run as the engagement's dedicated **migration service principal**,
-  configured by the org blueprint: OIDC token federation preferred (`DATABRICKS_AUTH_TYPE=env-oidc` —
-  the `databricks` binary is a wrapper that exports a fresh `DATABRICKS_OIDC_TOKEN` per call), OAuth
-  M2M fallback (`DATABRICKS_AUTH_TYPE=oauth-m2m` with `DATABRICKS_CLIENT_SECRET`). Auth arrives only
-  from env vars the blueprint sets (`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`); optional
-  `DATABRICKS_DEVIN_AUDIENCE` sets a per-tier OIDC audience. No PATs (the doctor fails a `pat`
-  session; there is no waiver), no profiles, no config files, no interactive `databricks auth login`. The
-  official "never auto-select a profile" rule is satisfied because there is exactly one identity and
-  it is recorded in the wave manifest's `capabilities`.
-- The federation policy that lets the workspace accept the session's OIDC token is a deployment
-  prerequisite the customer's workspace admin creates before intake; its issuer, subject and host
-  values belong to the engagement's blueprint and its plan blockers, never to this repo.
-- Every session verifies identity once: the doctor reads `databricks auth describe` (env-oidc or
-  oauth-m2m is `ok`; `pat` is a fail) plus `databricks current-user me`,
-  and stops if the identity is not the migration principal (an admin or a human user is a halt, not
-  a convenience). The recon harness connects with the same session identity; `DATABRICKS_HTTP_PATH`
-  (or `--target-http-path`) names the SQL warehouse.
-- Principal tiers: assessment (metadata + read-only, phase 0), migration (full rights on the
-  migration catalog, USE elsewhere, no admin roles), cutover (customer-held; `AGENTS.md`). Never
-  request or use account-admin or workspace-admin permissions; escalate instead.
-
-### Platform 5xx on bundle deploy and run
-
-A `databricks bundle deploy` or `databricks bundle run` that fails with an HTTP 5xx or
-platform-unavailable response is retried at most twice — three attempts total — with a backoff of
-30 s then 120 s. Nothing else is retried: a 4xx, a validation error, a failing job run, or a guard
-block is a finding, not a retry. After the third 5xx the session stops and reports `status=BLOCKED`
-with failure class `platform_5xx` and the last request id in `one_line_summary`. A retry repeats
-the same command as the same identity, and the three attempts count as one for the circuit breaker (rule in `AGENTS.md`).
-
-### Write scope
-- Write scope and the allowlist are `AGENTS.md`; a child writes only to the targets in its brief.
-  Per-batch isolated areas: `<catalog>.<schema>__wave<N>_<unit>` or a
-  batch-scoped schema, dropped and recreated idempotently. The promotion schema is created by the
-  migration principal at setup when absent, so it owns it; a pre-existing schema under another
-  owner needs the grants the factory doctor names.
-- Preserve legacy table/column names in like-for-like migrations even when ugly; renames break
-  consumers and recon. Forced renames (reserved words, illegal characters) go in the unit's mapping
-  table so recon joins on the mapping, not on name equality.
-- Medallion applies to re-architected pipelines. A like-for-like migration lands the legacy shape
-  first (this is what makes Tier 1–3 recon trivially defined) and defers medallion refactors to a
-  named follow-up wave, unless the intake target profile says otherwise.
-- One active update per Lakeflow pipeline per wave: each batch lists the pipelines it updates as
-  `lakeflow_pipelines` in the wave manifest, and `python3 skills/target-routing/pipeline_updates.py
-  .migration/waves/wave-N.json` runs before launch (the fan-out workflow runs it itself from the
-  pointer's `plugin` root and halts on any non-zero exit). Two batches of a wave naming the same
-  pipeline is a halt unless the wave is serial (`width` 1) or `serialized_pipelines` maps that pipeline
-  to the plan decision slug (`serialized_pipelines` in the manifest) whose selected option serializes it; then the workflow
-  launches those batches in manifest order, each after the previous one finished. A batch that lists
-  nothing makes the result `unsupported`, not clean.
+- Every session runs as the engagement's **migration principal** from env vars only: OIDC token
+  federation (`DATABRICKS_AUTH_TYPE=env-oidc`) preferred, OAuth M2M (`oauth-m2m` with
+  `DATABRICKS_CLIENT_SECRET`) fallback. No PATs (the doctor's `identity` check fails a `pat`
+  session), no profiles, no config files, no interactive `databricks auth login`.
+- The principal must equal `policy.migration_principal`; the doctor proves it and `isolation`
+  proves it writes nowhere else. An admin or human-user identity is a halt, not a convenience.
+- `DATABRICKS_HTTP_PATH` (or `--target-http-path`) names the warehouse recon runs against;
+  `DBX_VERIFY_TOKEN` reaches verifier sessions only.
+- Never request or use account-admin or workspace-admin permissions; escalate instead.
+- A `databricks bundle deploy|run` that fails with HTTP 5xx is retried at most twice (backoff
+  30 s, then 120 s); a third 5xx is `status=BLOCKED` with `failure_class: platform_5xx`. A 4xx,
+  a validation error, a failing job run, or a guard block is a finding, never a retry.

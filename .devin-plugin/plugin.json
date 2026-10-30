@@ -1,7 +1,7 @@
 {
   "name": "dbx-migration-factory",
-  "version": "0.6.2",
-  "description": "Databricks migration factory on a board: a manager writes plan.yaml, humans approve it in the Plan view, worker tickets run waves; source-dialect skills, a reconciliation harness, enforcement hooks, and target routing onto the official Databricks skills.",
+  "version": "0.7.0",
+  "description": "Databricks migration factory, slice edition: a manager writes plan.yaml over consumer slices, humans approve it at three stops, slice children convert and prove parity, an independent verifier's dbx-recon verdict merges each slice PR; source-dialect skills, a reconciliation harness, a PreToolUse guard, and target routing onto the official Databricks skills.",
   "requiredPlugins": [
     {
       "source": "git-subdir",
