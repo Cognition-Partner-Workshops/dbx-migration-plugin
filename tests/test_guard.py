@@ -214,6 +214,19 @@ def test_g5_edit_other_plugin_files(policy_ws):
         assert decision(run_guard(edit_event(PLUGIN_ROOT / rel), policy_ws)) == "block"
 
 
+PROBE_EVENT = exec_event("echo " + "__dbx_guard" + "_probe__")
+
+
+def test_probe_sentinel_blocks_when_armed(armed):
+    r = run_guard(PROBE_EVENT, armed)
+    assert r.returncode == 2 and decision(r) == "block"
+
+
+def test_probe_sentinel_passes_when_unarmed(plain):
+    r = run_guard(PROBE_EVENT, plain)
+    assert r.returncode == 0 and decision(r) is None
+
+
 def test_unarmed(plain):
     r = run_guard(exec_event("psql -f run.sql"), plain)
     assert r.returncode == 0

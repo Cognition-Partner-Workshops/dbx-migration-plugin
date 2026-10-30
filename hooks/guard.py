@@ -30,6 +30,7 @@ ENV_ASSIGN = re.compile(
     r"(?:^|[;&|]|\s)(?:export\s+)?DATABRICKS_(?:HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)\s*=")
 G3_PATH = re.compile(r"(^|/)\.databrickscfg$|\.databricks/|\.config/databricks/|" + re.escape(ENVRC))
 HOOK_SELF = re.compile(r"guard\.py|hooks\.json")
+PROBE = "__dbx_guard_probe__"  # tools/doctor.py hook_live sentinel; blocked only when armed
 REDIRECT = re.compile(r">+\s*([^\s;&|]+)")
 QARG = re.compile(r"(?:^|\s)-[ceQq]\s*('[^']*'|\"[^\"]*\")")
 WRITERS = ("cp", "mv", "tee", "rm", "dd", "truncate", "chmod", "chown",
@@ -301,7 +302,8 @@ def main(stdin_text=None):
         return 0
     if cmd:
         pol = _policy(mdir)
-        hit = (_g1(cmd, pol.get("legacy_sources") or []) or _g2(cmd, pol)
+        hit = ((("probe", "doctor hook_live sentinel") if PROBE in cmd else None)
+               or _g1(cmd, pol.get("legacy_sources") or []) or _g2(cmd, pol)
                or _g3_command(cmd) or _g5_command(cmd))
         rule, why = hit if hit else ("none", "")
         decision = "block" if why else "warn"
