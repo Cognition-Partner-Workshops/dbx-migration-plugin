@@ -5,7 +5,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dbx_guard.py\"",
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\"",
           "timeout": 10
         }
       ]
@@ -15,7 +15,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dbx_guard.py\"",
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\"",
           "timeout": 10
         }
       ]

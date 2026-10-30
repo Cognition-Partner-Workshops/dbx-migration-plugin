@@ -1,3 +1,14 @@
+# 0.7.0 — slices, platform fences, parity-only merge authority
+
+Rewrite per `docs/design-0.7.md`. Safety moves to the migration principal's grants and branch
+protection; `hooks/guard.py` blocks only legacy-client writes, production deploy targets, credential-store
+edits and plugin-tree edits, and is silent outside a repo with `.migration/`. The unit of work is a
+consumer slice (`.migration/slices.json`, `tools/slices.py --check`, `tools/fanout.py`); `tools/doctor.py`
+runs six unsigned checks; `skills/recon` is the lifted harness with `parity: PASS|FAIL|NOT_RUN` as the
+only merge authority. Removed: the 0.6.2 phase skills, wave manifests, signed doctor records, hook
+nonce probes, authorizations, merge overrides, and `hooks/dbx_guard.py`. Devin never writes to the
+legacy source.
+
 # 0.6.2 — mixed-family estates run unpatched
 
 ## Changed
