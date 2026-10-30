@@ -2,8 +2,8 @@
 
 Status: draft for red-team. Decides the shape of 0.7; nothing here is implemented. Decisions taken
 with the owner on 2026-10-30: safety lives in platform identity and isolation (F1), merge authority
-is parity only (F2), three human stops (F3), the unit of work is a consumer slice (F4), data lands
-through a Lakeflow Connect mirror (F5), Lakebridge writes the first conversion draft where it has a
+is parity only (F2), three human stops (F3), the unit of work is a consumer slice (F4), the source is reached through one Unity Catalog reference the official
+skills set up, never a hand-written loader (F5), Lakebridge writes the first conversion draft where it has a
 dialect (F6). Whether 0.7 is a new tree or a trim of 0.6.2 is decided after this spec is red-teamed (F7).
 
 Why: four unattended runs on 0.6.x halted on the plugin's own policy machinery and never on data;
@@ -22,7 +22,7 @@ for the slice's rollback window. This is strangler fig: the estate is replaced o
 time, with the two systems coexisting until the last slice routes.
 
 ```
-assess ─▶ plan.yaml ──[STOP 1 approve]──▶ mirror ─▶ slice-0 ─▶ slice-1 ──[STOP 2 canary]──▶ slice-2..N (auto-merge)
+assess ─▶ plan.yaml ──[STOP 1 approve]──▶ slice-0 (source access + reference tables) ─▶ slice-1 ──[STOP 2 canary]──▶ slice-2..N (auto-merge)
                                                                      each slice: convert ─▶ prove ─▶ shadow ─▶ ──[STOP 3 per slice]──▶ route
 ```
 
@@ -92,9 +92,9 @@ and the edit tool's `file_path` + content.
 
 | # | Rule | Decision | Regex family (illustrative; the test table pins exact strings) |
 |---|---|---|---|
-| G1 | A legacy-only client or a `legacy_sources` name on the same command line as a write verb | block | clients `sqlplus|sqlldr|bteq|mload|fastload|tbuild|tdload|snowsql`; or any `legacy_sources[]` token; verb `\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE|GRANT|REVOKE|EXEC(UTE)?|CALL|BEGIN|COMMIT)\b` outside single quotes. `DBX_DECISION=<id>` prefix whose id matches a committed `legacy_write_authorized` entry downgrades to `warn`. |
+| G1 | A legacy-only client or a `legacy_sources` name on the same command line as a write verb | block | clients `sqlplus|sqlldr|bteq|mload|fastload|tbuild|tdload|snowsql`; or any `legacy_sources[]` token; verb `\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE|GRANT|REVOKE|EXEC(UTE)?|CALL|BEGIN|COMMIT)\b` outside single quotes. `DBX_DECISION=<id>` prefix downgrades to `warn` only when the id matches a committed `legacy_write_authorized` entry **and** every `objects[]` literal of that entry appears in the command text and no other `<schema>.<table>` token follows a write verb; otherwise block. |
 | G2 | A deploy to a production target | block | `databricks bundle (deploy|run|destroy)` or `dbt (run|build|seed)` with `-t|--target` matching `policy.forbidden_targets` (default `prod`, `production`); any `--target` not in `policy.bundle_targets`; `databricks postgres` resource path containing `/branches/production` with a write verb (`create-|delete-|update-`). |
-| G3 | Editing an authorization or a credential store | block | edit/write with `file_path` ending `.migration/policy.json` whose new content adds a `legacy_write_authorized` entry; `file_path` matching `(^|/)\.databrickscfg$|\.databricks/|\.config/databricks/`; any command assigning `DATABRICKS_(HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)=` or editing `/opt/.devin/envrc`. |
+| G3 | Editing the contract or a credential store | block | edit/write with `file_path` ending `.migration/policy.json` or `.migration/slices.json` from any session other than the manager's plan step (the manager sets `DBX_ROLE=manager`; a worker never does), and from any session when the new content adds a `legacy_write_authorized` entry; `file_path` matching `(^|/)\.databrickscfg$|\.databricks/|\.config/databricks/`; any command assigning `DATABRICKS_(HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)=` or editing `/opt/.devin/envrc`. |
 | G4 | Anything the guard cannot read (script file it cannot open, `eval`, `$(…)` wrapping a G1 client) | warn | logged; the platform permission model is the control |
 | G5 | Edits under the running plugin tree | block | `file_path` under `realpath(__file__)/../..` |
 
@@ -103,6 +103,8 @@ Policy source: `policy.json` read from `git show <base>:.migration/policy.json` 
 policy committed → G1/G2/G3/G5 still apply with `legacy_sources = []` and `bundle_targets = []`
 (so every deploy blocks until the policy PR merges); reads are never blocked. Output contract is
 unchanged (`{"decision": "block"|"warn", "reason": ...}` on stdout, exit 2 on block).
+
+G2 is deliberately not a destination allowlist: the destination fence is the migration principal's grants, proven by the doctor's `isolation` check (§5), and `fanout.py` refuses to launch while `isolation` is not `ok`. `policy.json` and `slices.json` are further protected by a `CODEOWNERS` rule on `.migration/` requiring a human review on `base_branch`, and `fanout.py`/`verify` fail any slice PR that touches them (`protected_files_tampered`). The guard is a no-op in a checkout with no `.migration/policy.json` on its base; it never fires in another plugin's or project's repo.
 
 Removed on purpose: SQL text classification, catalog resolution, Lakebase project/branch parsing,
 curl/REST path parsing, Python literal inspection, git subcommand tables, `cd`/`ssh`/`docker`
@@ -140,14 +142,14 @@ checks, each `ok|fail|warn` with `data`; `ready` is every check not `fail`. No s
   "forbidden_targets": ["prod", "production"],
   "bundle_targets": ["migration"],
   "legacy_sources": ["LEGACY_RO_DSN", "legacy-host.example"],
-  "source": {"family": "oracle", "secret": "LEGACY_RO_DSN", "load": "mirror"},
+  "source": {"family": "oracle", "secret": "LEGACY_RO_DSN", "access": "mig_cat.legacy_fed"},
   "tolerances": {"version": "tol-<date>-v1", "exact": true, "per_type": {}, "mirror_lag_s": 900,
                   "full_diff_row_threshold": 1000000, "blocking_findings": []},
   "authorizations": []
 }
 ```
 
-- `source.load` is `mirror` (Lakeflow Connect query-based or CDC connector into `targets.catalog.<schema_prefix>bronze`) or `export` (no connector: the slice loads its own tables in FK order from an export; `tolerances.mirror_lag_s` is ignored).
+- `source.access` is the one Unity Catalog reference every slice and the harness read the source through: a foreign catalog (Lakehouse Federation: `<catalog>` or `<catalog>.<schema>`), a landed schema (Lakeflow Connect CDC or query-based pipeline: `<catalog>.<schema>`), or a volume of exports (`/Volumes/<catalog>/<schema>/<volume>`). Which one, and how it is created, is slice-0's job through `target-routing` (`databricks-lakeflow-connect`, `databricks-dbsql` federation, `databricks-unity-catalog`); the plugin holds no connector or loader code. `tolerances.mirror_lag_s` applies only to a landed schema (read from the pipeline's last update) and is otherwise ignored.
 - `tolerances.blocking_findings` lists structural classes the plan chose to make merge-blocking (`[]` by default). Any class not listed is a finding.
 - `authorizations` holds only `legacy_write_authorized` entries: `{"id", "by": "user:<id>", "objects": [...]}`.
 
@@ -158,15 +160,15 @@ checks, each `ok|fail|warn` with `data`; `ready` is every check not `fail`. No s
     {"id": "slice-0", "name": "reference", "track": "delta", "tables": ["BILLING.TENANTS", "BILLING.PLANS", "BILLING.CODES"],
      "routines": [], "jobs": [], "consumers": [], "depends_on": [], "routing": "none"},
     {"id": "slice-1", "name": "plans", "track": "lakebase", "tables": ["BILLING.SUBSCRIPTIONS", "BILLING.SUBSCRIPTIONS_HIST"],
-     "routines": ["PKG_PLANS.*"], "jobs": [], "consumers": ["billing-api"], "depends_on": ["slice-0"], "routing": "jdbc_url", "canary": true},
+     "routines": ["PKG_PLANS.*"], "jobs": [], "consumers": ["billing-api"], "depends_on": ["slice-0"], "routing": "jdbc_url", "route_group": "billing-api", "canary": true},
     {"id": "slice-2", "name": "rating+invoicing", "track": "lakebase", "tables": ["..."], "routines": ["PKG_RATING.*", "PKG_INVOICING.*"],
-     "jobs": ["NIGHTLY_RATING"], "consumers": ["billing-api", "finance-report"], "depends_on": ["slice-1"], "routing": "jdbc_url",
+     "jobs": ["NIGHTLY_RATING"], "consumers": ["billing-api", "finance-report"], "depends_on": ["slice-1"], "routing": "jdbc_url", "route_group": "billing-api",
      "shared_writes": {"RATING_RESULTS": "merged"}}
   ]
 }
 ```
 
-`tools/slices.py --check` fails when: a table appears in two slices without a `shared_writes`
+`tools/slices.py --check` fails when: a consumer appears in two slices whose `routing` is not independently switchable per capability (`jdbc_url`, `synonym`) unless those slices share a `route_group` (routed together at one STOP 3); a table appears in two slices without a `shared_writes`
 disposition (`merged` = the slices were combined; `dual_write:<owner slice>` = owner writes both sides
 until the other routes); a routine's transitive writes (from the dialect skill's dependency scan)
 touch a table outside its slice and outside `slice-0`; `depends_on` has a cycle; a `canary` slice is
@@ -203,6 +205,8 @@ one_line_summary}`. `fanout.py` fails a child whose `changed_paths` touch `.migr
 | `mode` | fixture/live/snapshot/transactional/continuous/structural | unchanged; `fixture` parity is development evidence and the verifier refuses it |
 | `grading` | `full|by_design_unverified` per object | unchanged, but an object graded `by_design_unverified` produces a finding `code: by_design_unverified`, never a block; no manifest mirroring |
 
+`parity` is `NOT_RUN` (exit 3) unless every row tier ran for every table of the slice **and** every routine in `slices.json[].routines` that writes has a `routine_parity` row with a verdict; a missing dependency analysis or routine row never leaves `parity` at PASS (0.6.2 recorded that gap as an `evidence` blocker beside a PASS parity; 0.7 folds it into `parity`).
+
 The verifier's merge rule: `parity == PASS` and `mode in {live, snapshot, transactional}` and no
 finding with `blocking: true`. The `privilege_visibility` class covers the last run's `trigger_extra` (RO
 principal cannot read `ALL_TRIGGERS`) and `grant_extra` on an inherited catalog grant; both are
@@ -218,12 +222,12 @@ because it covers routines, Lakebase transactional mode and rerun proof.
 Cold-start inputs: slice id, `policy.json`, `slices.json`, the dialect skill named by
 `source.family`, the official databricks skills via `target-routing`.
 
-1. **Land** (slice-0 and the first slice only, when `source.load == mirror`): create the Lakeflow
-   Connect ingestion pipeline with an `ingestion_definition` listing the estate's tables into
-   `<catalog>.<schema_prefix>bronze`, `continuous: false` on a schedule equal to the legacy batch
-   cadence; record the pipeline id in `.migration/recon/slice-0/mirror.json`. When `export`, load
-   the slice's tables from the export in FK order with `COPY INTO`/`psql \copy` and record the
-   export manifest instead. Later slices read the mirror; they never re-land.
+1. **Access** (slice-0 only; slice-0 always exists, with zero tables when nothing is shared): make
+   `source.access` resolvable using the official skill the estate calls for (federation connection +
+   foreign catalog; a Lakeflow Connect pipeline into a landed schema; a volume the export is copied
+   into and loaded in FK order), prove it with a row count per table, and record
+   `{access, kind: federation|landed|volume, pipeline_id?}` in `.migration/recon/slice-0/access.json`.
+   Every later slice reads `source.access` and never re-creates it.
 2. **Convert**: `databricks labs lakebridge transpile --source-dialect <family> --input-source
    <slice dir> --output-folder <work dir> --error-file-path <work dir>/errors.log` for SQL/DDL/
    views; PL/SQL bodies, triggers, schedulers and anything in `errors.log` are converted by hand
@@ -268,7 +272,7 @@ OLTP vs analytical is the slice's `track`, not the plan's shape.
 |---|---|---|
 | analyze: Lakebridge analyze + census → `slices.json` (slice-0 reference, slice-1 plans (canary), slice-2 rating+invoicing merged because `sp_issue_invoice` writes `RATING_RESULTS`, slice-3 dunning) | manager + 1 child | — |
 | plan.yaml + policy PR | manager | STOP 1 |
-| doctor; mirror pipeline; slice-0 | fanout → 1 child + verifier | — (auto-merge) |
+| doctor; slice-0 (source access + reference tables) | fanout → 1 child + verifier | — (auto-merge) |
 | slice-1 canary PR with recon + bill | 1 child + verifier | STOP 2 |
 | slice-2, slice-3 in parallel (`width 4`) | 2 children + 2 verifiers | — (auto-merge) |
 | shadow 3 cycles per slice | jobs | — |
@@ -294,7 +298,7 @@ tag stays.
 
 ## 15. Open questions
 
-1. Lakeflow Connect query-based Oracle availability in the demo workspace; if absent, slice-0 runs `load: export` and the spec's mirror claims are tested on SQL Server CDC first.
+1. Which `source.access` kind the demo estate uses first (federation is zero-copy and needs only a UC connection; a landed schema needs the Lakeflow Connect query-based Oracle connector in the workspace).
 2. Whether Lakebridge (`databricks labs`) is acceptable as a hard dependency of `skills/migrate` or stays optional with hand conversion as the default.
 3. Branch protection with a required status check needs admin on the run repo; for demo repos where that is unavailable, the fallback is `fanout.py` refusing to merge without the `dbx-recon/verify` status — weaker, and must be named in the README.
 4. Per-slice route (STOP 3 per slice) or one route decision for the estate by default.
