@@ -163,11 +163,16 @@ def test_isolation_source_unreadable_fails():
         POLICY, ok_dbx(**{"grants get-effective catalog fed_cat": {"privilege_assignments": []}}))
     assert st == "fail" and data["access_select"] is False
 
-def test_isolation_access_all_privileges_or_manage_satisfies_select():
-    for privs in (("ALL_PRIVILEGES",), ("MANAGE",), ("ALL_PRIVILEGES", "MANAGE")):
+def test_isolation_access_all_privileges_satisfies_select_manage_alone_does_not():
+    for privs in (("ALL_PRIVILEGES",), ("ALL_PRIVILEGES", "MANAGE")):
         st, data = doctor.check_isolation(POLICY, ok_dbx(**{"grants get-effective catalog fed_cat": grants(*privs)}))
         assert data["access_select"] is True
         assert st == "fail" and all(f"fed_cat:{p}" in data["writes_outside_targets"] for p in privs)
+    st, data = doctor.check_isolation(POLICY, ok_dbx(**{"grants get-effective catalog fed_cat": grants("MANAGE")}))
+    assert st == "fail" and data["access_select"] is False
+    same_cat = {**POLICY, "source": {**POLICY["source"], "access": "mig_cat.legacy_fed"}}
+    st, data = doctor.check_isolation(same_cat, ok_dbx(**{"grants get-effective catalog mig_cat": grants("MANAGE")}))
+    assert st == "fail" and data["access_select"] is False
 
 def test_isolation_read_only_uc_privileges_are_not_writes():
     st, data = doctor.check_isolation(POLICY, ok_dbx(**{
