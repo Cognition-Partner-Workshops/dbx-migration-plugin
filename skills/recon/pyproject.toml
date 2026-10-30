@@ -1,0 +1,25 @@
+[project]
+name = "dbx-recon-harness"
+version = "0.1.0"
+description = "Reconciliation harness for warehouse/ETL-to-Databricks migrations"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+databricks = ["databricks-sql-connector>=4.0", "databricks-sdk>=0.30"]
+sqlserver = ["pyodbc>=5.0"]
+lakebase = ["psycopg[binary]>=3.2"]
+oracle = ["oracledb>=3.4,<4"]
+all = ["databricks-sql-connector>=4.0", "databricks-sdk>=0.30", "pyodbc>=5.0",
+       "psycopg[binary]>=3.2", "oracledb>=3.4,<4"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+dbx-recon = "recon.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["recon*"]
