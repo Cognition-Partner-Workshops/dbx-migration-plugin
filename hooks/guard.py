@@ -137,7 +137,7 @@ ARGFLAG = {"sudo": {"-u", "-g", "-h", "-p", "-C", "-T",
            "doas": {"-u"},
            "env": {"-u", "-S", "-C", "--unset", "--split-string", "--chdir"},
            "nice": {"-n", "--adjustment"},
-           "time": {"-o", "-f", "-v", "--output", "--format", "--verbose"}}
+           "time": {"-o", "-f", "--output", "--format"}}
 
 
 def _head(words):

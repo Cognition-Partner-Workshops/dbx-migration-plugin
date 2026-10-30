@@ -166,6 +166,7 @@ G5_EXEC = [
     ("sudo -u root rm hooks/guard.py", "block"),
     ("sudo -n rm hooks/guard.py", "block"),
     ("nice -n 5 rm hooks/guard.py", "block"),
+    ("time -v rm hooks/guard.py", "block"),
     ("env -u HOME sed -i s/x/y/ hooks/guard.py", "block"),
     ("ls -l /bin/rm hooks/guard.py", "warn"),
     ("echo x > " + str(PLUGIN_ROOT) + "/hooks.json", "block"),
