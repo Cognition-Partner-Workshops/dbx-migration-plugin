@@ -59,8 +59,8 @@ def _g1(cmd, legacy):
         return ("G1", f"legacy client/source `{engaged}` inside an ssh/docker exec payload")
     if any(_has(p, t) for p in re.split(r"(?<!\|)\|(?!\|)", cmd)[1:] for t in toks):
         return ("G1", f"a pipe into legacy client `{engaged}`")
-    for q in CARRIER.findall(cmd):
-        hit = _g1(q[1:-1], legacy)
+    for q in _payloads(cmd):
+        hit = _g1(q, legacy)
         if hit:
             return hit
     return None
@@ -97,25 +97,51 @@ def _split(cmd, seps):
     return parts
 
 
+def _in_quotes(cmd, pos):
+    q = None
+    for ch in cmd[:pos]:
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "'\"":
+            q = ch
+    return q is not None
+
+
+def _payloads(cmd):
+    return [m.group(1)[1:-1] for m in CARRIER.finditer(cmd)
+            if not _in_quotes(cmd, m.start())]
+
+
+def _head(words):
+    skip = {"sudo", "env", "time", "command", "nice", "noglob"}
+    for i, w in enumerate(words):
+        if w.startswith("-") or re.match(r"^[A-Za-z_]\w*=", w) or w in skip:
+            continue
+        return i
+    return -1
+
+
 def _writes_to(cmd, pred):
     for seg in _split(cmd, ";&|"):
         targets = REDIRECT.findall(seg)
         words = [w for w in _split(seg, " \t") if w]
-        for i, w in enumerate(words):
-            if os.path.basename(w) not in WRITERS:
-                continue
-            w = os.path.basename(w)
+        i = _head(words)
+        if i >= 0:
             rest = words[i + 1:]
+            w = os.path.basename(words[i])
             args = [a for a in rest if not a.startswith("-")]
-            if w == "sed":
-                if not any(f.startswith("-i") or f.startswith("--in-place") for f in rest):
-                    continue
+            if w == "sed" and not any(
+                    f.startswith("-i") or f.startswith("--in-place") for f in rest):
+                args = []
             elif w in ("cp", "mv"):
                 dest = [rest[j + 1] for j, a in enumerate(rest[:-1])
                         if a in ("-t", "--target-directory")]
                 dest += [a.split("=", 1)[1] for a in rest
                          if a.startswith("--target-directory=")]
                 args = dest or args[-1:]
+            elif w not in WRITERS:
+                args = []
             targets += args
         if any(pred(t.strip("'\"")) for t in targets):
             return True
@@ -126,7 +152,7 @@ def _g2(cmd, pol):
     forbidden = {str(t).lower() for t in (pol.get("forbidden_targets") or ("prod", "production"))}
     allowed = {str(t).lower() for t in (pol.get("bundle_targets") or ())}
     segs = _split(cmd, ";&|")
-    segs += [s for q in CARRIER.findall(cmd) for s in _split(q[1:-1], ";&|")]
+    segs += [s for q in _payloads(cmd) for s in _split(q, ";&|")]
     for seg in segs:
         if not DEPLOY.search(seg):
             continue
