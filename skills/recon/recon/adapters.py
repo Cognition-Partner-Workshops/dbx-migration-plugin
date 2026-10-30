@@ -280,9 +280,16 @@ class _SqlAdapterBase:
         r";|\b(insert|update|delete|merge|drop|create|alter|truncate|grant|revoke|"
         r"call|execute|copy|comment|vacuum|analyze|checkpoint|set|use|show)\b", re.I)
 
+    @staticmethod
+    def _unquoted(sql: str) -> str:
+        sql = re.sub(r"'(?:''|[^'])*'", "''", sql)
+        sql = re.sub(r'"(?:""|[^"])*"', '""', sql)
+        sql = re.sub(r"--[^\n]*", "", sql)
+        return re.sub(r"/\*.*?\*/", "", sql, flags=re.S)
+
     def run_query(self, sql: str) -> list[dict[str, Any]]:
         head = sql.lstrip().lower()
-        if not head.startswith(("select", "with")) or self._WRITE_SQL.search(sql):
+        if not head.startswith(("select", "with")) or self._WRITE_SQL.search(self._unquoted(sql)):
             from .config import ConfigError
             raise ConfigError("recorded SQL ops must be a single read-only SELECT or WITH query")
         cur = self._execute(sql)
