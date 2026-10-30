@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """dbx-migration-factory 0.7 PreToolUse guard (design-0.7.md section 4).
 
-Blocks the three irreversible classes the platform cannot fence itself:
-G1 a legacy client or `legacy_sources` name used for anything but an inline
+Blocks the irreversible classes the platform cannot fence itself: G1 a
+legacy client or `legacy_sources` name used for anything but an inline
 read, G2 a deploy to a forbidden or undeclared target, G3/G5 writes to a
 credential store or the running plugin tree. Every other event is `warn`
-(approve with the reason attached) and every exec event appends one line to
-`.migration/guard.log`. Armed iff a `.migration/` directory exists at or
-above the command's cwd (or the edit's file_path); silent otherwise.
+(approve with the reason attached) and every exec event appends one line
+to `.migration/guard.log`. Armed iff a `.migration/` directory exists at
+or above the event's cwd, a `cd` target, or the edit's file_path.
 """
 import json
 import os
@@ -29,10 +29,12 @@ TARGET_FLAG = re.compile(r"(?:^|\s)(?:-t|--target)[=\s]+([^\s;&|]+)")
 ENV_ASSIGN = re.compile(
     r"(?:^|[;&|]|\s)(?:export\s+)?DATABRICKS_(?:HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)\s*=")
 G3_PATH = re.compile(r"(^|/)\.databrickscfg$|\.databricks/|\.config/databricks/|" + re.escape(ENVRC))
+WRITER = re.compile(r">+\s*\S|sed\s+-i|\b(?:tee|rm|mv|cp|vi|vim|nano|emacs|dd|truncate|chmod|chown)\b")
+HOOK_SELF = re.compile(r"guard\.py|hooks\.json")
 
 
 def _has(cmd, tok):
-    return re.search(r"(?<![\w.-])" + re.escape(tok) + r"(?![\w.-])", cmd) is not None
+    return re.search(r"(?<![\w.-])" + re.escape(tok) + r"(?![\w.-])", cmd, re.I) is not None
 
 
 def _g1(cmd, legacy):
@@ -40,10 +42,10 @@ def _g1(cmd, legacy):
     engaged = next((t for t in toks if _has(cmd, t)), None)
     if not engaged:
         return None
-    bare = SQUOTED.sub(" ", cmd)
-    if (m := WRITE_VERB.search(bare)):
+    if (m := WRITE_VERB.search(cmd)):
         return ("G1", f"legacy client/source `{engaged}` on a line with write verb `{m.group(0)}`"
                       " (no DBX_DECISION downgrade exists in 0.7)")
+    bare = SQUOTED.sub(" ", cmd)
     if re.search(r"(?:^|\s)(?:-[fi]\b|@)|<", bare):
         return ("G1", f"legacy client `{engaged}` fed a script input (-f/-i/@/<); only an inline read is allowed")
     if re.search(r"\b(?:ssh|docker\s+exec)\b", cmd):
@@ -54,10 +56,12 @@ def _g1(cmd, legacy):
 
 
 def _g2(cmd, pol):
-    if DEPLOY.search(cmd):
-        forbidden = {str(t).lower() for t in (pol.get("forbidden_targets") or ("prod", "production"))}
-        allowed = {str(t).lower() for t in (pol.get("bundle_targets") or ())}
-        targets = [t.lower() for t in TARGET_FLAG.findall(cmd)]
+    forbidden = {str(t).lower() for t in (pol.get("forbidden_targets") or ("prod", "production"))}
+    allowed = {str(t).lower() for t in (pol.get("bundle_targets") or ())}
+    for seg in re.split(r"[;&|]+", cmd):
+        if not DEPLOY.search(seg):
+            continue
+        targets = [t.strip("'\"").lower() for t in TARGET_FLAG.findall(seg)]
         if not targets:
             return ("G2", "deploy with no -t/--target; a deploy must name a policy.bundle_targets entry")
         for t in targets:
@@ -65,7 +69,6 @@ def _g2(cmd, pol):
                 return ("G2", f"deploy target `{t}` is in policy.forbidden_targets")
             if t not in allowed:
                 return ("G2", f"deploy target `{t}` is not in policy.bundle_targets")
-        return None
     if ("/branches/production" in cmd and re.search(r"\bdatabricks\s+postgres\b", cmd)
             and re.search(r"\b(?:create|delete|update)-", cmd)):
         return ("G2", "`databricks postgres` create/delete/update on `/branches/production`")
@@ -76,11 +79,16 @@ def _g3_command(cmd):
     if ENV_ASSIGN.search(cmd):
         return ("G3", "assigns DATABRICKS_HOST/TOKEN/CLIENT_ID/CLIENT_SECRET;"
                       " the migration principal's credentials are fixed")
-    if ENVRC in cmd and (
-            re.search(r">\s*\S*" + re.escape(ENVRC), cmd)
-            or re.search(r"\b(?:sed\s+-i|tee|rm|mv|cp|vi|vim|nano|emacs|dd|truncate|chmod|chown)\b[^;&|]*"
-                         + re.escape(ENVRC), cmd)):
-        return ("G3", f"writes {ENVRC}, the session credential/environment store")
+    if G3_PATH.search(cmd) and WRITER.search(cmd):
+        return ("G3", "writes to a Databricks credential store (.databrickscfg/.databricks/envrc)")
+    if re.search(r"\bdatabricks\s+(?:configure|auth\s+login)\b", cmd):
+        return ("G3", "`databricks configure`/`auth login` would rewrite the principal's credentials")
+    return None
+
+
+def _g5_command(cmd):
+    if WRITER.search(cmd) and (str(PLUGIN_ROOT) in cmd or HOOK_SELF.search(cmd)):
+        return ("G5", "command writes inside the running plugin tree; the hook is never modified from a session")
     return None
 
 
@@ -126,8 +134,10 @@ def _policy(mdir):
 
 
 def _log(mdir, rule, decision, cmd):
+    safe = re.sub(r"(DATABRICKS_(?:HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)\s*=\s*)\S+",
+                  r"\1<redacted>", cmd)[:200]
     line = json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                       "rule": rule, "decision": decision, "cmd": cmd[:200]})
+                       "rule": rule, "decision": decision, "cmd": safe})
     try:
         with open(mdir / "guard.log", "a") as f:
             f.write(line + "\n")
@@ -149,7 +159,9 @@ def main(stdin_text=None):
         return 0
     cwd = ti.get("workdir") or event.get("cwd") or os.getcwd()
     if cmd:
-        mdir = _armed(cwd)
+        dirs = [cwd] + [os.path.join(cwd, t) for t in
+                        re.findall(r"(?:^|[;&|]\s*)cd\s+(?:-[LP]\s+)?([^\s;&|]+)", cmd)]
+        mdir = next((m for m in map(_armed, dirs) if m), None)
     else:
         fp = fpath if os.path.isabs(fpath) else os.path.join(cwd, fpath)
         mdir = _armed(cwd) or _armed(fp)
@@ -157,7 +169,8 @@ def main(stdin_text=None):
         return 0
     if cmd:
         pol = _policy(mdir)
-        hit = (_g1(cmd, pol.get("legacy_sources") or []) or _g2(cmd, pol) or _g3_command(cmd))
+        hit = (_g1(cmd, pol.get("legacy_sources") or []) or _g2(cmd, pol)
+               or _g3_command(cmd) or _g5_command(cmd))
         rule, why = hit if hit else ("none", "")
         decision = "block" if why else "warn"
         _log(mdir, rule, decision, cmd)

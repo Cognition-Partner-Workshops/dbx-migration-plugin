@@ -86,6 +86,7 @@ G1 = [
     ("ssh db-01 \"bteq < q.sql\"", "block"),
     ("docker exec dbx psql -c 'select 1'", "block"),
     ("psql -c 'select 1' | grep x", "warn"),
+    ("psql -c 'DROP TABLE t'", "block"),
     ("grep -r psql src/", "warn"),
     ("git commit -m 'note about psql'", "block"),  # COMMIT is a G1 verb and the token is engaged
 ]
@@ -93,6 +94,7 @@ G1 = [
 G1_LEGACY = [
     ("sqlplus $LEGACY_DSN -c 'select 1'", "warn"),
     ("ssh legacy-db-01 'rm -rf /x'", "block"),
+    ("ssh LEGACY-DB-01 'rm -rf /x'", "block"),
     ("echo LEGACY_DSN is set", "warn"),
     ("sqlldr $LEGACY_DSN control=l.ctl < in.dat", "block"),
 ]
@@ -106,6 +108,10 @@ G2 = [
     ("databricks bundle run -t prod", "block"),
     ("databricks bundle destroy --target=prod", "block"),
     ("databricks bundle deploy", "block"),
+    ("databricks bundle deploy -t 'migration'", "warn"),
+    ("databricks bundle deploy -t 'prod'", "block"),
+    ("databricks bundle deploy --target=\"prod\"", "block"),
+    ("echo -t migration; databricks bundle deploy", "block"),
     ("databricks bundle validate -t prod", "warn"),
     ("databricks postgres create-branch projects/p/branches/production/x", "block"),
     ("databricks postgres delete-endpoint projects/p/branches/production/ep", "block"),
@@ -123,10 +129,25 @@ G3_EXEC = [
     ("echo hi | tee /opt/.devin/envrc", "block"),
     ("cat /opt/.devin/envrc", "warn"),
     ("source /opt/.devin/envrc", "warn"),
+    ("echo x > ~/.databrickscfg", "block"),
+    ("echo x > /home/u/.databricks/cfg", "block"),
+    ("cat ~/.databrickscfg", "warn"),
+    ("databricks configure --profile x", "block"),
+    ("databricks auth login", "block"),
+    ("databricks auth describe", "warn"),
 ]
 
-@pytest.mark.parametrize("cmd,want", G1 + G1_LEGACY + G2 + G3_EXEC,
-                         ids=[c[0] for c in G1 + G1_LEGACY + G2 + G3_EXEC])
+G5_EXEC = [
+    ("sed -i s/x/y/ hooks/guard.py", "block"),
+    ("rm hooks/guard.py", "block"),
+    ("echo x > " + str(PLUGIN_ROOT) + "/hooks.json", "block"),
+    ("cp " + str(PLUGIN_ROOT) + "/hooks/guard.py /tmp/g.py", "block"),
+    ("cat hooks/guard.py", "warn"),
+    (sys.executable + " hooks/guard.py", "warn"),
+]
+
+@pytest.mark.parametrize("cmd,want", G1 + G1_LEGACY + G2 + G3_EXEC + G5_EXEC,
+                         ids=[c[0] for c in G1 + G1_LEGACY + G2 + G3_EXEC + G5_EXEC])
 def test_exec(policy_ws, cmd, want):
     assert decision(run_guard(exec_event(cmd), policy_ws)) == want
 
@@ -222,6 +243,31 @@ def test_g4_log_line_per_exec_event(armed):
     assert (l0["rule"], l0["decision"], l0["cmd"]) == ("none", "warn", "ls")
     assert (l1["rule"], l1["decision"]) == ("G1", "block")
     assert l0["ts"]
+
+
+def test_g4_log_redacts_secret_values(armed):
+    run_guard(exec_event("export DATABRICKS_TOKEN=sekrit123"), armed)
+    (logged,) = (armed / ".migration/guard.log").read_text().splitlines()
+    entry = json.loads(logged)
+    assert entry["decision"] == "block" and "sekrit123" not in entry["cmd"]
+    assert "<redacted>" in entry["cmd"]
+
+
+def test_arming_via_cd_target(tmp_path):
+    ws, outside = tmp_path / "ws", tmp_path / "outside"
+    (ws / ".migration").mkdir(parents=True)
+    outside.mkdir()
+    r = run_guard(exec_event("cd ../ws && psql -f run.sql"), outside)
+    assert r.returncode == 2
+    assert (ws / ".migration/guard.log").exists()
+
+
+def test_arming_cd_into_unarmed_dir_stays_silent(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "empty").mkdir()
+    r = run_guard(exec_event("cd ../empty && psql -f run.sql"), outside)
+    assert r.returncode == 0 and r.stdout == ""
 
 
 def test_no_log_for_edit_events(armed):
