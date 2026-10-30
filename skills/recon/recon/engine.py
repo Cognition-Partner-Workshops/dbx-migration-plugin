@@ -53,11 +53,14 @@ def _snapshot_provenance_warnings(snapshot: dict | None, source_family: str | No
     manifest_counts = snapshot.get("row_counts", {})
     for c in spec.objects:
         name = c.root_table
-        if name not in manifest_counts:
+        keys = [k for k in manifest_counts if k == name or name.endswith("." + k)]
+        if not keys:
             warnings.append(f"SNAPSHOT provenance: {name} missing from manifest")
-        elif manifest_counts[name] != observed.get(name):
+        elif len(keys) > 1:
+            warnings.append(f"SNAPSHOT provenance: {name} matches several manifest keys {keys}")
+        elif manifest_counts[keys[0]] != observed.get(name):
             warnings.append(
-                f"SNAPSHOT provenance mismatch: {name} manifest={manifest_counts[name]} "
+                f"SNAPSHOT provenance mismatch: {name} manifest={manifest_counts[keys[0]]} "
                 f"observed={observed.get(name)}")
     return warnings
 
