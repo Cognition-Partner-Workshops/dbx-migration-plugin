@@ -163,6 +163,20 @@ def test_isolation_source_unreadable_fails():
         POLICY, ok_dbx(**{"grants get-effective catalog fed_cat": {"privilege_assignments": []}}))
     assert st == "fail" and data["access_select"] is False
 
+def test_isolation_access_all_privileges_or_manage_satisfies_select():
+    for privs in (("ALL_PRIVILEGES",), ("MANAGE",), ("ALL_PRIVILEGES", "MANAGE")):
+        st, data = doctor.check_isolation(POLICY, ok_dbx(**{"grants get-effective catalog fed_cat": grants(*privs)}))
+        assert data["access_select"] is True
+        assert st == "fail" and all(f"fed_cat:{p}" in data["writes_outside_targets"] for p in privs)
+
+def test_isolation_read_only_uc_privileges_are_not_writes():
+    st, data = doctor.check_isolation(POLICY, ok_dbx(**{
+        "grants get-effective catalog prod_cat": grants("USE_CATALOG", "USE_SCHEMA", "BROWSE", "READ_METADATA",
+                                                        "SELECT"),
+        "SHOW SCHEMAS IN `prod_cat`": {"status": {"state": "SUCCEEDED"}, "result": {"data_array": [["s1"]]}},
+        "grants get-effective schema prod_cat.s1": grants("USE_SCHEMA", "BROWSE", "READ_METADATA")}))
+    assert st == "ok" and data["writes_outside_targets"] == []
+
 def test_isolation_catalog_ownership_fails():
     st, data = doctor.check_isolation(POLICY, ok_dbx(**{
         "catalogs list": {"catalogs": [{"name": "prod_cat", "owner": "sp-123"}]}}))
@@ -276,6 +290,22 @@ def test_source_read_only_oracle_ok():
 def test_source_read_only_oracle_tab_privs_query_uses_table_schema():
     sql = dict(doctor._source_queries("oracle", doctor._objects(SLICES["slices"])))["tab_privs"]
     assert "table_schema" in sql and "owner" not in sql.lower() and "'BILLING'" in sql
+    assert "privilege, type FROM all_tab_privs" in sql
+
+def test_source_read_only_oracle_ignores_user_type_privs():
+    inherit = [("BILLING", "BILLING", "INHERIT PRIVILEGES", "USER")]
+    for rows in (inherit, [{"table_schema": "BILLING", "table_name": "BILLING",
+                            "privilege": "INHERIT PRIVILEGES", "type": "USER"}]):
+        st, data = doctor.check_source_read_only(
+            POLICY, SLICES["slices"], ok_dbx(),
+            oracle_run_sql({**ORACLE_OK, "all_tab_privs": [("BILLING", "TENANTS", "SELECT", "TABLE"), *rows]}),
+            "sp-123")
+        assert st == "ok" and data["violations"] == []
+    for priv in ("INSERT", "UPDATE", "DELETE", "ALTER"):
+        st, data = doctor.check_source_read_only(
+            POLICY, SLICES["slices"], ok_dbx(),
+            oracle_run_sql({**ORACLE_OK, "all_tab_privs": inherit + [("BILLING", "TENANTS", priv, "TABLE")]}), "sp-123")
+        assert st == "fail" and len(data["violations"]) == 1 and priv in data["violations"][0]
 
 def test_source_read_only_oracle_scoped_to_slice_schemas():
     public_stock = [("SYS", "DBMS_OUTPUT", "EXECUTE"), ("MDSYS", "SDO_GEOM", "EXECUTE"), ("XDB", "XDB$ACL", "SELECT")]
