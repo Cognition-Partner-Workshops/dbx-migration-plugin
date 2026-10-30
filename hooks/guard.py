@@ -31,10 +31,11 @@ ENV_ASSIGN = re.compile(
 G3_PATH = re.compile(r"(^|/)\.databrickscfg$|\.databricks/|\.config/databricks/|" + re.escape(ENVRC))
 HOOK_SELF = re.compile(r"guard\.py|hooks\.json")
 REDIRECT = re.compile(r">+\s*([^\s;&|]+)")
-WCMD = re.compile(r"\b(cp|mv|tee|rm|dd|truncate|chmod|chown|sed|vi|vim|nano|emacs)\b\s+([^;&|]+)")
-QARG = re.compile(r"(?:^|\s)-[ce]\s*('[^']*'|\"[^\"]*\")")
+QARG = re.compile(r"(?:^|\s)-[ceQq]\s*('[^']*'|\"[^\"]*\")")
+WRITERS = ("cp", "mv", "tee", "rm", "dd", "truncate", "chmod", "chown",
+           "sed", "vi", "vim", "nano", "emacs")
 RED = re.compile(r"(DATABRICKS_(?:HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)\s*=\s*)"
-                 r"(?:'[^']*'|\"[^\"]*\"|\S+)")
+                 r"(?:'[^']*'|\"[^\"]*\"|\\.|[^\s;&|'\"])+")
 
 
 def _has(cmd, tok):
@@ -71,12 +72,44 @@ def _g1_write(cmd):
     return None
 
 
+def _split(cmd, seps):
+    parts, cur, q = [], [], None
+    for ch in cmd:
+        if q:
+            cur.append(ch)
+            if ch == q:
+                q = None
+        elif ch in "'\"":
+            q = ch
+            cur.append(ch)
+        elif ch in seps:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
 def _writes_to(cmd, pred):
-    for seg in re.split(r"[;&|]+", cmd):
+    for seg in _split(cmd, ";&|"):
         targets = REDIRECT.findall(seg)
-        for m in WCMD.finditer(seg):
-            args = [a for a in m.group(2).split() if not a.startswith("-")]
-            targets += args[-1:] if m.group(1) in ("cp", "mv") else args
+        words = [w for w in _split(seg, " \t") if w]
+        for i, w in enumerate(words):
+            if w not in WRITERS:
+                continue
+            rest = words[i + 1:]
+            args = [a for a in rest if not a.startswith("-")]
+            if w == "sed":
+                if not any(f.startswith("-i") or f.startswith("--in-place") for f in rest):
+                    continue
+            elif w in ("cp", "mv"):
+                dest = [rest[j + 1] for j, a in enumerate(rest[:-1])
+                        if a in ("-t", "--target-directory")]
+                dest += [a.split("=", 1)[1] for a in rest
+                         if a.startswith("--target-directory=")]
+                args = dest or args[-1:]
+            targets += args
         if any(pred(t) for t in targets):
             return True
     return False
@@ -85,7 +118,7 @@ def _writes_to(cmd, pred):
 def _g2(cmd, pol):
     forbidden = {str(t).lower() for t in (pol.get("forbidden_targets") or ("prod", "production"))}
     allowed = {str(t).lower() for t in (pol.get("bundle_targets") or ())}
-    for seg in re.split(r"[;&|]+", cmd):
+    for seg in _split(cmd, ";&|"):
         if not DEPLOY.search(seg):
             continue
         targets = [t.strip("'\"").lower() for t in TARGET_FLAG.findall(seg)]
