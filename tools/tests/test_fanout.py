@@ -36,17 +36,22 @@ def verify_pass(sid, head):
 
 
 class FakeOps:
-    def __init__(self, reports=(), states=None, diffs=None):
+    def __init__(self, reports=(), states=None, diffs=None, polls=()):
         self.reports = list(reports)
         self.states = dict(states or {})
         self.diffs = dict(diffs or {})
+        self.polls = list(polls)
         self.launches = []
         self.merges = []
+        self.diff_calls = []
 
     def launch(self, brief):
         self.launches.append(brief)
         assert self.reports, f"unexpected launch: {brief}"
         return self.reports.pop(0)
+
+    def poll(self, session_id):
+        return self.polls.pop(0) if self.polls else None
 
     def pr_state(self, pr_url):
         return dict(self.states.get(pr_url, {"state": "open", "head": "h0"}))
@@ -56,6 +61,7 @@ class FakeOps:
         self.states[pr_url] = {"state": "merged", "head": sha}
 
     def changed_paths(self, pr_url):
+        self.diff_calls.append(pr_url)
         return list(self.diffs.get(pr_url, []))
 
 
@@ -99,15 +105,6 @@ def test_dependent_waits_until_merged(tmp_path):
     assert summary["slices"]["slice-2"]["status"] == "waiting"
 
 
-def test_merges_only_at_verified_head(tmp_path):
-    doc = mk_doc(mk_slice("slice-1"))
-    ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
-                  states={"https://x/slice-1": {"state": "open", "head": "h2"}})
-    summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
-    assert ops.merges == []
-    assert summary["slices"]["slice-1"]["status"] == "verify_pending"
-
-
 def test_merge_uses_verified_head(tmp_path):
     doc = mk_doc(mk_slice("slice-1"))
     ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
@@ -117,13 +114,13 @@ def test_merge_uses_verified_head(tmp_path):
     assert summary["slices"]["slice-1"]["status"] == "merged"
 
 
-@pytest.mark.parametrize("bad", [".migration/policy.json",
-                                 ".migration/slices.json",
+@pytest.mark.parametrize("bad", [".migration/policy.json", ".migration/slices.json",
                                  ".migration/recon/slice-1/inputs/mapping.json",
                                  ".migration/recon/slice-1/fanout.json"])
 def test_protected_paths_fail_child(tmp_path, bad):
     doc = mk_doc(mk_slice("slice-1"))
     ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
+                  states={"https://x/slice-1": {"state": "open", "head": "h1"}},
                   diffs={"https://x/slice-1": ["src/ok.py", bad]})
     summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
     assert ops.merges == []
@@ -234,6 +231,66 @@ def test_collision_cleared_by_disposition(tmp_path):
                           "https://x/slice-2": {"state": "open", "head": "h2"}})
     summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
     assert summary["slices"]["slice-2"]["status"] == "merged"
+
+
+def test_canary_gates_later_slices(tmp_path):
+    doc = mk_doc(mk_slice("slice-1", canary=True, auto_merge=False),
+                 mk_slice("slice-2"))  # depends only on slice-0-like nothing
+    ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
+                  states={"https://x/slice-1": {"state": "open", "head": "h1"}})
+    summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
+    assert summary["slices"]["slice-1"]["status"] == "awaiting_human"
+    assert summary["slices"]["slice-2"]["status"] == "waiting"
+    assert len(ops.launches) == 2
+    ops.states["https://x/slice-1"] = {"state": "merged", "head": "h1"}
+    ops.reports += [migrate_pass("slice-2"), verify_pass("slice-2", "h2")]
+    ops.states["https://x/slice-2"] = {"state": "open", "head": "h2"}
+    summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
+    assert summary["slices"]["slice-2"]["status"] == "merged"
+
+
+def test_parity_fail_blocks_merge(tmp_path):
+    doc = mk_doc(mk_slice("slice-1"))
+    report = dict(verify_pass("slice-1", "h1"), parity="FAIL")
+    ops = FakeOps([migrate_pass("slice-1"), report],
+                  states={"https://x/slice-1": {"state": "open", "head": "h1"}})
+    summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
+    assert ops.merges == []
+    assert summary["slices"]["slice-1"]["failure_class"] == "parity"
+
+
+def test_head_move_before_diff_reverifies(tmp_path):
+    doc = mk_doc(mk_slice("slice-1"))
+    ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
+                  states={"https://x/slice-1": {"state": "open", "head": "h2"}})
+    summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
+    assert summary["slices"]["slice-1"]["status"] == "verify_pending"
+    assert ops.diff_calls == [] and ops.merges == []
+
+
+def test_merge_refusal_reverifies(tmp_path):
+    doc = mk_doc(mk_slice("slice-1"))
+    ops = FakeOps([migrate_pass("slice-1"), verify_pass("slice-1", "h1")],
+                  states={"https://x/slice-1": {"state": "open", "head": "h1"}})
+    ops.merge = lambda url, sha: 1 / 0
+    summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
+    assert summary["slices"]["slice-1"]["status"] == "verify_pending"
+
+
+def test_async_children_run_in_parallel(tmp_path):
+    doc = mk_doc(mk_slice("slice-1"), mk_slice("slice-2"))
+    ops = FakeOps([{"status": "launched", "session_id": s}
+                   for s in ("m1", "m2", "v1", "v2")])
+    fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
+    assert len(ops.launches) == 2  # both migrates in flight at once
+    ops.polls = [migrate_pass("slice-1"), migrate_pass("slice-2")]
+    fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
+    assert len(ops.launches) == 4  # two verifies launched
+    ops.polls = [verify_pass("slice-1", "h1"), verify_pass("slice-2", "h2")]
+    ops.states.update({f"https://x/slice-{i}": {"state": "open", "head": f"h{i}"}
+                       for i in (1, 2)})
+    summary = fanout.run(ops, mk_policy(), doc, migration_dir=str(tmp_path))
+    assert all(summary["slices"][f"slice-{i}"]["status"] == "merged" for i in (1, 2))
 
 
 def test_fanout_json_written(tmp_path):
