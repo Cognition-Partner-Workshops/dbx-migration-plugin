@@ -10,7 +10,7 @@ never restate it. Track **A** is Delta/DBSQL, track **L** is Lakebase Postgres.
 
 - Lakebridge: `--source-dialect oracle` — handles static SQL/DDL/views; anything with `BEGIN`,
   `DECLARE`, `CREATE OR REPLACE (PACKAGE|PROCEDURE|FUNCTION|TRIGGER)` or `DBMS_` is hand work here.
-- Canonicalization: [canonicalization.json](../../oracle-plsql/canonicalization.json) (loaded by
+- Canonicalization: [canonicalization.json](canonicalization.json) (loaded by
   `recon.config.load_canon_rules`; moves beside this file when the harness component lands).
 - Full construct/function/type maps: `skills/oracle-plsql/SKILL.md` until the 0.6.2 files are
   removed.
