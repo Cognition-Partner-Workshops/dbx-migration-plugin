@@ -87,6 +87,9 @@ G1 = [
     ("mysql -u x db < dump.sql", "block"),
     ("cat q.sql | bteq", "block"),
     ("echo 'DROP TABLE t' | psql", "block"),
+    ("sh -c 'psql -f run.sql'", "block"),
+    ("sh -c 'psql -c \"select 1\"'", "warn"),
+    ("eval 'sqlcmd -Q \"DELETE FROM t\"'", "block"),
     ("ssh db-01 \"bteq < q.sql\"", "block"),
     ("docker exec dbx psql -c 'select 1'", "block"),
     ("psql -c 'select 1' | grep x", "warn"),
@@ -118,6 +121,8 @@ G2 = [
     ("databricks bundle deploy -t 'prod'", "block"),
     ("databricks bundle deploy --target=\"prod\"", "block"),
     ("echo -t migration; databricks bundle deploy", "block"),
+    ("sh -c 'databricks bundle deploy -t migration; databricks bundle deploy'", "block"),
+    ("sh -c 'databricks bundle deploy -t migration'", "warn"),
     ("databricks bundle validate -t prod", "warn"),
     ("databricks postgres create-branch projects/p/branches/production/x", "block"),
     ("databricks postgres delete-endpoint projects/p/branches/production/ep", "block"),
@@ -149,7 +154,9 @@ G3_EXEC = [
 
 G5_EXEC = [
     ("sed -i s/x/y/ hooks/guard.py", "block"),
+    ("/usr/bin/sed -i s/x/y/ hooks/guard.py", "block"),
     ("rm hooks/guard.py", "block"),
+    ("/bin/rm hooks/guard.py", "block"),
     ("echo x > " + str(PLUGIN_ROOT) + "/hooks.json", "block"),
     ("cp " + str(PLUGIN_ROOT) + "/hooks/guard.py /tmp/g.py", "warn"),
     ("cp /tmp/x " + str(PLUGIN_ROOT) + "/hooks/", "block"),

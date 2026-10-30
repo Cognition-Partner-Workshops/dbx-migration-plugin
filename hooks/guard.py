@@ -34,6 +34,8 @@ REDIRECT = re.compile(r">+\s*([^\s;&|]+)")
 QARG = re.compile(r"(?:^|\s)-[ceQq]\s*('[^']*'|\"[^\"]*\")")
 WRITERS = ("cp", "mv", "tee", "rm", "dd", "truncate", "chmod", "chown",
            "sed", "vi", "vim", "nano", "emacs")
+CARRIER = re.compile(
+    r"\b(?:(?:ba|z|da|k)?sh\s+-c|eval|ssh|(?:docker|kubectl)\s+exec)\s*('[^']*'|\"[^\"]*\")")
 RED = re.compile(r"(DATABRICKS_(?:HOST|TOKEN|CLIENT_ID|CLIENT_SECRET)\s*=\s*)"
                  r"(?:'[^']*'|\"[^\"]*\"|\\.|[^\s;&|'\"])+")
 
@@ -57,6 +59,10 @@ def _g1(cmd, legacy):
         return ("G1", f"legacy client/source `{engaged}` inside an ssh/docker exec payload")
     if any(_has(p, t) for p in re.split(r"(?<!\|)\|(?!\|)", cmd)[1:] for t in toks):
         return ("G1", f"a pipe into legacy client `{engaged}`")
+    for q in CARRIER.findall(cmd):
+        hit = _g1(q[1:-1], legacy)
+        if hit:
+            return hit
     return None
 
 
@@ -96,8 +102,9 @@ def _writes_to(cmd, pred):
         targets = REDIRECT.findall(seg)
         words = [w for w in _split(seg, " \t") if w]
         for i, w in enumerate(words):
-            if w not in WRITERS:
+            if os.path.basename(w) not in WRITERS:
                 continue
+            w = os.path.basename(w)
             rest = words[i + 1:]
             args = [a for a in rest if not a.startswith("-")]
             if w == "sed":
@@ -110,7 +117,7 @@ def _writes_to(cmd, pred):
                          if a.startswith("--target-directory=")]
                 args = dest or args[-1:]
             targets += args
-        if any(pred(t) for t in targets):
+        if any(pred(t.strip("'\"")) for t in targets):
             return True
     return False
 
@@ -118,7 +125,9 @@ def _writes_to(cmd, pred):
 def _g2(cmd, pol):
     forbidden = {str(t).lower() for t in (pol.get("forbidden_targets") or ("prod", "production"))}
     allowed = {str(t).lower() for t in (pol.get("bundle_targets") or ())}
-    for seg in _split(cmd, ";&|"):
+    segs = _split(cmd, ";&|")
+    segs += [s for q in CARRIER.findall(cmd) for s in _split(q[1:-1], ";&|")]
+    for seg in segs:
         if not DEPLOY.search(seg):
             continue
         targets = [t.strip("'\"").lower() for t in TARGET_FLAG.findall(seg)]
