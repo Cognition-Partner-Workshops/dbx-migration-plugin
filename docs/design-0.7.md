@@ -60,7 +60,9 @@ skills/dialects/<family>/      oracle-plsql, tsql-ssis, teradata-bteq, informati
 skills/target-routing/SKILL.md step → official databricks skill table; auth rules (kept, halved)
 .migration/policy.json         the one committed contract (section 6)
 .migration/slices.json         slices, written by analyze, approved with the plan
-.migration/recon/<slice>/      result.json, report.md, rerun_proof.json (the only paths a slice PR may touch under .migration/)
+.migration/recon/<slice>/inputs/   mapping, dependencies, canonicalization, grading, rerun_posture (manager-committed, protected)
+.migration/recon/<slice>/out/      result.json, report.md, rerun_proof.json, access.json (slice-0); with .migration/authorized/<slice>/ the only paths a slice PR may touch under .migration/
+.migration/recon/<slice>/fanout.json, route.md   manager-written on base_branch, never in a slice PR
 ```
 
 Deleted from 0.6.2: `skills/{intake,migration-planning,workspace-setup,estate-inventory,pipeline-analysis,wave-plan,wave-verify,unit-migration,migration-fanout,parallel-run,cutover,factory-doctor}`, `hooks/dbx_guard.py`, `skills/test_no_*.py`, `skills/test_skill_manifests.py`, `OVERVIEW.md`, `references/{guards,checks,estate-types,decisions,phase1-steps}.md`, `.migration/{allowed_targets,recon_tolerances,capabilities,authorizations}.json`, `.migration/waves/`, `.migration/units/`, `~/.dbx-migration-factory/`, the doctor signature, the hook nonce, `plan_sha`/`manifest_sha`, `gate_waived`, `merge_override`, `source_principal_attested`, `by_design_unverified` manifest mirroring, `serialized_pipelines`, the pipelines barrier.
@@ -106,7 +108,10 @@ the plan step, committed with the policy, e.g. `mig/<run>`), read from `git show
 else the working copy, else `origin/HEAD`. `policy.json` is `git show <base>:.migration/policy.json`,
 never the working copy. Armed with no committed policy (the window between `git init` of `.migration/`
 and the policy PR merging) → G1/G2/G3/G5 apply with `legacy_sources = []` and `bundle_targets = []`,
-so every deploy blocks until the policy PR merges; reads are never blocked. Output contract is
+so every deploy blocks until the policy PR merges; reads are never blocked. Outside a run repo the
+guard is silent by design: the only legacy credential any session holds is read-only (§3 rule 4), so
+the fence there is the principal, not a hook; 0.6.2's org-wide hook firing in unrelated repos is the
+behaviour this removes. Output contract is
 unchanged (`{"decision": "block"|"warn", "reason": ...}` on stdout, exit 2 on block).
 
 G2 is deliberately not a destination allowlist: the destination fence is the migration principal's grants, proven by the doctor's `isolation` check (§5), and `fanout.py` refuses to launch while `isolation` is not `ok`. `policy.json` and `slices.json` are further protected by a `CODEOWNERS` rule on `.migration/` requiring a human review on `base_branch`, and `fanout.py`/`verify` fail any slice PR that touches them (`protected_files_tampered`). The guard is a no-op in a checkout with no `.migration/policy.json` on its base; it never fires in another plugin's or project's repo.
@@ -193,7 +198,7 @@ kept as defence). No run log, no manifest sha, no lock file, no pointer; the man
 
 Child report schema (structured output): `{status: PASS|FAIL|BLOCKED, slice, pr_url, branch, parity:
 PASS|FAIL, findings: [{class, code, detail}], failure_class?, changed_paths: [...], recon_cost,
-one_line_summary}`. `changed_paths` is informational; `fanout.py` computes `git diff --name-only <base>...<pr_head>` itself and fails a child whose diff touches `.migration/` outside `.migration/recon/<slice>/out/` (`protected_files_tampered`). It merges only when the PR head equals the `verified_head` in the verifier's report.
+one_line_summary}`. `changed_paths` is informational; `fanout.py` computes `git diff --name-only <base>...<pr_head>` itself and fails a child whose diff touches `.migration/` outside `.migration/recon/<slice>/out/` and `.migration/authorized/<slice>/` (`protected_files_tampered`); `fanout.json` and `route.md` are the manager's own commits on `base_branch`. It merges only when the PR head equals the `verified_head` in the verifier's report.
 
 ## 8. Harness: parity is the verdict
 
@@ -231,7 +236,7 @@ Cold-start inputs: slice id, `policy.json`, `slices.json`, the dialect skill nam
    `source.access` resolvable using the official skill the estate calls for (federation connection +
    foreign catalog; a Lakeflow Connect pipeline into a landed schema; a volume the export is copied
    into and loaded in FK order), prove it with a row count per table, and record
-   `{access, kind: federation|landed|loaded_from_export, pipeline_id?, export_manifest?}` in `.migration/recon/slice-0/access.json`.
+   `{access, kind: federation|landed|loaded_from_export, pipeline_id?, export_manifest?}` in `.migration/recon/slice-0/out/access.json`.
    Every later slice reads `source.access` and never re-creates it. Access prerequisites that are the customer's (connection privilege, connector DB user and CDC enablement, export delivery) are `blockers` on the plan resolved at STOP 1, never a mid-run halt. For `loaded_from_export` the tables are a frozen snapshot: `mode: snapshot` is the only merge-evidence mode and the route packet says so.
 2. **Convert**: `databricks labs lakebridge transpile --source-dialect <family> --input-source
    <slice dir> --output-folder <work dir> --error-file-path <work dir>/errors.log` for SQL/DDL/
@@ -241,7 +246,7 @@ Cold-start inputs: slice id, `policy.json`, `slices.json`, the dialect skill nam
    `targets.lakebase.branch`, reference data via `databricks postgres create-synced-table` from the
    mirror. One DAB per slice named `mig_<run>_<slice>`, target `migration`, schedules `PAUSED`.
 3. **Prove**: `dbx-recon run --unit <slice> --family <family> --mode live|transactional --depth
-   threshold --out .migration/recon/<slice>/`; retry cap 3; `data` findings are fixed in converted
+   threshold --out .migration/recon/<slice>/out/`; retry cap 3; `data` findings are fixed in converted
    code; `rerun-proof` once. Open the PR: parity on line 1, findings table, bill (`acus_consumed`,
    wall time) as the last section.
 4. **Shadow**: deploy a Lakeflow Job `mig_<run>_<slice>_shadow` that runs the slice on the legacy
