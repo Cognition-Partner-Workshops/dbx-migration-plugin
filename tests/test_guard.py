@@ -258,6 +258,44 @@ def test_base_resolution_via_git_show(policy_ws):
     assert decision(run_guard(exec_event("ssh legacy-db-01 'ls'"), policy_ws)) == "block"
 
 
+def _worker_checkout(tmp_path, base="mig/run"):
+    """Worker clone shape: the base named in .migration/base exists only as
+    origin/<base>; the local branch is the slice branch."""
+    (tmp_path / ".migration").mkdir()
+    git(tmp_path, "init", "-b", "slice-0")
+    git(tmp_path, "config", "user.email", "t@example.com")
+    git(tmp_path, "config", "user.name", "t")
+    (tmp_path / ".migration/base").write_text(f"{base}\n")
+    (tmp_path / ".migration/policy.json").write_text(json.dumps(POLICY))
+    git(tmp_path, "add", ".migration")
+    git(tmp_path, "commit", "-qm", "policy")
+    git(tmp_path, "update-ref", "refs/remotes/origin/mig/run", "HEAD")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(tmp_path, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    return tmp_path
+
+
+def test_base_only_as_origin_ref_allows_listed_target(tmp_path):
+    ws = _worker_checkout(tmp_path)
+    assert git(ws, "branch", "--list", "mig/run") == ""
+    (ws / ".migration/policy.json").write_text(
+        json.dumps({**POLICY, "bundle_targets": ["evil"]}))
+    assert decision(run_guard(exec_event("databricks bundle deploy -t migration"), ws)) == "warn"
+    assert decision(run_guard(exec_event("databricks bundle deploy -t evil"), ws)) == "block"
+
+
+def test_base_only_as_origin_ref_still_blocks_unlisted_target(tmp_path):
+    ws = _worker_checkout(tmp_path)
+    assert decision(run_guard(exec_event("databricks bundle deploy -t prod"), ws)) == "block"
+    assert decision(run_guard(exec_event("databricks bundle deploy"), ws)) == "block"
+
+
+def test_base_missing_everywhere_blocks(tmp_path):
+    ws = _worker_checkout(tmp_path, base="mig/gone")
+    assert decision(run_guard(exec_event("databricks bundle deploy -t migration"), ws)) == "block"
+    assert decision(run_guard(exec_event("ls"), ws)) == "warn"
+
+
 def test_base_file_working_copy_fallback(tmp_path):
     """No origin/HEAD: the working-copy .migration/base names the base ref."""
     (tmp_path / ".migration").mkdir()

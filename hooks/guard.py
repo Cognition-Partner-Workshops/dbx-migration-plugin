@@ -261,8 +261,11 @@ def _policy(mdir):
         base = (mdir / "base").read_text(errors="replace")
     lines = (base or "").splitlines()
     base = lines[0].strip() if lines and lines[0].strip() else "origin/HEAD"
+    text = _show(ws, base, ".migration/policy.json")
+    if text is None and not base.startswith(("origin/", "refs/")):
+        text = _show(ws, f"origin/{base}", ".migration/policy.json")
     try:
-        return json.loads(_show(ws, base, ".migration/policy.json") or "{}")
+        return json.loads(text or "{}")
     except json.JSONDecodeError:
         return {}
 
