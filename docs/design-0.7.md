@@ -106,7 +106,8 @@ command's cwd (or the edit's `file_path`); otherwise it exits 0 with no output, 
 another plugin's or an application's repo. `<base>` is the one line of `.migration/base` (written by
 the plan step, committed with the policy, e.g. `mig/<run>`), read from `git show origin/HEAD:.migration/base`
 else the working copy, else `origin/HEAD`. `policy.json` is `git show <base>:.migration/policy.json`,
-never the working copy. Armed with no committed policy (the window between `git init` of `.migration/`
+else `git show origin/<base>:.migration/policy.json` (a worker checkout has the base only as a
+remote-tracking ref), never the working copy; a base that resolves nowhere loads an empty policy. Armed with no committed policy (the window between `git init` of `.migration/`
 and the policy PR merging) → G1/G2/G3/G5 apply with `legacy_sources = []` and `bundle_targets = []`,
 so every deploy blocks until the policy PR merges; reads are never blocked. Outside a run repo the
 guard is silent by design: the only legacy credential any session holds is read-only (§3 rule 4), so
