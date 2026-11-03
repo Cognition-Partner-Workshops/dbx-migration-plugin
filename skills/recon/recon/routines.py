@@ -83,6 +83,13 @@ def writers(dependencies: object) -> dict[str, list[str]]:
             out[name] = list(dict.fromkeys(tables))
     return out
 
+def slice_writers(declared: list[str] | None, dependencies: object) -> list[str]:
+    """The routines a slice must prove: the writing routines of its dependency analysis,
+    lower-cased and deduplicated. Without an analysis every declared routine is a writer."""
+    if dependencies is not None:
+        return sorted(writers(dependencies))
+    return sorted({str(r).lower() for r in declared or [] if r})
+
 def _tables(mapping: object, routine: str, which: str) -> dict[str, object]:
     if not isinstance(mapping, dict):
         raise ConfigError(f"{routine}: golden and observed must map table -> rows")
