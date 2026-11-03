@@ -29,7 +29,7 @@ from .config import (CanonRule, ConfigError, load_policy, load_slice_inputs, loa
 from .engine import DEPTHS, MODES, run_recon
 from .report import status_line
 from .rerun import check_proof, grade_rerun, load_prior, load_record, source_digest
-from .routines import check_parity, git_committed, grade_routines, load_runs, writers
+from .routines import check_parity, git_committed, grade_routines, load_runs, slice_writers
 from .typemap import apply_type_map, load_type_map
 
 SOURCE_FAMILIES = ("oracle", "sqlserver", "postgres", "databricks")
@@ -281,8 +281,7 @@ def _dispatch(args) -> int:
         routine_parity = check_parity(
             rows, str(rp_path), deps,
             committed=git_committed(Path(".")), repo=Path("."))
-    routine_writers = sorted(set((entry or {}).get("routines") or []) |
-                             set(writers(deps))) if deps else (entry or {}).get("routines") or []
+    routine_writers = slice_writers((entry or {}).get("routines"), deps)
     rerun_proof = None
     proof_path = out / "rerun_proof.json"
     if proof_path.exists():

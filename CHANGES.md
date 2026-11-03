@@ -9,6 +9,14 @@ only merge authority. Removed: the 0.6.2 phase skills, wave manifests, signed do
 nonce probes, authorizations, merge overrides, and `hooks/dbx_guard.py`. Devin never writes to the
 legacy source.
 
+## Fixed
+
+- `dbx-recon run` lists only the writing routines of the slice's dependency analysis (own or
+  transitive writes) as `routine_writers`, lower-cased once; read-only functions and triggers no longer
+  need a `routine_parity` row, and an upper-case `slices.json` entry no longer duplicates its
+  lower-cased writer. A declared routine or glob the analysis has no row for stays a writer (`NOT_RUN`
+  until proven), and without an analysis every declared routine is still a writer.
+
 # 0.6.2 — mixed-family estates run unpatched
 
 ## Changed

@@ -10,6 +10,7 @@ from recon import cli
 from recon.config import MappingSpec, Tolerances, load_mapping_spec, load_slice_inputs
 from recon.engine import run_recon
 from recon.report import build_result
+from recon.routines import slice_writers
 
 from .fakes import FakeSource, FakeTarget
 
@@ -98,6 +99,66 @@ def test_failed_routine_is_fail(tmp_path):
     r = run(tmp_path, routine_writers=["pkg_a"],
             routine_parity=[{"routine": "pkg_a", "status": "failed", "evidence": "x"}])
     assert r["parity"] == "FAIL"
+
+
+DECLARED = ["PKG_OW_UTIL.F_FMT", "PKG_OW_UTIL.LOG_MSG", "TRG_AUDIT_ID", "P_WRAP"]
+DEPS = {"routines": [
+    {"routine": "PKG_OW_UTIL.F_FMT", "writes": [], "calls": []},
+    {"routine": "PKG_OW_UTIL.LOG_MSG", "writes": ["AUDIT_LOG"], "calls": []},
+    {"routine": "TRG_AUDIT_ID", "writes": [], "calls": ["PKG_OW_UTIL.F_FMT"]},
+    {"routine": "P_WRAP", "writes": [], "calls": ["PKG_OW_UTIL.LOG_MSG"]},
+]}
+
+
+def test_read_only_routine_is_not_a_writer():
+    writers_ = slice_writers(DECLARED, DEPS)
+    assert "pkg_ow_util.f_fmt" not in writers_
+    assert "trg_audit_id" not in writers_
+
+
+def test_transitive_writer_is_a_writer():
+    assert slice_writers(DECLARED, DEPS) == ["p_wrap", "pkg_ow_util.log_msg"]
+
+
+def test_declared_writer_without_row_is_not_run(tmp_path):
+    r = run(tmp_path, routine_writers=slice_writers(DECLARED, DEPS),
+            routine_parity=[{"routine": "PKG_OW_UTIL.LOG_MSG", "status": "proven", "evidence": "x"}])
+    assert r["parity"] == "NOT_RUN"
+    missing = [f["object"] for f in r["findings"] if f["code"] == "routine_parity_missing"]
+    assert missing == ["p_wrap"]
+
+
+def test_mixed_case_writer_is_one_row(tmp_path):
+    deps = {"routines": [{"routine": "Pkg_Ow_Util.Log_Msg", "writes": ["audit_log"], "calls": []}]}
+    writers_ = slice_writers(["PKG_OW_UTIL.LOG_MSG"], deps)
+    assert writers_ == ["pkg_ow_util.log_msg"]
+    r = run(tmp_path, routine_writers=writers_,
+            routine_parity=[{"routine": "PKG_OW_UTIL.LOG_MSG", "status": "proven", "evidence": "x"}])
+    assert r["parity"] == "PASS"
+    assert not [f for f in r["findings"] if f["code"] == "routine_parity_missing"]
+
+
+def test_no_analysis_lists_every_declared_routine_once():
+    assert slice_writers(["PKG_A", "pkg_a", "Pkg_B"], None) == ["pkg_a", "pkg_b"]
+
+
+def test_declared_routine_unknown_to_analysis_stays_a_writer(tmp_path):
+    writers_ = slice_writers(["PKG.WRITE"], {"routines": []})
+    assert writers_ == ["pkg.write"]
+    r = run(tmp_path, routine_writers=writers_)
+    assert r["parity"] == "NOT_RUN"
+    assert any(f["code"] == "routine_parity_missing" and f["object"] == "pkg.write"
+               for f in r["findings"])
+
+
+def test_declared_glob_is_covered_by_analysis_rows_or_required():
+    assert slice_writers(["PKG_OW_UTIL.*"], DEPS) == ["p_wrap", "pkg_ow_util.log_msg"]
+    assert slice_writers(["PKG_PLANS.*"], DEPS) == ["p_wrap", "pkg_ow_util.log_msg", "pkg_plans.*"]
+
+
+def test_bracketed_read_only_routine_matches_its_row_exactly():
+    deps = {"routines": [{"routine": "dbo.[Order]", "writes": [], "calls": []}]}
+    assert slice_writers(["dbo.[Order]"], deps) == []
 
 
 def test_non_merge_mode_is_evidence_finding(tmp_path):
