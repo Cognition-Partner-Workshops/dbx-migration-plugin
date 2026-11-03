@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -84,11 +85,19 @@ def writers(dependencies: object) -> dict[str, list[str]]:
     return out
 
 def slice_writers(declared: list[str] | None, dependencies: object) -> list[str]:
-    """The routines a slice must prove: the writing routines of its dependency analysis,
-    lower-cased and deduplicated. Without an analysis every declared routine is a writer."""
-    if dependencies is not None:
-        return sorted(writers(dependencies))
-    return sorted({str(r).lower() for r in declared or [] if r})
+    """The routines a slice must prove, lower-cased and deduplicated: the writing routines of
+    the dependency analysis (own or transitive writes), plus every declared routine or glob the
+    analysis has no row for. A declared routine the analysis knows as read-only is not a writer.
+    Without an analysis every declared routine is a writer."""
+    names = {str(r).lower() for r in declared or [] if r}
+    if dependencies is None:
+        return sorted(names)
+    required = set(writers(dependencies))
+    known = {r["routine"].lower() for r in dependencies["routines"]}
+    for d in names:
+        if not any(fnmatch.fnmatchcase(k, d) for k in known):
+            required.add(d)
+    return sorted(required)
 
 def _tables(mapping: object, routine: str, which: str) -> dict[str, object]:
     if not isinstance(mapping, dict):

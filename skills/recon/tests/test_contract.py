@@ -142,6 +142,20 @@ def test_no_analysis_lists_every_declared_routine_once():
     assert slice_writers(["PKG_A", "pkg_a", "Pkg_B"], None) == ["pkg_a", "pkg_b"]
 
 
+def test_declared_routine_unknown_to_analysis_stays_a_writer(tmp_path):
+    writers_ = slice_writers(["PKG.WRITE"], {"routines": []})
+    assert writers_ == ["pkg.write"]
+    r = run(tmp_path, routine_writers=writers_)
+    assert r["parity"] == "NOT_RUN"
+    assert any(f["code"] == "routine_parity_missing" and f["object"] == "pkg.write"
+               for f in r["findings"])
+
+
+def test_declared_glob_is_covered_by_analysis_rows_or_required():
+    assert slice_writers(["PKG_OW_UTIL.*"], DEPS) == ["p_wrap", "pkg_ow_util.log_msg"]
+    assert slice_writers(["PKG_PLANS.*"], DEPS) == ["p_wrap", "pkg_ow_util.log_msg", "pkg_plans.*"]
+
+
 def test_non_merge_mode_is_evidence_finding(tmp_path):
     r = run(tmp_path, mode="fixture")
     assert any(f["code"] == "mode" and f["class"] == "evidence" and not f["blocking"]
