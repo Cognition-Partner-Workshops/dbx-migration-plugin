@@ -156,6 +156,11 @@ def test_declared_glob_is_covered_by_analysis_rows_or_required():
     assert slice_writers(["PKG_PLANS.*"], DEPS) == ["p_wrap", "pkg_ow_util.log_msg", "pkg_plans.*"]
 
 
+def test_bracketed_read_only_routine_matches_its_row_exactly():
+    deps = {"routines": [{"routine": "dbo.[Order]", "writes": [], "calls": []}]}
+    assert slice_writers(["dbo.[Order]"], deps) == []
+
+
 def test_non_merge_mode_is_evidence_finding(tmp_path):
     r = run(tmp_path, mode="fixture")
     assert any(f["code"] == "mode" and f["class"] == "evidence" and not f["blocking"]

@@ -94,7 +94,7 @@ def slice_writers(declared: list[str] | None, dependencies: object) -> list[str]
         return sorted(names)
     required = set(writers(dependencies))
     known = {r["routine"].lower() for r in dependencies["routines"]}
-    for d in names:
+    for d in names - known:
         if not any(fnmatch.fnmatchcase(k, d) for k in known):
             required.add(d)
     return sorted(required)
